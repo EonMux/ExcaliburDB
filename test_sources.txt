@@ -1,0 +1,5 @@
+excalibur-core/src/test/java/com/excalibur/core/XxHash64Test.java
+excalibur-core/src/test/java/io/excalibur/core/checksum/CRC32Test.java
+excalibur-core/src/test/java/io/excalibur/core/checksum/CRC32ChecksumTest.java
+excalibur-core/src/test/java/io/excalibur/core/mapped/MappedFileTest.java
+excalibur-core/src/test/java/io/excalibur/core/hash/XxHash64Test.java
