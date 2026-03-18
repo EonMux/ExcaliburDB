@@ -10,13 +10,19 @@ import java.nio.charset.StandardCharsets;
  * <p>This is a correct implementation of the xxHash64 algorithm based on the
  * official specification from https://github.com/Cyan4973/xxHash.</p>
  *
- * <h2>Test Vectors (seed=0)</h2>
+ * <h2>Positive Hash Guarantee</h2>
+ * <p>All hash values returned by this class are normalized to the range [0, Long.MAX_VALUE]
+ * (positive 63-bit values). This is achieved by clearing the sign bit (MSB) of the
+ * raw 64-bit hash. This guarantee is required for ExcaliburDB storage where key_hash
+ * values must be non-negative for use in hash table slot calculations.</p>
+ *
+ * <h2>Test Vectors (seed=0, normalized to positive)</h2>
  * <ul>
- *   <li>"" (empty) = 0xEF46DB3751D8E999</li>
- *   <li>"a" = 0xD24EC4F1A98C6E5B</li>
+ *   <li>"" (empty) = 0x6F46DB3751D8E999</li>
+ *   <li>"a" = 0x524EC4F1A98C6E5B</li>
  *   <li>"abc" = 0x44BC2CF5AD770999</li>
  *   <li>"message digest" = 0x066ED728FCEEB3BE</li>
- *   <li>"abcdefghijklmnopqrstuvwxyz" = 0xCFE1F278FA89835C</li>
+ *   <li>"abcdefghijklmnopqrstuvwxyz" = 0x4FE1F278FA89835C</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -35,6 +41,20 @@ public class XxHash64 {
     private static final long PRIME3 = 0x165667B19E3779F9L;
     private static final long PRIME4 = 0x85EBCA77C2B2AE63L;
     private static final long PRIME5 = 0x27D4EB2F165667C5L;
+
+    /**
+     * Mask for normalizing hash values to positive range [0, Long.MAX_VALUE].
+     * This clears the sign bit, ensuring the result is always non-negative.
+     *
+     * <p>Domain constraint: key_hash values MUST be in range [0, Long.MAX_VALUE] (positive 64-bit).
+     * This is required because:
+     * <ul>
+     *   <li>SegmentEntry stores key_hash and validates it must be non-negative</li>
+     *   <li>LogEntry stores key_hash and validates it must be non-negative</li>
+     *   <li>Slot positions are computed as hash % capacity, which requires non-negative hash</li>
+     * </ul>
+     */
+    public static final long POSITIVE_HASH_MASK = 0x7FFFFFFFFFFFFFFFL;
 
     // Instance state for streaming API
     private final long seed;
@@ -205,7 +225,23 @@ public class XxHash64 {
         h64 *= PRIME3;
         h64 ^= h64 >>> 32;
 
-        return h64;
+        // Normalize to positive range [0, Long.MAX_VALUE]
+        // Domain constraint: key_hash values MUST be non-negative for ExcaliburDB storage
+        return normalizeToPositive(h64);
+    }
+
+    /**
+     * Normalizes a 64-bit hash value to the positive range [0, Long.MAX_VALUE].
+     *
+     * <p>xxHash64 produces a full 64-bit unsigned value, but Java's long is signed.
+     * This method clears the sign bit to ensure the result is always non-negative,
+     * which is required for use as key_hash in ExcaliburDB storage.</p>
+     *
+     * @param hash The raw hash value (may be negative in Java's signed interpretation)
+     * @return The normalized hash value in range [0, Long.MAX_VALUE]
+     */
+    public static long normalizeToPositive(long hash) {
+        return hash & POSITIVE_HASH_MASK;
     }
 
     /**
@@ -307,7 +343,8 @@ public class XxHash64 {
         h64 *= PRIME3;
         h64 ^= h64 >>> 32;
 
-        return h64;
+        // Normalize to positive range [0, Long.MAX_VALUE]
+        return normalizeToPositive(h64);
     }
 
     // ==================== Instance Methods for Streaming ====================
@@ -440,7 +477,8 @@ public class XxHash64 {
         h64 *= PRIME3;
         h64 ^= h64 >>> 32;
 
-        return h64;
+        // Normalize to positive range [0, Long.MAX_VALUE]
+        return normalizeToPositive(h64);
     }
 
     /**
@@ -530,33 +568,42 @@ public class XxHash64 {
      * Verifies this implementation against known test vectors from
      * the official xxHash repository.
      *
+     * <p>Note: All test vectors are normalized to positive range [0, Long.MAX_VALUE]
+     * to comply with ExcaliburDB's key_hash constraint.</p>
+     *
      * @return true if all test vectors pass
      */
     public static boolean verifyTestVectors() {
         boolean allPassed = true;
 
-        // Official xxHash64 test vectors (seed=0)
-        // Verified against official xxhsum tool from https://github.com/Cyan4973/xxHash
-        allPassed &= verifyVector("", 0xEF46DB3751D8E999L, 0L);
-        allPassed &= verifyVector("a", 0xD24EC4F1A98C6E5BL, 0L);
+        // Official xxHash64 test vectors (seed=0), normalized to positive range
+        // Original raw values from https://github.com/Cyan4973/xxHash:
+        //   "" = 0xEF46DB3751D8E999, normalized = 0x6F46DB3751D8E999
+        //   "a" = 0xD24EC4F1A98C6E5B, normalized = 0x524EC4F1A98C6E5B
+        //   "abc" = 0x44BC2CF5AD770999 (already positive)
+        //   "message digest" = 0x066ED728FCEEB3BE (already positive)
+        //   "abcdefghijklmnopqrstuvwxyz" = 0xCFE1F278FA89835C, normalized = 0x4FE1F278FA89835C
+        allPassed &= verifyVector("", 0x6F46DB3751D8E999L, 0L);
+        allPassed &= verifyVector("a", 0x524EC4F1A98C6E5BL, 0L);
         allPassed &= verifyVector("abc", 0x44BC2CF5AD770999L, 0L);
         allPassed &= verifyVector("message digest", 0x066ED728FCEEB3BEL, 0L);
-        allPassed &= verifyVector("abcdefghijklmnopqrstuvwxyz", 0xCFE1F278FA89835CL, 0L);
-        allPassed &= verifyVector("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", 0xAAA46907D3047814L, 0L);
-        allPassed &= verifyVector("12345678901234567890123456789012345678901234567890123456789012345678901234567890", 0xE04A477F19EE145DL, 0L);
+        allPassed &= verifyVector("abcdefghijklmnopqrstuvwxyz", 0x4FE1F278FA89835CL, 0L);
+        allPassed &= verifyVector("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", 0x2AA46907D3047814L, 0L);
+        allPassed &= verifyVector("12345678901234567890123456789012345678901234567890123456789012345678901234567890", 0x604A477F19EE145DL, 0L);
 
-        // Test with non-zero seed
-        // Note: Official test vectors use seed=2654435761 (prime), but we test with seed=1
-        // for simpler verification. These values are verified against the algorithm.
-        allPassed &= verifyVector("", 0xD5AFBA1336A3BE4BL, 1L);
-        allPassed &= verifyVector("a", 0xDEC2BC81C3CD46C6L, 1L);
+        // Test with non-zero seed (seed=1)
+        // Original raw values:
+        //   "" = 0xD5AFBA1336A3BE4B, normalized = 0x55AFBA1336A3BE4B
+        //   "a" = 0xDEC2BC81C3CD46C6, normalized = 0x5EC2BC81C3CD46C6
+        allPassed &= verifyVector("", 0x55AFBA1336A3BE4BL, 1L);
+        allPassed &= verifyVector("a", 0x5EC2BC81C3CD46C6L, 1L);
 
         // Test byte array directly
         byte[] emptyBytes = new byte[0];
-        allPassed &= check("empty byte array", hash(emptyBytes, 0), 0xEF46DB3751D8E999L);
+        allPassed &= check("empty byte array", hash(emptyBytes, 0), 0x6F46DB3751D8E999L);
 
         byte[] singleByte = new byte[] {0x61}; // 'a'
-        allPassed &= check("single byte array", hash(singleByte, 0), 0xD24EC4F1A98C6E5BL);
+        allPassed &= check("single byte array", hash(singleByte, 0), 0x524EC4F1A98C6E5BL);
 
         // Test streaming API
         XxHash64 streaming = new XxHash64(0);
@@ -574,7 +621,7 @@ public class XxHash64 {
         streaming.update(abc, 0, 10);
         streaming.update(abc, 10, 10);
         streaming.update(abc, 20, abc.length - 20);
-        allPassed &= check("chunked streaming", streaming.getValue(), 0xCFE1F278FA89835CL);
+        allPassed &= check("chunked streaming", streaming.getValue(), 0x4FE1F278FA89835CL);
 
         return allPassed;
     }

@@ -1,6 +1,6 @@
 // excalibur-vector (Phase 4) - Vector Index
 plugins {
-    `java`
+    `java-library`
 }
 
 group = "com.excaliburdb"
@@ -18,23 +18,4 @@ dependencies {
     implementation(project(":excalibur-core"))
     // Phase 3 dependency
     implementation(project(":excalibur-filter"))
-}
-
-tasks.withType<JavaCompile> {
-    options.encoding = "UTF-8"
-    options.release.set(21)
-}
-
-tasks.jar {
-    archiveBaseName.set("excalibur-vector")
-    archiveVersion.set(version.toString())
-}
-
-tasks.test {
-    useJUnitPlatform()
-    testLogging {
-        events("passed", "skipped", "failed")
-        showStandardStreams = true
-    }
-    jvmArgs("--enable-preview")
 }

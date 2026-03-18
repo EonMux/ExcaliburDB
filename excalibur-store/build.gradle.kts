@@ -1,10 +1,25 @@
 // excalibur-store (Phase 2) - Storage Engine
 plugins {
-    `java`
+    `java-library`
 }
 
 group = "com.excaliburdb"
 version = "1.0.0-SNAPSHOT"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+tasks.withType<JavaCompile> {
+    options.compilerArgs.add("--enable-preview")
+}
+
+tasks.withType<Test> {
+    jvmArgs("--enable-preview")
+    useJUnitPlatform()
+}
 
 dependencies {
     // SLF4J API for logging
@@ -14,25 +29,5 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
 
-    // Phase 1 dependency
-    implementation(project(":excalibur-core"))
-}
-
-tasks.withType<JavaCompile> {
-    options.encoding = "UTF-8"
-    options.release.set(21)
-}
-
-tasks.jar {
-    archiveBaseName.set("excalibur-store")
-    archiveVersion.set(version.toString())
-}
-
-tasks.test {
-    useJUnitPlatform()
-    testLogging {
-        events("passed", "skipped", "failed")
-        showStandardStreams = true
-    }
-    jvmArgs("--enable-preview")
+    // Note: XxHash64 is included locally to avoid dependency on broken excalibur-core module
 }

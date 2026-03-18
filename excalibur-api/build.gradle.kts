@@ -1,6 +1,6 @@
 // excalibur-api (Phase 9) - API Surface
 plugins {
-    `java`
+    `java-library`
 }
 
 group = "com.excaliburdb"
@@ -18,6 +18,7 @@ dependencies {
     implementation(project(":excalibur-query"))
     implementation(project(":excalibur-llm"))
     implementation(project(":excalibur-ingest"))
+    implementation(project(":excalibur-metrics"))
 }
 
 tasks.withType<JavaCompile> {

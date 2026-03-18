@@ -1,6 +1,6 @@
 // excalibur-llm (Phase 7) - LLM Client
 plugins {
-    `java`
+    `java-library`
 }
 
 group = "com.excaliburdb"
@@ -16,23 +16,4 @@ dependencies {
 
     // Phase 1 dependency
     implementation(project(":excalibur-core"))
-}
-
-tasks.withType<JavaCompile> {
-    options.encoding = "UTF-8"
-    options.release.set(21)
-}
-
-tasks.jar {
-    archiveBaseName.set("excalibur-llm")
-    archiveVersion.set(version.toString())
-}
-
-tasks.test {
-    useJUnitPlatform()
-    testLogging {
-        events("passed", "skipped", "failed")
-        showStandardStreams = true
-    }
-    jvmArgs("--enable-preview")
 }

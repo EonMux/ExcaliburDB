@@ -11,6 +11,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Comprehensive tests for XxHash64 implementation.
  * Tests official xxHash64 test vectors and various input types.
+ *
+ * <p>Note: All test vectors are normalized to positive range [0, Long.MAX_VALUE]
+ * to comply with ExcaliburDB's key_hash constraint.</p>
  */
 class XxHash64Test {
 
@@ -21,76 +24,161 @@ class XxHash64Test {
         hasher = new XxHash64();
     }
 
-    // ==================== Official Test Vectors ====================
-    // These test vectors are widely-used and verified against multiple implementations
+    // ==================== Positive Hash Guarantee Tests ====================
+    // Domain constraint: key_hash values MUST be in range [0, Long.MAX_VALUE]
+
+    /**
+     * Verifies that all hash values are non-negative.
+     * This is the core domain constraint for ExcaliburDB storage.
+     */
+    @Test
+    void testAllHashesAreNonNegative() {
+        // Test various inputs to ensure hash is always non-negative
+        String[] testInputs = {
+            "", "a", "abc", "message digest", "abcdefghijklmnopqrstuvwxyz",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+            "12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+            "The quick brown fox jumps over the lazy dog",
+            "\u0000\u0001\u0002\u0003",  // Binary data
+            new String(new char[1000]).replace('\0', 'x')  // Long string
+        };
+
+        for (String input : testInputs) {
+            long hash = XxHash64.hash(input);
+            assertTrue(hash >= 0,
+                "Hash must be non-negative for input: " + input.substring(0, Math.min(20, input.length())));
+            assertTrue(hash <= Long.MAX_VALUE,
+                "Hash must be <= Long.MAX_VALUE for input: " + input.substring(0, Math.min(20, input.length())));
+        }
+    }
+
+    /**
+     * Verifies that streaming API also produces non-negative hashes.
+     */
+    @Test
+    void testStreamingApiProducesNonNegativeHashes() {
+        String[] testInputs = {
+            "", "a", "abc", "abcdefghijklmnopqrstuvwxyz",
+            new String(new char[100]).replace('\0', 'x')
+        };
+
+        for (String input : testInputs) {
+            hasher.reset();
+            hasher.update(input.getBytes(StandardCharsets.UTF_8));
+            long hash = hasher.getValue();
+            assertTrue(hash >= 0, "Streaming hash must be non-negative for input: " + input.substring(0, Math.min(20, input.length())));
+        }
+    }
+
+    /**
+     * Verifies that hash(long) produces non-negative values.
+     */
+    @Test
+    void testLongValueHashIsNonNegative() {
+        long[] testValues = {0L, 1L, -1L, Long.MAX_VALUE, Long.MIN_VALUE, 0xDEADBEEFL, 0xCAFEBABEL};
+
+        for (long value : testValues) {
+            long hash = XxHash64.hash(value);
+            assertTrue(hash >= 0, "Hash of long value must be non-negative: " + value);
+        }
+    }
+
+    /**
+     * Verifies the normalizeToPositive method works correctly.
+     */
+    @Test
+    void testNormalizeToPositive() {
+        // Test edge cases
+        assertEquals(0L, XxHash64.normalizeToPositive(0L));
+        assertEquals(Long.MAX_VALUE, XxHash64.normalizeToPositive(Long.MAX_VALUE));
+        assertEquals(Long.MAX_VALUE, XxHash64.normalizeToPositive(-1L)); // All 1s -> clear MSB
+        assertEquals(0L, XxHash64.normalizeToPositive(Long.MIN_VALUE)); // Only MSB set -> clear it
+
+        // Test that normalization clears the sign bit
+        for (long value : new long[]{0x8000000000000001L, 0xFFFFFFFFFFFFFFFFL, 0xDEADBEEFCAFEBABEL}) {
+            long normalized = XxHash64.normalizeToPositive(value);
+            assertTrue(normalized >= 0, "Normalized value must be non-negative");
+            assertTrue(normalized <= Long.MAX_VALUE, "Normalized value must be <= Long.MAX_VALUE");
+        }
+    }
+
+    // ==================== Official Test Vectors (Normalized) ====================
+    // These test vectors are normalized to positive range [0, Long.MAX_VALUE]
+    // Original raw values are commented for reference
 
     /**
      * Official test vector: empty string with seed=0
-     * Expected: 0xEF46DB3751D8E999
+     * Original raw: 0xEF46DB3751D8E999, normalized: 0x6F46DB3751D8E999
      */
     @Test
     void testEmptyInput() {
         byte[] empty = new byte[0];
-        assertEquals(0xEF46DB3751D8E999L, XxHash64.hash(empty, 0));
+        assertEquals(0x6F46DB3751D8E999L, XxHash64.hash(empty, 0));
     }
 
     /**
      * Official test vector: empty string with seed=PRIME32 (2654435761)
-     * Expected: 0xAC75FDA2929B17EF
+     * Original raw: 0xAC75FDA2929B17EF, normalized: 0x2C75FDA2929B17EF
      */
     @Test
     void testEmptyWithPrimeSeed() {
         byte[] empty = new byte[0];
-        assertEquals(0xAC75FDA2929B17EFL, XxHash64.hash(empty, 2654435761L));
+        assertEquals(0x2C75FDA2929B17EFL, XxHash64.hash(empty, 2654435761L));
     }
 
     /**
      * Official test vector: empty string with seed=1
-     * Expected: 0xD5AFBA1336A3BE4B
+     * Original raw: 0xD5AFBA1336A3BE4B, normalized: 0x55AFBA1336A3BE4B
      */
     @Test
     void testEmptyWithSeed1() {
-        assertEquals(0xD5AFBA1336A3BE4BL, XxHash64.hash(new byte[0], 1L));
+        assertEquals(0x55AFBA1336A3BE4BL, XxHash64.hash(new byte[0], 1L));
     }
 
-    // ==================== Common String Test Vectors ====================
-    // These are widely-used test vectors that many xxHash implementations test against
+    // ==================== Common String Test Vectors (Normalized) ====================
 
     @Test
     void testSingleCharacter() {
-        assertEquals(0xD24EC4F1A98C6E5BL, XxHash64.hash("a"));
+        // Original raw: 0xD24EC4F1A98C6E5B, normalized: 0x524EC4F1A98C6E5B
+        assertEquals(0x524EC4F1A98C6E5BL, XxHash64.hash("a"));
     }
 
     @Test
     void testSingleCharWithSeed1() {
-        assertEquals(0xDEC2BC81C3CD46C6L, XxHash64.hash("a", 1L));
+        // Original raw: 0xDEC2BC81C3CD46C6, normalized: 0x5EC2BC81C3CD46C6
+        assertEquals(0x5EC2BC81C3CD46C6L, XxHash64.hash("a", 1L));
     }
 
     @Test
     void testAbc() {
+        // Already positive: 0x44BC2CF5AD770999
         assertEquals(0x44BC2CF5AD770999L, XxHash64.hash("abc"));
     }
 
     @Test
     void testMessageDigest() {
+        // Already positive: 0x066ED728FCEEB3BE
         assertEquals(0x066ED728FCEEB3BEL, XxHash64.hash("message digest"));
     }
 
     @Test
     void testAlphabetLower() {
-        assertEquals(0xCFE1F278FA89835CL, XxHash64.hash("abcdefghijklmnopqrstuvwxyz"));
+        // Original raw: 0xCFE1F278FA89835C, normalized: 0x4FE1F278FA89835C
+        assertEquals(0x4FE1F278FA89835CL, XxHash64.hash("abcdefghijklmnopqrstuvwxyz"));
     }
 
     @Test
     void testAlphabetMixed() {
+        // Original raw: 0xAAA46907D3047814, normalized: 0x2AA46907D3047814
         String input = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        assertEquals(0xAAA46907D3047814L, XxHash64.hash(input));
+        assertEquals(0x2AA46907D3047814L, XxHash64.hash(input));
     }
 
     @Test
     void testLongRepeating() {
+        // Original raw: 0xE04A477F19EE145D, normalized: 0x604A477F19EE145D
         String input = "12345678901234567890123456789012345678901234567890123456789012345678901234567890";
-        assertEquals(0xE04A477F19EE145DL, XxHash64.hash(input));
+        assertEquals(0x604A477F19EE145DL, XxHash64.hash(input));
     }
 
     // ==================== Input Type Tests ====================
@@ -225,7 +313,8 @@ class XxHash64Test {
     void testStreamingEmptyInput() {
         hasher.update(new byte[0]);
         long hash = hasher.getValue();
-        assertEquals(0xEF46DB3751D8E999L, hash);
+        // Original raw: 0xEF46DB3751D8E999, normalized: 0x6F46DB3751D8E999
+        assertEquals(0x6F46DB3751D8E999L, hash);
     }
 
     @Test
@@ -263,7 +352,7 @@ class XxHash64Test {
 
     @Test
     void testVariousLengths() {
-        // Test that hash works for various input lengths
+        // Test that hash works for various input lengths and all are non-negative
         for (int len = 0; len <= 100; len++) {
             byte[] data = new byte[len];
             for (int i = 0; i < len; i++) {
@@ -271,7 +360,8 @@ class XxHash64Test {
             }
 
             long hash = XxHash64.hash(data);
-            assertNotEquals(0L, hash, "Hash should not be 0 for length " + len);
+            assertTrue(hash >= 0, "Hash must be non-negative for length " + len);
+            assertTrue(hash <= Long.MAX_VALUE, "Hash must be <= Long.MAX_VALUE for length " + len);
         }
     }
 

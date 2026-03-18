@@ -1,10 +1,22 @@
 // excalibur-filter (Phase 3) - Probabilistic Structures
 plugins {
-    `java`
+    `java-library`
 }
 
 group = "com.excaliburdb"
 version = "1.0.0-SNAPSHOT"
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
 
 dependencies {
     // SLF4J API for logging
@@ -21,18 +33,10 @@ dependencies {
 tasks.withType<JavaCompile> {
     options.encoding = "UTF-8"
     options.release.set(21)
-}
-
-tasks.jar {
-    archiveBaseName.set("excalibur-filter")
-    archiveVersion.set(version.toString())
+    options.compilerArgs.add("--enable-preview")
 }
 
 tasks.test {
     useJUnitPlatform()
-    testLogging {
-        events("passed", "skipped", "failed")
-        showStandardStreams = true
-    }
     jvmArgs("--enable-preview")
 }

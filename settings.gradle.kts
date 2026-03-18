@@ -16,7 +16,10 @@ dependencyResolutionManagement {
 rootProject.name = "excaliburdb"
 
 include(
+    "excalibur-config",
+    "excalibur-metrics",
     "excalibur-core",
+    "excalibur-test",
     "excalibur-store",
     "excalibur-filter",
     "excalibur-vector",

@@ -1,6 +1,6 @@
 // excalibur-query (Phase 6) - Query Pipeline
 plugins {
-    `java`
+    `java-library`
 }
 
 group = "com.excaliburdb"
@@ -18,23 +18,4 @@ dependencies {
     implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-vector"))
     implementation(project(":excalibur-shard"))
-}
-
-tasks.withType<JavaCompile> {
-    options.encoding = "UTF-8"
-    options.release.set(21)
-}
-
-tasks.jar {
-    archiveBaseName.set("excalibur-query")
-    archiveVersion.set(version.toString())
-}
-
-tasks.test {
-    useJUnitPlatform()
-    testLogging {
-        events("passed", "skipped", "failed")
-        showStandardStreams = true
-    }
-    jvmArgs("--enable-preview")
 }

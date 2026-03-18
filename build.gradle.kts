@@ -21,6 +21,10 @@ subprojects {
     }
 
     dependencies {
+        // Runtime dependencies
+        runtimeOnly("org.slf4j:slf4j-simple:2.0.16")
+        runtimeOnly("ch.qos.logback:logback-classic:1.5.12")
+        
         // Test dependencies
         testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
         testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.3")
@@ -40,6 +44,21 @@ subprojects {
     tasks.withType<JavaCompile> {
         options.encoding = "UTF-8"
         options.release.set(21)
+        options.compilerArgs.add("--enable-preview")
+    }
+
+    // Enable Panama FFM preview features
+    tasks.withType<JavaCompile> {
+        options.compilerArgs.add("--enable-preview")
+    }
+
+    // Enable preview features for excalibur-test
+    subprojects {
+        if (name == "excalibur-test") {
+            tasks.withType<JavaCompile> {
+                options.compilerArgs.add("--enable-preview")
+            }
+        }
     }
 
     // Source sets configuration
