@@ -19,3 +19,18 @@ dependencies {
     // Phase 3 dependency
     implementation(project(":excalibur-filter"))
 }
+
+// Enable Vector API incubator module for SIMD operations
+tasks.withType<JavaCompile> {
+    options.compilerArgs.add("--add-modules=jdk.incubator.vector")
+}
+
+tasks.withType<Test> {
+    jvmArgs("--add-modules=jdk.incubator.vector")
+    jvmArgs("--enable-preview")
+}
+
+tasks.withType<JavaExec> {
+    jvmArgs("--add-modules=jdk.incubator.vector")
+    jvmArgs("--enable-preview")
+}

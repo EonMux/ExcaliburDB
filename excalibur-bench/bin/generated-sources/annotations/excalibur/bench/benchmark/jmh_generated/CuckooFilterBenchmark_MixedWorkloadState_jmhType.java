@@ -1,0 +1,4 @@
+package excalibur.bench.benchmark.jmh_generated;
+public class CuckooFilterBenchmark_MixedWorkloadState_jmhType extends CuckooFilterBenchmark_MixedWorkloadState_jmhType_B3 {
+}
+

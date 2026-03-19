@@ -10,6 +10,7 @@
 package io.excalibur.test;
 
 import java.util.Collections;
+import java.util.Objects;
 
 /**
  * Immutable representation of query index coverage information.

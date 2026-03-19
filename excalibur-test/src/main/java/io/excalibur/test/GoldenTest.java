@@ -13,29 +13,29 @@
 package io.excalibur.test;
 
 import java.util.*;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 /**
  * Base class for golden test cases that verify query results against expected values.
- * 
+ *
  * Each test case defines a query and its expected result. The comparison is deterministic:
  * same inputs always produce identical comparison results.
- * 
+ *
  * Results are sorted by document ID before comparison to ensure stable ordering.
  * Numeric comparisons use configurable epsilon tolerance.
  */
 public class GoldenTest {
-    
-    private static final Logger LOG = java.util.logging.Logger.getLogger(GoldenTest.class);
-    
+
+    private static final Logger LOG = Logger.getLogger(GoldenTest.class.getName());
+
     private final String name;
     private final Query query;
     private final ExpectedResult expected;
-    private final TestContext context;
-    
+
     /**
      * Constructor for a new golden test case.
-     * 
+     *
      * @param name  Unique test name for reporting
      * @param query The query being tested
      * @param expected The expected result structure
@@ -44,12 +44,11 @@ public class GoldenTest {
         this.name = name;
         this.query = query;
         this.expected = expected;
-        this.context = TestContext.current();
     }
-    
+
     /**
      * Constructor with parameters.
-     * 
+     *
      * @param name      Unique test name
      * @param query     The query being tested
      * @param expected  The expected result structure
@@ -60,7 +59,6 @@ public class GoldenTest {
         this.query = query;
         this.expected = expected;
         this.tolerance = tolerance;
-        this.context = TestContext.current();
     }
     
     private double tolerance = 1e-6;
@@ -416,25 +414,25 @@ public class GoldenTest {
         sb.append("Query: ").append(queryIdMatch(actual.getQueryId(), expected.getQueryId()) ? "MATCH" : "MISMATCH\n");
         sb.append("Top K: ");
         
-        List<String> actualItems = actual.getTopK().stream()
+        String actualItems = actual.getTopK().stream()
             .sorted(Comparator.comparing(QueryResultItem::getDocumentId))
             .limit(10)
             .map(i -> i.getDocumentId() + " (score: " + String.format("%.6f", i.getScore()) + ")")
-            .collect(Collectors.joining(", ")))
-        
-        List<String> expectedItems = expected.getTopK().stream()
+            .collect(Collectors.joining(", "));
+
+        String expectedItems = expected.getTopK().stream()
             .sorted(Comparator.comparing(QueryResultItem::getDocumentId))
             .limit(10)
             .map(i -> i.getDocumentId() + " (score: " + String.format("%.6f", i.getScore()) + ")")
-            .collect(Collectors.joining(", ")))
+            .collect(Collectors.joining(", "));
         
         sb.append(actualItems.isEmpty() ? "empty" : actualItems);
         sb.append(" vs ").append(expectedItems.isEmpty() ? "empty" : expectedItems);
         sb.append("\n");
         
         sb.append("Partial: ");
-        sb.append(actual.getPartial() == null ? "none" : 
-              expected.partialSetMatch(actual.getPartial(), tolerance) ? "MATCH" : "MISMATCH");
+        sb.append(actual.getPartial() == null ? "none" :
+              partialMatch(actual.getPartial(), expected.getPartial(), tolerance) ? "MATCH" : "MISMATCH");
         sb.append("\n");
         
         sb.append("Coverage: ");

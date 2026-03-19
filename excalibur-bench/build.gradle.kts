@@ -37,6 +37,9 @@ dependencies {
 
     // Phase 3 dependency for Cuckoo Filter benchmarks
     implementation(project(":excalibur-filter"))
+
+    // Phase 4 dependency for Vector Distance benchmarks
+    implementation(project(":excalibur-vector"))
 }
 
 // Enable Panama FFM preview features
@@ -107,6 +110,21 @@ tasks.register<JavaExec>("runCuckooFilterDeleteBenchmark") {
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
+        "-Xms2g",
+        "-Xmx2g"
+    )
+}
+
+// Task to run the JMH benchmark for Vector Distance functions
+tasks.register<JavaExec>("runDistanceBenchmark") {
+    group = "benchmark"
+    description = "Runs the JMH benchmark for Vector Distance functions (Cosine, L2, Inner Product)"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("excalibur.bench.DistanceBenchmarkRunner")
+    jvmArgs = listOf(
+        "--enable-preview",
+        "--enable-native-access=ALL-UNNAMED",
+        "--add-modules=jdk.incubator.vector",
         "-Xms2g",
         "-Xmx2g"
     )

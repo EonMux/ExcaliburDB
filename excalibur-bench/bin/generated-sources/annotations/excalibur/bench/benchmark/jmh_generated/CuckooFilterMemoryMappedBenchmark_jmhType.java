@@ -1,0 +1,4 @@
+package excalibur.bench.benchmark.jmh_generated;
+public class CuckooFilterMemoryMappedBenchmark_jmhType extends CuckooFilterMemoryMappedBenchmark_jmhType_B3 {
+}
+

@@ -122,7 +122,7 @@ public final class ConfigValidation {
         }
         
         // Document timeout must be between 1000 and 30000 ms
-        int documentTimeoutMs = ingest.documentTimeoutMs();
+        int documentTimeoutMs = ingest.getDocumentTimeoutMs();
         if (documentTimeoutMs < 1000) {
             throw new IllegalStateException(
                 "ingest.document-atomicity-timeout-ms must be >= 1000, got: " + documentTimeoutMs);
@@ -163,7 +163,7 @@ public final class ConfigValidation {
         }
         
         // Max latency must be between 100 and 60000 ms
-        int maxLatencyMs = health.maxLatencyMs();
+        int maxLatencyMs = health.getMaxLatencyMs();
         if (maxLatencyMs < 100) {
             throw new IllegalStateException(
                 "health.max-latency-ms must be >= 100, got: " + maxLatencyMs);
@@ -193,7 +193,7 @@ public final class ConfigValidation {
         }
         
         // Recall target must be between 0.0 and 1.0
-        double recallTarget = query.recallTarget();
+        double recallTarget = query.getRecallTarget();
         if (recallTarget < 0.0) {
             throw new IllegalStateException(
                 "query.recall-target must be >= 0.0, got: " + recallTarget);
@@ -204,7 +204,7 @@ public final class ConfigValidation {
         }
         
         // Threshold must be between 0.0 and 1.0
-        double threshold = query.threshold();
+        double threshold = query.getThreshold();
         if (threshold < 0.0) {
             throw new IllegalStateException(
                 "query.threshold must be >= 0.0, got: " + threshold);
@@ -215,7 +215,7 @@ public final class ConfigValidation {
         }
         
         // Vector dimensions must be between 128 and 4096
-        int vectorDimensions = query.vectorDimensions();
+        int vectorDimensions = query.getVectorDimensions();
         if (vectorDimensions < 128) {
             throw new IllegalStateException(
                 "query.vector-dimensions must be >= 128, got: " + vectorDimensions);
@@ -226,7 +226,7 @@ public final class ConfigValidation {
         }
         
         // LLM timeout must be between 5000 and 300000 ms
-        int llmTimeoutMs = query.llmTimeoutMs();
+        int llmTimeoutMs = query.getLlmTimeoutMs();
         if (llmTimeoutMs < 5000) {
             throw new IllegalStateException(
                 "query.llm-timeout-ms must be >= 5000, got: " + llmTimeoutMs);
@@ -271,7 +271,7 @@ public final class ConfigValidation {
      */
     private static void validateShard(Config.Shard shard) {
         // Load factor must be between 0.5 and 0.9
-        double loadFactor = shard.loadFactor();
+        double loadFactor = shard.getLoadFactor();
         if (loadFactor < 0.5) {
             throw new IllegalStateException(
                 "shard.segment-load-factor must be >= 0.5, got: " + loadFactor);
@@ -282,7 +282,7 @@ public final class ConfigValidation {
         }
         
         // efConstruction must be between 16 and 1024
-        int efConstruction = shard.efConstruction();
+        int efConstruction = shard.getEfConstruction();
         if (efConstruction < 16) {
             throw new IllegalStateException(
                 "shard.default-ef-construction must be >= 16, got: " + efConstruction);
@@ -293,7 +293,7 @@ public final class ConfigValidation {
         }
         
         // efSearch must be between 8 and 1024
-        int efSearch = shard.efSearch();
+        int efSearch = shard.getEfSearch();
         if (efSearch < 8) {
             throw new IllegalStateException(
                 "shard.default-ef-search must be >= 8, got: " + efSearch);
@@ -304,7 +304,7 @@ public final class ConfigValidation {
         }
         
         // HNSW queue limit must be between 10000 and 1000000
-        int hnswQueueLimit = shard.hnswQueueLimit();
+        int hnswQueueLimit = shard.getHnswQueueLimit();
         if (hnswQueueLimit < 10000) {
             throw new IllegalStateException(
                 "shard.hnsw-integration-queue-depth-limit must be >= 10000, got: " + hnswQueueLimit);

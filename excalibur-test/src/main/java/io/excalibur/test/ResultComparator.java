@@ -15,24 +15,25 @@
 package io.excalibur.test;
 
 import java.util.*;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 /**
  * Deterministic comparator for query result verification.
- * 
+ *
  * The comparator ensures that comparison results are always the same
  * for the same inputs, regardless of processing order. This is achieved
  * by:
- * 
+ *
  * 1. Sorting results by document ID before comparison
  * 2. Using stable comparison operations
  * 3. Applying consistent tolerance for numeric comparisons
- * 
+ *
  * This makes the verification process reproducible and debuggable.
  */
 public class ResultComparator {
-    
-    private static final Logger LOG = LoggerFactory.getLogger(ResultComparator.class);
+
+    private static final Logger LOG = Logger.getLogger(ResultComparator.class.getName());
     
     private final double tolerance;
     private final double relativeTolerance;
@@ -346,7 +347,7 @@ public class ResultComparator {
         if (sizeDiff != 0) {
             differences.add(new Difference(
                 String.format("Size mismatch: expected %d, got %d", expected.size(), actual.size()),
-                actual, expected
+                null, null
             ));
         }
         
@@ -371,7 +372,7 @@ public class ResultComparator {
                 ));
             }
         }
-        
+
         // Find extra items in actual
         for (QueryResultItem actItem : sortedActual) {
             boolean found = sortedExpected.stream()
@@ -383,12 +384,12 @@ public class ResultComparator {
                 ));
             }
         }
-        
+
         // Find differing items
         for (int i = 0; i < Math.min(sortedActual.size(), sortedExpected.size()); i++) {
             QueryResultItem actItem = sortedActual.get(i);
             QueryResultItem expItem = sortedExpected.get(i);
-            
+
             if (!matchesItem(actItem, expItem)) {
                 differences.add(new Difference(
                     String.format("Item %s differs", actItem.getDocumentId()),
@@ -420,27 +421,27 @@ public class ResultComparator {
      */
     public static class Difference {
         private final String message;
-        private final List<QueryResultItem> actual;
-        private final List<QueryResultItem> expected;
-        
-        public Difference(String message, List<QueryResultItem> actual, List<QueryResultItem> expected) {
+        private final QueryResultItem actual;
+        private final QueryResultItem expected;
+
+        public Difference(String message, QueryResultItem actual, QueryResultItem expected) {
             this.message = message;
             this.actual = actual;
             this.expected = expected;
         }
-        
+
         public String getMessage() {
             return message;
         }
-        
-        public List<QueryResultItem> getActual() {
+
+        public QueryResultItem getActual() {
             return actual;
         }
-        
-        public List<QueryResultItem> getExpected() {
+
+        public QueryResultItem getExpected() {
             return expected;
         }
-        
+
         @Override
         public String toString() {
             return message;

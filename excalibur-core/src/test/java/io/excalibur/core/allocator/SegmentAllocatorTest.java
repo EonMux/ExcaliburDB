@@ -1,5 +1,6 @@
 package io.excalibur.core.allocator;
 
+import io.excalibur.core.allocator.SegmentAllocator.AllocatedRegion;
 import io.excalibur.core.exception.AllocationException;
 import io.excalibur.core.mapped.MappedFile;
 
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -56,7 +58,7 @@ class SegmentAllocatorTest {
     }
 
     @Test
-    void testCreateWithEmptySegment() {
+    void testCreateWithEmptySegment() throws IOException {
         Path emptyFile = tempDir.resolve("empty.dat");
         MappedFile emptyMf = MappedFile.create(emptyFile, 0);
         assertThrows(IllegalArgumentException.class, () -> new SegmentAllocator(emptyMf.segment()));
@@ -68,20 +70,20 @@ class SegmentAllocatorTest {
     @Test
     void testAllocateSmallRegion() {
         AllocatedRegion region = allocator.allocate(64);
-        
+
         assertNotNull(region);
         assertEquals(64, region.size());
         assertEquals(0, region.offset());
-        assertEquals(64, allocator.remaining());
+        assertEquals(16384 - 64, allocator.remaining());
     }
 
     @Test
     void testAllocateMediumRegion() {
         AllocatedRegion region = allocator.allocate(4096);
-        
+
         assertNotNull(region);
         assertEquals(4096, region.size());
-        assertEquals(4096, allocator.remaining());
+        assertEquals(16384 - 4096, allocator.remaining());
     }
 
     @Test

@@ -1,6 +1,6 @@
 package excalibur.bench.benchmark;
 
-import excalibur.store.Segment;
+import io.excalibur.store.Segment;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 

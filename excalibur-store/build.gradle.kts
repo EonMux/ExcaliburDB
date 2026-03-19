@@ -25,9 +25,10 @@ dependencies {
     // SLF4J API for logging
     implementation("org.slf4j:slf4j-api:2.0.16")
 
+    // Phase 1 dependencies
+    implementation(project(":excalibur-core"))
+
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
-
-    // Note: XxHash64 is included locally to avoid dependency on broken excalibur-core module
 }

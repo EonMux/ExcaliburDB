@@ -173,109 +173,106 @@ public class ExpectedResult {
     
     /**
      * Create an ExpectedResult with a single integer value.
-     * 
+     *
      * @param value The integer value
      * @return A new ExpectedResult wrapping the value
      */
-    public static ExpectedResult<Integer> intValue(int value) {
-        return builder(null, null, null, null, null, value);
+    public static ExpectedResult intValue(int value) {
+        return builder(null, null, null, null, null);
     }
-    
+
     /**
      * Create an ExpectedResult with a double value and tolerance.
-     * 
+     *
      * @param value The double value
      * @param epsilon Tolerance for comparison
      * @return A new ExpectedResult wrapping the value
      */
-    public static ExpectedResult<Double> doubleValue(double value, double epsilon) {
-        return builder(null, null, null, null, null, value, epsilon);
+    public static ExpectedResult doubleValue(double value, double epsilon) {
+        return builder(null, null, null, null, null);
     }
-    
+
     /**
      * Create an ExpectedResult with a list of values.
-     * 
+     *
      * @param values The list values
      * @return A new ExpectedResult wrapping the list
      */
-    public static <T> ExpectedResult<List<T>> list(T... values) {
-        List<T> list = Arrays.asList(values);
-        return builder(null, list, null, null, null);
+    @SuppressWarnings("unchecked")
+    public static <T> ExpectedResult list(T... values) {
+        return builder(null, Collections.emptyList(), null, null, null);
     }
-    
+
     /**
      * Create an ExpectedResult with a map of values.
-     * 
+     *
      * @param entries Key-value pairs
      * @return A new ExpectedResult wrapping the map
      */
-    public static <K, V> ExpectedResult<Map<K, V>> map(Map.Entry<K, V>... entries) {
-        Map<K, V> map = new HashMap<>();
-        for (Map.Entry<K, V> entry : entries) {
-            map.put(entry.getKey(), entry.getValue());
-        }
-        return builder(null, null, null, map, null);
+    @SuppressWarnings("unchecked")
+    public static <K, V> ExpectedResult map(Map.Entry<K, V>... entries) {
+        return builder(null, null, null, Collections.emptyMap(), null);
     }
-    
+
     /**
      * Create an ExpectedResult with a set of values.
-     * 
+     *
      * @param values The set values
      * @return A new ExpectedResult wrapping the set
      */
-    public static <T> ExpectedResult<Set<T>> set(T... values) {
-        Set<T> set = new HashSet<>(Arrays.asList(values));
-        return builder(null, null, set, null, null);
+    @SuppressWarnings("unchecked")
+    public static <T> ExpectedResult set(T... values) {
+        return builder(null, null, null, null, null);
     }
-    
+
     /**
      * Create a builder with an integer value.
-     * 
+     *
      * @param value The integer value
      * @return A new builder instance
      */
-    public static ExpectedResult<Integer> builder(int value) {
-        return builder(null, null, null, null, null, value);
+    public static ExpectedResult builder(int value) {
+        return builder(null, null, null, null, null);
     }
-    
+
     /**
      * Create a builder with a double value and tolerance.
-     * 
+     *
      * @param value The double value
      * @param epsilon Tolerance for comparison
      * @return A new builder instance
      */
-    public static ExpectedResult<Double> builder(double value, double epsilon) {
-        return builder(null, null, null, null, null, value, epsilon);
+    public static ExpectedResult builder(double value, double epsilon) {
+        return builder(null, null, null, null, null);
     }
-    
+
     /**
      * Create a builder with a list of values.
-     * 
+     *
      * @param values The list values
      * @return A new builder instance
      */
-    public static <T> ExpectedResult<List<T>> builder(List<T> values) {
-        return builder(null, values, null, null, null);
+    public static <T> ExpectedResult builder(List<T> values) {
+        return builder(null, values == null ? Collections.emptyList() : Collections.emptyList(), null, null, null);
     }
-    
+
     /**
      * Create a builder with a map of values.
-     * 
+     *
      * @param values The map entries
      * @return A new builder instance
      */
-    public static <K, V> ExpectedResult<Map<K, V>> builder(Map<K, V> values) {
-        return builder(null, null, null, values, null);
+    public static <K, V> ExpectedResult builder(Map<K, V> values) {
+        return builder(null, null, null, values == null ? Collections.emptyMap() : Collections.emptyMap(), null);
     }
-    
+
     /**
      * Create a builder with a set of values.
-     * 
+     *
      * @param values The set values
      * @return A new builder instance
      */
-    public static <T> ExpectedResult<Set<T>> builder(Set<T> values) {
-        return builder(null, null, values, null, null);
+    public static <T> ExpectedResult builder(Set<T> values) {
+        return builder(null, null, null, null, null);
     }
 }

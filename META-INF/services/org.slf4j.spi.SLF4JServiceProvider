@@ -1,0 +1,2 @@
+org.slf4j.spi.SLF4JServiceProvider
+org.slf4j.simple.SimpleServiceProvider
