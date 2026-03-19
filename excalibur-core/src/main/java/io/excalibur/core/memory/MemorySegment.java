@@ -10,6 +10,12 @@ import java.nio.file.StandardOpenOption;
  * Compatibility interface for memory segment operations.
  * This provides a common API that can be implemented by either
  * Panama FFI MemorySegment or fallback implementations.
+ *
+ * <h2>Thread Safety</h2>
+ * <p>Read operations on MemorySegment instances are thread-safe and may be
+ * performed concurrently from multiple threads. Write operations require
+ * external synchronization to ensure thread safety. Implementations should
+ * document any additional thread-safety guarantees.</p>
  */
 public interface MemorySegment {
 

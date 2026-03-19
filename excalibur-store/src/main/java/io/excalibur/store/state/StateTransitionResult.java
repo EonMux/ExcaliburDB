@@ -2,6 +2,11 @@ package io.excalibur.store.state;
 
 /**
  * Result of a state transition operation.
+ *
+ * <h2>Thread Safety</h2>
+ * <p>This class is immutable and thread-safe. Once constructed, all state
+ * (previousState, desiredState, successful, errorMessage) cannot be modified.
+ * Instances may be safely shared between threads.</p>
  */
 public class StateTransitionResult {
     

@@ -40,6 +40,12 @@ import java.util.concurrent.TimeUnit;
  *   <li>Striped locks ensure concurrent deletion performance</li>
  * </ul>
  *
+ * <h2>Thread Safety</h2>
+ * <p>This is a JMH benchmark class. JMH handles all thread safety for benchmark
+ * execution. The benchmark state is managed by JMH's @State annotations which
+ * provide proper isolation between threads. The CuckooFilter being tested has
+ * its own thread-safety guarantees documented in its class Javadoc.</p>
+ *
  * @author ExcaliburDB
  */
 @BenchmarkMode(Mode.Throughput)

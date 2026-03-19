@@ -5,7 +5,7 @@ import java.nio.ByteOrder;
 
 /**
  * Codec for 32-bit integer values.
- * Uses big-endian byte order.
+ * Uses little-endian byte order.
  *
  * <h2>Thread Safety</h2>
  * <p>All methods are thread-safe. The singleton instance is immutable.</p>
@@ -45,13 +45,13 @@ public class IntCodec implements Codec<Integer> {
         if (value == null) {
             // Encode 0 as default for null
             ByteBuffer buffer = ByteBuffer.allocate(SIZE)
-                .order(ByteOrder.BIG_ENDIAN);
+                .order(ByteOrder.LITTLE_ENDIAN);
             buffer.putInt(0);
             return buffer.array();
         }
 
         ByteBuffer buffer = ByteBuffer.allocate(SIZE)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
         buffer.putInt(value);
         return buffer.array();
     }
@@ -66,7 +66,7 @@ public class IntCodec implements Codec<Integer> {
         }
 
         return ByteBuffer.wrap(data, 0, SIZE)
-            .order(ByteOrder.BIG_ENDIAN)
+            .order(ByteOrder.LITTLE_ENDIAN)
             .getInt();
     }
 
@@ -80,7 +80,7 @@ public class IntCodec implements Codec<Integer> {
         }
 
         return ByteBuffer.wrap(data, offset, SIZE)
-            .order(ByteOrder.BIG_ENDIAN)
+            .order(ByteOrder.LITTLE_ENDIAN)
             .getInt();
     }
 

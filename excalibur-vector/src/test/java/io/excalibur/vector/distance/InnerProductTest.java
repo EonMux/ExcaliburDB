@@ -609,6 +609,103 @@ class InnerProductTest {
     }
 
     @Nested
+    @DisplayName("Compute With One Norm")
+    class ComputeWithOneNormTests {
+
+        @Test
+        @DisplayName("computeWithOneNorm produces same result as compute")
+        void computeWithOneNormMatchesCompute() {
+            float[] v1 = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+            float[] v2 = {2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+            double v2NormSq = 4.0 + 9.0 + 16.0 + 25.0 + 36.0; // sum of squares
+
+            float result = INNER_PRODUCT.computeWithOneNorm(v1, v2, v2NormSq);
+            float expected = INNER_PRODUCT.compute(v1, v2);
+
+            assertThat(result).isEqualTo(expected);
+        }
+
+        @Test
+        @DisplayName("computeWithOneNorm null first vector throws NPE")
+        void computeWithOneNormNullFirst() {
+            float[] v2 = {1.0f, 2.0f, 3.0f};
+
+            assertThatThrownBy(() -> INNER_PRODUCT.computeWithOneNorm(null, v2, 10.0))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("First vector");
+        }
+
+        @Test
+        @DisplayName("computeWithOneNorm null second vector throws NPE")
+        void computeWithOneNormNullSecond() {
+            float[] v1 = {1.0f, 2.0f, 3.0f};
+
+            assertThatThrownBy(() -> INNER_PRODUCT.computeWithOneNorm(v1, null, 10.0))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Second vector");
+        }
+
+        @Test
+        @DisplayName("computeWithOneNorm mismatched dimensions throws IAE")
+        void computeWithOneNormMismatchedDimensions() {
+            float[] v1 = {1.0f, 2.0f, 3.0f};
+            float[] v2 = {1.0f, 2.0f};
+
+            assertThatThrownBy(() -> INNER_PRODUCT.computeWithOneNorm(v1, v2, 10.0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("dimensions must match");
+        }
+
+        @Test
+        @DisplayName("computeWithOneNorm negative norm throws IAE")
+        void computeWithOneNormNegativeNorm() {
+            float[] v1 = {1.0f, 2.0f, 3.0f};
+            float[] v2 = {1.0f, 2.0f, 3.0f};
+
+            assertThatThrownBy(() -> INNER_PRODUCT.computeWithOneNorm(v1, v2, -1.0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-negative");
+        }
+
+        @Test
+        @DisplayName("computeWithOneNorm zero norm works")
+        void computeWithOneNormZeroNorm() {
+            float[] v1 = {1.0f, 2.0f, 3.0f};
+            float[] v2 = {1.0f, 2.0f, 3.0f};
+
+            float result = INNER_PRODUCT.computeWithOneNorm(v1, v2, 0.0);
+
+            assertThat(result).isEqualTo(14.0f); // 1+4+9 = 14
+        }
+    }
+
+    @Nested
+    @DisplayName("Squared Norm Additional Tests")
+    class SquaredNormAdditionalTests {
+
+        @Test
+        @DisplayName("computeSquaredNorm null vector throws NPE")
+        void computeSquaredNormNull() {
+            assertThatThrownBy(() -> INNER_PRODUCT.computeSquaredNorm(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Vector must not be null");
+        }
+
+        @Test
+        @DisplayName("computeSquaredNorm large vector with vectorized path")
+        void computeSquaredNormLargeVector() {
+            float[] v = new float[128];
+            for (int i = 0; i < 128; i++) {
+                v[i] = 1.0f;
+            }
+
+            float norm = INNER_PRODUCT.computeSquaredNorm(v);
+
+            assertThat(norm).isEqualTo(128.0f);
+        }
+    }
+
+    @Nested
     @DisplayName("ToString")
     class ToStringTests {
 

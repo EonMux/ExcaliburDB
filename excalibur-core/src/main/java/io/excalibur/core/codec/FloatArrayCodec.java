@@ -6,8 +6,8 @@ import java.util.Arrays;
 
 /**
  * Codec for float arrays.
- * Arrays are encoded as a 4-byte element count (big-endian) followed by
- * 4-byte float values (big-endian).
+ * Arrays are encoded as a 4-byte element count (little-endian) followed by
+ * 4-byte float values (little-endian).
  *
  * <h2>Thread Safety</h2>
  * <p>All methods are thread-safe. The singleton instance is immutable.</p>
@@ -48,14 +48,14 @@ public class FloatArrayCodec implements Codec<float[]> {
     public byte[] encode(float[] value) {
         if (value == null || value.length == 0) {
             ByteBuffer buffer = ByteBuffer.allocate(LENGTH_PREFIX_SIZE)
-                .order(ByteOrder.BIG_ENDIAN);
+                .order(ByteOrder.LITTLE_ENDIAN);
             buffer.putInt(0);
             return buffer.array();
         }
 
         int totalSize = LENGTH_PREFIX_SIZE + (value.length * FLOAT_SIZE);
         ByteBuffer buffer = ByteBuffer.allocate(totalSize)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
 
         buffer.putInt(value.length);
         for (float f : value) {
@@ -74,7 +74,7 @@ public class FloatArrayCodec implements Codec<float[]> {
             throw new IllegalArgumentException("Invalid encoded data");
         }
 
-        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         if (length == 0) {
@@ -98,7 +98,7 @@ public class FloatArrayCodec implements Codec<float[]> {
         }
 
         ByteBuffer buffer = ByteBuffer.wrap(data, offset, data.length - offset)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         if (length == 0) {
@@ -124,7 +124,7 @@ public class FloatArrayCodec implements Codec<float[]> {
             return false;
         }
 
-        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         // Check that length is non-negative and data contains full payload
@@ -163,7 +163,7 @@ public class FloatArrayCodec implements Codec<float[]> {
         }
 
         ByteBuffer buffer = ByteBuffer.wrap(data, offset, data.length - offset)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         int expectedSize = LENGTH_PREFIX_SIZE + (length * FLOAT_SIZE);

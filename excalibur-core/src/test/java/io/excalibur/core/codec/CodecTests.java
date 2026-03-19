@@ -242,7 +242,13 @@ class CodecTests {
     @Test
     void testStringCodecIsValidTruncated() {
         byte[] data = stringCodec.encode("Hello");
-        assertFalse(stringCodec.isValid(new byte[4]));
+        // Create truncated data - fewer bytes than needed for length prefix
+        assertFalse(stringCodec.isValid(new byte[3]));
+        // Also test with partial payload (length says 5 bytes but only 2 present)
+        byte[] truncated = new byte[6]; // 4 bytes prefix + 2 bytes data (but length says 5)
+        truncated[0] = 0; truncated[1] = 0; truncated[2] = 0; truncated[3] = 5; // length = 5
+        truncated[4] = 'H'; truncated[5] = 'e'; // only 2 bytes of payload
+        assertFalse(stringCodec.isValid(truncated));
     }
 
     @Test
@@ -287,7 +293,7 @@ class CodecTests {
     void testDoubleCodecEncodeNull() {
         byte[] encoded = doubleCodec.encode(null);
         double decoded = doubleCodec.decode(encoded);
-        assertEquals(Double.NaN, decoded, Double.NaN);
+        assertTrue(Double.isNaN(decoded), "Null should decode to NaN");
     }
 
     @Test

@@ -638,6 +638,83 @@ public class WriteLog implements AutoCloseable {
     }
 
     /**
+     * Reads the log entry at the specified offset.
+     *
+     * <p>This method is used by the tail scan to read entries directly from
+     * the write log without going through the full recovery mechanism.</p>
+     *
+     * <p><strong>Performance:</strong> This is a direct read from the memory-mapped
+     * file with CRC32 validation. For bulk reads, consider using {@link #recover(Consumer)}.</p>
+     *
+     * @param offset The byte offset within the log file
+     * @return The log entry, or null if offset is out of range or entry is corrupted
+     * @throws IllegalStateException if the log is closed
+     */
+    public LogEntry readEntryAt(long offset) {
+        ensureOpen();
+
+        long endOffset = writeOffset.get();
+
+        // Check if offset is within valid range
+        if (offset < 0 || offset >= endOffset) {
+            return null;
+        }
+
+        // Check if we have enough bytes for a header
+        if (offset + LogEntry.HEADER_SIZE > endOffset) {
+            return null;
+        }
+
+        try {
+            // Read entry size first
+            int entrySize = LogEntry.sizeAt(mappedSegment, offset);
+
+            // Check if we have enough bytes for the full entry
+            if (offset + entrySize > endOffset) {
+                return null;
+            }
+
+            // Validate CRC32
+            if (!LogEntry.validateCrc32(mappedSegment, offset)) {
+                LOGGER.fine("CRC32 validation failed at offset " + offset);
+                return null;
+            }
+
+            // Read and return the entry
+            return LogEntry.readFromUnchecked(mappedSegment, offset);
+
+        } catch (Exception e) {
+            LOGGER.fine("Failed to read entry at offset " + offset + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Returns the size of the entry at the specified offset.
+     *
+     * <p>This is useful for iterating through entries without reading the full content.</p>
+     *
+     * @param offset The byte offset within the log file
+     * @return The entry size in bytes, or -1 if offset is invalid
+     * @throws IllegalStateException if the log is closed
+     */
+    public int entrySizeAt(long offset) {
+        ensureOpen();
+
+        long endOffset = writeOffset.get();
+
+        if (offset < 0 || offset + LogEntry.HEADER_SIZE > endOffset) {
+            return -1;
+        }
+
+        try {
+            return LogEntry.sizeAt(mappedSegment, offset);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /**
      * Returns the current size of the log file.
      *
      * @return The file size in bytes

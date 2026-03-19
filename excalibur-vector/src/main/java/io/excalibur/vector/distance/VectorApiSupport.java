@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 /**
@@ -73,10 +74,9 @@ public final class VectorApiSupport {
             Class<?> vectorSpeciesClass = Class.forName("jdk.incubator.vector.VectorSpecies");
             Class<?> vectorOperatorsClass = Class.forName("jdk.incubator.vector.VectorOperators");
 
-            // Get SPECIES_PREFERRED via reflection
-            @SuppressWarnings("unchecked")
-            Method speciesMethod = floatVectorClass.getMethod("SPECIES_PREFERRED");
-            Object species = speciesMethod.invoke(null);
+            // Get SPECIES_PREFERRED via reflection (it's a static field, not a method)
+            Field speciesField = floatVectorClass.getField("SPECIES_PREFERRED");
+            Object species = speciesField.get(null);
 
             // Get species length
             Method lengthMethod = vectorSpeciesClass.getMethod("length");

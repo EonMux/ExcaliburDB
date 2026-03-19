@@ -30,6 +30,12 @@ import java.util.concurrent.TimeUnit;
  *   <li>Both scalar and Vector API paths tested</li>
  * </ul>
  *
+ * <h2>Thread Safety</h2>
+ * <p>This is a JMH benchmark class. JMH handles all thread safety for benchmark
+ * execution. The benchmark state is managed by JMH's @State annotations which
+ * provide proper isolation between threads. The distance functions being tested
+ * are stateless and inherently thread-safe.</p>
+ *
  * @author ExcaliburDB
  */
 @BenchmarkMode(Mode.Throughput)

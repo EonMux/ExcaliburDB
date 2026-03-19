@@ -83,6 +83,9 @@ public final class Config {
         }
 
         private long parseLong(String value, long defaultValue) {
+            if (value == null) {
+                return defaultValue;
+            }
             try {
                 return Long.parseLong(value);
             } catch (NumberFormatException e) {
@@ -121,6 +124,9 @@ public final class Config {
         }
 
         private int parseInt(String value, int defaultValue) {
+            if (value == null) {
+                return defaultValue;
+            }
             try {
                 return Integer.parseInt(value);
             } catch (NumberFormatException e) {
@@ -129,6 +135,9 @@ public final class Config {
         }
 
         private double parseDouble(String value, double defaultValue) {
+            if (value == null) {
+                return defaultValue;
+            }
             try {
                 return Double.parseDouble(value);
             } catch (NumberFormatException e) {
@@ -161,6 +170,9 @@ public final class Config {
         }
 
         private int parseInt(String value, int defaultValue) {
+            if (value == null) {
+                return defaultValue;
+            }
             try {
                 return Integer.parseInt(value);
             } catch (NumberFormatException e) {
@@ -212,6 +224,9 @@ public final class Config {
         }
 
         private double parseDouble(String value, double defaultValue) {
+            if (value == null) {
+                return defaultValue;
+            }
             try {
                 return Double.parseDouble(value);
             } catch (NumberFormatException e) {

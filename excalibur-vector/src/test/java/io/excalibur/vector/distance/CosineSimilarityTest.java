@@ -388,6 +388,98 @@ class CosineSimilarityTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("zero-length");
         }
+
+        @Test
+        @DisplayName("computeSquaredNorm null throws NPE")
+        void computeSquaredNormNull() {
+            assertThatThrownBy(() -> SIMILARITY.computeSquaredNorm(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Vector must not be null");
+        }
+
+        @Test
+        @DisplayName("isNormalized null throws NPE")
+        void isNormalizedNull() {
+            assertThatThrownBy(() -> SIMILARITY.isNormalized(null, 0.01f))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Vector must not be null");
+        }
+
+        @Test
+        @DisplayName("normalizeInPlace null throws NPE")
+        void normalizeInPlaceNull() {
+            assertThatThrownBy(() -> SIMILARITY.normalizeInPlace(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Vector must not be null");
+        }
+
+        @Test
+        @DisplayName("normalize null throws NPE")
+        void normalizeNull() {
+            assertThatThrownBy(() -> SIMILARITY.normalize(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Vector must not be null");
+        }
+
+        @Test
+        @DisplayName("computeSquaredNorm with large vector uses vectorized path")
+        void computeSquaredNormLargeVector() {
+            float[] v = new float[128];
+            for (int i = 0; i < 128; i++) {
+                v[i] = 1.0f;
+            }
+
+            double normSq = SIMILARITY.computeSquaredNorm(v);
+
+            assertThat(normSq).isEqualTo(128.0);
+        }
+
+        @Test
+        @DisplayName("computeWithNorms null first vector throws NPE")
+        void computeWithNormsNullFirst() {
+            float[] v2 = {1.0f, 2.0f, 3.0f};
+            assertThatThrownBy(() -> SIMILARITY.computeWithNorms(null, v2, 10.0, 10.0))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("First vector");
+        }
+
+        @Test
+        @DisplayName("computeWithNorms null second vector throws NPE")
+        void computeWithNormsNullSecond() {
+            float[] v1 = {1.0f, 2.0f, 3.0f};
+            assertThatThrownBy(() -> SIMILARITY.computeWithNorms(v1, null, 10.0, 10.0))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Second vector");
+        }
+
+        @Test
+        @DisplayName("computeWithNorms mismatched dimensions throws IAE")
+        void computeWithNormsMismatchedDimensions() {
+            float[] v1 = {1.0f, 2.0f, 3.0f};
+            float[] v2 = {1.0f, 2.0f};
+            assertThatThrownBy(() -> SIMILARITY.computeWithNorms(v1, v2, 10.0, 10.0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("dimensions must match");
+        }
+
+        @Test
+        @DisplayName("computeWithNorms both zero norms returns 0")
+        void computeWithNormsBothZeroNorms() {
+            float[] v1 = {1.0f, 2.0f, 3.0f};
+            float[] v2 = {1.0f, 2.0f, 3.0f};
+            float result = SIMILARITY.computeWithNorms(v1, v2, 0.0, 0.0);
+            assertThat(result).isEqualTo(0.0f);
+        }
+
+        @Test
+        @DisplayName("computeWithNorms second negative norm throws IAE")
+        void computeWithNormsSecondNegativeNorm() {
+            float[] v1 = {1.0f, 2.0f, 3.0f};
+            float[] v2 = {1.0f, 2.0f, 3.0f};
+            assertThatThrownBy(() -> SIMILARITY.computeWithNorms(v1, v2, 10.0, -1.0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-negative");
+        }
     }
 
     @Nested

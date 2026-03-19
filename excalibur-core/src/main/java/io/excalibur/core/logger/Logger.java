@@ -2,6 +2,12 @@ package io.excalibur.core.logger;
 
 /**
  * Simple logger interface for application logging.
+ *
+ * <h2>Thread Safety</h2>
+ * <p>Implementations of this interface must be thread-safe. Log messages may be
+ * emitted from multiple threads concurrently, and implementations must ensure
+ * that log output is properly synchronized and does not interleave messages
+ * in an unreadable manner.</p>
  */
 public interface Logger {
     

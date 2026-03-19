@@ -6,7 +6,7 @@ import java.util.Arrays;
 
 /**
  * Codec for raw byte data with length encoding.
- * Bytes are encoded as a 4-byte length prefix (big-endian) followed by the raw bytes.
+ * Bytes are encoded as a 4-byte length prefix (little-endian) followed by the raw bytes.
  *
  * <h2>Thread Safety</h2>
  * <p>All methods are thread-safe. The singleton instance is immutable.</p>
@@ -49,7 +49,7 @@ public class ByteCodec implements Codec<byte[]> {
         }
 
         ByteBuffer buffer = ByteBuffer.allocate(LENGTH_PREFIX_SIZE + value.length)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
 
         buffer.putInt(value.length);
         buffer.put(value);
@@ -74,7 +74,7 @@ public class ByteCodec implements Codec<byte[]> {
         }
 
         ByteBuffer buffer = ByteBuffer.allocate(LENGTH_PREFIX_SIZE + length)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
 
         buffer.putInt(length);
         buffer.put(value, offset, length);
@@ -91,7 +91,7 @@ public class ByteCodec implements Codec<byte[]> {
             throw new IllegalArgumentException("Invalid encoded data");
         }
 
-        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         byte[] result = new byte[length];
@@ -109,7 +109,7 @@ public class ByteCodec implements Codec<byte[]> {
         }
 
         ByteBuffer buffer = ByteBuffer.wrap(data, offset, data.length - offset)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         byte[] result = new byte[length];
@@ -129,7 +129,7 @@ public class ByteCodec implements Codec<byte[]> {
             return false;
         }
 
-        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         // Check that length is non-negative and data contains full payload
@@ -155,7 +155,7 @@ public class ByteCodec implements Codec<byte[]> {
         }
 
         ByteBuffer buffer = ByteBuffer.wrap(data, offset, data.length - offset)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         return length >= 0 && data.length >= offset + LENGTH_PREFIX_SIZE + length;

@@ -232,9 +232,12 @@ class SplitWorkerTest {
             // Register segment
             splitWorker.registerSegment(segment);
 
-            // Fill segment close to threshold
+            // Fill segment to just under threshold (0.7 = 70%)
+            // Note: puts are rejected at >= 70% load factor, We need to reach
+            // exactly the threshold for shouldSplit() to return true.
+            // Calculate entries to reach just under 70% threshold
             int slotCount = segment.slotCount();
-            int entriesToInsert = (int) (slotCount * 0.68); // Just under threshold
+            int entriesToInsert = (int) Math.ceil(slotCount * Segment.LOAD_FACTOR_THRESHOLD) - 1;
 
             for (int i = 0; i < entriesToInsert; i++) {
                 byte[] key = ("auto-key-" + String.format("%04d", i)).getBytes();
@@ -242,7 +245,7 @@ class SplitWorkerTest {
                 try {
                     segment.put(key, value);
                 } catch (IllegalStateException e) {
-                    // Segment full - that's fine, we want to trigger split
+                    // Segment hit threshold - stop inserting
                     break;
                 }
             }
@@ -250,15 +253,10 @@ class SplitWorkerTest {
             // Start worker
             splitWorker.start();
 
-            // Insert one more to potentially trigger split
-            try {
-                segment.put("trigger-key".getBytes(), "trigger-value".getBytes());
-            } catch (IllegalStateException e) {
-                // Expected if segment at threshold
-            }
-
-            // Wait for automatic split
-            boolean splitCompleted = splitLatch.await(10, TimeUnit.SECONDS);
+            // Wait for automatic split with reasonable timeout
+            // If load factor is at threshold, split should trigger within a few check intervals
+            // (100ms interval * a few checks = ~500ms expected, 1.5s is generous)
+            boolean splitCompleted = splitLatch.await(1500, TimeUnit.MILLISECONDS);
 
             if (splitCompleted) {
                 assertTrue(segment.isSplitComplete(), "Segment should be SPLIT_COMPLETE after auto split");
@@ -269,7 +267,7 @@ class SplitWorkerTest {
                 if (leftChildRef.get() != null) leftChildRef.get().close();
                 if (rightChildRef.get() != null) rightChildRef.get().close();
             }
-            // Note: If split wasn't triggered, it may be because segment didn't reach threshold
+            // Note: If split wasn't triggered, the segment may not have reached threshold
             // which is acceptable for this test
         }
     }

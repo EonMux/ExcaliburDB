@@ -429,4 +429,244 @@ class SegmentConfigTest {
             }
         }
     }
+
+    // ==================== Load Factor Validation Tests ====================
+
+    @Nested
+    @DisplayName("Load Factor Validation")
+    class LoadFactorValidationTests {
+
+        @Test
+        @DisplayName("Should accept load factor below threshold")
+        void shouldAcceptLoadFactorBelowThreshold() {
+            // 50% load factor is below 70% threshold
+            assertDoesNotThrow(() -> SegmentConfig.validateLoadFactor(50, 100));
+            // 69% load factor is just below threshold
+            assertDoesNotThrow(() -> SegmentConfig.validateLoadFactor(69, 100));
+            // 0% load factor is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateLoadFactor(0, 100));
+        }
+
+        @Test
+        @DisplayName("Should reject load factor at or above threshold")
+        void shouldRejectLoadFactorAtOrAboveThreshold() {
+            // 70% load factor equals threshold
+            assertThrows(IllegalStateException.class, () ->
+                SegmentConfig.validateLoadFactor(70, 100));
+
+            // 80% load factor exceeds threshold
+            assertThrows(IllegalStateException.class, () ->
+                SegmentConfig.validateLoadFactor(80, 100));
+
+            // 100% load factor far exceeds threshold
+            assertThrows(IllegalStateException.class, () ->
+                SegmentConfig.validateLoadFactor(100, 100));
+        }
+
+        @Test
+        @DisplayName("Error message should contain threshold")
+        void testLoadFactorErrorMessage() {
+            try {
+                SegmentConfig.validateLoadFactor(80, 100);
+                fail("Expected IllegalStateException");
+            } catch (IllegalStateException e) {
+                assertTrue(e.getMessage().contains("0.7"));
+                assertTrue(e.getMessage().contains("0.8"));
+            }
+        }
+    }
+
+    // ==================== Key Length Validation Tests ====================
+
+    @Nested
+    @DisplayName("Key Length Validation")
+    class KeyLengthValidationTests {
+
+        @Test
+        @DisplayName("Should accept valid key lengths")
+        void shouldAcceptValidKeyLengths() {
+            // Zero length is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateKeyLen(0));
+            // Small length is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateKeyLen(10));
+            // Large length is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateKeyLen(1000000));
+            // Maximum length is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateKeyLen(SegmentConfig.MAX_KEY_LEN));
+        }
+
+        @Test
+        @DisplayName("Should reject negative key length")
+        void shouldRejectNegativeKeyLength() {
+            assertThrows(IllegalArgumentException.class, () ->
+                SegmentConfig.validateKeyLen(-1));
+            assertThrows(IllegalArgumentException.class, () ->
+                SegmentConfig.validateKeyLen(-100));
+        }
+
+        @Test
+        @DisplayName("Should reject key length exceeding maximum")
+        void shouldRejectKeyLengthExceedingMaximum() {
+            assertThrows(IllegalArgumentException.class, () ->
+                SegmentConfig.validateKeyLen(SegmentConfig.MAX_KEY_LEN + 1));
+            assertThrows(IllegalArgumentException.class, () ->
+                SegmentConfig.validateKeyLen(Integer.MAX_VALUE));
+        }
+
+        @Test
+        @DisplayName("isValidKeyLen should return true for valid lengths")
+        void isValidKeyLenShouldReturnTrueForValidLengths() {
+            assertTrue(SegmentConfig.isValidKeyLen(0));
+            assertTrue(SegmentConfig.isValidKeyLen(10));
+            assertTrue(SegmentConfig.isValidKeyLen(SegmentConfig.MAX_KEY_LEN));
+        }
+
+        @Test
+        @DisplayName("isValidKeyLen should return false for invalid lengths")
+        void isValidKeyLenShouldReturnFalseForInvalidLengths() {
+            assertFalse(SegmentConfig.isValidKeyLen(-1));
+            assertFalse(SegmentConfig.isValidKeyLen(SegmentConfig.MAX_KEY_LEN + 1));
+            assertFalse(SegmentConfig.isValidKeyLen(Integer.MAX_VALUE));
+        }
+
+        @Test
+        @DisplayName("MAX_KEY_LEN should be Integer.MAX_VALUE - 17")
+        void maxKeyLenShouldBeCorrect() {
+            assertEquals(Integer.MAX_VALUE - 17, SegmentConfig.MAX_KEY_LEN);
+        }
+    }
+
+    // ==================== Value Length Validation Tests ====================
+
+    @Nested
+    @DisplayName("Value Length Validation")
+    class ValueLengthValidationTests {
+
+        @Test
+        @DisplayName("Should accept valid value lengths")
+        void shouldAcceptValidValueLengths() {
+            // Zero length is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateValueLen(0));
+            // Small length is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateValueLen(10));
+            // Large length is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateValueLen(1000000));
+            // Maximum length is valid
+            assertDoesNotThrow(() -> SegmentConfig.validateValueLen(SegmentConfig.MAX_VALUE_LEN));
+        }
+
+        @Test
+        @DisplayName("Should reject negative value length")
+        void shouldRejectNegativeValueLength() {
+            assertThrows(IllegalArgumentException.class, () ->
+                SegmentConfig.validateValueLen(-1));
+            assertThrows(IllegalArgumentException.class, () ->
+                SegmentConfig.validateValueLen(-100));
+        }
+
+        @Test
+        @DisplayName("Should reject value length exceeding maximum")
+        void shouldRejectValueLengthExceedingMaximum() {
+            assertThrows(IllegalArgumentException.class, () ->
+                SegmentConfig.validateValueLen(SegmentConfig.MAX_VALUE_LEN + 1));
+            assertThrows(IllegalArgumentException.class, () ->
+                SegmentConfig.validateValueLen(Integer.MAX_VALUE));
+        }
+
+        @Test
+        @DisplayName("isValidValueLen should return true for valid lengths")
+        void isValidValueLenShouldReturnTrueForValidLengths() {
+            assertTrue(SegmentConfig.isValidValueLen(0));
+            assertTrue(SegmentConfig.isValidValueLen(10));
+            assertTrue(SegmentConfig.isValidValueLen(SegmentConfig.MAX_VALUE_LEN));
+        }
+
+        @Test
+        @DisplayName("isValidValueLen should return false for invalid lengths")
+        void isValidValueLenShouldReturnFalseForInvalidLengths() {
+            assertFalse(SegmentConfig.isValidValueLen(-1));
+            assertFalse(SegmentConfig.isValidValueLen(SegmentConfig.MAX_VALUE_LEN + 1));
+            assertFalse(SegmentConfig.isValidValueLen(Integer.MAX_VALUE));
+        }
+
+        @Test
+        @DisplayName("MAX_VALUE_LEN should be Integer.MAX_VALUE - 17")
+        void maxValueLenShouldBeCorrect() {
+            assertEquals(Integer.MAX_VALUE - 17, SegmentConfig.MAX_VALUE_LEN);
+        }
+    }
+
+    // ==================== Constants Tests ====================
+
+    @Nested
+    @DisplayName("Constants")
+    class ConstantsTests {
+
+        @Test
+        @DisplayName("MIN_SEGMENT_CAPACITY should be 1024")
+        void minSegmentCapacity() {
+            assertEquals(1024, SegmentConfig.MIN_SEGMENT_CAPACITY);
+        }
+
+        @Test
+        @DisplayName("MAX_SEGMENT_CAPACITY should be 2^20")
+        void maxSegmentCapacity() {
+            assertEquals(1 << 20, SegmentConfig.MAX_SEGMENT_CAPACITY);
+            assertEquals(1048576, SegmentConfig.MAX_SEGMENT_CAPACITY);
+        }
+
+        @Test
+        @DisplayName("LOAD_FACTOR_THRESHOLD should be 0.7")
+        void loadFactorThreshold() {
+            assertEquals(0.7, SegmentConfig.LOAD_FACTOR_THRESHOLD, 0.0001);
+        }
+
+        @Test
+        @DisplayName("MAX_PROBE_LENGTH should be 128")
+        void maxProbeLength() {
+            assertEquals(128, SegmentConfig.MAX_PROBE_LENGTH);
+        }
+
+        @Test
+        @DisplayName("MAX_DISTANCE should be 127")
+        void maxDistance() {
+            assertEquals(127, SegmentConfig.MAX_DISTANCE);
+        }
+
+        @Test
+        @DisplayName("ENTRY_FIXED_OVERHEAD should be 18 bytes")
+        void entryFixedOverhead() {
+            // 8 (key_hash) + 4 (key_len) + 4 (value_len) + 1 (distance) + 1 (tombstone) = 18
+            assertEquals(18, SegmentConfig.ENTRY_FIXED_OVERHEAD);
+        }
+
+        @Test
+        @DisplayName("ENTRY_HEADER_SIZE should be 17 bytes")
+        void entryHeaderSize() {
+            // 8 (key_hash) + 4 (key_len) + 4 (value_len) + 1 (distance) = 17
+            assertEquals(17, SegmentConfig.ENTRY_HEADER_SIZE);
+        }
+
+        @Test
+        @DisplayName("ENTRY_TRAILER_SIZE should be 1 byte")
+        void entryTrailerSize() {
+            assertEquals(1, SegmentConfig.ENTRY_TRAILER_SIZE);
+        }
+
+        @Test
+        @DisplayName("SLOT_SIZE should be 24 bytes")
+        void slotSize() {
+            assertEquals(24, SegmentConfig.SLOT_SIZE);
+        }
+
+        @Test
+        @DisplayName("Offset constants should be correct")
+        void offsetConstants() {
+            assertEquals(0, SegmentConfig.KEY_HASH_OFFSET);
+            assertEquals(8, SegmentConfig.KEY_LEN_OFFSET);
+            assertEquals(12, SegmentConfig.VALUE_LEN_OFFSET);
+            assertEquals(16, SegmentConfig.DISTANCE_OFFSET);
+            assertEquals(17, SegmentConfig.KEY_BYTES_OFFSET);
+        }
+    }
 }

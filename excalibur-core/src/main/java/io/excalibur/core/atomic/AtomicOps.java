@@ -95,22 +95,10 @@ public class AtomicOps {
         segment.set(ValueLayout.JAVA_BYTE, offset, value);
     }
 
-    /**
-     * Atomically compares and sets a byte value.
-     *
-     * @param segment  The memory segment
-     * @param offset   The offset within the segment
-     * @param expected The expected current value
-     * @param newValue The new value to set if comparison succeeds
-     * @return true if the comparison succeeded and value was updated
-     * @throws AtomicException if segment is null or offset is invalid
-     */
-    public static boolean compareAndSetByte(MemorySegment segment, long offset,
-                                            byte expected, byte newValue) {
-        checkSegment(segment, offset, 1);
-        MemorySegment slice = segment.asSlice(offset, 1);
-        return BYTE_HANDLE.compareAndSet(slice, expected, newValue);
-    }
+    // Note: VarHandle does NOT support compareAndSet for byte types in Java 21.
+    // Only int, long, float, and double support CAS operations.
+    // For atomic byte operations, use getInt/compareAndSetInt with bit masking,
+    // or use external synchronization.
 
     // ==================== Int Operations ====================
 
@@ -286,6 +274,26 @@ public class AtomicOps {
         segment.set(FLOAT_LAYOUT, offset, value);
     }
 
+    /**
+     * Atomically compares and sets a float value.
+     *
+     * <p>Uses bitwise comparison for floating-point values, following the semantics
+     * of Float.floatToRawIntBits(). NaN values are compared bitwise, not numerically.</p>
+     *
+     * @param segment  The memory segment
+     * @param offset   The offset within the segment
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws AtomicException if segment is null or offset is invalid
+     */
+    public static boolean compareAndSetFloat(MemorySegment segment, long offset,
+                                             float expected, float newValue) {
+        checkSegment(segment, offset, 4);
+        MemorySegment slice = segment.asSlice(offset, 4);
+        return FLOAT_HANDLE.compareAndSet(slice, expected, newValue);
+    }
+
     // ==================== Double Operations ====================
 
     /**
@@ -312,6 +320,26 @@ public class AtomicOps {
     public static void putDouble(MemorySegment segment, long offset, double value) {
         checkSegment(segment, offset, 8);
         segment.set(DOUBLE_LAYOUT, offset, value);
+    }
+
+    /**
+     * Atomically compares and sets a double value.
+     *
+     * <p>Uses bitwise comparison for floating-point values, following the semantics
+     * of Double.doubleToRawLongBits(). NaN values are compared bitwise, not numerically.</p>
+     *
+     * @param segment  The memory segment
+     * @param offset   The offset within the segment
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws AtomicException if segment is null or offset is invalid
+     */
+    public static boolean compareAndSetDouble(MemorySegment segment, long offset,
+                                              double expected, double newValue) {
+        checkSegment(segment, offset, 8);
+        MemorySegment slice = segment.asSlice(offset, 8);
+        return DOUBLE_HANDLE.compareAndSet(slice, expected, newValue);
     }
 
     // ==================== Utility Methods ====================
@@ -404,5 +432,21 @@ public class AtomicOps {
      */
     public static VarHandle longHandle() {
         return LONG_HANDLE;
+    }
+
+    /**
+     * Gets the VarHandle for float access.
+     * @return The float VarHandle
+     */
+    public static VarHandle floatHandle() {
+        return FLOAT_HANDLE;
+    }
+
+    /**
+     * Gets the VarHandle for double access.
+     * @return The double VarHandle
+     */
+    public static VarHandle doubleHandle() {
+        return DOUBLE_HANDLE;
     }
 }

@@ -52,6 +52,12 @@ import java.util.concurrent.TimeUnit;
  * </pre>
  * <p>For 13-bit fingerprints with 4 fingerprints per bucket: 7 bytes per bucket</p>
  *
+ * <h2>Thread Safety</h2>
+ * <p>This is a JMH benchmark class. JMH handles all thread safety for benchmark
+ * execution. The benchmark state is managed by JMH's @State annotations which
+ * provide proper isolation between threads. Resources like Arena and MappedFile
+ * are properly managed in setup/teardown lifecycle methods.</p>
+ *
  * @author ExcaliburDB
  */
 @BenchmarkMode(Mode.Throughput)

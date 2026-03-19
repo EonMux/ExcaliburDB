@@ -12,6 +12,10 @@ package io.excalibur.vector.layout;
  *   <tr><td>INNER_PRODUCT</td><td>(-inf, +inf)</td><td>Larger = more similar</td></tr>
  * </table>
  *
+ * <h2>Thread Safety</h2>
+ * <p>As an enum, this class is inherently thread-safe. Enum instances are
+ * immutable and may be safely accessed from multiple threads concurrently.</p>
+ *
  * @author ExcaliburDB
  * @since 1.0
  */

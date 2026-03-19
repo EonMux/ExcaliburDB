@@ -2,6 +2,8 @@ package io.excalibur.vector.hnsw;
 
 import io.excalibur.core.mapped.MappedFile;
 import io.excalibur.vector.distance.DistanceFunction;
+import io.excalibur.vector.quantization.PQDistanceTable;
+import io.excalibur.vector.quantization.ProductQuantizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -157,6 +159,14 @@ public class HnswGraph implements AutoCloseable {
 
     // Maximum number of nodes this graph can hold
     private long maxNodes;
+
+    // Optional Product Quantizer for compressed vectors
+    // Volatile for safe publication after training
+    private volatile ProductQuantizer pq;
+
+    // PQ codes storage: maps nodeId -> PQ codes (only when PQ is trained)
+    // This is a simple in-memory map; for production, consider disk-backed storage
+    private volatile java.util.concurrent.ConcurrentHashMap<Long, byte[]> pqCodes;
 
     /**
      * Creates a new HNSW graph backed by a memory-mapped file.
@@ -1874,6 +1884,397 @@ public class HnswGraph implements AutoCloseable {
 
     public boolean isClosed() {
         return closed;
+    }
+
+    // ==================== Product Quantization Support ====================
+
+    /**
+     * Returns the ProductQuantizer associated with this graph, if any.
+     *
+     * <p>Product Quantization enables compressed vector storage and asymmetric
+     * distance computation for memory-efficient approximate nearest neighbor search.</p>
+     *
+     * @return The ProductQuantizer, or null if not configured
+     */
+    public ProductQuantizer getProductQuantizer() {
+        return pq;
+    }
+
+    /**
+     * Sets a pre-trained ProductQuantizer for this graph.
+     *
+     * <p>After setting a trained quantizer, subsequent searches can optionally
+     * use asymmetric distance computation via the PQ codes.</p>
+     *
+     * <p><strong>Note:</strong> The quantizer's dimension must match this graph's dimension.</p>
+     *
+     * @param quantizer A trained ProductQuantizer (must not be null)
+     * @throws IllegalArgumentException if quantizer dimension doesn't match
+     * @throws IllegalStateException if quantizer is not trained
+     */
+    public void setProductQuantizer(ProductQuantizer quantizer) {
+        Objects.requireNonNull(quantizer, "ProductQuantizer cannot be null");
+        if (!quantizer.isTrained()) {
+            throw new IllegalStateException("ProductQuantizer must be trained before use");
+        }
+        if (quantizer.originalDim() != config.dimension()) {
+            throw new IllegalArgumentException(
+                "ProductQuantizer dimension (" + quantizer.originalDim() +
+                ") must match graph dimension (" + config.dimension() + ")");
+        }
+
+        lock.writeLock().lock();
+        try {
+            this.pq = quantizer;
+            this.pqCodes = new java.util.concurrent.ConcurrentHashMap<>();
+            LOGGER.info("ProductQuantizer set for graph at {} (compression ratio: {}x)",
+                path, quantizer.compressionRatio());
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Trains a ProductQuantizer on a sample of vectors from this graph.
+     *
+     * <p>This method extracts sample vectors from the graph and trains
+     * a new ProductQuantizer. After training, vectors are encoded and
+     * stored as PQ codes for efficient distance computation.</p>
+     *
+     * <p><strong>Note:</strong> Training requires reading vectors from disk,
+     * which may be slow for large graphs. Use a representative sample size.</p>
+     *
+     * @param sampleSize Number of vectors to sample for training (0 = use all)
+     * @param numSubspaces Number of subspaces for PQ
+     * @param numCentroids Number of centroids per subspace (typically 256)
+     * @return The trained ProductQuantizer
+     * @throws IllegalStateException if graph is empty or closed
+     */
+    public ProductQuantizer trainProductQuantizer(int sampleSize, int numSubspaces, int numCentroids) {
+        validateNotClosed();
+
+        lock.readLock().lock();
+        try {
+            if (nodeCount == 0) {
+                throw new IllegalStateException("Cannot train ProductQuantizer on empty graph");
+            }
+
+            // Collect sample vectors
+            int actualSampleSize = sampleSize > 0 ? Math.min(sampleSize, (int) nodeCount) : (int) nodeCount;
+            List<float[]> samples = new ArrayList<>(actualSampleSize);
+
+            // Sample uniformly from the graph
+            java.util.concurrent.ThreadLocalRandom random = java.util.concurrent.ThreadLocalRandom.current();
+            java.util.Set<Integer> sampledIndices = new java.util.HashSet<>();
+
+            while (sampledIndices.size() < actualSampleSize && sampledIndices.size() < nodeCount) {
+                int idx = random.nextInt((int) nodeCount);
+                if (sampledIndices.add(idx)) {
+                    NodeView node = readNode(idx);
+                    if (node != null && !node.isTombstoned()) {
+                        samples.add(node.vector());
+                    }
+                }
+            }
+
+            if (samples.isEmpty()) {
+                throw new IllegalStateException("No valid vectors found for training");
+            }
+
+            LOGGER.info("Training ProductQuantizer on {} sample vectors", samples.size());
+
+            // Create and train quantizer
+            ProductQuantizer quantizer = new ProductQuantizer(config.dimension(), numSubspaces, numCentroids);
+            quantizer.train(samples.toArray(new float[0][]));
+
+            // Store reference
+            this.pq = quantizer;
+            this.pqCodes = new java.util.concurrent.ConcurrentHashMap<>();
+
+            LOGGER.info("ProductQuantizer trained successfully (compression ratio: {}x)",
+                quantizer.compressionRatio());
+
+            return quantizer;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Encodes all vectors in the graph using the configured ProductQuantizer.
+     *
+     * <p>After encoding, searches can use asymmetric distance computation
+     * via {@link #searchWithPQ(float[], int, PQDistanceTable)}.</p>
+     *
+     * <p><strong>Note:</strong> This is a one-time operation that reads all
+     * vectors from disk. Subsequent insertions should call
+     * {@link #encodeAndStorePQCode(long, float[])} to maintain consistency.</p>
+     *
+     * @throws IllegalStateException if ProductQuantizer is not set
+     */
+    public void encodeAllVectors() {
+        if (pq == null || !pq.isTrained()) {
+            throw new IllegalStateException("ProductQuantizer must be set and trained");
+        }
+
+        lock.writeLock().lock();
+        try {
+            int encoded = 0;
+            for (long nodeId = 0; nodeId < nodeCount; nodeId++) {
+                NodeView node = readNode(nodeId);
+                if (node != null && !node.isTombstoned()) {
+                    byte[] codes = pq.encode(node.vector());
+                    pqCodes.put(nodeId, codes);
+                    encoded++;
+                }
+            }
+            LOGGER.info("Encoded {} vectors with ProductQuantizer", encoded);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Encodes and stores PQ codes for a single vector.
+     *
+     * <p>Call this after inserting a vector to maintain PQ consistency.</p>
+     *
+     * @param nodeId The node ID
+     * @param vector The vector to encode
+     * @throws IllegalStateException if ProductQuantizer is not set
+     */
+    public void encodeAndStorePQCode(long nodeId, float[] vector) {
+        if (pq == null || !pq.isTrained()) {
+            return; // No PQ configured, skip silently
+        }
+        byte[] codes = pq.encode(vector);
+        pqCodes.put(nodeId, codes);
+    }
+
+    /**
+     * Searches for k nearest neighbors using Product Quantization for distance computation.
+     *
+     * <p>This method uses asymmetric distance computation: the query is kept at full
+     * precision while database vectors are represented by their PQ codes. This provides
+     * good accuracy with significantly reduced memory usage.</p>
+     *
+     * <h3>Fallback Behavior</h3>
+     * <ul>
+     *   <li>If ProductQuantizer is not set, falls back to full-precision search</li>
+     *   <li>If a node has no PQ codes, uses full-precision distance</li>
+     * </ul>
+     *
+     * @param query Query vector
+     * @param k Number of neighbors to return
+     * @return List of search results sorted by distance (closest first)
+     */
+    public List<HnswSearchResult> searchWithPQ(float[] query, int k) {
+        if (pq == null || !pq.isTrained()) {
+            // Fall back to regular search
+            return search(query, k);
+        }
+
+        // Create distance table for efficient lookup
+        PQDistanceTable distanceTable = pq.createDistanceTable(query);
+        return searchWithPQ(query, k, distanceTable);
+    }
+
+    /**
+     * Searches for k nearest neighbors using a precomputed PQ distance table.
+     *
+     * <p>Use this when performing multiple searches with the same query,
+     * as it reuses the precomputed distance table.</p>
+     *
+     * @param query Query vector
+     * @param k Number of neighbors to return
+     * @param distanceTable Precomputed distance table for the query
+     * @return List of search results sorted by distance (closest first)
+     */
+    public List<HnswSearchResult> searchWithPQ(float[] query, int k, PQDistanceTable distanceTable) {
+        validateNotClosed();
+        validateQuery(query);
+        if (k <= 0) {
+            throw new IllegalArgumentException("k must be positive: " + k);
+        }
+
+        if (pq == null || !pq.isTrained()) {
+            return search(query, k);
+        }
+
+        lock.readLock().lock();
+        try {
+            if (nodeCount == 0 || entryPointId < 0) {
+                return new ArrayList<>();
+            }
+
+            // Start from entry point
+            long currentNodeId = entryPointId;
+            NodeView current = readNode(currentNodeId);
+
+            if (current == null || current.isTombstoned()) {
+                currentNodeId = findActiveNode();
+                if (currentNodeId < 0) {
+                    return new ArrayList<>();
+                }
+                current = readNode(currentNodeId);
+            }
+
+            final int efSearch = config.efSearch();
+
+            // Search through layers from top to layer 1
+            for (int level = maxLevel; level > 0; level--) {
+                NodeView closest = searchLayerSimpleWithPQ(query, current, level, distanceTable);
+                if (closest != null) {
+                    current = closest;
+                }
+            }
+
+            // At layer 0, perform beam search with PQ
+            PriorityQueue<HnswSearchResult> results = searchLayerBeamWithPQ(
+                query, current, 0, efSearch, distanceTable);
+
+            // Extract and sort results
+            List<HnswSearchResult> allResults = new ArrayList<>();
+            while (!results.isEmpty()) {
+                HnswSearchResult result = results.poll();
+                allResults.add(result);
+            }
+
+            allResults.sort(Comparator.comparingDouble(HnswSearchResult::distance));
+
+            List<HnswSearchResult> topResults = new ArrayList<>();
+            for (int i = 0; i < Math.min(k, allResults.size()); i++) {
+                topResults.add(allResults.get(i));
+            }
+
+            return topResults;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Simple greedy search at a single layer using PQ distances.
+     */
+    private NodeView searchLayerSimpleWithPQ(float[] query, NodeView entry, int level, PQDistanceTable distanceTable) {
+        NodeView current = entry;
+        float currentDist = computeDistanceWithPQ(query, current, distanceTable);
+        boolean improved = true;
+
+        while (improved) {
+            improved = false;
+            List<Long> neighbors = current.getActiveNeighbors(level);
+
+            for (long neighborId : neighbors) {
+                NodeView neighbor = readNode(neighborId);
+                if (neighbor == null || neighbor.isTombstoned()) {
+                    continue;
+                }
+
+                float dist = computeDistanceWithPQ(query, neighbor, distanceTable);
+                if (dist < currentDist) {
+                    currentDist = dist;
+                    current = neighbor;
+                    improved = true;
+                }
+            }
+        }
+
+        return current;
+    }
+
+    /**
+     * Beam search at a layer using PQ distances.
+     */
+    private PriorityQueue<HnswSearchResult> searchLayerBeamWithPQ(
+            float[] query, NodeView entry, int level, int ef, PQDistanceTable distanceTable) {
+
+        PriorityQueue<HnswSearchResult> results = new PriorityQueue<>(
+            Comparator.comparingDouble(HnswSearchResult::distance).reversed());
+        PriorityQueue<HnswSearchResult> candidates = new PriorityQueue<>(
+            Comparator.comparingDouble(HnswSearchResult::distance));
+        java.util.Set<Long> visited = new java.util.HashSet<>();
+
+        if (entry == null || entry.isTombstoned()) {
+            return results;
+        }
+
+        float entryDist = computeDistanceWithPQ(query, entry, distanceTable);
+        HnswSearchResult entryResult = new HnswSearchResult(entry.nodeId(), entryDist);
+        candidates.add(entryResult);
+        results.add(entryResult);
+        visited.add(entry.nodeId());
+
+        while (!candidates.isEmpty()) {
+            HnswSearchResult current = candidates.poll();
+            NodeView currentNode = readNode(current.nodeId());
+
+            if (currentNode == null || currentNode.isTombstoned()) {
+                continue;
+            }
+
+            if (!results.isEmpty() && current.distance() > results.peek().distance()) {
+                break;
+            }
+
+            List<Long> neighbors = currentNode.getActiveNeighbors(level);
+
+            for (long neighborId : neighbors) {
+                if (visited.contains(neighborId)) {
+                    continue;
+                }
+                visited.add(neighborId);
+
+                NodeView neighbor = readNode(neighborId);
+                if (neighbor == null || neighbor.isTombstoned()) {
+                    continue;
+                }
+
+                float dist = computeDistanceWithPQ(query, neighbor, distanceTable);
+                HnswSearchResult result = new HnswSearchResult(neighborId, dist);
+
+                if (results.size() < ef || dist < results.peek().distance()) {
+                    candidates.add(result);
+                    results.add(result);
+
+                    while (results.size() > ef) {
+                        results.poll();
+                    }
+                }
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Computes distance using PQ when available, falling back to full precision.
+     */
+    private float computeDistanceWithPQ(float[] query, NodeView node, PQDistanceTable distanceTable) {
+        // Try PQ-based distance first
+        if (pqCodes != null) {
+            byte[] codes = pqCodes.get(node.nodeId());
+            if (codes != null) {
+                return distanceTable.lookup(codes);
+            }
+        }
+
+        // Fall back to full precision
+        return distanceFunction.compute(query, node.vector());
+    }
+
+    /**
+     * Returns whether Product Quantization is enabled for this graph.
+     */
+    public boolean isPQEnabled() {
+        return pq != null && pq.isTrained();
+    }
+
+    /**
+     * Returns the number of vectors that have been encoded with PQ.
+     */
+    public int encodedVectorCount() {
+        return pqCodes != null ? pqCodes.size() : 0;
     }
 
     // ==================== Lifecycle ====================

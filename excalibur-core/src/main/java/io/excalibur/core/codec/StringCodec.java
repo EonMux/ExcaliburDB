@@ -6,7 +6,7 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Codec for UTF-8 encoded strings.
- * Strings are encoded as a 4-byte length prefix (big-endian) followed by UTF-8 bytes.
+ * Strings are encoded as a 4-byte length prefix (little-endian) followed by UTF-8 bytes.
  *
  * <h2>Thread Safety</h2>
  * <p>All methods are thread-safe. The singleton instance is immutable.</p>
@@ -46,14 +46,14 @@ public class StringCodec implements Codec<String> {
     public byte[] encode(String value) {
         if (value == null || value.isEmpty()) {
             ByteBuffer buffer = ByteBuffer.allocate(LENGTH_PREFIX_SIZE)
-                .order(ByteOrder.BIG_ENDIAN);
+                .order(ByteOrder.LITTLE_ENDIAN);
             buffer.putInt(0);
             return buffer.array();
         }
 
         byte[] utf8Bytes = value.getBytes(StandardCharsets.UTF_8);
         ByteBuffer buffer = ByteBuffer.allocate(LENGTH_PREFIX_SIZE + utf8Bytes.length)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
 
         buffer.putInt(utf8Bytes.length);
         buffer.put(utf8Bytes);
@@ -70,7 +70,7 @@ public class StringCodec implements Codec<String> {
             throw new IllegalArgumentException("Invalid encoded data");
         }
 
-        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         if (length == 0) {
@@ -92,7 +92,7 @@ public class StringCodec implements Codec<String> {
         }
 
         ByteBuffer buffer = ByteBuffer.wrap(data, offset, data.length - offset)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         if (length == 0) {
@@ -116,7 +116,7 @@ public class StringCodec implements Codec<String> {
             return false;
         }
 
-        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         // Check that length is non-negative and data contains full payload
@@ -158,7 +158,7 @@ public class StringCodec implements Codec<String> {
         }
 
         ByteBuffer buffer = ByteBuffer.wrap(data, offset, data.length - offset)
-            .order(ByteOrder.BIG_ENDIAN);
+            .order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
         if (length < 0 || data.length < offset + LENGTH_PREFIX_SIZE + length) {

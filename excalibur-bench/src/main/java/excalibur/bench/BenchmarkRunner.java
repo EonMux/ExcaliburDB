@@ -33,6 +33,11 @@ import org.openjdk.jmh.runner.options.TimeValue;
  *   <li>Results should show stable variance (&lt; 10% deviation)</li>
  * </ul>
  *
+ * <h2>Thread Safety</h2>
+ * <p>This class is designed for single-threaded use as a command-line application.
+ * The main method is not intended to be called concurrently. JMH handles
+ * thread safety internally for benchmark execution.</p>
+ *
  * @author ExcaliburDB
  */
 public class BenchmarkRunner {

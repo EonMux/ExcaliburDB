@@ -367,8 +367,43 @@ public class Segment implements AutoCloseable {
      * @param arena Arena for memory management
      * @return The opened Segment
      * @throws IOException if the file cannot be opened or is invalid
+     * @deprecated Use {@link #openExisting(Path, Arena)} instead to preserve existing data
      */
+    @Deprecated
     public static Segment open(Path path, Arena arena) throws IOException {
+        return openExisting(path, arena);
+    }
+
+    /**
+     * Opens an existing Segment from a file without truncating it.
+     *
+     * <p>This method opens an existing memory-mapped segment file and recovers
+     * its state by scanning the slot table. This is the preferred method for
+     * opening segments during startup to preserve existing data.</p>
+     *
+     * <h3>Recovery Process</h3>
+     * <ol>
+     *   <li>Opens the file without truncating</li>
+     *   <li>Maps the file into memory</li>
+     *   <li>Derives slot count from file size (accounting for minimum 1MB data region)</li>
+     *   <li>Scans slot table to recover entry count and data offset</li>
+     * </ol>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>File is NOT truncated - existing data is preserved</li>
+     *   <li>Entry count is recovered by scanning the slot table</li>
+     *   <li>Data offset is calculated from the last entry position</li>
+     *   <li>Slot count is derived from file size and validated</li>
+     * </ul>
+     *
+     * @param path Path to the existing segment file (must exist)
+     * @param arena Arena for memory management (must not be null)
+     * @return The opened Segment with recovered state
+     * @throws IOException if the file cannot be opened or is invalid
+     * @throws IllegalArgumentException if path or arena is null, or file doesn't exist
+     */
+    public static Segment openExisting(Path path, Arena arena) throws IOException {
         if (path == null) {
             throw new IllegalArgumentException("Path cannot be null");
         }
@@ -379,20 +414,153 @@ public class Segment implements AutoCloseable {
             throw new IOException("Segment file does not exist: " + path);
         }
 
-        // Open file to read size and derive slot count
         long fileSize = Files.size(path);
 
+        // Minimum valid file size is the slot table + minimum data region
+        // If file is too small, it's corrupted or empty
+        if (fileSize < 1024) {
+            throw new IOException("Segment file too small to be valid: " + path + " (size=" + fileSize + ")");
+        }
+
         // Derive slot count from file size
-        // Assume 50% of file is slot table, 50% is data
-        int slotCount = deriveSlotCount(fileSize);
+        // The file format is: [slot_table | data_region]
+        // Where data_region is at least 1MB (MIN_DATA_SIZE = 1024*1024)
+        // So: fileSize = slotCount * SLOT_SIZE + dataRegionSize
+        // And: dataRegionSize >= MIN_DATA_SIZE
+        // Therefore: slotCount <= (fileSize - MIN_DATA_SIZE) / SLOT_SIZE
+        int slotCount = deriveSlotCountForRecovery(fileSize);
+        long slotTableSize = (long) slotCount * SLOT_SIZE;
 
-        // Calculate estimated capacity
-        long estimatedCapacity = (long) slotCount * SLOT_SIZE * 2;
+        // Open file WITHOUT truncating - this is the key difference from the constructor
+        FileChannel fileChannel = FileChannel.open(
+            path,
+            StandardOpenOption.READ,
+            StandardOpenOption.WRITE
+            // Note: No TRUNCATE_EXISTING - we want to preserve existing data
+        );
 
-        // Create a new segment with the same capacity
-        // Note: This will truncate the existing file, which is not ideal
-        // In production, we would read the existing data and preserve it
-        return new Segment(path, estimatedCapacity, arena);
+        // Map the file into memory
+        MemorySegment segment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, fileSize, arena);
+
+        // Create a Segment instance using private constructor pattern
+        // We need to recover the state from the file
+        Segment result = new Segment(path, arena, fileChannel, segment, slotCount, slotTableSize);
+
+        // Recover entry count and data offset by scanning the slot table
+        result.recoverStateFromSlotTable();
+
+        return result;
+    }
+
+    /**
+     * Derives slot count from file size for recovery purposes.
+     *
+     * <p>This method accounts for the minimum 1MB data region that the constructor
+     * always includes. The file format is: [slot_table | data_region] where
+     * data_region is at least 1MB.</p>
+     *
+     * <p>Formula: slotCount = (fileSize - MIN_DATA_SIZE) / SLOT_SIZE, rounded to power of 2</p>
+     *
+     * @param fileSize The file size in bytes
+     * @return The derived slot count
+     */
+    private static int deriveSlotCountForRecovery(long fileSize) {
+        // Minimum data region size (must match constructor)
+        final long MIN_DATA_SIZE = 1024 * 1024;
+
+        // Calculate slot table size by subtracting minimum data region
+        long slotTableSize = fileSize - MIN_DATA_SIZE;
+        if (slotTableSize <= 0) {
+            // File is too small, use minimum
+            return MIN_SEGMENT_CAPACITY;
+        }
+
+        // Calculate estimated slot count
+        long estimatedSlots = slotTableSize / SLOT_SIZE;
+
+        // Round to power of 2 (same logic as constructor)
+        int slotCount = roundToPowerOf2((int) Math.min(estimatedSlots, MAX_SEGMENT_CAPACITY));
+
+        // Validate the slot count
+        SegmentConfig.validateCapacity(slotCount);
+
+        return slotCount;
+    }
+
+    /**
+     * Private constructor for opening existing segments.
+     *
+     * <p>This constructor is used by {@link #openExisting(Path, Arena)} to
+     * create a Segment instance without truncating the file.</p>
+     */
+    private Segment(Path path, Arena arena, FileChannel fileChannel, MemorySegment segment,
+                    int slotCount, long slotTableSize) {
+        this.path = path;
+        this.arena = arena;
+        this.fileChannel = fileChannel;
+        this.segment = segment;
+        this.slotCount = slotCount;
+        this.slotTableSize = slotTableSize;
+        this.segmentId = SEGMENT_ID_GENERATOR.getAndIncrement();
+        // entryCount and dataOffset will be recovered by recoverStateFromSlotTable()
+    }
+
+    /**
+     * Recovers the segment state by scanning the slot table.
+     *
+     * <p>This method scans all slots in the slot table to:</p>
+     * <ul>
+     *   <li>Count occupied entries (non-tombstoned)</li>
+     *   <li>Find the maximum data offset (for future writes)</li>
+     * </ul>
+     *
+     * <p>This is called during recovery from an existing segment file.</p>
+     */
+    private void recoverStateFromSlotTable() {
+        int recoveredEntryCount = 0;
+        long maxEndOffset = 0;  // Track the END of the last entry (offset + size)
+        long segmentSize = segment.byteSize();
+
+        for (int i = 0; i < slotCount; i++) {
+            long slotOffset = (long) i * SLOT_SIZE;
+            byte flags = segment.get(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET);
+
+            // Check if slot is occupied
+            if ((flags & FLAG_OCCUPIED) != 0) {
+                // Read the data offset for this entry (offset within data region)
+                long dataRegionOffset = readDataOffset(i);
+
+                // Calculate absolute entry offset
+                long entryOffset = slotTableSize + dataRegionOffset;
+
+                // Validate entry offset is within bounds
+                if (entryOffset + ENTRY_HEADER_SIZE > segmentSize) {
+                    // Entry header would be out of bounds - skip this slot
+                    continue;
+                }
+
+                // Read entry size to calculate where this entry ends
+                int keyLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_KEY_LEN_OFFSET);
+                int valueLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_VALUE_LEN_OFFSET);
+                int entrySize = ENTRY_HEADER_SIZE + keyLen + valueLen + ENTRY_TRAILER_SIZE;
+
+                // Calculate where this entry ends
+                long entryEndOffset = dataRegionOffset + entrySize;
+
+                // Update max end offset
+                if (entryEndOffset > maxEndOffset) {
+                    maxEndOffset = entryEndOffset;
+                }
+
+                // Count non-tombstoned entries
+                if ((flags & FLAG_TOMBSTONE) == 0) {
+                    recoveredEntryCount++;
+                }
+            }
+        }
+
+        this.entryCount = recoveredEntryCount;
+        this.dataOffset = maxEndOffset;
     }
 
     // ==================== Public API ====================
@@ -444,6 +612,16 @@ public class Segment implements AutoCloseable {
 
             // Compute hash
             long keyHash = computeHash(key);
+
+            // WAL: Append to write-ahead log BEFORE modifying the segment
+            // This ensures the log is the source of truth for crash recovery
+            if (writeLog != null) {
+                try {
+                    writeLog.appendPut(key, value);
+                } catch (IOException e) {
+                    throw new IllegalStateException("Failed to append to write-ahead log", e);
+                }
+            }
 
             // Check if key already exists (update case)
             int existingSlot = findSlot(keyHash, key);
@@ -692,6 +870,16 @@ public class Segment implements AutoCloseable {
             // Check if already tombstoned
             if (isSlotTombstoned(slotIndex)) {
                 return false;
+            }
+
+            // WAL: Append to write-ahead log BEFORE modifying the segment
+            // This ensures the log is the source of truth for crash recovery
+            if (writeLog != null) {
+                try {
+                    writeLog.appendDelete(key);
+                } catch (IOException e) {
+                    throw new IllegalStateException("Failed to append to write-ahead log", e);
+                }
             }
 
             // Mark slot and entry as tombstoned
@@ -987,6 +1175,16 @@ public class Segment implements AutoCloseable {
         // Compute hash
         long keyHash = computeHash(key);
 
+        // WAL: Append to write-ahead log BEFORE modifying the segment
+        // This ensures the log is the source of truth for crash recovery
+        if (writeLog != null) {
+            try {
+                writeLog.appendPut(key, value);
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to append to write-ahead log", e);
+            }
+        }
+
         // Check if key already exists (update case)
         int existingSlot = findSlot(keyHash, key);
         if (existingSlot >= 0) {
@@ -1032,6 +1230,16 @@ public class Segment implements AutoCloseable {
         // Check if already tombstoned
         if (isSlotTombstoned(slotIndex)) {
             return false;
+        }
+
+        // WAL: Append to write-ahead log BEFORE modifying the segment
+        // This ensures the log is the source of truth for crash recovery
+        if (writeLog != null) {
+            try {
+                writeLog.appendDelete(key);
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to append to write-ahead log", e);
+            }
         }
 
         // Mark slot and entry as tombstoned
@@ -1115,9 +1323,13 @@ public class Segment implements AutoCloseable {
         long insertKeyHash = keyHash;
         byte[] insertKey = key;
         byte[] insertValue = value;
+        // CRITICAL: Track the ideal slot for the CURRENT entry being inserted.
+        // After a Robin Hood swap, this must be recalculated for the displaced entry.
+        int currentIdealSlot = idealSlot;
 
         while (distance < MAX_PROBE_LENGTH) {
-            int slotIndex = (idealSlot + distance) & (slotCount - 1);
+            // Use currentIdealSlot, not idealSlot, to probe from the correct ideal slot
+            int slotIndex = (currentIdealSlot + distance) & (slotCount - 1);
             long slotOffset = (long) slotIndex * SLOT_SIZE;
 
             // Check if slot is empty (unoccupied)
@@ -1144,6 +1356,11 @@ public class Segment implements AutoCloseable {
                 insertKeyHash = displaced.keyHash;
                 insertKey = displaced.key;
                 insertValue = displaced.value;
+
+                // CRITICAL FIX: Recalculate ideal slot for the displaced entry.
+                // The displaced entry has a different key hash, so its ideal slot
+                // is different from the original entry's ideal slot.
+                currentIdealSlot = (int) (insertKeyHash & (slotCount - 1));
 
                 // Critical: The displaced entry's distance must be incremented by 1.
                 // We've taken its slot, so from the next position, it's one step further
@@ -1727,6 +1944,25 @@ public class Segment implements AutoCloseable {
      */
     public WriteLog writeLog() {
         return writeLog;
+    }
+
+    /**
+     * Returns the current write log head position.
+     *
+     * <p>This is the byte offset in the write log up to which entries
+     * have been written. Used for tail scan to find entries that have
+     * not yet been integrated into the HNSW graph.</p>
+     *
+     * <p>When the write log is attached, this returns the current write
+     * offset. When no write log is attached, returns 0.</p>
+     *
+     * @return The write log head position in bytes
+     */
+    public long getWriteLogHead() {
+        if (writeLog == null) {
+            return 0;
+        }
+        return writeLog.writeOffset();
     }
 
     /**

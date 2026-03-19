@@ -29,16 +29,35 @@ public class IndexCoverage {
     
     /**
      * Create a new IndexCoverage.
-     * 
+     *
      * @param totalSegments  Total number of segments in the index
      * @param activeSegments Number of ACTIVE segments (fully indexed and optimized)
      * @param indexingSegments Number of INDEXING segments (being populated)
      * @param warmingSegments Number of WARMING segments (being optimized)
-     * @param estimatedCoverage Estimated fraction of corpus covered
+     * @param estimatedCoverage Estimated fraction of corpus covered (must be in [0.0, 1.0])
      * @param degraded true if coverage is below readiness threshold
+     * @throws IllegalArgumentException if estimatedCoverage is outside [0.0, 1.0] or any count is negative
      */
     public IndexCoverage(int totalSegments, int activeSegments, int indexingSegments,
                          int warmingSegments, double estimatedCoverage, boolean degraded) {
+        // Domain correctness validation: coverage must be in [0.0, 1.0] (0-100%)
+        // Note: NaN checks are explicit because NaN comparisons always return false
+        if (Double.isNaN(estimatedCoverage) || estimatedCoverage < 0.0 || estimatedCoverage > 1.0) {
+            throw new IllegalArgumentException(
+                "estimatedCoverage must be in range [0.0, 1.0], got: " + estimatedCoverage);
+        }
+        if (totalSegments < 0) {
+            throw new IllegalArgumentException("totalSegments cannot be negative: " + totalSegments);
+        }
+        if (activeSegments < 0) {
+            throw new IllegalArgumentException("activeSegments cannot be negative: " + activeSegments);
+        }
+        if (indexingSegments < 0) {
+            throw new IllegalArgumentException("indexingSegments cannot be negative: " + indexingSegments);
+        }
+        if (warmingSegments < 0) {
+            throw new IllegalArgumentException("warmingSegments cannot be negative: " + warmingSegments);
+        }
         this.totalSegments = totalSegments;
         this.activeSegments = activeSegments;
         this.indexingSegments = indexingSegments;

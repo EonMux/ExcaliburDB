@@ -489,6 +489,430 @@ class VectorBlockTest {
         }
     }
 
+    @Nested
+    @DisplayName("Constructor edge cases")
+    class ConstructorEdgeCases {
+
+        @Test
+        @DisplayName("Constructor with null layout throws NPE")
+        void constructorNullLayout() {
+            assertThatThrownBy(() -> new VectorBlock(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Layout must not be null");
+        }
+
+        @Test
+        @DisplayName("Constructor with null layout and direct flag throws NPE")
+        void constructorNullLayoutDirect() {
+            assertThatThrownBy(() -> new VectorBlock(null, true))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Layout must not be null");
+        }
+
+        @Test
+        @DisplayName("Constructor with null buffer throws NPE")
+        void constructorNullBuffer() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            assertThatThrownBy(() -> new VectorBlock(layout, (java.nio.ByteBuffer) null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Buffer must not be null");
+        }
+
+        @Test
+        @DisplayName("Constructor with buffer too small throws IAE")
+        void constructorBufferTooSmall() {
+            VectorLayout layout = VectorLayout.create(128, 100);
+            java.nio.ByteBuffer smallBuffer = java.nio.ByteBuffer.allocate(100);
+
+            assertThatThrownBy(() -> new VectorBlock(layout, smallBuffer))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Buffer too small");
+        }
+
+        @Test
+        @DisplayName("Constructor with ByteBuffer wraps correctly")
+        void constructorWithByteBuffer() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            long size = layout.totalBlockSize();
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate((int) size);
+
+            VectorBlock block = new VectorBlock(layout, buffer);
+
+            assertThat(block.layout()).isEqualTo(layout);
+            assertThat(block.dimension()).isEqualTo(4);
+            assertThat(block.vectorCount()).isEqualTo(10);
+        }
+    }
+
+    @Nested
+    @DisplayName("Index validation")
+    class IndexValidation {
+
+        @Test
+        @DisplayName("getVector with negative index throws IAE")
+        void getVectorNegativeIndex() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.getVector(-1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Vector index out of range");
+        }
+
+        @Test
+        @DisplayName("getVector with index too large throws IAE")
+        void getVectorIndexTooLarge() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.getVector(10))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Vector index out of range");
+        }
+
+        @Test
+        @DisplayName("putVector with negative index throws IAE")
+        void putVectorNegativeIndex() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] v = {1.0f, 2.0f, 3.0f, 4.0f};
+
+            assertThatThrownBy(() -> block.putVector(-1, v))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Vector index out of range");
+        }
+
+        @Test
+        @DisplayName("putVector with null vector throws IAE")
+        void putVectorNullVector() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.putVector(0, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Vector must have dimension");
+        }
+
+        @Test
+        @DisplayName("putVector with wrong dimension throws IAE")
+        void putVectorWrongDimension() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] v = {1.0f, 2.0f, 3.0f}; // Only 3 elements
+
+            assertThatThrownBy(() -> block.putVector(0, v))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Vector must have dimension");
+        }
+
+        @Test
+        @DisplayName("getElement with negative element index throws IAE")
+        void getElementNegativeElementIndex() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.getElement(0, -1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Element index out of range");
+        }
+
+        @Test
+        @DisplayName("getElement with element index too large throws IAE")
+        void getElementIndexTooLarge() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.getElement(0, 4))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Element index out of range");
+        }
+
+        @Test
+        @DisplayName("putElement with negative element index throws IAE")
+        void putElementNegativeElementIndex() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.putElement(0, -1, 1.0f))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Element index out of range");
+        }
+    }
+
+    @Nested
+    @DisplayName("getVector with destination array")
+    class GetVectorWithDestination {
+
+        @Test
+        @DisplayName("getVector with destination array works")
+        void getVectorWithDestination() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] v = {1.0f, 2.0f, 3.0f, 4.0f};
+            block.putVector(5, v);
+
+            float[] dest = new float[10];
+            block.getVector(5, dest, 2);
+
+            assertThat(dest[2]).isEqualTo(1.0f);
+            assertThat(dest[3]).isEqualTo(2.0f);
+            assertThat(dest[4]).isEqualTo(3.0f);
+            assertThat(dest[5]).isEqualTo(4.0f);
+        }
+
+        @Test
+        @DisplayName("getVector with null destination throws IAE")
+        void getVectorNullDestination() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.getVector(0, null, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Destination array too small");
+        }
+
+        @Test
+        @DisplayName("getVector with destination too small throws IAE")
+        void getVectorDestinationTooSmall() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] dest = new float[3];
+
+            assertThatThrownBy(() -> block.getVector(0, dest, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Destination array too small");
+        }
+    }
+
+    @Nested
+    @DisplayName("Batch operations error handling")
+    class BatchOperationsErrors {
+
+        @Test
+        @DisplayName("putVectors with null array throws IAE")
+        void putVectorsNullArray() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.putVectors(null, 0, 5))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Vectors array must not be null");
+        }
+
+        @Test
+        @DisplayName("putVectors with negative offset throws IAE")
+        void putVectorsNegativeOffset() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[][] vectors = new float[5][4];
+
+            assertThatThrownBy(() -> block.putVectors(vectors, -1, 3))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid offset or count");
+        }
+
+        @Test
+        @DisplayName("putVectors with count exceeding capacity throws IAE")
+        void putVectorsCountExceedsCapacity() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[][] vectors = new float[20][4];
+
+            assertThatThrownBy(() -> block.putVectors(vectors, 0, 15))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Count exceeds block capacity");
+        }
+
+        @Test
+        @DisplayName("putVectorsFlat with null array throws IAE")
+        void putVectorsFlatNullArray() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.putVectorsFlat(null, 0, 5))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Vectors array must not be null");
+        }
+
+        @Test
+        @DisplayName("putVectorsFlat with negative offset throws IAE")
+        void putVectorsFlatNegativeOffset() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] flat = new float[100];
+
+            assertThatThrownBy(() -> block.putVectorsFlat(flat, -1, 5))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid offset or count");
+        }
+
+        @Test
+        @DisplayName("putVectorsFlat with insufficient data throws IAE")
+        void putVectorsFlatInsufficientData() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] flat = new float[10]; // Not enough for 5 vectors of dim 4
+
+            assertThatThrownBy(() -> block.putVectorsFlat(flat, 0, 5))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Insufficient data in array");
+        }
+
+        @Test
+        @DisplayName("getVectorsFlat with null destination throws IAE")
+        void getVectorsFlatNullDestination() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThatThrownBy(() -> block.getVectorsFlat(null, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Destination array must not be null");
+        }
+
+        @Test
+        @DisplayName("getVectorsFlat with destination too small throws IAE")
+        void getVectorsFlatDestinationTooSmall() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] dest = new float[10]; // Need 40 for 10 vectors of dim 4
+
+            assertThatThrownBy(() -> block.getVectorsFlat(dest, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Destination array too small");
+        }
+    }
+
+    @Nested
+    @DisplayName("computeDistances error handling")
+    class ComputeDistancesErrors {
+
+        @Test
+        @DisplayName("computeDistances with null query throws NPE")
+        void computeDistancesNullQuery() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] results = new float[10];
+
+            assertThatThrownBy(() -> block.computeDistances(null, results, DistanceType.L2))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Query vector must not be null");
+        }
+
+        @Test
+        @DisplayName("computeDistances with null results throws NPE")
+        void computeDistancesNullResults() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] query = {1.0f, 2.0f, 3.0f, 4.0f};
+
+            assertThatThrownBy(() -> block.computeDistances(query, null, DistanceType.L2))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Results array must not be null");
+        }
+
+        @Test
+        @DisplayName("computeDistances with null distance type throws NPE")
+        void computeDistancesNullDistanceType() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] query = {1.0f, 2.0f, 3.0f, 4.0f};
+            float[] results = new float[10];
+
+            assertThatThrownBy(() -> block.computeDistances(query, results, null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Distance type must not be null");
+        }
+
+        @Test
+        @DisplayName("computeDistances with query dimension mismatch throws IAE")
+        void computeDistancesQueryDimensionMismatch() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] query = {1.0f, 2.0f, 3.0f}; // Only 3 elements
+            float[] results = new float[10];
+
+            assertThatThrownBy(() -> block.computeDistances(query, results, DistanceType.L2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Query dimension mismatch");
+        }
+
+        @Test
+        @DisplayName("computeDistances with results array too small throws IAE")
+        void computeDistancesResultsTooSmall() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+            float[] query = {1.0f, 2.0f, 3.0f, 4.0f};
+            float[] results = new float[5]; // Need 10
+
+            assertThatThrownBy(() -> block.computeDistances(query, results, DistanceType.L2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Results array too small");
+        }
+    }
+
+    @Nested
+    @DisplayName("Accessors")
+    class Accessors {
+
+        @Test
+        @DisplayName("layout returns the layout")
+        void layoutAccessor() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThat(block.layout()).isEqualTo(layout);
+        }
+
+        @Test
+        @DisplayName("dimension returns the dimension")
+        void dimensionAccessor() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThat(block.dimension()).isEqualTo(4);
+        }
+
+        @Test
+        @DisplayName("vectorCount returns the count")
+        void vectorCountAccessor() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThat(block.vectorCount()).isEqualTo(10);
+        }
+
+        @Test
+        @DisplayName("buffer returns the buffer")
+        void bufferAccessor() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThat(block.buffer()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("size returns total block size")
+        void sizeAccessor() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            assertThat(block.size()).isEqualTo(layout.totalBlockSize());
+        }
+
+        @Test
+        @DisplayName("toString contains useful information")
+        void toStringContainsInfo() {
+            VectorLayout layout = VectorLayout.create(4, 10);
+            VectorBlock block = new VectorBlock(layout);
+
+            String str = block.toString();
+
+            assertThat(str).contains("VectorBlock");
+            assertThat(str).contains("dimension=4");
+            assertThat(str).contains("vectorCount=10");
+        }
+    }
+
     // Helper methods
 
     private static float[] createRandomVector(int dimension, long seed) {

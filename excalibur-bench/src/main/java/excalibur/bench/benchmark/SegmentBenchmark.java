@@ -28,6 +28,12 @@ import java.util.concurrent.TimeUnit;
  *   <li>Capacity is power of 2 in range [1024, 1048576]</li>
  * </ul>
  *
+ * <h2>Thread Safety</h2>
+ * <p>This is a JMH benchmark class. JMH handles all thread safety for benchmark
+ * execution. The benchmark state is managed by JMH's @State annotations which
+ * provide proper isolation between threads. The Segment being tested has its
+ * own thread-safety guarantees documented in its class Javadoc.</p>
+ *
  * @author ExcaliburDB
  */
 @BenchmarkMode(Mode.Throughput)

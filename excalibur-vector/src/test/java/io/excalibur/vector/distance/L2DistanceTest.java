@@ -305,6 +305,58 @@ class L2DistanceTest {
             float[] b = {3.0f, 4.0f};
             assertThat(distance.computeSquared(a, b)).isEqualTo(25.0f);
         }
+
+        @Test
+        @DisplayName("Squared distance null first vector throws NPE")
+        void squaredDistance_nullFirstVector() {
+            float[] b = {1.0f, 2.0f, 3.0f};
+            assertThatThrownBy(() -> distance.computeSquared(null, b))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("First vector");
+        }
+
+        @Test
+        @DisplayName("Squared distance null second vector throws NPE")
+        void squaredDistance_nullSecondVector() {
+            float[] a = {1.0f, 2.0f, 3.0f};
+            assertThatThrownBy(() -> distance.computeSquared(a, null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Second vector");
+        }
+
+        @Test
+        @DisplayName("Squared distance mismatched dimensions throws IAE")
+        void squaredDistance_mismatchedDimensions() {
+            float[] a = {1.0f, 2.0f, 3.0f};
+            float[] b = {1.0f, 2.0f};
+            assertThatThrownBy(() -> distance.computeSquared(a, b))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("dimensions must match");
+        }
+
+        @Test
+        @DisplayName("Squared distance empty vectors returns 0")
+        void squaredDistance_emptyVectors() {
+            float[] a = {};
+            float[] b = {};
+            assertThat(distance.computeSquared(a, b)).isEqualTo(0.0f);
+        }
+
+        @Test
+        @DisplayName("Squared distance with large vector uses vectorized path")
+        void squaredDistance_largeVectorVectorized() {
+            float[] a = new float[128];
+            float[] b = new float[128];
+            for (int i = 0; i < 128; i++) {
+                a[i] = i;
+                b[i] = i + 1;
+            }
+
+            float squared = distance.computeSquared(a, b);
+
+            // Each element diff is 1, so squared = 128 * 1 = 128
+            assertThat(squared).isEqualTo(128.0f);
+        }
     }
 
     @Nested

@@ -1,7 +1,13 @@
 package io.excalibur.store;
 
+import io.excalibur.store.catalog.CatalogFile;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.lang.foreign.Arena;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -110,13 +116,41 @@ public class SegmentCatalog {
      */
     private final CatalogMetadata metadata = new CatalogMetadata();
 
+    /**
+     * Persistent catalog file for durable storage.
+     * May be null if persistence is not enabled (in-memory only mode).
+     */
+    private final CatalogFile catalogFile;
+
     // ==================== Constructors ====================
 
     /**
-     * Creates a new empty catalog.
+     * Creates a new empty catalog (in-memory only, no persistence).
+     *
+     * <p><strong>Warning:</strong> Using this constructor means all catalog
+     * metadata will be lost on restart. For persistent catalogs, use
+     * {@link #SegmentCatalog(Path, Arena)} instead.</p>
      */
     public SegmentCatalog() {
-        // Default initial capacity
+        this.catalogFile = null;
+    }
+
+    /**
+     * Creates a new catalog with persistent storage.
+     *
+     * <p>The catalog file is created if it doesn't exist, or opened if it does.
+     * Call {@link #recover()} after construction to load persisted metadata.</p>
+     *
+     * @param catalogPath Path to the catalog file
+     * @param arena Arena for memory allocation (currently unused, reserved for future)
+     * @throws UncheckedIOException if the catalog file cannot be created or opened
+     */
+    public SegmentCatalog(Path catalogPath, Arena arena) {
+        try {
+            this.catalogFile = new CatalogFile(catalogPath);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to open catalog file: " + catalogPath, e);
+        }
     }
 
     // ==================== Public API - Segment Operations ====================
@@ -127,12 +161,16 @@ public class SegmentCatalog {
      * <p>This is the primary method for updating segment metadata. It atomically
      * updates all fields for a given segment ID.</p>
      *
+     * <p><strong>Important:</strong> This method now synchronizes both the entry state
+     * AND the lifecycle state. The lifecycle state is derived from the entry state
+     * to ensure consistency.</p>
+     *
      * @param segmentId Unique segment identifier
      * @param entryState Current state of entries in the segment
      * @param deltaChange In delta for entry count
      */
     public void update(long segmentId, int entryState, int deltaChange) {
-        SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k -> 
+        SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
             new SegmentMetadata(segmentId));
 
         // Update entry state
@@ -140,6 +178,9 @@ public class SegmentCatalog {
 
         // Update entry count using delta for atomic updates
         metadata.setEntryCount(metadata.getEntryCount() + deltaChange);
+
+        // Synchronize lifecycle state with entry state for consistency
+        syncLifecycleState(metadata, entryState);
 
         // Track catalog statistics
         if (entryState == ENTRY_STATE_ACTIVE) {
@@ -151,6 +192,64 @@ public class SegmentCatalog {
 
         // Update catalog metadata
         updateCatalogMetadata();
+
+        // Persist to disk
+        persistSegment(metadata);
+    }
+
+    /**
+     * Synchronizes the lifecycle state with the entry state.
+     *
+     * <p>This ensures the lifecycle state enum stays in sync with the entry state integer,
+     * maintaining backward compatibility while properly utilizing the lifecycle state machine.</p>
+     *
+     * @param metadata The segment metadata to update
+     * @param entryState The entry state to sync from
+     */
+    private void syncLifecycleState(SegmentMetadata metadata, int entryState) {
+        LifecycleState targetLifecycleState = entryStateToLifecycleState(entryState);
+        if (targetLifecycleState != null && metadata.getLifecycleState() != targetLifecycleState) {
+            try {
+                // Use internal setter to bypass transition validation for sync operations
+                metadata.setLifecycleStateInternal(targetLifecycleState);
+            } catch (Exception e) {
+                // Log but don't fail the update if transition is invalid
+                // This allows the entry state to be updated even if lifecycle
+                // state can't transition
+            }
+        }
+    }
+
+    /**
+     * Converts an entry state constant to the corresponding lifecycle state.
+     *
+     * @param entryState The entry state
+     * @return The corresponding lifecycle state, or null if no mapping exists
+     */
+    private LifecycleState entryStateToLifecycleState(int entryState) {
+        switch (entryState) {
+            case ENTRY_STATE_NONE: return LifecycleState.BOOTSTRAPPING;
+            case ENTRY_STATE_INDEXING: return LifecycleState.INDEXING;
+            case ENTRY_STATE_WARMING: return LifecycleState.WARMING;
+            case ENTRY_STATE_ACTIVE: return LifecycleState.ACTIVE;
+            case ENTRY_STATE_COMPACTING: return LifecycleState.COMPACTING;
+            case ENTRY_STATE_DELETED: return LifecycleState.TOMBSTONED;
+            default: return null;
+        }
+    }
+
+    /**
+     * Updates entry count for a segment without changing state.
+     *
+     * @param segmentId Unique segment identifier
+     * @param deltaChange Change in entry count (can be negative for deletions)
+     */
+    public void updateEntryCount(long segmentId, int deltaChange) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata != null) {
+            metadata.setEntryCount(metadata.getEntryCount() + deltaChange);
+            updateCatalogMetadata();
+        }
     }
 
     /**
@@ -195,7 +294,7 @@ public class SegmentCatalog {
      * @return The created metadata
      */
     public SegmentMetadata add(long segmentId, Path volumePath) {
-        SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k -> 
+        SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
             new SegmentMetadata(segmentId));
 
         metadata.setVolumePath(volumePath);
@@ -206,6 +305,9 @@ public class SegmentCatalog {
         volumeToSegments.computeIfAbsent(volumePath, k -> new java.util.ArrayList<>())
             .add(segmentId);
 
+        // Persist to disk
+        persistSegment(metadata);
+
         return metadata;
     }
 
@@ -215,12 +317,36 @@ public class SegmentCatalog {
      * <p>This is typically called when a segment is purged or tombstoned.
      * The segment remains in memory until explicitly removed.</p>
      *
+     * <p><strong>CRITICAL:</strong> This method transitions the segment to PURGED state.
+     * The segment MUST be in TOMBSTONED state before calling this method,
+     * otherwise an IllegalStateException will be thrown.</p>
+     *
      * @param segmentId Unique segment identifier
+     * @throws IllegalStateException if segment is not in TOMBSTONED state
      */
     public void remove(long segmentId) {
-        SegmentMetadata metadata = segments.remove(segmentId);
-        
-        if (metadata != null && metadata.getVolumePath() != null) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            return; // Already removed
+        }
+
+        // Validate state before removal - segment must be TOMBSTONED
+        if (metadata.getLifecycleState() != LifecycleState.TOMBSTONED) {
+            throw new IllegalStateException(
+                "Cannot remove segment " + segmentId + " in state " + metadata.getLifecycleState() +
+                ". Segment must be in TOMBSTONED state before removal.");
+        }
+
+        // Transition to PURGED first (validates TOMBSTONED -> PURGED transition)
+        metadata.transitionToPurged();
+
+        // Persist the PURGED state before removing from memory
+        persistSegment(metadata);
+
+        // Now remove from collections
+        segments.remove(segmentId);
+
+        if (metadata.getVolumePath() != null) {
             java.util.List<Long> segmentIds = volumeToSegments.get(metadata.getVolumePath());
             if (segmentIds != null) {
                 segmentIds.remove(segmentId);
@@ -229,8 +355,6 @@ public class SegmentCatalog {
                 }
             }
         }
-
-        metadata.transitionToPurged();
     }
 
     /**
@@ -241,6 +365,175 @@ public class SegmentCatalog {
      */
     public boolean contains(long segmentId) {
         return segments.containsKey(segmentId);
+    }
+
+    // ==================== Lifecycle Transition Methods ====================
+
+    /**
+     * Completes the indexing phase for a segment and transitions it to WARMING.
+     *
+     * <p>This method should be called when all entries for a batch have been
+     * written to the segment and the Cuckoo filter and LSH have been populated.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @throws IllegalStateException if the segment is not in INDEXING state
+     * @throws IllegalArgumentException if segment not found
+     */
+    public void completeIndexing(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("Segment not found: " + segmentId);
+        }
+        metadata.transitionToWarming();
+        updateCatalogMetadata();
+        persistSegment(metadata);
+    }
+
+    /**
+     * Completes the warming phase for a segment and transitions it to ACTIVE.
+     *
+     * <p>This method should be called when HNSW edge optimization and PQ
+     * codebook training are complete.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @throws IllegalStateException if the segment is not in WARMING state
+     * @throws IllegalArgumentException if segment not found
+     */
+    public void completeWarmup(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("Segment not found: " + segmentId);
+        }
+        metadata.transitionToActive();
+        updateCatalogMetadata();
+        persistSegment(metadata);
+    }
+
+    /**
+     * Begins compaction for a segment and transitions it to COMPACTING.
+     *
+     * <p>This method should be called when a compaction worker starts
+     * cleaning up tombstones in the segment.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @throws IllegalStateException if the segment is not in ACTIVE state
+     * @throws IllegalArgumentException if segment not found
+     */
+    public void beginCompaction(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("Segment not found: " + segmentId);
+        }
+        metadata.transitionToCompacting();
+        updateCatalogMetadata();
+        persistSegment(metadata);
+    }
+
+    /**
+     * Completes compaction for a segment and transitions it back to ACTIVE.
+     *
+     * <p>This method should be called when a compaction worker finishes
+     * cleaning up tombstones in the segment.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @throws IllegalStateException if the segment is not in COMPACTING state
+     * @throws IllegalArgumentException if segment not found
+     */
+    public void completeCompaction(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("Segment not found: " + segmentId);
+        }
+        // Transition from COMPACTING back to ACTIVE
+        metadata.setLifecycleState(LifecycleState.ACTIVE);
+        metadata.setEntryState(ENTRY_STATE_ACTIVE);
+        metadata.setLastCompactionTime(System.currentTimeMillis());
+        updateCatalogMetadata();
+        persistSegment(metadata);
+    }
+
+    /**
+     * Marks a segment as TOMBSTONED, making it invisible to new queries.
+     *
+     * <p>This method should be called when a segment is scheduled for deletion.
+     * The segment remains on disk until epoch-based reclamation completes.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @throws IllegalStateException if the segment is not in ACTIVE or COMPACTING state
+     * @throws IllegalArgumentException if segment not found
+     */
+    public void tombstone(long segmentId) {
+        tombstone(segmentId, -1);
+    }
+
+    /**
+     * Marks a segment as TOMBSTONED with visibility epoch tracking.
+     *
+     * <p>This method should be called when a segment is scheduled for deletion.
+     * The segment remains on disk until epoch-based reclamation completes.
+     * The visibility epoch is recorded to enable epoch-based visibility tracking.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @param visibilityEpoch The current visibility epoch from the StorageEngine
+     * @throws IllegalStateException if the segment is not in ACTIVE or COMPACTING state
+     * @throws IllegalArgumentException if segment not found
+     */
+    public void tombstone(long segmentId, long visibilityEpoch) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("Segment not found: " + segmentId);
+        }
+        if (visibilityEpoch >= 0) {
+            metadata.transitionToTombstoned(visibilityEpoch);
+        } else {
+            metadata.transitionToTombstoned();
+        }
+        updateCatalogMetadata();
+        persistSegment(metadata);
+    }
+
+    /**
+     * Marks a segment as ready for indexing by transitioning from BOOTSTRAPPING to INDEXING.
+     *
+     * <p>This is typically called automatically by {@link #add(long, Path)}.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @throws IllegalStateException if the segment is not in BOOTSTRAPPING state
+     * @throws IllegalArgumentException if segment not found
+     */
+    public void beginIndexing(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("Segment not found: " + segmentId);
+        }
+        metadata.transitionToIndexing();
+        updateCatalogMetadata();
+        persistSegment(metadata);
+    }
+
+    /**
+     * Gets all segments in a specific lifecycle state.
+     *
+     * @param state The lifecycle state to filter by
+     * @return List of segment IDs in the specified state
+     */
+    public java.util.List<Long> getSegmentsByState(LifecycleState state) {
+        return segments.values().stream()
+            .filter(m -> m.getLifecycleState() == state)
+            .map(SegmentMetadata::getSegmentId)
+            .collect(java.util.stream.Collectors.toList());
+    }
+
+    /**
+     * Gets all segments that are queryable (INDEXING, WARMING, ACTIVE, COMPACTING).
+     *
+     * @return List of queryable segment IDs
+     */
+    public java.util.List<Long> getQueryableSegments() {
+        return segments.values().stream()
+            .filter(m -> m.getLifecycleState().isQueryable())
+            .map(SegmentMetadata::getSegmentId)
+            .collect(java.util.stream.Collectors.toList());
     }
 
     /**
@@ -254,7 +547,7 @@ public class SegmentCatalog {
 
     /**
      * Clears the entire catalog.
-     * 
+     *
      * <p>Use with caution - this removes all segment metadata.</p>
      */
     public void clear() {
@@ -262,6 +555,128 @@ public class SegmentCatalog {
         volumeToSegments.clear();
         metadata.reset();
         segmentIdGenerator.set(0);
+    }
+
+    // ==================== Persistence Methods ====================
+
+    /**
+     * Recovers persisted catalog metadata from disk.
+     *
+     * <p>This method loads all segment metadata from the catalog file and
+     * populates the in-memory catalog. It should be called after construction
+     * when using persistent storage.</p>
+     *
+     * <p>If persistence is not enabled (in-memory only mode), this method
+     * does nothing.</p>
+     *
+     * <p>Records that fail CRC validation are skipped, providing graceful
+     * recovery from partial writes or corruption.</p>
+     *
+     * @throws UncheckedIOException if the catalog file cannot be read
+     */
+    public void recover() {
+        if (catalogFile == null) {
+            return; // No persistence enabled
+        }
+
+        try {
+            List<SegmentMetadata> persisted = catalogFile.readAll();
+
+            for (SegmentMetadata metadata : persisted) {
+                // Skip PURGED segments - they're fully deleted
+                if (metadata.getLifecycleState() == LifecycleState.PURGED) {
+                    continue;
+                }
+
+                // Add to in-memory structures
+                segments.put(metadata.getSegmentId(), metadata);
+
+                if (metadata.getVolumePath() != null) {
+                    volumeToSegments.computeIfAbsent(metadata.getVolumePath(), k -> new java.util.ArrayList<>())
+                        .add(metadata.getSegmentId());
+                }
+
+                // Update ID generator to avoid conflicts
+                segmentIdGenerator.accumulateAndGet(metadata.getSegmentId(), Math::max);
+            }
+
+            updateCatalogMetadata();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to recover catalog from: " + catalogFile.getPath(), e);
+        }
+    }
+
+    /**
+     * Flushes all pending changes to the catalog file.
+     *
+     * <p>This forces all metadata changes to be written to disk, ensuring
+     * durability. Call this before shutting down to ensure no data loss.</p>
+     *
+     * <p>If persistence is not enabled (in-memory only mode), this method
+     * does nothing.</p>
+     *
+     * @throws UncheckedIOException if the flush fails
+     */
+    public void flush() {
+        if (catalogFile == null) {
+            return; // No persistence enabled
+        }
+
+        try {
+            catalogFile.flush();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to flush catalog file: " + catalogFile.getPath(), e);
+        }
+    }
+
+    /**
+     * Closes the catalog file and releases resources.
+     *
+     * <p>This flushes any pending changes and closes the underlying file.
+     * After calling this method, the catalog is still usable in-memory but
+     * persistence operations will fail.</p>
+     *
+     * <p>If persistence is not enabled (in-memory only mode), this method
+     * does nothing.</p>
+     */
+    public void close() {
+        if (catalogFile != null) {
+            try {
+                catalogFile.close();
+            } catch (Exception e) {
+                // Ignore close errors
+            }
+        }
+    }
+
+    /**
+     * Checks if persistence is enabled for this catalog.
+     *
+     * @return true if the catalog has a persistent backing store
+     */
+    public boolean isPersistent() {
+        return catalogFile != null;
+    }
+
+    /**
+     * Persists a single segment's metadata to disk.
+     *
+     * <p>This is an internal method called after in-memory updates to ensure
+     * the change is durable. If persistence is not enabled, this method does
+     * nothing.</p>
+     *
+     * @param metadata The metadata to persist
+     */
+    private void persistSegment(SegmentMetadata metadata) {
+        if (catalogFile == null || metadata == null) {
+            return;
+        }
+
+        try {
+            catalogFile.writeSegment(metadata);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to persist segment metadata: " + metadata.getSegmentId(), e);
+        }
     }
 
     /**
@@ -440,6 +855,24 @@ public class SegmentCatalog {
         private long lastActiveTime = 0;
 
         /**
+         * Epoch at which this segment was created.
+         * Set when the segment is first registered.
+         * Used for visibility tracking: queries with epoch < creationEpoch
+         * cannot see this segment.
+         * A value of -1 indicates the creation epoch has not been set.
+         */
+        private volatile long creationEpoch = -1;
+
+        /**
+         * Epoch at which this segment was tombstoned.
+         * Set when the segment transitions to TOMBSTONED state.
+         * Used for epoch-based reclamation: queries started before this epoch
+         * can still see the segment, while queries started after cannot.
+         * A value of -1 indicates the segment has not been tombstoned.
+         */
+        private volatile long tombstoneEpoch = -1;
+
+        /**
          * Creates new segment metadata.
          *
          * @param segmentId Unique segment identifier
@@ -538,6 +971,23 @@ public class SegmentCatalog {
         }
 
         /**
+         * Sets the lifecycle state without transition validation.
+         *
+         * <p>This is an internal method used by the catalog to sync lifecycle state
+         * with entry state. It bypasses validation to allow state synchronization
+         * during recovery or migration scenarios.</p>
+         *
+         * <p><strong>Warning:</strong> This method should only be used for internal
+         * synchronization. External callers should use {@link #setLifecycleState(LifecycleState)}
+         * to ensure valid transitions.</p>
+         *
+         * @param state The new lifecycle state
+         */
+        void setLifecycleStateInternal(LifecycleState state) {
+            this.lifecycleState = state;
+        }
+
+        /**
          * Sets the lifecycle state from an integer value.
          *
          * @param value The lifecycle state value
@@ -613,10 +1063,28 @@ public class SegmentCatalog {
         /**
          * Transition to the TOMBSTONED state.
          *
+         * <p>This method does NOT record the tombstone epoch. Use
+         * {@link #transitionToTombstoned(long)} to record the visibility epoch.</p>
+         *
          * @throws IllegalStateException if not in ACTIVE or COMPACTING state
          */
         public void transitionToTombstoned() {
             setLifecycleState(LifecycleState.TOMBSTONED);
+        }
+
+        /**
+         * Transition to the TOMBSTONED state with visibility epoch tracking.
+         *
+         * <p>This method records the visibility epoch at which the segment was
+         * tombstoned. Queries started before this epoch will still see the segment,
+         * while queries started at or after this epoch will not.</p>
+         *
+         * @param visibilityEpoch The current visibility epoch from the StorageEngine
+         * @throws IllegalStateException if not in ACTIVE or COMPACTING state
+         */
+        public void transitionToTombstoned(long visibilityEpoch) {
+            setLifecycleState(LifecycleState.TOMBSTONED);
+            this.tombstoneEpoch = visibilityEpoch;
         }
 
         /**
@@ -775,6 +1243,106 @@ public class SegmentCatalog {
          */
         public void incrementDeletedSegments() {
             this.lastActiveTime = System.currentTimeMillis();
+        }
+
+        /**
+         * Gets the epoch at which this segment was created.
+         *
+         * <p>The creation epoch is the visibility epoch value at the time
+         * the segment was first registered. Queries with epoch < creationEpoch
+         * cannot see this segment.</p>
+         *
+         * @return The creation epoch, or -1 if not set
+         */
+        public long getCreationEpoch() {
+            return creationEpoch;
+        }
+
+        /**
+         * Sets the creation epoch.
+         *
+         * <p>This should be called when a segment is first registered.
+         * The value should be the current visibility epoch from the VisibilityTracker.</p>
+         *
+         * @param epoch The visibility epoch at which the segment was created
+         */
+        public void setCreationEpoch(long epoch) {
+            this.creationEpoch = epoch;
+        }
+
+        /**
+         * Gets the epoch at which this segment was tombstoned.
+         *
+         * <p>The tombstone epoch is the visibility epoch value at the time
+         * the segment transitioned to TOMBSTONED state. Queries started
+         * before this epoch will still see the segment, while queries
+         * started at or after this epoch will not.</p>
+         *
+         * @return The tombstone epoch, or -1 if the segment has not been tombstoned
+         */
+        public long getTombstoneEpoch() {
+            return tombstoneEpoch;
+        }
+
+        /**
+         * Sets the tombstone epoch.
+         *
+         * <p>This should be called when a segment transitions to TOMBSTONED state.
+         * The value should be the current visibility epoch from the StorageEngine.</p>
+         *
+         * @param epoch The visibility epoch at which the segment was tombstoned
+         */
+        public void setTombstoneEpoch(long epoch) {
+            this.tombstoneEpoch = epoch;
+        }
+
+        /**
+         * Checks if this segment is visible at the given query epoch.
+         *
+         * <p>A segment is visible at epoch E if:</p>
+         * <ul>
+         *   <li>creationEpoch <= E (segment existed at query start)</li>
+         *   <li>E < tombstoneEpoch (segment was not tombstoned before query started)</li>
+         * </ul>
+         *
+         * <p><strong>Note:</strong> This method only checks epoch visibility, not lifecycle state.
+         * Callers should also check {@link #getLifecycleState()}.isQueryable() if needed.</p>
+         *
+         * @param queryEpoch The epoch at which a query started
+         * @return true if the segment is visible to the query
+         */
+        public boolean isVisibleAtEpoch(long queryEpoch) {
+            // If creation epoch is set and query epoch is before creation, not visible
+            if (creationEpoch >= 0 && queryEpoch < creationEpoch) {
+                return false;
+            }
+            // If not tombstoned, visible
+            if (tombstoneEpoch < 0) {
+                return true;
+            }
+            // If tombstoned after query started, visible to that query
+            return tombstoneEpoch > queryEpoch;
+        }
+
+        /**
+         * Checks if this segment was tombstoned after the given query epoch.
+         *
+         * <p>This is used for epoch-based visibility: a query that started at
+         * queryEpoch should still see segments that were tombstoned after
+         * the query started.</p>
+         *
+         * @param queryEpoch The epoch at which a query started
+         * @return true if the segment is visible to the query (tombstoned after query started, or not tombstoned)
+         * @deprecated Use {@link #isVisibleAtEpoch(long)} instead for full epoch visibility check
+         */
+        @Deprecated
+        public boolean wasTombstonedAfter(long queryEpoch) {
+            // If not tombstoned, always visible
+            if (tombstoneEpoch < 0) {
+                return true;
+            }
+            // If tombstoned after query started, visible to that query
+            return tombstoneEpoch > queryEpoch;
         }
 
         @Override

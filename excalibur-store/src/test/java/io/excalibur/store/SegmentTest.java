@@ -691,6 +691,71 @@ class SegmentTest {
                 }
             }
         }
+
+        /**
+         * CRITICAL TEST: Verifies the fix for displaced entries probing from the correct ideal slot.
+         *
+         * <p>Before the fix, after a Robin Hood swap:
+         * <ul>
+         *   <li>The displaced entry's keyHash was updated correctly</li>
+         *   <li>The displaced entry's distance was updated correctly</li>
+         *   <li>BUT the idealSlot was NOT recalculated for the displaced entry</li>
+         *   <li>This caused the displaced entry to probe from the ORIGINAL entry's ideal slot</li>
+         * </ul>
+         *
+         * <p>This test creates a scenario where:
+         * <ol>
+         *   <li>Multiple entries with DIFFERENT ideal slots are inserted</li>
+         *   <li>Robin Hood swaps occur during insertion</li>
+         *   <li>The displaced entry must probe from ITS OWN ideal slot, not the original's</li>
+         * </ol>
+         */
+        @Test
+        @DisplayName("Displaced entries must probe from their own ideal slot (not the original entry's)")
+        void testDisplacedEntryProbesFromCorrectIdealSlot() throws IOException {
+            // Create a small segment to increase collision probability and force swaps
+            segment.close();
+            segmentFile = tempDir.resolve("ideal-slot-fix-test.bin");
+            segment = new Segment(segmentFile, 16 * 1024, arena); // 16KB for many collisions
+
+            // Insert entries with diverse keys that will have different ideal slots
+            // but collide during insertion, forcing Robin Hood swaps
+            int entryCount = 300;
+            List<String> keys = new ArrayList<>();
+            List<String> values = new ArrayList<>();
+
+            // Use keys with varying patterns to ensure different hash values
+            for (int i = 0; i < entryCount; i++) {
+                // Create keys that will distribute across different ideal slots
+                String key = "ideal-slot-test-" + (i * 17) + "-" + (i % 13);
+                String value = "value-" + i + "-data-" + (i * 31);
+                keys.add(key);
+                values.add(value);
+                segment.put(key.getBytes(), value.getBytes());
+            }
+
+            // CRITICAL VERIFICATION: ALL entries must be retrievable
+            // If the ideal slot bug exists, entries would be placed at wrong positions
+            // and the stored distance would not match the actual distance from ideal slot,
+            // causing lookups to fail (early termination) or return wrong results
+            int foundCount = 0;
+            for (int i = 0; i < entryCount; i++) {
+                MemorySegment result = segment.get(keys.get(i).getBytes());
+                if (result != null) {
+                    String actualValue = new String(result.toArray(ValueLayout.JAVA_BYTE));
+                    assertEquals(values.get(i), actualValue,
+                        "Value mismatch for key " + i + ": expected '" + values.get(i) +
+                        "' but got '" + actualValue + "'");
+                    foundCount++;
+                } else {
+                    fail("Key not found: " + keys.get(i) + " at index " + i +
+                         " - this indicates displaced entry probed from wrong ideal slot");
+                }
+            }
+
+            assertEquals(entryCount, foundCount,
+                "All entries should be found - if some are missing, the ideal slot fix may be incorrect");
+        }
     }
 
 // ==================== Concurrent Reads Tests ====================
