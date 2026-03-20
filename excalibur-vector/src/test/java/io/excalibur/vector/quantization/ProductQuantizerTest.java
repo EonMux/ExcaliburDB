@@ -276,8 +276,13 @@ class ProductQuantizerTest {
     @DisplayName("Should train with typical embedding dimension")
     void testTypicalEmbeddingDimension() {
         // 768 is common for BERT embeddings
-        ProductQuantizer bertPq = new ProductQuantizer(768, 48, 256);
-        float[][] bertData = generateRandomVectors(500, 768);
+        // Use fast trainer settings for unit test speed:
+        // - Reduced training samples (256 min for 256 centroids)
+        // - Minimal iterations (3)
+        // - Relaxed convergence threshold
+        ProductQuantizer bertPq = new ProductQuantizer(768, 48, 256,
+            new CodebookTrainer(256, 3, 1e-2f, 42));
+        float[][] bertData = generateRandomVectors(256, 768);
 
         bertPq.train(bertData);
 
