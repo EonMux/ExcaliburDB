@@ -10,6 +10,9 @@ import java.util.zip.CRC32;
 /**
  * Represents a write-ahead log entry for crash recovery.
  *
+ * <h2>Consistent Entry Format</h2>
+ * <p>Each log entry follows the format: {@code [offset | entry_data]}</p>
+ *
  * <h2>Log Entry Format (Memory Layout)</h2>
  * <pre>
  * Offset 0:   opcode (1 byte: PUT=0x01, DELETE=0x02)
@@ -23,8 +26,15 @@ import java.util.zip.CRC32;
  * Offset 33+key_len+value_len: crc32 (4 bytes, CRC-32 of all preceding bytes)
  * </pre>
  *
+ * <h2>String Representation</h2>
+ * <p>String representations follow the consistent format:</p>
+ * <pre>
+ * [offset={offset} | opcode={op} lsn={lsn} ts={ts} keyHash={kh} keyLen={kl} valLen={vl}]
+ * </pre>
+ *
  * <h2>Domain Constraints</h2>
  * <ul>
+ *   <li>{@code offset}: Non-negative byte offset in log file, or -1 if not associated</li>
  *   <li>{@code opcode}: Exactly 0x01 (PUT) or 0x02 (DELETE)</li>
  *   <li>{@code lsn}: Range [0, Long.MAX_VALUE], monotonically increasing</li>
  *   <li>{@code timestamp}: Positive 64-bit epoch milliseconds</li>
@@ -146,11 +156,14 @@ public final class LogEntry {
     private final long keyHash;
     private final byte[] key;
     private final byte[] value;
+    private final long offset; // Byte offset in log file (-1 if not associated with a file)
 
     // ==================== Constructors ====================
 
     /**
-     * Creates a new log entry.
+     * Creates a new log entry without file offset association.
+     *
+     * <p>Use this constructor when creating entries for writing (offset is unknown until written).</p>
      *
      * @param opcode   Operation type (PUT or DELETE)
      * @param lsn      Log sequence number (must be non-negative)
@@ -162,6 +175,27 @@ public final class LogEntry {
      * @throws NullPointerException if key or value is null
      */
     public LogEntry(byte opcode, long lsn, long timestamp, long keyHash, byte[] key, byte[] value) {
+        this(opcode, lsn, timestamp, keyHash, key, value, -1);
+    }
+
+    /**
+     * Creates a new log entry with file offset.
+     *
+     * <p>Use this constructor when reading entries from a log file.</p>
+     *
+     * <p><strong>Consistent Format:</strong> Log entries follow the format {@code [offset | entry_data]}</p>
+     *
+     * @param opcode   Operation type (PUT or DELETE)
+     * @param lsn      Log sequence number (must be non-negative)
+     * @param timestamp Epoch timestamp in milliseconds (must be positive)
+     * @param keyHash  64-bit hash of the key (must be non-negative)
+     * @param key      The key bytes (must not be null)
+     * @param value    The value bytes (must not be null; can be empty for DELETE)
+     * @param offset   Byte offset in log file (-1 if not associated with a file)
+     * @throws IllegalArgumentException if any constraint is violated
+     * @throws NullPointerException if key or value is null
+     */
+    public LogEntry(byte opcode, long lsn, long timestamp, long keyHash, byte[] key, byte[] value, long offset) {
         validateOpcode(opcode);
         validateLsn(lsn);
         validateTimestamp(timestamp);
@@ -175,6 +209,7 @@ public final class LogEntry {
         this.keyHash = keyHash;
         this.key = key.clone(); // Defensive copy for immutability
         this.value = value.clone(); // Defensive copy for immutability
+        this.offset = offset;
     }
 
     // ==================== Factory Methods ====================
@@ -260,7 +295,7 @@ public final class LogEntry {
                 ", Computed: 0x" + Integer.toHexString(computedCrc));
         }
 
-        return new LogEntry(opcode, lsn, timestamp, keyHash, key, value);
+        return new LogEntry(opcode, lsn, timestamp, keyHash, key, value, offset);
     }
 
     /**
@@ -294,7 +329,7 @@ public final class LogEntry {
             valueSlice.asByteBuffer().get(value);
         }
 
-        return new LogEntry(opcode, lsn, timestamp, keyHash, key, value);
+        return new LogEntry(opcode, lsn, timestamp, keyHash, key, value, offset);
     }
 
     /**
@@ -334,7 +369,7 @@ public final class LogEntry {
             throw new IllegalStateException("CRC32 validation failed");
         }
 
-        return new LogEntry(opcode, lsn, timestamp, keyHash, key, value);
+        return new LogEntry(opcode, lsn, timestamp, keyHash, key, value, offset);
     }
 
     /**
@@ -740,6 +775,15 @@ public final class LogEntry {
         return opcode == OPCODE_DELETE;
     }
 
+    /**
+     * Returns the byte offset of this entry in the log file.
+     *
+     * @return The offset (-1 if not associated with a file)
+     */
+    public long offset() {
+        return offset;
+    }
+
     // ==================== Object Methods ====================
 
     @Override
@@ -751,6 +795,7 @@ public final class LogEntry {
                lsn == logEntry.lsn &&
                timestamp == logEntry.timestamp &&
                keyHash == logEntry.keyHash &&
+               offset == logEntry.offset &&
                java.util.Arrays.equals(key, logEntry.key) &&
                java.util.Arrays.equals(value, logEntry.value);
     }
@@ -761,6 +806,7 @@ public final class LogEntry {
         result = 31 * result + Long.hashCode(lsn);
         result = 31 * result + Long.hashCode(timestamp);
         result = 31 * result + Long.hashCode(keyHash);
+        result = 31 * result + Long.hashCode(offset);
         result = 31 * result + java.util.Arrays.hashCode(key);
         result = 31 * result + java.util.Arrays.hashCode(value);
         return result;
@@ -768,35 +814,44 @@ public final class LogEntry {
 
     @Override
     public String toString() {
+        // Consistent format: [offset | entry_data]
+        // entry_data = opcode lsn timestamp keyHash keyLen valueLen
         return String.format(
-            "LogEntry{opcode=0x%02X, lsn=%d, timestamp=%d, keyHash=0x%016X, keyLen=%d, valueLen=%d}",
-            opcode, lsn, timestamp, keyHash, key.length, value.length);
+            "[offset=%d | opcode=0x%02X lsn=%d ts=%d keyHash=0x%016X keyLen=%d valLen=%d]",
+            offset, opcode, lsn, timestamp, keyHash, key.length, value.length);
     }
 
     /**
      * Returns a detailed string representation including key bytes (for debugging).
      *
+     * <p>Format: {@code [offset={offset} | opcode={op} lsn={lsn} ts={ts} keyHash={kh} key=[...] valLen={len}]}</p>
+     *
      * @param maxKeyBytes Maximum number of key bytes to include in output
-     * @return Detailed string representation
+     * @return Detailed string representation in consistent format
      */
     public String toString(int maxKeyBytes) {
-        StringBuilder sb = new StringBuilder("LogEntry{");
-        sb.append(String.format("opcode=0x%02X (%s), ", opcode, isPut() ? "PUT" : "DELETE"));
-        sb.append(String.format("lsn=%d, timestamp=%d, ", lsn, timestamp));
-        sb.append(String.format("keyHash=0x%016X, ", keyHash));
+        // Consistent format: [offset | entry_data]
+        StringBuilder sb = new StringBuilder("[offset=");
+        sb.append(offset);
+        sb.append(" | opcode=0x");
+        sb.append(String.format("%02X", opcode));
+        sb.append(" (").append(isPut() ? "PUT" : "DELETE").append(")");
+        sb.append(" lsn=").append(lsn);
+        sb.append(" ts=").append(timestamp);
+        sb.append(" keyHash=0x").append(String.format("%016X", keyHash));
 
         int showBytes = Math.min(maxKeyBytes, key.length);
-        sb.append("key=[");
+        sb.append(" key=[");
         for (int i = 0; i < showBytes; i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(String.format("0x%02X", key[i]));
+            if (i > 0) sb.append(" ");
+            sb.append(String.format("%02X", key[i]));
         }
         if (key.length > showBytes) {
-            sb.append(", ...");
+            sb.append(" ...");
         }
-        sb.append("], ");
+        sb.append("]");
 
-        sb.append(String.format("valueLen=%d}", value.length));
+        sb.append(" valLen=").append(value.length).append("]");
         return sb.toString();
     }
 }

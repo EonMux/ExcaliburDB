@@ -5,6 +5,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
+
 import static org.assertj.core.api.Assertions.*;
 
 /**
@@ -17,8 +19,23 @@ import static org.assertj.core.api.Assertions.*;
 class HealthGaugeTest {
 
     @BeforeEach
-    void resetHealth() {
+    void resetHealth() throws Exception {
+        // Reset cooldown timer via reflection to avoid Thread.sleep in tests
+        resetCooldownTimer();
         HealthGauge.setFullyHealthy();
+    }
+
+    /**
+     * Resets the internal cooldown timer to allow immediate score changes in tests.
+     * This avoids the need for Thread.sleep(1100) in each test.
+     */
+    private void resetCooldownTimer() throws Exception {
+        Field field = HealthGauge.class.getDeclaredField("lastTransitionTime");
+        field.setAccessible(true);
+        Object atomicInt = field.get(null);
+        Field valueField = atomicInt.getClass().getDeclaredField("value");
+        valueField.setAccessible(true);
+        valueField.set(atomicInt, 0);
     }
 
     @Nested
@@ -27,9 +44,8 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should set valid score")
-        void shouldSetValidScore() throws InterruptedException {
-            // Wait for cooldown to pass
-            Thread.sleep(1100);
+        void shouldSetValidScore() throws Exception {
+            resetCooldownTimer();
             HealthGauge.setScore(0.75);
 
             assertThat(HealthGauge.getScore()).isEqualTo(0.75);
@@ -37,8 +53,8 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should set score to 1.0")
-        void shouldSetScoreToOne() throws InterruptedException {
-            Thread.sleep(1100);
+        void shouldSetScoreToOne() throws Exception {
+            resetCooldownTimer();
             HealthGauge.setScore(1.0);
 
             assertThat(HealthGauge.getScore()).isEqualTo(1.0);
@@ -46,8 +62,8 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should set score to 0.0")
-        void shouldSetScoreToZero() throws InterruptedException {
-            Thread.sleep(1100);
+        void shouldSetScoreToZero() throws Exception {
+            resetCooldownTimer();
             HealthGauge.setScore(0.0);
 
             assertThat(HealthGauge.getScore()).isEqualTo(0.0);
@@ -76,8 +92,8 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should return score in valid range")
-        void shouldReturnScoreInValidRange() throws InterruptedException {
-            Thread.sleep(1100);
+        void shouldReturnScoreInValidRange() throws Exception {
+            resetCooldownTimer();
             HealthGauge.setScore(0.5);
 
             double score = HealthGauge.getScore();
@@ -92,8 +108,8 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should be healthy when score >= 0.8")
-        void shouldBeHealthyWhenScoreHigh() throws InterruptedException {
-            Thread.sleep(1100);
+        void shouldBeHealthyWhenScoreHigh() throws Exception {
+            resetCooldownTimer();
             HealthGauge.setScore(0.85);
 
             assertThat(HealthGauge.isHealthy()).isTrue();
@@ -102,8 +118,8 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should be unhealthy when score < 0.8")
-        void shouldBeUnhealthyWhenScoreLow() throws InterruptedException {
-            Thread.sleep(1100);
+        void shouldBeUnhealthyWhenScoreLow() throws Exception {
+            resetCooldownTimer();
             HealthGauge.setScore(0.7);
 
             assertThat(HealthGauge.isHealthy()).isFalse();
@@ -117,8 +133,8 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should set fully healthy")
-        void shouldSetFullyHealthy() throws InterruptedException {
-            Thread.sleep(1100);
+        void shouldSetFullyHealthy() throws Exception {
+            resetCooldownTimer();
             double result = HealthGauge.setFullyHealthy();
 
             assertThat(result).isEqualTo(1.0);
@@ -127,8 +143,8 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should set fully unhealthy")
-        void shouldSetFullyUnhealthy() throws InterruptedException {
-            Thread.sleep(1100);
+        void shouldSetFullyUnhealthy() throws Exception {
+            resetCooldownTimer();
             double result = HealthGauge.setFullyUnhealthy();
 
             assertThat(result).isEqualTo(0.0);
@@ -155,15 +171,16 @@ class HealthGaugeTest {
 
         @Test
         @DisplayName("Should respect cooldown period")
-        void shouldRespectCooldown() throws InterruptedException {
+        void shouldRespectCooldown() throws Exception {
             // Initial state - healthy
+            resetCooldownTimer();
             HealthGauge.setFullyHealthy();
 
-            // First change should be blocked if within cooldown
+            // First change should be blocked if within cooldown (cooldown is now active)
             HealthGauge.setScore(0.5); // May be blocked by cooldown
 
-            // Wait for cooldown to pass
-            Thread.sleep(1100);
+            // Reset cooldown to allow the change
+            resetCooldownTimer();
 
             // This change should succeed
             HealthGauge.setScore(0.5);

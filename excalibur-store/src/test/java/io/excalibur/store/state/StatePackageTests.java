@@ -1,5 +1,7 @@
 package io.excalibur.store.state;
 
+import io.excalibur.store.LifecycleState;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -8,31 +10,32 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 /**
- * Tests for state package classes.
+ * Tests for state package classes using canonical LifecycleState enum.
  */
 @DisplayName("State Package Tests")
 class StatePackageTests {
 
     @Nested
-    @DisplayName("SegmentState Tests")
+    @DisplayName("SegmentState Deprecated Tests")
     class SegmentStateTests {
 
         @Test
         @DisplayName("Should have all expected states")
+        @SuppressWarnings("deprecation")
         void shouldHaveAllExpectedStates() {
-            assertThat(SegmentState.values()).containsExactlyInAnyOrder(
-                SegmentState.BOOTSTRAPPING,
-                SegmentState.INDEXING,
-                SegmentState.WARMING,
-                SegmentState.ACTIVE,
-                SegmentState.COMPACTING,
-                SegmentState.TOMBSTONED,
-                SegmentState.PURGED
-            );
+            // SegmentState is deprecated, test that it maps correctly to LifecycleState
+            assertThat(SegmentState.BOOTSTRAPPING.toLifecycleState()).isEqualTo(LifecycleState.BOOTSTRAPPING);
+            assertThat(SegmentState.INDEXING.toLifecycleState()).isEqualTo(LifecycleState.INDEXING);
+            assertThat(SegmentState.WARMING.toLifecycleState()).isEqualTo(LifecycleState.WARMING);
+            assertThat(SegmentState.ACTIVE.toLifecycleState()).isEqualTo(LifecycleState.ACTIVE);
+            assertThat(SegmentState.COMPACTING.toLifecycleState()).isEqualTo(LifecycleState.COMPACTING);
+            assertThat(SegmentState.TOMBSTONED.toLifecycleState()).isEqualTo(LifecycleState.TOMBSTONED);
+            assertThat(SegmentState.PURGED.toLifecycleState()).isEqualTo(LifecycleState.PURGED);
         }
 
         @Test
         @DisplayName("Should return correct codes")
+        @SuppressWarnings("deprecation")
         void shouldReturnCorrectCodes() {
             assertThat(SegmentState.BOOTSTRAPPING.getCode()).isEqualTo(0);
             assertThat(SegmentState.INDEXING.getCode()).isEqualTo(1);
@@ -45,6 +48,7 @@ class StatePackageTests {
 
         @Test
         @DisplayName("Should convert code to state")
+        @SuppressWarnings("deprecation")
         void shouldConvertCodeToState() {
             assertThat(SegmentState.fromCode(0)).isEqualTo(SegmentState.BOOTSTRAPPING);
             assertThat(SegmentState.fromCode(1)).isEqualTo(SegmentState.INDEXING);
@@ -57,6 +61,7 @@ class StatePackageTests {
 
         @Test
         @DisplayName("Should return null for invalid code")
+        @SuppressWarnings("deprecation")
         void shouldReturnNullForInvalidCode() {
             assertThat(SegmentState.fromCode(-1)).isNull();
             assertThat(SegmentState.fromCode(7)).isNull();
@@ -65,10 +70,24 @@ class StatePackageTests {
 
         @Test
         @DisplayName("Should return human readable names")
+        @SuppressWarnings("deprecation")
         void shouldReturnHumanReadableNames() {
             assertThat(SegmentState.BOOTSTRAPPING.toStringHuman()).isEqualTo("BOOTSTRAPPING");
             assertThat(SegmentState.INDEXING.toStringHuman()).isEqualTo("INDEXING");
             assertThat(SegmentState.ACTIVE.toStringHuman()).isEqualTo("ACTIVE");
+        }
+
+        @Test
+        @DisplayName("Should convert to and from LifecycleState")
+        @SuppressWarnings("deprecation")
+        void shouldConvertToAndFromLifecycleState() {
+            for (SegmentState ss : SegmentState.values()) {
+                LifecycleState ls = ss.toLifecycleState();
+                assertThat(ls.value()).isEqualTo(ss.getCode());
+
+                SegmentState converted = SegmentState.fromLifecycleState(ls);
+                assertThat(converted).isEqualTo(ss);
+            }
         }
     }
 
@@ -76,35 +95,35 @@ class StatePackageTests {
     @DisplayName("StateMachine Tests")
     class StateMachineTests {
 
-        private StateMachine<SegmentState> stateMachine;
+        private StateMachine stateMachine;
 
         @BeforeEach
         void setUp() {
-            stateMachine = new StateMachine<>(SegmentState.BOOTSTRAPPING);
+            stateMachine = new StateMachine(LifecycleState.BOOTSTRAPPING);
         }
 
         @Test
         @DisplayName("Should initialize with given state")
         void shouldInitializeWithGivenState() {
-            assertThat(stateMachine.get()).isEqualTo(SegmentState.BOOTSTRAPPING);
+            assertThat(stateMachine.get()).isEqualTo(LifecycleState.BOOTSTRAPPING);
         }
 
         @Test
         @DisplayName("Should transition to new state")
         void shouldTransitionToNewState() {
-            SegmentState previous = stateMachine.transitionTo(SegmentState.INDEXING);
+            LifecycleState previous = stateMachine.transitionTo(LifecycleState.INDEXING);
 
-            assertThat(previous).isEqualTo(SegmentState.BOOTSTRAPPING);
-            assertThat(stateMachine.get()).isEqualTo(SegmentState.INDEXING);
+            assertThat(previous).isEqualTo(LifecycleState.BOOTSTRAPPING);
+            assertThat(stateMachine.get()).isEqualTo(LifecycleState.INDEXING);
         }
 
         @Test
         @DisplayName("Should try transition to new state")
         void shouldTryTransitionToNewState() {
-            boolean success = stateMachine.tryTransitionTo(SegmentState.INDEXING);
+            boolean success = stateMachine.tryTransitionTo(LifecycleState.INDEXING);
 
             assertThat(success).isTrue();
-            assertThat(stateMachine.get()).isEqualTo(SegmentState.INDEXING);
+            assertThat(stateMachine.get()).isEqualTo(LifecycleState.INDEXING);
         }
 
         @Test
@@ -112,58 +131,58 @@ class StatePackageTests {
         void shouldIncrementTransitionCount() {
             assertThat(stateMachine.getTransitionCount()).isEqualTo(0);
 
-            stateMachine.transitionTo(SegmentState.INDEXING);
+            stateMachine.transitionTo(LifecycleState.INDEXING);
             assertThat(stateMachine.getTransitionCount()).isEqualTo(1);
 
-            stateMachine.transitionTo(SegmentState.WARMING);
+            stateMachine.transitionTo(LifecycleState.WARMING);
             assertThat(stateMachine.getTransitionCount()).isEqualTo(2);
         }
 
         @Test
         @DisplayName("Should check if queryable")
         void shouldCheckIfQueryable() {
-            stateMachine = new StateMachine<>(SegmentState.INDEXING);
+            stateMachine = new StateMachine(LifecycleState.INDEXING);
             assertThat(stateMachine.isQueryable()).isTrue();
 
-            stateMachine = new StateMachine<>(SegmentState.ACTIVE);
+            stateMachine = new StateMachine(LifecycleState.ACTIVE);
             assertThat(stateMachine.isQueryable()).isTrue();
 
-            stateMachine = new StateMachine<>(SegmentState.BOOTSTRAPPING);
+            stateMachine = new StateMachine(LifecycleState.BOOTSTRAPPING);
             assertThat(stateMachine.isQueryable()).isFalse();
 
-            stateMachine = new StateMachine<>(SegmentState.TOMBSTONED);
+            stateMachine = new StateMachine(LifecycleState.TOMBSTONED);
             assertThat(stateMachine.isQueryable()).isFalse();
         }
 
         @Test
         @DisplayName("Should check if active")
         void shouldCheckIfActive() {
-            stateMachine = new StateMachine<>(SegmentState.ACTIVE);
+            stateMachine = new StateMachine(LifecycleState.ACTIVE);
             assertThat(stateMachine.isActive()).isTrue();
 
-            stateMachine = new StateMachine<>(SegmentState.INDEXING);
+            stateMachine = new StateMachine(LifecycleState.INDEXING);
             assertThat(stateMachine.isActive()).isFalse();
         }
 
         @Test
         @DisplayName("Should check if terminal")
         void shouldCheckIfTerminal() {
-            stateMachine = new StateMachine<>(SegmentState.PURGED);
+            stateMachine = new StateMachine(LifecycleState.PURGED);
             assertThat(stateMachine.isTerminal()).isTrue();
 
-            stateMachine = new StateMachine<>(SegmentState.ACTIVE);
+            stateMachine = new StateMachine(LifecycleState.ACTIVE);
             assertThat(stateMachine.isTerminal()).isFalse();
         }
 
         @Test
         @DisplayName("Should reset to new state")
         void shouldResetToNewState() {
-            stateMachine.transitionTo(SegmentState.INDEXING);
-            stateMachine.transitionTo(SegmentState.ACTIVE);
+            stateMachine.transitionTo(LifecycleState.INDEXING);
+            stateMachine.transitionTo(LifecycleState.WARMING);
 
-            stateMachine.reset(SegmentState.BOOTSTRAPPING);
+            stateMachine.reset(LifecycleState.BOOTSTRAPPING);
 
-            assertThat(stateMachine.get()).isEqualTo(SegmentState.BOOTSTRAPPING);
+            assertThat(stateMachine.get()).isEqualTo(LifecycleState.BOOTSTRAPPING);
             assertThat(stateMachine.getTransitionCount()).isEqualTo(0);
         }
 
@@ -172,8 +191,22 @@ class StatePackageTests {
         void shouldReturnStateCode() {
             assertThat(stateMachine.getStateCode()).isEqualTo(0);
 
-            stateMachine.transitionTo(SegmentState.INDEXING);
+            stateMachine.transitionTo(LifecycleState.INDEXING);
             assertThat(stateMachine.getStateCode()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("Should reject null initial state")
+        void shouldRejectNullInitialState() {
+            assertThatThrownBy(() -> new StateMachine((LifecycleState) null))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        @Test
+        @DisplayName("Should reject null transition target")
+        void shouldRejectNullTransitionTarget() {
+            assertThatThrownBy(() -> stateMachine.transitionTo(null))
+                .isInstanceOf(IllegalArgumentException.class);
         }
     }
 
@@ -191,53 +224,53 @@ class StatePackageTests {
         @Test
         @DisplayName("Should initialize with segment ID")
         void shouldInitializeWithSegmentId() {
-            assertThat(transition.getState()).isEqualTo(SegmentState.BOOTSTRAPPING);
+            assertThat(transition.getState()).isEqualTo(LifecycleState.BOOTSTRAPPING);
         }
 
         @Test
         @DisplayName("Should initialize with custom initial state")
         void shouldInitializeWithCustomInitialState() {
-            transition = new SegmentStateTransition("test-segment", SegmentState.ACTIVE);
+            transition = new SegmentStateTransition("test-segment", LifecycleState.ACTIVE);
 
-            assertThat(transition.getState()).isEqualTo(SegmentState.ACTIVE);
+            assertThat(transition.getState()).isEqualTo(LifecycleState.ACTIVE);
         }
 
         @Test
         @DisplayName("Should transition to new state")
         void shouldTransitionToNewState() {
-            SegmentState previous = transition.transitionTo(SegmentState.INDEXING);
+            LifecycleState previous = transition.transitionTo(LifecycleState.INDEXING);
 
-            assertThat(previous).isEqualTo(SegmentState.BOOTSTRAPPING);
-            assertThat(transition.getState()).isEqualTo(SegmentState.INDEXING);
+            assertThat(previous).isEqualTo(LifecycleState.BOOTSTRAPPING);
+            assertThat(transition.getState()).isEqualTo(LifecycleState.INDEXING);
         }
 
         @Test
         @DisplayName("Should try transition to new state")
         void shouldTryTransitionToNewState() {
-            boolean success = transition.tryTransitionTo(SegmentState.INDEXING);
+            boolean success = transition.tryTransitionTo(LifecycleState.INDEXING);
 
             assertThat(success).isTrue();
-            assertThat(transition.getState()).isEqualTo(SegmentState.INDEXING);
+            assertThat(transition.getState()).isEqualTo(LifecycleState.INDEXING);
         }
 
         @Test
         @DisplayName("Should check if queryable")
         void shouldCheckIfQueryable() {
-            transition = new SegmentStateTransition("test", SegmentState.INDEXING);
+            transition = new SegmentStateTransition("test", LifecycleState.INDEXING);
             assertThat(transition.isQueryable()).isTrue();
         }
 
         @Test
         @DisplayName("Should check if active")
         void shouldCheckIfActive() {
-            transition = new SegmentStateTransition("test", SegmentState.ACTIVE);
+            transition = new SegmentStateTransition("test", LifecycleState.ACTIVE);
             assertThat(transition.isActive()).isTrue();
         }
 
         @Test
         @DisplayName("Should check if terminal")
         void shouldCheckIfTerminal() {
-            transition = new SegmentStateTransition("test", SegmentState.PURGED);
+            transition = new SegmentStateTransition("test", LifecycleState.PURGED);
             assertThat(transition.isTerminal()).isTrue();
         }
 
@@ -246,15 +279,15 @@ class StatePackageTests {
         void shouldGetTransitionCount() {
             assertThat(transition.getTransitionCount()).isEqualTo(0);
 
-            transition.transitionTo(SegmentState.INDEXING);
+            transition.transitionTo(LifecycleState.INDEXING);
             assertThat(transition.getTransitionCount()).isEqualTo(1);
         }
 
         @Test
         @DisplayName("Should check if transition is valid")
         void shouldCheckIfTransitionIsValid() {
-            // With default validator, all transitions are valid
-            assertThat(transition.isTransitionValid(SegmentState.INDEXING)).isTrue();
+            // BOOTSTRAPPING -> INDEXING is a valid transition
+            assertThat(transition.isTransitionValid(LifecycleState.INDEXING)).isTrue();
         }
 
         @Test
@@ -281,18 +314,18 @@ class StatePackageTests {
         @Test
         @DisplayName("Should reset state")
         void shouldResetState() {
-            transition.transitionTo(SegmentState.INDEXING);
-            transition.reset(SegmentState.ACTIVE);
+            transition.transitionTo(LifecycleState.INDEXING);
+            transition.reset(LifecycleState.ACTIVE);
 
-            assertThat(transition.getState()).isEqualTo(SegmentState.ACTIVE);
+            assertThat(transition.getState()).isEqualTo(LifecycleState.ACTIVE);
             assertThat(transition.getTransitionCount()).isEqualTo(0);
         }
 
         @Test
         @DisplayName("Should record history")
         void shouldRecordHistory() {
-            transition.transitionTo(SegmentState.INDEXING);
-            transition.transitionTo(SegmentState.WARMING);
+            transition.transitionTo(LifecycleState.INDEXING);
+            transition.transitionTo(LifecycleState.WARMING);
 
             String history = transition.getHistory().toString();
 
@@ -307,6 +340,7 @@ class StatePackageTests {
 
         @Test
         @DisplayName("Should create successful result")
+        @SuppressWarnings("deprecation")
         void shouldCreateSuccessfulResult() {
             StateTransitionResult result = new StateTransitionResult(
                 SegmentState.BOOTSTRAPPING, SegmentState.INDEXING
@@ -320,6 +354,7 @@ class StatePackageTests {
 
         @Test
         @DisplayName("Should create failed result")
+        @SuppressWarnings("deprecation")
         void shouldCreateFailedResult() {
             StateTransitionResult result = new StateTransitionResult(
                 SegmentState.BOOTSTRAPPING, SegmentState.INDEXING, "Invalid transition"
@@ -331,6 +366,7 @@ class StatePackageTests {
 
         @Test
         @DisplayName("Should generate string for successful result")
+        @SuppressWarnings("deprecation")
         void shouldGenerateStringForSuccessfulResult() {
             StateTransitionResult result = new StateTransitionResult(
                 SegmentState.BOOTSTRAPPING, SegmentState.INDEXING
@@ -343,6 +379,7 @@ class StatePackageTests {
 
         @Test
         @DisplayName("Should generate string for failed result")
+        @SuppressWarnings("deprecation")
         void shouldGenerateStringForFailedResult() {
             StateTransitionResult result = new StateTransitionResult(
                 SegmentState.BOOTSTRAPPING, SegmentState.INDEXING, "Error message"
@@ -354,12 +391,52 @@ class StatePackageTests {
 
         @Test
         @DisplayName("Should check if has states")
+        @SuppressWarnings("deprecation")
         void shouldCheckIfHasStates() {
             StateTransitionResult result = new StateTransitionResult(
                 SegmentState.BOOTSTRAPPING, SegmentState.INDEXING
             );
 
             assertThat(result.hasStates()).isTrue();
+        }
+    }
+
+    @Nested
+    @DisplayName("State Validation Tests")
+    class StateValidationTests {
+
+        @Test
+        @DisplayName("Should validate LifecycleState as valid state")
+        void shouldValidateLifecycleStateAsValidState() {
+            assertThat(StateMachine.isValidState(LifecycleState.ACTIVE)).isTrue();
+            assertThat(StateMachine.isValidState(LifecycleState.INDEXING)).isTrue();
+            assertThat(StateMachine.isValidState(LifecycleState.BOOTSTRAPPING)).isTrue();
+        }
+
+        @Test
+        @DisplayName("Should reject non-LifecycleState objects")
+        void shouldRejectNonLifecycleStateObjects() {
+            assertThat(StateMachine.isValidState("ACTIVE")).isFalse();
+            assertThat(StateMachine.isValidState(1)).isFalse();
+            assertThat(StateMachine.isValidState(null)).isFalse();
+        }
+
+        @Test
+        @DisplayName("Should require valid state without exception")
+        void shouldRequireValidStateWithoutException() {
+            // Should not throw
+            StateMachine.requireValidState(LifecycleState.ACTIVE);
+            StateMachine.requireValidState(LifecycleState.INDEXING);
+        }
+
+        @Test
+        @DisplayName("Should throw on invalid state")
+        void shouldThrowOnInvalidState() {
+            assertThatThrownBy(() -> StateMachine.requireValidState("ACTIVE"))
+                .isInstanceOf(IllegalArgumentException.class);
+
+            assertThatThrownBy(() -> StateMachine.requireValidState(null))
+                .isInstanceOf(IllegalArgumentException.class);
         }
     }
 }

@@ -9,8 +9,10 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Set;
@@ -31,9 +33,15 @@ import java.util.Set;
  *   <li>Take top-k results</li>
  * </ol>
  *
+ * <h2>Sorting Modes</h2>
+ * <ul>
+ *   <li><strong>Distance sorting (ascending):</strong> Used for L2 distance where lower is better</li>
+ *   <li><strong>Relevance sorting (descending):</strong> Used for LLM relevancy scores where higher is better</li>
+ * </ul>
+ *
  * <h2>Domain Correctness</h2>
  * <ul>
- *   <li>Results are always sorted (closest/smallest distance first)</li>
+ *   <li>Results are always sorted (closest/smallest distance first OR highest relevance first)</li>
  *   <li>No duplicate document IDs in output</li>
  *   <li>Exactly k results (or fewer if insufficient candidates)</li>
  *   <li>Coverage is computed from segment statistics</li>
@@ -99,6 +107,24 @@ public class ResultAggregator {
      * <p>This method takes the list of segment query results and produces
      * a unified list of top-k QueryResultItems.</p>
      *
+     * <h3>Deduplication Strategy</h3>
+     * <p>When the same document ID appears in multiple segments (e.g., during re-indexing
+     * with rolling replacement), this method keeps the result with the BEST score
+     * (lowest distance for distance-based metrics). This ensures:</p>
+     * <ul>
+     *   <li>No duplicate document IDs in the final result set</li>
+     *   <li>The best matching result is retained when duplicates exist</li>
+     *   <li>Consistent behavior across segment overlap scenarios</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Results are sorted by score (ascending - closest first)</li>
+     *   <li>No duplicate document IDs in output</li>
+     *   <li>When duplicates exist, the one with the lowest score is kept</li>
+     *   <li>Exactly topK results (or fewer if insufficient candidates)</li>
+     * </ul>
+     *
      * @param segmentResults Results from each segment
      * @return Aggregated and ranked results (at most topK items)
      */
@@ -109,15 +135,11 @@ public class ResultAggregator {
             return new ArrayList<>();
         }
 
-        // Use a min-heap approach for efficient top-k selection
-        // Max-heap: keep largest (worst) at top so we can remove it
-        PriorityQueue<QueryResultItem> topResults = new PriorityQueue<>(
-            topK,
-            Comparator.comparingDouble(QueryResultItem::score).reversed()
-        );
-
-        // Track seen document IDs for deduplication
-        Set<Long> seenDocumentIds = new HashSet<>();
+        // Phase 1: Collect all results and deduplicate, keeping the best score for each document
+        // Using a map ensures we keep the best (lowest distance) result for each document ID
+        // This handles the case where the same document appears in multiple segments
+        // during re-indexing or segment overlap scenarios
+        Map<Long, QueryResultItem> bestResultsByDocId = new HashMap<>();
 
         // Process results from all segments
         for (SegmentQueryTask.SegmentQueryResult segmentResult : segmentResults) {
@@ -134,11 +156,6 @@ public class ResultAggregator {
 
                 long documentId = hnswResult.nodeId();
 
-                // Skip duplicates
-                if (!seenDocumentIds.add(documentId)) {
-                    continue;
-                }
-
                 // Create result item
                 QueryResultItem item = new QueryResultItem(
                     documentId,
@@ -148,22 +165,36 @@ public class ResultAggregator {
                     hnswResult.nodeId()
                 );
 
-                // Add to top-k heap
-                if (topResults.size() < topK) {
-                    topResults.add(item);
-                } else if (hnswResult.distance() < topResults.peek().score()) {
-                    topResults.poll();
-                    topResults.add(item);
-                }
+                // Keep the best (lowest distance) result for each document ID
+                // This ensures no duplicates and best score is retained
+                bestResultsByDocId.merge(documentId, item, (existing, newItem) ->
+                    newItem.score() < existing.score() ? newItem : existing
+                );
             }
         }
 
-        // Convert heap to sorted list (smallest distance first)
+        // Phase 2: Select top-k results using a max-heap
+        // Max-heap: keep largest (worst) at top so we can remove it
+        PriorityQueue<QueryResultItem> topResults = new PriorityQueue<>(
+            topK,
+            Comparator.comparingDouble(QueryResultItem::score).reversed()
+        );
+
+        for (QueryResultItem item : bestResultsByDocId.values()) {
+            if (topResults.size() < topK) {
+                topResults.add(item);
+            } else if (item.score() < topResults.peek().score()) {
+                topResults.poll();
+                topResults.add(item);
+            }
+        }
+
+        // Phase 3: Convert heap to sorted list (smallest distance first)
         List<QueryResultItem> results = new ArrayList<>(topResults);
         results.sort(Comparator.comparingDouble(QueryResultItem::score));
 
-        LOGGER.trace("Aggregated {} results from {} segments",
-            results.size(), segmentResults.size());
+        LOGGER.trace("Aggregated {} results from {} segments ({} unique documents)",
+            results.size(), segmentResults.size(), bestResultsByDocId.size());
 
         return results;
     }
@@ -233,6 +264,19 @@ public class ResultAggregator {
      *
      * <p>This is a simpler method for when full segment context isn't needed.</p>
      *
+     * <h3>Deduplication Strategy</h3>
+     * <p>When the same node ID appears in multiple result sets, this method keeps
+     * the result with the BEST (lowest) distance. This ensures no duplicates
+     * in the output and the best matching result is always retained.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Results are sorted by distance (ascending - closest first)</li>
+     *   <li>No duplicate node IDs in output</li>
+     *   <li>When duplicates exist, the one with the lowest distance is kept</li>
+     *   <li>Exactly k results (or fewer if insufficient candidates)</li>
+     * </ul>
+     *
      * @param allResults Results from all segments
      * @param k Number of results to return
      * @return Top-k merged results
@@ -244,33 +288,36 @@ public class ResultAggregator {
             return new ArrayList<>();
         }
 
-        // Use a max-heap for top-k selection
-        PriorityQueue<HnswSearchResult> topResults = new PriorityQueue<>(
-            k,
-            Comparator.comparingDouble(HnswSearchResult::distance).reversed()
-        );
-
-        Set<Long> seenNodeIds = new HashSet<>();
+        // Phase 1: Deduplicate by keeping the best (lowest distance) for each node ID
+        Map<Long, HnswSearchResult> bestResultsByNodeId = new HashMap<>();
 
         for (List<HnswSearchResult> segmentResults : allResults) {
             if (segmentResults == null) continue;
 
             for (HnswSearchResult result : segmentResults) {
-                // Skip duplicates
-                if (!seenNodeIds.add(result.nodeId())) {
-                    continue;
-                }
-
-                if (topResults.size() < k) {
-                    topResults.add(result);
-                } else if (result.distance() < topResults.peek().distance()) {
-                    topResults.poll();
-                    topResults.add(result);
-                }
+                // Keep the best (lowest distance) result for each node ID
+                bestResultsByNodeId.merge(result.nodeId(), result, (existing, newItem) ->
+                    newItem.distance() < existing.distance() ? newItem : existing
+                );
             }
         }
 
-        // Convert to sorted list
+        // Phase 2: Select top-k using a max-heap
+        PriorityQueue<HnswSearchResult> topResults = new PriorityQueue<>(
+            k,
+            Comparator.comparingDouble(HnswSearchResult::distance).reversed()
+        );
+
+        for (HnswSearchResult result : bestResultsByNodeId.values()) {
+            if (topResults.size() < k) {
+                topResults.add(result);
+            } else if (result.distance() < topResults.peek().distance()) {
+                topResults.poll();
+                topResults.add(result);
+            }
+        }
+
+        // Phase 3: Convert to sorted list
         List<HnswSearchResult> results = new ArrayList<>(topResults);
         results.sort(Comparator.comparingDouble(HnswSearchResult::distance));
 
@@ -296,5 +343,104 @@ public class ResultAggregator {
      */
     public double coverageThreshold() {
         return coverageThreshold;
+    }
+
+    // ==================== Relevance Score Sorting ====================
+
+    /**
+     * Sorts results by relevance score in descending order.
+     *
+     * <p>This method is used after LLM relevancy scoring, where higher scores
+     * indicate better matches. Results are sorted from highest relevance to lowest.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Results sorted by score descending (highest first)</li>
+     *   <li>Relevance scores should be in range [0.0, 1.0]</li>
+     *   <li>Original list is not modified (returns new sorted list)</li>
+     * </ul>
+     *
+     * @param results The results to sort (may be null or empty)
+     * @return New list sorted by relevance score descending
+     */
+    public static List<QueryResultItem> sortByRelevanceDescending(List<QueryResultItem> results) {
+        if (results == null || results.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        // Create a new list to avoid modifying the original
+        List<QueryResultItem> sorted = new ArrayList<>(results);
+
+        // Sort by relevance score descending (highest first)
+        // Using reversed() because higher relevance score = better match
+        sorted.sort(Comparator.comparingDouble(QueryResultItem::score).reversed());
+
+        return sorted;
+    }
+
+    /**
+     * Sorts results by distance in ascending order.
+     *
+     * <p>This method is used for vector distance metrics (L2, cosine distance)
+     * where lower values indicate closer matches.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Results sorted by distance ascending (closest first)</li>
+     *   <li>L2 distance should be in range [0.0, ∞)</li>
+     *   <li>Cosine distance should be in range [0.0, 2.0]</li>
+     *   <li>Original list is not modified (returns new sorted list)</li>
+     * </ul>
+     *
+     * @param results The results to sort (may be null or empty)
+     * @return New list sorted by distance ascending
+     */
+    public static List<QueryResultItem> sortByDistanceAscending(List<QueryResultItem> results) {
+        if (results == null || results.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        // Create a new list to avoid modifying the original
+        List<QueryResultItem> sorted = new ArrayList<>(results);
+
+        // Sort by distance ascending (closest first)
+        sorted.sort(Comparator.comparingDouble(QueryResultItem::score));
+
+        return sorted;
+    }
+
+    /**
+     * Sorts results based on the specified sorting mode.
+     *
+     * <p>Convenience method that delegates to the appropriate sorting method
+     * based on the sorting mode.</p>
+     *
+     * @param results The results to sort
+     * @param mode The sorting mode
+     * @return New sorted list
+     */
+    public static List<QueryResultItem> sort(List<QueryResultItem> results, SortMode mode) {
+        if (mode == SortMode.RELEVANCE_DESCENDING) {
+            return sortByRelevanceDescending(results);
+        } else {
+            return sortByDistanceAscending(results);
+        }
+    }
+
+    /**
+     * Sorting mode for query results.
+     */
+    public enum SortMode {
+        /**
+         * Sort by distance ascending (lower is better).
+         * Used for L2 distance and other distance metrics.
+         */
+        DISTANCE_ASCENDING,
+
+        /**
+         * Sort by relevance score descending (higher is better).
+         * Used for LLM relevancy scores and similarity metrics.
+         */
+        RELEVANCE_DESCENDING
     }
 }

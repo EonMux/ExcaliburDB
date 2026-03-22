@@ -13,8 +13,12 @@ dependencies {
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.mockito:mockito-core:5.14.2")
+    testImplementation("org.mockito:mockito-junit-jupiter:5.14.2")
 
-    // Phase 6, 7, 8 dependencies
+    // Phase 2, 5, 6, 7, 8 dependencies
+    implementation(project(":excalibur-store"))
+    implementation(project(":excalibur-shard"))
     implementation(project(":excalibur-query"))
     implementation(project(":excalibur-llm"))
     implementation(project(":excalibur-ingest"))

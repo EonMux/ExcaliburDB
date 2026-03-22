@@ -182,6 +182,115 @@ class WriteLogTest {
     }
 
     @Nested
+    @DisplayName("Batch Append Operations")
+    class BatchAppendOperationTests {
+
+        @Test
+        @DisplayName("Should append batch atomically with contiguous offsets")
+        void shouldAppendBatchAtomically() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                List<WriteLog.BatchEntry> entries = List.of(
+                    WriteLog.BatchEntry.put("key1".getBytes(StandardCharsets.UTF_8), "value1".getBytes(StandardCharsets.UTF_8)),
+                    WriteLog.BatchEntry.put("key2".getBytes(StandardCharsets.UTF_8), "value2".getBytes(StandardCharsets.UTF_8)),
+                    WriteLog.BatchEntry.put("key3".getBytes(StandardCharsets.UTF_8), "value3".getBytes(StandardCharsets.UTF_8))
+                );
+
+                WriteLog.BatchAppendResult result = log.appendBatch(entries);
+
+                assertThat(result).isNotNull();
+                assertThat(result.startOffset()).isGreaterThanOrEqualTo(0);
+                assertThat(result.endOffset()).isGreaterThan(result.startOffset());
+                assertThat(result.entryIds()).hasSize(3);
+                assertThat(result.getEntryCount()).isEqualTo(3);
+                assertThat(result.getByteSize()).isEqualTo(result.endOffset() - result.startOffset());
+            }
+        }
+
+        @Test
+        @DisplayName("Should assign unique sequential entry IDs in batch")
+        void shouldAssignUniqueEntryIdsInBatch() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                List<WriteLog.BatchEntry> entries = List.of(
+                    WriteLog.BatchEntry.put("k1".getBytes(), "v1".getBytes()),
+                    WriteLog.BatchEntry.put("k2".getBytes(), "v2".getBytes()),
+                    WriteLog.BatchEntry.put("k3".getBytes(), "v3".getBytes())
+                );
+
+                WriteLog.BatchAppendResult result = log.appendBatch(entries);
+                List<Long> entryIds = result.entryIds();
+
+                assertThat(entryIds.get(0)).isGreaterThanOrEqualTo(0);
+                for (int i = 1; i < entryIds.size(); i++) {
+                    assertThat(entryIds.get(i)).isGreaterThan(entryIds.get(i - 1));
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("Should throw for null entries")
+        void shouldThrowForNullEntries() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                assertThatNullPointerException()
+                    .isThrownBy(() -> log.appendBatch(null));
+            }
+        }
+
+        @Test
+        @DisplayName("Should throw for empty entries")
+        void shouldThrowForEmptyEntries() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                assertThatIllegalArgumentException()
+                    .isThrownBy(() -> log.appendBatch(List.of()))
+                    .withMessageContaining("empty");
+            }
+        }
+
+        @Test
+        @DisplayName("Should support batch with delete entries")
+        void shouldSupportBatchWithDeleteEntries() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                List<WriteLog.BatchEntry> entries = List.of(
+                    WriteLog.BatchEntry.put("key1".getBytes(), "value1".getBytes()),
+                    WriteLog.BatchEntry.delete("key2".getBytes()),
+                    WriteLog.BatchEntry.put("key3".getBytes(), "value3".getBytes())
+                );
+
+                WriteLog.BatchAppendResult result = log.appendBatch(entries);
+
+                assertThat(result.entryIds()).hasSize(3);
+            }
+        }
+
+        @Test
+        @DisplayName("Should ensure no interleaving between batches")
+        void shouldEnsureNoInterleavingBetweenBatches() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                List<WriteLog.BatchEntry> batch1 = List.of(
+                    WriteLog.BatchEntry.put("a1".getBytes(), "v1".getBytes()),
+                    WriteLog.BatchEntry.put("a2".getBytes(), "v2".getBytes())
+                );
+
+                List<WriteLog.BatchEntry> batch2 = List.of(
+                    WriteLog.BatchEntry.put("b1".getBytes(), "v1".getBytes()),
+                    WriteLog.BatchEntry.put("b2".getBytes(), "v2".getBytes()),
+                    WriteLog.BatchEntry.put("b3".getBytes(), "v3".getBytes())
+                );
+
+                WriteLog.BatchAppendResult result1 = log.appendBatch(batch1);
+                WriteLog.BatchAppendResult result2 = log.appendBatch(batch2);
+
+                boolean disjoint = (result1.endOffset() <= result2.startOffset()) ||
+                                   (result2.endOffset() <= result1.startOffset());
+                assertThat(disjoint)
+                    .withFailMessage("Batches should not overlap: [%d,%d) vs [%d,%d)",
+                        result1.startOffset(), result1.endOffset(),
+                        result2.startOffset(), result2.endOffset())
+                    .isTrue();
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("Entry ID Management")
     class EntryIdManagementTests {
 
@@ -647,6 +756,340 @@ class WriteLogTest {
                 long id = log.appendPut("key".getBytes(), largeValue);
 
                 assertThat(id).isGreaterThanOrEqualTo(0);
+            }
+        }
+    }
+
+    // ==================== Range Scan Tests (Phase 6 Tail Scan) ====================
+
+    @Nested
+    @DisplayName("Log Entry Format Consistency")
+    class LogEntryFormatConsistencyTests {
+
+        @Test
+        @DisplayName("LogEntry toString should follow [offset | entry_data] format")
+        void logEntryToStringShouldFollowConsistentFormat() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+
+                long writeHead = log.writeHead();
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                assertThat(entries).isNotEmpty();
+
+                LogEntry entry = entries.get(0);
+                String str = entry.toString();
+
+                // Should follow format: [offset=X | type=Y id=Z len=W crc=0xV]
+                assertThat(str).startsWith("[offset=");
+                assertThat(str).contains(" | ");
+                assertThat(str).endsWith("]");
+                assertThat(str).contains("type=");
+                assertThat(str).contains("id=");
+                assertThat(str).contains("crc=0x");
+            }
+        }
+
+        @Test
+        @DisplayName("PUT entry should include offset in toString")
+        void putEntryShouldIncludeOffsetInToString() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+
+                long writeHead = log.writeHead();
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                LogEntry entry = entries.get(0);
+                LogEntry.PutEntry putEntry = entry.asPutEntry();
+
+                assertThat(putEntry).isNotNull();
+                String str = putEntry.toString();
+
+                // Should follow format: [offset=X | PUT id=Y keyLen=Z valLen=W]
+                assertThat(str).startsWith("[offset=");
+                assertThat(str).contains(" | PUT");
+                assertThat(str).endsWith("]");
+                assertThat(str).contains("keyLen=");
+                assertThat(str).contains("valLen=");
+            }
+        }
+
+        @Test
+        @DisplayName("DELETE entry should include offset in toString")
+        void deleteEntryShouldIncludeOffsetInToString() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendDelete("key1");
+
+                long writeHead = log.writeHead();
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                LogEntry entry = entries.get(0);
+                LogEntry.DeleteEntry deleteEntry = entry.asDeleteEntry();
+
+                assertThat(deleteEntry).isNotNull();
+                String str = deleteEntry.toString();
+
+                // Should follow format: [offset=X | DELETE id=Y keyLen=Z]
+                assertThat(str).startsWith("[offset=");
+                assertThat(str).contains(" | DELETE");
+                assertThat(str).endsWith("]");
+                assertThat(str).contains("keyLen=");
+            }
+        }
+
+        @Test
+        @DisplayName("Entry offset should be non-negative")
+        void entryOffsetShouldBeNonNegative() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+                log.appendPut("key2", "value2");
+                log.appendDelete("key1");
+
+                long writeHead = log.writeHead();
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                for (LogEntry entry : entries) {
+                    assertThat(entry.getOffset()).isGreaterThanOrEqualTo(0);
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("Entry offsets should be monotonically increasing")
+        void entryOffsetsShouldBeMonotonicallyIncreasing() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+                log.appendPut("key2", "value2");
+                log.appendPut("key3", "value3");
+
+                long writeHead = log.writeHead();
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                long prevOffset = -1;
+                for (LogEntry entry : entries) {
+                    assertThat(entry.getOffset()).isGreaterThan(prevOffset);
+                    prevOffset = entry.getOffset();
+                }
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("Range Scan Operations")
+    class RangeScanOperationTests {
+
+        @Test
+        @DisplayName("Should return empty list for empty range")
+        void shouldReturnEmptyListForEmptyRange() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+
+                List<LogEntry> entries = log.scanRange(0, 0);
+
+                assertThat(entries).isEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("Should throw for negative start offset")
+        void shouldThrowForNegativeStartOffset() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                assertThatIllegalArgumentException()
+                    .isThrownBy(() -> log.scanRange(-1, 100))
+                    .withMessageContaining("startOffset must be non-negative");
+            }
+        }
+
+        @Test
+        @DisplayName("Should throw for end offset less than start offset")
+        void shouldThrowForEndOffsetLessThanStartOffset() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                assertThatIllegalArgumentException()
+                    .isThrownBy(() -> log.scanRange(100, 50))
+                    .withMessageContaining("endOffset must be >= startOffset");
+            }
+        }
+
+        @Test
+        @DisplayName("Should return entries within specified range")
+        void shouldReturnEntriesWithinSpecifiedRange() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+                log.appendPut("key2", "value2");
+                log.appendPut("key3", "value3");
+
+                // Get the write head to know the full range
+                long writeHead = log.writeHead();
+
+                // Scan from beginning to end
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                assertThat(entries).isNotEmpty();
+                // All entries should be PUT entries
+                assertThat(entries.stream().allMatch(e -> e.getType() == LogEntry.TYPE_PUT)).isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("Should return entries sorted by offset")
+        void shouldReturnEntriesSortedByOffset() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+                log.appendPut("key2", "value2");
+                log.appendPut("key3", "value3");
+
+                long writeHead = log.writeHead();
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                // Verify entries are sorted by offset
+                for (int i = 1; i < entries.size(); i++) {
+                    assertThat(entries.get(i).getOffset())
+                        .isGreaterThan(entries.get(i - 1).getOffset());
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("Should clamp end offset to write head")
+        void shouldClampEndOffsetToWriteHead() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+
+                long writeHead = log.writeHead();
+
+                // Request range beyond write head - should be clamped
+                List<LogEntry> entries = log.scanRange(0, writeHead + 10000);
+
+                // Should not throw and return available entries
+                assertThat(entries).isNotEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("Should handle scan with start offset beyond write head")
+        void shouldHandleScanWithStartOffsetBeyondWriteHead() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+
+                long writeHead = log.writeHead();
+
+                // Scan from beyond write head - should return empty
+                List<LogEntry> entries = log.scanRange(writeHead + 1000, writeHead + 2000);
+
+                assertThat(entries).isEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("Should include PUT and DELETE entries in range")
+        void shouldIncludePutAndDeleteEntriesInRange() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                log.appendPut("key1", "value1");
+                log.appendDelete("key2");
+                log.appendPut("key3", "value3");
+
+                long writeHead = log.writeHead();
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                boolean hasPut = entries.stream().anyMatch(e -> e.getType() == LogEntry.TYPE_PUT);
+                boolean hasDelete = entries.stream().anyMatch(e -> e.getType() == LogEntry.TYPE_DELETE);
+
+                assertThat(hasPut).isTrue();
+                assertThat(hasDelete).isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("Should scan tail entries for live indexing scenario")
+        void shouldScanTailEntriesForLiveIndexingScenario() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                // Simulate a live indexing scenario:
+                // 1. Some entries are already integrated (simulated by lastIntegratedOffset)
+                // 2. New entries exist in the write log beyond that point
+                // 3. Query needs to scan the "tail" for un-integrated entries
+
+                // Append initial entries
+                log.appendPut("doc1", "content1");
+                log.appendPut("doc2", "content2");
+
+                long lastIntegratedOffset = log.writeHead();
+
+                // Append more entries that are "not yet integrated"
+                log.appendPut("doc3", "content3");
+                log.appendPut("doc4", "content4");
+
+                long writeHead = log.writeHead();
+
+                // Scan the tail (un-integrated portion)
+                List<LogEntry> tailEntries = log.scanRange(lastIntegratedOffset, writeHead);
+
+                // Should return the un-integrated entries
+                assertThat(tailEntries).isNotEmpty();
+
+                // All tail entries should have offset >= lastIntegratedOffset
+                assertThat(tailEntries.stream()
+                    .allMatch(e -> e.getOffset() >= lastIntegratedOffset))
+                    .isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("Should work with memory-only log")
+        void shouldWorkWithMemoryOnlyLog() throws IOException {
+            WriteLog log = new WriteLog(100);
+
+            log.appendPut("key1", "value1");
+            log.appendPut("key2", "value2");
+
+            long writeHead = log.writeHead();
+            List<LogEntry> entries = log.scanRange(0, writeHead);
+
+            // Memory-only log has no file channel, but scanRange should still work
+            // from in-memory entries
+            assertThat(entries).isNotEmpty();
+
+            log.close();
+        }
+
+        @Test
+        @DisplayName("Should handle batch append and range scan")
+        void shouldHandleBatchAppendAndRangeScan() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                List<WriteLog.BatchEntry> batch = List.of(
+                    WriteLog.BatchEntry.put("k1".getBytes(), "v1".getBytes()),
+                    WriteLog.BatchEntry.put("k2".getBytes(), "v2".getBytes()),
+                    WriteLog.BatchEntry.put("k3".getBytes(), "v3".getBytes())
+                );
+
+                WriteLog.BatchAppendResult result = log.appendBatch(batch);
+
+                // Scan the batch range
+                List<LogEntry> entries = log.scanRange(result.startOffset(), result.endOffset());
+
+                assertThat(entries).hasSize(3);
+            }
+        }
+
+        @Test
+        @DisplayName("Should verify entry data integrity after scan")
+        void shouldVerifyEntryDataIntegrityAfterScan() throws IOException {
+            try (WriteLog log = new WriteLog(logPath)) {
+                String key = "testKey";
+                String value = "testValue";
+
+                log.appendPut(key, value);
+
+                long writeHead = log.writeHead();
+                List<LogEntry> entries = log.scanRange(0, writeHead);
+
+                assertThat(entries).hasSize(1);
+
+                LogEntry entry = entries.get(0);
+                LogEntry.PutEntry putEntry = entry.asPutEntry();
+
+                assertThat(putEntry).isNotNull();
+                assertThat(putEntry.getKeyAsString()).isEqualTo(key);
+                assertThat(putEntry.getValueAsString()).isEqualTo(value);
             }
         }
     }

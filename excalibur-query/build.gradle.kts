@@ -13,6 +13,8 @@ dependencies {
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.mockito:mockito-core:5.14.2")
+    testImplementation("org.mockito:mockito-junit-jupiter:5.14.2")
 
     // Phase 2 (Storage Engine - needed for WriteLog access)
     implementation(project(":excalibur-store"))
@@ -21,6 +23,9 @@ dependencies {
     implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-vector"))
     implementation(project(":excalibur-shard"))
+    
+    // Phase 8 dependency for document visibility tracking
+    implementation(project(":excalibur-ingest"))
 }
 
 tasks.withType<JavaCompile> {

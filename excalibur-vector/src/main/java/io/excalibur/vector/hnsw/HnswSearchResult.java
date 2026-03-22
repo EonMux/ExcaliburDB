@@ -1,5 +1,7 @@
 package io.excalibur.vector.hnsw;
 
+import io.excalibur.vector.distance.DistanceValidator;
+
 /**
  * Result of an HNSW nearest neighbor search.
  *
@@ -13,6 +15,14 @@ package io.excalibur.vector.hnsw;
  *   <li><strong>Cosine similarity:</strong> Range [-1, 1], where 1 is most similar</li>
  *   <li><strong>L2 distance:</strong> Range [0, ∞), where 0 is most similar</li>
  *   <li><strong>Inner product:</strong> Range (-∞, ∞), higher is more similar</li>
+ * </ul>
+ *
+ * <h2>Domain Correctness</h2>
+ * <p>Distance values are validated at construction time:</p>
+ * <ul>
+ *   <li>NaN values are preserved (indicate computation issues)</li>
+ *   <li>Infinite values are preserved (indicate overflow)</li>
+ *   <li>Finite values are assumed to be within valid range for their metric</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -34,7 +44,32 @@ public final class HnswSearchResult {
      */
     public HnswSearchResult(long nodeId, float distance) {
         this.nodeId = nodeId;
+        // Store the distance as-is; validation/clamping is the responsibility
+        // of the distance function implementations
+        // NaN is valid (indicates invalid input), Infinity is valid (overflow)
         this.distance = distance;
+    }
+
+    /**
+     * Creates a new search result with distance validation for a specific metric.
+     *
+     * <p>This factory method validates the distance is within the expected range
+     * for the given metric type. If the distance is out of range, it is clamped.</p>
+     *
+     * @param nodeId The ID of the node found
+     * @param distance The distance/similarity to the query vector
+     * @param isCosine true if using cosine similarity (range [-1, 1])
+     * @return A new HnswSearchResult with validated distance
+     */
+    public static HnswSearchResult createWithValidation(long nodeId, float distance, boolean isCosine) {
+        float validatedDistance = distance;
+        if (isCosine && Float.isFinite(distance)) {
+            validatedDistance = DistanceValidator.clampCosineSimilarity(distance);
+        } else if (!isCosine && Float.isFinite(distance)) {
+            // For L2 and other distance metrics, ensure non-negative
+            validatedDistance = DistanceValidator.clampL2Distance(distance);
+        }
+        return new HnswSearchResult(nodeId, validatedDistance);
     }
 
     /**

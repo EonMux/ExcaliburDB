@@ -190,9 +190,6 @@ public class SegmentCatalog {
             metadata.incrementDeletedSegments();
         }
 
-        // Update catalog metadata
-        updateCatalogMetadata();
-
         // Persist to disk
         persistSegment(metadata);
     }
@@ -248,7 +245,6 @@ public class SegmentCatalog {
         SegmentMetadata metadata = segments.get(segmentId);
         if (metadata != null) {
             metadata.setEntryCount(metadata.getEntryCount() + deltaChange);
-            updateCatalogMetadata();
         }
     }
 
@@ -385,7 +381,6 @@ public class SegmentCatalog {
             throw new IllegalArgumentException("Segment not found: " + segmentId);
         }
         metadata.transitionToWarming();
-        updateCatalogMetadata();
         persistSegment(metadata);
     }
 
@@ -405,7 +400,6 @@ public class SegmentCatalog {
             throw new IllegalArgumentException("Segment not found: " + segmentId);
         }
         metadata.transitionToActive();
-        updateCatalogMetadata();
         persistSegment(metadata);
     }
 
@@ -425,7 +419,6 @@ public class SegmentCatalog {
             throw new IllegalArgumentException("Segment not found: " + segmentId);
         }
         metadata.transitionToCompacting();
-        updateCatalogMetadata();
         persistSegment(metadata);
     }
 
@@ -448,7 +441,6 @@ public class SegmentCatalog {
         metadata.setLifecycleState(LifecycleState.ACTIVE);
         metadata.setEntryState(ENTRY_STATE_ACTIVE);
         metadata.setLastCompactionTime(System.currentTimeMillis());
-        updateCatalogMetadata();
         persistSegment(metadata);
     }
 
@@ -488,7 +480,6 @@ public class SegmentCatalog {
         } else {
             metadata.transitionToTombstoned();
         }
-        updateCatalogMetadata();
         persistSegment(metadata);
     }
 
@@ -507,7 +498,6 @@ public class SegmentCatalog {
             throw new IllegalArgumentException("Segment not found: " + segmentId);
         }
         metadata.transitionToIndexing();
-        updateCatalogMetadata();
         persistSegment(metadata);
     }
 
@@ -553,7 +543,6 @@ public class SegmentCatalog {
     public void clear() {
         segments.clear();
         volumeToSegments.clear();
-        metadata.reset();
         segmentIdGenerator.set(0);
     }
 
@@ -582,25 +571,23 @@ public class SegmentCatalog {
         try {
             List<SegmentMetadata> persisted = catalogFile.readAll();
 
-            for (SegmentMetadata metadata : persisted) {
+            for (SegmentMetadata segMetadata : persisted) {
                 // Skip PURGED segments - they're fully deleted
-                if (metadata.getLifecycleState() == LifecycleState.PURGED) {
+                if (segMetadata.getLifecycleState() == LifecycleState.PURGED) {
                     continue;
                 }
 
                 // Add to in-memory structures
-                segments.put(metadata.getSegmentId(), metadata);
+                segments.put(segMetadata.getSegmentId(), segMetadata);
 
-                if (metadata.getVolumePath() != null) {
-                    volumeToSegments.computeIfAbsent(metadata.getVolumePath(), k -> new java.util.ArrayList<>())
-                        .add(metadata.getSegmentId());
+                if (segMetadata.getVolumePath() != null) {
+                    volumeToSegments.computeIfAbsent(segMetadata.getVolumePath(), k -> new java.util.ArrayList<>())
+                        .add(segMetadata.getSegmentId());
                 }
 
                 // Update ID generator to avoid conflicts
-                segmentIdGenerator.accumulateAndGet(metadata.getSegmentId(), Math::max);
+                segmentIdGenerator.accumulateAndGet(segMetadata.getSegmentId(), Math::max);
             }
-
-            updateCatalogMetadata();
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to recover catalog from: " + catalogFile.getPath(), e);
         }
@@ -709,93 +696,57 @@ public class SegmentCatalog {
     /**
      * Returns the catalog metadata.
      *
-     * <p>Recalculates all counts from current segment states to ensure accuracy.</p>
+     * <p>Recalculates all counts from current segment states to ensure accuracy.
+     * Returns an immutable snapshot that will not be affected by subsequent updates.</p>
      *
-     * @return CatalogMetadata
+     * @return Immutable CatalogMetadata snapshot
      */
     public CatalogMetadata getCatalogMetadata() {
-        updateCatalogMetadata();
-        return metadata;
+        return computeCatalogMetadataSnapshot();
     }
 
     /**
-     * Updates catalog metadata with current statistics.
-     */
-    private void updateCatalogMetadata() {
-        metadata.setTotalSegments(segments.size());
-        metadata.setActiveSegments(getActiveSegmentCount());
-        metadata.setIndexingSegments(getIndexingSegmentCount());
-        metadata.setWarmSegments(getWarmSegmentCount());
-        metadata.setCompactingSegments(getCompactingSegmentCount());
-        metadata.setTombstonedSegments(getTombstonedSegmentCount());
-        metadata.setPurgedSegments(getPurgedSegmentCount());
-        metadata.setTotalEntryCount(getTotalEntryCount());
-    }
-
-    /**
-     * Gets the count of active segments.
+     * Computes and returns an immutable snapshot of catalog metadata.
      *
-     * @return Count of segments with lifecycle state ACTIVE
-     */
-    private long getActiveSegmentCount() {
-        return segments.values().stream()
-            .filter(m -> m.getLifecycleState() == LifecycleState.ACTIVE)
-            .count();
-    }
-
-    /**
-     * Gets the count of indexing segments.
+     * <p>This method iterates through all segments to compute accurate counts,
+     * ensuring no stale data. The returned snapshot is immutable and safe to
+     * cache by callers.</p>
      *
-     * @return Count of segments with lifecycle state INDEXING
-     */
-    private long getIndexingSegmentCount() {
-        return segments.values().stream()
-            .filter(m -> m.getLifecycleState() == LifecycleState.INDEXING)
-            .count();
-    }
-
-    /**
-     * Gets the count of warming segments.
+     * <p>Domain correctness guarantees:</p>
+     * <ul>
+     *   <li>All counts are computed from current segment states</li>
+     *   <li>No cached/stale values are returned</li>
+     *   <li>The snapshot is immutable after creation</li>
+     * </ul>
      *
-     * @return Count of segments with lifecycle state WARMING
+     * @return Immutable CatalogMetadata snapshot
      */
-    private long getWarmSegmentCount() {
-        return segments.values().stream()
-            .filter(m -> m.getLifecycleState() == LifecycleState.WARMING)
-            .count();
-    }
+    private CatalogMetadata computeCatalogMetadataSnapshot() {
+        long total = segments.size();
+        long active = 0;
+        long indexing = 0;
+        long warming = 0;
+        long compacting = 0;
+        long tombstoned = 0;
+        long purged = 0;
+        long totalEntryCount = 0;
 
-    /**
-     * Gets the count of compacting segments.
-     *
-     * @return Count of segments with lifecycle state COMPACTING
-     */
-    private long getCompactingSegmentCount() {
-        return segments.values().stream()
-            .filter(m -> m.getLifecycleState() == LifecycleState.COMPACTING)
-            .count();
-    }
+        for (SegmentMetadata m : segments.values()) {
+            LifecycleState state = m.getLifecycleState();
+            switch (state) {
+                case ACTIVE -> active++;
+                case INDEXING -> indexing++;
+                case WARMING -> warming++;
+                case COMPACTING -> compacting++;
+                case TOMBSTONED -> tombstoned++;
+                case PURGED -> purged++;
+                default -> {}
+            }
+            totalEntryCount += m.getEntryCount();
+        }
 
-    /**
-     * Gets the count of tombstoned segments.
-     *
-     * @return Count of segments with lifecycle state TOMBSTONED
-     */
-    private long getTombstonedSegmentCount() {
-        return segments.values().stream()
-            .filter(m -> m.getLifecycleState() == LifecycleState.TOMBSTONED)
-            .count();
-    }
-
-    /**
-     * Gets the count of purged segments.
-     *
-     * @return Count of segments with lifecycle state PURGED
-     */
-    private long getPurgedSegmentCount() {
-        return segments.values().stream()
-            .filter(m -> m.getLifecycleState() == LifecycleState.PURGED)
-            .count();
+        return new CatalogMetadata(total, active, indexing, warming, compacting,
+                                   tombstoned, purged, totalEntryCount);
     }
 
     /**
@@ -812,19 +763,159 @@ public class SegmentCatalog {
     /**
      * Computes estimated corpus coverage.
      *
-     * <p>Coverage is the ratio of active segments to total non-purged segments.</p>
+     * <p>Coverage is computed as the ratio of queryable segments to total non-purged segments.
+     * The value is clamped to [0.0, 1.0] to ensure domain correctness.</p>
      *
      * @return Coverage ratio (0.0 to 1.0)
      */
     public double getEstimatedCoverage() {
-        long totalActive = metadata.getTotalSegments();
-        long totalNonPurged = metadata.getTotalSegments() - metadata.getPurgedSegments();
-        
+        CatalogMetadata snapshot = getCatalogMetadata();
+        long totalNonPurged = snapshot.getTotalSegments() - snapshot.getPurgedSegments();
+
         if (totalNonPurged <= 0) {
             return 0.0;
         }
-        
-        return (double) metadata.getActiveSegments() / totalNonPurged;
+
+        long queryableSegments = snapshot.getActiveSegments() +
+                                 snapshot.getIndexingSegments() +
+                                 snapshot.getWarmSegments() +
+                                 snapshot.getCompactingSegments();
+
+        double rawCoverage = (double) queryableSegments / totalNonPurged;
+        return Math.max(0.0, Math.min(1.0, rawCoverage));
+    }
+
+    // ==================== Offset Tracking Methods ====================
+
+    /**
+     * Gets the last integrated offset for a segment.
+     *
+     * <p>The last integrated offset is the write log offset up to which all entries
+     * have been linked into the HNSW graph. Entries beyond this offset exist in
+     * the write log but are not yet in the graph.</p>
+     *
+     * <p><strong>Domain Constraints:</strong></p>
+     * <ul>
+     *   <li>Value is always non-negative (≥ 0)</li>
+     *   <li>Value is monotonically increasing</li>
+     *   <li>Value ≤ writeLogHead</li>
+     * </ul>
+     *
+     * @param segmentId Unique segment identifier
+     * @return Last integrated offset, or 0 if segment not found
+     */
+    public long getLastIntegratedOffset(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        return metadata != null ? metadata.getLastIntegratedOffset() : 0L;
+    }
+
+    /**
+     * Sets the last integrated offset for a segment.
+     *
+     * <p>This method should be called by the HNSW integration worker after
+     * successfully linking entries into the graph.</p>
+     *
+     * <p><strong>Thread Safety:</strong> This method delegates to
+     * {@link SegmentMetadata#compareAndSetLastIntegratedOffset(long)} which
+     * ensures atomic monotonic updates.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @param offset The new last integrated offset (must be ≥ 0)
+     * @return true if the offset was updated, false if segment not found or offset not greater
+     */
+    public boolean setLastIntegratedOffset(long segmentId, long offset) {
+        if (offset < 0) {
+            throw new IllegalArgumentException("Offset must be non-negative: " + offset);
+        }
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            return false;
+        }
+        return metadata.compareAndSetLastIntegratedOffset(offset);
+    }
+
+    /**
+     * Gets the write log head offset for a segment.
+     *
+     * <p>The write log head is the offset of the next byte to be written.
+     * All entries with offset < writeLogHead have been persisted to the write log.</p>
+     *
+     * <p><strong>Domain Constraints:</strong></p>
+     * <ul>
+     *   <li>Value is always non-negative (≥ 0)</li>
+     *   <li>Value is monotonically increasing</li>
+     *   <li>Value ≥ lastIntegratedOffset</li>
+     * </ul>
+     *
+     * @param segmentId Unique segment identifier
+     * @return Write log head offset, or 0 if segment not found
+     */
+    public long getWriteLogHead(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        return metadata != null ? metadata.getWriteLogHead() : 0L;
+    }
+
+    /**
+     * Sets the write log head offset for a segment.
+     *
+     * <p>This method should be called by the storage engine after successfully
+     * appending entries to the write log.</p>
+     *
+     * <p><strong>Thread Safety:</strong> This method uses atomic CAS operations
+     * to ensure monotonic updates.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @param offset The new write log head offset (must be ≥ 0)
+     * @return true if the offset was updated, false if segment not found or offset not greater
+     */
+    public boolean setWriteLogHead(long segmentId, long offset) {
+        if (offset < 0) {
+            throw new IllegalArgumentException("Offset must be non-negative: " + offset);
+        }
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            return false;
+        }
+        return metadata.compareAndSetWriteLogHead(offset);
+    }
+
+    /**
+     * Gets the tail scan size for a segment.
+     *
+     * <p>The tail scan size is the number of bytes that need to be scanned
+     * in the write log for entries not yet integrated into the HNSW graph.</p>
+     *
+     * <p><strong>Domain Constraints:</strong></p>
+     * <ul>
+     *   <li>Value is always non-negative (≥ 0)</li>
+     *   <li>Value = writeLogHead - lastIntegratedOffset</li>
+     * </ul>
+     *
+     * @param segmentId Unique segment identifier
+     * @return Tail scan size in bytes, or 0 if segment not found
+     */
+    public long getTailScanSize(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            return 0L;
+        }
+        long writeLogHead = metadata.getWriteLogHead();
+        long lastIntegrated = metadata.getLastIntegratedOffset();
+        // Clamp to non-negative to handle edge cases
+        return Math.max(0L, writeLogHead - lastIntegrated);
+    }
+
+    /**
+     * Checks if a segment has un-integrated entries in its write log tail.
+     *
+     * <p>This is used by the query pipeline to determine if a tail scan
+     * is needed for a segment.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @return true if there are un-integrated entries, false otherwise
+     */
+    public boolean hasTailEntries(long segmentId) {
+        return getTailScanSize(segmentId) > 0;
     }
 
     // ==================== Inner Classes ====================
@@ -847,8 +938,21 @@ public class SegmentCatalog {
         /**
          * Atomic last integrated offset for thread-safe updates.
          * Uses AtomicLong to ensure monotonic increase and visibility across threads.
+         *
+         * <p>This is the write log offset up to which all entries have been
+         * linked into the HNSW graph. Entries beyond this offset exist in
+         * the write log but are not yet in the graph.</p>
          */
         private final AtomicLong lastIntegratedOffset = new AtomicLong(0);
+
+        /**
+         * Atomic write log head offset for thread-safe updates.
+         * Uses AtomicLong to ensure monotonic increase and visibility across threads.
+         *
+         * <p>This is the offset of the next byte to be written to the write log.
+         * All entries with offset < writeLogHead have been persisted to the write log.</p>
+         */
+        private final AtomicLong writeLogHead = new AtomicLong(0);
 
         private long lastCompactionTime = 0;
         private long creationTime = 0;
@@ -1122,13 +1226,21 @@ public class SegmentCatalog {
         /**
          * Sets the last integrated offset.
          *
+         * <p><strong>Domain Constraint:</strong> The offset must be non-negative.
+         * This method validates the input and throws an exception if negative.</p>
+         *
          * <p><strong>Note:</strong> This method directly sets the offset without
          * checking monotonicity. Use {@link #compareAndSetLastIntegratedOffset(long)}
          * for thread-safe updates that guarantee monotonic increase.</p>
          *
-         * @param lastIntegratedOffset Last integrated offset
+         * @param lastIntegratedOffset Last integrated offset (must be >= 0)
+         * @throws IllegalArgumentException if lastIntegratedOffset is negative
          */
         public void setLastIntegratedOffset(long lastIntegratedOffset) {
+            if (lastIntegratedOffset < 0) {
+                throw new IllegalArgumentException(
+                    "lastIntegratedOffset must be non-negative, got: " + lastIntegratedOffset);
+            }
             this.lastIntegratedOffset.set(lastIntegratedOffset);
         }
 
@@ -1138,13 +1250,22 @@ public class SegmentCatalog {
          * <p>This method only updates the offset if the new value is greater than
          * the current value, ensuring the offset never decreases.</p>
          *
+         * <p><strong>Domain Constraints:</strong></p>
+         * <ul>
+         *   <li>Offset must be non-negative (returns false if negative)</li>
+         *   <li>Offset must be greater than current value (monotonicity)</li>
+         * </ul>
+         *
          * <p><strong>Thread Safety:</strong> This operation is atomic and thread-safe.
          * Multiple threads can call this method concurrently without corrupting the offset.</p>
          *
-         * @param newOffset The new offset value
-         * @return true if the offset was updated (new value was greater)
+         * @param newOffset The new offset value (must be >= 0)
+         * @return true if the offset was updated (new value was greater and non-negative)
          */
         public boolean compareAndSetLastIntegratedOffset(long newOffset) {
+            if (newOffset < 0) {
+                return false;
+            }
             while (true) {
                 long current = lastIntegratedOffset.get();
                 if (newOffset <= current) {
@@ -1163,15 +1284,93 @@ public class SegmentCatalog {
          * <p>This method is useful for batch updates where you want to advance
          * the offset to the maximum of multiple values.</p>
          *
-         * @param newOffset The new offset value
+         * <p><strong>Domain Constraint:</strong> Silently ignores negative values
+         * to maintain the non-negative invariant.</p>
+         *
+         * @param newOffset The new offset value (negative values are ignored)
          */
         public void updateOffsetToMax(long newOffset) {
+            if (newOffset < 0) {
+                return; // Ignore negative values
+            }
             while (true) {
                 long current = lastIntegratedOffset.get();
                 if (newOffset <= current) {
                     return; // Current is already >= new
                 }
                 if (lastIntegratedOffset.compareAndSet(current, newOffset)) {
+                    return;
+                }
+            }
+        }
+
+        // ==================== Write Log Head Methods ====================
+
+        /**
+         * Gets the write log head offset.
+         *
+         * <p><strong>Atomicity:</strong> This method returns a consistent snapshot
+         * of the offset value. The returned value is always ≥ lastIntegratedOffset.</p>
+         *
+         * @return Write log head offset
+         */
+        public long getWriteLogHead() {
+            return writeLogHead.get();
+        }
+
+        /**
+         * Sets the write log head offset.
+         *
+         * <p><strong>Note:</strong> This method directly sets the offset without
+         * checking monotonicity. Use {@link #compareAndSetWriteLogHead(long)}
+         * for thread-safe updates that guarantee monotonic increase.</p>
+         *
+         * @param offset Write log head offset
+         */
+        public void setWriteLogHead(long offset) {
+            this.writeLogHead.set(offset);
+        }
+
+        /**
+         * Atomically sets the write log head offset with monotonicity guarantee.
+         *
+         * <p>This method only updates the offset if the new value is greater than
+         * the current value, ensuring the offset never decreases.</p>
+         *
+         * <p><strong>Thread Safety:</strong> This operation is atomic and thread-safe.
+         * Multiple threads can call this method concurrently without corrupting the offset.</p>
+         *
+         * @param newOffset The new offset value
+         * @return true if the offset was updated (new value was greater)
+         */
+        public boolean compareAndSetWriteLogHead(long newOffset) {
+            while (true) {
+                long current = writeLogHead.get();
+                if (newOffset <= current) {
+                    return false;
+                }
+                if (writeLogHead.compareAndSet(current, newOffset)) {
+                    return true;
+                }
+                // CAS failed, retry
+            }
+        }
+
+        /**
+         * Atomically updates the write log head to the maximum of current and new value.
+         *
+         * <p>This method is useful for batch updates where you want to advance
+         * the offset to the maximum of multiple values.</p>
+         *
+         * @param newOffset The new offset value
+         */
+        public void updateWriteLogHeadToMax(long newOffset) {
+            while (true) {
+                long current = writeLogHead.get();
+                if (newOffset <= current) {
+                    return; // Current is already >= new
+                }
+                if (writeLogHead.compareAndSet(current, newOffset)) {
                     return;
                 }
             }
@@ -1354,45 +1553,78 @@ public class SegmentCatalog {
     }
 
     /**
-     * Metadata for the entire catalog.
+     * Mutable metadata for the entire catalog.
+     *
+     * <p>This holds current catalog state. Thread-safe access is managed
+     * by the enclosing SegmentCatalog class.</p>
+     *
+     * <p>Domain correctness: All counts are non-negative.</p>
      */
-    public static class CatalogMetadata {
-        private long totalSegments = 0;
-        private long activeSegments = 0;
-        private long indexingSegments = 0;
-        private long warmSegments = 0;
-        private long compactingSegments = 0;
-        private long tombstonedSegments = 0;
-        private long purgedSegments = 0;
-        private long totalEntryCount = 0;
+    public static final class CatalogMetadata {
+        private long totalSegments;
+        private long activeSegments;
+        private long indexingSegments;
+        private long warmSegments;
+        private long compactingSegments;
+        private long tombstonedSegments;
+        private long purgedSegments;
+        private long totalEntryCount;
 
-        public void setTotalSegments(long total) { this.totalSegments = total; }
-        public void setActiveSegments(long active) { this.activeSegments = active; }
-        public void setIndexingSegments(long indexing) { this.indexingSegments = indexing; }
-        public void setWarmSegments(long warm) { this.warmSegments = warm; }
-        public void setCompactingSegments(long compacting) { this.compactingSegments = compacting; }
-        public void setTombstonedSegments(long tombstoned) { this.tombstonedSegments = tombstoned; }
-        public void setPurgedSegments(long purged) { this.purgedSegments = purged; }
-        public void setTotalEntryCount(long count) { this.totalEntryCount = count; }
+        /**
+         * Creates a new catalog metadata instance with zero values.
+         */
+        public CatalogMetadata() {
+        }
+
+        /**
+         * Creates a catalog metadata snapshot with specified values.
+         *
+         * @param totalSegments Total number of segments
+         * @param activeSegments Number of ACTIVE segments
+         * @param indexingSegments Number of INDEXING segments
+         * @param warmSegments Number of WARMING segments
+         * @param compactingSegments Number of COMPACTING segments
+         * @param tombstonedSegments Number of TOMBSTONED segments
+         * @param purgedSegments Number of PURGED segments
+         * @param totalEntryCount Total entries across all segments
+         */
+        public CatalogMetadata(long totalSegments, long activeSegments, long indexingSegments,
+                               long warmSegments, long compactingSegments, long tombstonedSegments,
+                               long purgedSegments, long totalEntryCount) {
+            this.totalSegments = totalSegments;
+            this.activeSegments = activeSegments;
+            this.indexingSegments = indexingSegments;
+            this.warmSegments = warmSegments;
+            this.compactingSegments = compactingSegments;
+            this.tombstonedSegments = tombstonedSegments;
+            this.purgedSegments = purgedSegments;
+            this.totalEntryCount = totalEntryCount;
+        }
 
         public long getTotalSegments() { return totalSegments; }
+        public void setTotalSegments(long totalSegments) { this.totalSegments = totalSegments; }
         public long getActiveSegments() { return activeSegments; }
+        public void setActiveSegments(long activeSegments) { this.activeSegments = activeSegments; }
         public long getIndexingSegments() { return indexingSegments; }
+        public void setIndexingSegments(long indexingSegments) { this.indexingSegments = indexingSegments; }
         public long getWarmSegments() { return warmSegments; }
+        public void setWarmSegments(long warmSegments) { this.warmSegments = warmSegments; }
         public long getCompactingSegments() { return compactingSegments; }
+        public void setCompactingSegments(long compactingSegments) { this.compactingSegments = compactingSegments; }
         public long getTombstonedSegments() { return tombstonedSegments; }
+        public void setTombstonedSegments(long tombstonedSegments) { this.tombstonedSegments = tombstonedSegments; }
         public long getPurgedSegments() { return purgedSegments; }
+        public void setPurgedSegments(long purgedSegments) { this.purgedSegments = purgedSegments; }
         public long getTotalEntryCount() { return totalEntryCount; }
+        public void setTotalEntryCount(long totalEntryCount) { this.totalEntryCount = totalEntryCount; }
 
-        public void reset() {
-            totalSegments = 0;
-            activeSegments = 0;
-            indexingSegments = 0;
-            warmSegments = 0;
-            compactingSegments = 0;
-            tombstonedSegments = 0;
-            purgedSegments = 0;
-            totalEntryCount = 0;
+        @Override
+        public String toString() {
+            return String.format(
+                "CatalogMetadata{total=%d, active=%d, indexing=%d, warming=%d, " +
+                "compacting=%d, tombstoned=%d, purged=%d, entries=%d}",
+                totalSegments, activeSegments, indexingSegments, warmSegments,
+                compactingSegments, tombstonedSegments, purgedSegments, totalEntryCount);
         }
     }
 }

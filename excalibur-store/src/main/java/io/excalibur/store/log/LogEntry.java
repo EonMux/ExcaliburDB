@@ -11,11 +11,26 @@ import java.nio.ByteOrder;
  * <p>This class wraps the raw entry data and provides convenient accessors
  * for parsing and validation.</p>
  *
+ * <h2>Entry Format</h2>
+ * <p>Each log entry follows the consistent format: {@code [offset | entry_data]}</p>
+ * <table border="1" cellpadding="4" cellspacing="0">
+ *   <tr><th>Field</th><th>Size (bytes)</th><th>Description</th></tr>
+ *   <tr><td>offset</td><td>implicit (8 bytes in context)</td><td>Byte offset in log file (non-negative)</td></tr>
+ *   <tr><td>entryType</td><td>1</td><td>Entry type (PUT=1, DELETE=2, BARRIER=3)</td></tr>
+ *   <tr><td>entryId</td><td>8</td><td>Unique entry identifier (monotonically increasing)</td></tr>
+ *   <tr><td>checksum</td><td>4</td><td>CRC32 checksum of entry data (unsigned 32-bit)</td></tr>
+ *   <tr><td>payload</td><td>N</td><td>Entry-specific data (variable length)</td></tr>
+ * </table>
+ *
+ * <p><strong>Consistent Format Representation:</strong> {@code [offset={offset} | type={type} id={id} crc={crc} payload={payload}]}</p>
+ *
  * <h2>Domain Constraints</h2>
  * <ul>
  *   <li>Log entries MUST be immutable after construction</li>
  *   <li>Entry IDs MUST be unique within a log</li>
- *   <li>Offsets MUST be monotonically increasing</li>
+ *   <li>Offsets MUST be non-negative and monotonically increasing</li>
+ *   <li>Entry types MUST be valid (1=PUT, 2=DELETE, 3=BARRIER)</li>
+ *   <li>Checksums MUST be valid CRC32 values</li>
  * </ul>
  *
  * @author ExcaliburDB
@@ -179,7 +194,7 @@ public final class LogEntry {
             System.arraycopy(payload, 1 + keyLen, valueBytes, 0, valueLen);
         }
 
-        return new PutEntry(keyBytes, valueBytes, id);
+        return new PutEntry(keyBytes, valueBytes, id, offset);
     }
 
     /**
@@ -198,7 +213,7 @@ public final class LogEntry {
             System.arraycopy(payload, 0, keyBytes, 0, payload.length);
         }
 
-        return new DeleteEntry(keyBytes, id);
+        return new DeleteEntry(keyBytes, id, offset);
     }
 
     /**
@@ -299,14 +314,55 @@ public final class LogEntry {
     }
 
     /**
-     * Returns a string representation of this entry.
+     * Returns a string representation of this entry in the consistent format.
      *
-     * @return String representation
+     * <p>Format: {@code [offset={offset} | type={type} id={id} len={len} crc=0x{crc}]}</p>
+     *
+     * @return String representation in consistent format: [offset | entry_data]
      */
     @Override
     public String toString() {
-        return String.format("LogEntry[type=%d(%s), id=%d, payloadLen=%d, offset=%d, checksum=0x%08X]",
-                type, typeToString(), id, payload != null ? payload.length : 0, offset, checksum);
+        // Consistent format: [offset | entry_data]
+        // entry_data = type id len crc
+        return String.format("[offset=%d | type=%s id=%d len=%d crc=0x%08X]",
+                offset, typeToString(), id, payload != null ? payload.length : 0, checksum);
+    }
+
+    /**
+     * Returns a detailed string representation with payload preview.
+     *
+     * <p>Format: {@code [offset={offset} | type={type} id={id} len={len} crc=0x{crc} payload={preview}]}</p>
+     *
+     * @param maxPayloadBytes Maximum payload bytes to include in preview
+     * @return Detailed string representation
+     */
+    public String toString(int maxPayloadBytes) {
+        StringBuilder sb = new StringBuilder("[offset=");
+        sb.append(offset);
+        sb.append(" | type=");
+        sb.append(typeToString());
+        sb.append(" id=");
+        sb.append(id);
+        sb.append(" len=");
+        sb.append(payload != null ? payload.length : 0);
+        sb.append(" crc=0x");
+        sb.append(String.format("%08X", checksum));
+
+        if (payload != null && payload.length > 0) {
+            sb.append(" payload=");
+            int showBytes = Math.min(maxPayloadBytes, payload.length);
+            sb.append("[");
+            for (int i = 0; i < showBytes; i++) {
+                if (i > 0) sb.append(" ");
+                sb.append(String.format("%02X", payload[i] & 0xFF));
+            }
+            if (payload.length > showBytes) {
+                sb.append(" ...");
+            }
+            sb.append("]");
+        }
+        sb.append("]");
+        return sb.toString();
     }
 
     private String typeToString() {
@@ -322,16 +378,24 @@ public final class LogEntry {
 
     /**
      * Represents a PUT log entry.
+     *
+     * <p>Format: {@code [offset | PUT id={id} keyLen={keyLen} valLen={valLen}]}</p>
      */
     public static class PutEntry {
         private final byte[] key;
         private final byte[] value;
         private final long id;
+        private final long offset;
 
         PutEntry(byte[] key, byte[] value, long id) {
+            this(key, value, id, -1);
+        }
+
+        PutEntry(byte[] key, byte[] value, long id, long offset) {
             this.key = key;
             this.value = value;
             this.id = id;
+            this.offset = offset;
         }
 
         public byte[] getKey() {
@@ -354,24 +418,36 @@ public final class LogEntry {
             return id;
         }
 
+        public long getOffset() {
+            return offset;
+        }
+
         @Override
         public String toString() {
-            return String.format("PutEntry[id=%d, key='%s', value='%s']",
-                               id, new String(key, java.nio.charset.StandardCharsets.UTF_8),
-                               value != null ? new String(value, java.nio.charset.StandardCharsets.UTF_8) : null);
+            // Consistent format: [offset | entry_data]
+            return String.format("[offset=%d | PUT id=%d keyLen=%d valLen=%d]",
+                               offset, id, key != null ? key.length : 0, value != null ? value.length : 0);
         }
     }
 
     /**
      * Represents a DELETE log entry.
+     *
+     * <p>Format: {@code [offset | DELETE id={id} keyLen={keyLen}]}</p>
      */
     public static class DeleteEntry {
         private final byte[] key;
         private final long id;
+        private final long offset;
 
         DeleteEntry(byte[] key, long id) {
+            this(key, id, -1);
+        }
+
+        DeleteEntry(byte[] key, long id, long offset) {
             this.key = key;
             this.id = id;
+            this.offset = offset;
         }
 
         public byte[] getKey() {
@@ -386,15 +462,22 @@ public final class LogEntry {
             return id;
         }
 
+        public long getOffset() {
+            return offset;
+        }
+
         @Override
         public String toString() {
-            return String.format("DeleteEntry[id=%d, key='%s']",
-                               id, key != null ? new String(key, java.nio.charset.StandardCharsets.UTF_8) : null);
+            // Consistent format: [offset | entry_data]
+            return String.format("[offset=%d | DELETE id=%d keyLen=%d]",
+                               offset, id, key != null ? key.length : 0);
         }
     }
 
     /**
      * Represents a barrier entry.
+     *
+     * <p>Format: {@code [offset | BARRIER id={id}]}</p>
      */
     public static class BarrierEntry {
         private final long id;
@@ -415,7 +498,8 @@ public final class LogEntry {
 
         @Override
         public String toString() {
-            return String.format("BarrierEntry[id=%d, offset=%d]", id, offset);
+            // Consistent format: [offset | entry_data]
+            return String.format("[offset=%d | BARRIER id=%d]", offset, id);
         }
     }
 

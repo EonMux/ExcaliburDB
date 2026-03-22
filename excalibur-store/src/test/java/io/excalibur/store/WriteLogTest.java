@@ -516,4 +516,136 @@ class WriteLogTest {
             assertThat(writeLog.path()).isEqualTo(logFile);
         }
     }
+
+    // ==================== lastIntegratedOffset Domain Constraints ====================
+
+    @Nested
+    @DisplayName("lastIntegratedOffset Domain Constraints")
+    class LastIntegratedOffsetDomainTests {
+
+        @Test
+        @DisplayName("Should initialize lastIntegratedOffset to 0")
+        void shouldInitializeToZero() {
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(0L);
+            assertThat(writeLog.lastIntegratedOffset()).isEqualTo(0L);
+        }
+
+        @Test
+        @DisplayName("Should accept non-negative offset in setLastIntegratedOffset")
+        void shouldAcceptNonNegativeOffset() {
+            // Initial value is 0, so set to positive value first
+            writeLog.setLastIntegratedOffset(100L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(100L);
+
+            // Larger positive is valid
+            writeLog.setLastIntegratedOffset(1000L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1000L);
+        }
+
+        @Test
+        @DisplayName("Should reject negative offset in setLastIntegratedOffset")
+        void shouldRejectNegativeOffset() {
+            assertThatThrownBy(() -> writeLog.setLastIntegratedOffset(-1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-negative");
+        }
+
+        @Test
+        @DisplayName("Should enforce monotonicity in setLastIntegratedOffset")
+        void shouldEnforceMonotonicity() {
+            writeLog.setLastIntegratedOffset(1000L);
+
+            // Attempt to decrease - should fail
+            assertThatThrownBy(() -> writeLog.setLastIntegratedOffset(500L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("monotonically increasing");
+
+            // Current value should remain unchanged
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1000L);
+
+            // Same value - should fail (not an increase)
+            assertThatThrownBy(() -> writeLog.setLastIntegratedOffset(1000L))
+                .isInstanceOf(IllegalStateException.class);
+
+            // Increase - should succeed
+            writeLog.setLastIntegratedOffset(1500L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1500L);
+        }
+
+        @Test
+        @DisplayName("Should accept non-negative delta in incrementLastIntegratedOffset")
+        void shouldAcceptNonNegativeDelta() {
+            writeLog.setLastIntegratedOffset(1000L);
+
+            // Zero delta is valid (no-op)
+            writeLog.incrementLastIntegratedOffset(0L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1000L);
+
+            // Positive delta is valid
+            writeLog.incrementLastIntegratedOffset(500L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1500L);
+        }
+
+        @Test
+        @DisplayName("Should reject negative delta in incrementLastIntegratedOffset")
+        void shouldRejectNegativeDelta() {
+            writeLog.setLastIntegratedOffset(1000L);
+
+            assertThatThrownBy(() -> writeLog.incrementLastIntegratedOffset(-1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-negative");
+        }
+
+        @Test
+        @DisplayName("Should detect overflow in incrementLastIntegratedOffset")
+        void shouldDetectOverflow() {
+            writeLog.setLastIntegratedOffset(Long.MAX_VALUE - 10);
+
+            // This should succeed
+            writeLog.incrementLastIntegratedOffset(10L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(Long.MAX_VALUE);
+
+            // This should fail due to overflow
+            assertThatThrownBy(() -> writeLog.incrementLastIntegratedOffset(1L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("overflow");
+        }
+
+        @Test
+        @DisplayName("Should handle large offsets correctly")
+        void shouldHandleLargeOffsets() {
+            // Half of max
+            long halfMax = Long.MAX_VALUE / 2;
+            writeLog.setLastIntegratedOffset(halfMax);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(halfMax);
+
+            // Increment by same amount (no overflow)
+            writeLog.incrementLastIntegratedOffset(halfMax);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(halfMax * 2);
+        }
+
+        @Test
+        @DisplayName("Should maintain domain constraints across operations")
+        void shouldMaintainDomainConstraintsAcrossOperations() {
+            // Start at 0
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(0L);
+
+            // Increment multiple times
+            writeLog.incrementLastIntegratedOffset(100L);
+            writeLog.incrementLastIntegratedOffset(200L);
+            writeLog.incrementLastIntegratedOffset(300L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(600L);
+
+            // Set to higher value
+            writeLog.setLastIntegratedOffset(1000L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1000L);
+
+            // Increment again
+            writeLog.incrementLastIntegratedOffset(500L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1500L);
+
+            // Verify all intermediate values were non-negative
+            assertThat(writeLog.getLastIntegratedOffset()).isGreaterThanOrEqualTo(0L);
+        }
+    }
 }

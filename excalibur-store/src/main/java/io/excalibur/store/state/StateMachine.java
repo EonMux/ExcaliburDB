@@ -2,20 +2,30 @@ package io.excalibur.store.state;
 
 import java.util.concurrent.atomic.AtomicReference;
 
+import io.excalibur.store.LifecycleState;
+
 /**
  * Atomic state machine for segment lifecycle management.
- * 
- * Uses VarHandle-based operations to ensure thread-safe, atomic state transitions.
+ *
+ * <p>Uses atomic operations to ensure thread-safe, atomic state transitions.
  * No external synchronization is required for state access.
- * 
- * Thread-safety guarantees:
- * - All state reads are atomic
- * - All state transitions are atomic (no torn reads)
- * - Transitions are visible to all threads immediately after completion
- * - No race conditions between state transitions
+ *
+ * <p>All states must be from the canonical {@link LifecycleState} enum,
+ * which ensures consistent state management across the entire storage engine.
+ *
+ * <h2>Thread-safety guarantees:</h2>
+ * <ul>
+ *   <li>All state reads are atomic</li>
+ *   <li>All state transitions are atomic (no torn reads)</li>
+ *   <li>Transitions are visible to all threads immediately after completion</li>
+ *   <li>No race conditions between state transitions</li>
+ * </ul>
+ *
+ * @author ExcaliburDB
+ * @since 2.0
  */
-public class StateMachine<T> {
-    
+public class StateMachine {
+
     /**
      * Functional interface for validating state transitions.
      * @param currentState the current state
@@ -24,151 +34,187 @@ public class StateMachine<T> {
      */
     @FunctionalInterface
     public interface TransitionValidator {
-        boolean validate(SegmentState currentState, SegmentState desiredState);
+        boolean validate(LifecycleState currentState, LifecycleState desiredState);
     }
-    
+
+    /**
+     * Default validator that enforces the lifecycle state transition rules.
+     */
+    private static final TransitionValidator DEFAULT_VALIDATOR = (current, desired) -> {
+        if (current == desired) {
+            return true; // No-op transition is valid
+        }
+        try {
+            LifecycleState.validateTransition(current, desired);
+            return true;
+        } catch (IllegalStateException e) {
+            return false;
+        }
+    };
+
     /**
      * Atomic reference to current state.
      */
-    private final AtomicReference<SegmentState> stateRef;
-    
+    private final AtomicReference<LifecycleState> stateRef;
+
     /**
      * Validator for allowed transitions.
      */
     private final TransitionValidator validator;
-    
+
     /**
      * Transition counter.
      */
-    private int transitionCount = 0;
-    
+    private volatile int transitionCount = 0;
+
     /**
      * Creates a new state machine with default validator.
      */
     public StateMachine() {
-        this(SegmentState.BOOTSTRAPPING);
+        this(LifecycleState.BOOTSTRAPPING);
     }
-    
+
     /**
      * Creates a new state machine with custom initial state.
-     * @param initialState the initial state
+     * @param initialState the initial state (must be from LifecycleState enum)
+     * @throws IllegalArgumentException if initialState is null
      */
-    public StateMachine(SegmentState initialState) {
+    public StateMachine(LifecycleState initialState) {
+        if (initialState == null) {
+            throw new IllegalArgumentException("Initial state cannot be null");
+        }
         this.stateRef = new AtomicReference<>(initialState);
-        this.validator = (current, desired) -> true;
+        this.validator = DEFAULT_VALIDATOR;
     }
-    
+
     /**
      * Creates a new state machine with custom validator.
      * @param validator transition validator
      */
     public StateMachine(TransitionValidator validator) {
-        this(SegmentState.BOOTSTRAPPING, validator);
+        this(LifecycleState.BOOTSTRAPPING, validator);
     }
-    
+
     /**
-     * Creates a new state machine with custom parameters.
-     * @param initialState initial state
+     * Creates a new state machine with custom initial state and validator.
+     * @param initialState initial state (must be from LifecycleState enum)
      * @param validator transition validator
+     * @throws IllegalArgumentException if initialState is null
      */
-    public StateMachine(SegmentState initialState, TransitionValidator validator) {
+    public StateMachine(LifecycleState initialState, TransitionValidator validator) {
+        if (initialState == null) {
+            throw new IllegalArgumentException("Initial state cannot be null");
+        }
         this.stateRef = new AtomicReference<>(initialState);
-        this.validator = validator;
+        this.validator = validator != null ? validator : DEFAULT_VALIDATOR;
     }
-    
+
     /**
      * Performs an atomic state transition.
-     * 
-     * @param desiredState the state to transition to
+     *
+     * @param desiredState the state to transition to (must be from LifecycleState enum)
      * @return the previous state before transition
      * @throws IllegalStateException if transition is not allowed
+     * @throws IllegalArgumentException if desiredState is null
      */
-    public SegmentState transitionTo(SegmentState desiredState) {
-        SegmentState previousState = get();
-        
+    public LifecycleState transitionTo(LifecycleState desiredState) {
+        if (desiredState == null) {
+            throw new IllegalArgumentException("Desired state cannot be null");
+        }
+
+        LifecycleState previousState = get();
+
         if (!validator.validate(previousState, desiredState)) {
             throw new IllegalStateException(
-                String.format("Invalid state transition: %s → %s", 
-                    previousState.toStringHuman(), desiredState.toStringHuman())
+                String.format("Invalid state transition: %s → %s",
+                    previousState, desiredState)
             );
         }
-        
+
+        // Use the LifecycleState's built-in validation for additional safety
+        LifecycleState.validateTransition(previousState, desiredState);
+
         // Atomically update the state
         stateRef.set(desiredState);
         transitionCount++;
-        
+
         return previousState;
     }
-    
+
     /**
      * Attempts an atomic state transition with compare-and-set semantics.
      * Returns true if the transition was successful, false otherwise.
-     * 
-     * @param desiredState the state to transition to
+     *
+     * @param desiredState the state to transition to (must be from LifecycleState enum)
      * @return true if transition succeeded, false if another thread modified the state
+     *         or transition is invalid
      */
-    public boolean tryTransitionTo(SegmentState desiredState) {
-        SegmentState expectedState = get();
-        
+    public boolean tryTransitionTo(LifecycleState desiredState) {
+        if (desiredState == null) {
+            return false;
+        }
+
+        LifecycleState expectedState = get();
+
         while (true) {
             if (!validator.validate(expectedState, desiredState)) {
                 return false;
             }
-            
+
             if (stateRef.compareAndSet(expectedState, desiredState)) {
                 transitionCount++;
                 return true;
             }
-            
+
             expectedState = get();
         }
     }
-    
+
     /**
      * Gets the current state.
-     * @return the current state
+     * @return the current state (always from LifecycleState enum)
      */
-    public SegmentState get() {
+    public LifecycleState get() {
         return stateRef.get();
     }
-    
+
     /**
      * Checks if the state machine is in a queryable state.
      * @return true if the segment can be queried
      */
     public boolean isQueryable() {
-        SegmentState state = get();
-        return state == SegmentState.INDEXING ||
-               state == SegmentState.WARMING ||
-               state == SegmentState.ACTIVE ||
-               state == SegmentState.COMPACTING;
+        return get().isQueryable();
     }
-    
+
     /**
      * Checks if the state machine is in an active state (fully ready).
      * @return true if the segment is fully active
      */
     public boolean isActive() {
-        return get() == SegmentState.ACTIVE;
+        return get() == LifecycleState.ACTIVE;
     }
-    
+
     /**
      * Checks if the state machine is in a terminal state.
      * @return true if the segment cannot transition further
      */
     public boolean isTerminal() {
-        return get() == SegmentState.PURGED;
+        return get() == LifecycleState.PURGED;
     }
-    
+
     /**
      * Resets the state machine to its initial state.
-     * @param initialState the initial state to reset to
+     * @param initialState the initial state to reset to (must be from LifecycleState enum)
+     * @throws IllegalArgumentException if initialState is null
      */
-    public void reset(SegmentState initialState) {
+    public void reset(LifecycleState initialState) {
+        if (initialState == null) {
+            throw new IllegalArgumentException("Initial state cannot be null");
+        }
         transitionCount = 0;
         stateRef.set(initialState);
     }
-    
+
     /**
      * Gets the current transition count.
      * @return number of transitions performed
@@ -176,35 +222,60 @@ public class StateMachine<T> {
     public int getTransitionCount() {
         return transitionCount;
     }
-    
+
     /**
      * Gets the current state as an integer code.
      * @return the numeric code of the current state
      */
     public int getStateCode() {
-        return get().getCode();
+        return get().value();
     }
-    
+
     /**
      * Gets the validator.
      */
     public TransitionValidator getValidator() {
         return validator;
     }
-    
+
+    /**
+     * Validates that a state is from the canonical LifecycleState enum.
+     *
+     * @param state the state to validate
+     * @return true if the state is valid
+     */
+    public static boolean isValidState(Object state) {
+        return state instanceof LifecycleState;
+    }
+
+    /**
+     * Requires that a state is from the canonical LifecycleState enum.
+     *
+     * @param state the state to validate
+     * @throws IllegalArgumentException if state is null or not a LifecycleState
+     */
+    public static void requireValidState(Object state) {
+        if (!(state instanceof LifecycleState)) {
+            throw new IllegalArgumentException(
+                "State must be from LifecycleState enum, got: " +
+                (state == null ? "null" : state.getClass().getName())
+            );
+        }
+    }
+
     /**
      * Transition history for debugging and auditing.
      */
     public static class TransitionHistory {
         private final StringBuilder history = new StringBuilder();
-        
-        public void recordTransition(String segmentId, SegmentState from, SegmentState to) {
+
+        public void recordTransition(String segmentId, LifecycleState from, LifecycleState to) {
             history.append(segmentId)
-                   .append(" ").append(from.toStringHuman())
-                   .append(" → ").append(to.toStringHuman())
+                   .append(" ").append(from)
+                   .append(" → ").append(to)
                    .append("\n");
         }
-        
+
         public String toString() {
             return history.toString();
         }

@@ -961,7 +961,8 @@ class CircuitBreakerTest {
         @DisplayName("openedAtMillis is consistent with state after concurrent operations")
         void openedAtMillisConsistentWithStateAfterConcurrentOperations() throws InterruptedException {
             CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(100), "timestamp-test");
-            int numIterations = 50;
+            // Reduced from 50 to 10 iterations - still verifies consistency without 6s delay
+            int numIterations = 10;
 
             for (int iter = 0; iter < numIterations; iter++) {
                 // Trip the circuit

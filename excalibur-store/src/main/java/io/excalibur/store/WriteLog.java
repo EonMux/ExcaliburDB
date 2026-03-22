@@ -154,25 +154,73 @@ public class WriteLog implements AutoCloseable {
      * this offset exist in the write log but are not yet in the graph.
      * Critical for live-indexing tail scan (Phase 6).
      * </p>
-     * @return The last integrated offset
+     *
+     * <p><strong>Domain Guarantee:</strong> The returned value is always
+     * non-negative and has only increased since the last call.</p>
+     *
+     * @return The last integrated offset (always >= 0)
      */
     public long getLastIntegratedOffset() {
         return lastIntegratedOffset;
     }
 
     /**
-     * Updates the last integrated offset.
-     * Must be called during HNSW graph integration to track progress.
+     * Updates the last integrated offset with domain constraint validation.
+     *
+     * <p><strong>Domain Constraints:</strong></p>
+     * <ul>
+     *   <li>Offset must be non-negative (throws IllegalArgumentException if negative)</li>
+     *   <li>Offset must be strictly monotonically increasing (new offset > current offset)</li>
+     * </ul>
+     *
+     * <p>This method is called during HNSW graph integration to track progress.
+     * The monotonicity constraint ensures the offset never goes backwards,
+     * which is critical for correct tail scan behavior in Phase 6.</p>
+     *
+     * @param offset The new last integrated offset (must be >= 0 and > current value)
+     * @throws IllegalArgumentException if offset is negative
+     * @throws IllegalStateException if offset is not greater than current value
      */
     public void setLastIntegratedOffset(long offset) {
+        if (offset < 0) {
+            throw new IllegalArgumentException(
+                "lastIntegratedOffset must be non-negative, got: " + offset);
+        }
+        if (offset <= this.lastIntegratedOffset) {
+            throw new IllegalStateException(String.format(
+                "lastIntegratedOffset must be monotonically increasing: " +
+                "attempted to set %d but current value is %d",
+                offset, this.lastIntegratedOffset));
+        }
         this.lastIntegratedOffset = offset;
     }
 
     /**
      * Increments the last integrated offset by the specified amount.
+     *
+     * <p><strong>Domain Constraints:</strong></p>
+     * <ul>
+     *   <li>Delta must result in a non-negative offset</li>
+     *   <li>Resulting offset must be >= current offset (delta must be non-negative)</li>
+     * </ul>
+     *
+     * @param delta The amount to increment (must be >= 0)
+     * @throws IllegalArgumentException if delta is negative
+     * @throws IllegalStateException if increment would overflow
      */
     public void incrementLastIntegratedOffset(long delta) {
-        this.lastIntegratedOffset += delta;
+        if (delta < 0) {
+            throw new IllegalArgumentException(
+                "Delta must be non-negative, got: " + delta);
+        }
+        long newValue = this.lastIntegratedOffset + delta;
+        // Check for overflow
+        if (newValue < this.lastIntegratedOffset) {
+            throw new IllegalStateException(
+                "Increment would cause overflow: current=" + this.lastIntegratedOffset +
+                ", delta=" + delta);
+        }
+        this.lastIntegratedOffset = newValue;
     }
 
     // ==================== Constructors ====================

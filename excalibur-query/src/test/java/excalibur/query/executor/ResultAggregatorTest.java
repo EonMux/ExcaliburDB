@@ -183,8 +183,158 @@ class ResultAggregatorTest {
         // Should have 3 unique document IDs
         assertThat(merged).hasSize(3);
 
-        // Document 1 should appear once with distance 0.1 (first encountered)
+        // Document 1 should appear once with the BEST distance (0.1, not 0.5)
         assertThat(merged.stream().anyMatch(r -> r.documentId() == 1L && r.score() == 0.1f)).isTrue();
+        // Ensure no duplicate with worse score
+        assertThat(merged.stream().filter(r -> r.documentId() == 1L)).hasSize(1);
+    }
+
+    /**
+     * Test mergeAndRank keeps the BEST score when duplicates exist across segments.
+     * This simulates re-indexing scenario where the same document appears in
+     * both old and new segments with different distances.
+     */
+    @Test
+    void testMergeAndRankKeepsBestScoreForDuplicates() {
+        ResultAggregator aggregator = new ResultAggregator(10);
+
+        // Segment 1 (old segment during re-index): doc 1 with WORSE distance
+        List<HnswSearchResult> oldSegmentResults = List.of(
+            new HnswSearchResult(1L, 0.9f),  // Worse distance - should be replaced
+            new HnswSearchResult(2L, 0.5f)
+        );
+
+        // Segment 2 (new segment during re-index): doc 1 with BETTER distance
+        List<HnswSearchResult> newSegmentResults = List.of(
+            new HnswSearchResult(1L, 0.1f),  // Better distance - should be kept
+            new HnswSearchResult(3L, 0.2f)
+        );
+
+        SegmentQueryTask.SegmentQueryResult oldResult = new SegmentQueryTask.SegmentQueryResult(
+            1L, oldSegmentResults, 0, 10, true, null
+        );
+        SegmentQueryTask.SegmentQueryResult newResult = new SegmentQueryTask.SegmentQueryResult(
+            2L, newSegmentResults, 0, 10, true, null
+        );
+
+        // Process in order: new segment first, then old segment
+        // The aggregator should still keep the best score regardless of processing order
+        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(newResult, oldResult));
+
+        // Should have 3 unique document IDs
+        assertThat(merged).hasSize(3);
+
+        // Document 1 should appear with the BEST distance (0.1), not the worse one (0.9)
+        QueryResultItem doc1Result = merged.stream()
+            .filter(r -> r.documentId() == 1L)
+            .findFirst()
+            .orElseThrow();
+        assertThat(doc1Result.score()).isEqualTo(0.1f);
+
+        // Verify only one entry for document 1
+        assertThat(merged.stream().filter(r -> r.documentId() == 1L)).hasSize(1);
+    }
+
+    /**
+     * Test mergeAndRank keeps best score regardless of segment processing order.
+     * Verifies that processing order doesn't affect which duplicate is kept.
+     */
+    @Test
+    void testMergeAndRankDeduplicationOrderIndependent() {
+        ResultAggregator aggregator = new ResultAggregator(10);
+
+        // Segment 1: doc 1 with worse distance
+        List<HnswSearchResult> segment1Results = List.of(
+            new HnswSearchResult(1L, 0.8f)   // Worse distance
+        );
+
+        // Segment 2: doc 1 with better distance
+        List<HnswSearchResult> segment2Results = List.of(
+            new HnswSearchResult(1L, 0.2f)   // Better distance
+        );
+
+        SegmentQueryTask.SegmentQueryResult result1 = new SegmentQueryTask.SegmentQueryResult(
+            1L, segment1Results, 0, 10, true, null
+        );
+        SegmentQueryTask.SegmentQueryResult result2 = new SegmentQueryTask.SegmentQueryResult(
+            2L, segment2Results, 0, 10, true, null
+        );
+
+        // Process segment 1 FIRST (worse score comes first)
+        List<QueryResultItem> mergedOrder1 = aggregator.mergeAndRank(List.of(result1, result2));
+
+        // Process segment 2 FIRST (better score comes first)
+        List<QueryResultItem> mergedOrder2 = aggregator.mergeAndRank(List.of(result2, result1));
+
+        // Both should have the same result: doc 1 with the BEST score (0.2)
+        assertThat(mergedOrder1).hasSize(1);
+        assertThat(mergedOrder2).hasSize(1);
+        assertThat(mergedOrder1.get(0).score()).isEqualTo(0.2f);
+        assertThat(mergedOrder2.get(0).score()).isEqualTo(0.2f);
+    }
+
+    /**
+     * Test mergeAndRank with multiple duplicates across many segments.
+     * Verifies deduplication works correctly with complex overlap scenarios.
+     */
+    @Test
+    void testMergeAndRankMultipleDuplicatesAcrossSegments() {
+        ResultAggregator aggregator = new ResultAggregator(5);
+
+        // Three segments, each containing some overlapping documents
+        List<HnswSearchResult> segment1 = List.of(
+            new HnswSearchResult(1L, 0.5f),  // Doc 1: medium
+            new HnswSearchResult(2L, 0.3f),  // Doc 2: best
+            new HnswSearchResult(3L, 0.9f)   // Doc 3: worst
+        );
+
+        List<HnswSearchResult> segment2 = List.of(
+            new HnswSearchResult(1L, 0.2f),  // Doc 1: best
+            new HnswSearchResult(2L, 0.6f),  // Doc 2: worst
+            new HnswSearchResult(4L, 0.4f)   // Doc 4: only in this segment
+        );
+
+        List<HnswSearchResult> segment3 = List.of(
+            new HnswSearchResult(1L, 0.8f),  // Doc 1: worst
+            new HnswSearchResult(3L, 0.1f),  // Doc 3: best
+            new HnswSearchResult(5L, 0.7f)   // Doc 5: only in this segment
+        );
+
+        List<SegmentQueryTask.SegmentQueryResult> results = List.of(
+            new SegmentQueryTask.SegmentQueryResult(1L, segment1, 0, 10, true, null),
+            new SegmentQueryTask.SegmentQueryResult(2L, segment2, 0, 10, true, null),
+            new SegmentQueryTask.SegmentQueryResult(3L, segment3, 0, 10, true, null)
+        );
+
+        List<QueryResultItem> merged = aggregator.mergeAndRank(results);
+
+        // Should have 5 unique documents
+        assertThat(merged).hasSize(5);
+
+        // Verify each document has its best score
+        java.util.Map<Long, Float> expectedScores = java.util.Map.of(
+            1L, 0.2f,  // Best of {0.5, 0.2, 0.8}
+            2L, 0.3f,  // Best of {0.3, 0.6}
+            3L, 0.1f,  // Best of {0.9, 0.1}
+            4L, 0.4f,  // Only one
+            5L, 0.7f   // Only one
+        );
+
+        for (QueryResultItem item : merged) {
+            float expected = expectedScores.get(item.documentId());
+            assertThat(item.score())
+                .withFailMessage("Document %d should have score %.2f but got %.2f",
+                    item.documentId(), expected, item.score())
+                .isEqualTo(expected);
+        }
+
+        // Verify no duplicates
+        java.util.Set<Long> seenIds = new java.util.HashSet<>();
+        for (QueryResultItem item : merged) {
+            assertThat(seenIds.add(item.documentId()))
+                .withFailMessage("Duplicate document ID %d in results", item.documentId())
+                .isTrue();
+        }
     }
 
     /**
@@ -445,6 +595,74 @@ class ResultAggregatorTest {
     }
 
     /**
+     * Test static mergeResults keeps the BEST distance when duplicates exist.
+     * Verifies that when the same node ID appears with different distances,
+     * the one with the lowest (best) distance is kept.
+     */
+    @Test
+    void testStaticMergeResultsKeepsBestDistanceForDuplicates() {
+        // Segment 1: node 1 with worse distance
+        List<HnswSearchResult> segment1 = List.of(
+            new HnswSearchResult(1L, 0.9f),  // Worse distance
+            new HnswSearchResult(2L, 0.3f)
+        );
+
+        // Segment 2: node 1 with better distance
+        List<HnswSearchResult> segment2 = List.of(
+            new HnswSearchResult(1L, 0.1f),  // Better distance - should be kept
+            new HnswSearchResult(3L, 0.2f)
+        );
+
+        List<HnswSearchResult> merged = ResultAggregator.mergeResults(
+            List.of(segment1, segment2), 10
+        );
+
+        // Should have 3 unique nodes
+        assertThat(merged).hasSize(3);
+
+        // Node 1 should have the BEST distance (0.1), not the worse one (0.9)
+        HnswSearchResult node1Result = merged.stream()
+            .filter(r -> r.nodeId() == 1L)
+            .findFirst()
+            .orElseThrow();
+        assertThat(node1Result.distance()).isEqualTo(0.1f);
+
+        // Verify only one entry for node 1
+        assertThat(merged.stream().filter(r -> r.nodeId() == 1L)).hasSize(1);
+    }
+
+    /**
+     * Test static mergeResults best distance is order-independent.
+     * Verifies that processing order doesn't affect which duplicate is kept.
+     */
+    @Test
+    void testStaticMergeResultsDeduplicationOrderIndependent() {
+        List<HnswSearchResult> segment1 = List.of(
+            new HnswSearchResult(1L, 0.8f)   // Worse distance
+        );
+
+        List<HnswSearchResult> segment2 = List.of(
+            new HnswSearchResult(1L, 0.2f)   // Better distance
+        );
+
+        // Process segment 1 FIRST (worse score comes first)
+        List<HnswSearchResult> mergedOrder1 = ResultAggregator.mergeResults(
+            List.of(segment1, segment2), 10
+        );
+
+        // Process segment 2 FIRST (better score comes first)
+        List<HnswSearchResult> mergedOrder2 = ResultAggregator.mergeResults(
+            List.of(segment2, segment1), 10
+        );
+
+        // Both should have the same result: node 1 with the BEST distance (0.2)
+        assertThat(mergedOrder1).hasSize(1);
+        assertThat(mergedOrder2).hasSize(1);
+        assertThat(mergedOrder1.get(0).distance()).isEqualTo(0.2f);
+        assertThat(mergedOrder2.get(0).distance()).isEqualTo(0.2f);
+    }
+
+    /**
      * Test results are sorted correctly (smallest distance first).
      */
     @Test
@@ -499,5 +717,256 @@ class ResultAggregatorTest {
         for (int i = 0; i < 5; i++) {
             assertThat(merged.get(i).score()).isEqualTo(i * 0.01f);
         }
+    }
+
+    // ==================== Relevance Score Sorting Tests ====================
+
+    /**
+     * Test sortByRelevanceDescending with valid results.
+     * Verifies results are sorted with highest relevance first.
+     */
+    @Test
+    void testSortByRelevanceDescending() {
+        // Create results with varying relevance scores
+        List<QueryResultItem> results = new ArrayList<>();
+        results.add(new QueryResultItem(1L, 0.85f, null, 1L, 1L));  // High relevance
+        results.add(new QueryResultItem(2L, 0.25f, null, 1L, 2L));  // Low relevance
+        results.add(new QueryResultItem(3L, 0.95f, null, 1L, 3L));  // Highest relevance
+        results.add(new QueryResultItem(4L, 0.50f, null, 1L, 4L));  // Medium relevance
+
+        List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(results);
+
+        // Verify sorted order (highest first)
+        assertThat(sorted).hasSize(4);
+        assertThat(sorted.get(0).documentId()).isEqualTo(3L);  // 0.95
+        assertThat(sorted.get(0).score()).isEqualTo(0.95f);
+        assertThat(sorted.get(1).documentId()).isEqualTo(1L);  // 0.85
+        assertThat(sorted.get(1).score()).isEqualTo(0.85f);
+        assertThat(sorted.get(2).documentId()).isEqualTo(4L);  // 0.50
+        assertThat(sorted.get(2).score()).isEqualTo(0.50f);
+        assertThat(sorted.get(3).documentId()).isEqualTo(2L);  // 0.25
+        assertThat(sorted.get(3).score()).isEqualTo(0.25f);
+    }
+
+    /**
+     * Test sortByRelevanceDescending does not modify original list.
+     */
+    @Test
+    void testSortByRelevanceDescendingImmutable() {
+        List<QueryResultItem> original = new ArrayList<>();
+        original.add(new QueryResultItem(1L, 0.5f));
+        original.add(new QueryResultItem(2L, 0.9f));
+        original.add(new QueryResultItem(3L, 0.1f));
+
+        List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(original);
+
+        // Original list order should be unchanged
+        assertThat(original.get(0).score()).isEqualTo(0.5f);
+        assertThat(original.get(1).score()).isEqualTo(0.9f);
+        assertThat(original.get(2).score()).isEqualTo(0.1f);
+
+        // Sorted list should be different
+        assertThat(sorted.get(0).score()).isEqualTo(0.9f);
+        assertThat(sorted.get(1).score()).isEqualTo(0.5f);
+        assertThat(sorted.get(2).score()).isEqualTo(0.1f);
+    }
+
+    /**
+     * Test sortByRelevanceDescending with null input.
+     */
+    @Test
+    void testSortByRelevanceDescendingNull() {
+        List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(null);
+        assertThat(sorted).isEmpty();
+    }
+
+    /**
+     * Test sortByRelevanceDescending with empty input.
+     */
+    @Test
+    void testSortByRelevanceDescendingEmpty() {
+        List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(Collections.emptyList());
+        assertThat(sorted).isEmpty();
+    }
+
+    /**
+     * Test sortByRelevanceDescending with single item.
+     */
+    @Test
+    void testSortByRelevanceDescendingSingleItem() {
+        List<QueryResultItem> results = List.of(
+            new QueryResultItem(1L, 0.75f)
+        );
+
+        List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(results);
+
+        assertThat(sorted).hasSize(1);
+        assertThat(sorted.get(0).score()).isEqualTo(0.75f);
+    }
+
+    /**
+     * Test sortByRelevanceDescending with identical scores.
+     * When scores are equal, order should be stable.
+     */
+    @Test
+    void testSortByRelevanceDescendingEqualScores() {
+        List<QueryResultItem> results = new ArrayList<>();
+        results.add(new QueryResultItem(1L, 0.5f));
+        results.add(new QueryResultItem(2L, 0.5f));
+        results.add(new QueryResultItem(3L, 0.5f));
+
+        List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(results);
+
+        assertThat(sorted).hasSize(3);
+        // All should have same score
+        assertThat(sorted.get(0).score()).isEqualTo(0.5f);
+        assertThat(sorted.get(1).score()).isEqualTo(0.5f);
+        assertThat(sorted.get(2).score()).isEqualTo(0.5f);
+    }
+
+    /**
+     * Test sortByRelevanceDescending with boundary scores (0.0 and 1.0).
+     */
+    @Test
+    void testSortByRelevanceDescendingBoundaryScores() {
+        List<QueryResultItem> results = new ArrayList<>();
+        results.add(new QueryResultItem(1L, 0.0f));  // Minimum
+        results.add(new QueryResultItem(2L, 1.0f));  // Maximum
+        results.add(new QueryResultItem(3L, 0.5f));  // Middle
+
+        List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(results);
+
+        assertThat(sorted).hasSize(3);
+        assertThat(sorted.get(0).documentId()).isEqualTo(2L);  // 1.0
+        assertThat(sorted.get(0).score()).isEqualTo(1.0f);
+        assertThat(sorted.get(1).documentId()).isEqualTo(3L);  // 0.5
+        assertThat(sorted.get(1).score()).isEqualTo(0.5f);
+        assertThat(sorted.get(2).documentId()).isEqualTo(1L);  // 0.0
+        assertThat(sorted.get(2).score()).isEqualTo(0.0f);
+    }
+
+    /**
+     * Test sortByDistanceAscending with valid results.
+     * Verifies results are sorted with lowest distance first.
+     */
+    @Test
+    void testSortByDistanceAscending() {
+        // Create results with varying distances (L2 distance: lower is better)
+        List<QueryResultItem> results = new ArrayList<>();
+        results.add(new QueryResultItem(1L, 0.5f, null, 1L, 1L));
+        results.add(new QueryResultItem(2L, 0.1f, null, 1L, 2L));  // Best
+        results.add(new QueryResultItem(3L, 0.9f, null, 1L, 3L));  // Worst
+        results.add(new QueryResultItem(4L, 0.3f, null, 1L, 4L));
+
+        List<QueryResultItem> sorted = ResultAggregator.sortByDistanceAscending(results);
+
+        // Verify sorted order (lowest first)
+        assertThat(sorted).hasSize(4);
+        assertThat(sorted.get(0).documentId()).isEqualTo(2L);  // 0.1
+        assertThat(sorted.get(0).score()).isEqualTo(0.1f);
+        assertThat(sorted.get(1).documentId()).isEqualTo(4L);  // 0.3
+        assertThat(sorted.get(1).score()).isEqualTo(0.3f);
+        assertThat(sorted.get(2).documentId()).isEqualTo(1L);  // 0.5
+        assertThat(sorted.get(2).score()).isEqualTo(0.5f);
+        assertThat(sorted.get(3).documentId()).isEqualTo(3L);  // 0.9
+        assertThat(sorted.get(3).score()).isEqualTo(0.9f);
+    }
+
+    /**
+     * Test sortByDistanceAscending with null input.
+     */
+    @Test
+    void testSortByDistanceAscendingNull() {
+        List<QueryResultItem> sorted = ResultAggregator.sortByDistanceAscending(null);
+        assertThat(sorted).isEmpty();
+    }
+
+    /**
+     * Test sortByDistanceAscending with empty input.
+     */
+    @Test
+    void testSortByDistanceAscendingEmpty() {
+        List<QueryResultItem> sorted = ResultAggregator.sortByDistanceAscending(Collections.emptyList());
+        assertThat(sorted).isEmpty();
+    }
+
+    /**
+     * Test sort method with RELEVANCE_DESCENDING mode.
+     */
+    @Test
+    void testSortWithRelevanceDescendingMode() {
+        List<QueryResultItem> results = new ArrayList<>();
+        results.add(new QueryResultItem(1L, 0.3f));
+        results.add(new QueryResultItem(2L, 0.9f));
+
+        List<QueryResultItem> sorted = ResultAggregator.sort(
+            results, ResultAggregator.SortMode.RELEVANCE_DESCENDING);
+
+        assertThat(sorted.get(0).score()).isEqualTo(0.9f);  // Highest first
+        assertThat(sorted.get(1).score()).isEqualTo(0.3f);
+    }
+
+    /**
+     * Test sort method with DISTANCE_ASCENDING mode.
+     */
+    @Test
+    void testSortWithDistanceAscendingMode() {
+        List<QueryResultItem> results = new ArrayList<>();
+        results.add(new QueryResultItem(1L, 0.9f));
+        results.add(new QueryResultItem(2L, 0.3f));
+
+        List<QueryResultItem> sorted = ResultAggregator.sort(
+            results, ResultAggregator.SortMode.DISTANCE_ASCENDING);
+
+        assertThat(sorted.get(0).score()).isEqualTo(0.3f);  // Lowest first
+        assertThat(sorted.get(1).score()).isEqualTo(0.9f);
+    }
+
+    /**
+     * Test that LLM-relevancy scored results are sorted descending.
+     * This simulates the flow in QueryPipeline.stage5_LlmScoring.
+     */
+    @Test
+    void testLlmScoredResultsSortedDescending() {
+        // Simulate results after LLM scoring with relevancy scores
+        List<QueryResultItem> llmScoredResults = new ArrayList<>();
+        llmScoredResults.add(new QueryResultItem(100L, 0.45f, "doc1".getBytes(), 1L, 100L));
+        llmScoredResults.add(new QueryResultItem(101L, 0.92f, "doc2".getBytes(), 1L, 101L));
+        llmScoredResults.add(new QueryResultItem(102L, 0.78f, "doc3".getBytes(), 2L, 102L));
+        llmScoredResults.add(new QueryResultItem(103L, 0.31f, "doc4".getBytes(), 2L, 103L));
+        llmScoredResults.add(new QueryResultItem(104L, 0.85f, "doc5".getBytes(), 3L, 104L));
+
+        // Sort by relevance descending (as done in stage5_LlmScoring)
+        List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(llmScoredResults);
+
+        // Verify results are sorted by relevance score descending
+        assertThat(sorted).hasSize(5);
+
+        // Highest relevance should be first
+        assertThat(sorted.get(0).documentId()).isEqualTo(101L);
+        assertThat(sorted.get(0).score()).isEqualTo(0.92f);
+
+        assertThat(sorted.get(1).documentId()).isEqualTo(104L);
+        assertThat(sorted.get(1).score()).isEqualTo(0.85f);
+
+        assertThat(sorted.get(2).documentId()).isEqualTo(102L);
+        assertThat(sorted.get(2).score()).isEqualTo(0.78f);
+
+        assertThat(sorted.get(3).documentId()).isEqualTo(100L);
+        assertThat(sorted.get(3).score()).isEqualTo(0.45f);
+
+        assertThat(sorted.get(4).documentId()).isEqualTo(103L);
+        assertThat(sorted.get(4).score()).isEqualTo(0.31f);
+    }
+
+    /**
+     * Test SortMode enum values exist.
+     */
+    @Test
+    void testSortModeEnum() {
+        assertThat(ResultAggregator.SortMode.DISTANCE_ASCENDING)
+            .isNotNull();
+        assertThat(ResultAggregator.SortMode.RELEVANCE_DESCENDING)
+            .isNotNull();
     }
 }

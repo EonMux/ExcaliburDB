@@ -3,6 +3,7 @@ package excalibur.query.executor;
 import io.excalibur.store.WriteLog;
 import io.excalibur.store.format.LogEntry;
 import io.excalibur.vector.distance.DistanceFunction;
+import io.excalibur.vector.distance.DistanceValidator;
 import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,6 +31,11 @@ import java.util.PriorityQueue;
  * ensures queries see these entries immediately, without waiting for
  * integration.</p>
  *
+ * <h2>Backpressure Enforcement</h2>
+ * <p>Tail scan entry count is bounded by the backpressure limit (default 100K entries).
+ * This ensures query latency remains acceptable even during heavy ingestion.
+ * When the limit is reached, scanning stops and a warning flag is set in results.</p>
+ *
  * <h2>Vector Storage in Write Log</h2>
  * <p>Vectors are stored in the write log's value field as:
  * <pre>
@@ -44,6 +50,7 @@ import java.util.PriorityQueue;
  *   <li>Offsets must be within write log bounds</li>
  *   <li>Vector dimension must match the distance function's expected dimension</li>
  *   <li>Distances are computed using exact arithmetic (full precision)</li>
+ *   <li>Entry count never exceeds backpressure limit (100K)</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -58,9 +65,54 @@ public class TailScanner {
     private static final Logger LOGGER = LoggerFactory.getLogger(TailScanner.class);
 
     /**
+     * Default backpressure limit for tail scan entry count.
+     * When the number of entries scanned exceeds this limit, scanning stops.
+     * This bounds tail scan latency to ensure acceptable query response times.
+     */
+    public static final int DEFAULT_BACKPRESSURE_ENTRY_LIMIT = 100_000;
+
+    /**
+     * Configuration key for the backpressure entry limit.
+     */
+    public static final String CONFIG_BACKPRESSURE_ENTRY_LIMIT = "excalibur.tail-scan.backpressure-entry-limit";
+
+    /**
      * Size of the dimension field in the value buffer (4 bytes for int).
      */
     private static final int DIMENSION_SIZE = 4;
+
+    /**
+     * The maximum number of entries to scan before applying backpressure.
+     * Must be positive. Defaults to {@link #DEFAULT_BACKPRESSURE_ENTRY_LIMIT}.
+     */
+    private final int backpressureEntryLimit;
+
+    /**
+     * Creates a new TailScanner with the default backpressure entry limit.
+     */
+    public TailScanner() {
+        this(DEFAULT_BACKPRESSURE_ENTRY_LIMIT);
+    }
+
+    /**
+     * Creates a new TailScanner with a custom backpressure entry limit.
+     *
+     * @param backpressureEntryLimit The maximum number of entries to scan.
+     *                               Must be positive. Values ≤ 0 are clamped to 1.
+     */
+    public TailScanner(int backpressureEntryLimit) {
+        // Ensure limit is at least 1 to avoid division by zero and allow some scanning
+        this.backpressureEntryLimit = Math.max(1, backpressureEntryLimit);
+    }
+
+    /**
+     * Gets the configured backpressure entry limit.
+     *
+     * @return The maximum number of entries this scanner will process
+     */
+    public int getBackpressureEntryLimit() {
+        return backpressureEntryLimit;
+    }
 
     /**
      * Performs a brute-force scan over write log entries in the specified range.
@@ -128,11 +180,21 @@ public class TailScanner {
         long writeLogEnd = writeLog.writeOffset();
         int entriesScanned = 0;
         int vectorEntriesFound = 0;
+        boolean backpressureTriggered = false;
 
         // Ensure we don't read beyond the actual write log data
         endOffset = Math.min(endOffset, writeLogEnd);
 
         while (currentOffset < endOffset) {
+            // BACKPRESSURE CHECK: Stop if entry limit reached
+            if (entriesScanned >= backpressureEntryLimit) {
+                backpressureTriggered = true;
+                LOGGER.warn("Tail scan backpressure triggered at {} entries (limit: {}). " +
+                           "Remaining entries in tail will not be scanned. " +
+                           "Query results may be incomplete.",
+                           entriesScanned, backpressureEntryLimit);
+                break;
+            }
             try {
                 // Read entry at current offset
                 LogEntry entry = readEntryAtOffset(writeLog, currentOffset);
@@ -151,6 +213,10 @@ public class TailScanner {
                     if (vector != null) {
                         // Compute exact distance
                         float distance = distanceFunction.compute(queryVector, vector);
+
+                        // Validate and clamp distance to ensure domain correctness
+                        // Cosine similarity ∈ [-1, 1], L2 distance ∈ [0, ∞)
+                        distance = DistanceValidator.validateAndClamp(distance, distanceFunction);
 
                         // Use a synthetic node ID based on offset for deduplication
                         // In production, this would be the actual document/vector ID
@@ -189,8 +255,14 @@ public class TailScanner {
         List<HnswSearchResult> results = new ArrayList<>(topResults);
         results.sort(Comparator.comparingDouble(HnswSearchResult::distance));
 
-        LOGGER.trace("Tail scan complete: {} entries scanned, {} vectors found, {} results returned",
-            entriesScanned, vectorEntriesFound, results.size());
+        if (backpressureTriggered) {
+            LOGGER.warn("Tail scan complete with backpressure: {} entries scanned (limit: {}), " +
+                       "{} vectors found, {} results returned. Some tail entries were not scanned.",
+                       entriesScanned, backpressureEntryLimit, vectorEntriesFound, results.size());
+        } else {
+            LOGGER.trace("Tail scan complete: {} entries scanned, {} vectors found, {} results returned",
+                entriesScanned, vectorEntriesFound, results.size());
+        }
 
         return results;
     }

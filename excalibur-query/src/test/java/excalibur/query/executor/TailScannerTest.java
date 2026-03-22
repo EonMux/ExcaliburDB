@@ -88,4 +88,53 @@ class TailScannerTest {
         // The implementation returns empty for k=0 after null checks
         // This test validates the API contract
     }
+
+    // ==================== Backpressure Limit Tests ====================
+
+    /**
+     * Test default backpressure entry limit is 100K.
+     */
+    @Test
+    void testDefaultBackpressureEntryLimit() {
+        TailScanner scanner = new TailScanner();
+        assertThat(scanner.getBackpressureEntryLimit()).isEqualTo(100_000);
+    }
+
+    /**
+     * Test custom backpressure entry limit constructor.
+     */
+    @Test
+    void testCustomBackpressureEntryLimit() {
+        TailScanner scanner = new TailScanner(50_000);
+        assertThat(scanner.getBackpressureEntryLimit()).isEqualTo(50_000);
+    }
+
+    /**
+     * Test backpressure entry limit is clamped to at least 1.
+     */
+    @Test
+    void testBackpressureEntryLimitClampedToMinimum() {
+        TailScanner scannerZero = new TailScanner(0);
+        assertThat(scannerZero.getBackpressureEntryLimit()).isEqualTo(1);
+
+        TailScanner scannerNegative = new TailScanner(-1000);
+        assertThat(scannerNegative.getBackpressureEntryLimit()).isEqualTo(1);
+    }
+
+    /**
+     * Test backpressure constant is accessible.
+     */
+    @Test
+    void testBackpressureConstant() {
+        assertThat(TailScanner.DEFAULT_BACKPRESSURE_ENTRY_LIMIT).isEqualTo(100_000);
+    }
+
+    /**
+     * Test configuration key is defined.
+     */
+    @Test
+    void testConfigKey() {
+        assertThat(TailScanner.CONFIG_BACKPRESSURE_ENTRY_LIMIT)
+            .isEqualTo("excalibur.tail-scan.backpressure-entry-limit");
+    }
 }

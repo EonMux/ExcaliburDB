@@ -1,5 +1,6 @@
 package excalibur.query.pipeline;
 
+import excalibur.ingest.visibility.DocumentVisibilityChecker;
 import excalibur.query.IndexCoverage;
 import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
@@ -8,6 +9,7 @@ import excalibur.query.executor.CancellationToken;
 import excalibur.query.executor.ParallelQueryDispatcher;
 import excalibur.query.executor.ResultAggregator;
 import excalibur.query.executor.SegmentQueryTask;
+import excalibur.query.visibility.DocumentAtomicityFilter;
 import excalibur.query.visibility.QuerySnapshot;
 import excalibur.shard.VisibilityTracker;
 import io.excalibur.store.LifecycleState;
@@ -82,6 +84,7 @@ public class QueryPipeline {
 
     private final StorageEngine storageEngine;
     private final VisibilityTracker visibilityTracker;
+    private final DocumentVisibilityChecker visibilityChecker;
     private final HnswGraphProvider graphProvider;
     private final DistanceFunction distanceFunction;
     private final LlmScorer llmScorer;
@@ -101,7 +104,26 @@ public class QueryPipeline {
             HnswGraphProvider graphProvider,
             DistanceFunction distanceFunction) {
 
-        this(storageEngine, visibilityTracker, graphProvider, distanceFunction, null, DEFAULT_COVERAGE_THRESHOLD);
+        this(storageEngine, visibilityTracker, null, graphProvider, distanceFunction, null, DEFAULT_COVERAGE_THRESHOLD);
+    }
+
+    /**
+     * Creates a new QueryPipeline with document atomicity support.
+     *
+     * @param storageEngine The storage engine
+     * @param visibilityTracker The visibility tracker for epoch coordination
+     * @param visibilityChecker The visibility checker for document atomicity (may be null)
+     * @param graphProvider Provider for HNSW graphs
+     * @param distanceFunction The distance function for vector comparison
+     */
+    public QueryPipeline(
+            StorageEngine storageEngine,
+            VisibilityTracker visibilityTracker,
+            DocumentVisibilityChecker visibilityChecker,
+            HnswGraphProvider graphProvider,
+            DistanceFunction distanceFunction) {
+
+        this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction, null, DEFAULT_COVERAGE_THRESHOLD);
     }
 
     /**
@@ -122,8 +144,32 @@ public class QueryPipeline {
             LlmScorer llmScorer,
             double coverageThreshold) {
 
+        this(storageEngine, visibilityTracker, null, graphProvider, distanceFunction, llmScorer, coverageThreshold);
+    }
+
+    /**
+     * Creates a new QueryPipeline with all options including document atomicity.
+     *
+     * @param storageEngine The storage engine
+     * @param visibilityTracker The visibility tracker
+     * @param visibilityChecker The visibility checker for document atomicity (may be null)
+     * @param graphProvider Provider for HNSW graphs
+     * @param distanceFunction The distance function
+     * @param llmScorer Optional LLM scorer for Stage 5
+     * @param coverageThreshold Threshold for degraded state
+     */
+    public QueryPipeline(
+            StorageEngine storageEngine,
+            VisibilityTracker visibilityTracker,
+            DocumentVisibilityChecker visibilityChecker,
+            HnswGraphProvider graphProvider,
+            DistanceFunction distanceFunction,
+            LlmScorer llmScorer,
+            double coverageThreshold) {
+
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
+        this.visibilityChecker = visibilityChecker;
         this.graphProvider = Objects.requireNonNull(graphProvider, "GraphProvider cannot be null");
         this.distanceFunction = Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
         this.llmScorer = llmScorer;
@@ -315,19 +361,35 @@ public class QueryPipeline {
      * <p>Performs precise ANN search within candidate segments using HNSW.
      * For segments where lastIntegratedOffset < writeLogHead, also performs
      * brute-force tail scan over un-integrated entries.</p>
+     *
+     * <p><strong>Offset Comparison:</strong> Uses {@link TailScanAnalyzer} to compare
+     * lastIntegratedOffset vs writeLogHead for each candidate segment. This determines
+     * which segments have un-integrated entries that need tail scanning.</p>
      */
     private PipelineContext stage3_HnswVectorSearch(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 3 cancelled before HNSW search");
 
         LOGGER.trace("Stage 3: Running HNSW vector search");
 
+        // Use TailScanAnalyzer to compare lastIntegratedOffset vs writeLogHead for each segment
+        TailScanAnalyzer analyzer = new TailScanAnalyzer();
+        TailScanAnalyzer.AnalysisResult analysis = analyzer.analyzeWithSummary(context.candidates);
+
+        LOGGER.debug("Stage 3: Tail scan analysis - {} of {} segments need tail scan, total tail size: {} bytes",
+            analysis.segmentsNeedingTailScan(), analysis.totalSegments(), analysis.totalTailSize());
+
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
-        long totalTailScanEntries = 0;
+        long totalTailScanEntries = analysis.totalTailSize();
 
         float[] queryVector = context.request.queryVectorUnsafe();
         int oversamplingFactor = (int) (context.request.recallTarget() * 2); // Approximate oversampling
 
-        for (SegmentCandidate candidate : context.candidates) {
+        // Process each candidate with its tail scan requirement
+        List<TailScanRequirement> requirements = analysis.requirements();
+        for (int i = 0; i < context.candidates.size(); i++) {
+            SegmentCandidate candidate = context.candidates.get(i);
+            TailScanRequirement requirement = requirements.get(i);
+
             token.checkCancelled("Stage 3 cancelled during segment search");
 
             try {
@@ -335,18 +397,15 @@ public class QueryPipeline {
                 List<HnswSearchResult> results = searchSegment(
                     queryVector,
                     candidate,
-                    context.request.topK() * oversamplingFactor
+                    context.request.topK() * oversamplingFactor,
+                    requirement
                 );
 
-                // Count tail scan entries
-                long tailEntries = candidate.graph.getLastIntegratedOffset() > 0
-                    ? Math.max(0, candidate.segment.getWriteLogHead() - candidate.graph.getLastIntegratedOffset())
-                    : 0;
-
-                totalTailScanEntries += tailEntries;
+                // Use the pre-computed tail size from the requirement
+                long tailEntries = requirement.isTailScanNeeded() ? requirement.tailSize() : 0;
 
                 segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    candidate.segmentId,
+                    candidate.segmentId(),
                     results,
                     tailEntries,
                     0, // duration computed separately
@@ -355,9 +414,9 @@ public class QueryPipeline {
                 ));
 
             } catch (Exception e) {
-                LOGGER.warn("Segment {} search failed: {}", candidate.segmentId, e.getMessage());
+                LOGGER.warn("Segment {} search failed: {}", candidate.segmentId(), e.getMessage());
                 segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    candidate.segmentId,
+                    candidate.segmentId(),
                     Collections.emptyList(),
                     0,
                     0,
@@ -375,26 +434,189 @@ public class QueryPipeline {
 
     /**
      * Searches a single segment using HNSW and optional tail scan.
+     *
+     * <p>Uses the pre-computed TailScanRequirement to determine if tail scan
+     * is needed. If tail scan is required, performs brute-force scan over
+     * un-integrated write log entries and merges results with HNSW results.</p>
+     *
+     * <h3>Merge Strategy</h3>
+     * <ol>
+     *   <li>Perform HNSW graph search for k results</li>
+     *   <li>If tail scan needed: perform brute-force scan of un-integrated entries</li>
+     *   <li>Merge both result sets, sorting by distance</li>
+     *   <li>Deduplicate by node ID and return top-k</li>
+     * </ol>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Results are sorted by distance (closest first)</li>
+     *   <li>No duplicate node IDs in output</li>
+     *   <li>Distance values are valid: cosine ∈ [-1,1], L2 ∈ [0,∞)</li>
+     *   <li>Exactly k results (or fewer if insufficient candidates)</li>
+     * </ul>
+     *
+     * @param queryVector The query vector
+     * @param candidate The candidate segment to search
+     * @param k The number of results to return
+     * @param requirement The pre-computed tail scan requirement
+     * @return List of merged search results (HNSW + tail scan if needed), sorted by distance
      */
     private List<HnswSearchResult> searchSegment(
             float[] queryVector,
             SegmentCandidate candidate,
-            int k) {
+            int k,
+            TailScanRequirement requirement) {
 
-        // HNSW search
-        List<HnswSearchResult> hnswResults = candidate.graph.search(queryVector, k);
+        // Step 1: Perform HNSW graph search
+        List<HnswSearchResult> hnswResults = candidate.graph().search(queryVector, k);
 
-        // Check for tail scan
-        long lastIntegratedOffset = candidate.graph.getLastIntegratedOffset();
-        long writeLogHead = candidate.segment.getWriteLogHead();
+        LOGGER.trace("Segment {}: HNSW search returned {} results",
+            candidate.segmentId(), hnswResults.size());
 
-        if (lastIntegratedOffset < writeLogHead && candidate.segment.writeLog() != null) {
-            // Tail scan needed for live indexing
-            // This would be handled by TailScanner
-            // For now, just return HNSW results
+        // Step 2: Check if tail scan is needed based on pre-computed requirement
+        if (!requirement.isTailScanNeeded()) {
+            // No tail scan needed - return HNSW results only
+            return hnswResults;
         }
 
-        return hnswResults;
+        // Step 3: Perform tail scan over un-integrated write log entries
+        List<HnswSearchResult> tailResults = performTailScan(
+            queryVector,
+            candidate,
+            requirement,
+            k
+        );
+
+        LOGGER.trace("Segment {}: Tail scan returned {} results",
+            candidate.segmentId(), tailResults.size());
+
+        // Step 4: Merge HNSW and tail scan results
+        return mergeHnswAndTailResults(hnswResults, tailResults, k);
+    }
+
+    /**
+     * Performs a brute-force tail scan over un-integrated write log entries.
+     *
+     * <p>The tail scan computes exact distances on full-precision vectors
+     * from the write log that haven't been integrated into the HNSW graph yet.</p>
+     *
+     * @param queryVector The query vector
+     * @param candidate The candidate segment
+     * @param requirement The tail scan requirement with offset information
+     * @param k Maximum number of results to return from tail scan
+     * @return List of results from tail scan, sorted by distance
+     */
+    private List<HnswSearchResult> performTailScan(
+            float[] queryVector,
+            SegmentCandidate candidate,
+            TailScanRequirement requirement,
+            int k) {
+
+        Segment segment = candidate.segment();
+        if (segment == null || segment.writeLog() == null) {
+            LOGGER.trace("Segment {}: No write log available for tail scan", candidate.segmentId());
+            return Collections.emptyList();
+        }
+
+        try {
+            // Create tail scanner and perform scan
+            excalibur.query.executor.TailScanner tailScanner =
+                new excalibur.query.executor.TailScanner();
+
+            // Scan range: [lastIntegratedOffset, writeLogHead)
+            long startOffset = requirement.tailScanStartOffset();
+            long endOffset = requirement.tailScanEndOffset();
+
+            return tailScanner.performTailScan(
+                queryVector,
+                segment.writeLog(),
+                startOffset,
+                endOffset,
+                k,
+                distanceFunction
+            );
+
+        } catch (Exception e) {
+            LOGGER.warn("Segment {}: Tail scan failed: {}",
+                candidate.segmentId(), e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Merges HNSW search results with tail scan results.
+     *
+     * <p>This method combines results from both sources, removes duplicates,
+     * and returns the top-k results sorted by distance (closest first).</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Results are sorted by distance (ascending)</li>
+     *   <li>No duplicate node IDs in output</li>
+     *   <li>Exactly k results (or fewer if insufficient candidates)</li>
+     *   <li>Distances are from exact computation (full precision)</li>
+     * </ul>
+     *
+     * @param hnswResults Results from HNSW graph search
+     * @param tailResults Results from tail scan
+     * @param k Maximum number of results to return
+     * @return Merged and deduplicated results, sorted by distance
+     */
+    private List<HnswSearchResult> mergeHnswAndTailResults(
+            List<HnswSearchResult> hnswResults,
+            List<HnswSearchResult> tailResults,
+            int k) {
+
+        // Early return for k <= 0
+        if (k <= 0) {
+            return Collections.emptyList();
+        }
+
+        // Early returns for edge cases
+        if (tailResults.isEmpty()) {
+            return limitResults(hnswResults, k);
+        }
+        if (hnswResults.isEmpty()) {
+            return limitResults(tailResults, k);
+        }
+
+        // Combine both result lists
+        List<HnswSearchResult> combined = new ArrayList<>(
+            hnswResults.size() + tailResults.size());
+        combined.addAll(hnswResults);
+        combined.addAll(tailResults);
+
+        // Sort by distance (ascending - closest first)
+        combined.sort(Comparator.comparingDouble(HnswSearchResult::distance));
+
+        // Deduplicate by node ID and take top-k
+        Set<Long> seenNodeIds = new HashSet<>();
+        List<HnswSearchResult> merged = new ArrayList<>(k);
+
+        for (HnswSearchResult result : combined) {
+            if (seenNodeIds.add(result.nodeId())) {
+                merged.add(result);
+                if (merged.size() >= k) {
+                    break;
+                }
+            }
+        }
+
+        return merged;
+    }
+
+    /**
+     * Limits results to the specified count.
+     *
+     * @param results The results to limit
+     * @param limit Maximum number of results
+     * @return Limited results (new list)
+     */
+    private List<HnswSearchResult> limitResults(List<HnswSearchResult> results, int limit) {
+        if (results.size() <= limit) {
+            return new ArrayList<>(results);
+        }
+        return new ArrayList<>(results.subList(0, limit));
     }
 
     /**
@@ -402,6 +624,11 @@ public class QueryPipeline {
      *
      * <p>Exact distance computation on full-precision vectors for top candidates.
      * Merges HNSW results with tail scan results.</p>
+     *
+     * <p><strong>Document Atomicity:</strong> After merging results, this stage
+     * applies the DocumentAtomicityFilter to ensure queries never see partially-
+     * ingested documents. All chunks from a visible document are included; none
+     * from partial documents.</p>
      */
     private PipelineContext stage4_FullVectorRerank(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 4 cancelled before reranking");
@@ -417,7 +644,21 @@ public class QueryPipeline {
 
         List<QueryResultItem> mergedResults = aggregator.mergeAndRank(context.segmentResults);
 
-        LOGGER.debug("Stage 4: Reranked to {} results", mergedResults.size());
+        int beforeAtomicityFilter = mergedResults.size();
+
+        // Apply document atomicity filter to exclude partial documents
+        if (visibilityChecker != null) {
+            DocumentAtomicityFilter atomicityFilter = new DocumentAtomicityFilter(visibilityChecker);
+            mergedResults = atomicityFilter.filterPartialDocuments(mergedResults, context.epoch);
+
+            if (mergedResults.size() < beforeAtomicityFilter) {
+                LOGGER.debug("Stage 4: Document atomicity filter removed {} partial document results",
+                    beforeAtomicityFilter - mergedResults.size());
+            }
+        }
+
+        LOGGER.debug("Stage 4: Reranked to {} results (atomicity filtered from {})",
+            mergedResults.size(), beforeAtomicityFilter);
 
         return context.withMergedResults(mergedResults);
     }
@@ -428,6 +669,11 @@ public class QueryPipeline {
      * <p>Sends top-k candidates + original query text to LLM for relevancy
      * scoring. Discards results below threshold. Falls back to vector-only
      * ranking if LLM is unavailable.</p>
+     *
+     * <h3>Sorting After LLM Scoring</h3>
+     * <p>After LLM scoring, results are sorted by relevance score in descending
+     * order (highest relevance first). This ensures the most relevant results
+     * appear at the top of the response.</p>
      */
     private PipelineContext stage5_LlmScoring(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 5 cancelled before LLM scoring");
@@ -452,6 +698,10 @@ public class QueryPipeline {
                 context.mergedResults,
                 context.request.llmThreshold()
             );
+
+            // Sort by relevance score descending (highest first)
+            // LLM relevancy scores are in range [0.0, 1.0] where higher is better
+            scoredResults = ResultAggregator.sortByRelevanceDescending(scoredResults);
 
             LOGGER.debug("Stage 5: LLM scored {} results, {} after threshold filtering",
                 context.mergedResults.size(), scoredResults.size());
@@ -587,13 +837,11 @@ public class QueryPipeline {
 
     /**
      * A candidate segment for querying.
+     *
+     * <p>Uses the public {@link SegmentCandidate} class from the same package.</p>
+     *
+     * <p><strong>Thread Safety:</strong> Each pipeline execution uses its own context.</p>
      */
-    private record SegmentCandidate(
-        long segmentId,
-        Segment segment,
-        HnswGraph graph,
-        LifecycleState state
-    ) {}
 
     /**
      * Context passed through pipeline stages.

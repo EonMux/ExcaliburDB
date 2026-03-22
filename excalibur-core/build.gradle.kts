@@ -123,5 +123,8 @@ tasks.test {
     useJUnitPlatform {
         excludeTags("slow")
     }
-    jvmArgs("--enable-preview")
+    jvmArgs(
+        "--enable-preview",
+        "--add-opens", "java.base/java.util.concurrent.atomic=ALL-UNNAMED"
+    )
 }
