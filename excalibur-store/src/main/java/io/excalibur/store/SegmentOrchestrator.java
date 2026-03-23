@@ -149,6 +149,9 @@ public class SegmentOrchestrator implements AutoCloseable {
     private final AtomicBoolean compactorRunning = new AtomicBoolean(false);
     private final CompactionWorker compactionWorker;
 
+    // Background split worker
+    private final SplitWorker splitWorker;
+
     // Visibility epoch for this orchestrator
     private final AtomicLong orchestratorEpoch = new AtomicLong(0);
 
@@ -187,6 +190,32 @@ public class SegmentOrchestrator implements AutoCloseable {
             orchestratorEpoch.incrementAndGet();
 
             statistics.incrementCompactionOperations();
+        });
+
+        // Create and configure the split worker for elastic segment splitting
+        this.splitWorker = new SplitWorker(arena, (parent, leftChild, rightChild) -> {
+            // Remove parent segment from registry
+            segments.remove(parent.path());
+
+            // Add child segments to registry
+            segments.put(leftChild.path(), leftChild);
+            segments.put(rightChild.path(), rightChild);
+
+            // Register children for compaction monitoring
+            compactionWorker.registerSegment(leftChild);
+            compactionWorker.registerSegment(rightChild);
+
+            // Unregister parent from compaction (it will be garbage collected)
+            compactionWorker.unregisterSegment(parent);
+
+            // Update statistics
+            statistics.incrementSplitOperations();
+
+            // Increment visibility epoch for snapshot consistency
+            orchestratorEpoch.incrementAndGet();
+
+            LOGGER.log(Level.INFO, "Split complete: {0} -> {1}, {2}",
+                new Object[] { parent.path(), leftChild.path(), rightChild.path() });
         });
 
         LOGGER.log(Level.INFO, "SegmentOrchestrator created with dataDir={0}", dataDir);
@@ -259,6 +288,9 @@ public class SegmentOrchestrator implements AutoCloseable {
         Path segmentPath = dataDir.resolve("segment_" + segmentIndex + ".dat");
 
         Segment segment = getSegment(segmentPath);
+        if (segment == null) {
+            return null; // Segment doesn't exist yet - key not found
+        }
         return segment.get(key);
     }
 
@@ -295,6 +327,11 @@ public class SegmentOrchestrator implements AutoCloseable {
         Path segmentPath = dataDir.resolve("segment_" + segmentIndex + ".dat");
 
         Segment segment = getSegment(segmentPath);
+        if (segment == null) {
+            // Segment doesn't exist yet - key not found
+            return ZeroCopySlice.notFound(epoch, -1, null);
+        }
+
         ZeroCopySlice slice = segment.getWithEpoch(key);
 
         // Increment epoch after read
@@ -324,6 +361,10 @@ public class SegmentOrchestrator implements AutoCloseable {
         Path segmentPath = dataDir.resolve("segment_" + segmentIndex + ".dat");
 
         Segment segment = getSegment(segmentPath);
+        if (segment == null) {
+            return false; // Segment doesn't exist yet - key not found
+        }
+
         boolean deleted = segment.delete(key);
 
         // Increment orchestrator epoch
@@ -402,22 +443,24 @@ public class SegmentOrchestrator implements AutoCloseable {
     // ==================== AutoCloseable ====================
 
     /**
-     * Starts the orchestrator and its background compaction worker.
+     * Starts the orchestrator and its background workers.
      *
-     * <p>This method starts the background compaction thread that monitors
-     * segments and performs compaction as needed. The orchestrator accepts
-     * operations before this method is called, but compaction will not run.</p>
+     * <p>This method starts the background compaction and split threads that monitor
+     * segments and perform maintenance as needed. The orchestrator accepts
+     * operations before this method is called, but background workers will not run.</p>
      */
     public void start() {
         if (compactorRunning.compareAndSet(false, true)) {
             compactionWorker.start();
-            LOGGER.log(Level.INFO, "SegmentOrchestrator started with background compaction");
+            splitWorker.start();
+            LOGGER.log(Level.INFO, "SegmentOrchestrator started with background compaction and splitting");
         }
     }
 
     @Override
     public void close() {
         compactorRunning.set(false);
+        splitWorker.stop();
         compactionWorker.stop();
         closeSegments();
         LOGGER.log(Level.INFO, "SegmentOrchestrator closed");
@@ -443,6 +486,9 @@ public class SegmentOrchestrator implements AutoCloseable {
 
                 // Register segment for compaction monitoring
                 compactionWorker.registerSegment(segment);
+
+                // Register segment for split monitoring (elastic splitting)
+                splitWorker.registerSegment(segment);
 
                 LOGGER.log(Level.FINE, "Created and registered segment: {0}", segmentPath);
             } catch (IOException e) {
@@ -587,6 +633,7 @@ public class SegmentOrchestrator implements AutoCloseable {
 
         void incrementWriteOperations() { writeOperations++; }
         void incrementDeleteOperations() { deleteOperations++; }
+        void incrementSplitOperations() { splitOperations++; }
         void incrementCompactionOperations() { compactionOperations++; }
 
         @Override
@@ -607,5 +654,17 @@ public class SegmentOrchestrator implements AutoCloseable {
      */
     public CompactionWorker getCompactionWorker() {
         return compactionWorker;
+    }
+
+    /**
+     * Returns the split worker for this orchestrator.
+     *
+     * <p>The split worker manages background elastic splitting of segments.
+     * Use this to configure split thresholds or request manual splits.</p>
+     *
+     * @return The split worker
+     */
+    public SplitWorker getSplitWorker() {
+        return splitWorker;
     }
 }

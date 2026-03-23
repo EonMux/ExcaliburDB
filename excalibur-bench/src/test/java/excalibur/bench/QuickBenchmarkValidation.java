@@ -262,27 +262,31 @@ public class QuickBenchmarkValidation {
         System.out.println("Target: ≥99% recall@10");
         System.out.println("========================================\n");
 
-        // Check if HNSW implementation exists
-        try {
-            Class<?> hnswClass = Class.forName("io.excalibur.vector.HNSWIndex");
-            System.out.println("HNSW implementation found: " + hnswClass.getName());
-            System.out.println("Status: Implementation exists - full benchmark required for recall validation");
-            // Full recall benchmark would require:
-            // 1. Generate test vectors
-            // 2. Build HNSW index
-            // 3. Query and compare with brute-force ground truth
-            // 4. Calculate recall@10
-        } catch (ClassNotFoundException e) {
-            System.out.println("HNSW implementation not found at io.excalibur.vector.HNSWIndex");
-            System.out.println("Checking for alternative locations...");
+        // Check if HNSW implementation exists (correct package location)
+        boolean found = false;
+        String[] possibleLocations = {
+            "io.excalibur.vector.hnsw.HnswGraph",
+            "io.excalibur.vector.HNSWIndex",
+            "io.excalibur.vector.HNSWGraph"
+        };
 
-            // Check vector module for HNSW-related classes
+        for (String location : possibleLocations) {
             try {
-                Class<?> graphClass = Class.forName("io.excalibur.vector.HNSWGraph");
-                System.out.println("Found: " + graphClass.getName());
-            } catch (ClassNotFoundException e2) {
-                System.out.println("HNSWGraph not found");
+                Class<?> hnswClass = Class.forName(location);
+                System.out.println("HNSW implementation found: " + hnswClass.getName());
+                found = true;
+                break;
+            } catch (ClassNotFoundException e) {
+                // Try next location
             }
+        }
+
+        if (found) {
+            System.out.println("Status: Implementation exists - full benchmark required for recall validation");
+            System.out.println("Note: Run HnswRecallBenchmarkRunner to validate ≥99% recall@10");
+        } else {
+            System.out.println("WARNING: HNSW implementation not found in any expected location");
+            fail("HNSW implementation not found");
         }
     }
 

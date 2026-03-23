@@ -246,6 +246,13 @@ public class Segment implements AutoCloseable {
     private WriteLog writeLog;
 
     /**
+     * Locality-Sensitive Hashing index for approximate nearest neighbor pre-filtering.
+     * Used during Stage 2 of the query pipeline to reduce candidates to ~10x-100x top_k.
+     * The index is populated during document ingestion when vectors are written.
+     */
+    private excalibur.filter.lsh.LshIndex lshIndex;
+
+    /**
      * Split state for copy-on-write splitting.
      * A segment can be in one of three states:
      * - NORMAL: No split in progress
@@ -678,6 +685,13 @@ public class Segment implements AutoCloseable {
 
         lock.readLock().lock();
         try {
+            // Check if segment is splitting - serve from snapshot for consistent reads
+            // This ensures copy-on-write semantics: reads see the pre-split snapshot
+            // even if the underlying memory could be modified externally
+            if (splitState == SplitState.SPLITTING && splitSnapshot != null) {
+                return getFromSnapshot(key);
+            }
+
             long keyHash = computeHash(key);
             int slotIndex = findSlot(keyHash, key);
 
@@ -745,7 +759,19 @@ public class Segment implements AutoCloseable {
         lock.readLock().lock();
         try {
             // Capture current epoch before reading
-            long epoch = modificationEpoch;
+            // During split, use the snapshot's epoch for consistency
+            long epoch = (splitState == SplitState.SPLITTING && splitSnapshot != null)
+                ? splitSnapshot.modificationEpoch
+                : modificationEpoch;
+
+            // Check if segment is splitting - serve from snapshot for consistent reads
+            if (splitState == SplitState.SPLITTING && splitSnapshot != null) {
+                MemorySegment valueSlice = getFromSnapshot(key);
+                if (valueSlice == null) {
+                    return ZeroCopySlice.notFound(epoch, segmentId, this);
+                }
+                return new ZeroCopySlice(epoch, segmentId, valueSlice, this);
+            }
 
             long keyHash = computeHash(key);
             int slotIndex = findSlot(keyHash, key);
@@ -1118,6 +1144,120 @@ public class Segment implements AutoCloseable {
 
         // Get the entry and return value slice
         return getValueSlice(slotIndex);
+    }
+
+    // ==================== High-Performance Lookup Methods ====================
+
+    /**
+     * Retrieves the value for a key using a pre-computed hash.
+     *
+     * <p>This method is optimized for high-throughput scenarios where the hash
+     * can be pre-computed and cached. The caller is responsible for ensuring
+     * the hash matches the key.</p>
+     *
+     * <p><strong>Thread Safety:</strong> This method acquires the read lock.</p>
+     *
+     * @param key The key to look up (must not be null)
+     * @param keyHash Pre-computed hash of the key (must match the key)
+     * @return MemorySegment slice containing the value, or null if not found
+     * @throws IllegalStateException if segment is closed
+     * @see #hashKey(byte[])
+     */
+    public MemorySegment getByHash(byte[] key, long keyHash) {
+        validateNotClosed();
+        if (key == null) {
+            throw new IllegalArgumentException("Key cannot be null");
+        }
+
+        lock.readLock().lock();
+        try {
+            int slotIndex = findSlot(keyHash, key);
+            if (slotIndex < 0 || isSlotTombstoned(slotIndex)) {
+                return null;
+            }
+            return getValueSlice(slotIndex);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Retrieves the value for a key using a pre-computed hash without lock acquisition.
+     *
+     * <p><strong>Warning:</strong> This method does NOT acquire any lock.
+     * The caller MUST hold the read lock before calling this method.
+     * Use only in read-only scenarios or with external synchronization.</p>
+     *
+     * <p>This is the fastest possible lookup path, designed for benchmarking
+     * and high-throughput batch operations where the caller manages concurrency.</p>
+     *
+     * @param key The key to look up (must not be null)
+     * @param keyHash Pre-computed hash of the key
+     * @return MemorySegment slice containing the value, or null if not found
+     * @throws IllegalStateException if segment is closed
+     * @see #readLock()
+     */
+    public MemorySegment getByHashWithoutLock(byte[] key, long keyHash) {
+        validateNotClosed();
+        // Caller must hold lock - no lock acquisition here
+        int slotIndex = findSlot(keyHash, key);
+        if (slotIndex < 0 || isSlotTombstoned(slotIndex)) {
+            return null;
+        }
+        return getValueSlice(slotIndex);
+    }
+
+    /**
+     * Computes the hash for a key that can be used with getByHash methods.
+     *
+     * <p>This method returns a normalized positive hash suitable for use
+     * with the high-performance lookup methods.</p>
+     *
+     * @param key The key to hash
+     * @return The 64-bit hash value (positive, in range [0, Long.MAX_VALUE])
+     * @throws IllegalArgumentException if key is null
+     */
+    public long hashKey(byte[] key) {
+        if (key == null) {
+            throw new IllegalArgumentException("Key cannot be null");
+        }
+        return computeHash(key);
+    }
+
+    /**
+     * Batch lookup of multiple keys with pre-computed hashes.
+     *
+     * <p>This method is optimized for high-throughput batch operations.
+     * It acquires the read lock once and performs all lookups, then releases.</p>
+     *
+     * @param keys Array of keys to look up
+     * @param hashes Array of pre-computed hashes (must match keys)
+     * @return Array of MemorySegment slices (null for not-found entries)
+     * @throws IllegalStateException if segment is closed
+     * @throws IllegalArgumentException if arrays are null or mismatched length
+     */
+    public MemorySegment[] batchGetByHash(byte[][] keys, long[] hashes) {
+        validateNotClosed();
+        if (keys == null || hashes == null) {
+            throw new IllegalArgumentException("Keys and hashes cannot be null");
+        }
+        if (keys.length != hashes.length) {
+            throw new IllegalArgumentException("Keys and hashes arrays must have same length");
+        }
+
+        MemorySegment[] results = new MemorySegment[keys.length];
+        lock.readLock().lock();
+        try {
+            for (int i = 0; i < keys.length; i++) {
+                int slotIndex = findSlot(hashes[i], keys[i]);
+                if (slotIndex >= 0 && !isSlotTombstoned(slotIndex)) {
+                    results[i] = getValueSlice(slotIndex);
+                }
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+        return results;
     }
 
     /**
@@ -1614,6 +1754,163 @@ public class Segment implements AutoCloseable {
         return segment.asSlice(valueOffset, valueLen);
     }
 
+    // ==================== Snapshot Read Methods ====================
+
+    /**
+     * Retrieves a value from the split snapshot for copy-on-write semantics.
+     *
+     * <p>This method is called when the segment is in SPLITTING state to ensure
+     * reads see a consistent pre-split view of the data. The snapshot is an
+     * immutable MemorySegment view created at the moment split began.</p>
+     *
+     * @param key The key to look up
+     * @return MemorySegment slice pointing to the value in the snapshot,
+     *         or null if not found or tombstoned
+     */
+    private MemorySegment getFromSnapshot(byte[] key) {
+        long keyHash = computeHash(key);
+        int slotIndex = findSlotInSnapshot(keyHash, key);
+
+        if (slotIndex < 0) {
+            return null; // Not found
+        }
+
+        // Check if tombstoned in snapshot
+        if (isSlotTombstonedInSnapshot(slotIndex)) {
+            return null;
+        }
+
+        // Get the value slice from snapshot
+        return getValueSliceFromSnapshot(slotIndex);
+    }
+
+    /**
+     * Finds a slot in the snapshot using Robin Hood hashing.
+     *
+     * <p>This method performs the same lookup as {@link #findSlot} but reads
+     * from the snapshot's read-only MemorySegment instead of the live segment.</p>
+     *
+     * @param keyHash The 64-bit hash of the key
+     * @param key The key bytes
+     * @return Slot index if found, -1 if not found
+     */
+    private int findSlotInSnapshot(long keyHash, byte[] key) {
+        MemorySegment snapshotSegment = splitSnapshot.segment;
+        int idealSlot = (int) (keyHash & (slotCount - 1));
+
+        for (int distance = 0; distance < MAX_PROBE_LENGTH; distance++) {
+            int slotIndex = (idealSlot + distance) & (slotCount - 1);
+            long slotOffset = (long) slotIndex * SLOT_SIZE;
+
+            // Check if slot is occupied in snapshot
+            byte flags = snapshotSegment.get(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET);
+            if ((flags & FLAG_OCCUPIED) == 0) {
+                // Empty slot - key not found
+                return -1;
+            }
+
+            // Check if we've gone past all entries with smaller distances
+            byte slotDistance = snapshotSegment.get(BYTE_LAYOUT, slotOffset + SLOT_DISTANCE_OFFSET);
+            if (slotDistance < distance) {
+                // Would have found it by now due to Robin Hood ordering
+                return -1;
+            }
+
+            // Check if hash matches
+            long slotKeyHash = snapshotSegment.get(LONG_LAYOUT, slotOffset + SLOT_KEY_HASH_OFFSET);
+            if (slotKeyHash != keyHash) {
+                continue;
+            }
+
+            // Hash matches - verify key bytes in snapshot
+            if (keyMatchesInSnapshot(slotIndex, key)) {
+                return slotIndex;
+            }
+        }
+
+        return -1;
+    }
+
+    /**
+     * Checks if a slot is tombstoned in the snapshot.
+     *
+     * @param slotIndex The slot index to check
+     * @return true if the slot is tombstoned in the snapshot
+     */
+    private boolean isSlotTombstonedInSnapshot(int slotIndex) {
+        long slotOffset = (long) slotIndex * SLOT_SIZE;
+        byte flags = splitSnapshot.segment.get(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET);
+        return (flags & FLAG_TOMBSTONE) != 0;
+    }
+
+    /**
+     * Checks if the key in the snapshot slot matches the given key.
+     *
+     * @param slotIndex The slot index to check
+     * @param key The key to compare against
+     * @return true if the keys match
+     */
+    private boolean keyMatchesInSnapshot(int slotIndex, byte[] key) {
+        MemorySegment snapshotSegment = splitSnapshot.segment;
+        long dataRegionOffset = readDataOffsetFromSnapshot(slotIndex);
+        long entryOffset = slotTableSize + dataRegionOffset;
+
+        // Read key length from snapshot
+        int keyLen = snapshotSegment.get(INT_LAYOUT, entryOffset + ENTRY_KEY_LEN_OFFSET);
+        if (keyLen != key.length) {
+            return false;
+        }
+
+        // Compare key bytes in snapshot
+        for (int i = 0; i < keyLen; i++) {
+            byte entryByte = snapshotSegment.get(BYTE_LAYOUT, entryOffset + ENTRY_KEY_BYTES_OFFSET + i);
+            if (entryByte != key[i]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Reads the 6-byte data offset from a slot in the snapshot.
+     *
+     * @param slotIndex The slot index
+     * @return The data region offset
+     */
+    private long readDataOffsetFromSnapshot(int slotIndex) {
+        MemorySegment snapshotSegment = splitSnapshot.segment;
+        long slotOffset = (long) slotIndex * SLOT_SIZE;
+        long offset = 0;
+        offset |= (snapshotSegment.get(BYTE_LAYOUT, slotOffset + SLOT_DATA_OFFSET_OFFSET) & 0xFFL);
+        offset |= (snapshotSegment.get(BYTE_LAYOUT, slotOffset + SLOT_DATA_OFFSET_OFFSET + 1) & 0xFFL) << 8;
+        offset |= (snapshotSegment.get(BYTE_LAYOUT, slotOffset + SLOT_DATA_OFFSET_OFFSET + 2) & 0xFFL) << 16;
+        offset |= (snapshotSegment.get(BYTE_LAYOUT, slotOffset + SLOT_DATA_OFFSET_OFFSET + 3) & 0xFFL) << 24;
+        offset |= (snapshotSegment.get(BYTE_LAYOUT, slotOffset + SLOT_DATA_OFFSET_OFFSET + 4) & 0xFFL) << 32;
+        offset |= (snapshotSegment.get(BYTE_LAYOUT, slotOffset + SLOT_DATA_OFFSET_OFFSET + 5) & 0xFFL) << 40;
+        return offset;
+    }
+
+    /**
+     * Returns a zero-copy MemorySegment slice of the value from the snapshot.
+     *
+     * @param slotIndex The slot index
+     * @return MemorySegment slice pointing to the value in the snapshot
+     */
+    private MemorySegment getValueSliceFromSnapshot(int slotIndex) {
+        MemorySegment snapshotSegment = splitSnapshot.segment;
+        long dataRegionOffset = readDataOffsetFromSnapshot(slotIndex);
+        long entryOffset = slotTableSize + dataRegionOffset;
+
+        // Read key length and value length from snapshot
+        int keyLen = snapshotSegment.get(INT_LAYOUT, entryOffset + ENTRY_KEY_LEN_OFFSET);
+        int valueLen = snapshotSegment.get(INT_LAYOUT, entryOffset + ENTRY_VALUE_LEN_OFFSET);
+
+        // Create slice pointing to value bytes in snapshot
+        long valueOffset = entryOffset + ENTRY_KEY_BYTES_OFFSET + keyLen;
+        return snapshotSegment.asSlice(valueOffset, valueLen);
+    }
+
     /**
      * Reads swap data from a slot for Robin Hood displacement.
      */
@@ -1944,6 +2241,52 @@ public class Segment implements AutoCloseable {
      */
     public WriteLog writeLog() {
         return writeLog;
+    }
+
+    /**
+     * Attaches an LSH index to this segment for approximate nearest neighbor pre-filtering.
+     *
+     * <p>The LSH index is used during Stage 2 of the query pipeline to perform
+     * coarse vector similarity filtering, reducing candidates to approximately
+     * 10x-100x of the requested top_k before the more expensive HNSW search.</p>
+     *
+     * @param lshIndex The LSH index to attach (must not be null)
+     * @throws NullPointerException if lshIndex is null
+     * @throws IllegalStateException if segment is closed
+     */
+    public void attachLshIndex(excalibur.filter.lsh.LshIndex lshIndex) {
+        Objects.requireNonNull(lshIndex, "LshIndex cannot be null");
+        validateNotClosed();
+
+        lock.writeLock().lock();
+        try {
+            this.lshIndex = lshIndex;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Returns the LSH index attached to this segment.
+     *
+     * <p>The LSH index is used for approximate nearest neighbor pre-filtering
+     * during query execution. Returns null if no LSH index has been attached.</p>
+     *
+     * @return The LSH index, or null if none is attached
+     */
+    public excalibur.filter.lsh.LshIndex lshIndex() {
+        return lshIndex;
+    }
+
+    /**
+     * Returns the LSH index attached to this segment.
+     *
+     * <p>This is an alias for {@link #lshIndex()} for API consistency.</p>
+     *
+     * @return The LSH index, or null if none is attached
+     */
+    public excalibur.filter.lsh.LshIndex getLshIndex() {
+        return lshIndex;
     }
 
     /**

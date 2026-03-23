@@ -1,10 +1,13 @@
 package excalibur.query.pipeline;
 
+import excalibur.filter.lsh.LshIndex;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.vector.hnsw.HnswGraph;
 
+import java.util.Collections;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Represents a candidate segment for querying in the query pipeline.
@@ -33,6 +36,8 @@ public final class SegmentCandidate {
     private final Segment segment;
     private final HnswGraph graph;
     private final LifecycleState state;
+    private final LshIndex lshIndex;
+    private final Set<Long> lshCandidates;
 
     /**
      * Creates a new SegmentCandidate.
@@ -47,6 +52,47 @@ public final class SegmentCandidate {
         this.segment = segment;
         this.graph = graph;
         this.state = state;
+        this.lshIndex = null;
+        this.lshCandidates = Collections.emptySet();
+    }
+
+    /**
+     * Creates a new SegmentCandidate with LSH index.
+     *
+     * @param segmentId The segment identifier
+     * @param segment The storage segment
+     * @param graph The HNSW graph for the segment
+     * @param state The lifecycle state of the segment
+     * @param lshIndex The LSH index for the segment (may be null)
+     */
+    public SegmentCandidate(long segmentId, Segment segment, HnswGraph graph,
+                            LifecycleState state, LshIndex lshIndex) {
+        this.segmentId = segmentId;
+        this.segment = segment;
+        this.graph = graph;
+        this.state = state;
+        this.lshIndex = lshIndex;
+        this.lshCandidates = Collections.emptySet();
+    }
+
+    /**
+     * Creates a new SegmentCandidate with all fields.
+     *
+     * @param segmentId The segment identifier
+     * @param segment The storage segment
+     * @param graph The HNSW graph for the segment
+     * @param state The lifecycle state of the segment
+     * @param lshIndex The LSH index for the segment (may be null)
+     * @param lshCandidates The set of candidate entry IDs from LSH filtering
+     */
+    private SegmentCandidate(long segmentId, Segment segment, HnswGraph graph,
+                             LifecycleState state, LshIndex lshIndex, Set<Long> lshCandidates) {
+        this.segmentId = segmentId;
+        this.segment = segment;
+        this.graph = graph;
+        this.state = state;
+        this.lshIndex = lshIndex;
+        this.lshCandidates = lshCandidates != null ? lshCandidates : Collections.emptySet();
     }
 
     /**
@@ -83,6 +129,68 @@ public final class SegmentCandidate {
      */
     public LifecycleState state() {
         return state;
+    }
+
+    /**
+     * Gets the LSH index for the segment.
+     *
+     * @return The LSH index, or null if not available
+     */
+    public LshIndex lshIndex() {
+        return lshIndex;
+    }
+
+    /**
+     * Gets the set of candidate entry IDs from LSH filtering.
+     *
+     * <p>These are the entry IDs that passed LSH pre-filtering for this segment.
+     * This set is populated during Stage 2 of the query pipeline.</p>
+     *
+     * @return The set of candidate entry IDs (may be empty)
+     */
+    public Set<Long> lshCandidates() {
+        return lshCandidates;
+    }
+
+    /**
+     * Creates a new SegmentCandidate with the specified LSH candidates.
+     *
+     * <p>This method is used during Stage 2 (LSH pre-filter) to attach
+     * the set of candidate entry IDs that passed LSH filtering.</p>
+     *
+     * @param lshCandidates The set of candidate entry IDs from LSH filtering
+     * @return A new SegmentCandidate with the LSH candidates
+     */
+    public SegmentCandidate withLshCandidates(Set<Long> lshCandidates) {
+        return new SegmentCandidate(segmentId, segment, graph, state, lshIndex, lshCandidates);
+    }
+
+    /**
+     * Creates a new SegmentCandidate with the specified LSH index.
+     *
+     * @param lshIndex The LSH index for the segment (may be null)
+     * @return A new SegmentCandidate with the LSH index
+     */
+    public SegmentCandidate withLshIndex(LshIndex lshIndex) {
+        return new SegmentCandidate(segmentId, segment, graph, state, lshIndex, lshCandidates);
+    }
+
+    /**
+     * Checks if this candidate has an LSH index.
+     *
+     * @return true if LSH index is available, false otherwise
+     */
+    public boolean hasLshIndex() {
+        return lshIndex != null;
+    }
+
+    /**
+     * Checks if this candidate has LSH pre-filtered candidates.
+     *
+     * @return true if LSH candidates are available (non-empty), false otherwise
+     */
+    public boolean hasLshCandidates() {
+        return lshCandidates != null && !lshCandidates.isEmpty();
     }
 
     /**

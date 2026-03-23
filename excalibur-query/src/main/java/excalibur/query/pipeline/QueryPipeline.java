@@ -1,5 +1,7 @@
 package excalibur.query.pipeline;
 
+import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.filter.lsh.LshIndex;
 import excalibur.ingest.visibility.DocumentVisibilityChecker;
 import excalibur.query.IndexCoverage;
 import excalibur.query.QueryRequest;
@@ -22,6 +24,7 @@ import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -35,6 +38,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 /**
  * Executes the full query pipeline with cancellation and timeout support.
@@ -89,6 +93,7 @@ public class QueryPipeline {
     private final DistanceFunction distanceFunction;
     private final LlmScorer llmScorer;
     private final double coverageThreshold;
+    private final HierarchicalCuckooFilter hierarchicalFilter;
 
     /**
      * Creates a new QueryPipeline.
@@ -104,7 +109,7 @@ public class QueryPipeline {
             HnswGraphProvider graphProvider,
             DistanceFunction distanceFunction) {
 
-        this(storageEngine, visibilityTracker, null, graphProvider, distanceFunction, null, DEFAULT_COVERAGE_THRESHOLD);
+        this(storageEngine, visibilityTracker, null, graphProvider, distanceFunction, null, DEFAULT_COVERAGE_THRESHOLD, null);
     }
 
     /**
@@ -123,7 +128,7 @@ public class QueryPipeline {
             HnswGraphProvider graphProvider,
             DistanceFunction distanceFunction) {
 
-        this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction, null, DEFAULT_COVERAGE_THRESHOLD);
+        this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction, null, DEFAULT_COVERAGE_THRESHOLD, null);
     }
 
     /**
@@ -144,7 +149,7 @@ public class QueryPipeline {
             LlmScorer llmScorer,
             double coverageThreshold) {
 
-        this(storageEngine, visibilityTracker, null, graphProvider, distanceFunction, llmScorer, coverageThreshold);
+        this(storageEngine, visibilityTracker, null, graphProvider, distanceFunction, llmScorer, coverageThreshold, null);
     }
 
     /**
@@ -167,6 +172,31 @@ public class QueryPipeline {
             LlmScorer llmScorer,
             double coverageThreshold) {
 
+        this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction, llmScorer, coverageThreshold, null);
+    }
+
+    /**
+     * Creates a new QueryPipeline with all options including hierarchical filter.
+     *
+     * @param storageEngine The storage engine
+     * @param visibilityTracker The visibility tracker
+     * @param visibilityChecker The visibility checker for document atomicity (may be null)
+     * @param graphProvider Provider for HNSW graphs
+     * @param distanceFunction The distance function
+     * @param llmScorer Optional LLM scorer for Stage 5
+     * @param coverageThreshold Threshold for degraded state
+     * @param hierarchicalFilter Optional hierarchical Cuckoo filter for Stage 1 pruning
+     */
+    public QueryPipeline(
+            StorageEngine storageEngine,
+            VisibilityTracker visibilityTracker,
+            DocumentVisibilityChecker visibilityChecker,
+            HnswGraphProvider graphProvider,
+            DistanceFunction distanceFunction,
+            LlmScorer llmScorer,
+            double coverageThreshold,
+            HierarchicalCuckooFilter hierarchicalFilter) {
+
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
         this.visibilityChecker = visibilityChecker;
@@ -174,6 +204,7 @@ public class QueryPipeline {
         this.distanceFunction = Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
         this.llmScorer = llmScorer;
         this.coverageThreshold = coverageThreshold;
+        this.hierarchicalFilter = hierarchicalFilter;
     }
 
     // ==================== Main Execution Method ====================
@@ -298,7 +329,9 @@ public class QueryPipeline {
             HnswGraph graph = graphProvider.getGraph(segmentId);
 
             if (segment != null && graph != null) {
-                candidates.add(new SegmentCandidate(segmentId, segment, graph, state));
+                // Get LSH index from segment if available
+                LshIndex lshIndex = segment.lshIndex();
+                candidates.add(new SegmentCandidate(segmentId, segment, graph, state, lshIndex));
             }
         }
 
@@ -314,20 +347,55 @@ public class QueryPipeline {
      * <p>Eliminates segments that cannot contain relevant entries using
      * the hierarchical Cuckoo filter. Segments that pass this stage
      * are candidates for further processing.</p>
+     *
+     * <h3>Query Flow</h3>
+     * <ol>
+     *   <li>If no hierarchical filter configured, all candidates pass through</li>
+     *   <li>If no query text available, all candidates pass through</li>
+     *   <li>Query text is hashed and used to check which segments might contain relevant entries</li>
+     *   <li>Only segments whose IDs are in the candidate set from the filter pass through</li>
+     * </ol>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Query text converted to UTF-8 bytes for consistent hashing</li>
+     *   <li>Segment IDs compared as strings (filter returns String IDs)</li>
+     *   <li>Empty candidate set is valid (no segments match the query)</li>
+     * </ul>
      */
     private PipelineContext stage1_CuckooFilterCascade(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 1 cancelled before Cuckoo filter cascade");
 
         LOGGER.trace("Stage 1: Running Cuckoo filter cascade");
 
-        // For now, all segments pass through (Cuckoo filter integration
-        // would be added here when hierarchical filters are implemented)
-        // The Cuckoo filter would check if the query hash might be in the segment
+        // If no hierarchical filter configured, pass all segments through
+        if (hierarchicalFilter == null) {
+            LOGGER.debug("Stage 1: No hierarchical filter configured, {} candidates pass",
+                context.candidates.size());
+            return context.withCandidates(new ArrayList<>(context.candidates));
+        }
 
-        // Placeholder: mark all candidates as passing Cuckoo filter
-        List<SegmentCandidate> passed = new ArrayList<>(context.candidates);
+        // Use the query text hash to check which segments might contain relevant entries
+        byte[] queryKey = context.request.queryText() != null
+            ? context.request.queryText().getBytes(StandardCharsets.UTF_8)
+            : null;
 
-        LOGGER.debug("Stage 1: {} segments passed Cuckoo filter cascade", passed.size());
+        if (queryKey == null) {
+            LOGGER.debug("Stage 1: No query text for filter lookup, {} candidates pass",
+                context.candidates.size());
+            return context.withCandidates(new ArrayList<>(context.candidates));
+        }
+
+        // Find candidate segments using hierarchical filter
+        List<String> candidateSegmentIds = hierarchicalFilter.findCandidateSegments(queryKey);
+        Set<String> candidateSet = new HashSet<>(candidateSegmentIds);
+
+        List<SegmentCandidate> passed = context.candidates.stream()
+            .filter(c -> candidateSet.contains(String.valueOf(c.segmentId())))
+            .collect(Collectors.toList());
+
+        LOGGER.debug("Stage 1: {} of {} segments passed Cuckoo filter cascade",
+            passed.size(), context.candidates.size());
 
         return context.withCandidates(passed);
     }
@@ -337,20 +405,65 @@ public class QueryPipeline {
      *
      * <p>Coarse vector similarity filtering using Locality-Sensitive Hashing.
      * Reduces candidates to approximately 10x-100x top_k.</p>
+     *
+     * <h3>LSH Filtering Algorithm</h3>
+     * <ol>
+     *   <li>For each segment candidate, query its LSH index with the query vector</li>
+     *   <li>If the LSH index returns candidates, attach them to the segment candidate</li>
+     *   <li>If no LSH index is available, pass the segment through unchanged</li>
+     *   <li>If LSH returns no candidates, the segment is excluded from further processing</li>
+     * </ol>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>LSH candidates are entry IDs (long values) that potentially match the query vector</li>
+     *   <li>Semantically correct: segments with no LSH candidates are filtered out</li>
+     *   <li>Segments without LSH index pass through to ensure no data loss</li>
+     * </ul>
      */
     private PipelineContext stage2_LshPreFilter(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 2 cancelled before LSH pre-filter");
 
         LOGGER.trace("Stage 2: Running LSH pre-filter");
 
-        // For now, all segments pass through (LSH integration would be
-        // added here when LSH is implemented)
-        // LSH would pre-filter to 10x-100x top_k candidates
+        float[] queryVector = context.request.queryVectorUnsafe();
+        int targetCandidates = context.request.topK() * 50; // 50x oversampling
 
-        // Placeholder: mark all candidates as passing LSH filter
-        List<SegmentCandidate> passed = new ArrayList<>(context.candidates);
+        List<SegmentCandidate> passed = new ArrayList<>();
+        int segmentsWithLsh = 0;
+        int segmentsFiltered = 0;
+        long totalLshCandidates = 0;
 
-        LOGGER.debug("Stage 2: {} segments passed LSH pre-filter", passed.size());
+        for (SegmentCandidate candidate : context.candidates) {
+            token.checkCancelled("Stage 2 cancelled during LSH query");
+
+            LshIndex lsh = candidate.lshIndex();
+            if (lsh != null) {
+                segmentsWithLsh++;
+                try {
+                    Set<Long> lshCandidates = lsh.query(queryVector);
+                    if (!lshCandidates.isEmpty()) {
+                        totalLshCandidates += lshCandidates.size();
+                        passed.add(candidate.withLshCandidates(lshCandidates));
+                    } else {
+                        // Segment has no LSH candidates - filter it out
+                        segmentsFiltered++;
+                        LOGGER.trace("Segment {} filtered out by LSH (no candidates)", candidate.segmentId());
+                    }
+                } catch (Exception e) {
+                    // On LSH error, pass the segment through to ensure no data loss
+                    LOGGER.warn("LSH query failed for segment {}: {}. Passing through.",
+                        candidate.segmentId(), e.getMessage());
+                    passed.add(candidate);
+                }
+            } else {
+                // No LSH index - pass through to ensure no data loss
+                passed.add(candidate);
+            }
+        }
+
+        LOGGER.debug("Stage 2: {} segments passed LSH pre-filter ({} with LSH, {} filtered out, {} total LSH candidates)",
+            passed.size(), segmentsWithLsh, segmentsFiltered, totalLshCandidates);
 
         return context.withCandidates(passed);
     }

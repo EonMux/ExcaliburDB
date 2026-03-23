@@ -28,11 +28,11 @@ public final class ConfigLoader {
     
     /**
      * Loads configuration from properties file with environment variable overrides.
-     * 
+     *
      * @param basePath Path to properties file in classpath (default: "excalibur.properties")
-     * @param envOverrides Map of environment variable overrides in format "excalibur.key=value"
+     * @param envOverrides Map of environment variable overrides in format "EXCALIBUR_KEY=value"
      * @return Loaded and validated Config object
-     * 
+     *
      * @throws IllegalStateException if configuration is invalid or missing required fields
      */
     public static Config load(String basePath, Map<String, String> envOverrides) {
@@ -40,11 +40,88 @@ public final class ConfigLoader {
             if (cachedConfig != null) {
                 return cachedConfig;
             }
-            
+
             instance = new ConfigLoader();
-            cachedConfig = instance.load(basePath, envOverrides);
+            cachedConfig = instance.doLoad(basePath, envOverrides);
             return cachedConfig;
         }
+    }
+
+    /**
+     * Internal method that performs the actual configuration loading.
+     *
+     * @param basePath Path to properties file in classpath
+     * @param envOverrides Map of environment variable overrides
+     * @return Loaded and validated Config object
+     */
+    private Config doLoad(String basePath, Map<String, String> envOverrides) {
+        try {
+            InputStream stream = ConfigLoader.class.getClassLoader()
+                .getResourceAsStream(basePath);
+            if (stream == null) {
+                throw new IllegalStateException("Properties file not found: " + basePath);
+            }
+
+            PropertiesLoader loader = new PropertiesLoader(stream);
+            Map<String, String> props = loader.load();
+
+            // Apply environment variable overrides
+            applyEnvOverrides(props, envOverrides);
+
+            return new Config(props);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to load configuration", e);
+        }
+    }
+
+    /**
+     * Applies environment variable overrides to the properties map.
+     *
+     * <p>Environment variables follow the pattern:
+     * EXCALIBUR_VISIBILITY_EPOCH_TICK_MS -> excalibur.visibility.epoch-tick-ms</p>
+     *
+     * @param props The properties map to modify
+     * @param envOverrides Map of environment variable overrides
+     */
+    private void applyEnvOverrides(Map<String, String> props, Map<String, String> envOverrides) {
+        if (envOverrides == null) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : envOverrides.entrySet()) {
+            String envKey = entry.getKey();
+            String propKey = transformEnvKey(envKey);
+            // Always apply override, even for keys not in properties file
+            props.put(propKey, entry.getValue());
+        }
+    }
+
+    /**
+     * Transforms an environment variable key to a property key.
+     *
+     * <p>Example: EXCALIBUR_VISIBILITY_EPOCH_TICK_MS -> excalibur.visibility.epoch-tick-ms</p>
+     * <p>The property key format is: excalibur.&lt;section&gt;.&lt;value-name&gt;</p>
+     * <p>where section is a single word and value-name uses hyphens.</p>
+     *
+     * @param envKey The environment variable key
+     * @return The corresponding property key
+     */
+    private String transformEnvKey(String envKey) {
+        // EXCALIBUR_VISIBILITY_EPOCH_TICK_MS -> excalibur.visibility.epoch-tick-ms
+        if (envKey.startsWith("EXCALIBUR_")) {
+            envKey = envKey.substring(10);  // "EXCALIBUR_" is 10 characters
+        }
+
+        // Split into section and value name
+        // VISIBILITY_EPOCH_TICK_MS -> section=VISIBILITY, value=EPOCH_TICK_MS
+        int firstUnderscore = envKey.indexOf('_');
+        if (firstUnderscore > 0) {
+            String section = envKey.substring(0, firstUnderscore).toLowerCase();
+            String valueName = envKey.substring(firstUnderscore + 1).replace("_", "-").toLowerCase();
+            return "excalibur." + section + "." + valueName;
+        }
+
+        // Fallback for keys without underscores after prefix
+        return "excalibur." + envKey.toLowerCase();
     }
     
     /**

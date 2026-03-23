@@ -5,6 +5,9 @@ import com.sun.net.httpserver.HttpHandler;
 import excalibur.api.endpoint.HealthEndpoint;
 import excalibur.api.endpoint.StatsEndpoint;
 import excalibur.api.endpoint.QueryEndpoint;
+import excalibur.api.endpoint.IngestEndpoint;
+import excalibur.api.endpoint.ReindexEndpoint;
+import excalibur.api.endpoint.IngestStatusEndpoint;
 import excalibur.query.pipeline.QueryPipeline;
 import excalibur.shard.IndexOrchestrator;
 import io.excalibur.store.StorageEngine;
@@ -31,6 +34,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>{@code GET /health} - Health check for load balancers and Kubernetes</li>
  *   <li>{@code GET /v1/stats} - System statistics and observability</li>
  *   <li>{@code POST /v1/query} - Query execution</li>
+ *   <li>{@code POST /v1/ingest} - Register ingestion source</li>
+ *   <li>{@code POST /v1/reindex} - Force reindex of a source</li>
+ *   <li>{@code GET /v1/ingest/status} - Ingestion status per source</li>
  * </ul>
  *
  * <h2>Virtual Thread Dispatch</h2>
@@ -76,6 +82,11 @@ public class ExcaliburDBServer {
     private final IndexOrchestrator indexOrchestrator;
     private final StorageEngine storageEngine;
     private final QueryPipeline queryPipeline;
+
+    // Registries for ingestion endpoints
+    private final IngestEndpoint.SourceRegistry ingestSourceRegistry;
+    private final ReindexEndpoint.ReindexStatusRegistry reindexStatusRegistry;
+    private final IngestStatusEndpoint.IngestionStatusRegistry ingestionStatusRegistry;
 
     private HttpServer server;
     private final AtomicBoolean running;
@@ -141,6 +152,11 @@ public class ExcaliburDBServer {
         this.queryPipeline = queryPipeline;
         this.running = new AtomicBoolean(false);
 
+        // Initialize registries for ingestion endpoints
+        this.ingestSourceRegistry = new IngestEndpoint.InMemorySourceRegistry();
+        this.reindexStatusRegistry = new ReindexEndpoint.InMemoryReindexStatusRegistry();
+        this.ingestionStatusRegistry = new IngestStatusEndpoint.InMemoryIngestionStatusRegistry();
+
         LOGGER.debug("ExcaliburDBServer configured for port {}", port);
     }
 
@@ -171,9 +187,12 @@ public class ExcaliburDBServer {
 
         LOGGER.info("ExcaliburDB API server started successfully on port {}", port);
         LOGGER.info("Endpoints available:");
-        LOGGER.info("  GET  /health   - Health check");
-        LOGGER.info("  GET  /v1/stats - System statistics");
-        LOGGER.info("  POST /v1/query - Query execution");
+        LOGGER.info("  GET  /health           - Health check");
+        LOGGER.info("  GET  /v1/stats         - System statistics");
+        LOGGER.info("  POST /v1/query         - Query execution");
+        LOGGER.info("  POST /v1/ingest        - Register ingestion source");
+        LOGGER.info("  POST /v1/reindex       - Force reindex");
+        LOGGER.info("  GET  /v1/ingest/status - Ingestion status");
     }
 
     /**
@@ -231,17 +250,30 @@ public class ExcaliburDBServer {
      * Registers all API endpoints.
      */
     private void registerEndpoints() {
+        // Core endpoints
         HealthEndpoint healthEndpoint = new HealthEndpoint(indexOrchestrator);
         StatsEndpoint statsEndpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
         QueryEndpoint queryEndpoint = new QueryEndpoint(queryPipeline);
 
+        // Ingestion endpoints
+        IngestEndpoint ingestEndpoint = new IngestEndpoint(ingestSourceRegistry);
+        ReindexEndpoint reindexEndpoint = new ReindexEndpoint(
+            new ReindexEndpoint.InMemorySourceRegistry(), // Source registry adapter
+            reindexStatusRegistry
+        );
+        IngestStatusEndpoint ingestStatusEndpoint = new IngestStatusEndpoint(ingestionStatusRegistry);
+
+        // Register endpoints
         server.createContext("/health", wrapHandler(healthEndpoint));
         server.createContext("/v1/stats", wrapHandler(statsEndpoint));
         server.createContext("/v1/query", wrapHandler(queryEndpoint));
+        server.createContext("/v1/ingest", wrapHandler(ingestEndpoint));
+        server.createContext("/v1/reindex", wrapHandler(reindexEndpoint));
+        server.createContext("/v1/ingest/status", wrapHandler(ingestStatusEndpoint));
 
         server.createContext("/", this::handleNotFound);
 
-        LOGGER.debug("Registered endpoints: /health, /v1/stats, /v1/query");
+        LOGGER.debug("Registered endpoints: /health, /v1/stats, /v1/query, /v1/ingest, /v1/reindex, /v1/ingest/status");
     }
 
     /**

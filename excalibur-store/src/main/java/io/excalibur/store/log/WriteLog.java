@@ -31,19 +31,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Each log entry has the following structure:</p>
  * <table border="1" cellpadding="4" cellspacing="0">
  *   <tr><th>Field</th><th>Size (bytes)</th><th>Description</th></tr>
- *   <tr><td>entryType</td><td>1</td><td>Log entry type (1 byte)</td></tr>
+ *   <tr><td>entryType</td><td>1</td><td>Log entry type (PUT=1, DELETE=2, BARRIER=3)</td></tr>
  *   <tr><td>entryId</td><td>8</td><td>Unique entry identifier (long)</td></tr>
+ *   <tr><td>payloadLen</td><td>4</td><td>Length of payload in bytes</td></tr>
  *   <tr><td>checksum</td><td>4</td><td>CRC32 checksum of payload (unsigned 32-bit)</td></tr>
- *   <tr><td>payload</td><td>N</td><td>Entry-specific data</td></tr>
+ *   <tr><td>payload</td><td>N</td><td>Entry-specific data (N = payloadLen)</td></tr>
  * </table>
- *
- * <h2>Entry Types</h2>
- * <ul>
- *   <li>PUT_LOG_ENTRY (1): Key-value put operation</li>
- *   <tr><td>entryType</td><td>1</td><td>Log entry type (1 byte)</td></tr>
- *   <tr><td>entryId</td><td>8</td><td>Unique entry identifier (long)</td></tr>
- *   <tr><td>checksum</td><td>4</td><td>CRC32 checksum of payload (unsigned 32-bit)</td></tr>
- *   <tr><td>payload</td><td>N</td><td>Entry-specific data</td></tr>
+ * <p>Total header size: 17 bytes (1 + 8 + 4 + 4)</p>
  *
  * <h2>Entry Types</h2>
  * <ul>
@@ -83,7 +77,10 @@ public class WriteLog implements Closeable {
     public static final byte TYPE_DELETE = 2;
 
     // Fixed header sizes
-    private static final int HEADER_SIZE = 1 + 8 + 4; // entryType + entryId + checksum
+    // Format: entryType(1) + entryId(8) + payloadLen(4) + checksum(4) = 17 bytes
+    private static final int HEADER_SIZE = 1 + 8 + 4 + 4; // entryType + entryId + payloadLen + checksum
+    private static final int PAYLOAD_LEN_OFFSET = 1 + 8; // offset of payload length field in header
+    private static final int CHECKSUM_OFFSET = 1 + 8 + 4; // offset of checksum field in header
 
     /**
      * Maximum number of entries to keep in memory for fast replay.
@@ -209,20 +206,29 @@ public class WriteLog implements Closeable {
      */
     public long appendBarrier() throws IOException {
         byte[] payload = new byte[0];
+
+        // FIX: Get entry ID ONCE and reuse it to ensure consistency
+        long entryId = nextEntryId();
+
+        // Format: type(1) + entryId(8) + payloadLen(4) + checksum(4) + payload(N)
         ByteBuffer buffer = ByteBuffer.allocate(HEADER_SIZE + payload.length);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
         buffer.put((byte) TYPE_BARRIER);
-        buffer.putLong(nextEntryId());
-        buffer.putInt((int) (calculateChecksum(TYPE_BARRIER, nextEntryId(), payload) & 0xFFFFFFFFL));
+        buffer.putLong(entryId);
+        buffer.putInt(payload.length); // payload length
+        buffer.putInt((int) (calculateChecksum(TYPE_BARRIER, entryId, payload) & 0xFFFFFFFFL));
         buffer.put(payload);
         buffer.flip();
 
         long offset = fileOffset.getAndAdd(buffer.remaining());
-        fileChannel.write(buffer, offset);
+        // Only write to file if we have a file channel (not memory-only mode)
+        if (fileChannel != null) {
+            fileChannel.write(buffer, offset);
+        }
         logger.trace("Appended barrier at offset {}", offset);
 
-        inMemoryEntries.add(new LogEntryEntry(TYPE_BARRIER, nextEntryId(), payload, offset));
-        return nextEntryId();
+        inMemoryEntries.add(new LogEntryEntry(TYPE_BARRIER, entryId, payload, offset));
+        return entryId;
     }
 
     /**
@@ -249,24 +255,33 @@ public class WriteLog implements Closeable {
             payload = keyBytes;
         }
 
+        // FIX: Get entry ID ONCE and reuse it to ensure consistency
+        // across buffer write, checksum calculation, in-memory storage, and return value
+        long entryId = nextEntryId();
+
+        // Format: type(1) + entryId(8) + payloadLen(4) + checksum(4) + payload(N)
         ByteBuffer buffer = ByteBuffer.allocate(HEADER_SIZE + payload.length);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
         buffer.put((byte) type);
-        buffer.putLong(nextEntryId());
-        buffer.putInt((int) (calculateChecksum(type, nextEntryId(), payload) & 0xFFFFFFFFL));
+        buffer.putLong(entryId);
+        buffer.putInt(payload.length); // payload length
+        buffer.putInt((int) (calculateChecksum(type, entryId, payload) & 0xFFFFFFFFL));
         buffer.put(payload);
         buffer.flip();
 
         long offset = fileOffset.getAndAdd(buffer.remaining());
-        fileChannel.write(buffer, offset);
+        // Only write to file if we have a file channel (not memory-only mode)
+        if (fileChannel != null) {
+            fileChannel.write(buffer, offset);
+        }
         logger.trace("Appended entry type={}, id={}, size={} at offset {}",
-                    type, nextEntryId(), buffer.remaining(), offset);
+                    type, entryId, buffer.remaining(), offset);
 
         // Evict oldest entries if we exceed memory limit
         evictIfNeeded();
 
-        inMemoryEntries.add(new LogEntryEntry(type, nextEntryId(), payload, offset));
-        return nextEntryId();
+        inMemoryEntries.add(new LogEntryEntry(type, entryId, payload, offset));
+        return entryId;
     }
 
     // ==================== Batch Append Operations ====================
@@ -425,10 +440,12 @@ public class WriteLog implements Closeable {
      * Encodes a single log entry to bytes.
      */
     private byte[] encodeEntry(byte type, long entryId, byte[] payload) {
+        // Format: type(1) + entryId(8) + payloadLen(4) + checksum(4) + payload(N)
         ByteBuffer buffer = ByteBuffer.allocate(HEADER_SIZE + payload.length);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
         buffer.put(type);
         buffer.putLong(entryId);
+        buffer.putInt(payload.length); // payload length
         buffer.putInt((int) (calculateChecksum(type, entryId, payload) & 0xFFFFFFFFL));
         buffer.put(payload);
         return buffer.array();
@@ -485,39 +502,52 @@ public class WriteLog implements Closeable {
         List<LogEntry> entries = new ArrayList<>();
         long fileSize = fileChannel != null ? fileChannel.size() : 0;
 
-        for (long offset = 0; offset < fileSize; offset += HEADER_SIZE + 1) {
-            if (offset >= fileSize) break;
+        long offset = 0;
+        while (offset < fileSize) {
+            if (offset + HEADER_SIZE > fileSize) break;
 
             // Read header
             ByteBuffer headerBuffer = ByteBuffer.allocate(HEADER_SIZE);
+            headerBuffer.order(ByteOrder.LITTLE_ENDIAN);
             int bytesRead = fileChannel.read(headerBuffer, offset);
-            if (bytesRead != HEADER_SIZE) continue;
-            byte[] header = headerBuffer.array();
+            if (bytesRead != HEADER_SIZE) break;
 
-            ByteBuffer buffer = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
-            byte type = buffer.get();
-            long id = buffer.getLong();
-            long checksum = buffer.getInt();
+            headerBuffer.flip();
+            byte type = headerBuffer.get();
+            long id = headerBuffer.getLong();
+            int payloadLen = headerBuffer.getInt();
+            int checksum = headerBuffer.getInt();
 
-            // Read payload (first byte is payload length)
-            int payloadLen = header[HEADER_SIZE - 1];
+            // Validate payload length
+            if (payloadLen < 0 || offset + HEADER_SIZE + payloadLen > fileSize) {
+                logger.warn("Invalid payload length {} at offset {}", payloadLen, offset);
+                break;
+            }
+
+            // Read payload
             byte[] payload = new byte[payloadLen];
-            if (payloadLen > 0 && offset + HEADER_SIZE + payloadLen <= fileSize) {
+            if (payloadLen > 0) {
                 ByteBuffer payloadBuffer = ByteBuffer.allocate(payloadLen);
                 int readBytes = fileChannel.read(payloadBuffer, offset + HEADER_SIZE);
+                if (readBytes != payloadLen) {
+                    logger.warn("Could not read full payload at offset {}", offset);
+                    break;
+                }
                 payloadBuffer.flip();
-                payloadBuffer.get(payload, 0, readBytes);
+                payloadBuffer.get(payload);
             }
 
             // Verify checksum
             long computedChecksum = calculateChecksum(type, id, payload);
-            if (computedChecksum != checksum) {
+            if (computedChecksum != (checksum & 0xFFFFFFFFL)) {
                 logger.warn("Checksum mismatch at offset {}: expected=0x{:X}, computed=0x{:X}",
-                           offset, checksum, computedChecksum);
+                           offset, checksum & 0xFFFFFFFFL, computedChecksum);
+                offset += HEADER_SIZE + Math.max(1, payloadLen); // Skip this entry
                 continue;
             }
 
             entries.add(new LogEntry(type, id, payload, offset));
+            offset += HEADER_SIZE + payloadLen;
         }
 
         return entries;
@@ -558,39 +588,52 @@ public class WriteLog implements Closeable {
         List<LogEntry> entries = new ArrayList<>();
         long fileSize = fileChannel != null ? fileChannel.size() : 0;
 
-        for (long offset = startOffset; offset < fileSize; offset += HEADER_SIZE + 1) {
-            if (offset >= fileSize) break;
+        long offset = startOffset;
+        while (offset < fileSize) {
+            if (offset + HEADER_SIZE > fileSize) break;
 
             // Read header
             ByteBuffer headerBuffer = ByteBuffer.allocate(HEADER_SIZE);
+            headerBuffer.order(ByteOrder.LITTLE_ENDIAN);
             int readBytes = fileChannel.read(headerBuffer, offset);
             if (readBytes != HEADER_SIZE) break;
-            byte[] header = headerBuffer.array();
 
-            ByteBuffer buffer = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
-            byte type = buffer.get();
-            long id = buffer.getLong();
-            long checksum = buffer.getInt();
+            headerBuffer.flip();
+            byte type = headerBuffer.get();
+            long id = headerBuffer.getLong();
+            int payloadLen = headerBuffer.getInt();
+            int checksum = headerBuffer.getInt();
+
+            // Validate payload length
+            if (payloadLen < 0 || offset + HEADER_SIZE + payloadLen > fileSize) {
+                logger.warn("Invalid payload length {} at offset {}", payloadLen, offset);
+                break;
+            }
 
             // Read payload
-            int payloadLen = header[HEADER_SIZE - 1];
             byte[] payload = new byte[payloadLen];
-            if (payloadLen > 0 && offset + HEADER_SIZE + payloadLen <= fileSize) {
+            if (payloadLen > 0) {
                 ByteBuffer payloadBuffer = ByteBuffer.allocate(payloadLen);
                 int readBytes2 = fileChannel.read(payloadBuffer, offset + HEADER_SIZE);
+                if (readBytes2 != payloadLen) {
+                    logger.warn("Could not read full payload at offset {}", offset);
+                    break;
+                }
                 payloadBuffer.flip();
-                payloadBuffer.get(payload, 0, readBytes2);
+                payloadBuffer.get(payload);
             }
 
             // Verify checksum
             long computedChecksum = calculateChecksum(type, id, payload);
-            if (computedChecksum != checksum) {
+            if (computedChecksum != (checksum & 0xFFFFFFFFL)) {
                 logger.warn("Checksum mismatch at offset {}: expected=0x{:X}, computed=0x{:X}",
-                           offset, checksum, computedChecksum);
+                           offset, checksum & 0xFFFFFFFFL, computedChecksum);
+                offset += HEADER_SIZE + Math.max(1, payloadLen);
                 continue;
             }
 
             entries.add(new LogEntry(type, id, payload, offset));
+            offset += HEADER_SIZE + payloadLen;
         }
 
         return entries;
@@ -745,7 +788,12 @@ public class WriteLog implements Closeable {
         long currentOffset = startOffset;
 
         while (currentOffset < endOffset && currentOffset < fileSize) {
-            // Read header
+            if (currentOffset + HEADER_SIZE > fileSize) {
+                logger.trace("Incomplete header at offset {}, stopping scan", currentOffset);
+                break;
+            }
+
+            // Read header - Format: type(1) + entryId(8) + payloadLen(4) + checksum(4)
             ByteBuffer headerBuffer = ByteBuffer.allocate(HEADER_SIZE);
             headerBuffer.order(ByteOrder.LITTLE_ENDIAN);
             int bytesRead = fileChannel.read(headerBuffer, currentOffset);
@@ -759,36 +807,12 @@ public class WriteLog implements Closeable {
             headerBuffer.flip();
             byte type = headerBuffer.get();
             long id = headerBuffer.getLong();
+            int payloadLen = headerBuffer.getInt();
             long checksum = headerBuffer.getInt() & 0xFFFFFFFFL; // unsigned
 
-            // Read payload length (first byte of payload indicates key length for PUT/DELETE)
-            ByteBuffer payloadLenBuffer = ByteBuffer.allocate(1);
-            int lenBytesRead = fileChannel.read(payloadLenBuffer, currentOffset + HEADER_SIZE);
-
-            if (lenBytesRead != 1) {
-                logger.trace("Could not read payload length at offset {}, stopping scan", currentOffset);
-                break;
-            }
-
-            // For PUT entries: payload format is [keyLen(1) | keyBytes | valueBytes]
-            // For DELETE entries: payload is just keyBytes
-            // For BARRIER entries: payload is empty
-
-            int payloadLen;
-            if (type == TYPE_BARRIER) {
-                payloadLen = 0;
-            } else if (type == TYPE_DELETE) {
-                // DELETE: payload is just the key, read remaining header to get size
-                // We need to determine the actual entry size
-                // Read more bytes to estimate payload size
-                payloadLen = readPayloadLength(currentOffset, type);
-            } else {
-                // PUT: payload includes key length byte, key, and value
-                payloadLen = readPayloadLength(currentOffset, type);
-            }
-
-            if (payloadLen < 0) {
-                logger.trace("Invalid payload length at offset {}, stopping scan", currentOffset);
+            // Validate payload length
+            if (payloadLen < 0 || currentOffset + HEADER_SIZE + payloadLen > fileSize) {
+                logger.trace("Invalid payload length {} at offset {}, stopping scan", payloadLen, currentOffset);
                 break;
             }
 
@@ -810,8 +834,8 @@ public class WriteLog implements Closeable {
             if (computedChecksum != checksum) {
                 logger.warn("Checksum mismatch at offset {}: expected=0x{:X}, computed=0x{:X}, skipping",
                            currentOffset, checksum, computedChecksum);
-                // Skip to next potential entry (best effort - this shouldn't happen in normal operation)
-                currentOffset += HEADER_SIZE + 1;
+                // Skip to next potential entry
+                currentOffset += HEADER_SIZE + Math.max(1, payloadLen);
                 continue;
             }
 
@@ -965,13 +989,20 @@ public class WriteLog implements Closeable {
 
     /**
      * Pre-allocates file space to avoid fragmentation.
+     * Only preallocates if the file is empty to avoid overwriting existing data on recovery.
      *
      * @param size Number of bytes to pre-allocate
      */
     private void preallocate(long size) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate((int) size);
-        fileChannel.write(buffer, 0);
-        logger.debug("Pre-allocated {} bytes", size);
+        // Only preallocate if file is empty - otherwise we'd overwrite existing data
+        long currentSize = fileChannel.size();
+        if (currentSize == 0) {
+            ByteBuffer buffer = ByteBuffer.allocate((int) size);
+            fileChannel.write(buffer, 0);
+            logger.debug("Pre-allocated {} bytes", size);
+        } else {
+            logger.debug("Skipping preallocation - file already has {} bytes", currentSize);
+        }
     }
 
     /**
@@ -1093,8 +1124,13 @@ public class WriteLog implements Closeable {
             }
         }
 
+        // Set entry counter to the highest entry ID
         entryCounter.set(recovered.isEmpty() ? 0 : recovered.get(recovered.size() - 1).getId() + 1);
-        fileOffset.set(recovered.isEmpty() ? 0 : recovered.get(recovered.size() - 1).getOffset() + HEADER_SIZE + 1);
+
+        // Set file offset to end of last entry (actual entry size = HEADER_SIZE + payload length)
+        LogEntry lastEntry = recovered.get(recovered.size() - 1);
+        long lastEntrySize = HEADER_SIZE + lastEntry.getPayload().length;
+        fileOffset.set(recovered.isEmpty() ? 0 : lastEntry.getOffset() + lastEntrySize);
     }
 
     /**

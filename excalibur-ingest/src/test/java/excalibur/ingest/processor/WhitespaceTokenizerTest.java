@@ -134,7 +134,7 @@ class WhitespaceTokenizerTest {
         void shouldCalculateAverageCharsPerToken() {
             WhitespaceTokenizer tokenizer = WhitespaceTokenizer.tokenize("Hello world test");
             
-            assertThat(tokenizer.getAvgCharsPerToken()).isEqualTo(5.0); // (5+5+4)/3 = 14/3 ≈ 4.67
+            assertThat(tokenizer.getAvgCharsPerToken()).isEqualTo(14.0 / 3.0); // (5+5+4)/3 = 14/3 ≈ 4.67
         }
 
         @Test

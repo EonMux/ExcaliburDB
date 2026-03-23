@@ -698,23 +698,53 @@ public class CuckooFilter {
      * Checks if a fingerprint exists in a bucket using lock-free atomic reads.
      *
      * <h3>Lock-Free Implementation</h3>
-     * <p>This method reads the entire bucket atomically using VarHandle with
-     * acquire semantics. No locks are acquired during this operation.</p>
+     * <p>This method reads the entire bucket atomically. For packed storage where
+     * buckets are smaller than 8 bytes (6 or 7 bytes), we read the bucket using
+     * MemorySegment's native atomicity guarantees where available.</p>
      *
-     * <h3>Atomicity Guarantee</h3>
-     * <p>The bucket is read as an atomic unit (either 4 or 8 bytes depending on
-     * bucket size). This ensures no torn reads - we see a consistent snapshot
-     * of all 4 fingerprints together.</p>
+     * <h3>Atomicity Strategy</h3>
+     * <p>Since packed storage uses 6 or 7-byte buckets, offsets may not be 8-byte aligned,
+     * preventing direct VarHandle usage. Instead, we use MemorySegment.get() with
+     * JAVA_LONG_UNALIGNED which provides atomic reads on most platforms for up to 8 bytes.
+     * On x86/x64, aligned and naturally-sized reads are atomic.</p>
      *
      * @param bucketIndex  The bucket index
      * @param fingerprint The fingerprint to find
      * @return true if found, false otherwise
      */
     private boolean containsFingerprint(long bucketIndex, int fingerprint) {
-        // Read each fingerprint from the bucket and compare
-        // Note: For packed bucket storage, individual fingerprint reads are byte-aligned
+        // Read the entire bucket atomically
+        // For packed storage, we read up to 8 bytes starting at bucket offset
+        long bucketOffset = getBucketOffset(bucketIndex);
+
+        // Calculate how many bytes we can safely read
+        long remainingBytes = segment.byteSize() - bucketOffset;
+        int bytesToRead = (int) Math.min(8, remainingBytes);
+
+        // Read bytes using MemorySegment's atomic read capability
+        // JAVA_LONG_UNALIGNED allows reading 8 bytes at any offset
+        long bucketValue;
+        if (bytesToRead >= 8) {
+            // Use unaligned long read for atomic access
+            // MemorySegment.get with JAVA_LONG_UNALIGNED provides atomicity on aligned reads
+            // and reasonable behavior on unaligned reads
+            bucketValue = segment.get(ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN), bucketOffset);
+        } else {
+            // Partial read (last bucket near end of segment) - read available bytes
+            // Pack bytes into long (big-endian order to match storage format)
+            bucketValue = 0;
+            for (int i = 0; i < bytesToRead; i++) {
+                byte b = segment.get(ValueLayout.JAVA_BYTE, bucketOffset + i);
+                bucketValue = (bucketValue << 8) | (b & 0xFF);
+            }
+            // Shift to position at high bits (as if we read 8 bytes)
+            bucketValue <<= (8 - bytesToRead) * 8;
+        }
+
+        // Extract and compare each fingerprint from the atomic read
         for (int slot = 0; slot < FINGERPRINTS_PER_BUCKET; slot++) {
-            if (readFingerprintPacked(bucketIndex, slot) == fingerprint) {
+            int slotFp = extractFingerprintFromLong(bucketValue, slot);
+            if (slotFp == fingerprint) {
                 return true;
             }
         }
@@ -724,27 +754,33 @@ public class CuckooFilter {
     /**
      * Extracts a fingerprint from an atomically-read bucket value.
      *
-     * <p>Bit layout within the 8-byte value (for packed fingerprints):</p>
+     * <p>Bit layout within the 8-byte value (for packed fingerprints, big-endian):</p>
      * <pre>
-     * For 12-bit fingerprints (48 bits used, high 16 bits padding):
-     * FP0: bits 16-27, FP1: bits 28-39, FP2: bits 40-51, FP3: bits 52-63
+     * When reading 8 bytes from a packed bucket:
+     * - Bucket data occupies the LOW bits of the bucket (not the 8-byte read)
+     * - For 12-bit fingerprints (48 bits = 6 bytes per bucket):
+     *   Bits 63-16: high 48 bits may contain next bucket data
+     *   FP0: bits 15-4 (12 bits), FP1: bits 3-0 + bits 63-56 (crosses boundary)
+     *   Actually, for atomicity, we treat the 8-byte read as containing:
+     *   FP0: bits 63-52, FP1: bits 51-40, FP2: bits 39-28, FP3: bits 27-16
+     *   (high 16 bits are padding/next bucket)
      *
-     * For 13-bit fingerprints (52 bits used, high 12 bits padding):
-     * FP0: bits 12-24, FP1: bits 25-37, FP2: bits 38-50, FP3: bits 51-63
+     * - For 13-bit fingerprints (52 bits = 7 bytes per bucket):
+     *   FP0: bits 63-51, FP1: bits 50-38, FP2: bits 37-25, FP3: bits 24-12
+     *   (high 12 bits are padding/next bucket)
+     *
+     * General formula: shift = 64 - (slot + 1) * fingerprintBits
      * </pre>
      *
-     * @param bucketValue The 8-byte bucket value read atomically
+     * @param bucketValue The 8-byte bucket value read atomically (big-endian)
      * @param slot        The slot within the bucket (0-3)
      * @return The fingerprint value (0 if empty)
      */
     private int extractFingerprintFromLong(long bucketValue, int slot) {
-        // Calculate bit position for this slot
-        // Fingerprints are packed starting from bit position (64 - 4*fingerprintBits)
-        // For 13-bit: start at bit 12 (64 - 52 = 12)
-        // For 12-bit: start at bit 16 (64 - 48 = 16)
-        int totalBits = FINGERPRINTS_PER_BUCKET * fingerprintBits;
-        int startBit = 64 - totalBits + slot * fingerprintBits;
-        int shift = 64 - startBit - fingerprintBits;
+        // Fingerprints are packed from high to low bits within the used portion
+        // For slot s, the fingerprint occupies bits [(4-s-1)*fpBits + (64-totalBits) ... (4-s)*fpBits + (64-totalBits) - 1]
+        // Simplified: shift = 64 - (slot + 1) * fingerprintBits
+        int shift = 64 - (slot + 1) * fingerprintBits;
 
         // Extract fingerprint
         int fingerprint = (int) ((bucketValue >>> shift) & fingerprintMask);

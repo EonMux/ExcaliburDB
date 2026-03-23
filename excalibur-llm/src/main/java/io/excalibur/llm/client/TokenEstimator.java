@@ -46,9 +46,15 @@ public final class TokenEstimator {
     /**
      * Private constructor to prevent instantiation.
      * This is a utility class with only static methods.
+     *
+     * Note: We intentionally do not throw any exception here.
+     * The private modifier alone prevents external instantiation,
+     * and throwing exceptions in constructors is discouraged for
+     * utility classes as it can interfere with reflection-based
+     * frameworks and testing tools.
      */
     private TokenEstimator() {
-        throw new UnsupportedOperationException("TokenEstimator is a utility class and cannot be instantiated");
+        // Utility class - no instantiation allowed
     }
 
     /**

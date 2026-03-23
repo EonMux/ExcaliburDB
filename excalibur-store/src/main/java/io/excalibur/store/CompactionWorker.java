@@ -510,15 +510,64 @@ public class CompactionWorker {
     /**
      * Gets the write log path for a segment.
      *
+     * <p>The write log convention established by SegmentDiscovery is:
+     * {@code segment_<index>.wal} (e.g., segment_0.wal), not
+     * {@code segment_<index>.dat.wal}.</p>
+     *
+     * <p>This method first attempts to use the segment's attached write log path
+     * if available. If not, it derives the path from the segment path using
+     * the correct convention.</p>
+     *
      * @param segment The segment
      * @return The write log path, or null if not applicable
      */
     private Path getWriteLogPath(Segment segment) {
+        // Use the segment's attached write log path if available
+        WriteLog writeLog = segment.writeLog();
+        if (writeLog != null) {
+            return writeLog.path();
+        }
+        // Fallback: derive from segment path using correct convention
         Path segmentPath = segment.path();
         if (segmentPath == null) {
             return null;
         }
-        return Path.of(segmentPath.toString() + ".wal");
+        // segment_0.dat -> segment_0.wal (not segment_0.dat.wal)
+        String filename = segmentPath.getFileName().toString();
+        if (filename.endsWith(".dat")) {
+            String baseName = filename.substring(0, filename.length() - 4);
+            return segmentPath.getParent().resolve(baseName + ".wal");
+        }
+        return segmentPath.getParent().resolve(filename + ".wal");
+    }
+
+    /**
+     * Gets the write log path for a new segment being created during compaction.
+     *
+     * <p>During compaction, the new segment is created with a ".compact" extension.
+     * This method computes the correct write log path that will be used after
+     * the segment is renamed to ".dat".</p>
+     *
+     * <p>For a segment at /path/segment_0.compact, the write log should be at
+     * /path/segment_0.wal (after rename from .compact to .dat).</p>
+     *
+     * @param segment The new segment being created during compaction
+     * @return The write log path for the new segment, or null if not applicable
+     */
+    private Path getWriteLogPathForNewSegment(Segment segment) {
+        Path segmentPath = segment.path();
+        if (segmentPath == null) {
+            return null;
+        }
+        // For new segment at /path/segment_0.compact, the write log should be at
+        // /path/segment_0.wal (after rename from .compact to .dat)
+        String filename = segmentPath.getFileName().toString();
+        if (filename.endsWith(".compact")) {
+            String baseName = filename.substring(0, filename.length() - 8); // Remove .compact
+            return segmentPath.getParent().resolve(baseName + ".wal");
+        }
+        // Fallback for other naming patterns (e.g., .dat extension)
+        return getWriteLogPath(segment);
     }
 
     // ==================== Core Compaction Logic ====================
@@ -592,6 +641,21 @@ public class CompactionWorker {
 
         // Flush the new segment to disk
         newSegment.flush();
+
+        // Create and attach a new write log for the compacted segment
+        // This ensures crash recovery works after compaction
+        Path newWriteLogPath = getWriteLogPathForNewSegment(newSegment);
+        if (newWriteLogPath != null) {
+            try {
+                WriteLog newWriteLog = new WriteLog(newWriteLogPath, arena);
+                newSegment.attachWriteLog(newWriteLog);
+                LOGGER.log(Level.FINE, "Attached write log to compacted segment: {0}", newWriteLogPath);
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to create write log for compacted segment: " + newWriteLogPath, e);
+                // Continue without write log - compaction still succeeds, but crash recovery
+                // for this segment will not be available until next compaction
+            }
+        }
 
         // Close the old segment
         segment.close();

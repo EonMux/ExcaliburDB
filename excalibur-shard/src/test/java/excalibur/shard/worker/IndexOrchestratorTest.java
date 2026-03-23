@@ -235,4 +235,307 @@ class IndexOrchestratorTest {
 
         catalog.close();
     }
+
+    @Test
+    @DisplayName("CuckooMaintenanceWorker should support filter registration")
+    void testCuckooWorkerFilterRegistration() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, segmentId -> {});
+
+        assertEquals(0, worker.getRegisteredFilterCount());
+
+        excalibur.filter.CuckooFilter filter = excalibur.filter.CuckooFilter.create(1000, 8);
+        worker.registerFilter(1L, filter);
+        assertEquals(1, worker.getRegisteredFilterCount());
+
+        // Duplicate registration should not add
+        worker.registerFilter(1L, filter);
+        assertEquals(1, worker.getRegisteredFilterCount());
+
+        // Null filter should be ignored
+        worker.registerFilter(2L, null);
+        assertEquals(1, worker.getRegisteredFilterCount());
+
+        worker.unregisterFilter(1L);
+        assertEquals(0, worker.getRegisteredFilterCount());
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("CuckooMaintenanceWorker should support deletion queueing")
+    void testCuckooWorkerDeletionQueueing() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, segmentId -> {});
+
+        assertEquals(0, worker.getPendingDeletionCount());
+
+        worker.queueDeletion(1L, new byte[]{1, 2, 3});
+        assertEquals(1, worker.getPendingDeletionCount());
+
+        // Null key should be ignored
+        worker.queueDeletion(1L, null);
+        assertEquals(1, worker.getPendingDeletionCount());
+
+        // Queue multiple
+        java.util.List<byte[]> keys = new java.util.ArrayList<>();
+        keys.add(new byte[]{4, 5, 6});
+        keys.add(new byte[]{7, 8, 9});
+        worker.queueDeletions(2L, keys);
+        assertEquals(3, worker.getPendingDeletionCount());
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("CuckooMaintenanceWorker should track statistics")
+    void testCuckooWorkerStatistics() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, segmentId -> {});
+
+        assertEquals(0L, worker.getTotalDeletions());
+        assertEquals(0L, worker.getTotalFailedDeletions());
+        assertEquals(0L, worker.getLastMaintenanceTime());
+        assertEquals(0L, worker.getTombstonedSegmentsProcessed());
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("CuckooMaintenanceWorker should reject null parameters")
+    void testCuckooWorkerNullParameters() {
+        assertThrows(NullPointerException.class, () ->
+            new CuckooMaintenanceWorker(null, segmentId -> {}));
+
+        SegmentCatalog catalog = new SegmentCatalog();
+        assertThrows(NullPointerException.class, () ->
+            new CuckooMaintenanceWorker(catalog, null));
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("CuckooMaintenanceWorker should have correct toString")
+    void testCuckooWorkerToString() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, segmentId -> {});
+
+        String str = worker.toString();
+        assertNotNull(str);
+        assertTrue(str.contains("CuckooMaintenanceWorker"));
+        assertTrue(str.contains("running=false"));
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("HnswIntegrationWorker should support segment registration")
+    void testHnswWorkerSegmentRegistration() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        HnswIntegrationWorker worker = new HnswIntegrationWorker(catalog,
+            (segment, count) -> {});
+
+        assertEquals(0, worker.getRegisteredSegmentCount());
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("HnswIntegrationWorker should reject null parameters")
+    void testHnswWorkerNullParameters() {
+        assertThrows(NullPointerException.class, () ->
+            new HnswIntegrationWorker(null, (segment, count) -> {}));
+
+        SegmentCatalog catalog = new SegmentCatalog();
+        assertThrows(NullPointerException.class, () ->
+            new HnswIntegrationWorker(catalog, null));
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("HnswIntegrationWorker should validate settable parameters")
+    void testHnswWorkerSettableValidation() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        HnswIntegrationWorker worker = new HnswIntegrationWorker(catalog,
+            (segment, count) -> {});
+
+        // Valid values
+        worker.setIntegrationIntervalMs(50);
+        assertEquals(50L, worker.getIntegrationIntervalMs());
+
+        worker.setQueueDepthLimit(200_000);
+        assertEquals(200_000, worker.getQueueDepthLimit());
+
+        worker.setBatchSize(200);
+        assertEquals(200, worker.getBatchSize());
+
+        // Invalid values
+        assertThrows(IllegalArgumentException.class, () ->
+            worker.setIntegrationIntervalMs(5));
+
+        assertThrows(IllegalArgumentException.class, () ->
+            worker.setQueueDepthLimit(100));
+
+        assertThrows(IllegalArgumentException.class, () ->
+            worker.setBatchSize(0));
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("HnswIntegrationWorker should have correct toString")
+    void testHnswWorkerToString() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        HnswIntegrationWorker worker = new HnswIntegrationWorker(catalog,
+            (segment, count) -> {});
+
+        String str = worker.toString();
+        assertNotNull(str);
+        assertTrue(str.contains("HnswIntegrationWorker"));
+        assertTrue(str.contains("running=false"));
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should support source management")
+    void testReindexSchedulerSourceManagement() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
+            sourceId -> true);
+
+        assertEquals(0, scheduler.getRegisteredSourceCount());
+
+        scheduler.registerSource(1L, 1_800_000L);
+        assertEquals(1, scheduler.getRegisteredSourceCount());
+
+        scheduler.registerSource(2L); // Using default interval
+        assertEquals(2, scheduler.getRegisteredSourceCount());
+
+        scheduler.updateReindexInterval(1L, 3_600_000L);
+
+        scheduler.unregisterSource(2L);
+        assertEquals(1, scheduler.getRegisteredSourceCount());
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should support manual reindex triggering")
+    void testReindexSchedulerManualTrigger() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        java.util.concurrent.atomic.AtomicBoolean triggered = new java.util.concurrent.atomic.AtomicBoolean(false);
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
+            sourceId -> { triggered.set(true); return true; });
+
+        scheduler.registerSource(1L);
+
+        // Trigger immediate reindex
+        assertTrue(scheduler.triggerReindexNow(1L));
+        assertTrue(triggered.get());
+        assertEquals(1L, scheduler.getTotalReindexesTriggered());
+
+        // Unknown source should return false
+        assertFalse(scheduler.triggerReindexNow(999L));
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should track reindex completion and failure")
+    void testReindexSchedulerCompletionAndFailure() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
+            sourceId -> true);
+
+        scheduler.registerSource(1L);
+
+        scheduler.markReindexComplete(1L);
+        assertEquals(1L, scheduler.getTotalReindexesCompleted());
+
+        scheduler.markReindexFailed(1L, "Test error");
+        assertEquals(1L, scheduler.getTotalReindexesFailed());
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should support configuration changes")
+    void testReindexSchedulerConfiguration() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
+            sourceId -> true);
+
+        scheduler.setCheckIntervalMs(30_000L);
+        assertEquals(30_000L, scheduler.getCheckIntervalMs());
+
+        scheduler.setDefaultReindexIntervalMs(1_800_000L);
+        assertEquals(1_800_000L, scheduler.getDefaultReindexIntervalMs());
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should validate configuration")
+    void testReindexSchedulerValidation() {
+        SegmentCatalog catalog = new SegmentCatalog();
+
+        // Invalid check interval
+        assertThrows(IllegalArgumentException.class, () ->
+            new SegmentReindexScheduler(catalog, sourceId -> true, 1000, 3_600_000L));
+
+        // Invalid reindex interval - too low
+        assertThrows(IllegalArgumentException.class, () ->
+            new SegmentReindexScheduler(catalog, sourceId -> true, 60_000L, 1000));
+
+        // Invalid reindex interval - too high
+        assertThrows(IllegalArgumentException.class, () ->
+            new SegmentReindexScheduler(catalog, sourceId -> true, 60_000L, 25 * 60 * 60 * 1000L));
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should reject null parameters")
+    void testReindexSchedulerNullParameters() {
+        assertThrows(NullPointerException.class, () ->
+            new SegmentReindexScheduler(null, sourceId -> true));
+
+        SegmentCatalog catalog = new SegmentCatalog();
+        assertThrows(NullPointerException.class, () ->
+            new SegmentReindexScheduler(catalog, null));
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should have correct toString")
+    void testReindexSchedulerToString() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
+            sourceId -> true);
+
+        String str = scheduler.toString();
+        assertNotNull(str);
+        assertTrue(str.contains("SegmentReindexScheduler"));
+        assertTrue(str.contains("running=false"));
+
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should get next reindex time")
+    void testReindexSchedulerNextReindexTime() {
+        SegmentCatalog catalog = new SegmentCatalog();
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
+            sourceId -> true);
+
+        scheduler.registerSource(1L, 3_600_000L); // 1 hour
+
+        java.time.Instant nextTime = scheduler.getNextReindexTime(1L);
+        assertNotNull(nextTime);
+
+        // Unknown source should return null
+        assertNull(scheduler.getNextReindexTime(999L));
+
+        catalog.close();
+    }
 }

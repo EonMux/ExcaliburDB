@@ -307,6 +307,9 @@ public class IndexOrchestrator implements AutoCloseable {
         // Store segment index info
         segmentIndexInfo.put(segmentId, new SegmentIndexInfo(segmentId, segment, graph, filter, tracker));
 
+        // Register with visibility tracker for epoch-based visibility
+        visibilityTracker.registerSegment(segmentId, visibilityTracker.currentEpoch());
+
         // Register with HNSW worker if graph exists
         if (graph != null && tracker != null) {
             hnswWorker.registerSegment(segment, graph, tracker);
@@ -328,6 +331,9 @@ public class IndexOrchestrator implements AutoCloseable {
     public void unregisterSegment(long segmentId) {
         SegmentIndexInfo info = segmentIndexInfo.remove(segmentId);
         if (info != null) {
+            // Unregister from visibility tracker
+            visibilityTracker.unregisterSegment(segmentId);
+
             if (info.graph != null) {
                 hnswWorker.unregisterSegment(info.segment);
             }
@@ -343,6 +349,43 @@ public class IndexOrchestrator implements AutoCloseable {
      */
     public int getRegisteredSegmentCount() {
         return segmentIndexInfo.size();
+    }
+
+    /**
+     * Marks a segment as tombstoned for visibility tracking.
+     *
+     * <p>This method should be called when a segment transitions to TOMBSTONED state.
+     * It records the tombstone epoch in the visibility tracker, ensuring that:</p>
+     * <ul>
+     *   <li>New queries (capturing epoch >= tombstone epoch) will not see this segment</li>
+     *   <li>In-flight queries (capturing epoch < tombstone epoch) will still see the segment</li>
+     * </ul>
+     *
+     * <p><strong>Note:</strong> This method only updates the visibility tracker.
+     * The caller is responsible for updating the segment catalog state.</p>
+     *
+     * @param segmentId The segment ID to tombstone
+     * @throws IllegalArgumentException if the segment is not registered with the visibility tracker
+     */
+    public void tombstoneSegment(long segmentId) {
+        long tombstoneEpoch = visibilityTracker.currentEpoch();
+        visibilityTracker.markTombstoned(segmentId, tombstoneEpoch);
+        LOGGER.info("Segment {} tombstoned at epoch {}", segmentId, tombstoneEpoch);
+    }
+
+    /**
+     * Marks a segment as tombstoned with a specific visibility epoch.
+     *
+     * <p>This overload allows specifying an explicit tombstone epoch,
+     * useful for coordinated state transitions.</p>
+     *
+     * @param segmentId The segment ID to tombstone
+     * @param tombstoneEpoch The epoch at which the segment becomes invisible to new queries
+     * @throws IllegalArgumentException if the segment is not registered with the visibility tracker
+     */
+    public void tombstoneSegment(long segmentId, long tombstoneEpoch) {
+        visibilityTracker.markTombstoned(segmentId, tombstoneEpoch);
+        LOGGER.info("Segment {} tombstoned at epoch {}", segmentId, tombstoneEpoch);
     }
 
     // ==================== Metrics Exposure ====================

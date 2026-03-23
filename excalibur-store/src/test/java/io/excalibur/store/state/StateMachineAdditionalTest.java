@@ -82,13 +82,14 @@ class StateMachineAdditionalTest {
         }
 
         @Test
-        @DisplayName("Should transition from COMPACTING to TOMBSTONED")
+        @DisplayName("Should transition from COMPACTING to ACTIVE then TOMBSTONED")
         void shouldTransitionFromCompactingToTombstoned() {
             stateMachine.transitionTo(LifecycleState.INDEXING);
             stateMachine.transitionTo(LifecycleState.WARMING);
             stateMachine.transitionTo(LifecycleState.ACTIVE);
             stateMachine.transitionTo(LifecycleState.COMPACTING);
-
+            // COMPACTING can only go to ACTIVE first
+            stateMachine.transitionTo(LifecycleState.ACTIVE);
             stateMachine.transitionTo(LifecycleState.TOMBSTONED);
 
             assertThat(stateMachine.get()).isEqualTo(LifecycleState.TOMBSTONED);

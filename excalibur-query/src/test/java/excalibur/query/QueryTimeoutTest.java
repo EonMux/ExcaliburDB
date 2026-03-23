@@ -240,8 +240,8 @@ class QueryTimeoutTest {
 
         CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
             try {
-                // Simulate long-running operation
-                Thread.sleep(10000);
+                // Simulate long-running operation (500ms is enough to exceed 100ms timeout)
+                Thread.sleep(500);
                 return "completed";
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

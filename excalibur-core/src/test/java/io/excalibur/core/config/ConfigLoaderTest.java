@@ -316,4 +316,93 @@ class ConfigLoaderTest {
             assertThat(config.query().getDefaultTopK()).isEqualTo(20);
         }
     }
+
+    @Nested
+    @DisplayName("Load Integration Tests")
+    class LoadIntegrationTests {
+
+        @Test
+        @DisplayName("Should load configuration from properties file")
+        void shouldLoadConfigurationFromPropertiesFile() {
+            ConfigLoader.clearCache();
+            Map<String, String> env = new HashMap<>();
+            Config config = ConfigLoader.load("excalibur.properties", env);
+
+            assertThat(config).isNotNull();
+            assertThat(config.visibility().getEpochTickMs()).isEqualTo(100L);
+            assertThat(config.query().includePartialSegments()).isTrue();
+            assertThat(config.query().getDefaultTopK()).isEqualTo(10);
+            assertThat(config.ingest().getHnswQueueDepthLimit()).isEqualTo(100000);
+            assertThat(config.health().getReadinessThreshold()).isEqualTo(0.5);
+        }
+
+        @Test
+        @DisplayName("Should apply environment variable overrides")
+        void shouldApplyEnvironmentVariableOverrides() {
+            ConfigLoader.clearCache();
+            Map<String, String> env = new HashMap<>();
+            env.put("EXCALIBUR_VISIBILITY_EPOCH_TICK_MS", "500");
+            Config config = ConfigLoader.load("excalibur.properties", env);
+
+            assertThat(config).isNotNull();
+            assertThat(config.visibility().getEpochTickMs()).isEqualTo(500L);
+        }
+
+        @Test
+        @DisplayName("Should apply multiple environment variable overrides")
+        void shouldApplyMultipleEnvironmentVariableOverrides() {
+            ConfigLoader.clearCache();
+            Map<String, String> env = new HashMap<>();
+            env.put("EXCALIBUR_VISIBILITY_EPOCH_TICK_MS", "250");
+            env.put("EXCALIBUR_QUERY_DEFAULT_TOP_K", "50");
+            env.put("EXCALIBUR_HEALTH_READINESS_THRESHOLD", "0.75");
+            Config config = ConfigLoader.load("excalibur.properties", env);
+
+            assertThat(config).isNotNull();
+            assertThat(config.visibility().getEpochTickMs()).isEqualTo(250L);
+            assertThat(config.query().getDefaultTopK()).isEqualTo(50);
+            assertThat(config.health().getReadinessThreshold()).isEqualTo(0.75);
+        }
+
+        @Test
+        @DisplayName("Should allow environment variables to set new values not in properties file")
+        void shouldAllowEnvVarsToSetNewValues() {
+            ConfigLoader.clearCache();
+            Map<String, String> env = new HashMap<>();
+            // This property might not exist in the file but env var should still work
+            env.put("EXCALIBUR_CUSTOM_NEW_VALUE", "test123");
+            Config config = ConfigLoader.load("excalibur.properties", env);
+
+            assertThat(config).isNotNull();
+            // The config should still load successfully
+            assertThat(config.visibility().getEpochTickMs()).isEqualTo(100L);
+        }
+
+        @Test
+        @DisplayName("Should return cached config on subsequent loads")
+        void shouldReturnCachedConfigOnSubsequentLoads() {
+            ConfigLoader.clearCache();
+            Map<String, String> env1 = new HashMap<>();
+            Config config1 = ConfigLoader.load("excalibur.properties", env1);
+
+            Map<String, String> env2 = new HashMap<>();
+            env2.put("EXCALIBUR_VISIBILITY_EPOCH_TICK_MS", "999");
+            Config config2 = ConfigLoader.load("excalibur.properties", env2);
+
+            // Should return same cached instance, ignoring second env overrides
+            assertThat(config1).isSameAs(config2);
+            assertThat(config2.visibility().getEpochTickMs()).isEqualTo(100L);
+        }
+
+        @Test
+        @DisplayName("Should throw exception for missing properties file")
+        void shouldThrowExceptionForMissingPropertiesFile() {
+            ConfigLoader.clearCache();
+            Map<String, String> env = new HashMap<>();
+
+            assertThatThrownBy(() -> ConfigLoader.load("nonexistent.properties", env))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Failed to load configuration");
+        }
+    }
 }

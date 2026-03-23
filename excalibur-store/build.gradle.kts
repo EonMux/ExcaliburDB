@@ -28,6 +28,9 @@ dependencies {
     // Phase 1 dependencies
     implementation(project(":excalibur-core"))
 
+    // Phase 3 dependencies (for LSH integration)
+    implementation(project(":excalibur-filter"))
+
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")

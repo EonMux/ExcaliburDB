@@ -235,8 +235,9 @@ class LogEntryTest {
             LogEntry entry = new LogEntry(LogEntry.TYPE_PUT, 1L, payload, 0L);
             LogEntry.PutEntry putEntry = entry.asPutEntry();
 
-            assertThat(putEntry.toString()).contains("testKey");
-            assertThat(putEntry.toString()).contains("testValue");
+            assertThat(putEntry.toString()).contains("PUT");
+            assertThat(putEntry.toString()).contains("keyLen=7");  // "testKey" length
+            assertThat(putEntry.toString()).contains("valLen=9");  // "testValue" length
         }
     }
 
@@ -288,7 +289,8 @@ class LogEntryTest {
             LogEntry entry = new LogEntry(LogEntry.TYPE_DELETE, 1L, TEST_KEY, 0L);
             LogEntry.DeleteEntry deleteEntry = entry.asDeleteEntry();
 
-            assertThat(deleteEntry.toString()).contains("testKey");
+            assertThat(deleteEntry.toString()).contains("DELETE");
+            assertThat(deleteEntry.toString()).contains("keyLen=7");  // "testKey" length
         }
     }
 

@@ -128,6 +128,8 @@ public class HealthEndpoint implements HttpHandler {
     @Override
     public void handle(HttpExchange exchange) throws IOException {
         try {
+            // Health endpoint always returns 200 if process is alive,
+            // regardless of HTTP method (useful for load balancers/K8s probes)
             HealthStatus status = computeHealthStatus();
             sendResponse(exchange, status);
         } catch (Exception e) {

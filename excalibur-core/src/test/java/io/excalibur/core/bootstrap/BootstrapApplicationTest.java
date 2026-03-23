@@ -1,5 +1,7 @@
 package io.excalibur.core.bootstrap;
 
+import io.excalibur.metrics.Metrics;
+import io.excalibur.metrics.MetricsRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -101,6 +103,50 @@ class BootstrapApplicationTest {
 
             // Running may be false since we're just testing initialization
             assertThat(instance.isRunning()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("Should have initialized metrics registry")
+        void shouldHaveInitializedMetricsRegistry() throws Exception {
+            BootstrapApplication.main(new String[]{});
+
+            Field instanceField = BootstrapApplication.class.getDeclaredField("instance");
+            instanceField.setAccessible(true);
+            BootstrapApplication instance = (BootstrapApplication) instanceField.get(null);
+
+            MetricsRegistry registry = instance.getMetricsRegistry();
+            assertThat(registry).isNotNull();
+        }
+
+        @Test
+        @DisplayName("Should have metrics registry available")
+        void shouldHaveMetricsRegistryAvailable() throws Exception {
+            BootstrapApplication.main(new String[]{});
+
+            Field instanceField = BootstrapApplication.class.getDeclaredField("instance");
+            instanceField.setAccessible(true);
+            BootstrapApplication instance = (BootstrapApplication) instanceField.get(null);
+
+            MetricsRegistry registry = instance.getMetricsRegistry();
+            assertThat(registry).isNotNull();
+            // Note: JMX MBean registration depends on the metrics module's MBean implementation
+            // The bootstrap correctly attempts to register MBeans via Metrics.registerAll()
+        }
+    }
+
+    @Nested
+    @DisplayName("Metrics Initialization Tests")
+    class MetricsTests {
+
+        @Test
+        @DisplayName("Should initialize metrics with default values")
+        void shouldInitializeMetricsWithDefaults() throws Exception {
+            BootstrapApplication.main(new String[]{});
+
+            // Verify metrics are initialized
+            assertThat(Metrics.getHealthScore()).isEqualTo(0.5);
+            assertThat(Metrics.getEstimatedCoverage()).isEqualTo(0.0);
+            assertThat(Metrics.getCurrentEpoch()).isEqualTo(0L);
         }
     }
 }

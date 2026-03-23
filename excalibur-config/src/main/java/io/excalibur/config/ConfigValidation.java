@@ -81,7 +81,7 @@ public final class ConfigValidation {
      */
     private static void validateVisibility(Config.Visibility visibility) {
         // Epoch tick must be between 10 and 10000 ms
-        long epochTickMs = visibility.visibilityEpochTickMs();
+        long epochTickMs = visibility.getEpochTickMs();
         if (epochTickMs < 10) {
             throw new IllegalStateException(
                 "visibility.epoch-tick-ms must be >= 10, got: " + epochTickMs);
@@ -90,9 +90,9 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "visibility.epoch-tick-ms must be <= 10000, got: " + epochTickMs);
         }
-        
+
         // Query timeout must be between 1000 and 300000 ms
-        int queryTimeoutMs = visibility.visibilityQueryTimeoutMs();
+        int queryTimeoutMs = visibility.getQueryTimeoutMs();
         if (queryTimeoutMs < 1000) {
             throw new IllegalStateException(
                 "visibility.query-timeout-ms must be >= 1000, got: " + queryTimeoutMs);
@@ -111,7 +111,7 @@ public final class ConfigValidation {
      */
     private static void validateIngest(Config.Ingest ingest) {
         // HNSW queue depth limit must be between 10000 and 1000000
-        long hnswQueueDepthLimit = ingest.hnswQueueDepthLimit();
+        long hnswQueueDepthLimit = ingest.getHnswQueueDepthLimit();
         if (hnswQueueDepthLimit < 10000) {
             throw new IllegalStateException(
                 "ingest.hnsw-queue-depth-limit must be >= 10000, got: " + hnswQueueDepthLimit);
@@ -120,7 +120,7 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "ingest.hnsw-queue-depth-limit must be <= 1000000, got: " + hnswQueueDepthLimit);
         }
-        
+
         // Document timeout must be between 1000 and 30000 ms
         int documentTimeoutMs = ingest.getDocumentTimeoutMs();
         if (documentTimeoutMs < 1000) {
@@ -141,7 +141,7 @@ public final class ConfigValidation {
      */
     private static void validateHealth(Config.Health health) {
         // Readiness threshold must be between 0.0 and 1.0
-        double readinessThreshold = health.readinessThreshold();
+        double readinessThreshold = health.getReadinessThreshold();
         if (readinessThreshold < 0.0) {
             throw new IllegalStateException(
                 "health.readiness-threshold must be >= 0.0, got: " + readinessThreshold);
@@ -150,9 +150,9 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "health.readiness-threshold must be <= 1.0, got: " + readinessThreshold);
         }
-        
+
         // Healthy threshold must be between 0.0 and 1.0
-        double healthyThreshold = health.healthyThreshold();
+        double healthyThreshold = health.getHealthyThreshold();
         if (healthyThreshold < 0.0) {
             throw new IllegalStateException(
                 "health.healthy-threshold must be >= 0.0, got: " + healthyThreshold);
@@ -161,7 +161,7 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "health.healthy-threshold must be <= 1.0, got: " + healthyThreshold);
         }
-        
+
         // Max latency must be between 100 and 60000 ms
         int maxLatencyMs = health.getMaxLatencyMs();
         if (maxLatencyMs < 100) {
@@ -173,7 +173,7 @@ public final class ConfigValidation {
                 "health.max-latency-ms must be <= 60000, got: " + maxLatencyMs);
         }
     }
-    
+
     /**
      * Validates query configuration.
      *
@@ -182,7 +182,7 @@ public final class ConfigValidation {
      */
     private static void validateQuery(Config.Query query) {
         // Default top-k must be between 1 and 10000
-        int defaultTopK = query.defaultTopK();
+        int defaultTopK = query.getDefaultTopK();
         if (defaultTopK < 1) {
             throw new IllegalStateException(
                 "query.top-k-default must be >= 1, got: " + defaultTopK);
@@ -191,7 +191,7 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "query.top-k-default must be <= 10000, got: " + defaultTopK);
         }
-        
+
         // Recall target must be between 0.0 and 1.0
         double recallTarget = query.getRecallTarget();
         if (recallTarget < 0.0) {
@@ -202,7 +202,7 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "query.recall-target must be <= 1.0, got: " + recallTarget);
         }
-        
+
         // Threshold must be between 0.0 and 1.0
         double threshold = query.getThreshold();
         if (threshold < 0.0) {
@@ -213,7 +213,7 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "query.threshold must be <= 1.0, got: " + threshold);
         }
-        
+
         // Vector dimensions must be between 128 and 4096
         int vectorDimensions = query.getVectorDimensions();
         if (vectorDimensions < 128) {
@@ -224,7 +224,7 @@ public final class ConfigValidation {
             throw new IllegalStateException(
                 "query.vector-dimensions must be <= 4096, got: " + vectorDimensions);
         }
-        
+
         // LLM timeout must be between 5000 and 300000 ms
         int llmTimeoutMs = query.getLlmTimeoutMs();
         if (llmTimeoutMs < 5000) {
@@ -236,7 +236,7 @@ public final class ConfigValidation {
                 "query.llm-timeout-ms must be <= 300000, got: " + llmTimeoutMs);
         }
     }
-    
+
     /**
      * Validates LLM configuration.
      *
@@ -245,14 +245,14 @@ public final class ConfigValidation {
      */
     private static void validateLlm(Config.Llm llm) {
         // Base URL must be a valid URL
-        String baseUrl = llm.baseUrl();
+        String baseUrl = llm.getBaseUrl();
         if (baseUrl != null && !isValidUrl(baseUrl)) {
             throw new IllegalStateException(
                 "llm.base-url must be a valid URL (http:// or https://), got: " + baseUrl);
         }
-        
+
         // Embeddings dimensions must be between 128 and 4096
-        int embeddingsDimensions = llm.embeddingsDimensions();
+        int embeddingsDimensions = llm.getEmbeddingsDimensions();
         if (embeddingsDimensions < 128) {
             throw new IllegalStateException(
                 "llm.embeddings-dimensions must be >= 128, got: " + embeddingsDimensions);
