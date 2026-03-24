@@ -77,6 +77,154 @@ class ProductQuantizerTest {
             .hasMessageContaining("must be trained");
     }
 
+    // ==================== PQ Graceful Fallback Tests ====================
+
+    @Test
+    @DisplayName("encodeOrNull should return null when quantizer is not trained")
+    void testEncodeOrNullUntrained() {
+        // Create untrained quantizer
+        ProductQuantizer untrainedPq = new ProductQuantizer(16, 4, 16);
+        assertThat(untrainedPq.isTrained()).isFalse();
+
+        float[] vector = generateRandomVectors(1, 16)[0];
+        byte[] codes = untrainedPq.encodeOrNull(vector);
+
+        assertThat(codes).isNull();
+    }
+
+    @Test
+    @DisplayName("encodeOrNull should return codes when quantizer is trained")
+    void testEncodeOrNullTrained() {
+        pq.train(trainingData);
+        assertThat(pq.isTrained()).isTrue();
+
+        float[] vector = generateRandomVectors(1, 16)[0];
+        byte[] codes = pq.encodeOrNull(vector);
+
+        assertThat(codes).isNotNull();
+        assertThat(codes).hasSize(4);  // numSubspaces = 4
+    }
+
+    @Test
+    @DisplayName("encodeOrNull should validate vector dimension")
+    void testEncodeOrNullWrongDimension() {
+        float[] wrongDim = new float[32];
+
+        assertThatThrownBy(() -> pq.encodeOrNull(wrongDim))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("dimension");
+    }
+
+    @Test
+    @DisplayName("computeDistanceOrFallback should return exact distance when not trained")
+    void testComputeDistanceOrFallbackUntrained() {
+        // Create untrained quantizer
+        ProductQuantizer untrainedPq = new ProductQuantizer(16, 4, 16);
+        assertThat(untrainedPq.isTrained()).isFalse();
+
+        // Create two test vectors with known distance
+        float[] query = new float[16];
+        float[] target = new float[16];
+        for (int i = 0; i < 16; i++) {
+            query[i] = 0.0f;
+            target[i] = 1.0f;
+        }
+
+        // Compute expected exact squared L2 distance: sum of (0-1)^2 = 16 * 1 = 16
+        float expectedDistance = 16.0f;
+
+        float distance = untrainedPq.computeDistanceOrFallback(query, target);
+
+        assertThat(distance).isCloseTo(expectedDistance, within(0.001f));
+        assertThat(distance).isGreaterThanOrEqualTo(0.0f);
+    }
+
+    @Test
+    @DisplayName("computeDistanceOrFallback should return exact distance for zero vector")
+    void testComputeDistanceOrFallbackUntrainedZeroVector() {
+        ProductQuantizer untrainedPq = new ProductQuantizer(16, 4, 16);
+
+        float[] zero = new float[16];
+
+        float distance = untrainedPq.computeDistanceOrFallback(zero, zero);
+
+        assertThat(distance).isCloseTo(0.0f, within(0.001f));
+    }
+
+    @Test
+    @DisplayName("computeDistanceOrFallback should use PQ when trained")
+    void testComputeDistanceOrFallbackTrained() {
+        pq.train(trainingData);
+        assertThat(pq.isTrained()).isTrue();
+
+        float[] query = generateRandomVectors(1, 16)[0];
+        float[] target = generateRandomVectors(1, 16)[0];
+
+        // When trained, computeDistanceOrFallback should use PQ
+        float distance = pq.computeDistanceOrFallback(query, target);
+
+        // Distance should be non-negative
+        assertThat(distance).isGreaterThanOrEqualTo(0.0f);
+        assertThat(distance).isFinite();
+
+        // Should be close to asymmetric distance (since we encode target on-the-fly)
+        byte[] targetCodes = pq.encode(target);
+        float asymmetricDist = pq.asymmetricDistance(query, targetCodes);
+        assertThat(distance).isCloseTo(asymmetricDist, within(0.001f));
+    }
+
+    @Test
+    @DisplayName("computeDistanceOrFallback should validate query vector dimension")
+    void testComputeDistanceOrFallbackWrongQueryDimension() {
+        ProductQuantizer untrainedPq = new ProductQuantizer(16, 4, 16);
+        float[] wrongDim = new float[32];
+        float[] correct = new float[16];
+
+        assertThatThrownBy(() -> untrainedPq.computeDistanceOrFallback(wrongDim, correct))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("dimension");
+    }
+
+    @Test
+    @DisplayName("computeDistanceOrFallback should validate target vector dimension")
+    void testComputeDistanceOrFallbackWrongTargetDimension() {
+        ProductQuantizer untrainedPq = new ProductQuantizer(16, 4, 16);
+        float[] correct = new float[16];
+        float[] wrongDim = new float[32];
+
+        assertThatThrownBy(() -> untrainedPq.computeDistanceOrFallback(correct, wrongDim))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("dimension");
+    }
+
+    @Test
+    @DisplayName("computeDistanceOrFallback handles transition from untrained to trained")
+    void testComputeDistanceOrFallbackTrainingTransition() {
+        // Start untrained
+        ProductQuantizer transitionPq = new ProductQuantizer(16, 4, 16, new CodebookTrainer(100, 20, 1e-4f, 42));
+        assertThat(transitionPq.isTrained()).isFalse();
+
+        float[] query = new float[16];
+        float[] target = new float[16];
+        for (int i = 0; i < 16; i++) {
+            query[i] = 0.5f;
+            target[i] = 0.5f;
+        }
+
+        // Distance to self should be 0 (exact computation when untrained)
+        float untrainedDistance = transitionPq.computeDistanceOrFallback(query, target);
+        assertThat(untrainedDistance).isCloseTo(0.0f, within(0.001f));
+
+        // Now train
+        transitionPq.train(trainingData);
+        assertThat(transitionPq.isTrained()).isTrue();
+
+        // Distance should still be close to 0 (PQ approximation)
+        float trainedDistance = transitionPq.computeDistanceOrFallback(query, target);
+        assertThat(trainedDistance).isGreaterThanOrEqualTo(0.0f);
+        // Note: With PQ, the distance to self may not be exactly 0 due to quantization
+    }
+
     @Test
     @DisplayName("Should reject encoding wrong dimension")
     void testEncodeWrongDimension() {

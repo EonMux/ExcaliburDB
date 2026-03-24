@@ -1,7 +1,28 @@
 package io.excalibur.vector.distance;
 
+import java.util.Objects;
+
 /**
- * Utility class for validating distance values against their expected ranges.
+ * Utility class for validating distance function inputs and output values.
+ *
+ * <p>This class provides two categories of validation:</p>
+ *
+ * <h3>Input Validation</h3>
+ * <p>Validates input vectors before distance computation:</p>
+ * <ul>
+ *   <li>Non-null vectors</li>
+ *   <li>Non-empty vectors</li>
+ *   <li>Finite values only (no NaN or Infinity)</li>
+ *   <li>Matching dimensions between vector pairs</li>
+ * </ul>
+ *
+ * <h3>Output Validation</h3>
+ * <p>Validates computed distance values against their expected ranges:</p>
+ * <ul>
+ *   <li><strong>Cosine similarity:</strong> Range [-1.0, 1.0]</li>
+ *   <li><strong>L2 distance:</strong> Range [0.0, +infinity)</li>
+ *   <li><strong>Inner product:</strong> Range (-infinity, +infinity)</li>
+ * </ul>
  *
  * <p>This class provides methods to validate that computed distance values
  * fall within the mathematically correct range for each distance metric:</p>
@@ -40,6 +61,84 @@ public final class DistanceValidator {
     private DistanceValidator() {
         throw new AssertionError("Utility class - do not instantiate");
     }
+
+    // ============================================================
+    // INPUT VALIDATION METHODS
+    // ============================================================
+
+    /**
+     * Validates that a vector is non-null, non-empty, and contains only finite values.
+     *
+     * <p>This method should be called before distance computation to ensure
+     * that input vectors are valid. Vectors containing NaN or Infinity values
+     * will produce undefined results in distance calculations.</p>
+     *
+     * <p><strong>Domain Correctness:</strong> Finite values are required for
+     * meaningful distance computation. NaN propagates through calculations
+     * producing NaN results, and Infinity can cause overflow or undefined behavior.</p>
+     *
+     * @param vector The vector to validate
+     * @param name The parameter name for error messages (e.g., "v1", "query vector")
+     * @throws NullPointerException if vector is null
+     * @throws IllegalArgumentException if vector is empty or contains NaN/Infinity values
+     */
+    public static void validateInputVector(float[] vector, String name) {
+        Objects.requireNonNull(vector, name + " cannot be null");
+        if (vector.length == 0) {
+            throw new IllegalArgumentException(name + " cannot be empty");
+        }
+        for (int i = 0; i < vector.length; i++) {
+            if (!Float.isFinite(vector[i])) {
+                throw new IllegalArgumentException(
+                    name + " contains non-finite value at index " + i + ": " + vector[i]);
+            }
+        }
+    }
+
+    /**
+     * Validates that two vectors have matching dimensions.
+     *
+     * <p>This method should be called after {@link #validateInputVector(float[], String)}
+     * for both vectors to ensure they have the same dimensionality.</p>
+     *
+     * @param v1 The first vector
+     * @param v2 The second vector
+     * @throws IllegalArgumentException if vectors have different lengths
+     */
+    public static void validateMatchingDimensions(float[] v1, float[] v2) {
+        if (v1.length != v2.length) {
+            throw new IllegalArgumentException(
+                "Vector dimensions must match: " + v1.length + " vs " + v2.length);
+        }
+    }
+
+    /**
+     * Convenience method that validates both input vectors and their dimensions.
+     *
+     * <p>This is equivalent to calling:</p>
+     * <pre>
+     * validateInputVector(v1, "v1");
+     * validateInputVector(v2, "v2");
+     * validateMatchingDimensions(v1, v2);
+     * </pre>
+     *
+     * @param v1 The first vector
+     * @param v2 The second vector
+     * @param name1 The name of the first vector for error messages
+     * @param name2 The name of the second vector for error messages
+     * @throws NullPointerException if either vector is null
+     * @throws IllegalArgumentException if either vector is empty, contains non-finite values,
+     *         or if dimensions don't match
+     */
+    public static void validateVectorPair(float[] v1, float[] v2, String name1, String name2) {
+        validateInputVector(v1, name1);
+        validateInputVector(v2, name2);
+        validateMatchingDimensions(v1, v2);
+    }
+
+    // ============================================================
+    // OUTPUT VALIDATION METHODS
+    // ============================================================
 
     /**
      * Validates that a cosine similarity value is in the valid range [-1.0, 1.0].

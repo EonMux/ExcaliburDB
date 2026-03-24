@@ -68,13 +68,17 @@ class HnswGraphPQTest {
         }
 
         @Test
-        @DisplayName("setProductQuantizer throws on untrained quantizer")
-        void setUntrainedQuantizerThrows() throws IOException {
+        @DisplayName("setProductQuantizer accepts untrained quantizer for graceful fallback")
+        void acceptsUntrainedQuantizerForFallback() throws IOException {
             try (HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 1000)) {
+                // Untrained quantizers are allowed for graceful fallback during cold start
+                // Per PROJECT GOAL: "if codebook is not yet trained (cold segment),
+                // distance computation uses full-precision vectors"
                 ProductQuantizer untrained = new ProductQuantizer(64, 8, 256);
-                assertThatThrownBy(() -> graph.setProductQuantizer(untrained))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("trained");
+                // Should NOT throw - untrained quantizers are allowed
+                graph.setProductQuantizer(untrained);
+                assertThat(graph.getProductQuantizer()).isNotNull();
+                assertThat(graph.getProductQuantizer().isTrained()).isFalse();
             }
         }
 

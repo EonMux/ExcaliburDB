@@ -49,11 +49,11 @@ class QueryEndpointTest {
         }
 
         @Test
-        @DisplayName("rejects null executor service")
-        void rejectsNullExecutorService() {
-            assertThatThrownBy(() -> new QueryEndpoint(queryPipeline, null))
-                .isInstanceOf(NullPointerException.class)
-                .hasMessageContaining("ExecutorService cannot be null");
+        @DisplayName("allows null executor service with default fallback")
+        void allowsNullExecutorService() {
+            // Null executor service is allowed - a default virtual thread executor is created
+            QueryEndpoint endpointWithNullExecutor = new QueryEndpoint(queryPipeline, null, null);
+            assertThat(endpointWithNullExecutor).isNotNull();
         }
     }
 
@@ -174,6 +174,11 @@ class QueryEndpointTest {
             String response = responseBody.toString(StandardCharsets.UTF_8);
             assertThat(response).contains("\"coverage\":");
             assertThat(response).contains("\"total_segments\":");
+            assertThat(response).contains("\"active_segments\":");
+            assertThat(response).contains("\"indexing_segments\":");
+            assertThat(response).contains("\"warming_segments\":");
+            assertThat(response).contains("\"estimated_corpus_coverage\":");
+            assertThat(response).contains("\"tail_scan_entries\":");
             assertThat(response).contains("\"degraded\":");
         }
     }
@@ -308,6 +313,8 @@ class QueryEndpointTest {
         IndexCoverage coverage = IndexCoverage.builder()
             .totalSegments(10)
             .activeSegments(8)
+            .indexingSegments(1)
+            .warmingSegments(1)
             .estimatedCorpusCoverage(0.8)
             .tailScanEntries(0)
             .degraded(false)

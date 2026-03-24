@@ -16,6 +16,12 @@ dependencies {
     testImplementation("org.mockito:mockito-core:5.14.2")
     testImplementation("org.mockito:mockito-junit-jupiter:5.14.2")
 
+    // Phase 1 (Core primitives - TermExtractor for query text processing)
+    implementation(project(":excalibur-core"))
+
+    // Configuration module
+    implementation(project(":excalibur-config"))
+
     // Phase 2 (Storage Engine - needed for WriteLog access)
     implementation(project(":excalibur-store"))
 
@@ -23,7 +29,10 @@ dependencies {
     implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-vector"))
     implementation(project(":excalibur-shard"))
-    
+
+    // Phase 7 (LLM Client - for relevancy scoring)
+    implementation(project(":excalibur-llm"))
+
     // Phase 8 dependency for document visibility tracking
     implementation(project(":excalibur-ingest"))
 }

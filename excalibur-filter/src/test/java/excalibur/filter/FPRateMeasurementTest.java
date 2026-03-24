@@ -1,6 +1,7 @@
 package excalibur.filter;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -36,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * @author ExcaliburDB
  */
+@Tag("slow")
 class FPRateMeasurementTest {
 
     /** Exact number of items to insert per specification */

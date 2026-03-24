@@ -260,6 +260,24 @@ public class SegmentReindexScheduler {
     }
 
     /**
+     * Registers a source for re-index scheduling without interval validation.
+     *
+     * <p><strong>For testing only.</strong> This method bypasses domain validation
+     * to allow faster test execution with shorter intervals.</p>
+     *
+     * @param sourceId          The source ID
+     * @param reindexIntervalMs The re-index interval for this source (no min/max enforced)
+     */
+    void registerSourceUnchecked(long sourceId, long reindexIntervalMs) {
+        if (reindexIntervalMs <= 0) {
+            throw new IllegalArgumentException("Reindex interval must be positive, got: " + reindexIntervalMs);
+        }
+        sourceSchedules.put(sourceId, new SourceSchedule(sourceId, reindexIntervalMs));
+        LOGGER.debug("Registered source {} for re-index scheduling with interval {}ms (unchecked)",
+            sourceId, reindexIntervalMs);
+    }
+
+    /**
      * Registers a source with the default re-index interval.
      *
      * @param sourceId The source ID
@@ -391,15 +409,27 @@ public class SegmentReindexScheduler {
                 Duration timeSinceLastReindex = Duration.between(schedule.lastReindexTime, now);
                 if (timeSinceLastReindex.toMillis() >= schedule.reindexIntervalMs) {
                     try {
+                        // Mark as in progress BEFORE calling listener to prevent re-entry
+                        schedule.reindexInProgress = true;
                         boolean triggered = listener.onReindexNeeded(schedule.sourceId);
                         if (triggered) {
-                            schedule.reindexInProgress = true;
-                            totalReindexesTriggered.incrementAndGet();
-                            reindexesTriggered++;
+                            // Only update counters if listener confirmed trigger
+                            // Note: listener may have already called markReindexComplete(),
+                            // which would have set reindexInProgress=false and updated lastReindexTime.
+                            // We only increment triggered count if not already completed.
+                            if (schedule.reindexInProgress) {
+                                // Listener didn't complete synchronously, keep in-progress state
+                                totalReindexesTriggered.incrementAndGet();
+                                reindexesTriggered++;
+                            }
                             LOGGER.info("Scheduled re-index triggered for source {} (last reindex: {} ago)",
                                 schedule.sourceId, formatDuration(timeSinceLastReindex));
+                        } else {
+                            // Listener rejected, reset in-progress flag
+                            schedule.reindexInProgress = false;
                         }
                     } catch (Exception e) {
+                        schedule.reindexInProgress = false;
                         totalReindexesFailed.incrementAndGet();
                         LOGGER.error("Failed to trigger scheduled re-index for source {}: {}",
                             schedule.sourceId, e.getMessage());
@@ -545,6 +575,40 @@ public class SegmentReindexScheduler {
      */
     public void setDefaultReindexIntervalMs(long intervalMs) {
         validateReindexInterval(intervalMs);
+        this.defaultReindexIntervalMs = intervalMs;
+    }
+
+    // ==================== Test-Friendly Methods ====================
+
+    /**
+     * Sets the check interval in milliseconds without validation.
+     *
+     * <p><strong>For testing only.</strong> This method bypasses domain validation
+     * to allow faster test execution. Using intervals below {@link #MIN_CHECK_INTERVAL_MS}
+     * in production is not recommended.</p>
+     *
+     * @param intervalMs The new interval (no minimum enforced)
+     */
+    void setCheckIntervalMsUnchecked(long intervalMs) {
+        if (intervalMs <= 0) {
+            throw new IllegalArgumentException("Interval must be positive, got: " + intervalMs);
+        }
+        this.checkIntervalMs = intervalMs;
+    }
+
+    /**
+     * Sets the default re-index interval in milliseconds without validation.
+     *
+     * <p><strong>For testing only.</strong> This method bypasses domain validation
+     * to allow faster test execution. Using intervals below {@link #MIN_REINDEX_INTERVAL_MS}
+     * in production is not recommended.</p>
+     *
+     * @param intervalMs The new default interval (no min/max enforced)
+     */
+    void setDefaultReindexIntervalMsUnchecked(long intervalMs) {
+        if (intervalMs <= 0) {
+            throw new IllegalArgumentException("Interval must be positive, got: " + intervalMs);
+        }
         this.defaultReindexIntervalMs = intervalMs;
     }
 

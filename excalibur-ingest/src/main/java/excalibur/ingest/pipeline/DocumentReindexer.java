@@ -20,11 +20,12 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Coordinates re-indexing of changed documents: re-chunking, re-embedding via Phase 7, 
+ * Coordinates re-indexing of changed documents: re-chunking, re-embedding via Phase 7,
  * and upserting with tombstoning of old versions.
  *
  * <h2>Re-indexing Process</h2>
@@ -38,6 +39,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>Removes old chunks from the Cuckoo filter hierarchy</li>
  *   <li>Updates the document registry with new metadata</li>
  * </ol>
+ *
+ * <h2>Atomic Publication</h2>
+ * <p>When a {@link DocumentBatchPublisher} is configured, documents are published
+ * atomically to the visibility epoch. This ensures:</p>
+ * <ul>
+ *   <li>No partial documents in query results</li>
+ *   <li>Consistent snapshots across concurrent queries</li>
+ *   <li>Epoch isolation for in-flight ingestion</li>
+ *   <li>Cuckoo filter insertion for chunk membership</li>
+ * </ul>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -65,6 +76,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * @see UpsertHandler
  * @see TextChunker
  * @see LLMHttpClient
+ * @see DocumentBatchPublisher
  */
 public class DocumentReindexer {
 
@@ -76,6 +88,10 @@ public class DocumentReindexer {
     private final UpsertHandler upsertHandler;
     private final DocumentRegistry registry;
     private final StorageWriter storageWriter;
+
+    // Optional atomic publication support
+    private final DocumentBatchPublisher batchPublisher;
+    private final OffsetAwareStorageWriter offsetAwareWriter;
 
     /**
      * Functional interface for writing chunks to storage.
@@ -95,7 +111,12 @@ public class DocumentReindexer {
     }
 
     /**
-     * Creates a new DocumentReindexer.
+     * Creates a new DocumentReindexer with basic storage writer (no atomic publication).
+     *
+     * <p>When using this constructor, documents are written directly to storage
+     * without atomic visibility epoch advancement. Use
+     * {@link #DocumentReindexer(TextChunker, LLMHttpClient, UpsertHandler, DocumentRegistry, OffsetAwareStorageWriter, DocumentBatchPublisher)}
+     * for full atomic publication support.</p>
      *
      * @param chunker Text chunker for splitting documents
      * @param llmClient LLM client for generating embeddings
@@ -104,7 +125,7 @@ public class DocumentReindexer {
      * @param storageWriter Storage writer for persisting chunks
      * @throws NullPointerException if any parameter is null
      */
-    public DocumentReindexer(TextChunker chunker, 
+    public DocumentReindexer(TextChunker chunker,
                             LLMHttpClient llmClient,
                             UpsertHandler upsertHandler,
                             DocumentRegistry registry,
@@ -114,6 +135,54 @@ public class DocumentReindexer {
         this.upsertHandler = Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.storageWriter = Objects.requireNonNull(storageWriter, "storageWriter must not be null");
+        this.batchPublisher = null;
+        this.offsetAwareWriter = null;
+    }
+
+    /**
+     * Creates a new DocumentReindexer with atomic batch publication support.
+     *
+     * <p>When using this constructor, documents are published atomically to the
+     * visibility epoch via {@link DocumentBatchPublisher}. This ensures:</p>
+     * <ul>
+     *   <li>All chunks for a document become visible at the same epoch</li>
+     *   <li>No partial documents in query results</li>
+     *   <li>Cuckoo filter insertion for chunk membership</li>
+     *   <li>Write log sync before epoch advancement</li>
+     * </ul>
+     *
+     * @param chunker Text chunker for splitting documents
+     * @param llmClient LLM client for generating embeddings
+     * @param upsertHandler Handler for tombstoning old chunks
+     * @param registry Document registry for metadata tracking
+     * @param offsetAwareWriter Storage writer that returns write log offsets
+     * @param batchPublisher Publisher for atomic batch publication
+     * @throws NullPointerException if any required parameter is null
+     */
+    public DocumentReindexer(TextChunker chunker,
+                            LLMHttpClient llmClient,
+                            UpsertHandler upsertHandler,
+                            DocumentRegistry registry,
+                            OffsetAwareStorageWriter offsetAwareWriter,
+                            DocumentBatchPublisher batchPublisher) {
+        this.chunker = Objects.requireNonNull(chunker, "chunker must not be null");
+        this.llmClient = Objects.requireNonNull(llmClient, "llmClient must not be null");
+        this.upsertHandler = Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
+        this.registry = Objects.requireNonNull(registry, "registry must not be null");
+        this.storageWriter = (chunkId, content, embedding) -> offsetAwareWriter.writeChunkWithOffset(chunkId, content, embedding) >= 0;
+        this.offsetAwareWriter = Objects.requireNonNull(offsetAwareWriter, "offsetAwareWriter must not be null");
+        this.batchPublisher = Objects.requireNonNull(batchPublisher, "batchPublisher must not be null");
+
+        LOG.info("DocumentReindexer configured with atomic batch publication support");
+    }
+
+    /**
+     * Returns true if this reindexer is configured with atomic batch publication.
+     *
+     * @return true if atomic publication is enabled
+     */
+    public boolean hasAtomicPublication() {
+        return batchPublisher != null && offsetAwareWriter != null;
     }
 
     /**
@@ -201,6 +270,16 @@ public class DocumentReindexer {
      *   <li>Updates document registry with new metadata</li>
      * </ol>
      *
+     * <h3>Atomic Publication</h3>
+     * <p>If a {@link DocumentBatchPublisher} is configured, this method uses
+     * {@link DocumentBatchBuffer} to accumulate all chunks and then publishes
+     * them atomically via the publisher. This ensures:</p>
+     * <ul>
+     *   <li>All chunks become visible at the same visibility epoch</li>
+     *   <li>No partial documents in query results</li>
+     *   <li>Cuckoo filter insertion for chunk membership</li>
+     * </ul>
+     *
      * @param sourceId Source identifier
      * @param documentId Document identifier
      * @param fetched The fetched document content
@@ -211,41 +290,166 @@ public class DocumentReindexer {
         Objects.requireNonNull(sourceId, "sourceId must not be null");
         Objects.requireNonNull(documentId, "documentId must not be null");
         Objects.requireNonNull(fetched, "fetched must not be null");
-        
+
         long startTime = System.currentTimeMillis();
-        
+
         byte[] content = fetched.getContent();
         if (content == null || content.length == 0) {
-            return new DocumentResult(documentId, 0, 0, 0, 
+            return new DocumentResult(documentId, 0, 0, 0,
                 System.currentTimeMillis() - startTime, "Empty content");
         }
-        
+
         if (content.length > MAX_CONTENT_LENGTH) {
             throw new IllegalArgumentException(
                 "Content length " + content.length + " exceeds maximum " + MAX_CONTENT_LENGTH);
         }
-        
+
         String text = new String(content, StandardCharsets.UTF_8);
-        
+
         List<TextChunk> chunks = chunker.chunk(documentId, text);
         if (chunks.isEmpty()) {
             return new DocumentResult(documentId, 0, 0, 0,
                 System.currentTimeMillis() - startTime, "No chunks produced");
         }
-        
+
+        // Use atomic publication if configured
+        if (hasAtomicPublication()) {
+            return reindexDocumentWithAtomicPublication(sourceId, documentId, content, text, chunks,
+                fetched.getLastModifiedMillis(), startTime);
+        }
+
+        // Fall back to legacy direct-write path
+        return reindexDocumentDirect(sourceId, documentId, content, chunks, fetched.getLastModifiedMillis(), startTime);
+    }
+
+    /**
+     * Re-indexes using atomic batch publication for document-atomic visibility.
+     *
+     * <p>This method writes all chunks to storage, accumulates them in a
+     * {@link DocumentBatchBuffer}, and then publishes them atomically via
+     * {@link DocumentBatchPublisher}.</p>
+     */
+    private DocumentResult reindexDocumentWithAtomicPublication(
+            String sourceId,
+            String documentId,
+            byte[] content,
+            String text,
+            List<TextChunk> chunks,
+            long lastModifiedMillis,
+            long startTime) {
+
+        DocumentBatchBuffer batchBuffer = new DocumentBatchBuffer(documentId, sourceId);
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failureCount = new AtomicInteger(0);
+        List<String> errors = new ArrayList<>();
+        List<String> chunkIds = new ArrayList<>(chunks.size());
+
+        // Write all chunks to storage and accumulate in batch buffer
+        for (int i = 0; i < chunks.size(); i++) {
+            TextChunk chunk = chunks.get(i);
+            String chunkId = generateChunkId(documentId, i);
+
+            try {
+                float[] embedding = llmClient.generateEmbedding(chunk.getText(),
+                    "reindex:" + sourceId + ":" + documentId);
+
+                // Write to storage and get offset
+                long writeLogOffset = offsetAwareWriter.writeChunkWithOffset(chunkId, chunk.getText(), embedding);
+
+                if (writeLogOffset >= 0) {
+                    // Add to batch buffer for atomic publication
+                    batchBuffer.addChunk(chunkId, chunk, writeLogOffset, embedding);
+                    chunkIds.add(chunkId);
+                    successCount.incrementAndGet();
+                } else {
+                    failureCount.incrementAndGet();
+                    errors.add("Storage write failed for chunk " + i);
+                    LOG.warn("Failed to write chunk {} for document {}", i, documentId);
+                }
+            } catch (LLMException e) {
+                failureCount.incrementAndGet();
+                errors.add("Embedding failed for chunk " + i + ": " + e.getMessage());
+                LOG.error("Failed to generate embedding for chunk {} of document {}: {}",
+                    i, documentId, e.getMessage());
+            }
+        }
+
+        // If no chunks were written successfully, return failure
+        if (successCount.get() == 0) {
+            return new DocumentResult(documentId, chunks.size(), 0, failureCount.get(),
+                System.currentTimeMillis() - startTime, "All chunks failed: " + String.join("; ", errors));
+        }
+
+        // Seal the buffer for atomic publication
+        batchBuffer.seal();
+
+        // Build document metadata
+        long contentHash = DocumentRegistry.computeContentHash(content);
+        DocumentMetadata metadata = DocumentMetadata.builder()
+            .sourceId(sourceId)
+            .documentId(documentId)
+            .lastModifiedMillis(lastModifiedMillis)
+            .contentHash(contentHash)
+            .contentLength(content.length)
+            .chunkIds(chunkIds)
+            .indexTimeMillis(System.currentTimeMillis())
+            .build();
+
+        // Publish atomically - advances visibility epoch, inserts to Cuckoo filter, registers document
+        try {
+            DocumentBatchPublisher.PublicationResult result = batchPublisher.publish(batchBuffer, metadata);
+
+            long elapsed = System.currentTimeMillis() - startTime;
+            String errorMsg = errors.isEmpty() ? null : String.join("; ", errors);
+
+            LOG.info("Document {} published atomically at epoch {}: {} chunks ({} successful, {} failed) in {}ms",
+                documentId, result.epoch(), chunks.size(), successCount.get(), failureCount.get(), elapsed);
+
+            return new DocumentResult(documentId, chunks.size(), successCount.get(),
+                failureCount.get(), elapsed, errorMsg);
+
+        } catch (DocumentBatchPublisher.PublicationException e) {
+            // Publication failed - document should not be visible
+            String errorMsg = "Atomic publication failed: " + e.getMessage();
+            if (!errors.isEmpty()) {
+                errorMsg += "; " + String.join("; ", errors);
+            }
+
+            long elapsed = System.currentTimeMillis() - startTime;
+            LOG.error("Atomic publication failed for document {}: {}", documentId, e.getMessage());
+
+            return new DocumentResult(documentId, chunks.size(), 0, chunks.size(),
+                elapsed, errorMsg);
+        }
+    }
+
+    /**
+     * Re-indexes using direct writes without atomic publication (legacy path).
+     *
+     * <p>This method writes chunks directly to storage without epoch-based
+     * visibility management. Used when no {@link DocumentBatchPublisher} is configured.</p>
+     */
+    private DocumentResult reindexDocumentDirect(
+            String sourceId,
+            String documentId,
+            byte[] content,
+            List<TextChunk> chunks,
+            long lastModifiedMillis,
+            long startTime) {
+
         List<String> chunkIds = new ArrayList<>(chunks.size());
         AtomicInteger successCount = new AtomicInteger(0);
         AtomicInteger failureCount = new AtomicInteger(0);
         List<String> errors = new ArrayList<>();
-        
+
         for (int i = 0; i < chunks.size(); i++) {
             TextChunk chunk = chunks.get(i);
             String chunkId = generateChunkId(documentId, i);
-            
+
             try {
-                float[] embedding = llmClient.generateEmbedding(chunk.getText(), 
+                float[] embedding = llmClient.generateEmbedding(chunk.getText(),
                     "reindex:" + sourceId + ":" + documentId);
-                
+
                 boolean written = storageWriter.writeChunk(chunkId, chunk.getText(), embedding);
                 if (written) {
                     chunkIds.add(chunkId);
@@ -258,31 +462,31 @@ public class DocumentReindexer {
             } catch (LLMException e) {
                 failureCount.incrementAndGet();
                 errors.add("Embedding failed for chunk " + i + ": " + e.getMessage());
-                LOG.error("Failed to generate embedding for chunk {} of document {}: {}", 
+                LOG.error("Failed to generate embedding for chunk {} of document {}: {}",
                     i, documentId, e.getMessage());
             }
         }
-        
+
         long contentHash = DocumentRegistry.computeContentHash(content);
         DocumentMetadata metadata = DocumentMetadata.builder()
             .sourceId(sourceId)
             .documentId(documentId)
-            .lastModifiedMillis(fetched.getLastModifiedMillis())
+            .lastModifiedMillis(lastModifiedMillis)
             .contentHash(contentHash)
-            .contentLength(fetched.getContentLength())
+            .contentLength(content.length)
             .chunkIds(chunkIds)
             .indexTimeMillis(System.currentTimeMillis())
             .build();
-        
+
         registry.register(metadata);
-        
+
         long elapsed = System.currentTimeMillis() - startTime;
         String errorMsg = errors.isEmpty() ? null : String.join("; ", errors);
-        
+
         LOG.debug("Re-indexed document {}: {} chunks ({} successful, {} failed) in {}ms",
             documentId, chunks.size(), successCount.get(), failureCount.get(), elapsed);
-        
-        return new DocumentResult(documentId, chunks.size(), successCount.get(), 
+
+        return new DocumentResult(documentId, chunks.size(), successCount.get(),
             failureCount.get(), elapsed, errorMsg);
     }
 

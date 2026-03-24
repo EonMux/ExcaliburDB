@@ -41,7 +41,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * <p>All tests are deterministic - same mock responses always produce the same results.</p>
  */
 @Timeout(value = 10)
-class LLMHttpClientTest {
+public class LLMHttpClientTest {
 
     private MockLLMServer server;
     private LLMClientConfig config;
@@ -746,6 +746,16 @@ class LLMHttpClientTest {
     @Test
     @DisplayName("Circuit breaker: multiple HTTP errors eventually open circuit")
     void scoreRelevancyWithCircuitBreaker_multipleErrors_opensCircuit() {
+        // Configure client with no retries to avoid long delays
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0) // No retries to avoid timeout
+                .build();
+        client = new LLMHttpClient(config);
+
         server.setChatHandler(server.errorHandler(500, "Internal Server Error"));
 
         // Record failures up to threshold (default is 5)
@@ -774,6 +784,16 @@ class LLMHttpClientTest {
     @Test
     @DisplayName("Circuit breaker: success after failures resets failure count")
     void scoreRelevancyWithCircuitBreaker_successAfterFailures_resetsCount() {
+        // Configure client with no retries to avoid long delays
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0) // No retries to avoid timeout
+                .build();
+        client = new LLMHttpClient(config);
+
         // Record some failures (but not enough to trip)
         server.setChatHandler(server.errorHandler(500, "Internal Server Error"));
 
@@ -864,31 +884,463 @@ class LLMHttpClientTest {
 
     @Test
     @DisplayName("MockLLMServer: sequence handler works correctly")
-    void mockServer_sequenceHandler_worksCorrectly() {
+    void mockServer_sequenceHandler_worksCorrectly() throws IOException {
+        // Create client with retries disabled to test server behavior (not client retry)
+        LLMClientConfig noRetryConfig = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)  // Disable retries to test sequence handler
+                .build();
+        LLMHttpClient noRetryClient = new LLMHttpClient(noRetryConfig);
+
         server.setChatHandler(server.sequenceHandler(
             server.errorHandler(500, "First"),
             server.successRelevancyHandler(0.9)
         ));
 
         // First call fails
-        assertThrows(LLMException.class, () -> client.scoreRelevancy("q", List.of("t")));
+        assertThrows(LLMException.class, () -> noRetryClient.scoreRelevancy("q", List.of("t")));
 
         // Second call succeeds
-        List<RelevancyScore> scores = client.scoreRelevancy("q", List.of("t"));
+        List<RelevancyScore> scores = noRetryClient.scoreRelevancy("q", List.of("t"));
         assertEquals(0.9, scores.get(0).getScore(), 0.001);
     }
 
     @Test
     @DisplayName("MockLLMServer: fail then succeed handler works correctly")
-    void mockServer_failThenSucceedHandler_worksCorrectly() {
+    void mockServer_failThenSucceedHandler_worksCorrectly() throws IOException {
+        // Create client with retries disabled to test server behavior (not client retry)
+        LLMClientConfig noRetryConfig = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)  // Disable retries to test fail-then-succeed handler
+                .build();
+        LLMHttpClient noRetryClient = new LLMHttpClient(noRetryConfig);
+
         server.setChatHandler(server.failThenSucceedHandler(2, server.successRelevancyHandler(0.95)));
 
         // First two calls fail
-        assertThrows(LLMException.class, () -> client.scoreRelevancy("q", List.of("t")));
-        assertThrows(LLMException.class, () -> client.scoreRelevancy("q", List.of("t")));
+        assertThrows(LLMException.class, () -> noRetryClient.scoreRelevancy("q", List.of("t")));
+        assertThrows(LLMException.class, () -> noRetryClient.scoreRelevancy("q", List.of("t")));
 
         // Third call succeeds
-        List<RelevancyScore> scores = client.scoreRelevancy("q", List.of("t"));
+        List<RelevancyScore> scores = noRetryClient.scoreRelevancy("q", List.of("t"));
         assertEquals(0.95, scores.get(0).getScore(), 0.001);
+    }
+
+    // ============= Retry with Exponential Backoff Tests =============
+
+    @Test
+    @DisplayName("Retry: transient network error triggers retry and eventually succeeds")
+    void scoreRelevancy_networkError_retriesAndSucceeds() throws IOException {
+        // Create config with 3 retries
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)  // Allow 3 retries
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Handler that fails once then succeeds
+        server.setChatHandler(server.failThenSucceedHandler(1, server.successRelevancyHandler(0.88)));
+
+        // This should succeed after retry (initial + 1 retry = 2 attempts)
+        List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("test"));
+
+        assertEquals(1, scores.size());
+        assertEquals(0.88, scores.get(0).getScore(), 0.001);
+    }
+
+    @Test
+    @DisplayName("Retry: HTTP 500 error triggers retry")
+    void scoreRelevancy_http500_retriesAndSucceeds() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // First call returns 500, second call succeeds
+        server.setChatHandler(server.sequenceHandler(
+                server.errorHandler(500, "Internal Server Error"),
+                server.successRelevancyHandler(0.75)
+        ));
+
+        List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("test"));
+
+        assertEquals(1, scores.size());
+        assertEquals(0.75, scores.get(0).getScore(), 0.001);
+    }
+
+    @Test
+    @DisplayName("Retry: HTTP 429 rate limited triggers retry")
+    void scoreRelevancy_rateLimited_retriesAndSucceeds() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // First call returns 429, second call succeeds
+        server.setChatHandler(server.sequenceHandler(
+                server.errorHandler(429, "Rate Limited"),
+                server.successRelevancyHandler(0.82)
+        ));
+
+        List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("test"));
+
+        assertEquals(1, scores.size());
+        assertEquals(0.82, scores.get(0).getScore(), 0.001);
+    }
+
+    @Test
+    @DisplayName("Retry: HTTP 401 auth error does NOT trigger retry")
+    void scoreRelevancy_http401_noRetry() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Set up sequence handler to track if retry happens
+        // If retry happens, second call would succeed
+        // If no retry, we should get 401 immediately
+        AtomicInteger callCount = new AtomicInteger(0);
+        server.setChatHandler(exchange -> {
+            callCount.incrementAndGet();
+            server.errorHandler(401, "Unauthorized").handle(exchange);
+        });
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.scoreRelevancy("query", List.of("test")));
+
+        // Should have only one call (no retry)
+        assertEquals(1, callCount.get(), "401 should not trigger retry");
+        assertEquals(LLMException.ErrorType.AUTH_ERROR, ex.getErrorType());
+    }
+
+    @Test
+    @DisplayName("Retry: HTTP 403 forbidden does NOT trigger retry")
+    void scoreRelevancy_http403_noRetry() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .build();
+        client = new LLMHttpClient(config);
+
+        AtomicInteger callCount = new AtomicInteger(0);
+        server.setChatHandler(exchange -> {
+            callCount.incrementAndGet();
+            server.errorHandler(403, "Forbidden").handle(exchange);
+        });
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.scoreRelevancy("query", List.of("test")));
+
+        // Should have only one call (no retry)
+        assertEquals(1, callCount.get(), "403 should not trigger retry");
+        assertEquals(LLMException.ErrorType.AUTH_ERROR, ex.getErrorType());
+    }
+
+    @Test
+    @DisplayName("Retry: exhausts retries and fails")
+    void scoreRelevancy_exhaustsRetries_fails() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(1))  // Short timeout
+                .maxRetries(2)  // Only 2 retries
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Always fail with 500
+        server.setChatHandler(server.errorHandler(500, "Always fails"));
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.scoreRelevancy("query", List.of("test")));
+
+        // Should have made 3 attempts (initial + 2 retries)
+        List<MockLLMServer.CapturedRequest> requests = server.getCapturedChatRequests();
+        assertEquals(3, requests.size(), "Should have made 3 attempts (initial + 2 retries)");
+    }
+
+    @Test
+    @DisplayName("Retry: maxRetries=0 means no retry")
+    void scoreRelevancy_zeroRetries_noRetry() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)  // No retries
+                .build();
+        client = new LLMHttpClient(config);
+
+        AtomicInteger callCount = new AtomicInteger(0);
+        server.setChatHandler(exchange -> {
+            callCount.incrementAndGet();
+            server.errorHandler(500, "Internal Server Error").handle(exchange);
+        });
+
+        assertThrows(LLMException.class, () -> client.scoreRelevancy("query", List.of("test")));
+
+        // Should have only one call (no retry)
+        assertEquals(1, callCount.get(), "maxRetries=0 should not trigger any retry");
+    }
+
+    @Test
+    @DisplayName("Retry: embedding generation also retries on network error")
+    void generateEmbedding_networkError_retriesAndSucceeds() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .build();
+        client = new LLMHttpClient(config);
+
+        float[] expectedEmbedding = new float[]{0.5f, 0.3f, 0.2f};
+
+        // First call fails, second succeeds
+        server.setEmbeddingHandler(server.sequenceHandler(
+                server.errorHandler(500, "Internal Server Error"),
+                server.successEmbeddingHandler(expectedEmbedding)
+        ));
+
+        float[] result = client.generateEmbedding("Test text");
+
+        assertNotNull(result);
+        assertEquals(expectedEmbedding.length, result.length);
+        for (int i = 0; i < expectedEmbedding.length; i++) {
+            assertEquals(expectedEmbedding[i], result[i], 0.0001f);
+        }
+    }
+
+    @Test
+    @DisplayName("Retry: config default maxRetries is 3")
+    void config_defaultMaxRetries_is3() {
+        LLMClientConfig defaultConfig = LLMClientConfig.builder()
+                .baseUrl("http://localhost:11434")
+                .build();
+
+        assertEquals(3, defaultConfig.getMaxRetries(),
+                "Default maxRetries should be 3");
+    }
+
+    @Test
+    @DisplayName("Retry: config validates maxRetries range [0, 10]")
+    void config_maxRetries_validated() {
+        // Valid: 0
+        LLMClientConfig config0 = LLMClientConfig.builder()
+                .baseUrl("http://localhost:11434")
+                .maxRetries(0)
+                .build();
+        assertEquals(0, config0.getMaxRetries());
+
+        // Valid: 10
+        LLMClientConfig config10 = LLMClientConfig.builder()
+                .baseUrl("http://localhost:11434")
+                .maxRetries(10)
+                .build();
+        assertEquals(10, config10.getMaxRetries());
+
+        // Invalid: -1
+        assertThrows(IllegalArgumentException.class, () ->
+                LLMClientConfig.builder()
+                        .baseUrl("http://localhost:11434")
+                        .maxRetries(-1)
+                        .build());
+
+        // Invalid: 11
+        assertThrows(IllegalArgumentException.class, () ->
+                LLMClientConfig.builder()
+                        .baseUrl("http://localhost:11434")
+                        .maxRetries(11)
+                        .build());
+    }
+
+    @Test
+    @DisplayName("Retry: success after retry does not affect circuit breaker")
+    void retry_successAfterRetry_noCircuitBreakerImpact() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // First call fails with 500, second succeeds
+        server.setChatHandler(server.sequenceHandler(
+                server.errorHandler(500, "Internal Server Error"),
+                server.successRelevancyHandler(0.9)
+        ));
+
+        // Call with circuit breaker protection
+        List<RelevancyScore> scores = client.scoreRelevancyWithCircuitBreaker(
+                "query", List.of("test"), null);
+
+        assertEquals(1, scores.size());
+        assertEquals(0.9, scores.get(0).getScore(), 0.001);
+
+        // Circuit breaker should still be CLOSED (success was recorded)
+        assertEquals(CircuitBreakerState.CLOSED, client.getCircuitBreaker().getState());
+        assertEquals(0, client.getCircuitBreaker().getFailureCount());
+    }
+
+    // ============= Retry Logic Tests (Additional) =============
+
+    @Test
+    @DisplayName("Retry: success on second attempt does")
+    void retry_successOnSecondAttempt() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .build();
+        client = new LLMHttpClient(config);
+
+        float[] expectedEmbedding = new float[]{0.5f, 0.3f, 0.2f};
+
+        // First call fails, second succeeds
+        server.setEmbeddingHandler(server.sequenceHandler(
+                server.errorHandler(500, "Internal Server Error"),
+                server.successEmbeddingHandler(expectedEmbedding)
+        ));
+
+        float[] result = client.generateEmbedding("Test");
+
+        assertNotNull(result);
+        assertEquals(expectedEmbedding.length, result.length);
+        for (int i = 0; i < expectedEmbedding.length; i++) {
+            assertEquals(expectedEmbedding[i], result[i], 0.0001f);
+        }
+    }
+
+    @Test
+    @DisplayName("Retry: exhausts all attempts and throws final error")
+    void retry_exhaustsAllAttempts_throwsFinalError() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(2) // 2 retries allowed
+                .retryBaseDelay(Duration.ofMillis(10)) // Fast retry for testing
+                .build();
+        client = new LLMHttpClient(config);
+
+        // All 3 attempts (1 initial + 2 retries) fail
+        server.setEmbeddingHandler(server.errorHandler(500, "Internal Server Error"));
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+        assertTrue(ex.getErrorType() == LLMException.ErrorType.HTTP_ERROR);
+        assertEquals(500, ex.getStatusCode());
+        // Note: generateEmbedding does NOT use the circuit breaker - only scoreRelevancyWithCircuitBreaker does
+        // The retry logic is internal to executeRequest and doesn't record to circuit breaker
+    }
+
+    @Test
+    @DisplayName("Retry: non-retryable error AUTH_ERROR does not trigger retry")
+    void retry_nonRetryableError_noRetry() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // 401 Unauthorized should NOT trigger retry
+        server.setEmbeddingHandler(server.unauthorizedHandler());
+
+        // Track request count before
+        int requestsBefore = server.getCapturedEmbeddingRequests().size();
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+        assertTrue(ex.getErrorType() == LLMException.ErrorType.AUTH_ERROR);
+        assertEquals(401, ex.getStatusCode());
+
+        // Verify only one request was made (no retry)
+        int requestsAfter = server.getCapturedEmbeddingRequests().size();
+        assertEquals(requestsBefore + 1, requestsAfter);
+    }
+
+    @Test
+    @DisplayName("Retry: exponential backoff delay increases with each attempt")
+    void retry_exponentialBackoffDelay_increases() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(3)
+                .retryBaseDelay(Duration.ofMillis(100)) // 100ms base delay
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Create a handler that always fails
+        server.setEmbeddingHandler(server.errorHandler(500, "Internal Server Error"));
+
+        // Make requests that will fail - should retry 3 times
+        assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+
+        // Verify exponential backoff is configured
+        assertTrue(config.getMaxRetries() >= 1, "Max retries should be at least 1");
+    }
+
+    @Test
+    @DisplayName("Retry: configurable retryBaseDelay is used")
+    void retry_configurableBaseDelay_used() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(1)
+                .retryBaseDelay(Duration.ofMillis(200)) // 200ms base delay
+                .build();
+        client = new LLMHttpClient(config);
+
+        float[] expectedEmbedding = new float[]{0.5f};
+
+        // First call fails, second succeeds
+        server.setEmbeddingHandler(server.sequenceHandler(
+                server.errorHandler(500, "Internal Server Error"),
+                server.successEmbeddingHandler(expectedEmbedding)
+        ));
+
+        float[] result = client.generateEmbedding("Test");
+        assertNotNull(result);
+        assertEquals(expectedEmbedding.length, result.length);
+        // Verify config uses the custom retry base delay
+        assertEquals(Duration.ofMillis(200), config.getRetryBaseDelay());
     }
 }

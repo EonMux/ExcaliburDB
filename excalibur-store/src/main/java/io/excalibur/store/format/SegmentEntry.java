@@ -1,5 +1,7 @@
 package io.excalibur.store.format;
 
+import io.excalibur.core.memory.Segment;
+
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
@@ -272,6 +274,41 @@ public final class SegmentEntry {
     }
 
     /**
+     * Reads an entry from a Segment at the specified offset.
+     *
+     * <p>This method uses the Segment abstraction interface for memory access,
+     * providing compatibility across Panama FFM and ByteBuffer implementations.</p>
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return The entry read from the segment
+     * @throws IndexOutOfBoundsException if offset is invalid or entry extends beyond segment
+     * @throws NullPointerException if segment is null
+     */
+    public static SegmentEntry readFrom(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        // Read header fields using Segment interface
+        long keyHash = segment.getLong(offset + KEY_HASH_OFFSET);
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        int valueLen = segment.getInt(offset + VALUE_LEN_OFFSET);
+        int distance = segment.getByte(offset + DISTANCE_OFFSET) & 0xFF;
+
+        // Read variable-length key bytes
+        byte[] key = segment.getBytes(offset + KEY_BYTES_OFFSET, keyLen);
+
+        // Read variable-length value bytes
+        byte[] value = segment.getBytes(offset + KEY_BYTES_OFFSET + keyLen, valueLen);
+
+        // Read and validate tombstone
+        byte tombstoneByte = segment.getByte(offset + KEY_BYTES_OFFSET + keyLen + valueLen);
+        validateTombstone(tombstoneByte);
+        boolean tombstoned = (tombstoneByte == TOMBSTONE_DELETED);
+
+        return new SegmentEntry(keyHash, key, value, distance, tombstoned);
+    }
+
+    /**
      * Reads just the key from a MemorySegment at the specified offset.
      * This is more efficient than reading the full entry when only the key is needed.
      *
@@ -386,6 +423,117 @@ public final class SegmentEntry {
         byte tombstoneByte = segment.get(ValueLayout.JAVA_BYTE, offset + KEY_BYTES_OFFSET + keyLen + valueLen);
 
         // Validate tombstone is exactly 0 or 1
+        validateTombstone(tombstoneByte);
+
+        return tombstoneByte == TOMBSTONE_DELETED;
+    }
+
+    // ==================== Segment Abstraction Overloads ====================
+
+    /**
+     * Reads just the key from a Segment at the specified offset.
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return The key bytes
+     * @throws IndexOutOfBoundsException if offset is invalid
+     */
+    public static byte[] readKey(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        return segment.getBytes(offset + KEY_BYTES_OFFSET, keyLen);
+    }
+
+    /**
+     * Reads just the value from a Segment at the specified offset.
+     * Returns a Segment slice for zero-copy access.
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return A Segment slice pointing to the value, or null if tombstoned
+     * @throws IndexOutOfBoundsException if offset is invalid
+     * @throws IllegalArgumentException if tombstone byte is not 0 or 1
+     */
+    public static Segment readValueSlice(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        int valueLen = segment.getInt(offset + VALUE_LEN_OFFSET);
+        byte tombstoneByte = segment.getByte(offset + KEY_BYTES_OFFSET + keyLen + valueLen);
+
+        validateTombstone(tombstoneByte);
+
+        if (tombstoneByte == TOMBSTONE_DELETED) {
+            return null;
+        }
+
+        return segment.asSlice(offset + KEY_BYTES_OFFSET + keyLen, valueLen);
+    }
+
+    /**
+     * Reads just the value bytes from a Segment at the specified offset.
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return The value bytes, or null if tombstoned
+     * @throws IndexOutOfBoundsException if offset is invalid
+     */
+    public static byte[] readValue(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        int valueLen = segment.getInt(offset + VALUE_LEN_OFFSET);
+        byte tombstoneByte = segment.getByte(offset + KEY_BYTES_OFFSET + keyLen + valueLen);
+
+        validateTombstone(tombstoneByte);
+
+        if (tombstoneByte == TOMBSTONE_DELETED) {
+            return null;
+        }
+
+        return segment.getBytes(offset + KEY_BYTES_OFFSET + keyLen, valueLen);
+    }
+
+    /**
+     * Reads the key hash from a Segment at the specified offset.
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return The 64-bit key hash
+     */
+    public static long readKeyHash(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+        return segment.getLong(offset + KEY_HASH_OFFSET);
+    }
+
+    /**
+     * Reads the distance from a Segment at the specified offset.
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return The distance value (0-127)
+     */
+    public static int readDistance(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+        return segment.getByte(offset + DISTANCE_OFFSET) & 0xFF;
+    }
+
+    /**
+     * Reads the tombstone status from a Segment at the specified offset.
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return true if the entry is tombstoned (deleted), false otherwise
+     * @throws IllegalArgumentException if tombstone byte is not 0 or 1
+     */
+    public static boolean isTombstoned(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        int valueLen = segment.getInt(offset + VALUE_LEN_OFFSET);
+        byte tombstoneByte = segment.getByte(offset + KEY_BYTES_OFFSET + keyLen + valueLen);
+
         validateTombstone(tombstoneByte);
 
         return tombstoneByte == TOMBSTONE_DELETED;

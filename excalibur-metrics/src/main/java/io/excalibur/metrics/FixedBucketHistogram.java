@@ -116,31 +116,113 @@ public final class FixedBucketHistogram {
      * Gets the percentile value.
      *
      * @param percentile Percentile (0-100)
-     * @return Value at the given percentile
+     * @return Value at the given percentile in milliseconds
      */
     public long getPercentile(double percentile) {
-        if (totalEntries == 0) return 0;
-        
-        double targetBucket = totalEntries * percentile / 100.0;
-        int bucketIndex = findBucketAtTarget(targetBucket);
-        
-        // Interpolate between buckets
-        int bucketStart = Math.max(0, (int) (bucketIndex * 10000.0 / NUM_BUCKETS));
-        int bucketEnd = Math.min(NUM_BUCKETS - 1, bucketIndex);
-        
-        if (bucketStart == bucketEnd) {
-            return (long) (bucketStart * NUM_BUCKETS / 10000.0);
+        synchronized (this) {
+            if (totalEntries == 0) return 0;
+
+            double targetCount = totalEntries * percentile / 100.0;
+            int bucketIndex = findBucketAtTarget(targetCount);
+
+            // Convert bucket index back to latency value
+            return (long) (bucketIndex * 10000L / NUM_BUCKETS);
         }
-        
-        double progress = (targetBucket - bucketStart * totalEntries) / 
-                          ((bucketEnd - bucketStart) * totalEntries);
-        
-        long bucketValue = (long) (bucketStart * NUM_BUCKETS / 10000.0);
-        long nextBucketValue = (long) (bucketEnd * NUM_BUCKETS / 10000.0);
-        
-        return (long) (bucketValue + progress * (nextBucketValue - bucketValue));
     }
-    
+
+    // ============================================
+    // Instance methods for JMX access
+    // ============================================
+
+    /**
+     * Gets the total number of entries recorded (instance method).
+     */
+    public long getTotalCount() {
+        synchronized (this) {
+            return totalEntries;
+        }
+    }
+
+    /**
+     * Gets the average latency (instance method).
+     */
+    public double getAverage() {
+        synchronized (this) {
+            if (totalEntries == 0) return 0.0;
+            long sum = 0;
+            for (int i = 0; i < NUM_BUCKETS; i++) {
+                sum += buckets[i] * (i * 10000L / NUM_BUCKETS);
+            }
+            return (double) sum / totalEntries;
+        }
+    }
+
+    /**
+     * Gets the minimum latency recorded (instance method).
+     */
+    public long getMinimum() {
+        synchronized (this) {
+            int firstBucket = findFirstNonZeroBucket();
+            if (firstBucket == NUM_BUCKETS) return 0;
+            return (long) (firstBucket * 10000.0 / NUM_BUCKETS);
+        }
+    }
+
+    /**
+     * Gets the maximum latency recorded (instance method).
+     */
+    public long getMaximum() {
+        synchronized (this) {
+            int lastBucket = findLastNonZeroBucket();
+            if (lastBucket == -1) return 0;
+            return (long) (lastBucket * 10000.0 / NUM_BUCKETS);
+        }
+    }
+
+    /**
+     * Gets the average FP rate (instance method).
+     */
+    public double getAverageFpRate() {
+        synchronized (this) {
+            if (fpRateEntries == 0) return 0.0;
+            long sum = 0;
+            for (int i = 0; i < NUM_FP_RATES; i++) {
+                sum += fpRateBuckets[i] * i;
+            }
+            return (double) sum / fpRateEntries / NUM_FP_RATES;
+        }
+    }
+
+    /**
+     * Gets the FP rate epoch (instance method).
+     */
+    public double getFpRateEpoch() {
+        return fpRateEpoch;
+    }
+
+    /**
+     * Gets the FP rate count (instance method).
+     */
+    public int getFpRateCount() {
+        synchronized (this) {
+            return fpRateEntries;
+        }
+    }
+
+    /**
+     * Gets the maximum FP rate recorded (instance method).
+     */
+    public double getMaxFpRate() {
+        synchronized (this) {
+            for (int i = NUM_FP_RATES - 1; i >= 0; i--) {
+                if (fpRateBuckets[i] > 0) {
+                    return (double) i / NUM_FP_RATES;
+                }
+            }
+            return 0.0;
+        }
+    }
+
     // Convenience methods for common percentiles (static for Metrics access)
     /**
      * Gets the p50 (median) percentile value.
@@ -176,72 +258,26 @@ public final class FixedBucketHistogram {
     public static long getP999() {
         return histogram.getPercentile(99.9);
     }
-    
+
     /**
-     * Gets the total number of entries recorded.
+     * Gets the singleton histogram instance for direct access.
+     *
+     * @return The singleton histogram instance
      */
-    public static long getTotalCount() {
-        return histogram.getTotalCount();
+    public static FixedBucketHistogram getInstance() {
+        return histogram;
     }
-    
-    /**
-     * Gets the average latency.
-     */
-    public static double getAverage() {
-        return histogram.getAverage();
-    }
-    
-    /**
-     * Gets the minimum latency recorded.
-     */
-    public static long getMinimum() {
-        return histogram.getMinimum();
-    }
-    
-    /**
-     * Gets the maximum latency recorded.
-     */
-    public static long getMaximum() {
-        return histogram.getMaximum();
-    }
-    
-    // FP rate statistics methods (static for Metrics access)
-    /**
-     * Gets the average FP rate across all epochs.
-     */
-    public static double getAverageFpRate() {
-        return histogram.getAverageFpRate();
-    }
-    
-    /**
-     * Gets the FP rate for the current epoch.
-     */
-    public static double getFpRateEpoch() {
-        return histogram.getFpRateEpoch();
-    }
-    
-    /**
-     * Gets the count of FP rate measurements.
-     */
-    public static int getFpRateCount() {
-        return histogram.getFpRateCount();
-    }
-    
-    /**
-     * Gets the maximum FP rate recorded.
-     */
-    public static double getMaxFpRate() {
-        return histogram.getMaxFpRate();
-    }
-    
+
     /**
      * Finds the bucket index for a given latency.
+     * Caps the index to prevent ArrayIndexOutOfBoundsException for large latencies.
      *
      * @param latency Latency in ms
-     * @return Bucket index
+     * @return Bucket index (0 to NUM_BUCKETS-1)
      */
     private int getBucketIndex(long latency) {
-        return (int) (latency * NUM_BUCKETS / 10000.0);
+        int index = (int) (latency * NUM_BUCKETS / 10000.0);
+        return Math.max(0, Math.min(NUM_BUCKETS - 1, index));
     }
     
     /**
@@ -270,15 +306,17 @@ public final class FixedBucketHistogram {
     
     /**
      * Finds the bucket index that contains the target cumulative count.
+     * Correctly accumulates counts across buckets to find the percentile position.
      *
      * @param target Target cumulative count
-     * @return Bucket index
+     * @return Bucket index where cumulative count reaches or exceeds target
      */
     private int findBucketAtTarget(double target) {
+        long cumulative = 0;
         for (int i = 0; i < NUM_BUCKETS; i++) {
-            if (buckets[i] > 0) {
-                double cumulative = i * totalEntries / NUM_BUCKETS;
-                if (cumulative >= target) return i;
+            cumulative += buckets[i];
+            if (cumulative >= target) {
+                return i;
             }
         }
         return NUM_BUCKETS - 1;

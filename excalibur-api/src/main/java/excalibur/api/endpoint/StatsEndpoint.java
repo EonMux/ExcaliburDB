@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.VisibilityTracker;
+import excalibur.shard.allocator.VolumeManager;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -83,6 +84,7 @@ public class StatsEndpoint implements HttpHandler {
     private final SegmentCatalog segmentCatalog;
     private final IndexOrchestrator indexOrchestrator;
     private final StorageEngine storageEngine;
+    private final VolumeManager volumeManager;
 
     /**
      * Creates a new StatsEndpoint with required dependencies.
@@ -92,6 +94,22 @@ public class StatsEndpoint implements HttpHandler {
      * @throws NullPointerException if any parameter is null
      */
     public StatsEndpoint(IndexOrchestrator indexOrchestrator, StorageEngine storageEngine) {
+        this(indexOrchestrator, storageEngine, null);
+    }
+
+    /**
+     * Creates a new StatsEndpoint with required dependencies and optional VolumeManager.
+     *
+     * <p>If VolumeManager is provided, it will be used for accurate disk space tracking.
+     * If null, volume stats will be computed from segment catalog (less accurate).</p>
+     *
+     * @param indexOrchestrator The index orchestrator for worker metrics
+     * @param storageEngine The storage engine for volume information
+     * @param volumeManager Optional volume manager for disk space tracking
+     * @throws NullPointerException if indexOrchestrator or storageEngine is null
+     */
+    public StatsEndpoint(IndexOrchestrator indexOrchestrator, StorageEngine storageEngine,
+                         VolumeManager volumeManager) {
         Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
         Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
 
@@ -99,8 +117,9 @@ public class StatsEndpoint implements HttpHandler {
         this.storageEngine = storageEngine;
         this.visibilityTracker = indexOrchestrator.getVisibilityTracker();
         this.segmentCatalog = storageEngine.getCatalog();
+        this.volumeManager = volumeManager;
 
-        LOGGER.debug("StatsEndpoint created");
+        LOGGER.debug("StatsEndpoint created with VolumeManager: {}", volumeManager != null);
     }
 
     /**
@@ -119,6 +138,27 @@ public class StatsEndpoint implements HttpHandler {
                          SegmentCatalog segmentCatalog,
                          IndexOrchestrator indexOrchestrator,
                          StorageEngine storageEngine) {
+        this(visibilityTracker, segmentCatalog, indexOrchestrator, storageEngine, null);
+    }
+
+    /**
+     * Creates a new StatsEndpoint with explicit dependencies and VolumeManager.
+     *
+     * <p>This constructor is useful for testing or when dependencies are
+     * managed separately.</p>
+     *
+     * @param visibilityTracker The visibility tracker for epoch information
+     * @param segmentCatalog The segment catalog for segment statistics
+     * @param indexOrchestrator The index orchestrator for worker metrics
+     * @param storageEngine The storage engine for volume information
+     * @param volumeManager The volume manager for disk space tracking
+     * @throws NullPointerException if any required parameter is null
+     */
+    public StatsEndpoint(VisibilityTracker visibilityTracker,
+                         SegmentCatalog segmentCatalog,
+                         IndexOrchestrator indexOrchestrator,
+                         StorageEngine storageEngine,
+                         VolumeManager volumeManager) {
         Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
         Objects.requireNonNull(segmentCatalog, "SegmentCatalog cannot be null");
         Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
@@ -128,6 +168,7 @@ public class StatsEndpoint implements HttpHandler {
         this.segmentCatalog = segmentCatalog;
         this.indexOrchestrator = indexOrchestrator;
         this.storageEngine = storageEngine;
+        this.volumeManager = volumeManager;
     }
 
     @Override
@@ -201,11 +242,50 @@ public class StatsEndpoint implements HttpHandler {
     }
 
     /**
-     * Computes volume statistics from the storage engine.
+     * Computes volume statistics from the VolumeManager or storage engine.
+     *
+     * <p>If VolumeManager is available, uses it for accurate disk space tracking via
+     * {@link Files#getFileStore(Path)}. Otherwise, falls back to estimating from
+     * segment catalog (which may be inaccurate as it uses directory metadata size).</p>
+     *
+     * <p><strong>Domain Correctness:</strong></p>
+     * <ul>
+     *   <li>totalBytes: Actual disk capacity from FileStore.getTotalSpace()</li>
+     *   <li>usedBytes: Actual used space (totalBytes - availableBytes)</li>
+     *   <li>Values represent real disk usage, not directory metadata size</li>
+     * </ul>
      *
      * @return Volume statistics
      */
     private VolumeStats computeVolumeStats() {
+        // Use VolumeManager for accurate disk space tracking when available
+        if (volumeManager != null) {
+            VolumeManager.VolumeStats aggregatedStats = volumeManager.getAggregatedVolumeStats();
+            int volumeCount = volumeManager.getVolumeCount();
+
+            return new VolumeStats(
+                volumeCount,
+                aggregatedStats.totalBytes(),
+                aggregatedStats.usedBytes()
+            );
+        }
+
+        // Fallback: compute from segment catalog (less accurate)
+        // WARNING: This uses Files.size(volumePath) which returns directory metadata size,
+        // not actual disk usage. This is kept for backward compatibility.
+        return computeVolumeStatsFallback();
+    }
+
+    /**
+     * Fallback method for computing volume statistics from segment catalog.
+     *
+     * <p><strong>Warning:</strong> This method uses {@link Files#size(Path)} which
+     * returns directory metadata size (typically 4096 bytes), not actual disk usage.
+     * Use VolumeManager for accurate disk space tracking.</p>
+     *
+     * @return Volume statistics computed from segment catalog
+     */
+    private VolumeStats computeVolumeStatsFallback() {
         Map<Long, SegmentCatalog.SegmentMetadata> allSegments = segmentCatalog.getAll();
 
         int volumeCount = 0;
@@ -222,6 +302,8 @@ public class StatsEndpoint implements HttpHandler {
 
                 try {
                     if (Files.exists(volumePath)) {
+                        // WARNING: Files.size() returns directory metadata size, not disk usage
+                        // This is intentionally kept for backward compatibility but is inaccurate
                         long size = Files.size(volumePath);
                         totalBytes += size;
                         usedBytes += size;

@@ -135,13 +135,8 @@ public final class InnerProduct implements DistanceFunction {
      */
     @Override
     public float compute(float[] v1, float[] v2) {
-        Objects.requireNonNull(v1, "First vector must not be null");
-        Objects.requireNonNull(v2, "Second vector must not be null");
-
-        if (v1.length != v2.length) {
-            throw new IllegalArgumentException(
-                "Vector dimensions must match: " + v1.length + " vs " + v2.length);
-        }
+        // Validate inputs using DistanceValidator for consistent error handling
+        DistanceValidator.validateVectorPair(v1, v2, "v1", "v2");
 
         final int length = v1.length;
 

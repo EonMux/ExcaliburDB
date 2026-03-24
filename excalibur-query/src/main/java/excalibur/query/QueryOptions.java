@@ -211,10 +211,24 @@ public final class QueryOptions {
         /**
          * Sets the minimum score threshold for results.
          *
-         * @param threshold The threshold value
+         * <p><strong>Domain Correctness:</strong> The threshold must be in [0.0, 1.0]
+         * because relevancy scores are in this range. Values outside this range
+         * would result in either all results being filtered out (threshold &gt; 1.0)
+         * or no filtering at all (threshold &lt; 0.0), which is likely a user error.</p>
+         *
+         * @param threshold The threshold value (must be in [0.0, 1.0])
          * @return This builder
+         * @throws IllegalArgumentException if threshold is NaN or outside [0.0, 1.0]
          */
         public Builder threshold(float threshold) {
+            // NaN check must be explicit since NaN comparisons return false
+            if (Float.isNaN(threshold)) {
+                throw new IllegalArgumentException("Threshold cannot be NaN");
+            }
+            if (threshold < 0.0f || threshold > 1.0f) {
+                throw new IllegalArgumentException(
+                    "Threshold must be in [0.0, 1.0], got: " + threshold);
+            }
             this.threshold = threshold;
             return this;
         }

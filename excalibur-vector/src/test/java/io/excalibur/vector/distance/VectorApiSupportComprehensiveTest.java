@@ -322,33 +322,36 @@ class VectorApiSupportComprehensiveTest {
     class VectorOperationsErrorHandling {
 
         @Test
-        @DisplayName("Distance functions handle NaN correctly regardless of Vector API")
+        @DisplayName("Distance functions reject NaN values")
         void nanHandlingConsistent() {
             float[] withNan = {1.0f, Float.NaN, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
             float[] normal = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
 
-            float l2 = L2Distance.getInstance().compute(withNan, normal);
-            float inner = InnerProduct.getInstance().compute(withNan, normal);
-            float cosine = CosineSimilarity.getInstance().compute(withNan, normal);
-
-            assertThat(l2).isNaN();
-            assertThat(inner).isNaN();
-            assertThat(cosine).isNaN();
+            // All distance functions should throw IllegalArgumentException for NaN input
+            assertThatThrownBy(() -> L2Distance.getInstance().compute(withNan, normal))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
+            assertThatThrownBy(() -> InnerProduct.getInstance().compute(withNan, normal))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
+            assertThatThrownBy(() -> CosineSimilarity.getInstance().compute(withNan, normal))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
         }
 
         @Test
-        @DisplayName("Distance functions handle infinity correctly")
+        @DisplayName("Distance functions reject infinity values")
         void infinityHandling() {
             float[] withInf = {1.0f, Float.POSITIVE_INFINITY, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
             float[] normal = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
 
-            float l2 = L2Distance.getInstance().compute(withInf, normal);
-            float inner = InnerProduct.getInstance().compute(withInf, normal);
-
-            // L2 distance should be infinite or NaN
-            assertThat(Float.isInfinite(l2) || Float.isNaN(l2)).isTrue();
-            // Inner product should be infinite or NaN
-            assertThat(Float.isInfinite(inner) || Float.isNaN(inner)).isTrue();
+            // All distance functions should throw IllegalArgumentException for infinity input
+            assertThatThrownBy(() -> L2Distance.getInstance().compute(withInf, normal))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
+            assertThatThrownBy(() -> InnerProduct.getInstance().compute(withInf, normal))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
         }
 
         @Test

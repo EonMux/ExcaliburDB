@@ -2,6 +2,7 @@ package excalibur.filter;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.RepeatedTest;
 
@@ -315,6 +316,7 @@ class CuckooFilterTest {
      * <p>This test validates the core specification requirement for the Cuckoo Filter.</p>
      */
     @Test
+    @Tag("slow")
     @DisplayName("FP rate measurement at load factor 0.95 - MUST be ≤ 0.1%")
     void testFPRateAtLoadFactor095() {
         // Create filter with default 13-bit fingerprints (achieves ≤0.1% FP at 95% load)

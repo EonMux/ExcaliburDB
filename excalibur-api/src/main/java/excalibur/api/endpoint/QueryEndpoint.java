@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpHandler;
 import excalibur.query.*;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.pipeline.QueryPipeline;
+import io.excalibur.config.Config;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,10 +42,12 @@ import java.util.concurrent.*;
  *     {"document_id": 123, "score": 0.95, "payload": "..."}
  *   ],
  *   "coverage": {
- *     "total_segments": 100,
- *     "active_segments": 95,
- *     "estimated_corpus_coverage": 0.95,
- *     "tail_scan_entries": 1000,
+ *     "total_segments": 1024,
+ *     "active_segments": 980,
+ *     "indexing_segments": 40,
+ *     "warming_segments": 4,
+ *     "estimated_corpus_coverage": 0.96,
+ *     "tail_scan_entries": 12500,
  *     "degraded": false
  *   },
  *   "timed_out": false,
@@ -80,6 +83,7 @@ public class QueryEndpoint implements HttpHandler {
 
     private final QueryPipeline queryPipeline;
     private final ExecutorService executorService;
+    private final Config config;
 
     /**
      * Creates a new QueryEndpoint.
@@ -87,8 +91,17 @@ public class QueryEndpoint implements HttpHandler {
      * @param queryPipeline The query pipeline for executing queries
      */
     public QueryEndpoint(QueryPipeline queryPipeline) {
-        this.queryPipeline = Objects.requireNonNull(queryPipeline, "QueryPipeline cannot be null");
-        this.executorService = Executors.newVirtualThreadPerTaskExecutor();
+        this(queryPipeline, null, null);
+    }
+
+    /**
+     * Creates a new QueryEndpoint with configuration.
+     *
+     * @param queryPipeline The query pipeline for executing queries
+     * @param config The configuration for default values (may be null)
+     */
+    public QueryEndpoint(QueryPipeline queryPipeline, Config config) {
+        this(queryPipeline, config, null);
     }
 
     /**
@@ -98,8 +111,20 @@ public class QueryEndpoint implements HttpHandler {
      * @param executorService The executor service for async operations
      */
     public QueryEndpoint(QueryPipeline queryPipeline, ExecutorService executorService) {
+        this(queryPipeline, null, executorService);
+    }
+
+    /**
+     * Creates a new QueryEndpoint with all options.
+     *
+     * @param queryPipeline The query pipeline for executing queries
+     * @param config The configuration for default values (may be null)
+     * @param executorService The executor service for async operations (may be null)
+     */
+    public QueryEndpoint(QueryPipeline queryPipeline, Config config, ExecutorService executorService) {
         this.queryPipeline = Objects.requireNonNull(queryPipeline, "QueryPipeline cannot be null");
-        this.executorService = Objects.requireNonNull(executorService, "ExecutorService cannot be null");
+        this.config = config;
+        this.executorService = executorService != null ? executorService : Executors.newVirtualThreadPerTaskExecutor();
     }
 
     @Override
@@ -187,7 +212,13 @@ public class QueryEndpoint implements HttpHandler {
         int topK = extractInt(json, "top_k", 10);
         float threshold = extractFloat(json, "threshold", 0.0f);
         long timeoutMs = extractLong(json, "timeout_ms", DEFAULT_TIMEOUT_MS);
-        boolean includePartial = extractBoolean(json, "include_partial_segments", true);
+
+        // Use config default for include_partial_segments if config is provided
+        boolean defaultIncludePartial = config != null
+            ? config.query().isIncludePartialSegments()
+            : true;
+        boolean includePartial = extractBoolean(json, "include_partial_segments", defaultIncludePartial);
+
         boolean enableLlmScoring = extractBoolean(json, "enable_llm_scoring", true);
         float llmThreshold = extractFloat(json, "llm_threshold", 0.3f);
 
@@ -264,6 +295,10 @@ public class QueryEndpoint implements HttpHandler {
             "\"total_segments\": %d, ", coverage.totalSegments()));
         sb.append(String.format(
             "\"active_segments\": %d, ", coverage.activeSegments()));
+        sb.append(String.format(
+            "\"indexing_segments\": %d, ", coverage.indexingSegments()));
+        sb.append(String.format(
+            "\"warming_segments\": %d, ", coverage.warmingSegments()));
         sb.append(String.format(
             "\"estimated_corpus_coverage\": %.4f, ", coverage.estimatedCorpusCoverage()));
         sb.append(String.format(

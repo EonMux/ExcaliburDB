@@ -23,6 +23,7 @@ dependencies {
     implementation(project(":excalibur-llm"))
     implementation(project(":excalibur-ingest"))
     implementation(project(":excalibur-metrics"))
+    implementation(project(":excalibur-config"))
 }
 
 tasks.withType<JavaCompile> {

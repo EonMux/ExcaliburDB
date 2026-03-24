@@ -2,6 +2,7 @@ package excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import excalibur.ingest.pipeline.IngestionOrchestrator;
 import excalibur.ingest.source.FilesystemSource;
 import excalibur.ingest.source.HttpSource;
 import excalibur.ingest.source.Source;
@@ -75,6 +76,83 @@ public class IngestEndpoint implements HttpHandler {
      */
     public IngestEndpoint(SourceRegistry sourceRegistry) {
         this.sourceRegistry = Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+    }
+
+    /**
+     * Creates a new IngestEndpoint with a source registry and status registry.
+     *
+     * <p>When both registries are provided, sources registered will automatically
+     * have their status tracked in the status registry.</p>
+     *
+     * @param sourceRegistry The registry for managing sources
+     * @param statusRegistry The registry for tracking ingestion status (may be null)
+     */
+    public IngestEndpoint(SourceRegistry sourceRegistry, IngestStatusEndpoint.IngestionStatusRegistry statusRegistry) {
+        Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+
+        // If it's an InMemorySourceRegistry and we have a status registry, configure it
+        if (sourceRegistry instanceof InMemorySourceRegistry && statusRegistry != null) {
+            ((InMemorySourceRegistry) sourceRegistry).setStatusRegistry(statusRegistry);
+        }
+
+        this.sourceRegistry = sourceRegistry;
+    }
+
+    /**
+     * Creates a new IngestEndpoint with a source registry and ingestion orchestrator.
+     *
+     * <p>When an orchestrator is provided, the InMemorySourceRegistry will trigger
+     * background ingestion when a source is registered. For custom SourceRegistry
+     * implementations, use the single-argument constructor.</p>
+     *
+     * @param sourceRegistry The registry for managing sources
+     * @param orchestrator The ingestion orchestrator for background processing (may be null)
+     */
+    public IngestEndpoint(SourceRegistry sourceRegistry, IngestionOrchestrator orchestrator) {
+        Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+
+        // If it's an InMemorySourceRegistry and we have an orchestrator, configure it
+        if (sourceRegistry instanceof InMemorySourceRegistry && orchestrator != null) {
+            ((InMemorySourceRegistry) sourceRegistry).setIngestionOrchestrator(orchestrator);
+        }
+
+        this.sourceRegistry = sourceRegistry;
+    }
+
+    /**
+     * Creates a new IngestEndpoint with a source registry, status registry, and ingestion orchestrator.
+     *
+     * <p>This is the recommended constructor for production use. It configures both
+     * status tracking and background ingestion.</p>
+     *
+     * <p>When both status registry and orchestrator are provided:</p>
+     * <ul>
+     *   <li>Status entries are created immediately when sources are registered</li>
+     *   <li>Background ingestion updates status progress automatically</li>
+     *   <li>The /v1/ingest/status endpoint returns meaningful data</li>
+     * </ul>
+     *
+     * @param sourceRegistry The registry for managing sources
+     * @param statusRegistry The registry for tracking ingestion status (may be null)
+     * @param orchestrator The ingestion orchestrator for background processing (may be null)
+     */
+    public IngestEndpoint(SourceRegistry sourceRegistry,
+                          IngestStatusEndpoint.IngestionStatusRegistry statusRegistry,
+                          IngestionOrchestrator orchestrator) {
+        Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+
+        // Configure InMemorySourceRegistry with both status and orchestrator
+        if (sourceRegistry instanceof InMemorySourceRegistry) {
+            InMemorySourceRegistry inMemRegistry = (InMemorySourceRegistry) sourceRegistry;
+            if (statusRegistry != null) {
+                inMemRegistry.setStatusRegistry(statusRegistry);
+            }
+            if (orchestrator != null) {
+                inMemRegistry.setIngestionOrchestrator(orchestrator);
+            }
+        }
+
+        this.sourceRegistry = sourceRegistry;
     }
 
     /**
@@ -441,14 +519,68 @@ public class IngestEndpoint implements HttpHandler {
 
     /**
      * In-memory implementation of SourceRegistry.
+     *
+     * <p>When an IngestionOrchestrator is configured via
+     * {@link #setIngestionOrchestrator(IngestionOrchestrator)}, this registry
+     * triggers background ingestion when a source is registered.</p>
+     *
+     * <p>When an IngestionStatusRegistry is configured via
+     * {@link #setStatusRegistry(IngestStatusEndpoint.IngestionStatusRegistry)},
+     * status entries are automatically created when sources are registered.</p>
      */
     public static class InMemorySourceRegistry implements SourceRegistry {
         private final ConcurrentHashMap<String, Source> sources = new ConcurrentHashMap<>();
+        private volatile IngestionOrchestrator ingestionOrchestrator;
+        private volatile IngestStatusEndpoint.IngestionStatusRegistry statusRegistry;
+
+        /**
+         * Sets the ingestion orchestrator for background processing.
+         *
+         * @param orchestrator The orchestrator (may be null to disable)
+         */
+        public void setIngestionOrchestrator(IngestionOrchestrator orchestrator) {
+            this.ingestionOrchestrator = orchestrator;
+        }
+
+        /**
+         * Sets the status registry for tracking ingestion status.
+         *
+         * <p>When set, this registry will create initial status entries
+         * for registered sources with state "idle" and progress 0.0.</p>
+         *
+         * @param statusRegistry The status registry (may be null to disable)
+         */
+        public void setStatusRegistry(IngestStatusEndpoint.IngestionStatusRegistry statusRegistry) {
+            this.statusRegistry = statusRegistry;
+        }
 
         @Override
         public void register(Source source) {
             Objects.requireNonNull(source, "Source cannot be null");
-            sources.put(source.getSourceId(), source);
+            String sourceId = source.getSourceId();
+            sources.put(sourceId, source);
+
+            // Create initial status entry if status registry is configured
+            // This ensures /v1/ingest/status returns data even without orchestrator
+            if (statusRegistry != null) {
+                IngestStatusEndpoint.IngestionStatus status = statusRegistry.getOrCreate(sourceId);
+                // Initialize with idle state, will be updated by orchestrator if present
+                status.update("idle", 0.0, 0, 0);
+                LOGGER.debug("Created initial status entry for source: {}", sourceId);
+            }
+
+            // Trigger background ingestion
+            if (ingestionOrchestrator != null) {
+                // Full ingestion pipeline with orchestrator
+                ingestionOrchestrator.startIngestion(source);
+            } else if (statusRegistry != null) {
+                // Stub mode: use IngestionWorker for status updates without full pipeline
+                IngestionWorker worker = new IngestionWorker(source, statusRegistry);
+                Thread.ofVirtual()
+                    .name("ingestion-worker-" + sourceId)
+                    .start(worker);
+                LOGGER.debug("Started stub ingestion worker for source: {}", sourceId);
+            }
         }
 
         @Override

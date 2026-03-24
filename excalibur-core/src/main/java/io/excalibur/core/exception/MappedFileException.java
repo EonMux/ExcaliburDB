@@ -7,7 +7,7 @@ package io.excalibur.core.exception;
  * <p>This class is immutable and thread-safe. Once constructed, the exception's
  * state (message and cause) cannot be modified.</p>
  */
-public class MappedFileException extends RuntimeException {
+public class MappedFileException extends ExcaliburException {
     
     public MappedFileException(String message) {
         super(message);

@@ -20,8 +20,9 @@ import java.util.Objects;
  * and merges the results while preserving the original candidate order.</p>
  *
  * <h2>Token Estimation</h2>
- * <p>Tokens are estimated using the approximation: {@code characterCount / 4.0}.
- * This is a rough estimate that works well for most text.</p>
+ * <p>Tokens are estimated using {@link TokenEstimator} which provides the
+ * approximation: {@code characterCount / 4.0}. This is a rough estimate that
+ * works well for most text.</p>
  *
  * <h2>Order Preservation (CRITICAL)</h2>
  * <p>When candidates are split into multiple batches, each batch is scored
@@ -46,13 +47,6 @@ import java.util.Objects;
 public class BatchHandler {
 
     private static final Logger LOG = LoggerFactory.getLogger(BatchHandler.class);
-
-    /**
-     * Token estimation divisor: characters per token approximation.
-     * Domain correctness: this is a standard approximation for tokenization.
-     * Most tokenizers produce roughly 1 token per 4 characters on average.
-     */
-    private static final double CHARS_PER_TOKEN = 4.0;
 
     /**
      * Fixed token overhead for the prompt template (system message, instructions, etc.).
@@ -127,7 +121,7 @@ public class BatchHandler {
         // If within limit, use single API call
         if (estimatedTokens <= maxBatchTokens) {
             LOG.debug("Single batch sufficient (correlationId={})", correlationId);
-            return httpClient.scoreRelevancy(query, candidates, correlationId);
+            return httpClient.scoreRelevancyUnbatched(query, candidates, correlationId);
         }
 
         // Split into batches and score each
@@ -150,7 +144,7 @@ public class BatchHandler {
                     batchCorrelationId);
 
             // Score this batch
-            List<RelevancyScore> batchScores = httpClient.scoreRelevancy(
+            List<RelevancyScore> batchScores = httpClient.scoreRelevancyUnbatched(
                     query, batch.candidates, batchCorrelationId);
 
             // Remap indices to original positions and add to results
@@ -201,7 +195,7 @@ public class BatchHandler {
         int estimatedTokens = estimateTokens(query, candidates);
 
         if (estimatedTokens <= maxBatchTokens) {
-            return httpClient.scoreRelevancyWithCircuitBreaker(query, candidates, correlationId);
+            return httpClient.scoreRelevancyUnbatchedWithCircuitBreaker(query, candidates, correlationId);
         }
 
         List<Batch> batches = splitIntoBatches(query, candidates, maxBatchTokens);
@@ -211,7 +205,7 @@ public class BatchHandler {
             Batch batch = batches.get(batchIndex);
             String batchCorrelationId = formatBatchCorrelationId(correlationId, batchIndex, batches.size());
 
-            List<RelevancyScore> batchScores = httpClient.scoreRelevancyWithCircuitBreaker(
+            List<RelevancyScore> batchScores = httpClient.scoreRelevancyUnbatchedWithCircuitBreaker(
                     query, batch.candidates, batchCorrelationId);
 
             // Remap indices to original positions and add to results
@@ -247,32 +241,18 @@ public class BatchHandler {
 
         // Add tokens for the query
         if (query != null) {
-            totalTokens += estimateTokensForText(query);
+            totalTokens += TokenEstimator.estimateTokens(query);
         }
 
         // Add tokens for each candidate (text + line overhead)
         for (String candidate : candidates) {
             if (candidate != null) {
-                totalTokens += estimateTokensForText(candidate);
+                totalTokens += TokenEstimator.estimateTokens(candidate);
             }
             totalTokens += CANDIDATE_LINE_OVERHEAD;
         }
 
         return totalTokens;
-    }
-
-    /**
-     * Estimates tokens for a single text string.
-     *
-     * @param text The text to estimate
-     * @return Estimated token count
-     */
-    private int estimateTokensForText(String text) {
-        if (text == null || text.isEmpty()) {
-            return 0;
-        }
-        // Domain correctness: character count / 4.0 approximation
-        return (int) Math.ceil(text.length() / CHARS_PER_TOKEN);
     }
 
     // ==================== Batch Splitting ====================
@@ -292,7 +272,7 @@ public class BatchHandler {
         List<Batch> batches = new ArrayList<>();
 
         // Calculate tokens used by query and overhead
-        int queryTokens = estimateTokensForText(query);
+        int queryTokens = TokenEstimator.estimateTokens(query);
         int availableForCandidates = maxTokens - PROMPT_OVERHEAD_TOKENS - queryTokens;
 
         // Ensure we have at least some space for candidates
@@ -309,7 +289,7 @@ public class BatchHandler {
 
         for (int i = 0; i < candidates.size(); i++) {
             String candidate = candidates.get(i);
-            int candidateTokens = estimateTokensForText(candidate) + CANDIDATE_LINE_OVERHEAD;
+            int candidateTokens = TokenEstimator.estimateTokens(candidate) + CANDIDATE_LINE_OVERHEAD;
 
             // Check if adding this candidate would exceed the limit
             if (!currentBatch.isEmpty() && currentBatchTokens + candidateTokens > availableForCandidates) {

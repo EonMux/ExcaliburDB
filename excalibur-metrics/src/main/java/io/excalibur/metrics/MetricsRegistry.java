@@ -129,7 +129,7 @@ public final class MetricsRegistry {
      * @return Current epoch, or current time-based epoch if MBean not available
      */
     public long getEpochFromMBean() {
-        MBeanServerProvider mbean = getMBean("io.excalibur:visibility:epoch");
+        MBeanServerProvider mbean = getMBean("io.excalibur:type=VisibilityEpoch");
         if (mbean != null) {
             try {
                 Object value = mbean.getAttribute("epoch");
@@ -149,7 +149,7 @@ public final class MetricsRegistry {
      * @return Coverage, or estimated coverage if MBean not available
      */
     public double getCoverageFromMBean() {
-        MBeanServerProvider mbean = getMBean("io.excalibur:system:health");
+        MBeanServerProvider mbean = getMBean("io.excalibur:type=SystemHealth");
         if (mbean != null) {
             try {
                 Object value = mbean.getAttribute("health");
@@ -162,7 +162,7 @@ public final class MetricsRegistry {
         }
         return estimatedCoverage.get();
     }
-    
+
     /**
      * Gets query latency percentile from MBean if available.
      *
@@ -170,7 +170,7 @@ public final class MetricsRegistry {
      * @return Latency in ms, or histogram value if MBean not available
      */
     public long getLatencyPercentile(int percentile) {
-        MBeanServerProvider mbean = getMBean("io.excalibur:query:latency");
+        MBeanServerProvider mbean = getMBean("io.excalibur:type=QueryLatency");
         if (mbean != null) {
             try {
                 Object value = mbean.getAttribute(String.valueOf(percentile));
@@ -183,14 +183,14 @@ public final class MetricsRegistry {
         }
         return queryLatency.get().getPercentile(percentile);
     }
-    
+
     /**
      * Gets query latency count from MBean if available.
      *
      * @return Entry count, or histogram count if MBean not available
      */
     public long getLatencyCount() {
-        MBeanServerProvider mbean = getMBean("io.excalibur:query:latency");
+        MBeanServerProvider mbean = getMBean("io.excalibur:type=QueryLatency");
         if (mbean != null) {
             try {
                 Object value = mbean.getAttribute("count");
@@ -203,14 +203,14 @@ public final class MetricsRegistry {
         }
         return queryLatency.get().getTotalCount();
     }
-    
+
     /**
      * Gets queue depth from MBean if available.
      *
      * @return Queue depth, or metrics value if MBean not available
      */
     public long getQueueDepthFromMBean() {
-        MBeanServerProvider mbean = getMBean("io.excalibur:ingest:queue");
+        MBeanServerProvider mbean = getMBean("io.excalibur:type=IngestionQueue");
         if (mbean != null) {
             try {
                 Object value = mbean.getAttribute("depth");
@@ -230,7 +230,7 @@ public final class MetricsRegistry {
      * @return Health score, or metrics value if MBean not available
      */
     public double getHealthScoreFromMBean() {
-        MBeanServerProvider mbean = getMBean("io.excalibur:system:health");
+        MBeanServerProvider mbean = getMBean("io.excalibur:type=SystemHealth");
         if (mbean != null) {
             try {
                 Object value = mbean.getAttribute("health");
@@ -243,7 +243,7 @@ public final class MetricsRegistry {
         }
         return Metrics.getHealthScore();
     }
-    
+
     /**
      * Gets all available attributes from all MBeans.
      *

@@ -336,7 +336,7 @@ class VectorApiFallbackTest {
     class CrossFunctionConsistency {
 
         @Test
-        @DisplayName("all functions handle empty vectors")
+        @DisplayName("all functions reject empty vectors")
         void allFunctionsHandleEmptyVectors() {
             float[] empty1 = {};
             float[] empty2 = {};
@@ -345,9 +345,15 @@ class VectorApiFallbackTest {
             L2Distance l2 = L2Distance.getInstance();
             InnerProduct inner = InnerProduct.getInstance();
 
-            assertThat(cosine.compute(empty1, empty2)).isEqualTo(0.0f);
-            assertThat(l2.compute(empty1, empty2)).isEqualTo(0.0f);
-            assertThat(inner.compute(empty1, empty2)).isEqualTo(0.0f);
+            assertThatThrownBy(() -> cosine.compute(empty1, empty2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cannot be empty");
+            assertThatThrownBy(() -> l2.compute(empty1, empty2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cannot be empty");
+            assertThatThrownBy(() -> inner.compute(empty1, empty2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cannot be empty");
         }
 
         @Test

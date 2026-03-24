@@ -17,7 +17,7 @@ import java.util.function.Supplier;
  * 
  * Use this builder to construct expected result items with minimal boilerplate:
  * <pre>
- *   QueryResultItem item = QueryResultItem.builder()
+ *   QueryResultItem item = QueryResultItemBuilder.builder()
  *       .documentId("doc-1")
  *       .score(0.95f)
  *       .metadata(Map.of("title", "Result 1", "author", "Author A"))

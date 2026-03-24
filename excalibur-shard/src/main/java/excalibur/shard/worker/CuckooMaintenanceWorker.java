@@ -2,13 +2,18 @@ package excalibur.shard.worker;
 
 
 import excalibur.filter.CuckooFilter;
+import excalibur.filter.HierarchicalCuckooFilter;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
+import io.excalibur.store.StorageEngine;
+import io.excalibur.store.format.SegmentEntry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -100,12 +105,24 @@ public class CuckooMaintenanceWorker {
      */
     public static final double DEFAULT_FP_RATE_THRESHOLD = 0.001; // 0.1%
 
+    /**
+     * Default batch size for hierarchy propagation.
+     */
+    private static final int DEFAULT_HIERARCHY_BATCH_SIZE = 100;
+
     // ==================== Instance Fields ====================
 
     private final SegmentCatalog catalog;
+    private final StorageEngine storageEngine;
     private final MaintenanceListener listener;
     private final CopyOnWriteArrayList<FilterEntry> pendingDeletions;
     private final CopyOnWriteArrayList<SegmentFilter> segmentFilters;
+
+    /**
+     * Hierarchical Cuckoo filter for corpus → cluster → segment deletion propagation.
+     * May be null if hierarchy is not configured.
+     */
+    private volatile HierarchicalCuckooFilter hierarchicalFilter;
 
     private final AtomicBoolean running;
     private final AtomicBoolean stopped;
@@ -126,12 +143,14 @@ public class CuckooMaintenanceWorker {
     /**
      * Creates a new CuckooMaintenanceWorker with default configuration.
      *
-     * @param catalog   The segment catalog for metadata access
-     * @param listener  Callback for maintenance events
-     * @throws NullPointerException if catalog or listener is null
+     * @param catalog       The segment catalog for metadata access
+     * @param storageEngine The storage engine for segment access
+     * @param listener      Callback for maintenance events
+     * @throws NullPointerException if catalog, storageEngine, or listener is null
      */
-    public CuckooMaintenanceWorker(SegmentCatalog catalog, MaintenanceListener listener) {
-        this(catalog, listener, DEFAULT_MAINTENANCE_INTERVAL_MS,
+    public CuckooMaintenanceWorker(SegmentCatalog catalog, StorageEngine storageEngine,
+                                     MaintenanceListener listener) {
+        this(catalog, storageEngine, listener, DEFAULT_MAINTENANCE_INTERVAL_MS,
              DEFAULT_MAX_DELETIONS_PER_CYCLE, DEFAULT_FP_RATE_THRESHOLD);
     }
 
@@ -139,18 +158,23 @@ public class CuckooMaintenanceWorker {
      * Creates a new CuckooMaintenanceWorker with custom configuration.
      *
      * @param catalog                  The segment catalog for metadata access
+     * @param storageEngine            The storage engine for segment access
      * @param listener                 Callback for maintenance events
      * @param maintenanceIntervalMs    Interval between maintenance cycles (ms)
      * @param maxDeletionsPerCycle     Maximum deletions per maintenance cycle
      * @param fpRateThreshold          False positive rate threshold for warnings
-     * @throws NullPointerException     if catalog or listener is null
+     * @throws NullPointerException     if catalog, storageEngine, or listener is null
      * @throws IllegalArgumentException if configuration values are invalid
      */
-    public CuckooMaintenanceWorker(SegmentCatalog catalog, MaintenanceListener listener,
+    public CuckooMaintenanceWorker(SegmentCatalog catalog, StorageEngine storageEngine,
+                                     MaintenanceListener listener,
                                      long maintenanceIntervalMs, int maxDeletionsPerCycle,
                                      double fpRateThreshold) {
         if (catalog == null) {
             throw new NullPointerException("Catalog cannot be null");
+        }
+        if (storageEngine == null) {
+            throw new NullPointerException("StorageEngine cannot be null");
         }
         if (listener == null) {
             throw new NullPointerException("Listener cannot be null");
@@ -161,6 +185,7 @@ public class CuckooMaintenanceWorker {
         validateFpRateThreshold(fpRateThreshold);
 
         this.catalog = catalog;
+        this.storageEngine = storageEngine;
         this.listener = listener;
         this.pendingDeletions = new CopyOnWriteArrayList<>();
         this.segmentFilters = new CopyOnWriteArrayList<>();
@@ -181,6 +206,30 @@ public class CuckooMaintenanceWorker {
 
         LOGGER.info("CuckooMaintenanceWorker created with interval={}ms, maxDeletions={}, fpThreshold={}",
             maintenanceIntervalMs, maxDeletionsPerCycle, fpRateThreshold);
+    }
+
+    /**
+     * Sets the hierarchical Cuckoo filter for deletion propagation.
+     *
+     * <p>When set, deletions will be propagated through the hierarchy:
+     * segment → cluster → corpus. This ensures no stale false positives
+     * from tombstoned entries.</p>
+     *
+     * @param filter The hierarchical Cuckoo filter (may be null)
+     */
+    public void setHierarchicalFilter(HierarchicalCuckooFilter filter) {
+        this.hierarchicalFilter = filter;
+        LOGGER.info("Hierarchical Cuckoo filter {} for CuckooMaintenanceWorker",
+            filter != null ? "configured" : "cleared");
+    }
+
+    /**
+     * Returns the hierarchical Cuckoo filter, if configured.
+     *
+     * @return The hierarchical filter, or null if not configured
+     */
+    public HierarchicalCuckooFilter getHierarchicalFilter() {
+        return hierarchicalFilter;
     }
 
     // ==================== Configuration Validation ====================
@@ -413,31 +462,67 @@ public class CuckooMaintenanceWorker {
     /**
      * Processes tombstoned segments and deletes their filter entries.
      *
+     * <p>This method iterates through all tombstoned segments, collects their keys,
+     * and deletes them from the Cuckoo filter hierarchy. This ensures no stale
+     * false positives from tombstoned entries.</p>
+     *
      * @return Number of deletions performed
      */
     private int processTombstonedSegments() {
-        int deletions = 0;
+        int totalDeletions = 0;
 
         List<Long> tombstoned = catalog.getSegmentsByState(LifecycleState.TOMBSTONED);
         for (Long segmentId : tombstoned) {
             // Find the filter for this segment
             SegmentFilter segmentFilter = findSegmentFilter(segmentId);
-            if (segmentFilter == null) {
-                continue;
+
+            int segmentDeletions = 0;
+
+            // Get the actual Segment to iterate entries
+            Segment segment = storageEngine.getSegment(segmentId);
+            if (segment != null) {
+                try (Segment.EntryIterator iter = segment.liveEntries()) {
+                    List<byte[]> keysToDelete = new ArrayList<>();
+                    while (iter.hasNext()) {
+                        SegmentEntry entry = iter.next();
+                        keysToDelete.add(entry.key());
+                    }
+
+                    if (!keysToDelete.isEmpty()) {
+                        // Delete from hierarchical filter if available
+                        if (hierarchicalFilter != null) {
+                            segmentDeletions = hierarchicalFilter.deleteFromHierarchy(
+                                keysToDelete, String.valueOf(segmentId));
+                            LOGGER.debug("Deleted {} entries from hierarchical filter for segment {}",
+                                segmentDeletions, segmentId);
+                        } else if (segmentFilter != null) {
+                            // Fallback: delete from segment filter only
+                            for (byte[] key : keysToDelete) {
+                                if (segmentFilter.filter.delete(key)) {
+                                    segmentDeletions++;
+                                }
+                            }
+                            LOGGER.debug("Deleted {} entries from segment filter for segment {}",
+                                segmentDeletions, segmentId);
+                        }
+                    }
+                } catch (Exception e) {
+                    LOGGER.warn("Error iterating segment {} for filter cleanup: {}",
+                        segmentId, e.getMessage());
+                }
             }
 
-            // Delete all entries in the filter
-            // Note: In a real implementation, we would iterate through all keys
-            // in the segment and delete them. For now, we just unregister the filter.
+            // Unregister the filter after cleanup
             unregisterFilter(segmentId);
             tombstonedSegmentsProcessed.incrementAndGet();
-            deletions++;
+            totalDeletions += segmentDeletions;
 
-            LOGGER.info("Processed tombstoned segment {} - filter cleaned", segmentId);
+            LOGGER.info("Processed tombstoned segment {} - {} entries deleted from filter",
+                segmentId, segmentDeletions);
             listener.onSegmentFilterCleaned(segmentId);
         }
 
-        return deletions;
+        return totalDeletions;
     }
 
     /**
@@ -486,20 +571,43 @@ public class CuckooMaintenanceWorker {
     /**
      * Propagates deletions up the filter hierarchy.
      *
-     * <p>In a hierarchical Cuckoo filter (corpus → topic cluster → segment), this method
-     * would propagate deletions from segment-level filters up to topic cluster
-     * and corpus-level filters.</p>
+     * <p>This method processes pending deletions through the hierarchical Cuckoo filter,
+     * propagating from segment level to cluster level to corpus level.</p>
      *
-     * <p>Note: This is a placeholder for future hierarchical filter implementation.</p>
+     * <p>If no hierarchical filter is configured, this method does nothing.</p>
      */
     private void propagateDeletionsUpHierarchy() {
-        // Placeholder for hierarchical filter propagation
-        // When hierarchical filters are implemented, this method would:
-        // 1. Track deleted keys at segment level
-        // 2. Delete corresponding entries in parent filters
-        // 3. Handle the case where a key exists in multiple segments
+        if (hierarchicalFilter == null) {
+            // No hierarchy configured, nothing to propagate
+            return;
+        }
 
-        LOGGER.trace("Hierarchical filter propagation - no-op (hierarchy not yet implemented)");
+        if (pendingDeletions.isEmpty()) {
+            return;
+        }
+
+        // Process pending deletions through hierarchy
+        int remaining = pendingDeletions.size();
+        int batchSize = Math.min(DEFAULT_HIERARCHY_BATCH_SIZE, remaining);
+        int processed = 0;
+
+        for (int i = 0; i < batchSize && !pendingDeletions.isEmpty(); i++) {
+            FilterEntry entry = pendingDeletions.remove(0);
+            if (entry == null || entry.key == null) {
+                continue;
+            }
+
+            boolean deleted = hierarchicalFilter.deleteFromHierarchy(
+                entry.key, String.valueOf(entry.segmentId));
+            if (deleted) {
+                processed++;
+            }
+        }
+
+        if (processed > 0) {
+            LOGGER.debug("Propagated {} deletions through hierarchy, {} pending",
+                processed, pendingDeletions.size());
+        }
     }
 
     /**

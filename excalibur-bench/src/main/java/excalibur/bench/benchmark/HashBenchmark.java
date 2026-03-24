@@ -95,6 +95,37 @@ public class HashBenchmark {
         }
     }
 
+    // ==================== Safe Index Helpers ====================
+
+    /**
+     * Safely computes a non-negative array index from the sequential counter.
+     * Prevents ArrayIndexOutOfBoundsException when sequentialIndex overflows.
+     *
+     * <p>When sequentialIndex overflows to a negative value (after ~2.1 billion
+     * iterations), the expression {@code sequentialIndex++ % keyCount} would
+     * produce negative results due to Java's sign-preserving modulo operator.
+     * This method masks the sign bit to ensure non-negative indices.</p>
+     *
+     * @return a non-negative index in the range [0, keyCount)
+     */
+    private int nextIndex() {
+        return (sequentialIndex++ & 0x7FFFFFFF) % keyCount;
+    }
+
+    /**
+     * Safely computes a non-negative start index for batch operations.
+     *
+     * <p>Batch operations multiply sequentialIndex by the batch size, which
+     * accelerates overflow. This method uses long arithmetic with sign-bit
+     * masking to prevent negative array indices.</p>
+     *
+     * @param batchSize the number of elements in the batch
+     * @return a non-negative start index suitable for batch operations
+     */
+    private int nextBatchStartIndex(int batchSize) {
+        return (int) ((sequentialIndex++ * batchSize & 0x7FFFFFFFL) % (keyCount - batchSize));
+    }
+
     // ==================== Setup ====================
 
     @Setup(Level.Trial)
@@ -157,7 +188,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long hashByteArray(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         return XxHash64.hash(keys[idx]);
     }
 
@@ -167,7 +198,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long hashByteArrayWithSeed(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         return XxHash64.hash(keys[idx], 42L);
     }
 
@@ -177,7 +208,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long hashByteArraySlice(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         byte[] key = keys[idx];
         // Hash middle portion of key
         int offset = Math.min(4, key.length / 4);
@@ -191,7 +222,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long hashString(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         return XxHash64.hash(keyStrings[idx]);
     }
 
@@ -200,7 +231,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long hashStringWithSeed(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         return XxHash64.hash(keyStrings[idx], 12345L);
     }
 
@@ -210,7 +241,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long hashByteBuffer(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         ByteBuffer buffer = keyBuffers[idx].duplicate();
         return XxHash64.hash(buffer);
     }
@@ -242,7 +273,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long streamingHash(StreamingState state) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         return state.hasher.reset().update(keys[idx]).getValue();
     }
 
@@ -252,7 +283,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long streamingHashChunked(StreamingState state) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         byte[] key = keys[idx];
         int chunkSize = Math.max(8, key.length / 4);
 
@@ -272,7 +303,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public int batchHash10(Blackhole bh) {
-        int startIdx = (sequentialIndex++ * 10) % (keyCount - 10);
+        int startIdx = nextBatchStartIndex(10);
         int count = 0;
         for (int i = 0; i < 10; i++) {
             long hash = XxHash64.hash(keys[startIdx + i]);
@@ -288,7 +319,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public int batchHash100(Blackhole bh) {
-        int startIdx = (sequentialIndex++ * 100) % (keyCount - 100);
+        int startIdx = nextBatchStartIndex(100);
         int count = 0;
         for (int i = 0; i < 100; i++) {
             long hash = XxHash64.hash(keys[startIdx + i]);
@@ -303,7 +334,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public int batchHash1000(Blackhole bh) {
-        int startIdx = (sequentialIndex++ * 1000) % (keyCount - 1000);
+        int startIdx = nextBatchStartIndex(1000);
         int count = 0;
         for (int i = 0; i < 1000; i++) {
             long hash = XxHash64.hash(keys[startIdx + i]);
@@ -320,7 +351,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long hashRandomAccess(Blackhole bh) {
-        int idx = randomIndices[sequentialIndex++ % keyCount];
+        int idx = randomIndices[nextIndex()];
         return XxHash64.hash(keys[idx]);
     }
 
@@ -348,7 +379,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public long hashWithCollisionCheck(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         long hash = XxHash64.hash(keys[idx]);
 
         // Domain correctness: verify hash is positive
@@ -365,7 +396,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public int javaStringHashCode(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         return keyStrings[idx].hashCode();
     }
 
@@ -375,7 +406,7 @@ public class HashBenchmark {
      */
     @Benchmark
     public int javaArraysHashCode(Blackhole bh) {
-        int idx = sequentialIndex++ % keyCount;
+        int idx = nextIndex();
         return java.util.Arrays.hashCode(keys[idx]);
     }
 }

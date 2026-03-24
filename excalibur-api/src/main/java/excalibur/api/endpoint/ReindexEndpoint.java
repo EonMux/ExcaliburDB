@@ -2,6 +2,9 @@ package excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import excalibur.ingest.pipeline.DocumentReindexer;
+import excalibur.ingest.source.Source;
+import excalibur.ingest.source.SourceResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -11,6 +14,8 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * HTTP endpoint for the /v1/reindex API.
@@ -63,8 +68,44 @@ public class ReindexEndpoint implements HttpHandler {
     private final SourceRegistry sourceRegistry;
     private final ReindexStatusRegistry reindexStatusRegistry;
 
+    // Optional components for actual reindexing (may be null for stub behavior)
+    private final DocumentReindexer documentReindexer;
+    private final SourceResolver sourceResolver;
+    private final ExecutorService reindexExecutor;
+
     /**
-     * Creates a new ReindexEndpoint.
+     * Creates a new ReindexEndpoint with full reindexing capability.
+     *
+     * <p>When DocumentReindexer and SourceResolver are provided, reindex
+     * operations will execute in background virtual threads, invoking
+     * the actual reindexing pipeline.</p>
+     *
+     * @param sourceRegistry The registry for looking up sources
+     * @param reindexStatusRegistry The registry for tracking reindex status
+     * @param documentReindexer The document reindexer for executing reindex operations
+     * @param sourceResolver The source resolver for obtaining Source instances
+     * @throws NullPointerException if sourceRegistry or reindexStatusRegistry is null
+     */
+    public ReindexEndpoint(SourceRegistry sourceRegistry,
+                           ReindexStatusRegistry reindexStatusRegistry,
+                           DocumentReindexer documentReindexer,
+                           SourceResolver sourceResolver) {
+        this.sourceRegistry = Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+        this.reindexStatusRegistry = Objects.requireNonNull(reindexStatusRegistry, "ReindexStatusRegistry cannot be null");
+        this.documentReindexer = documentReindexer;
+        this.sourceResolver = sourceResolver;
+        this.reindexExecutor = Executors.newVirtualThreadPerTaskExecutor();
+
+        LOGGER.info("ReindexEndpoint configured with document reindexer: {}",
+            documentReindexer != null ? "enabled" : "disabled (stub mode)");
+    }
+
+    /**
+     * Creates a new ReindexEndpoint with source registry but without actual reindexing.
+     *
+     * <p>This constructor provides backward compatibility. Reindex requests will
+     * be accepted and tracked in the status registry, but no actual reindexing
+     * will occur.</p>
      *
      * @param sourceRegistry The registry for looking up sources
      * @param reindexStatusRegistry The registry for tracking reindex status
@@ -72,10 +113,16 @@ public class ReindexEndpoint implements HttpHandler {
     public ReindexEndpoint(SourceRegistry sourceRegistry, ReindexStatusRegistry reindexStatusRegistry) {
         this.sourceRegistry = Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
         this.reindexStatusRegistry = Objects.requireNonNull(reindexStatusRegistry, "ReindexStatusRegistry cannot be null");
+        this.documentReindexer = null;
+        this.sourceResolver = null;
+        this.reindexExecutor = null;
     }
 
     /**
-     * Creates a new ReindexEndpoint with default registries.
+     * Creates a new ReindexEndpoint with default registries (stub mode).
+     *
+     * <p>This constructor creates an endpoint without actual reindexing capability.
+     * Use for testing or when reindexing should be handled externally.</p>
      */
     public ReindexEndpoint() {
         this(new InMemorySourceRegistry(), new InMemoryReindexStatusRegistry());
@@ -114,6 +161,15 @@ public class ReindexEndpoint implements HttpHandler {
 
             // Start reindex (runs in background)
             reindexStatusRegistry.startReindex(request.sourceId);
+
+            // Launch async reindex task if reindexer is configured
+            if (documentReindexer != null && sourceResolver != null && reindexExecutor != null) {
+                final String sourceId = request.sourceId;
+                reindexExecutor.submit(() -> executeReindex(sourceId));
+                LOGGER.info("[{}] Async reindex task submitted for source: {}", correlationId, request.sourceId);
+            } else {
+                LOGGER.info("[{}] Reindex started (stub mode - no actual reindexing)", correlationId);
+            }
 
             // Send success response
             ReindexResponse response = new ReindexResponse(
@@ -233,6 +289,71 @@ public class ReindexEndpoint implements HttpHandler {
             .replace("\\n", "\n")
             .replace("\\r", "\r")
             .replace("\\t", "\t");
+    }
+
+    // ==================== Async Reindex Execution ====================
+
+    /**
+     * Executes the reindex operation in a background virtual thread.
+     *
+     * <p>This method is called asynchronously after the HTTP response has been
+     * sent. It performs the actual reindexing by:</p>
+     * <ol>
+     *   <li>Resolving the source using SourceResolver</li>
+     *   <li>Invoking DocumentReindexer.reindexAll(source)</li>
+     *   <li>Updating status registry as reindex progresses</li>
+     *   <li>Calling completeReindex() or failReindex() when done</li>
+     * </ol>
+     *
+     * @param sourceId The source ID to reindex
+     */
+    private void executeReindex(String sourceId) {
+        String threadName = Thread.currentThread().getName();
+        LOGGER.info("[reindex-{}] Starting reindex execution for source: {}", threadName, sourceId);
+
+        try {
+            // Resolve the source
+            Source source = sourceResolver.resolve(sourceId);
+            if (source == null) {
+                String error = "Source not found: " + sourceId;
+                LOGGER.error("[reindex-{}] {}", threadName, error);
+                reindexStatusRegistry.failReindex(sourceId, error);
+                return;
+            }
+
+            // Update status to indicate embedding phase
+            reindexStatusRegistry.updateProgress(sourceId, "crawling", 0.1, 0, 0);
+            LOGGER.debug("[reindex-{}] Source resolved, starting reindexAll for: {}", threadName, sourceId);
+
+            // Execute the reindex
+            reindexStatusRegistry.updateProgress(sourceId, "embedding", 0.3, 0, 0);
+            DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
+
+            // Update status to indicate indexing phase
+            reindexStatusRegistry.updateProgress(sourceId, "indexing", 0.7,
+                result.getDocumentsIndexed(), result.getDocumentsIndexed() + result.getChunksFailed());
+
+            if (result.hasErrors()) {
+                String error = String.format("Reindex completed with %d errors: %s",
+                    result.getErrorCount(),
+                    result.getErrors().stream()
+                        .map(DocumentReindexer.ReindexResult.OperationError::getMessage)
+                        .reduce((a, b) -> a + "; " + b)
+                        .orElse("unknown"));
+                LOGGER.warn("[reindex-{}] Reindex completed with errors for {}: {}",
+                    threadName, sourceId, error);
+                reindexStatusRegistry.failReindex(sourceId, error);
+            } else {
+                LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs indexed, {} chunks created",
+                    threadName, sourceId, result.getDocumentsIndexed(), result.getChunksCreated());
+                reindexStatusRegistry.completeReindex(sourceId);
+            }
+
+        } catch (Exception e) {
+            String error = "Reindex failed: " + e.getMessage();
+            LOGGER.error("[reindex-{}] {} for source: {}", threadName, error, sourceId, e);
+            reindexStatusRegistry.failReindex(sourceId, error);
+        }
     }
 
     // ==================== Inner Classes ====================

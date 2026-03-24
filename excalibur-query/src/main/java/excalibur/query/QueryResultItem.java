@@ -1,6 +1,5 @@
 package excalibur.query;
 
-import java.lang.foreign.MemorySegment;
 import java.util.Arrays;
 import java.util.Objects;
 

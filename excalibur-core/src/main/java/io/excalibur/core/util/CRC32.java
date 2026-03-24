@@ -55,50 +55,40 @@ public class CRC32 {
      *
      * @param data The input bytes
      * @param offset Starting offset
+     * @param length Number of bytes to process
      * @return The CRC32 checksum as a 32-bit unsigned integer
+     * @throws NullPointerException if data is null
+     * @throws IndexOutOfBoundsException if offset or length is invalid
      */
     public static long crc32(byte[] data, int offset, int length) {
-        return crc32(data, offset, length, 0);
+        if (data == null) {
+            throw new NullPointerException("Data cannot be null");
+        }
+        if (offset < 0 || length < 0 || offset + length > data.length) {
+            throw new IndexOutOfBoundsException("Invalid offset or length");
+        }
+
+        int crc = 0xFFFFFFFF;
+
+        for (int i = offset; i < offset + length; i++) {
+            int index = (crc ^ (data[i] & 0xFF)) & 0xFF;
+            crc = (crc >>> 8) ^ table[index];
+        }
+
+        return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFFL;
     }
 
     /**
-     * Internal implementation of CRC32.
-     */
-    private static long crc32(byte[] data, int offset, int length, int seed) {
-        int crc = seed ^ 0xFFFFFFFF;
-
-        // Process in 8-byte chunks for efficiency
-        int i = offset;
-        while (i + 7 < offset + length) {
-            int v = ((crc >> 24) & 0xFF) * 0x01010101;
-            v = table[(v ^ data[i]) & 0xFF] ^ table[(v >>> 8) & 0xFF] ^
-                  table[(v >>> 16) & 0xFF] ^ table[(v >>> 24) & 0xFF];
-            crc = (crc << 8) ^ v;
-            i += 8;
-        }
-
-        // Process remaining bytes
-        while (i < offset + length) {
-            crc = ((crc >> 24) & 0xFF) * 0x01010101 ^ table[(crc ^ data[i]) & 0xFF];
-            crc = (crc << 8) ^ ((crc >> 24) & 0xFF);
-            crc = (crc << 8) ^ ((crc >> 24) & 0xFF);
-            crc = (crc << 8) ^ ((crc >> 24) & 0xFF);
-            i++;
-        }
-
-        return crc ^ 0xFFFFFFFFL;
-    }
-
-    /**
-     * Convenience method to compute CRC32 of a MemorySegment.
+     * Computes the CRC32 checksum of a MemorySegment.
      *
      * @param segment The memory segment
      * @param offset  Starting offset
      * @param length  Number of bytes to hash
-     * @param seed    Initial seed
-     * @return The CRC32 checksum
+     * @return The CRC32 checksum as a 32-bit unsigned integer
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset or length is invalid
      */
-    public static long crc32(MemorySegment segment, long offset, int length, int seed) {
+    public static long crc32(MemorySegment segment, long offset, int length) {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
@@ -107,41 +97,22 @@ public class CRC32 {
                 "Invalid range: offset=" + offset + ", length=" + length + ", segment.byteSize()=" + segment.byteSize());
         }
 
-        // Extract bytes from MemorySegment
+        // Extract bytes from MemorySegment and compute CRC32
         byte[] bytes = segment.asSlice(offset, length).toArray(ValueLayout.JAVA_BYTE);
-        return crc32(bytes, 0, bytes.length, seed);
+        return crc32(bytes, 0, bytes.length);
     }
 
     /**
-     * Convenience method to compute CRC32 of a MemorySegment without seed.
+     * Computes the CRC32 checksum of an entire MemorySegment.
      *
      * @param segment The memory segment
-     * @return The CRC32 checksum
+     * @return The CRC32 checksum as a 32-bit unsigned integer
+     * @throws NullPointerException if segment is null
      */
     public static long crc32(MemorySegment segment) {
-        return crc32(segment, 0, (int) segment.byteSize(), 0);
-    }
-
-    /**
-     * Convenience method to compute CRC32 of a MemorySegment with offset and length.
-     *
-     * @param segment The memory segment
-     * @param offset  Starting offset
-     * @param length  Number of bytes to hash
-     * @return The CRC32 checksum
-     */
-    public static long crc32(MemorySegment segment, long offset, int length) {
-        return crc32(segment, offset, length, 0);
-    }
-
-    /**
-     * Convenience method to compute CRC32 of a MemorySegment with seed.
-     *
-     * @param segment The memory segment
-     * @param seed    Initial seed
-     * @return The CRC32 checksum
-     */
-    public static long crc32(MemorySegment segment, int seed) {
-        return crc32(segment, 0, (int) segment.byteSize(), seed);
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        return crc32(segment, 0, (int) segment.byteSize());
     }
 }

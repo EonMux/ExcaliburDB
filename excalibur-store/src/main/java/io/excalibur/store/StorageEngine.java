@@ -578,8 +578,16 @@ public class StorageEngine implements AutoCloseable {
             }
 
             Path segmentPath = dataDir.resolve("segment_" + segmentIndex + ".dat");
+            Path writeLogPath = dataDir.resolve("segment_" + segmentIndex + ".wal");
             try {
                 Segment segment = new Segment(segmentPath, 1024 * 1024, arena);
+
+                // Create and attach WriteLog for crash recovery
+                // Every mutation (put, delete) is first appended to the log
+                // before updating the hash map - log is the source of truth
+                WriteLog writeLog = new WriteLog(writeLogPath, arena);
+                segment.attachWriteLog(writeLog);
+
                 segments.put((long) segmentIndex, segment);
 
                 // Add to catalog with initial INDEXING state
@@ -918,8 +926,15 @@ public class StorageEngine implements AutoCloseable {
             }
 
             Path segmentPath = dataDir.resolve("segment_" + segmentIndex + ".dat");
+            Path writeLogPath = dataDir.resolve("segment_" + segmentIndex + ".wal");
             try {
                 Segment segment = new Segment(segmentPath, 1024 * 1024, arena);
+
+                // Create and attach WriteLog for crash recovery
+                // This ensures all mutations to this segment are crash-safe
+                WriteLog writeLog = new WriteLog(writeLogPath, arena);
+                segment.attachWriteLog(writeLog);
+
                 // Use segmentIndex as the key for consistent routing
                 segments.put((long) segmentIndex, segment);
 

@@ -3,8 +3,8 @@ package io.excalibur.store.log;
 import io.excalibur.core.checksum.CRC32Checksum;
 import io.excalibur.core.exception.ChecksumException;
 import io.excalibur.core.hash.XxHash64;
-import io.excalibur.core.logger.LogManager;
-import io.excalibur.core.logger.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -64,8 +64,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class WriteLog implements Closeable {
 
-    private static final LogManager logManager = LogManager.getInstance();
-    private static final Logger logger = logManager.getLogger(WriteLog.class);
+    private static final Logger logger = LoggerFactory.getLogger(WriteLog.class);
 
     /** Barrier entry type for ordering guarantees. */
     public static final byte TYPE_BARRIER = 3;

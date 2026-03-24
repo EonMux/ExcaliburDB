@@ -253,6 +253,17 @@ public class Segment implements AutoCloseable {
     private excalibur.filter.lsh.LshIndex lshIndex;
 
     /**
+     * Count-Min Sketch for term/token frequency estimation.
+     * Used by the query planner to estimate selectivity and optimize query execution.
+     * Populated during document ingestion by tracking term frequencies from text chunks.
+     *
+     * <p>The sketch enables approximate frequency queries in O(1) time with bounded error,
+     * allowing the query planner to make informed decisions about segment prioritization
+     * and filter ordering without exact counts.</p>
+     */
+    private excalibur.filter.sketch.CountMinSketch termFrequencySketch;
+
+    /**
      * Split state for copy-on-write splitting.
      * A segment can be in one of three states:
      * - NORMAL: No split in progress
@@ -2287,6 +2298,57 @@ public class Segment implements AutoCloseable {
      */
     public excalibur.filter.lsh.LshIndex getLshIndex() {
         return lshIndex;
+    }
+
+    /**
+     * Attaches a Count-Min Sketch for term frequency estimation.
+     *
+     * <p>The Count-Min Sketch is used by the query planner to estimate
+     * term selectivity, which helps optimize query execution by:</p>
+     * <ul>
+     *   <li>Prioritizing segments with high selectivity for search terms</li>
+     *   <li>Skipping segments with very low selectivity</li>
+     *   <li>Ordering filter application based on selectivity</li>
+     * </ul>
+     *
+     * @param sketch The Count-Min Sketch to attach (must not be null)
+     * @throws NullPointerException if sketch is null
+     * @throws IllegalStateException if segment is closed
+     */
+    public void attachTermFrequencySketch(excalibur.filter.sketch.CountMinSketch sketch) {
+        Objects.requireNonNull(sketch, "CountMinSketch cannot be null");
+        validateNotClosed();
+
+        lock.writeLock().lock();
+        try {
+            this.termFrequencySketch = sketch;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Returns the Count-Min Sketch for term frequency estimation.
+     *
+     * <p>The sketch contains approximate term frequencies from documents
+     * ingested into this segment. Used by the query planner for
+     * selectivity estimation.</p>
+     *
+     * @return The Count-Min Sketch, or null if none is attached
+     */
+    public excalibur.filter.sketch.CountMinSketch termFrequencySketch() {
+        return termFrequencySketch;
+    }
+
+    /**
+     * Returns the Count-Min Sketch for term frequency estimation.
+     *
+     * <p>This is an alias for {@link #termFrequencySketch()} for API consistency.</p>
+     *
+     * @return The Count-Min Sketch, or null if none is attached
+     */
+    public excalibur.filter.sketch.CountMinSketch getTermFrequencySketch() {
+        return termFrequencySketch;
     }
 
     /**

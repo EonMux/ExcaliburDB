@@ -1,6 +1,8 @@
 package excalibur.shard;
 
 import excalibur.filter.CuckooFilter;
+import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.shard.allocator.VolumeManager;
 import excalibur.shard.worker.CuckooMaintenanceWorker;
 import excalibur.shard.worker.HnswIntegrationWorker;
 import excalibur.shard.worker.SegmentReindexScheduler;
@@ -15,7 +17,9 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Coordinates all background index workers for ExcaliburDB.
@@ -111,6 +115,12 @@ public class IndexOrchestrator implements AutoCloseable {
     private final SegmentReindexScheduler reindexScheduler;
 
     /**
+     * Volume manager for disk space tracking and segment-to-volume assignment.
+     * May be null if not configured.
+     */
+    private final VolumeManager volumeManager;
+
+    /**
      * Visibility tracker for coordinating epochs across segments.
      * Provides epoch-based visibility for consistent query snapshots.
      */
@@ -121,6 +131,12 @@ public class IndexOrchestrator implements AutoCloseable {
      * Ensures writes become visible within one tick of fsync.
      */
     private final EpochTickScheduler epochTickScheduler;
+
+    /**
+     * Handler for reindex operations.
+     * May be null if reindexing is handled externally or in stub mode.
+     */
+    private volatile ReindexOperationHandler reindexOperationHandler;
 
     private final Map<Long, SegmentIndexInfo> segmentIndexInfo;
 
@@ -177,6 +193,27 @@ public class IndexOrchestrator implements AutoCloseable {
     public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
                               int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
                               long reindexCheckIntervalMs, long epochTickIntervalMs) {
+        this(catalog, storageEngine, null, hnswQueueDepthLimit, cuckooMaintenanceIntervalMs,
+             reindexCheckIntervalMs, epochTickIntervalMs);
+    }
+
+    /**
+     * Creates a new IndexOrchestrator with full custom configuration and VolumeManager.
+     *
+     * @param catalog                       The segment catalog
+     * @param storageEngine                 The storage engine
+     * @param volumeManager                 The volume manager for disk space tracking (optional)
+     * @param hnswQueueDepthLimit           HNSW integration queue depth limit
+     * @param cuckooMaintenanceIntervalMs   Cuckoo maintenance interval (ms)
+     * @param reindexCheckIntervalMs        Re-index check interval (ms)
+     * @param epochTickIntervalMs           Epoch tick interval (ms)
+     * @throws NullPointerException         if catalog or storageEngine is null
+     * @throws IllegalArgumentException     if configuration values are invalid
+     */
+    public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
+                              VolumeManager volumeManager,
+                              int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
+                              long reindexCheckIntervalMs, long epochTickIntervalMs) {
         if (catalog == null) {
             throw new NullPointerException("Catalog cannot be null");
         }
@@ -186,6 +223,7 @@ public class IndexOrchestrator implements AutoCloseable {
 
         this.catalog = catalog;
         this.storageEngine = storageEngine;
+        this.volumeManager = volumeManager;
         this.segmentIndexInfo = new ConcurrentHashMap<>();
         this.running = new AtomicBoolean(false);
         this.stopped = new AtomicBoolean(false);
@@ -201,7 +239,7 @@ public class IndexOrchestrator implements AutoCloseable {
             (segment, count) -> onVectorsIntegrated(segment, count),
             100, hnswQueueDepthLimit, 100);
 
-        this.cuckooWorker = new CuckooMaintenanceWorker(catalog,
+        this.cuckooWorker = new CuckooMaintenanceWorker(catalog, storageEngine,
             segmentId -> onSegmentFilterCleaned(segmentId),
             cuckooMaintenanceIntervalMs, 1000, 0.001);
 
@@ -209,8 +247,8 @@ public class IndexOrchestrator implements AutoCloseable {
             sourceId -> onReindexNeeded(sourceId),
             reindexCheckIntervalMs, 3600000);
 
-        LOGGER.info("IndexOrchestrator created with hnswQueueDepthLimit={}, cuckooInterval={}ms, reindexInterval={}ms, epochTickInterval={}ms",
-            hnswQueueDepthLimit, cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs);
+        LOGGER.info("IndexOrchestrator created with hnswQueueDepthLimit={}, cuckooInterval={}ms, reindexInterval={}ms, epochTickInterval={}ms, volumeManager={}",
+            hnswQueueDepthLimit, cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs, volumeManager != null);
     }
 
     // ==================== Lifecycle Management ====================
@@ -421,6 +459,80 @@ public class IndexOrchestrator implements AutoCloseable {
     }
 
     /**
+     * Default backpressure timeout in milliseconds.
+     */
+    public static final long DEFAULT_BACKPRESSURE_TIMEOUT_MS = 30_000;
+
+    /**
+     * Blocks until backpressure is released or timeout expires.
+     *
+     * <p>This method should be called by the ingestion pipeline before adding
+     * entries to the write log. When the HNSW integration queue exceeds the
+     * configured depth limit, the worker signals backpressure, and callers
+     * should wait for the queue to drain before continuing.</p>
+     *
+     * <p>The method uses virtual thread-friendly parking (LockSupport.parkNanos)
+     * rather than busy-waiting.</p>
+     *
+     * <h3>Domain Constraints</h3>
+     * <ul>
+     *   <li>Poll interval: 10ms (virtual thread friendly)</li>
+     *   <li>Backpressure releases when queue depth falls below 50% of limit</li>
+     *   <li>Interrupts are handled gracefully with immediate return</li>
+     * </ul>
+     *
+     * @param timeoutMs Maximum time to wait in milliseconds
+     * @return true if backpressure was released (or was not active), false on timeout
+     * @throws IllegalArgumentException if timeoutMs is negative
+     */
+    public boolean awaitBackpressureRelease(long timeoutMs) {
+        if (timeoutMs < 0) {
+            throw new IllegalArgumentException("Timeout must be non-negative, got: " + timeoutMs);
+        }
+
+        if (!hnswWorker.isBackpressured()) {
+            return true;
+        }
+
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        long pollIntervalNs = TimeUnit.MILLISECONDS.toNanos(10); // 10ms poll interval
+
+        while (hnswWorker.isBackpressured() && System.nanoTime() < deadline) {
+            // Check for thread interruption
+            if (Thread.currentThread().isInterrupted()) {
+                LOGGER.debug("Backpressure wait interrupted");
+                return false;
+            }
+
+            // Park for a short duration (virtual thread friendly)
+            long remainingNs = deadline - System.nanoTime();
+            if (remainingNs <= 0) {
+                break;
+            }
+            LockSupport.parkNanos(Math.min(pollIntervalNs, remainingNs));
+        }
+
+        boolean released = !hnswWorker.isBackpressured();
+        if (!released) {
+            LOGGER.warn("Backpressure timeout after {}ms, queue depth: {}",
+                timeoutMs, hnswWorker.getCurrentQueueDepth());
+        }
+        return released;
+    }
+
+    /**
+     * Blocks until backpressure is released using the default timeout.
+     *
+     * <p>Uses a 30-second default timeout. For custom timeouts, use
+     * {@link #awaitBackpressureRelease(long)}.</p>
+     *
+     * @return true if backpressure was released, false on timeout
+     */
+    public boolean awaitBackpressureRelease() {
+        return awaitBackpressureRelease(DEFAULT_BACKPRESSURE_TIMEOUT_MS);
+    }
+
+    /**
      * Returns the number of pending Cuckoo filter deletions.
      *
      * @return Pending deletion count
@@ -546,11 +658,90 @@ public class IndexOrchestrator implements AutoCloseable {
 
     /**
      * Called when a re-index is needed for a source.
+     *
+     * <p>This method triggers the re-index operation and properly manages
+     * the reindexInProgress flag by calling markReindexComplete() on success
+     * or markReindexFailed() on failure. This ensures subsequent scheduled
+     * reindexes are not permanently blocked.</p>
+     *
+     * <p>If a {@link ReindexOperationHandler} is configured via
+     * {@link #setReindexOperationHandler(ReindexOperationHandler)}, this method
+     * will delegate to it. Otherwise, it logs a warning and completes without
+     * performing any actual reindexing.</p>
      */
     private boolean onReindexNeeded(long sourceId) {
         LOGGER.info("Re-index needed for source {}", sourceId);
-        // In a full implementation, this would trigger the ingestion pipeline
-        return true;
+        try {
+            // Trigger the ingestion pipeline for reindex
+            boolean success = triggerReindexOperation(sourceId);
+
+            if (success) {
+                // Mark as complete to allow future scheduled reindexes
+                reindexScheduler.markReindexComplete(sourceId);
+                LOGGER.info("Re-index completed successfully for source {}", sourceId);
+            } else {
+                reindexScheduler.markReindexFailed(sourceId, "Reindex returned failure");
+            }
+            return success;
+        } catch (Exception e) {
+            LOGGER.error("Re-index failed for source {}: {}", sourceId, e.getMessage());
+            reindexScheduler.markReindexFailed(sourceId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Triggers the actual re-index operation for a source.
+     *
+     * <p>If a {@link ReindexOperationHandler} is configured, this method
+     * delegates to it. Otherwise, logs a warning and returns true (stub mode).</p>
+     *
+     * @param sourceId The source ID to re-index
+     * @return true if reindex succeeded, false otherwise
+     */
+    private boolean triggerReindexOperation(long sourceId) {
+        // If handler is not configured, log warning and complete
+        if (reindexOperationHandler == null) {
+            LOGGER.warn("Reindex triggered for source {} but ReindexOperationHandler not configured. " +
+                "Reindex will not execute. Configure via setReindexOperationHandler().", sourceId);
+            return true; // Return true to avoid blocking future scheduled reindexes
+        }
+
+        // Delegate to the handler
+        LOGGER.debug("Executing reindex operation for source {} via ReindexOperationHandler", sourceId);
+        try {
+            return reindexOperationHandler.executeReindex(String.valueOf(sourceId));
+        } catch (Exception e) {
+            LOGGER.error("ReindexOperationHandler threw exception for source {}: {}", sourceId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Sets the handler for reindex operations.
+     *
+     * <p>When configured, scheduled reindex operations will delegate to this
+     * handler. The handler is responsible for resolving the source and
+     * executing the actual reindexing.</p>
+     *
+     * <p>Without this configuration, reindex operations operate in stub mode
+     * (logging warnings but not blocking future reindexes).</p>
+     *
+     * @param handler The reindex operation handler, or null to disable
+     */
+    public void setReindexOperationHandler(ReindexOperationHandler handler) {
+        this.reindexOperationHandler = handler;
+        LOGGER.info("ReindexOperationHandler {} for IndexOrchestrator",
+            handler != null ? "configured" : "cleared");
+    }
+
+    /**
+     * Returns the configured reindex operation handler.
+     *
+     * @return The handler, or null if not configured
+     */
+    public ReindexOperationHandler getReindexOperationHandler() {
+        return reindexOperationHandler;
     }
 
     // ==================== Worker Access ====================
@@ -571,6 +762,21 @@ public class IndexOrchestrator implements AutoCloseable {
      */
     public CuckooMaintenanceWorker getCuckooWorker() {
         return cuckooWorker;
+    }
+
+    /**
+     * Sets the hierarchical Cuckoo filter for deletion propagation.
+     *
+     * <p>When set, the Cuckoo maintenance worker will propagate deletions through
+     * the hierarchy: segment → cluster → corpus. This ensures no stale false
+     * positives from tombstoned entries.</p>
+     *
+     * @param filter The hierarchical Cuckoo filter (may be null)
+     */
+    public void setHierarchicalCuckooFilter(HierarchicalCuckooFilter filter) {
+        this.cuckooWorker.setHierarchicalFilter(filter);
+        LOGGER.info("Hierarchical Cuckoo filter {} for IndexOrchestrator",
+            filter != null ? "configured" : "cleared");
     }
 
     /**

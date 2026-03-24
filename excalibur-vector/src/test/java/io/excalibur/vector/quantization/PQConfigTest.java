@@ -1,6 +1,7 @@
 package io.excalibur.vector.quantization;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.*;
@@ -316,6 +317,7 @@ class PQConfigTest {
     // ==================== Integration Tests ====================
 
     @Test
+    @Tag("slow")
     @DisplayName("Config-created quantizer should train and encode correctly")
     void testQuantizerIntegration() {
         PQConfig config = new PQConfig(8, 256, 1000, 20, 1e-4f, 42);

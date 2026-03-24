@@ -2,6 +2,10 @@ package excalibur.ingest.registry;
 
 import excalibur.filter.CuckooFilter;
 import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.ingest.lsh.LshIngestionService;
+import io.excalibur.store.Segment;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -55,10 +59,37 @@ import java.util.function.Consumer;
  */
 public class UpsertHandler {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(UpsertHandler.class);
+
     private final DocumentRegistry registry;
     private final CuckooFilter cuckooFilter;
     private final HierarchicalCuckooFilter hierarchicalFilter;
     private final StorageAdapter storageAdapter;
+
+    /**
+     * Optional LSH ingestion service for removing entries from LSH index during tombstoning.
+     */
+    private final LshIngestionService lshIngestionService;
+
+    /**
+     * Optional segment provider for LSH removal operations.
+     */
+    private final SegmentProvider segmentProvider;
+
+    /**
+     * Functional interface for segment lookup.
+     * Used by LSH removal to get segment instances for entry deletion.
+     */
+    @FunctionalInterface
+    public interface SegmentProvider {
+        /**
+         * Gets a segment by its ID.
+         *
+         * @param segmentId The segment ID
+         * @return The segment, or null if not found
+         */
+        Segment getSegment(String segmentId);
+    }
 
     /**
      * Functional interface for storage operations.
@@ -89,6 +120,8 @@ public class UpsertHandler {
         this.cuckooFilter = cuckooFilter;
         this.hierarchicalFilter = null;
         this.storageAdapter = storageAdapter;
+        this.lshIngestionService = null;
+        this.segmentProvider = null;
     }
 
     /**
@@ -108,6 +141,8 @@ public class UpsertHandler {
         this.cuckooFilter = null;
         this.hierarchicalFilter = hierarchicalFilter;
         this.storageAdapter = storageAdapter;
+        this.lshIngestionService = null;
+        this.segmentProvider = null;
     }
 
     /**
@@ -128,6 +163,34 @@ public class UpsertHandler {
         this.cuckooFilter = cuckooFilter;
         this.hierarchicalFilter = hierarchicalFilter;
         this.storageAdapter = storageAdapter;
+        this.lshIngestionService = null;
+        this.segmentProvider = null;
+    }
+
+    /**
+     * Creates a new UpsertHandler with LSH ingestion support.
+     *
+     * <p>When LSH ingestion service is provided, entries will be removed from
+     * the LSH index during tombstoning operations, keeping the vector similarity
+     * index consistent with storage.</p>
+     *
+     * @param registry The document registry
+     * @param cuckooFilter The flat Cuckoo filter (may be null)
+     * @param hierarchicalFilter The hierarchical Cuckoo filter (may be null)
+     * @param storageAdapter The storage adapter for tombstone operations (may be null for dry-run)
+     * @param lshIngestionService The LSH ingestion service for vector index cleanup (may be null)
+     * @param segmentProvider The segment provider for LSH removal (may be null if lshIngestionService is null)
+     * @throws NullPointerException if registry is null
+     */
+    public UpsertHandler(DocumentRegistry registry, CuckooFilter cuckooFilter,
+                         HierarchicalCuckooFilter hierarchicalFilter, StorageAdapter storageAdapter,
+                         LshIngestionService lshIngestionService, SegmentProvider segmentProvider) {
+        this.registry = Objects.requireNonNull(registry, "registry must not be null");
+        this.cuckooFilter = cuckooFilter;
+        this.hierarchicalFilter = hierarchicalFilter;
+        this.storageAdapter = storageAdapter;
+        this.lshIngestionService = lshIngestionService;
+        this.segmentProvider = segmentProvider;
     }
 
     /**
@@ -235,12 +298,21 @@ public class UpsertHandler {
                     resultBuilder.addError("filter", chunkId, e.getMessage());
                 }
             }
-            
+
+            // Remove from Hierarchical Cuckoo filter (searches all segments)
+            if (!filterDeleted && hierarchicalFilter != null) {
+                try {
+                    filterDeleted = hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId));
+                } catch (Exception e) {
+                    resultBuilder.addError("hierarchical-filter", chunkId, e.getMessage());
+                }
+            }
+
             if (storageDeleted || filterDeleted) {
                 resultBuilder.incrementChunksTombstoned();
             }
         }
-        
+
         resultBuilder.incrementDocumentsChanged();
     }
 
@@ -279,12 +351,21 @@ public class UpsertHandler {
                     resultBuilder.addError("filter", chunkId, e.getMessage());
                 }
             }
-            
+
+            // Remove from Hierarchical Cuckoo filter (searches all segments)
+            if (!filterDeleted && hierarchicalFilter != null) {
+                try {
+                    filterDeleted = hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId));
+                } catch (Exception e) {
+                    resultBuilder.addError("hierarchical-filter", chunkId, e.getMessage());
+                }
+            }
+
             if (storageDeleted || filterDeleted) {
                 resultBuilder.incrementChunksTombstoned();
             }
         }
-        
+
         // Remove from registry
         registry.remove(sourceId, documentId);
         resultBuilder.incrementDocumentsDeleted();
@@ -296,6 +377,9 @@ public class UpsertHandler {
      * <p><strong>CRITICAL:</strong> This method deletes from ALL levels of the Cuckoo filter
      * hierarchy immediately: segment filter → cluster filter → corpus filter.</p>
      *
+     * <p>When LSH ingestion service is available, this method also removes entries from
+     * the segment's LSH index to maintain consistency with storage tombstones.</p>
+     *
      * @param changed The changed document information
      * @param segmentId The segment ID for hierarchical deletion
      * @param resultBuilder The result builder to record operations
@@ -305,11 +389,11 @@ public class UpsertHandler {
                                                     UpsertResult.Builder resultBuilder) {
         String documentId = changed.getDocumentId();
         DocumentMetadata oldMetadata = changed.getOldMetadata();
-        
+
         for (String chunkId : oldMetadata.getChunkIds()) {
             boolean storageDeleted = false;
             boolean filterDeleted = false;
-            
+
             // Tombstone in storage
             if (storageAdapter != null) {
                 try {
@@ -318,15 +402,18 @@ public class UpsertHandler {
                     resultBuilder.addError("storage", chunkId, e.getMessage());
                 }
             }
-            
+
             // Remove from Cuckoo filter hierarchy (ALL levels)
             filterDeleted = deleteFromFilterHierarchy(chunkId, segmentId);
-            
+
+            // Remove from LSH index if available
+            removeEntryFromLshIndex(chunkId, segmentId, resultBuilder);
+
             if (storageDeleted || filterDeleted) {
                 resultBuilder.incrementChunksTombstoned();
             }
         }
-        
+
         resultBuilder.incrementDocumentsChanged();
     }
 
@@ -424,18 +511,23 @@ public class UpsertHandler {
      */
     public boolean tombstoneChunk(String chunkId) {
         Objects.requireNonNull(chunkId, "chunkId must not be null");
-        
+
         boolean storageDeleted = false;
         boolean filterDeleted = false;
-        
+
         if (storageAdapter != null) {
             storageDeleted = storageAdapter.delete(toBytes(chunkId));
         }
-        
+
         if (cuckooFilter != null) {
             filterDeleted = cuckooFilter.delete(toBytes(chunkId));
         }
-        
+
+        // Remove from Hierarchical Cuckoo filter (searches all segments)
+        if (!filterDeleted && hierarchicalFilter != null) {
+            filterDeleted = hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId));
+        }
+
         return storageDeleted || filterDeleted;
     }
 
@@ -471,12 +563,16 @@ public class UpsertHandler {
      */
     public boolean removeFromFilter(String chunkId) {
         Objects.requireNonNull(chunkId, "chunkId must not be null");
-        
-        if (cuckooFilter == null) {
-            return false;
+
+        if (hierarchicalFilter != null) {
+            return hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId));
         }
-        
-        return cuckooFilter.delete(toBytes(chunkId));
+
+        if (cuckooFilter != null) {
+            return cuckooFilter.delete(toBytes(chunkId));
+        }
+
+        return false;
     }
 
     /**
@@ -547,6 +643,57 @@ public class UpsertHandler {
         Objects.requireNonNull(segmentId, "segmentId must not be null");
         
         return deleteFromFilterHierarchy(chunkId, segmentId);
+    }
+
+    /**
+     * Removes an entry from the LSH index if available.
+     *
+     * <p>This method attempts to remove the chunk entry from the LSH index
+     * used for approximate nearest neighbor pre-filtering. If the LSH
+     * ingestion service is not configured, this method does nothing.</p>
+     *
+     * @param chunkId The chunk ID to remove
+     * @param segmentId The segment ID for locating the LSH index
+     * @param resultBuilder The result builder to record any errors
+     */
+    private void removeEntryFromLshIndex(String chunkId, String segmentId, UpsertResult.Builder resultBuilder) {
+        if (lshIngestionService == null || segmentProvider == null) {
+            // LSH removal is optional - skip if not configured
+            return;
+        }
+
+        try {
+            Segment segment = segmentProvider.getSegment(segmentId);
+            if (segment == null) {
+                LOGGER.debug("Segment {} not found for LSH removal of chunk {}", segmentId, chunkId);
+                return;
+            }
+
+            // Compute entry ID from chunk ID (typically hash-based)
+            long entryId = computeEntryId(chunkId);
+
+            // Attempt to remove from LSH index - this is best-effort
+            boolean removed = lshIngestionService.removeEntry(segment, entryId);
+            if (!removed) {
+                LOGGER.debug("Entry {} not found in LSH index for segment {}", entryId, segmentId);
+            }
+        } catch (Exception e) {
+            // LSH removal failure should not block tombstone operation
+            String error = "Failed to remove chunk " + chunkId + " from LSH index: " + e.getMessage();
+            LOGGER.warn(error);
+            resultBuilder.addError("lsh", chunkId, error);
+        }
+    }
+
+    /**
+     * Computes an entry ID from a chunk ID for LSH index operations.
+     *
+     * @param chunkId The chunk ID
+     * @return The entry ID (hash-based)
+     */
+    private long computeEntryId(String chunkId) {
+        // Use a simple hash to generate a stable entry ID
+        return chunkId.hashCode() & 0xFFFFFFFFL;
     }
 
     /**

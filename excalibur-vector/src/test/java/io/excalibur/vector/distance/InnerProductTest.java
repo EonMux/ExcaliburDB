@@ -45,12 +45,14 @@ class InnerProductTest {
         }
 
         @Test
-        @DisplayName("Empty vectors return 0.0")
+        @DisplayName("Empty vectors throw IllegalArgumentException")
         void emptyVectors() {
             float[] empty1 = new float[0];
             float[] empty2 = new float[0];
 
-            assertThat(INNER_PRODUCT.compute(empty1, empty2)).isEqualTo(0.0f);
+            assertThatThrownBy(() -> INNER_PRODUCT.compute(empty1, empty2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cannot be empty");
         }
 
         @Test
@@ -140,22 +142,25 @@ class InnerProductTest {
         }
 
         @Test
-        @DisplayName("NaN in input produces NaN output")
-        void nanInputProducesNanOutput() {
+        @DisplayName("NaN in input throws IllegalArgumentException")
+        void nanInputThrowsException() {
             float[] v1 = {1.0f, Float.NaN, 3.0f};
             float[] v2 = {1.0f, 2.0f, 3.0f};
 
-            assertThat(INNER_PRODUCT.compute(v1, v2)).isNaN();
+            assertThatThrownBy(() -> INNER_PRODUCT.compute(v1, v2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
         }
 
         @Test
-        @DisplayName("Positive infinity produces infinity or NaN")
+        @DisplayName("Positive infinity throws IllegalArgumentException")
         void infinityInput() {
             float[] v1 = {1.0f, Float.POSITIVE_INFINITY, 3.0f};
             float[] v2 = {1.0f, 2.0f, 3.0f};
 
-            float result = INNER_PRODUCT.compute(v1, v2);
-            assertThat(Float.isInfinite(result) || Float.isNaN(result)).isTrue();
+            assertThatThrownBy(() -> INNER_PRODUCT.compute(v1, v2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
         }
 
         @Test
@@ -287,14 +292,14 @@ class InnerProductTest {
         }
 
         @Test
-        @DisplayName("Negative infinity input produces clamped negative result")
+        @DisplayName("Negative infinity input throws IllegalArgumentException")
         void negativeInfinityInput() {
             float[] v1 = {1.0f, Float.NEGATIVE_INFINITY, 3.0f};
             float[] v2 = {1.0f, 2.0f, 3.0f};
 
-            float result = INNER_PRODUCT.compute(v1, v2);
-            // Negative infinity * 2 = negative infinity, which should be handled
-            assertThat(Float.isInfinite(result) || Float.isNaN(result)).isTrue();
+            assertThatThrownBy(() -> INNER_PRODUCT.compute(v1, v2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
         }
     }
 
@@ -309,7 +314,7 @@ class InnerProductTest {
 
             assertThatThrownBy(() -> INNER_PRODUCT.compute(null, v2))
                 .isInstanceOf(NullPointerException.class)
-                .hasMessageContaining("First vector");
+                .hasMessageContaining("v1");
         }
 
         @Test
@@ -319,7 +324,7 @@ class InnerProductTest {
 
             assertThatThrownBy(() -> INNER_PRODUCT.compute(v1, null))
                 .isInstanceOf(NullPointerException.class)
-                .hasMessageContaining("Second vector");
+                .hasMessageContaining("v2");
         }
 
         @Test

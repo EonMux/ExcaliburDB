@@ -330,6 +330,16 @@ class MockLLMServerTest {
     @Test
     @DisplayName("Sequence handler returns responses in order")
     void sequenceHandler_returnsInOrder() {
+        // Create client with retries disabled to test sequence handler behavior
+        LLMClientConfig noRetryConfig = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)  // Disable retries to test sequence handler
+                .build();
+        LLMHttpClient noRetryClient = new LLMHttpClient(noRetryConfig);
+
         server.setChatHandler(server.sequenceHandler(
             server.errorHandler(500, "First failure"),
             server.errorHandler(500, "Second failure"),
@@ -338,14 +348,14 @@ class MockLLMServerTest {
 
         // First call: failure
         assertThrows(LLMException.class,
-            () -> client.scoreRelevancy("query", List.of("test")));
+            () -> noRetryClient.scoreRelevancy("query", List.of("test")));
 
         // Second call: failure
         assertThrows(LLMException.class,
-            () -> client.scoreRelevancy("query", List.of("test")));
+            () -> noRetryClient.scoreRelevancy("query", List.of("test")));
 
         // Third call: success
-        List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("test"));
+        List<RelevancyScore> scores = noRetryClient.scoreRelevancy("query", List.of("test"));
         assertEquals(1, scores.size());
         assertEquals(0.9, scores.get(0).getScore(), 0.001);
     }
@@ -367,21 +377,31 @@ class MockLLMServerTest {
     @Test
     @DisplayName("Fail then succeed handler works correctly")
     void failThenSucceedHandler_eventuallySucceeds() {
+        // Create client with retries disabled to test fail-then-succeed handler behavior
+        LLMClientConfig noRetryConfig = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)  // Disable retries to test handler
+                .build();
+        LLMHttpClient noRetryClient = new LLMHttpClient(noRetryConfig);
+
         server.setChatHandler(server.failThenSucceedHandler(2,
             server.successRelevancyHandler(0.95)));
 
         // First two calls fail
         assertThrows(LLMException.class,
-            () -> client.scoreRelevancy("query", List.of("test")));
+            () -> noRetryClient.scoreRelevancy("query", List.of("test")));
         assertThrows(LLMException.class,
-            () -> client.scoreRelevancy("query", List.of("test")));
+            () -> noRetryClient.scoreRelevancy("query", List.of("test")));
 
         // Third call succeeds
-        List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("test"));
+        List<RelevancyScore> scores = noRetryClient.scoreRelevancy("query", List.of("test"));
         assertEquals(0.95, scores.get(0).getScore(), 0.001);
 
         // Subsequent calls also succeed
-        scores = client.scoreRelevancy("query", List.of("test"));
+        scores = noRetryClient.scoreRelevancy("query", List.of("test"));
         assertEquals(0.95, scores.get(0).getScore(), 0.001);
     }
 
@@ -445,6 +465,17 @@ class MockLLMServerTest {
     @Test
     @DisplayName("Sequence handler simulates circuit breaker scenario")
     void circuitBreaker_scenario() {
+        // Create client with retries disabled to test circuit breaker behavior
+        // Without this, the client would retry internally and consume multiple sequence entries
+        LLMClientConfig noRetryConfig = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)  // Disable retries to test circuit breaker
+                .build();
+        LLMHttpClient noRetryClient = new LLMHttpClient(noRetryConfig);
+
         // Simulate: 5 failures to trip circuit, then successes to recover
         server.setChatHandler(server.sequenceHandler(
             server.internalServerErrorHandler(),  // 1
@@ -459,15 +490,15 @@ class MockLLMServerTest {
         // Make 5 failing calls to trip the circuit
         for (int i = 0; i < 5; i++) {
             assertThrows(LLMException.class,
-                () -> client.scoreRelevancyWithCircuitBreaker("query", List.of("test"), null));
+                () -> noRetryClient.scoreRelevancyWithCircuitBreaker("query", List.of("test"), null));
         }
 
         // Circuit should now be OPEN
-        assertEquals(CircuitBreakerState.OPEN, client.getCircuitBreaker().getState());
+        assertEquals(CircuitBreakerState.OPEN, noRetryClient.getCircuitBreaker().getState());
 
         // Next call should fail fast with CIRCUIT_OPEN
         LLMException ex = assertThrows(LLMException.class,
-            () -> client.scoreRelevancyWithCircuitBreaker("query", List.of("test"), null));
+            () -> noRetryClient.scoreRelevancyWithCircuitBreaker("query", List.of("test"), null));
         assertEquals(LLMException.ErrorType.CIRCUIT_OPEN, ex.getErrorType());
     }
 

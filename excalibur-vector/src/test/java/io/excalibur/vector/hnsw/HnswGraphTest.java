@@ -5,6 +5,7 @@ import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.distance.L2Distance;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -336,6 +337,7 @@ class HnswGraphTest {
      * </ol>
      */
     @Test
+    @Tag("slow")
     void shouldAchieve99PercentRecallAt10() throws IOException {
         // Use L2 distance for consistent ground truth computation
         DistanceFunction distFn = L2Distance.getInstance();
@@ -461,6 +463,7 @@ class HnswGraphTest {
      * across a range of graph sizes from small (100 vectors) to larger (1000 vectors).</p>
      */
     @Test
+    @Tag("slow")
     void shouldAchieve99PercentRecallAcrossGraphSizes() throws IOException {
         DistanceFunction distFn = L2Distance.getInstance();
         int dimension = 64;

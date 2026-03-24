@@ -41,6 +41,11 @@ public final class Config {
         public VisibilityConfig(Map<String, String> props) {
             // Default: 100ms epoch tick
             this.epochTickMs = parseLong(props.get("excalibur.visibility.epoch-tick-ms"), 100L);
+            // Validate: epoch tick must be between 10 and 10000 ms for proper epoch tracking
+            if (epochTickMs < 10 || epochTickMs > 10000) {
+                throw new IllegalStateException(
+                    "excalibur.visibility.epoch-tick-ms must be between 10 and 10000, got: " + epochTickMs);
+            }
         }
 
         /**
@@ -109,6 +114,16 @@ public final class Config {
             this.includePartialSegments = parseBoolean(props.get("excalibur.query.include-partial-segments"), true);
             this.defaultTopK = parseInt(props.get("excalibur.query.default-top-k"), 10);
             this.defaultThreshold = parseDouble(props.get("excalibur.query.default-threshold"), 0.3);
+            // Validate: default top-k must be between 1 and 10000
+            if (defaultTopK < 1 || defaultTopK > 10000) {
+                throw new IllegalStateException(
+                    "excalibur.query.default-top-k must be between 1 and 10000, got: " + defaultTopK);
+            }
+            // Validate: default threshold must be between 0.0 and 1.0
+            if (defaultThreshold < 0.0 || defaultThreshold > 1.0) {
+                throw new IllegalStateException(
+                    "excalibur.query.default-threshold must be between 0.0 and 1.0, got: " + defaultThreshold);
+            }
         }
 
         public boolean includePartialSegments() {
@@ -159,6 +174,11 @@ public final class Config {
         public IngestConfig(Map<String, String> props) {
             this.hnswQueueDepthLimit = parseInt(props.get("excalibur.ingest.hnsw-queue-depth-limit"), 100000);
             this.documentAtomicity = parseBoolean(props.get("excalibur.ingest.document-atomicity"), true);
+            // Validate: HNSW queue depth limit must be between 1000 and 1000000
+            if (hnswQueueDepthLimit < 1000 || hnswQueueDepthLimit > 1000000) {
+                throw new IllegalStateException(
+                    "excalibur.ingest.hnsw-queue-depth-limit must be between 1000 and 1000000, got: " + hnswQueueDepthLimit);
+            }
         }
 
         public int getHnswQueueDepthLimit() {
@@ -202,6 +222,11 @@ public final class Config {
         public HealthConfig(Map<String, String> props) {
             // Default: 50% coverage to be ready
             this.readinessThreshold = parseDouble(props.get("excalibur.health.readiness-threshold"), 0.5);
+            // Validate: readiness threshold must be between 0.0 and 1.0
+            if (readinessThreshold < 0.0 || readinessThreshold > 1.0) {
+                throw new IllegalStateException(
+                    "excalibur.health.readiness-threshold must be between 0.0 and 1.0, got: " + readinessThreshold);
+            }
         }
 
         /**

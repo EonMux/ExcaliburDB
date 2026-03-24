@@ -1,6 +1,7 @@
 package io.excalibur.core.atomic;
 
 import io.excalibur.core.exception.AtomicException;
+import io.excalibur.core.memory.Segment;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -9,14 +10,20 @@ import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 
 /**
- * VarHandle-based atomic operations for MemorySegment access.
+ * VarHandle-based atomic operations for memory segment access.
  *
  * <p>This class provides atomic read/write and compare-and-set operations
  * for memory segments using Java 21's Panama FFM VarHandle API.</p>
  *
+ * <h2>API Design</h2>
+ * <p>The primary public API accepts the {@link Segment} abstraction interface,
+ * while internal operations use {@link MemorySegment} for VarHandle access.
+ * The {@link Segment#nativeSegment()} method provides the escape hatch for
+ * Panama FFM operations.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>All operations are atomic and thread-safe for concurrent access to
- * the underlying MemorySegment. Compare-and-set operations provide
+ * the underlying memory segment. Compare-and-set operations provide
  * lock-free atomic updates.</p>
  *
  * <h2>Memory Ordering</h2>
@@ -30,6 +37,7 @@ import java.nio.ByteOrder;
  * The slice operation is zero-cost as it creates a view, not a copy.</p>
  *
  * @author ExcaliburDB
+ * @see Segment
  * @see MemorySegment
  * @see VarHandle
  */
@@ -67,12 +75,322 @@ public class AtomicOps {
         // Utility class - prevent instantiation
     }
 
-    // ==================== Byte Operations ====================
+    // ==================== Byte Operations (Segment API) ====================
 
     /**
      * Atomically reads a byte from the segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @return The byte value
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static byte getByte(Segment segment, long offset) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return getByte(nativeSegment, offset);
+    }
+
+    /**
+     * Atomically writes a byte to the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param value   The value to write
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static void putByte(Segment segment, long offset, byte value) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        putByte(nativeSegment, offset, value);
+    }
+
+    // ==================== Int Operations (Segment API) ====================
+
+    /**
+     * Atomically reads an int from the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @return The int value (big-endian)
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static int getInt(Segment segment, long offset) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return getInt(nativeSegment, offset);
+    }
+
+    /**
+     * Atomically writes an int to the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param value   The value to write (big-endian)
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static void putInt(Segment segment, long offset, int value) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        putInt(nativeSegment, offset, value);
+    }
+
+    /**
+     * Atomically compares and sets an int value.
+     *
+     * @param segment  The memory segment abstraction
+     * @param offset   The offset within the segment
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static boolean compareAndSetInt(Segment segment, long offset,
+                                           int expected, int newValue) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return compareAndSetInt(nativeSegment, offset, expected, newValue);
+    }
+
+    /**
+     * Atomically adds a delta to an int value and returns the previous value.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param delta   The value to add
+     * @return The previous value before addition
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static int getAndAddInt(Segment segment, long offset, int delta) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return getAndAddInt(nativeSegment, offset, delta);
+    }
+
+    /**
+     * Atomically adds a delta to an int value and returns the new value.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param delta   The value to add
+     * @return The new value after addition
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static int addGetInt(Segment segment, long offset, int delta) {
+        return getAndAddInt(segment, offset, delta) + delta;
+    }
+
+    // ==================== Long Operations (Segment API) ====================
+
+    /**
+     * Atomically reads a long from the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @return The long value (big-endian)
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static long getLong(Segment segment, long offset) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return getLong(nativeSegment, offset);
+    }
+
+    /**
+     * Atomically writes a long to the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param value   The value to write (big-endian)
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static void putLong(Segment segment, long offset, long value) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        putLong(nativeSegment, offset, value);
+    }
+
+    /**
+     * Atomically compares and sets a long value.
+     *
+     * @param segment  The memory segment abstraction
+     * @param offset   The offset within the segment
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static boolean compareAndSetLong(Segment segment, long offset,
+                                            long expected, long newValue) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return compareAndSetLong(nativeSegment, offset, expected, newValue);
+    }
+
+    /**
+     * Atomically adds a delta to a long value and returns the previous value.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param delta   The value to add
+     * @return The previous value before addition
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static long getAndAddLong(Segment segment, long offset, long delta) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return getAndAddLong(nativeSegment, offset, delta);
+    }
+
+    /**
+     * Atomically adds a delta to a long value and returns the new value.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param delta   The value to add
+     * @return The new value after addition
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static long addGetLong(Segment segment, long offset, long delta) {
+        return getAndAddLong(segment, offset, delta) + delta;
+    }
+
+    // ==================== Float Operations (Segment API) ====================
+
+    /**
+     * Atomically reads a float from the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @return The float value (big-endian)
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static float getFloat(Segment segment, long offset) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return getFloat(nativeSegment, offset);
+    }
+
+    /**
+     * Atomically writes a float to the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param value   The value to write (big-endian)
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static void putFloat(Segment segment, long offset, float value) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        putFloat(nativeSegment, offset, value);
+    }
+
+    /**
+     * Atomically compares and sets a float value.
+     *
+     * <p>Uses bitwise comparison for floating-point values, following the semantics
+     * of Float.floatToRawIntBits(). NaN values are compared bitwise, not numerically.</p>
+     *
+     * @param segment  The memory segment abstraction
+     * @param offset   The offset within the segment
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static boolean compareAndSetFloat(Segment segment, long offset,
+                                             float expected, float newValue) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return compareAndSetFloat(nativeSegment, offset, expected, newValue);
+    }
+
+    // ==================== Double Operations (Segment API) ====================
+
+    /**
+     * Atomically reads a double from the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @return The double value (big-endian)
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static double getDouble(Segment segment, long offset) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return getDouble(nativeSegment, offset);
+    }
+
+    /**
+     * Atomically writes a double to the segment at the given offset.
+     *
+     * @param segment The memory segment abstraction
+     * @param offset  The offset within the segment
+     * @param value   The value to write (big-endian)
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static void putDouble(Segment segment, long offset, double value) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        putDouble(nativeSegment, offset, value);
+    }
+
+    /**
+     * Atomically compares and sets a double value.
+     *
+     * <p>Uses bitwise comparison for floating-point values, following the semantics
+     * of Double.doubleToRawLongBits(). NaN values are compared bitwise, not numerically.</p>
+     *
+     * @param segment  The memory segment abstraction
+     * @param offset   The offset within the segment
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws AtomicException if segment is null, not Panama-backed, or offset is invalid
+     */
+    public static boolean compareAndSetDouble(Segment segment, long offset,
+                                              double expected, double newValue) {
+        MemorySegment nativeSegment = getNativeSegment(segment);
+        return compareAndSetDouble(nativeSegment, offset, expected, newValue);
+    }
+
+    // ==================== Utility Methods (Segment API) ====================
+
+    /**
+     * Performs a spin-loop CAS until successful or max retries exceeded.
+     *
+     * @param segment  The memory segment abstraction
+     * @param offset   The offset within the segment
+     * @param expected The expected current value
+     * @param newValue The new value to set
+     * @param maxRetries Maximum number of CAS attempts
+     * @return true if successful, false if max retries exceeded
+     */
+    public static boolean spinCasLong(Segment segment, long offset,
+                                      long expected, long newValue, int maxRetries) {
+        for (int i = 0; i < maxRetries; i++) {
+            if (compareAndSetLong(segment, offset, expected, newValue)) {
+                return true;
+            }
+            // Re-read current value for next attempt
+            expected = getLong(segment, offset);
+        }
+        return false;
+    }
+
+    /**
+     * Performs a spin-loop CAS until successful or max retries exceeded.
+     *
+     * @param segment  The memory segment abstraction
+     * @param offset   The offset within the segment
+     * @param expected The expected current value
+     * @param newValue The new value to set
+     * @param maxRetries Maximum number of CAS attempts
+     * @return true if successful, false if max retries exceeded
+     */
+    public static boolean spinCasInt(Segment segment, long offset,
+                                     int expected, int newValue, int maxRetries) {
+        for (int i = 0; i < maxRetries; i++) {
+            if (compareAndSetInt(segment, offset, expected, newValue)) {
+                return true;
+            }
+            // Re-read current value for next attempt
+            expected = getInt(segment, offset);
+        }
+        return false;
+    }
+
+    // ==================== Native MemorySegment Operations (Internal) ====================
+
+    /**
+     * Atomically reads a byte from the native segment at the given offset.
+     *
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @return The byte value
      * @throws AtomicException if segment is null or offset is invalid
@@ -83,9 +401,9 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically writes a byte to the segment at the given offset.
+     * Atomically writes a byte to the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param value   The value to write
      * @throws AtomicException if segment is null or offset is invalid
@@ -95,17 +413,10 @@ public class AtomicOps {
         segment.set(ValueLayout.JAVA_BYTE, offset, value);
     }
 
-    // Note: VarHandle does NOT support compareAndSet for byte types in Java 21.
-    // Only int, long, float, and double support CAS operations.
-    // For atomic byte operations, use getInt/compareAndSetInt with bit masking,
-    // or use external synchronization.
-
-    // ==================== Int Operations ====================
-
     /**
-     * Atomically reads an int from the segment at the given offset.
+     * Atomically reads an int from the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @return The int value (big-endian)
      * @throws AtomicException if segment is null or offset is invalid
@@ -116,9 +427,9 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically writes an int to the segment at the given offset.
+     * Atomically writes an int to the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param value   The value to write (big-endian)
      * @throws AtomicException if segment is null or offset is invalid
@@ -129,9 +440,9 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically compares and sets an int value.
+     * Atomically compares and sets an int value in the native segment.
      *
-     * @param segment  The memory segment
+     * @param segment  The native memory segment
      * @param offset   The offset within the segment
      * @param expected The expected current value
      * @param newValue The new value to set if comparison succeeds
@@ -148,7 +459,7 @@ public class AtomicOps {
     /**
      * Atomically adds a delta to an int value and returns the previous value.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param delta   The value to add
      * @return The previous value before addition
@@ -163,7 +474,7 @@ public class AtomicOps {
     /**
      * Atomically adds a delta to an int value and returns the new value.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param delta   The value to add
      * @return The new value after addition
@@ -173,12 +484,10 @@ public class AtomicOps {
         return getAndAddInt(segment, offset, delta) + delta;
     }
 
-    // ==================== Long Operations ====================
-
     /**
-     * Atomically reads a long from the segment at the given offset.
+     * Atomically reads a long from the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @return The long value (big-endian)
      * @throws AtomicException if segment is null or offset is invalid
@@ -189,9 +498,9 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically writes a long to the segment at the given offset.
+     * Atomically writes a long to the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param value   The value to write (big-endian)
      * @throws AtomicException if segment is null or offset is invalid
@@ -202,9 +511,9 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically compares and sets a long value.
+     * Atomically compares and sets a long value in the native segment.
      *
-     * @param segment  The memory segment
+     * @param segment  The native memory segment
      * @param offset   The offset within the segment
      * @param expected The expected current value
      * @param newValue The new value to set if comparison succeeds
@@ -221,7 +530,7 @@ public class AtomicOps {
     /**
      * Atomically adds a delta to a long value and returns the previous value.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param delta   The value to add
      * @return The previous value before addition
@@ -236,7 +545,7 @@ public class AtomicOps {
     /**
      * Atomically adds a delta to a long value and returns the new value.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param delta   The value to add
      * @return The new value after addition
@@ -246,12 +555,10 @@ public class AtomicOps {
         return getAndAddLong(segment, offset, delta) + delta;
     }
 
-    // ==================== Float Operations ====================
-
     /**
-     * Atomically reads a float from the segment at the given offset.
+     * Atomically reads a float from the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @return The float value (big-endian)
      * @throws AtomicException if segment is null or offset is invalid
@@ -262,9 +569,9 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically writes a float to the segment at the given offset.
+     * Atomically writes a float to the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param value   The value to write (big-endian)
      * @throws AtomicException if segment is null or offset is invalid
@@ -275,12 +582,12 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically compares and sets a float value.
+     * Atomically compares and sets a float value in the native segment.
      *
      * <p>Uses bitwise comparison for floating-point values, following the semantics
      * of Float.floatToRawIntBits(). NaN values are compared bitwise, not numerically.</p>
      *
-     * @param segment  The memory segment
+     * @param segment  The native memory segment
      * @param offset   The offset within the segment
      * @param expected The expected current value
      * @param newValue The new value to set if comparison succeeds
@@ -294,12 +601,10 @@ public class AtomicOps {
         return FLOAT_HANDLE.compareAndSet(slice, expected, newValue);
     }
 
-    // ==================== Double Operations ====================
-
     /**
-     * Atomically reads a double from the segment at the given offset.
+     * Atomically reads a double from the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @return The double value (big-endian)
      * @throws AtomicException if segment is null or offset is invalid
@@ -310,9 +615,9 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically writes a double to the segment at the given offset.
+     * Atomically writes a double to the native segment at the given offset.
      *
-     * @param segment The memory segment
+     * @param segment The native memory segment
      * @param offset  The offset within the segment
      * @param value   The value to write (big-endian)
      * @throws AtomicException if segment is null or offset is invalid
@@ -323,12 +628,12 @@ public class AtomicOps {
     }
 
     /**
-     * Atomically compares and sets a double value.
+     * Atomically compares and sets a double value in the native segment.
      *
      * <p>Uses bitwise comparison for floating-point values, following the semantics
      * of Double.doubleToRawLongBits(). NaN values are compared bitwise, not numerically.</p>
      *
-     * @param segment  The memory segment
+     * @param segment  The native memory segment
      * @param offset   The offset within the segment
      * @param expected The expected current value
      * @param newValue The new value to set if comparison succeeds
@@ -342,12 +647,10 @@ public class AtomicOps {
         return DOUBLE_HANDLE.compareAndSet(slice, expected, newValue);
     }
 
-    // ==================== Utility Methods ====================
-
     /**
      * Performs a spin-loop CAS until successful or max retries exceeded.
      *
-     * @param segment  The memory segment
+     * @param segment  The native memory segment
      * @param offset   The offset within the segment
      * @param expected The expected current value
      * @param newValue The new value to set
@@ -369,7 +672,7 @@ public class AtomicOps {
     /**
      * Performs a spin-loop CAS until successful or max retries exceeded.
      *
-     * @param segment  The memory segment
+     * @param segment  The native memory segment
      * @param offset   The offset within the segment
      * @param expected The expected current value
      * @param newValue The new value to set
@@ -388,10 +691,32 @@ public class AtomicOps {
         return false;
     }
 
+    // ==================== Helper Methods ====================
+
     /**
-     * Checks segment validity and bounds.
+     * Extracts the native MemorySegment from the Segment abstraction.
      *
-     * @param segment The memory segment to check
+     * @param segment The Segment abstraction
+     * @return The underlying native MemorySegment
+     * @throws AtomicException if segment is null or not Panama-backed
+     */
+    private static MemorySegment getNativeSegment(Segment segment) {
+        if (segment == null) {
+            throw new AtomicException("Segment cannot be null");
+        }
+        MemorySegment nativeSegment = segment.nativeSegment();
+        if (nativeSegment == null) {
+            throw new AtomicException(
+                "Segment must be Panama-backed for atomic operations. " +
+                "Fallback segments do not support VarHandle-based atomic operations.");
+        }
+        return nativeSegment;
+    }
+
+    /**
+     * Checks native segment validity and bounds.
+     *
+     * @param segment The native memory segment to check
      * @param offset  The offset to validate
      * @param size    The size of the access
      * @throws AtomicException if validation fails

@@ -1,6 +1,7 @@
 package excalibur.query.pipeline;
 
 import excalibur.filter.lsh.LshIndex;
+import excalibur.filter.sketch.CountMinSketch;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.vector.hnsw.HnswGraph;
@@ -220,6 +221,27 @@ public final class SegmentCandidate {
      */
     public boolean hasWriteLog() {
         return segment != null && segment.writeLog() != null;
+    }
+
+    /**
+     * Gets the Count-Min Sketch for term frequency estimation.
+     *
+     * <p>The sketch is used by the query planner to estimate term selectivity
+     * for query optimization. Returns null if no sketch is attached.</p>
+     *
+     * @return The Count-Min Sketch, or null if not available
+     */
+    public CountMinSketch termFrequencySketch() {
+        return segment != null ? segment.termFrequencySketch() : null;
+    }
+
+    /**
+     * Checks if this candidate has a term frequency sketch attached.
+     *
+     * @return true if the segment has a term frequency sketch, false otherwise
+     */
+    public boolean hasTermFrequencySketch() {
+        return segment != null && segment.termFrequencySketch() != null;
     }
 
     @Override

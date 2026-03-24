@@ -1,6 +1,8 @@
 package io.excalibur.core.atomic;
 
 import io.excalibur.core.exception.AtomicException;
+import io.excalibur.core.memory.MemorySegmentFactory;
+import io.excalibur.core.memory.Segment;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -36,12 +38,15 @@ class AtomicOpsTest {
 
     private Arena arena;
     private MemorySegment segment;
+    private Segment abstractSegment;
 
     @BeforeEach
     void setUp() {
         arena = Arena.ofShared();
         // Allocate enough space for all test operations: 128 bytes
         segment = arena.allocate(128);
+        // Wrap in Segment abstraction for tests that use the new API
+        abstractSegment = MemorySegmentFactory.wrapNative(segment);
     }
 
     // ==================== Byte Operations ====================
@@ -465,7 +470,7 @@ class AtomicOpsTest {
         @DisplayName("getByte throws AtomicException for null segment")
         void getByteNullSegment() {
             assertThrows(AtomicException.class, () -> {
-                AtomicOps.getByte(null, 0);
+                AtomicOps.getByte((Segment) null, 0);
             });
         }
 
@@ -473,7 +478,7 @@ class AtomicOpsTest {
         @DisplayName("putInt throws AtomicException for null segment")
         void putIntNullSegment() {
             assertThrows(AtomicException.class, () -> {
-                AtomicOps.putInt(null, 0, 100);
+                AtomicOps.putInt((Segment) null, 0, 100);
             });
         }
 
@@ -505,7 +510,7 @@ class AtomicOpsTest {
         @DisplayName("compareAndSetFloat throws AtomicException for null segment")
         void compareAndSetFloatNullSegment() {
             assertThrows(AtomicException.class, () -> {
-                AtomicOps.compareAndSetFloat(null, 0, 1.0f, 2.0f);
+                AtomicOps.compareAndSetFloat((Segment) null, 0, 1.0f, 2.0f);
             });
         }
 

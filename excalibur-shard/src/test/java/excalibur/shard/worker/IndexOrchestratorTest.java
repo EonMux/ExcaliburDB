@@ -1,12 +1,21 @@
 package excalibur.shard.worker;
 
 import io.excalibur.store.SegmentCatalog;
+import io.excalibur.store.StorageEngine;
 import excalibur.shard.IndexOrchestrator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.io.TempDir;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,6 +28,29 @@ import static org.junit.jupiter.api.Assertions.*;
 class IndexOrchestratorTest {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(IndexOrchestratorTest.class);
+
+    @TempDir
+    Path tempDir;
+
+    private Arena arena;
+    private StorageEngine storageEngine;
+
+    @BeforeEach
+    void setUp() throws IOException {
+        arena = Arena.ofShared();
+        storageEngine = new StorageEngine(tempDir, arena);
+        storageEngine.start();
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (storageEngine != null) {
+            storageEngine.close();
+        }
+        if (arena != null) {
+            arena.close();
+        }
+    }
 
     @Test
     @DisplayName("HnswIntegrationWorker should have correct default configuration")
@@ -45,7 +77,7 @@ class IndexOrchestratorTest {
     void testCuckooWorkerDefaults() {
         SegmentCatalog catalog = new SegmentCatalog();
         CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog,
-            segmentId -> {});
+            storageEngine, segmentId -> {});
 
         assertEquals(5000L, worker.getMaintenanceIntervalMs());
         assertEquals(1000, worker.getMaxDeletionsPerCycle());
@@ -98,7 +130,7 @@ class IndexOrchestratorTest {
     void testCuckooWorkerStartStop() {
         SegmentCatalog catalog = new SegmentCatalog();
         CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog,
-            segmentId -> {});
+            storageEngine, segmentId -> {});
 
         assertFalse(worker.isRunning());
         assertTrue(worker.start());
@@ -157,7 +189,7 @@ class IndexOrchestratorTest {
     void testCuckooWorkerConfiguration() {
         SegmentCatalog catalog = new SegmentCatalog();
         CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog,
-            segmentId -> {}, 10000, 5000, 0.005);
+            storageEngine, segmentId -> {}, 10000, 5000, 0.005);
 
         assertEquals(10000L, worker.getMaintenanceIntervalMs());
         assertEquals(5000, worker.getMaxDeletionsPerCycle());
@@ -223,15 +255,15 @@ class IndexOrchestratorTest {
 
         // Invalid interval
         assertThrows(IllegalArgumentException.class, () ->
-            new CuckooMaintenanceWorker(catalog, segmentId -> {}, 100, 1000, 0.001));
+            new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {}, 100, 1000, 0.001));
 
         // Invalid max deletions
         assertThrows(IllegalArgumentException.class, () ->
-            new CuckooMaintenanceWorker(catalog, segmentId -> {}, 5000, 10, 0.001));
+            new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {}, 5000, 10, 0.001));
 
         // Invalid FP rate threshold
         assertThrows(IllegalArgumentException.class, () ->
-            new CuckooMaintenanceWorker(catalog, segmentId -> {}, 5000, 1000, 0.5));
+            new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {}, 5000, 1000, 0.5));
 
         catalog.close();
     }
@@ -240,7 +272,7 @@ class IndexOrchestratorTest {
     @DisplayName("CuckooMaintenanceWorker should support filter registration")
     void testCuckooWorkerFilterRegistration() {
         SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, segmentId -> {});
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
 
         assertEquals(0, worker.getRegisteredFilterCount());
 
@@ -266,7 +298,7 @@ class IndexOrchestratorTest {
     @DisplayName("CuckooMaintenanceWorker should support deletion queueing")
     void testCuckooWorkerDeletionQueueing() {
         SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, segmentId -> {});
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
 
         assertEquals(0, worker.getPendingDeletionCount());
 
@@ -291,7 +323,7 @@ class IndexOrchestratorTest {
     @DisplayName("CuckooMaintenanceWorker should track statistics")
     void testCuckooWorkerStatistics() {
         SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, segmentId -> {});
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
 
         assertEquals(0L, worker.getTotalDeletions());
         assertEquals(0L, worker.getTotalFailedDeletions());
@@ -304,12 +336,15 @@ class IndexOrchestratorTest {
     @Test
     @DisplayName("CuckooMaintenanceWorker should reject null parameters")
     void testCuckooWorkerNullParameters() {
-        assertThrows(NullPointerException.class, () ->
-            new CuckooMaintenanceWorker(null, segmentId -> {}));
-
         SegmentCatalog catalog = new SegmentCatalog();
         assertThrows(NullPointerException.class, () ->
-            new CuckooMaintenanceWorker(catalog, null));
+            new CuckooMaintenanceWorker(null, storageEngine, segmentId -> {}));
+
+        assertThrows(NullPointerException.class, () ->
+            new CuckooMaintenanceWorker(catalog, null, segmentId -> {}));
+
+        assertThrows(NullPointerException.class, () ->
+            new CuckooMaintenanceWorker(catalog, storageEngine, null));
         catalog.close();
     }
 
@@ -317,7 +352,7 @@ class IndexOrchestratorTest {
     @DisplayName("CuckooMaintenanceWorker should have correct toString")
     void testCuckooWorkerToString() {
         SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, segmentId -> {});
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
 
         String str = worker.toString();
         assertNotNull(str);
@@ -536,6 +571,449 @@ class IndexOrchestratorTest {
         // Unknown source should return null
         assertNull(scheduler.getNextReindexTime(999L));
 
+        catalog.close();
+    }
+
+    // ==================== IndexOrchestrator Tests ====================
+
+    @Test
+    @DisplayName("IndexOrchestrator should have correct default configuration")
+    void testIndexOrchestratorDefaults() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data1");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertEquals(100_000, orchestrator.getHnswQueueDepthLimit());
+        assertFalse(orchestrator.isRunning());
+        assertEquals(0, orchestrator.getRegisteredSegmentCount());
+        assertEquals(0L, orchestrator.getVisibilityEpoch());
+        assertEquals(0L, orchestrator.getTotalVectorsIntegrated());
+        assertEquals(0L, orchestrator.getTotalCuckooDeletions());
+        assertEquals(0L, orchestrator.getTotalReindexesTriggered());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should have correct custom configuration")
+    void testIndexOrchestratorCustomConfiguration() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data2");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine,
+            50_000, 10_000, 30_000, 50);
+
+        assertEquals(50_000, orchestrator.getHnswQueueDepthLimit());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should start and stop successfully")
+    void testIndexOrchestratorStartStop() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data3");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertFalse(orchestrator.isRunning());
+        assertTrue(orchestrator.start());
+        assertTrue(orchestrator.isRunning());
+        assertFalse(orchestrator.start()); // Already running
+
+        orchestrator.stop();
+        assertFalse(orchestrator.isRunning());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should reject null parameters")
+    void testIndexOrchestratorNullParameters() throws IOException {
+        Path dataDir = tempDir.resolve("data4");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+
+        assertThrows(NullPointerException.class, () ->
+            new IndexOrchestrator(null, storageEngine));
+
+        SegmentCatalog catalog = new SegmentCatalog();
+        assertThrows(NullPointerException.class, () ->
+            new IndexOrchestrator(catalog, null));
+
+        catalog.close();
+        storageEngine.close();
+        arena.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should advance visibility epoch")
+    void testIndexOrchestratorAdvanceEpoch() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data5");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertEquals(0L, orchestrator.getVisibilityEpoch());
+
+        long newEpoch = orchestrator.advanceEpoch();
+        assertEquals(1L, newEpoch);
+        assertEquals(1L, orchestrator.getVisibilityEpoch());
+
+        newEpoch = orchestrator.advanceEpoch();
+        assertEquals(2L, newEpoch);
+        assertEquals(2L, orchestrator.getVisibilityEpoch());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should expose visibility tracker")
+    void testIndexOrchestratorVisibilityTracker() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data6");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertNotNull(orchestrator.getVisibilityTracker());
+        assertEquals(orchestrator.getVisibilityEpoch(), orchestrator.getVisibilityTracker().currentEpoch());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should expose epoch tick scheduler")
+    void testIndexOrchestratorEpochTickScheduler() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data7");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertNotNull(orchestrator.getEpochTickScheduler());
+        assertEquals(100L, orchestrator.getEpochTickScheduler().getTickIntervalMs());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should expose worker references")
+    void testIndexOrchestratorWorkerAccess() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data8");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertNotNull(orchestrator.getHnswWorker());
+        assertNotNull(orchestrator.getCuckooWorker());
+        assertNotNull(orchestrator.getReindexScheduler());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should support backpressure check")
+    void testIndexOrchestratorBackpressure() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data9");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertFalse(orchestrator.isBackpressured());
+        assertEquals(0L, orchestrator.getHnswQueueDepth());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should support pending cuckoo deletions check")
+    void testIndexOrchestratorPendingDeletions() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data10");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertEquals(0, orchestrator.getPendingCuckooDeletions());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should support scheduled reindex count")
+    void testIndexOrchestratorScheduledReindexCount() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data11");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        assertEquals(0, orchestrator.getScheduledReindexCount());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should have correct toString")
+    void testIndexOrchestratorToString() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data12");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        String str = orchestrator.toString();
+        assertNotNull(str);
+        assertTrue(str.contains("IndexOrchestrator"));
+        assertTrue(str.contains("running=false"));
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should validate configuration values")
+    void testIndexOrchestratorConfigurationValidation() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data13");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+
+        // Custom configuration should work
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine,
+            50_000, 10_000, 30_000, 200);
+        assertEquals(50_000, orchestrator.getHnswQueueDepthLimit());
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should close successfully")
+    void testIndexOrchestratorClose() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data14");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        orchestrator.start();
+        assertTrue(orchestrator.isRunning());
+
+        orchestrator.close();
+        assertFalse(orchestrator.isRunning());
+
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    // ==================== Segment Reindex Scheduler Flag Management Tests ====================
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should allow multiple reindexes when flag is properly managed")
+    void testReindexSchedulerMultipleReindexCyclesWithFlagManagement() throws Exception {
+        SegmentCatalog catalog = new SegmentCatalog();
+
+        // Track reindex invocations
+        java.util.concurrent.atomic.AtomicInteger reindexCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        java.util.List<Long> reindexTimes = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final SegmentReindexScheduler[] schedulerHolder = new SegmentReindexScheduler[1];
+
+        schedulerHolder[0] = new SegmentReindexScheduler(catalog, sourceId -> {
+            reindexCount.incrementAndGet();
+            reindexTimes.add(System.currentTimeMillis());
+            // Simulate reindex completion - this is what IndexOrchestrator.onReindexNeeded does
+            schedulerHolder[0].markReindexComplete(sourceId);
+            return true;
+        });
+
+        SegmentReindexScheduler scheduler = schedulerHolder[0];
+        // Use very short intervals for testing: 100ms check, 150ms reindex interval
+        // Using unchecked methods to bypass production domain constraints for faster tests
+        scheduler.setCheckIntervalMsUnchecked(100);
+        scheduler.setDefaultReindexIntervalMsUnchecked(150);
+
+        scheduler.registerSourceUnchecked(1L, 150);
+        scheduler.start();
+
+        // Wait for multiple reindex cycles to occur
+        // With 100ms check interval and 150ms reindex interval:
+        // - First check at ~100ms: triggers reindex (count=1)
+        // - Second check at ~200ms: timeSinceLastReindex ~100ms < 150ms, no trigger
+        // - Third check at ~300ms: timeSinceLastReindex ~200ms >= 150ms, triggers (count=2)
+        // Need enough time for at least 2 checks after the first reindex
+        Thread.sleep(700);
+
+        scheduler.stop();
+        catalog.close();
+
+        // Verify multiple reindexes occurred (should have at least 2)
+        int count = reindexCount.get();
+        assertTrue(count >= 2,
+            "Expected at least 2 reindexes to occur, but got " + count +
+            ". This indicates the reindexInProgress flag is not being properly reset.");
+    }
+
+    @Test
+    @DisplayName("SegmentReindexScheduler should block reindexes without flag management")
+    void testReindexSchedulerBlocksReindexesWithoutFlagManagement() throws Exception {
+        SegmentCatalog catalog = new SegmentCatalog();
+
+        // Track reindex invocations
+        java.util.concurrent.atomic.AtomicInteger reindexCount = new java.util.concurrent.atomic.AtomicInteger(0);
+
+        // This listener does NOT call markReindexComplete - simulating the bug
+        SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog, sourceId -> {
+            reindexCount.incrementAndGet();
+            // BUG: Not calling markReindexComplete - flag stays true forever
+            return true;
+        });
+
+        // Use very short intervals for testing
+        // Using unchecked methods to bypass production domain constraints for faster tests
+        scheduler.setCheckIntervalMsUnchecked(100);
+        scheduler.setDefaultReindexIntervalMsUnchecked(150);
+
+        scheduler.registerSourceUnchecked(1L, 150);
+        scheduler.start();
+
+        // Wait for multiple potential reindex cycles
+        Thread.sleep(500);
+
+        scheduler.stop();
+        catalog.close();
+
+        // Without proper flag management, only 1 reindex should occur
+        int count = reindexCount.get();
+        assertEquals(1, count,
+            "Expected exactly 1 reindex when flag is not managed, but got " + count +
+            ". This verifies the bug exists when markReindexComplete is not called.");
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator.onReindexNeeded should call markReindexComplete on success")
+    void testIndexOrchestratorCallsMarkCompleteOnSuccess() throws Exception {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data15");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        SegmentReindexScheduler scheduler = orchestrator.getReindexScheduler();
+
+        // Register a source
+        scheduler.registerSource(1L);
+
+        // Trigger a manual reindex through the scheduler
+        // This will call IndexOrchestrator.onReindexNeeded which should call markReindexComplete
+        long triggeredBefore = scheduler.getTotalReindexesTriggered();
+        long completedBefore = scheduler.getTotalReindexesCompleted();
+
+        boolean result = scheduler.triggerReindexNow(1L);
+
+        assertTrue(result, "Reindex should have been triggered successfully");
+        assertEquals(triggeredBefore + 1, scheduler.getTotalReindexesTriggered(),
+            "Triggered count should have incremented");
+
+        // The key verification: completed count should have incremented because
+        // onReindexNeeded calls markReindexComplete
+        assertEquals(completedBefore + 1, scheduler.getTotalReindexesCompleted(),
+            "Completed count should have incremented because onReindexNeeded calls markReindexComplete");
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should allow multiple consecutive reindexes")
+    void testIndexOrchestratorMultipleConsecutiveReindexes() throws Exception {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data16");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        SegmentReindexScheduler scheduler = orchestrator.getReindexScheduler();
+        scheduler.registerSource(1L);
+
+        // Trigger multiple reindexes in succession
+        for (int i = 0; i < 5; i++) {
+            boolean result = scheduler.triggerReindexNow(1L);
+            assertTrue(result, "Reindex " + (i + 1) + " should succeed");
+        }
+
+        // All 5 reindexes should have been triggered AND completed
+        assertEquals(5L, scheduler.getTotalReindexesTriggered(),
+            "All 5 reindexes should have been triggered");
+        assertEquals(5L, scheduler.getTotalReindexesCompleted(),
+            "All 5 reindexes should have been completed (flag properly reset)");
+        assertEquals(0L, scheduler.getTotalReindexesFailed(),
+            "No reindexes should have failed");
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
         catalog.close();
     }
 }

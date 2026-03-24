@@ -3,6 +3,8 @@ package io.excalibur.core.allocator;
 import io.excalibur.core.allocator.SegmentAllocator.AllocatedRegion;
 import io.excalibur.core.exception.AllocationException;
 import io.excalibur.core.mapped.MappedFile;
+import io.excalibur.core.memory.MemorySegmentFactory;
+import io.excalibur.core.memory.Segment;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -33,9 +35,9 @@ class SegmentAllocatorTest {
     void setUp() throws IOException {
         testFile = tempDir.resolve("test_" + System.nanoTime() + ".dat");
         mf = MappedFile.create(testFile, 16384); // 16 KB
-        
-        // Get the underlying MemorySegment from MappedFile
-        MemorySegment segment = mf.segment();
+
+        // Get the underlying MemorySegment from MappedFile and wrap as Segment
+        Segment segment = MemorySegmentFactory.wrapNative(mf.segment());
         allocator = new SegmentAllocator(segment);
     }
 
@@ -62,7 +64,7 @@ class SegmentAllocatorTest {
         Path emptyFile = tempDir.resolve("empty.dat");
         try (MappedFile emptyMf = MappedFile.create(emptyFile, 4096)) {
             // Get a slice that represents an empty region (offset at end)
-            MemorySegment emptySlice = emptyMf.segment().asSlice(0, 0);
+            Segment emptySlice = MemorySegmentFactory.wrapNative(emptyMf.segment()).asSlice(0, 0);
             assertThrows(IllegalArgumentException.class, () -> new SegmentAllocator(emptySlice));
         }
     }
@@ -139,7 +141,8 @@ class SegmentAllocatorTest {
     @Test
     void testFreeUnknownRegion() {
         // Create a region that was never allocated by this allocator
-        AllocatedRegion unknownRegion = new AllocatedRegion(9999, 100, mf.segment());
+        Segment segment = MemorySegmentFactory.wrapNative(mf.segment());
+        AllocatedRegion unknownRegion = new AllocatedRegion(9999, 100, segment);
         assertFalse(allocator.free(unknownRegion));
     }
 
@@ -281,14 +284,13 @@ class SegmentAllocatorTest {
     @Test
     void testRegionSlice() {
         AllocatedRegion region = allocator.allocate(1024);
-        
-        MemorySegment slice = region.slice(64, 256);
+
+        Segment slice = region.slice(64, 256);
         assertEquals(256, slice.byteSize());
-        
-        MemorySegment fullSlice = region.slice();
+
+        Segment fullSlice = region.slice();
         assertEquals(1024, fullSlice.byteSize());
     }
-
     @Test
     void testRegionSliceInvalid() {
         AllocatedRegion region = allocator.allocate(1024);
@@ -405,10 +407,11 @@ class SegmentAllocatorTest {
 
     @Test
     void testSegmentAccess() {
-        MemorySegment segment = allocator.segment();
+        Segment segment = allocator.segment();
         assertNotNull(segment);
         assertEquals(16384, segment.byteSize());
     }
+
 
     // ==================== Clear Tests ====================
 

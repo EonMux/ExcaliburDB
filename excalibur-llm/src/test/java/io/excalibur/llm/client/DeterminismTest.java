@@ -248,8 +248,17 @@ class DeterminismTest {
     @Test
     @DisplayName("DETERMINISM: Circuit breaker state is deterministic")
     void determinism_circuitBreakerState_isDeterministic() {
+        // Create config with retries disabled to test circuit breaker determinism
+        LLMClientConfig noRetryConfig = LLMClientConfig.builder()
+                .baseUrl(mockServer.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)  // Disable retries to test circuit breaker behavior
+                .build();
+
         // Fresh client with fresh circuit breaker
-        LLMHttpClient freshClient = new LLMHttpClient(config);
+        LLMHttpClient freshClient = new LLMHttpClient(noRetryConfig);
         assertEquals(CircuitBreakerState.CLOSED, freshClient.getCircuitBreaker().getState());
         assertEquals(0, freshClient.getCircuitBreaker().getFailureCount());
 
@@ -265,7 +274,7 @@ class DeterminismTest {
         assertEquals(CircuitBreakerState.OPEN, freshClient.getCircuitBreaker().getState());
 
         // Verify the same sequence produces same result with another fresh client
-        LLMHttpClient anotherClient = new LLMHttpClient(config);
+        LLMHttpClient anotherClient = new LLMHttpClient(noRetryConfig);
         for (int i = 0; i < 5; i++) {
             assertThrows(LLMException.class,
                 () -> anotherClient.scoreRelevancyWithCircuitBreaker("q", List.of("t"), null));
@@ -326,19 +335,29 @@ class DeterminismTest {
     @Test
     @DisplayName("DETERMINISM: Fail-then-succeed handler is deterministic")
     void determinism_failThenSucceedHandler_isDeterministic() {
+        // Create client with retries disabled to test handler determinism
+        LLMClientConfig noRetryConfig = LLMClientConfig.builder()
+                .baseUrl(mockServer.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)  // Disable retries to test handler behavior
+                .build();
+        LLMHttpClient noRetryClient = new LLMHttpClient(noRetryConfig);
+
         mockServer.setChatHandler(mockServer.failThenSucceedHandler(2,
             mockServer.successRelevancyHandler(0.95)));
 
         // First two calls must fail
-        assertThrows(LLMException.class, () -> client.scoreRelevancy("q", List.of("t")));
-        assertThrows(LLMException.class, () -> client.scoreRelevancy("q", List.of("t")));
+        assertThrows(LLMException.class, () -> noRetryClient.scoreRelevancy("q", List.of("t")));
+        assertThrows(LLMException.class, () -> noRetryClient.scoreRelevancy("q", List.of("t")));
 
         // Third call should succeed
-        List<RelevancyScore> scores = client.scoreRelevancy("q", List.of("t"));
+        List<RelevancyScore> scores = noRetryClient.scoreRelevancy("q", List.of("t"));
         assertEquals(0.95, scores.get(0).getScore(), 0.001);
 
         // Subsequent calls should also succeed
-        scores = client.scoreRelevancy("q", List.of("t"));
+        scores = noRetryClient.scoreRelevancy("q", List.of("t"));
         assertEquals(0.95, scores.get(0).getScore(), 0.001);
     }
 

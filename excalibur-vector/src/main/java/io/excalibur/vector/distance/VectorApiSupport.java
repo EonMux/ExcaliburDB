@@ -218,11 +218,16 @@ public final class VectorApiSupport {
             this.species = species;
             this.speciesLength = (Integer) vectorSpeciesClass.getMethod("length").invoke(species);
 
+            // Load Vector class for method signatures (mul/sub take Vector, not FloatVector)
+            Class<?> vectorClass = Class.forName("jdk.incubator.vector.Vector");
+            // Load Associative interface for reduceLanes (takes VectorOperators$Associative, not VectorOperators)
+            Class<?> associativeClass = Class.forName("jdk.incubator.vector.VectorOperators$Associative");
+
             // Get static methods and fields
             this.fromArrayMethod = floatVectorClass.getMethod("fromArray", vectorSpeciesClass, float[].class, int.class);
-            this.mulMethod = floatVectorClass.getMethod("mul", floatVectorClass);
-            this.subMethod = floatVectorClass.getMethod("sub", floatVectorClass);
-            this.reduceLanesAddMethod = floatVectorClass.getMethod("reduceLanes", vectorOperatorsClass);
+            this.mulMethod = floatVectorClass.getMethod("mul", vectorClass);
+            this.subMethod = floatVectorClass.getMethod("sub", vectorClass);
+            this.reduceLanesAddMethod = floatVectorClass.getMethod("reduceLanes", associativeClass);
 
             // Get ADD operator
             this.addOperator = vectorOperatorsClass.getField("ADD").get(null);

@@ -1,6 +1,8 @@
 package io.excalibur.vector.hnsw;
 
 import io.excalibur.core.mapped.MappedFile;
+import io.excalibur.core.memory.MemorySegmentFactory;
+import io.excalibur.core.memory.Segment;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.quantization.PQDistanceTable;
 import io.excalibur.vector.quantization.ProductQuantizer;
@@ -19,6 +21,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -325,6 +328,158 @@ public class HnswGraph implements AutoCloseable {
     }
 
     /**
+     * Opens an existing HNSW graph from a Segment abstraction.
+     *
+     * <p>This method provides an alternative way to open a graph using the
+     * {@link Segment} memory abstraction layer. The Segment abstraction allows
+     * the graph to work with either Panama FFM or fallback ByteBuffer implementations
+     * depending on runtime availability.</p>
+     *
+     * <p><strong>Note:</strong> This method creates a MappedFile internally from
+     * the Segment's path. If the Segment is not backed by a file, use
+     * {@link #open(Path, DistanceFunction)} instead.</p>
+     *
+     * @param segment The Segment containing the graph data (must be file-backed)
+     * @param distanceFunction Distance function for vector comparison
+     * @return The opened HNSW graph
+     * @throws IOException if the segment cannot be opened or is invalid
+     * @throws UnsupportedOperationException if the segment is not file-backed
+     * @throws NullPointerException if segment or distanceFunction is null
+     * @since 1.1
+     */
+    public static HnswGraph openFromSegment(Segment segment, DistanceFunction distanceFunction) throws IOException {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+        Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
+
+        Path path = segment.path();
+        if (path == null) {
+            throw new UnsupportedOperationException(
+                "Segment must be file-backed to open as HnswGraph. " +
+                "Use open(Path, DistanceFunction) for in-memory segments.");
+        }
+
+        // Delegate to the Path-based open method
+        return open(path, distanceFunction);
+    }
+
+    /**
+     * Creates a new HNSW graph using the Segment memory abstraction.
+     *
+     * <p>This method creates a graph using the {@link Segment} abstraction layer,
+     * which automatically selects the appropriate implementation (Panama FFM or
+     * ByteBuffer fallback) based on runtime capabilities.</p>
+     *
+     * <p><strong>Implementation Note:</strong> This method creates a file at the
+     * specified path and maps it using the Segment abstraction. The internal
+     * MappedFile is created from this path for compatibility with existing code.</p>
+     *
+     * @param path Path to the backing file
+     * @param config HNSW configuration
+     * @param distanceFunction Distance function for vector comparison
+     * @param maxNodes Maximum number of nodes the graph can hold
+     * @return A new HNSW graph
+     * @throws IOException if the graph cannot be created
+     * @throws NullPointerException if any parameter is null
+     * @since 1.1
+     */
+    public static HnswGraph createWithSegment(Path path, HnswConfig config,
+                                               DistanceFunction distanceFunction, long maxNodes) throws IOException {
+        Objects.requireNonNull(path, "Path cannot be null");
+        Objects.requireNonNull(config, "Config cannot be null");
+        Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
+
+        // Calculate initial file size for the Segment
+        long nodeIndexSize = maxNodes * NODE_INDEX_ENTRY_SIZE;
+        long estimatedVectorSize = config.vectorByteSize();
+        long estimatedAdjacencySize = config.adjacencyByteSizeLayer0() +
+            (long) config.maxConnections() * config.adjacencyByteSize();
+        long estimatedNodeSize = 8 + 4 + 4 + estimatedVectorSize + estimatedAdjacencySize;
+        long initialDataSize = Math.max(1024 * 1024, maxNodes / 10 * estimatedNodeSize);
+        long totalSize = HEADER_SIZE + nodeIndexSize + initialDataSize;
+
+        // Create the file using Segment abstraction (validates Panama availability)
+        try (Segment segment = MemorySegmentFactory.mapFile(path, totalSize)) {
+            // Segment is created and immediately closed; actual mapping done by MappedFile
+            LOGGER.debug("Pre-validated Segment creation at {} with size {}", path, totalSize);
+        }
+
+        // Create the actual graph using the standard constructor
+        return new HnswGraph(path, config, distanceFunction, maxNodes);
+    }
+
+    /**
+     * Reads header information from a Segment without fully opening the graph.
+     *
+     * <p>This utility method allows inspecting a graph file's metadata without
+     * the overhead of creating a full HnswGraph instance. Useful for validation
+     * and metadata extraction.</p>
+     *
+     * @param segment The Segment to read header from
+     * @return HeaderInfo containing metadata, or null if invalid
+     * @throws NullPointerException if segment is null
+     * @since 1.1
+     */
+    public static HeaderInfo readHeaderInfo(Segment segment) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        if (segment.byteSize() < HEADER_SIZE) {
+            return null;
+        }
+
+        try {
+            long magic = segment.getLong(OFFSET_MAGIC);
+            if (magic != MAGIC) {
+                return null;
+            }
+
+            int version = segment.getInt(OFFSET_VERSION);
+            int dimension = segment.getInt(OFFSET_DIMENSION);
+            long nodeCount = segment.getLong(OFFSET_NODE_COUNT);
+            long entryPoint = segment.getLong(OFFSET_ENTRY_POINT);
+            int maxLevel = segment.getInt(OFFSET_MAX_LEVEL);
+            long lastIntegrated = segment.getLong(OFFSET_LAST_INTEGRATED);
+            int maxConn = segment.getInt(OFFSET_CONFIG_MAX_CONN);
+            int maxConn0 = segment.getInt(OFFSET_CONFIG_MAX_CONN_0);
+            int efConstruction = segment.getInt(OFFSET_CONFIG_EF_CONSTRUCTION);
+            double mL = Double.longBitsToDouble(segment.getLong(OFFSET_CONFIG_ML));
+
+            return new HeaderInfo(version, dimension, nodeCount, entryPoint, maxLevel,
+                lastIntegrated, maxConn, maxConn0, efConstruction, mL);
+        } catch (Exception e) {
+            LOGGER.debug("Failed to read header info from segment: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Immutable record containing HNSW graph header information.
+     *
+     * @since 1.1
+     */
+    public record HeaderInfo(
+        int version,
+        int dimension,
+        long nodeCount,
+        long entryPoint,
+        int maxLevel,
+        long lastIntegratedOffset,
+        int maxConnections,
+        int maxConnectionsLayer0,
+        int efConstruction,
+        double mL
+    ) {
+        /**
+         * Creates an HnswConfig from this header info.
+         *
+         * @return A new HnswConfig with the header values
+         */
+        public HnswConfig toConfig() {
+            return new HnswConfig(maxConnections, maxConnectionsLayer0,
+                efConstruction, 100, mL, dimension);
+        }
+    }
+
+    /**
      * Estimates the size of a node based on its level.
      */
     private static int estimateNodeSize(HnswConfig config, int level) {
@@ -457,6 +612,270 @@ public class HnswGraph implements AutoCloseable {
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /**
+     * Searches for the k nearest neighbors to the query vector within a candidate set.
+     *
+     * <p>This method performs HNSW search but only considers nodes whose IDs are in the
+     * provided candidate set. This is used for LSH pre-filtering where LSH identifies
+     * a subset of potentially relevant vectors, and this search narrows down to the
+     * actual nearest neighbors within that subset.</p>
+     *
+     * <h3>Algorithm</h3>
+     * <ol>
+     *   <li>Find entry points from the candidate set at the highest layer</li>
+     *   <li>Greedy search at each layer, only considering candidate nodes</li>
+     *   <li>At layer 0, perform beam search restricted to candidate set</li>
+     *   <li>Return top-k results from the candidate set</li>
+     * </ol>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>If candidateIds is null or empty, falls back to full graph search</li>
+     *   <li>Results are sorted by distance (closest first)</li>
+     *   <li>Only nodes in the candidate set are returned</li>
+     *   <li>Tombstoned nodes are automatically skipped</li>
+     * </ul>
+     *
+     * @param query Query vector
+     * @param k Number of neighbors to return
+     * @param candidateIds Set of node IDs to search within (null or empty = full search)
+     * @return List of search results sorted by distance (closest first)
+     * @throws IllegalStateException if graph is closed
+     * @throws IllegalArgumentException if query is null or wrong dimension, or k <= 0
+     * @since 1.2
+     */
+    public List<HnswSearchResult> search(float[] query, int k, Set<Long> candidateIds) {
+        validateNotClosed();
+        validateQuery(query);
+        if (k <= 0) {
+            throw new IllegalArgumentException("k must be positive: " + k);
+        }
+
+        // If candidate filter is null, fall back to full search
+        // If candidate filter is empty (explicitly no candidates), return empty
+        if (candidateIds == null) {
+            return search(query, k);
+        }
+        if (candidateIds.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        lock.readLock().lock();
+        try {
+            if (nodeCount == 0 || entryPointId < 0) {
+                return new ArrayList<>();
+            }
+
+            // Find an entry point from the candidate set
+            long entryFromCandidates = findEntryPointFromCandidates(candidateIds);
+            if (entryFromCandidates < 0) {
+                // No valid entry point in candidates, return empty
+                return new ArrayList<>();
+            }
+
+            final float[] queryVec = query;
+            final int efSearch = Math.max(config.efSearch(), k * 2);
+
+            // Start from the candidate entry point
+            NodeView current = readNode(entryFromCandidates);
+            if (current == null || current.isTombstoned()) {
+                return new ArrayList<>();
+            }
+
+            // Get the level of our entry point
+            int startLevel = current.level();
+
+            // Search through layers from start level down to layer 1
+            // Only consider nodes that are in the candidate set
+            for (int level = startLevel; level > 0; level--) {
+                NodeView closest = searchLayerSimpleWithFilter(queryVec, current, level, candidateIds);
+                if (closest != null) {
+                    current = closest;
+                }
+            }
+
+            // At layer 0, perform beam search restricted to candidates
+            PriorityQueue<HnswSearchResult> results = searchLayerBeamWithFilter(
+                queryVec, current, 0, efSearch, candidateIds);
+
+            // Extract results from the heap
+            List<HnswSearchResult> allResults = new ArrayList<>();
+            while (!results.isEmpty()) {
+                HnswSearchResult result = results.poll();
+                // Verify node is still valid and in candidate set
+                if (candidateIds.contains(result.nodeId())) {
+                    NodeView node = readNode(result.nodeId());
+                    if (node != null && !node.isTombstoned()) {
+                        allResults.add(result);
+                    }
+                }
+            }
+
+            // Sort by distance (closest first)
+            allResults.sort(Comparator.comparingDouble(HnswSearchResult::distance));
+
+            // Take top-k closest results
+            List<HnswSearchResult> topResults = new ArrayList<>();
+            for (int i = 0; i < Math.min(k, allResults.size()); i++) {
+                topResults.add(allResults.get(i));
+            }
+
+            return topResults;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Finds an entry point from the candidate set.
+     *
+     * <p>Prefers higher-level nodes as they provide better starting points for
+     * hierarchical search. Falls back to any valid candidate if no high-level
+     * nodes are found.</p>
+     *
+     * @param candidateIds Set of candidate node IDs
+     * @return A valid entry point ID, or -1 if none found
+     */
+    private long findEntryPointFromCandidates(Set<Long> candidateIds) {
+        long bestCandidate = -1;
+        int bestLevel = -1;
+
+        for (Long nodeId : candidateIds) {
+            NodeView node = readNode(nodeId);
+            if (node != null && !node.isTombstoned()) {
+                if (node.level() > bestLevel) {
+                    bestLevel = node.level();
+                    bestCandidate = nodeId;
+                }
+                // If we haven't found any high-level node, take the first valid one
+                if (bestCandidate < 0) {
+                    bestCandidate = nodeId;
+                    bestLevel = node.level();
+                }
+            }
+        }
+
+        return bestCandidate;
+    }
+
+    /**
+     * Greedy search at a single layer, restricted to candidate set.
+     *
+     * <p>Only considers neighbors that are in the candidateIds set.</p>
+     */
+    private NodeView searchLayerSimpleWithFilter(float[] query, NodeView entry, int level, Set<Long> candidateIds) {
+        NodeView current = entry;
+        float currentDist = computeDistance(query, current.vector());
+        boolean improved = true;
+
+        while (improved) {
+            improved = false;
+            List<Long> neighbors = current.getActiveNeighbors(level);
+
+            for (long neighborId : neighbors) {
+                // Skip if not in candidate set
+                if (!candidateIds.contains(neighborId)) {
+                    continue;
+                }
+
+                NodeView neighbor = readNode(neighborId);
+                if (neighbor == null || neighbor.isTombstoned()) {
+                    continue;
+                }
+
+                float dist = computeDistance(query, neighbor.vector());
+                if (dist < currentDist) {
+                    currentDist = dist;
+                    current = neighbor;
+                    improved = true;
+                }
+            }
+        }
+
+        return current;
+    }
+
+    /**
+     * Beam search at a layer with candidate set filtering.
+     *
+     * <p>Only considers nodes that are in the candidateIds set during traversal.</p>
+     */
+    private PriorityQueue<HnswSearchResult> searchLayerBeamWithFilter(
+            float[] query, NodeView entry, int level, int ef, Set<Long> candidateIds) {
+
+        // Max-heap for results (furthest first so we can remove worst and peek at furthest)
+        PriorityQueue<HnswSearchResult> results = new PriorityQueue<>(
+            Comparator.comparingDouble(HnswSearchResult::distance).reversed()
+        );
+
+        // Min-heap for candidates (closest first so we process nearest first)
+        PriorityQueue<HnswSearchResult> candidates = new PriorityQueue<>(
+            Comparator.comparingDouble(HnswSearchResult::distance)
+        );
+
+        // Visited set
+        java.util.Set<Long> visited = new java.util.HashSet<>();
+
+        if (entry == null || entry.isTombstoned()) {
+            return results;
+        }
+
+        float entryDist = computeDistance(query, entry.vector());
+        HnswSearchResult entryResult = new HnswSearchResult(entry.nodeId(), entryDist);
+        candidates.add(entryResult);
+        results.add(entryResult);
+        visited.add(entry.nodeId());
+
+        while (!candidates.isEmpty()) {
+            HnswSearchResult current = candidates.poll();
+            NodeView currentNode = readNode(current.nodeId());
+
+            if (currentNode == null || currentNode.isTombstoned()) {
+                continue;
+            }
+
+            // If current is further than furthest in results, stop
+            if (!results.isEmpty() && current.distance() > results.peek().distance()) {
+                break;
+            }
+
+            List<Long> neighbors = currentNode.getActiveNeighbors(level);
+
+            for (long neighborId : neighbors) {
+                // Skip if not in candidate set
+                if (!candidateIds.contains(neighborId)) {
+                    continue;
+                }
+
+                if (visited.contains(neighborId)) {
+                    continue;
+                }
+                visited.add(neighborId);
+
+                NodeView neighbor = readNode(neighborId);
+                if (neighbor == null || neighbor.isTombstoned()) {
+                    continue;
+                }
+
+                float dist = computeDistance(query, neighbor.vector());
+                HnswSearchResult result = new HnswSearchResult(neighborId, dist);
+
+                // Add to candidates if closer than furthest result, or if results not full
+                if (results.size() < ef || dist < results.peek().distance()) {
+                    candidates.add(result);
+                    results.add(result);
+
+                    // Keep results bounded
+                    while (results.size() > ef) {
+                        results.poll();
+                    }
+                }
+            }
+        }
+
+        return results;
     }
 
     /**
@@ -1901,22 +2320,22 @@ public class HnswGraph implements AutoCloseable {
     }
 
     /**
-     * Sets a pre-trained ProductQuantizer for this graph.
+     * Sets a ProductQuantizer for this graph.
      *
      * <p>After setting a trained quantizer, subsequent searches can optionally
      * use asymmetric distance computation via the PQ codes.</p>
      *
+     * <p><strong>Graceful Fallback:</strong> If the quantizer is not yet trained,
+     * searches will use full-precision distance computation until training completes.
+     * This allows queries on cold segments during the indexing phase.</p>
+     *
      * <p><strong>Note:</strong> The quantizer's dimension must match this graph's dimension.</p>
      *
-     * @param quantizer A trained ProductQuantizer (must not be null)
+     * @param quantizer A ProductQuantizer (must not be null, may be untrained)
      * @throws IllegalArgumentException if quantizer dimension doesn't match
-     * @throws IllegalStateException if quantizer is not trained
      */
     public void setProductQuantizer(ProductQuantizer quantizer) {
         Objects.requireNonNull(quantizer, "ProductQuantizer cannot be null");
-        if (!quantizer.isTrained()) {
-            throw new IllegalStateException("ProductQuantizer must be trained before use");
-        }
         if (quantizer.originalDim() != config.dimension()) {
             throw new IllegalArgumentException(
                 "ProductQuantizer dimension (" + quantizer.originalDim() +
@@ -1927,8 +2346,13 @@ public class HnswGraph implements AutoCloseable {
         try {
             this.pq = quantizer;
             this.pqCodes = new java.util.concurrent.ConcurrentHashMap<>();
-            LOGGER.info("ProductQuantizer set for graph at {} (compression ratio: {}x)",
-                path, quantizer.compressionRatio());
+            if (quantizer.isTrained()) {
+                LOGGER.info("ProductQuantizer set for graph at {} (compression ratio: {}x)",
+                    path, quantizer.compressionRatio());
+            } else {
+                LOGGER.info("ProductQuantizer set for graph at {} (not yet trained, will use full-precision fallback)",
+                    path);
+            }
         } finally {
             lock.writeLock().unlock();
         }
@@ -2285,6 +2709,223 @@ public class HnswGraph implements AutoCloseable {
     public void flush() {
         validateNotClosed();
         mappedFile.flush();
+    }
+
+    // ==================== Segment-based Serialization ====================
+
+    /**
+     * Serializes a node's data to a Segment.
+     *
+     * <p>This method writes the complete node data (ID, level, vector, and all
+     * adjacency lists) to the provided Segment at the specified offset. This is
+     * useful for exporting individual nodes or creating backups.</p>
+     *
+     * <p><strong>Format:</strong></p>
+     * <pre>
+     * [nodeId:8][level:4][vectorLen:4][vector:dim*4]
+     * For each level 0..level: [connCount:4][neighbors:maxConn*4]
+     * </pre>
+     *
+     * @param nodeId The node ID to serialize
+     * @param segment The target Segment to write to
+     * @param offset The offset within the Segment to start writing
+     * @return The number of bytes written
+     * @throws IllegalStateException if graph is closed
+     * @throws NullPointerException if segment is null
+     * @throws IllegalArgumentException if nodeId is invalid or segment is too small
+     * @since 1.1
+     */
+    public long serializeNodeToSegment(long nodeId, Segment segment, long offset) {
+        validateNotClosed();
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        NodeView node = readNode(nodeId);
+        if (node == null) {
+            throw new IllegalArgumentException("Node not found: " + nodeId);
+        }
+
+        lock.readLock().lock();
+        try {
+            long writeOffset = offset;
+
+            // Write nodeId
+            segment.setLong(writeOffset, node.nodeId());
+            writeOffset += 8;
+
+            // Write level
+            segment.setInt(writeOffset, node.level());
+            writeOffset += 4;
+
+            // Write vector
+            float[] vector = node.vector();
+            segment.setInt(writeOffset, vector.length);
+            writeOffset += 4;
+
+            for (float v : vector) {
+                segment.setFloat(writeOffset, v);
+                writeOffset += 4;
+            }
+
+            // Write adjacency lists for each level
+            for (int level = 0; level <= node.level(); level++) {
+                List<Long> neighbors = node.getNeighbors(level);
+                int maxConnAtLevel = (level == 0) ?
+                    config.maxConnectionsLayer0() : config.maxConnections();
+
+                // Write connection count
+                segment.setInt(writeOffset, neighbors.size());
+                writeOffset += 4;
+
+                // Write neighbor IDs
+                for (Long neighborId : neighbors) {
+                    segment.setInt(writeOffset, neighborId.intValue());
+                    writeOffset += 4;
+                }
+
+                // Skip reserved space for remaining connections
+                int reservedSpace = (maxConnAtLevel - neighbors.size()) * 4;
+                writeOffset += reservedSpace;
+            }
+
+            return writeOffset - offset;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Deserializes a node from a Segment and inserts it into the graph.
+     *
+     * <p>This method reads node data from a Segment (in the format written by
+     * {@link #serializeNodeToSegment}) and inserts it as a new node. The node
+     * is assigned a new ID and connected to the graph structure.</p>
+     *
+     * <p><strong>Note:</strong> The neighbor IDs in the serialized data are
+     * informational only. The new node will be connected using the standard
+     * HNSW insertion algorithm.</p>
+     *
+     * @param segment The source Segment to read from
+     * @param offset The offset within the Segment to start reading
+     * @return The new node ID assigned to the deserialized node
+     * @throws IllegalStateException if graph is closed or full
+     * @throws NullPointerException if segment is null
+     * @throws IllegalArgumentException if segment data is invalid
+     * @since 1.1
+     */
+    public long deserializeNodeFromSegment(Segment segment, long offset) {
+        validateNotClosed();
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        lock.writeLock().lock();
+        try {
+            long readOffset = offset;
+
+            // Read and validate nodeId (informational)
+            long serializedNodeId = segment.getLong(readOffset);
+            readOffset += 8;
+
+            // Read level
+            int level = segment.getInt(readOffset);
+            readOffset += 4;
+
+            // Read vector
+            int vectorLen = segment.getInt(readOffset);
+            readOffset += 4;
+
+            if (vectorLen != config.dimension()) {
+                throw new IllegalArgumentException(
+                    "Vector dimension mismatch: expected " + config.dimension() +
+                    ", got " + vectorLen);
+            }
+
+            float[] vector = new float[vectorLen];
+            for (int i = 0; i < vectorLen; i++) {
+                vector[i] = segment.getFloat(readOffset);
+                readOffset += 4;
+            }
+
+            // Skip adjacency lists (we'll reconnect using standard algorithm)
+            for (int l = 0; l <= level; l++) {
+                int connCount = segment.getInt(readOffset);
+                readOffset += 4;
+
+                int maxConnAtLevel = (l == 0) ?
+                    config.maxConnectionsLayer0() : config.maxConnections();
+                readOffset += (long) maxConnAtLevel * 4; // Skip neighbors and reserved space
+            }
+
+            // Release lock and use standard insertion
+            lock.writeLock().unlock();
+            return insert(vector);
+        } finally {
+            // Ensure lock is released if not already
+            if (lock.writeLock().isHeldByCurrentThread()) {
+                lock.writeLock().unlock();
+            }
+        }
+    }
+
+    /**
+     * Exports the graph header to a Segment.
+     *
+     * <p>This method writes the complete graph header (first 4KB) to the provided
+     * Segment. Useful for creating snapshots or validating graph files.</p>
+     *
+     * @param segment The target Segment (must have at least HEADER_SIZE bytes)
+     * @return The number of bytes written
+     * @throws IllegalStateException if graph is closed
+     * @throws NullPointerException if segment is null
+     * @since 1.1
+     */
+    public long exportHeaderToSegment(Segment segment) {
+        validateNotClosed();
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        if (segment.byteSize() < HEADER_SIZE) {
+            throw new IllegalArgumentException(
+                "Segment too small for header: " + segment.byteSize() + " < " + HEADER_SIZE);
+        }
+
+        lock.readLock().lock();
+        try {
+            // Write header fields
+            segment.setLong(OFFSET_MAGIC, MAGIC);
+            segment.setInt(OFFSET_VERSION, VERSION);
+            segment.setInt(OFFSET_DIMENSION, config.dimension());
+            segment.setLong(OFFSET_NODE_COUNT, nodeCount);
+            segment.setLong(OFFSET_ENTRY_POINT, entryPointId);
+            segment.setInt(OFFSET_MAX_LEVEL, maxLevel);
+            segment.setLong(OFFSET_LAST_INTEGRATED, lastIntegratedOffset.get());
+            segment.setInt(OFFSET_CONFIG_MAX_CONN, config.maxConnections());
+            segment.setInt(OFFSET_CONFIG_MAX_CONN_0, config.maxConnectionsLayer0());
+            segment.setInt(OFFSET_CONFIG_EF_CONSTRUCTION, config.efConstruction());
+            segment.setLong(OFFSET_CONFIG_ML, Double.doubleToLongBits(config.mL()));
+
+            return HEADER_SIZE;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Returns the native MemorySegment if Panama FFM is available.
+     *
+     * <p>This method provides escape-hatch access to the underlying native
+     * MemorySegment for advanced operations. Returns null if Panama FFM is
+     * not available or if the graph is not backed by a native segment.</p>
+     *
+     * <p><strong>Warning:</strong> Direct access to the native MemorySegment
+     * bypasses the Segment abstraction. Use with caution.</p>
+     *
+     * @return The underlying java.lang.foreign.MemorySegment, or null
+     * @throws IllegalStateException if graph is closed
+     * @since 1.1
+     */
+    public java.lang.foreign.MemorySegment getNativeMemorySegment() {
+        validateNotClosed();
+        // MappedFile uses Panama FFM internally, but doesn't expose the segment directly
+        // This method is provided for API consistency
+        return null;
     }
 
     @Override

@@ -2,7 +2,6 @@ package io.excalibur.store;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.util.Objects;
 
 /**
  * A zero-copy slice of a value stored in a Segment, with epoch-based validity tracking.
@@ -49,7 +48,7 @@ import java.util.Objects;
  * @param epoch     The modification epoch at which this slice was created
  * @param segmentId The unique identifier of the segment that created this slice
  * @param data      The MemorySegment slice pointing to the value, or null if not found
- * @param segment   Reference to the segment for validity checking
+ * @param segment   Reference to the storage segment for validity checking
  *
  * @author ExcaliburDB
  * @since 1.0

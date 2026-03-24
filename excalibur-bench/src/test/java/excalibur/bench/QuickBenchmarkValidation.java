@@ -2,6 +2,7 @@ package excalibur.bench;
 
 import excalibur.filter.CuckooFilter;
 import io.excalibur.store.Segment;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -17,6 +18,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Quick validation tests for benchmark targets.
  * Runs fast micro-benchmarks to validate against spec requirements.
  */
+@Tag("benchmark")
 public class QuickBenchmarkValidation {
 
     // ==================== CUCKOO FILTER TARGETS ====================

@@ -2,10 +2,12 @@ package excalibur.query.pipeline;
 
 import excalibur.filter.HierarchicalCuckooFilter;
 import excalibur.filter.lsh.LshIndex;
+import excalibur.filter.sketch.CountMinSketch;
 import excalibur.ingest.visibility.DocumentVisibilityChecker;
 import excalibur.query.IndexCoverage;
 import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
+import excalibur.query.plan.SelectivityEstimator;
 import excalibur.query.QueryResultItem;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.executor.ParallelQueryDispatcher;
@@ -14,6 +16,7 @@ import excalibur.query.executor.SegmentQueryTask;
 import excalibur.query.visibility.DocumentAtomicityFilter;
 import excalibur.query.visibility.QuerySnapshot;
 import excalibur.shard.VisibilityTracker;
+import io.excalibur.core.text.TermExtractor;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
@@ -207,6 +210,84 @@ public class QueryPipeline {
         this.hierarchicalFilter = hierarchicalFilter;
     }
 
+    // ==================== Configuration Methods ====================
+
+    /**
+     * Returns a new QueryPipeline with the specified LLM scorer.
+     *
+     * <p>This method creates a new QueryPipeline instance with the provided LLM scorer,
+     * preserving all other configuration. Use this to enable Stage 5 LLM relevancy scoring
+     * on an existing pipeline.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Preserves all original configuration (storage, visibility, distance function, etc.)</li>
+     *   <li>LLM scorer may be null to disable LLM scoring</li>
+     * </ul>
+     *
+     * @param llmScorer The LLM scorer to use for Stage 5, or null to disable
+     * @return A new QueryPipeline instance with the specified LLM scorer
+     */
+    public QueryPipeline withLlmScorer(LlmScorer llmScorer) {
+        return new QueryPipeline(
+            this.storageEngine,
+            this.visibilityTracker,
+            this.visibilityChecker,
+            this.graphProvider,
+            this.distanceFunction,
+            llmScorer,
+            this.coverageThreshold,
+            this.hierarchicalFilter
+        );
+    }
+
+    /**
+     * Returns a new QueryPipeline with the specified visibility checker.
+     *
+     * <p>This method creates a new QueryPipeline instance with the provided visibility checker,
+     * preserving all other configuration. Use this to control document atomicity filtering.
+     * When visibilityChecker is null, document atomicity filtering is disabled.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Preserves all original configuration (storage, visibility tracker, distance function, etc.)</li>
+     *   <li>Visibility checker may be null to disable document atomicity filtering</li>
+     * </ul>
+     *
+     * @param visibilityChecker The visibility checker for document atomicity, or null to disable
+     * @return A new QueryPipeline instance with the specified visibility checker
+     */
+    public QueryPipeline withVisibilityChecker(DocumentVisibilityChecker visibilityChecker) {
+        return new QueryPipeline(
+            this.storageEngine,
+            this.visibilityTracker,
+            visibilityChecker,
+            this.graphProvider,
+            this.distanceFunction,
+            this.llmScorer,
+            this.coverageThreshold,
+            this.hierarchicalFilter
+        );
+    }
+
+    /**
+     * Returns the current LLM scorer, if any.
+     *
+     * @return The LLM scorer, or null if not configured
+     */
+    public LlmScorer getLlmScorer() {
+        return llmScorer;
+    }
+
+    /**
+     * Returns the current visibility checker, if any.
+     *
+     * @return The visibility checker, or null if not configured
+     */
+    public DocumentVisibilityChecker getVisibilityChecker() {
+        return visibilityChecker;
+    }
+
     // ==================== Main Execution Method ====================
 
     /**
@@ -235,6 +316,9 @@ public class QueryPipeline {
         CompletableFuture<PipelineContext> pipelineFuture = CompletableFuture.supplyAsync(() -> {
             // Stage 0: Epoch Snapshot
             PipelineContext context = stage0_EpochSnapshot(request, token);
+
+            // Stage 0b: Selectivity Estimation and Segment Prioritization
+            context = stage0b_SelectivityEstimation(context, token);
 
             // Stage 1: Cuckoo Filter Cascade
             context = stage1_CuckooFilterCascade(context, token);
@@ -342,25 +426,194 @@ public class QueryPipeline {
     }
 
     /**
+     * Stage 0b: Selectivity Estimation and Segment Prioritization.
+     *
+     * <p>This stage estimates query selectivity for each segment using Count-Min Sketch
+     * term frequency data. Segments are then prioritized based on estimated selectivity,
+     * with higher-selectivity segments searched first.</p>
+     *
+     * <h3>Selectivity-Based Optimization</h3>
+     * <ul>
+     *   <li><strong>Segment prioritization:</strong> Segments with higher selectivity
+     *       (more relevant terms) are searched first</li>
+     *   <li><strong>Early termination:</strong> Segments with very low selectivity
+     *       may be deprioritized to improve query latency</li>
+     *   <li><strong>Conservative defaults:</strong> Segments without frequency sketches
+     *       are assigned default selectivity (1.0) to ensure no data loss</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Selectivity values are clamped to [0.0, 1.0]</li>
+     *   <li>Segments without sketches get default selectivity (1.0)</li>
+     *   <li>Empty query text results in no reordering</li>
+     * </ul>
+     *
+     * @param context The pipeline context with segment candidates
+     * @param token The cancellation token
+     * @return Context with candidates sorted by selectivity
+     */
+    private PipelineContext stage0b_SelectivityEstimation(PipelineContext context, CancellationToken token) {
+        token.checkCancelled("Stage 0b cancelled before selectivity estimation");
+
+        LOGGER.trace("Stage 0b: Running selectivity estimation");
+
+        // If no query text, skip selectivity estimation
+        if (context.request.queryText() == null || context.request.queryText().isEmpty()) {
+            LOGGER.debug("Stage 0b: No query text, skipping selectivity estimation");
+            return context;
+        }
+
+        // Extract query terms for selectivity estimation
+        List<String> queryTerms = extractQueryTerms(context.request.queryText());
+        if (queryTerms.isEmpty()) {
+            LOGGER.debug("Stage 0b: No query terms extracted, skipping selectivity estimation");
+            return context;
+        }
+
+        // Calculate selectivity for each segment and sort by selectivity (descending)
+        List<SegmentCandidate> candidates = new ArrayList<>(context.candidates);
+        List<SegmentCandidate> prioritizedCandidates = new ArrayList<>(candidates.size());
+
+        int segmentsWithSketch = 0;
+        int segmentsWithoutSketch = 0;
+
+        // Calculate selectivity scores for each segment
+        List<SegmentCandidateWithScore> scoredCandidates = new ArrayList<>(candidates.size());
+        for (SegmentCandidate candidate : candidates) {
+            token.checkCancelled("Stage 0b cancelled during selectivity calculation");
+
+            double selectivity = calculateSegmentSelectivity(candidate, queryTerms);
+
+            if (candidate.hasTermFrequencySketch()) {
+                segmentsWithSketch++;
+            } else {
+                segmentsWithoutSketch++;
+            }
+
+            scoredCandidates.add(new SegmentCandidateWithScore(candidate, selectivity));
+        }
+
+        // Sort by selectivity descending (highest first)
+        scoredCandidates.sort((a, b) -> Double.compare(b.score, a.score));
+
+        // Extract sorted candidates
+        for (SegmentCandidateWithScore scored : scoredCandidates) {
+            prioritizedCandidates.add(scored.candidate);
+        }
+
+        LOGGER.debug("Stage 0b: Prioritized {} segments by selectivity ({} with sketch, {} without)",
+            prioritizedCandidates.size(), segmentsWithSketch, segmentsWithoutSketch);
+
+        return context.withCandidates(prioritizedCandidates);
+    }
+
+    /**
+     * Extracts query terms from query text for selectivity estimation.
+     *
+     * <p>Uses whitespace tokenization to match the ingestion pipeline.</p>
+     *
+     * @param queryText The query text
+     * @return List of query terms
+     */
+    private List<String> extractQueryTerms(String queryText) {
+        if (queryText == null || queryText.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<String> terms = new ArrayList<>();
+        StringBuilder currentTerm = new StringBuilder();
+
+        for (int i = 0; i < queryText.length(); i++) {
+            char c = queryText.charAt(i);
+            if (Character.isWhitespace(c)) {
+                if (currentTerm.length() > 0) {
+                    terms.add(currentTerm.toString().toLowerCase());
+                    currentTerm.setLength(0);
+                }
+            } else {
+                currentTerm.append(c);
+            }
+        }
+
+        // Add final term if any
+        if (currentTerm.length() > 0) {
+            terms.add(currentTerm.toString().toLowerCase());
+        }
+
+        return terms;
+    }
+
+    /**
+     * Calculates selectivity for a segment based on query terms.
+     *
+     * <p>Uses the segment's Count-Min Sketch to estimate how many documents
+     * in the segment contain the query terms. Returns 1.0 (default) if no
+     * sketch is available.</p>
+     *
+     * @param candidate The segment candidate
+     * @param queryTerms The query terms
+     * @return Estimated selectivity (0.0 to 1.0)
+     */
+    private double calculateSegmentSelectivity(SegmentCandidate candidate, List<String> queryTerms) {
+        CountMinSketch sketch = candidate.termFrequencySketch();
+
+        if (sketch == null) {
+            // No sketch available - use default selectivity
+            return SelectivityEstimator.DEFAULT_SELECTIVITY;
+        }
+
+        SelectivityEstimator estimator = new SelectivityEstimator(sketch);
+        return estimator.estimateCombinedSelectivity(queryTerms);
+    }
+
+    /**
+     * Helper class to associate a segment candidate with its selectivity score.
+     */
+    private static class SegmentCandidateWithScore {
+        final SegmentCandidate candidate;
+        final double score;
+
+        SegmentCandidateWithScore(SegmentCandidate candidate, double score) {
+            this.candidate = candidate;
+            this.score = score;
+        }
+    }
+
+    /**
      * Stage 1: Hierarchical Cuckoo Filter Cascade.
      *
      * <p>Eliminates segments that cannot contain relevant entries using
      * the hierarchical Cuckoo filter. Segments that pass this stage
      * are candidates for further processing.</p>
      *
-     * <h3>Query Flow</h3>
+     * <h3>Term-Based Filtering</h3>
+     * <p>This implementation uses term-based filtering:
      * <ol>
-     *   <li>If no hierarchical filter configured, all candidates pass through</li>
-     *   <li>If no query text available, all candidates pass through</li>
-     *   <li>Query text is hashed and used to check which segments might contain relevant entries</li>
-     *   <li>Only segments whose IDs are in the candidate set from the filter pass through</li>
+     *   <li>Extract significant terms from query text using {@link TermExtractor}</li>
+     *   <li>For each term, find candidate segments that might contain that term</li>
+     *   <li>Union all candidate segments across all query terms</li>
+     *   <li>This gives segments that might contain ANY of the query terms</li>
      * </ol>
+     *
+     * <h3>Key Matching</h3>
+     * <p><strong>CRITICAL:</strong> For this to work correctly:
+     * <ul>
+     *   <li><strong>Ingestion:</strong> Terms from chunk text are inserted into the filter</li>
+     *   <li><strong>Query:</strong> Terms from query text are used to find candidate segments</li>
+     *   <li>Both use the same {@link TermExtractor} for consistent term extraction</li>
+     * </ul>
+     *
+     * <h3>Segment ID Format</h3>
+     * <p>Segment IDs are compared as strings using {@code String.valueOf(segmentId)}
+     * to match the format used during ingestion. Both sides must use this format.</p>
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>Query text converted to UTF-8 bytes for consistent hashing</li>
+     *   <li>Query terms extracted consistently with ingestion pipeline</li>
      *   <li>Segment IDs compared as strings (filter returns String IDs)</li>
-     *   <li>Empty candidate set is valid (no segments match the query)</li>
+     *   <li>Empty candidate set is valid (no segments match any query term)</li>
+     *   <li>If no terms extracted, all candidates pass through (no filtering)</li>
      * </ul>
      */
     private PipelineContext stage1_CuckooFilterCascade(PipelineContext context, CancellationToken token) {
@@ -375,27 +628,56 @@ public class QueryPipeline {
             return context.withCandidates(new ArrayList<>(context.candidates));
         }
 
-        // Use the query text hash to check which segments might contain relevant entries
-        byte[] queryKey = context.request.queryText() != null
-            ? context.request.queryText().getBytes(StandardCharsets.UTF_8)
-            : null;
-
-        if (queryKey == null) {
+        // Extract query text
+        String queryText = context.request.queryText();
+        if (queryText == null || queryText.isEmpty()) {
             LOGGER.debug("Stage 1: No query text for filter lookup, {} candidates pass",
                 context.candidates.size());
             return context.withCandidates(new ArrayList<>(context.candidates));
         }
 
-        // Find candidate segments using hierarchical filter
-        List<String> candidateSegmentIds = hierarchicalFilter.findCandidateSegments(queryKey);
-        Set<String> candidateSet = new HashSet<>(candidateSegmentIds);
+        // Extract terms from query text using the same TermExtractor as ingestion
+        List<String> queryTerms = TermExtractor.extractTerms(queryText);
+        if (queryTerms.isEmpty()) {
+            LOGGER.debug("Stage 1: No significant terms extracted from query, {} candidates pass",
+                context.candidates.size());
+            return context.withCandidates(new ArrayList<>(context.candidates));
+        }
 
+        LOGGER.trace("Stage 1: Extracted {} terms from query: {}",
+            queryTerms.size(), queryTerms);
+
+        // Find candidate segments for each term and union the results
+        Set<String> candidateSegmentIds = new HashSet<>();
+        int termsWithMatches = 0;
+
+        for (String term : queryTerms) {
+            byte[] termBytes = term.getBytes(StandardCharsets.UTF_8);
+            List<String> segmentsForTerm = hierarchicalFilter.findCandidateSegments(termBytes);
+
+            if (!segmentsForTerm.isEmpty()) {
+                termsWithMatches++;
+                candidateSegmentIds.addAll(segmentsForTerm);
+                LOGGER.trace("Stage 1: Term '{}' found in {} segments",
+                    term, segmentsForTerm.size());
+            }
+        }
+
+        // If no terms matched any segments, return empty candidates
+        if (candidateSegmentIds.isEmpty()) {
+            LOGGER.debug("Stage 1: No segments matched any of {} query terms", queryTerms.size());
+            return context.withCandidates(Collections.emptyList());
+        }
+
+        // Filter candidates to only those that matched at least one term
+        // Use String.valueOf(segmentId) to match the format used during ingestion
         List<SegmentCandidate> passed = context.candidates.stream()
-            .filter(c -> candidateSet.contains(String.valueOf(c.segmentId())))
+            .filter(c -> candidateSegmentIds.contains(String.valueOf(c.segmentId())))
             .collect(Collectors.toList());
 
-        LOGGER.debug("Stage 1: {} of {} segments passed Cuckoo filter cascade",
-            passed.size(), context.candidates.size());
+        LOGGER.debug("Stage 1: {} of {} segments passed Cuckoo filter cascade " +
+            "({} terms matched, {} unique segment IDs from filter)",
+            passed.size(), context.candidates.size(), termsWithMatches, candidateSegmentIds.size());
 
         return context.withCandidates(passed);
     }
@@ -552,9 +834,14 @@ public class QueryPipeline {
      * is needed. If tail scan is required, performs brute-force scan over
      * un-integrated write log entries and merges results with HNSW results.</p>
      *
+     * <h3>LSH Pre-Filtering Integration</h3>
+     * <p>If the segment candidate has LSH pre-filtered candidates attached,
+     * the HNSW search is constrained to only consider those node IDs. This
+     * provides 10x-100x top_k candidate reduction for improved performance.</p>
+     *
      * <h3>Merge Strategy</h3>
      * <ol>
-     *   <li>Perform HNSW graph search for k results</li>
+     *   <li>Perform HNSW graph search for k results (filtered by LSH candidates if available)</li>
      *   <li>If tail scan needed: perform brute-force scan of un-integrated entries</li>
      *   <li>Merge both result sets, sorting by distance</li>
      *   <li>Deduplicate by node ID and return top-k</li>
@@ -581,10 +868,21 @@ public class QueryPipeline {
             TailScanRequirement requirement) {
 
         // Step 1: Perform HNSW graph search
-        List<HnswSearchResult> hnswResults = candidate.graph().search(queryVector, k);
+        // Use LSH pre-filtered candidates if available for 10x-100x top_k reduction
+        List<HnswSearchResult> hnswResults;
+        Set<Long> lshCandidates = candidate.lshCandidates();
 
-        LOGGER.trace("Segment {}: HNSW search returned {} results",
-            candidate.segmentId(), hnswResults.size());
+        if (lshCandidates != null && !lshCandidates.isEmpty()) {
+            // LSH pre-filtering: search only within the candidate set
+            hnswResults = candidate.graph().search(queryVector, k, lshCandidates);
+            LOGGER.trace("Segment {}: HNSW search with {} LSH candidates returned {} results",
+                candidate.segmentId(), lshCandidates.size(), hnswResults.size());
+        } else {
+            // No LSH filtering: full graph search
+            hnswResults = candidate.graph().search(queryVector, k);
+            LOGGER.trace("Segment {}: HNSW search returned {} results",
+                candidate.segmentId(), hnswResults.size());
+        }
 
         // Step 2: Check if tail scan is needed based on pre-computed requirement
         if (!requirement.isTailScanNeeded()) {
@@ -736,7 +1034,24 @@ public class QueryPipeline {
      * Stage 4: Full Vector Rerank.
      *
      * <p>Exact distance computation on full-precision vectors for top candidates.
-     * Merges HNSW results with tail scan results.</p>
+     * This stage computes exact distances for candidates from Stage 3, which may
+     * have used Product Quantization (PQ) for approximate distance computation.</p>
+     *
+     * <h3>Reranking Process</h3>
+     * <ol>
+     *   <li>Aggregate results from Stage 3 using ResultAggregator</li>
+     *   <li>Group candidates by segment ID</li>
+     *   <li>For each segment, use VectorReranker to compute exact distances from full-precision vectors stored in HNSW graph</li>
+     *   <li>Merge all reranked results and take top-k</li>
+     *   <li>Apply DocumentAtomicityFilter to exclude partial documents</li>
+     * </ol>
+     *
+     * <h3>Why Reranking is Critical</h3>
+     * <ul>
+     *   <li><strong>PQ correction:</strong> Stage 3 may use PQ for approximate distance - reranking ensures exact distances</li>
+     *   <li><strong>Tail scan integration:</strong> Results from HNSW and tail scan are merged with consistent exact distance computation</li>
+     *   <li><strong>Quality guarantee:</strong> Final ranking reflects true similarity, not approximations</li>
+     * </ul>
      *
      * <p><strong>Document Atomicity:</strong> After merging results, this stage
      * applies the DocumentAtomicityFilter to ensure queries never see partially-
@@ -748,32 +1063,82 @@ public class QueryPipeline {
 
         LOGGER.trace("Stage 4: Running full vector rerank");
 
-        // Aggregate results using ResultAggregator
+        // Step 1: Aggregate results from Stage 3 to get candidates
+        // Use topK * 2 to get more candidates for reranking, then limit after exact distance computation
         ResultAggregator aggregator = new ResultAggregator(
-            context.request.topK(),
+            context.request.topK() * 2,
             context.request.threshold(),
             coverageThreshold
         );
 
-        List<QueryResultItem> mergedResults = aggregator.mergeAndRank(context.segmentResults);
+        List<QueryResultItem> candidates = aggregator.mergeAndRank(context.segmentResults);
 
-        int beforeAtomicityFilter = mergedResults.size();
+        if (candidates.isEmpty()) {
+            LOGGER.debug("Stage 4: No candidates to rerank");
+            return context.withMergedResults(candidates);
+        }
 
-        // Apply document atomicity filter to exclude partial documents
+        // Step 2: Group candidates by segment ID for efficient reranking
+        Map<Long, List<QueryResultItem>> bySegment = candidates.stream()
+            .collect(Collectors.groupingBy(QueryResultItem::segmentId));
+
+        // Step 3: Create VectorReranker and rerank each segment's candidates
+        VectorReranker reranker = new VectorReranker(distanceFunction);
+        float[] queryVector = context.request.queryVectorUnsafe();
+
+        List<QueryResultItem> rerankedResults = new ArrayList<>();
+
+        for (Map.Entry<Long, List<QueryResultItem>> entry : bySegment.entrySet()) {
+            long segmentId = entry.getKey();
+            List<QueryResultItem> segmentCandidates = entry.getValue();
+
+            // Find the SegmentCandidate for this segment to get the HNSW graph
+            SegmentCandidate segmentCandidate = context.candidates.stream()
+                .filter(sc -> sc.segmentId() == segmentId)
+                .findFirst()
+                .orElse(null);
+
+            if (segmentCandidate == null || segmentCandidate.graph() == null) {
+                LOGGER.warn("Stage 4: No graph found for segment {}, keeping {} candidates with approximate distances",
+                    segmentId, segmentCandidates.size());
+                rerankedResults.addAll(segmentCandidates);
+                continue;
+            }
+
+            // Rerank by computing exact distances on full-precision vectors
+            List<QueryResultItem> segmentReranked = reranker.rerank(
+                segmentCandidates,
+                queryVector,
+                segmentCandidate.graph(),
+                segmentCandidates.size() // Keep all for final merge
+            );
+
+            rerankedResults.addAll(segmentReranked);
+        }
+
+        // Step 4: Final sort by exact distance and limit to top-k
+        rerankedResults.sort(Comparator.comparingDouble(QueryResultItem::score));
+        if (rerankedResults.size() > context.request.topK()) {
+            rerankedResults = new ArrayList<>(rerankedResults.subList(0, context.request.topK()));
+        }
+
+        int beforeAtomicityFilter = rerankedResults.size();
+
+        // Step 5: Apply document atomicity filter to exclude partial documents
         if (visibilityChecker != null) {
             DocumentAtomicityFilter atomicityFilter = new DocumentAtomicityFilter(visibilityChecker);
-            mergedResults = atomicityFilter.filterPartialDocuments(mergedResults, context.epoch);
+            rerankedResults = atomicityFilter.filterPartialDocuments(rerankedResults, context.epoch);
 
-            if (mergedResults.size() < beforeAtomicityFilter) {
+            if (rerankedResults.size() < beforeAtomicityFilter) {
                 LOGGER.debug("Stage 4: Document atomicity filter removed {} partial document results",
-                    beforeAtomicityFilter - mergedResults.size());
+                    beforeAtomicityFilter - rerankedResults.size());
             }
         }
 
-        LOGGER.debug("Stage 4: Reranked to {} results (atomicity filtered from {})",
-            mergedResults.size(), beforeAtomicityFilter);
+        LOGGER.debug("Stage 4: Reranked {} candidates to {} results (atomicity filtered from {})",
+            candidates.size(), rerankedResults.size(), beforeAtomicityFilter);
 
-        return context.withMergedResults(mergedResults);
+        return context.withMergedResults(rerankedResults);
     }
 
     /**

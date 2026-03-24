@@ -3,6 +3,7 @@ package excalibur.api.server;
 import excalibur.api.endpoint.HealthEndpoint;
 import excalibur.api.endpoint.StatsEndpoint;
 import excalibur.query.pipeline.QueryPipeline;
+import excalibur.shard.EpochTickScheduler;
 import excalibur.shard.IndexOrchestrator;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
@@ -45,13 +46,17 @@ class ExcaliburDBServerTest {
     @BeforeEach
     void setUp() throws IOException {
         segmentCatalog = new SegmentCatalog();
-        
+
         indexOrchestrator = mock(IndexOrchestrator.class);
         storageEngine = mock(StorageEngine.class);
         queryPipeline = mock(QueryPipeline.class);
 
         var visibilityTracker = new excalibur.shard.VisibilityTracker(segmentCatalog);
+        var epochTickScheduler = mock(EpochTickScheduler.class);
+
         when(indexOrchestrator.getVisibilityTracker()).thenReturn(visibilityTracker);
+        when(indexOrchestrator.getEpochTickScheduler()).thenReturn(epochTickScheduler);
+        when(epochTickScheduler.getTickIntervalMs()).thenReturn(100L);
         when(storageEngine.getCatalog()).thenReturn(segmentCatalog);
         when(indexOrchestrator.getHnswQueueDepth()).thenReturn(0L);
         when(indexOrchestrator.getHnswQueueDepthLimit()).thenReturn(100000);
@@ -83,10 +88,27 @@ class ExcaliburDBServerTest {
         }
 
         @Test
+        @DisplayName("starts index orchestrator when server starts")
+        void startsIndexOrchestrator() {
+            // Verify that indexOrchestrator.start() was called during server startup
+            // This ensures the epoch tick scheduler is started automatically
+            verify(indexOrchestrator).start();
+        }
+
+        @Test
         @DisplayName("stops successfully")
         void stopsSuccessfully() throws IOException {
             server.stop(1);
             assertThat(server.isRunning()).isFalse();
+        }
+
+        @Test
+        @DisplayName("closes index orchestrator when server stops")
+        void closesIndexOrchestrator() {
+            server.stop(1);
+            // Verify that indexOrchestrator.close() was called during server shutdown
+            // This ensures the epoch tick scheduler is stopped cleanly
+            verify(indexOrchestrator).close();
         }
 
         @Test
@@ -304,6 +326,127 @@ class ExcaliburDBServerTest {
             HttpURLConnection conn = connect("POST", "/v1/stats");
             assertThat(conn.getResponseCode()).isEqualTo(405);
             conn.disconnect();
+        }
+    }
+
+    @Nested
+    @DisplayName("LLM Scorer configuration")
+    class LlmScorerTests {
+
+        @Test
+        @DisplayName("accepts LLM scorer before start")
+        void acceptsLlmScorerBeforeStart() throws IOException {
+            // Create a new server instance (not the one started in setUp)
+            ExcaliburDBServer testServer = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+
+            // Create a mock LLM scorer
+            excalibur.query.pipeline.QueryPipeline.LlmScorer mockScorer =
+                mock(excalibur.query.pipeline.QueryPipeline.LlmScorer.class);
+
+            // Should be able to configure LLM scorer before start
+            assertThatCode(() -> testServer.withLlmScorer(mockScorer))
+                .doesNotThrowAnyException();
+
+            // Cleanup
+            testServer.stop(0);
+        }
+
+        @Test
+        @DisplayName("accepts null LLM scorer to disable LLM scoring")
+        void acceptsNullLlmScorer() throws IOException {
+            ExcaliburDBServer testServer = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+
+            // Should accept null to disable LLM scoring
+            assertThatCode(() -> testServer.withLlmScorer(null))
+                .doesNotThrowAnyException();
+
+            testServer.stop(0);
+        }
+
+        @Test
+        @DisplayName("rejects LLM scorer configuration after server started")
+        void rejectsLlmScorerAfterStart() {
+            excalibur.query.pipeline.QueryPipeline.LlmScorer mockScorer =
+                mock(excalibur.query.pipeline.QueryPipeline.LlmScorer.class);
+
+            // Server is already started in setUp, so this should fail
+            assertThatThrownBy(() -> server.withLlmScorer(mockScorer))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Cannot configure LLM scorer after server has started");
+        }
+    }
+
+    @Nested
+    @DisplayName("Reindexer configuration")
+    class ReindexerTests {
+
+        @Test
+        @DisplayName("accepts reindexer configuration before start")
+        void acceptsReindexerBeforeStart() throws IOException {
+            // Create a new server instance (not the one started in setUp)
+            ExcaliburDBServer testServer = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+
+            // Create mock reindexer components
+            excalibur.ingest.pipeline.DocumentReindexer mockReindexer =
+                mock(excalibur.ingest.pipeline.DocumentReindexer.class);
+            excalibur.ingest.source.SourceResolver mockResolver =
+                mock(excalibur.ingest.source.SourceResolver.class);
+
+            // Should be able to configure reindexer before start
+            assertThatCode(() -> testServer.withReindexer(mockReindexer, mockResolver))
+                .doesNotThrowAnyException();
+
+            // Cleanup
+            testServer.stop(0);
+        }
+
+        @Test
+        @DisplayName("accepts null reindexer to disable actual reindexing")
+        void acceptsNullReindexer() throws IOException {
+            ExcaliburDBServer testServer = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+
+            // Should accept null to disable reindexing (stub mode)
+            assertThatCode(() -> testServer.withReindexer(null, null))
+                .doesNotThrowAnyException();
+
+            testServer.stop(0);
+        }
+
+        @Test
+        @DisplayName("rejects partial reindexer configuration (only one null)")
+        void rejectsPartialReindexerConfig() throws IOException {
+            ExcaliburDBServer testServer = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+
+            excalibur.ingest.pipeline.DocumentReindexer mockReindexer =
+                mock(excalibur.ingest.pipeline.DocumentReindexer.class);
+            excalibur.ingest.source.SourceResolver mockResolver =
+                mock(excalibur.ingest.source.SourceResolver.class);
+
+            // Should reject when only reindexer is provided
+            assertThatThrownBy(() -> testServer.withReindexer(mockReindexer, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must both be null or both be non-null");
+
+            // Should reject when only resolver is provided
+            assertThatThrownBy(() -> testServer.withReindexer(null, mockResolver))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must both be null or both be non-null");
+
+            testServer.stop(0);
+        }
+
+        @Test
+        @DisplayName("rejects reindexer configuration after server started")
+        void rejectsReindexerAfterStart() {
+            excalibur.ingest.pipeline.DocumentReindexer mockReindexer =
+                mock(excalibur.ingest.pipeline.DocumentReindexer.class);
+            excalibur.ingest.source.SourceResolver mockResolver =
+                mock(excalibur.ingest.source.SourceResolver.class);
+
+            // Server is already started in setUp, so this should fail
+            assertThatThrownBy(() -> server.withReindexer(mockReindexer, mockResolver))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Cannot configure reindexer after server has started");
         }
     }
 

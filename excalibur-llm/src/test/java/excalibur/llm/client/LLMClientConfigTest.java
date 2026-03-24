@@ -1,11 +1,14 @@
 package excalibur.llm.client;
 
+import io.excalibur.config.Config;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -380,6 +383,103 @@ class LLMClientConfigTest {
 
             // The returned Duration should be equal to what we set
             assertEquals(originalCooldown, config.getCooldownPeriod());
+        }
+    }
+
+    @Nested
+    @DisplayName("Config.Llm Integration")
+    class ConfigLlmIntegrationTests {
+
+        @Test
+        @DisplayName("fromConfig() creates LLMClientConfig from Config.Llm")
+        void fromConfigCreatesLlmClientConfigFromConfigLlm() {
+            // Create a Config.Llm with custom values
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.llm.base-url", "https://api.custom.com/v1");
+            props.put("excalibur.llm.api-key", "test-api-key");
+            props.put("excalibur.llm.chat-model", "gpt-4");
+            props.put("excalibur.llm.embedding-model", "text-embedding-3-large");
+            props.put("excalibur.llm.embeddings-dimensions", "3072");
+            props.put("excalibur.llm.timeout-ms", "120000");
+            props.put("excalibur.llm.max-retries", "5");
+            props.put("excalibur.llm.failure-threshold", "10");
+            props.put("excalibur.llm.cooldown-period-ms", "90000");
+            props.put("excalibur.llm.max-prompts-per-query", "20");
+            props.put("excalibur.llm.relevancy-threshold", "0.5");
+            props.put("excalibur.llm.max-batch-tokens", "8000");
+
+            Config config = new Config(props);
+            Config.Llm llmConfig = config.llm();
+
+            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+
+            // Verify all values are correctly mapped
+            assertEquals("https://api.custom.com/v1", clientConfig.getBaseUrl());
+            assertEquals("test-api-key", clientConfig.getApiKey());
+            assertEquals("gpt-4", clientConfig.getChatModel());
+            assertEquals("text-embedding-3-large", clientConfig.getEmbeddingModel());
+            assertEquals(Duration.ofMillis(120000), clientConfig.getTimeout());
+            assertEquals(5, clientConfig.getMaxRetries());
+            assertEquals(10, clientConfig.getFailureThreshold());
+            assertEquals(Duration.ofMillis(90000), clientConfig.getCooldownPeriod());
+            assertEquals(20, clientConfig.getMaxPromptsPerQuery());
+            assertEquals(0.5, clientConfig.getRelevancyThreshold(), 0.001);
+            assertEquals(3072, clientConfig.getEmbeddingDimension());
+            assertEquals(8000, clientConfig.getMaxBatchTokens());
+        }
+
+        @Test
+        @DisplayName("fromConfig() uses defaults for missing properties")
+        void fromConfigUsesDefaultsForMissingProperties() {
+            // Create Config.Llm with minimal properties
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.llm.base-url", "http://localhost:11434");
+
+            Config config = new Config(props);
+            Config.Llm llmConfig = config.llm();
+
+            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+
+            // Verify defaults are applied
+            assertEquals("http://localhost:11434", clientConfig.getBaseUrl());
+            assertEquals("", clientConfig.getApiKey());
+            assertEquals(Config.Llm.DEFAULT_CHAT_MODEL, clientConfig.getChatModel());
+            assertEquals(Config.Llm.DEFAULT_EMBEDDING_MODEL, clientConfig.getEmbeddingModel());
+            assertEquals(Duration.ofMillis(Config.Llm.DEFAULT_TIMEOUT_MS), clientConfig.getTimeout());
+            assertEquals(Config.Llm.DEFAULT_MAX_RETRIES, clientConfig.getMaxRetries());
+            assertEquals(Config.Llm.DEFAULT_FAILURE_THRESHOLD, clientConfig.getFailureThreshold());
+            assertEquals(Duration.ofMillis(Config.Llm.DEFAULT_COOLDOWN_PERIOD_MS), clientConfig.getCooldownPeriod());
+            assertEquals(Config.Llm.DEFAULT_MAX_PROMPTS_PER_QUERY, clientConfig.getMaxPromptsPerQuery());
+            assertEquals(Config.Llm.DEFAULT_RELEVANCY_THRESHOLD, clientConfig.getRelevancyThreshold(), 0.001);
+            assertEquals(Config.Llm.DEFAULT_EMBEDDINGS_DIMENSIONS, clientConfig.getEmbeddingDimension());
+            assertEquals(Config.Llm.DEFAULT_MAX_BATCH_TOKENS, clientConfig.getMaxBatchTokens());
+        }
+
+        @Test
+        @DisplayName("fromConfig() throws NullPointerException for null input")
+        void fromConfigThrowsNullPointerExceptionForNullInput() {
+            assertThrows(
+                NullPointerException.class,
+                () -> LLMClientConfig.fromConfig(null)
+            );
+        }
+
+        @Test
+        @DisplayName("fromConfig() validates all values through builder")
+        void fromConfigValidatesAllValuesThroughBuilder() {
+            // Create Config.Llm with invalid values
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.llm.base-url", "https://api.test.com");
+            props.put("excalibur.llm.failure-threshold", "0"); // Invalid: must be >= 1
+
+            Config config = new Config(props);
+            Config.Llm llmConfig = config.llm();
+
+            // Should throw due to validation in the builder
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> LLMClientConfig.fromConfig(llmConfig)
+            );
         }
     }
 }

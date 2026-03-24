@@ -1,23 +1,32 @@
 package io.excalibur.core.memory;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 
 /**
- * Compatibility interface for memory segment operations.
- * This provides a common API that can be implemented by either
- * Panama FFI MemorySegment or fallback implementations.
+ * Deprecated memory segment interface - use {@link Segment} instead.
  *
- * <h2>Thread Safety</h2>
- * <p>Read operations on MemorySegment instances are thread-safe and may be
- * performed concurrently from multiple threads. Write operations require
- * external synchronization to ensure thread safety. Implementations should
- * document any additional thread-safety guarantees.</p>
+ * <p>This interface exists for backward compatibility only. All new code should
+ * use the {@link Segment} interface directly, which provides the same functionality
+ * with better support for both Panama FFM and fallback implementations.</p>
+ *
+ * <h2>Migration Guide</h2>
+ * <p>Replace:</p>
+ * <pre>
+ * import io.excalibur.core.memory.MemorySegment;
+ * </pre>
+ * <p>With:</p>
+ * <pre>
+ * import io.excalibur.core.memory.Segment;
+ * </pre>
+ *
+ * @author ExcaliburDB
+ * @deprecated Use {@link Segment} instead. This interface will be removed in a future version.
+ * @see Segment
+ * @see MemorySegmentFactory
  */
-public interface MemorySegment {
+@Deprecated(since = "1.1", forRemoval = true)
+public interface MemorySegment extends Segment {
 
     /**
      * Maps a file into memory.
@@ -26,57 +35,15 @@ public interface MemorySegment {
      * @param size The size of the mapping
      * @return A memory segment backed by the file
      * @throws IOException if mapping fails
+     * @deprecated Use {@link MemorySegmentFactory#mapFile(Path, long)} instead
      */
+    @Deprecated(since = "1.1", forRemoval = true)
     static MemorySegment mapFile(Path path, long size) throws IOException {
-        // Use FallbackMemorySegment by default
-        return FallbackMemorySegment.mapFile(path, size);
+        Segment segment = MemorySegmentFactory.mapFile(path, size);
+        if (segment instanceof MemorySegment) {
+            return (MemorySegment) segment;
+        }
+        // Wrap FallbackSegment in a backward-compatible adapter
+        return new MemorySegmentAdapter(segment);
     }
-
-    /**
-     * Returns the size of this memory segment in bytes.
-     *
-     * @return The size in bytes
-     */
-    long byteSize();
-
-    /**
-     * Reads bytes from the specified offset.
-     *
-     * @param offset The starting offset
-     * @param length The number of bytes to read
-     * @return The bytes read
-     */
-    byte[] read(int offset, int length);
-
-    /**
-     * Returns a slice of this memory segment.
-     *
-     * @param offset The starting offset
-     * @param length The length of the slice
-     * @return A new memory segment representing the slice
-     */
-    MemorySegment asSlice(long offset, long length);
-
-    /**
-     * Writes bytes to the specified offset.
-     *
-     * @param data The bytes to write
-     * @param offset The starting offset
-     * @param length The number of bytes to write
-     */
-    void put(byte[] data, int offset, int length);
-
-    /**
-     * Writes a ByteBuffer's contents to this segment.
-     *
-     * @param buffer The buffer to write
-     */
-    void put(ByteBuffer buffer);
-
-    /**
-     * Returns a FileChannel for this segment.
-     *
-     * @return The file channel
-     */
-    FileChannel toChannel();
 }

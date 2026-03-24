@@ -1,8 +1,9 @@
 package io.excalibur.core.allocator;
 
 import io.excalibur.core.exception.AllocationException;
-import io.excalibur.core.logger.LogManager;
-import io.excalibur.core.logger.Logger;
+import io.excalibur.core.memory.Segment;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -13,27 +14,33 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Bump allocator for file-backed memory regions using Panama FFM.
+ * Bump allocator for file-backed memory regions using the Segment abstraction.
  * Provides efficient allocation and deallocation within a memory segment.
  *
- * <p>This implementation uses MemorySegment slice and copy operations for zero-copy
+ * <p>This implementation uses Segment slice and copy operations for zero-copy
  * access to allocated regions, enabling high-performance disk-backed storage.</p>
+ *
+ * <h2>Implementation Details</h2>
+ * <p>The allocator accepts the {@link Segment} abstraction interface and uses
+ * {@link Segment#nativeSegment()} for Panama FFM-specific operations when
+ * available. For fallback segments, ByteBuffer-based operations are used via
+ * the Segment interface methods.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Allocation operations are thread-safe via atomic offset updates.
- * Read/write operations use the underlying MemorySegment's thread-safety guarantees.
+ * Read/write operations use the underlying Segment's thread-safety guarantees.
  * Concurrent reads are allowed, allocations use CAS for thread-safety.</p>
  *
  * @author ExcaliburDB
  */
 public class SegmentAllocator {
 
-    private static final LogManager logManager = LogManager.getInstance();
-    private static final Logger logger = logManager.getLogger(SegmentAllocator.class);
+    private static final Logger logger = LoggerFactory.getLogger(SegmentAllocator.class);
 
     private static final ValueLayout.OfByte BYTE_LAYOUT = ValueLayout.JAVA_BYTE;
 
-    private final MemorySegment segment;
+    private final Segment segment;
+    private final MemorySegment nativeSegment; // May be null for fallback segments
     private final long startOffset;
     private final long endOffset;
     private final long segmentSize;
@@ -45,20 +52,21 @@ public class SegmentAllocator {
     private final AtomicLong freeCount = new AtomicLong(0);
 
     /**
-     * Creates a new SegmentAllocator wrapping a MemorySegment.
+     * Creates a new SegmentAllocator wrapping a Segment.
      *
      * @param segment The memory segment to allocate within
      * @throws IllegalArgumentException if segment is null or empty
      */
-    public SegmentAllocator(MemorySegment segment) {
+    public SegmentAllocator(Segment segment) {
         if (segment == null) {
-            throw new IllegalArgumentException("MemorySegment must be non-null");
+            throw new IllegalArgumentException("Segment must be non-null");
         }
         if (segment.byteSize() == 0) {
-            throw new IllegalArgumentException("MemorySegment must have non-zero size");
+            throw new IllegalArgumentException("Segment must have non-zero size");
         }
 
         this.segment = segment;
+        this.nativeSegment = segment.nativeSegment(); // May be null for fallback
         this.startOffset = 0;
         this.endOffset = segment.byteSize();
         this.currentOffset = new AtomicLong(startOffset);
@@ -256,12 +264,30 @@ public class SegmentAllocator {
     }
 
     /**
-     * Gets the underlying segment.
+     * Gets the underlying Segment abstraction.
      *
-     * @return The MemorySegment
+     * @return The Segment
      */
-    public MemorySegment segment() {
+    public Segment segment() {
         return segment;
+    }
+
+    /**
+     * Gets the underlying native MemorySegment if Panama-backed.
+     *
+     * @return The native MemorySegment, or null if using fallback
+     */
+    public MemorySegment nativeSegment() {
+        return nativeSegment;
+    }
+
+    /**
+     * Checks if this allocator is backed by Panama FFM.
+     *
+     * @return true if using Panama FFM implementation
+     */
+    public boolean isPanama() {
+        return nativeSegment != null;
     }
 
     /**
@@ -316,9 +342,8 @@ public class SegmentAllocator {
                 "Read length exceeds region size: " + length + " > " + region.size());
         }
 
-        // Use MemorySegment.copy to read from segment into byte array
-        MemorySegment sourceSlice = segment.asSlice(region.offset(), length);
-        MemorySegment.copy(sourceSlice, BYTE_LAYOUT, 0, buffer, bufferOffset, length);
+        // Use Segment abstraction for reading
+        segment.copyTo(region.offset(), buffer, bufferOffset, length);
 
         return length;
     }
@@ -348,9 +373,8 @@ public class SegmentAllocator {
                 "Write length exceeds region size: " + length + " > " + region.size());
         }
 
-        // Use MemorySegment.copy to write from byte array into segment
-        MemorySegment destSlice = segment.asSlice(region.offset(), length);
-        MemorySegment.copy(buffer, bufferOffset, destSlice, BYTE_LAYOUT, 0, length);
+        // Use Segment abstraction for writing
+        segment.copyFrom(buffer, bufferOffset, region.offset(), length);
 
         return length;
     }
@@ -361,9 +385,9 @@ public class SegmentAllocator {
     public static final class AllocatedRegion {
         private final long offset;
         private final long size;
-        private final MemorySegment segment;
+        private final Segment segment;
 
-        AllocatedRegion(long offset, long size, MemorySegment segment) {
+        AllocatedRegion(long offset, long size, Segment segment) {
             this.offset = offset;
             this.size = size;
             this.segment = segment;
@@ -394,13 +418,13 @@ public class SegmentAllocator {
         }
 
         /**
-         * Gets a slice of this region as a MemorySegment.
+         * Gets a slice of this region as a Segment.
          *
          * @param sliceOffset Offset within this region
          * @param sliceLength Length of the slice
-         * @return A MemorySegment slice
+         * @return A Segment slice
          */
-        public MemorySegment slice(long sliceOffset, long sliceLength) {
+        public Segment slice(long sliceOffset, long sliceLength) {
             if (sliceOffset < 0 || sliceLength < 0 || sliceOffset + sliceLength > size) {
                 throw new IllegalArgumentException("Invalid slice parameters");
             }
@@ -409,10 +433,47 @@ public class SegmentAllocator {
 
         /**
          * Gets a slice of the entire region.
-         * @return A MemorySegment slice covering the entire region
+         * @return A Segment slice covering the entire region
          */
-        public MemorySegment slice() {
+        public Segment slice() {
             return segment.asSlice(offset, size);
+        }
+
+        /**
+         * Gets a slice of this region as a native MemorySegment.
+         *
+         * <p><strong>Warning:</strong> This method returns null if the segment
+         * is not Panama-backed. Use {@link #slice()} for the abstraction.</p>
+         *
+         * @param sliceOffset Offset within this region
+         * @param sliceLength Length of the slice
+         * @return A native MemorySegment slice, or null if not Panama-backed
+         */
+        public MemorySegment nativeSlice(long sliceOffset, long sliceLength) {
+            if (sliceOffset < 0 || sliceLength < 0 || sliceOffset + sliceLength > size) {
+                throw new IllegalArgumentException("Invalid slice parameters");
+            }
+            MemorySegment nativeSeg = segment.nativeSegment();
+            if (nativeSeg == null) {
+                return null;
+            }
+            return nativeSeg.asSlice(offset + sliceOffset, sliceLength);
+        }
+
+        /**
+         * Gets a slice of the entire region as a native MemorySegment.
+         *
+         * <p><strong>Warning:</strong> This method returns null if the segment
+         * is not Panama-backed. Use {@link #slice()} for the abstraction.</p>
+         *
+         * @return A native MemorySegment slice, or null if not Panama-backed
+         */
+        public MemorySegment nativeSlice() {
+            MemorySegment nativeSeg = segment.nativeSegment();
+            if (nativeSeg == null) {
+                return null;
+            }
+            return nativeSeg.asSlice(offset, size);
         }
 
         @Override

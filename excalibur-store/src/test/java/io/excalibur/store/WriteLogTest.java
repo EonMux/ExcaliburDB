@@ -558,14 +558,14 @@ class WriteLogTest {
             // Attempt to decrease - should fail
             assertThatThrownBy(() -> writeLog.setLastIntegratedOffset(500L))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("monotonically increasing");
+                .hasMessageContaining("not go backwards");
 
             // Current value should remain unchanged
             assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1000L);
 
-            // Same value - should fail (not an increase)
-            assertThatThrownBy(() -> writeLog.setLastIntegratedOffset(1000L))
-                .isInstanceOf(IllegalStateException.class);
+            // Same value - should succeed (idempotent operation)
+            writeLog.setLastIntegratedOffset(1000L);
+            assertThat(writeLog.getLastIntegratedOffset()).isEqualTo(1000L);
 
             // Increase - should succeed
             writeLog.setLastIntegratedOffset(1500L);

@@ -1,5 +1,7 @@
 package io.excalibur.store.format;
 
+import io.excalibur.core.memory.Segment;
+
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
@@ -398,6 +400,160 @@ public final class LogEntry {
         int computedCrc = computeCrc32(segment, offset, HEADER_SIZE + keyLen + valueLen);
 
         return storedCrc == computedCrc;
+    }
+
+    // ==================== Segment Abstraction Overloads ====================
+
+    /**
+     * Reads a log entry from a Segment at the specified offset.
+     *
+     * <p>This method validates the CRC32 checksum before returning the entry.
+     * Uses the Segment abstraction interface for memory access.</p>
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return The entry read from the segment
+     * @throws IndexOutOfBoundsException if offset is invalid or entry extends beyond segment
+     * @throws NullPointerException if segment is null
+     * @throws IllegalStateException if CRC32 validation fails
+     */
+    public static LogEntry readFrom(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        // Read header fields using Segment interface
+        byte opcode = segment.getByte(offset + OPCODE_OFFSET);
+        long lsn = segment.getLong(offset + LSN_OFFSET);
+        long timestamp = segment.getLong(offset + TIMESTAMP_OFFSET);
+        long keyHash = segment.getLong(offset + KEY_HASH_OFFSET);
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        int valueLen = segment.getInt(offset + VALUE_LEN_OFFSET);
+
+        // Read variable-length key bytes
+        byte[] key = segment.getBytes(offset + KEY_BYTES_OFFSET, keyLen);
+
+        // Read variable-length value bytes
+        byte[] value = segment.getBytes(offset + KEY_BYTES_OFFSET + keyLen, valueLen);
+
+        // Read CRC32 (little-endian)
+        long crcOffset = offset + KEY_BYTES_OFFSET + keyLen + valueLen;
+        int storedCrc = segment.getInt(crcOffset);
+
+        // Compute and validate CRC32
+        int computedCrc = computeCrc32(segment, offset, HEADER_SIZE + keyLen + valueLen);
+        if (storedCrc != computedCrc) {
+            throw new IllegalStateException(
+                "CRC32 validation failed at offset " + offset +
+                ". Stored: 0x" + Integer.toHexString(storedCrc) +
+                ", Computed: 0x" + Integer.toHexString(computedCrc));
+        }
+
+        return new LogEntry(opcode, lsn, timestamp, keyHash, key, value, offset);
+    }
+
+    /**
+     * Reads a log entry from a Segment without CRC32 validation.
+     *
+     * @param segment The segment to read from
+     * @param offset  The byte offset within the segment
+     * @return The entry read from the segment
+     */
+    public static LogEntry readFromUnchecked(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        byte opcode = segment.getByte(offset + OPCODE_OFFSET);
+        long lsn = segment.getLong(offset + LSN_OFFSET);
+        long timestamp = segment.getLong(offset + TIMESTAMP_OFFSET);
+        long keyHash = segment.getLong(offset + KEY_HASH_OFFSET);
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        int valueLen = segment.getInt(offset + VALUE_LEN_OFFSET);
+
+        byte[] key = segment.getBytes(offset + KEY_BYTES_OFFSET, keyLen);
+        byte[] value = segment.getBytes(offset + KEY_BYTES_OFFSET + keyLen, valueLen);
+
+        return new LogEntry(opcode, lsn, timestamp, keyHash, key, value, offset);
+    }
+
+    /**
+     * Validates CRC32 checksum of an entry in a Segment.
+     *
+     * @param segment The segment
+     * @param offset  The byte offset of the entry
+     * @return true if CRC32 is valid, false otherwise
+     */
+    public static boolean validateCrc32(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        int valueLen = segment.getInt(offset + VALUE_LEN_OFFSET);
+
+        long crcOffset = offset + KEY_BYTES_OFFSET + keyLen + valueLen;
+        int storedCrc = segment.getInt(crcOffset);
+
+        int computedCrc = computeCrc32(segment, offset, HEADER_SIZE + keyLen + valueLen);
+
+        return storedCrc == computedCrc;
+    }
+
+    /**
+     * Calculates the size of a log entry at the given offset in a Segment.
+     *
+     * @param segment The segment
+     * @param offset  The byte offset of the entry
+     * @return Total entry size in bytes
+     */
+    public static int sizeAt(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        int keyLen = segment.getInt(offset + KEY_LEN_OFFSET);
+        int valueLen = segment.getInt(offset + VALUE_LEN_OFFSET);
+        return calculateSize(keyLen, valueLen);
+    }
+
+    /**
+     * Writes this entry to a Segment at the specified offset.
+     *
+     * <p>This method computes and writes the CRC32 checksum at the end of the entry.</p>
+     *
+     * @param segment The segment to write to
+     * @param offset  The byte offset within the segment
+     * @throws IndexOutOfBoundsException if offset is invalid or entry extends beyond segment
+     * @throws NullPointerException if segment is null
+     */
+    public void writeTo(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+
+        // Write fixed header fields
+        segment.setByte(offset + OPCODE_OFFSET, opcode);
+        segment.setLong(offset + LSN_OFFSET, lsn);
+        segment.setLong(offset + TIMESTAMP_OFFSET, timestamp);
+        segment.setLong(offset + KEY_HASH_OFFSET, keyHash);
+        segment.setInt(offset + KEY_LEN_OFFSET, key.length);
+        segment.setInt(offset + VALUE_LEN_OFFSET, value.length);
+
+        // Write variable-length key bytes
+        segment.setBytes(offset + KEY_BYTES_OFFSET, key);
+
+        // Write variable-length value bytes
+        segment.setBytes(offset + KEY_BYTES_OFFSET + key.length, value);
+
+        // Compute and write CRC32
+        int crc32 = computeCrc32(segment, offset, HEADER_SIZE + key.length + value.length);
+        segment.setInt(offset + KEY_BYTES_OFFSET + key.length + value.length, crc32);
+    }
+
+    /**
+     * Computes CRC32 checksum of the entry data using Segment abstraction.
+     *
+     * @param segment The segment
+     * @param offset  The byte offset of the entry
+     * @param dataLen The length of data to checksum (header + key + value)
+     * @return The CRC32 checksum value
+     */
+    private static int computeCrc32(Segment segment, long offset, int dataLen) {
+        CRC32 crc = new CRC32();
+        byte[] data = segment.getBytes(offset, dataLen);
+        crc.update(data);
+        return (int) crc.getValue();
     }
 
     // ==================== Write Methods ====================

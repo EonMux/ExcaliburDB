@@ -118,19 +118,36 @@ class QueryOptionsTest {
         }
 
         @Test
-        @DisplayName("accepts negative threshold")
-        void acceptsNegativeThreshold() {
-            // Threshold can be negative for distance-based metrics
-            QueryOptions options = QueryOptions.builder().threshold(-1.0f).build();
-            assertThat(options.threshold()).isEqualTo(-1.0f);
+        @DisplayName("accepts threshold in valid range")
+        void acceptsValidThreshold() {
+            QueryOptions options = QueryOptions.builder().threshold(0.5f).build();
+            assertThat(options.threshold()).isEqualTo(0.5f);
         }
 
         @Test
-        @DisplayName("accepts threshold greater than 1.0")
-        void acceptsThresholdGreaterThanOne() {
-            // Threshold can be > 1 for some distance functions
-            QueryOptions options = QueryOptions.builder().threshold(5.0f).build();
-            assertThat(options.threshold()).isEqualTo(5.0f);
+        @DisplayName("rejects negative threshold")
+        void rejectsNegativeThreshold() {
+            // Domain correctness: threshold must be in [0.0, 1.0] since relevancy scores are in this range
+            assertThatThrownBy(() -> QueryOptions.builder().threshold(-1.0f))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Threshold must be in [0.0, 1.0]");
+        }
+
+        @Test
+        @DisplayName("rejects threshold greater than 1.0")
+        void rejectsThresholdGreaterThanOne() {
+            // Domain correctness: threshold must be in [0.0, 1.0] since relevancy scores are in this range
+            assertThatThrownBy(() -> QueryOptions.builder().threshold(5.0f))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Threshold must be in [0.0, 1.0]");
+        }
+
+        @Test
+        @DisplayName("rejects NaN threshold")
+        void rejectsNaNThreshold() {
+            assertThatThrownBy(() -> QueryOptions.builder().threshold(Float.NaN))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Threshold cannot be NaN");
         }
     }
 

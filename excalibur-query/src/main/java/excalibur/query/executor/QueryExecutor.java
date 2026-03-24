@@ -345,7 +345,11 @@ public class QueryExecutor {
         }
 
         // Step 1: Perform HNSW graph search
-        List<HnswSearchResult> hnswResults = graph.search(queryVector, k * 2); // Get extra for merging
+        // Use searchWithPQ to enable PQ fallback for cold segments (untrained codebook)
+        // This implements the PQ graceful fallback requirement from the specification:
+        // "if codebook is not yet trained (cold segment), distance computation uses
+        // full-precision vectors"
+        List<HnswSearchResult> hnswResults = graph.searchWithPQ(queryVector, k * 2); // Get extra for merging
 
         LOGGER.trace("HNSW search returned {} results", hnswResults.size());
 

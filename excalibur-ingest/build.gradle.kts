@@ -16,6 +16,9 @@ dependencies {
     testImplementation("org.mockito:mockito-core:5.14.2")
     testImplementation("org.mockito:mockito-junit-jupiter:5.14.2")
 
+    // Phase 1 (Core primitives - TermExtractor for text processing)
+    implementation(project(":excalibur-core"))
+
     // Phase 2, 3, 4, 5, 7 dependencies
     implementation(project(":excalibur-store"))
     implementation(project(":excalibur-filter"))

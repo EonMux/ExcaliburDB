@@ -1,8 +1,11 @@
 package excalibur.shard.allocator;
 
 import io.excalibur.store.SegmentCatalog;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -11,6 +14,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
@@ -50,6 +54,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * @see SegmentCatalog
  */
 public class VolumeManager {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(VolumeManager.class);
 
     /**
      * Default number of virtual nodes per volume.
@@ -146,8 +152,8 @@ public class VolumeManager {
                 return volumeId;
             }
 
-            // Initialize segment tracking for this volume
-            volumeToSegments.computeIfAbsent(volumePath, k -> new ArrayList<>());
+            // Initialize segment tracking for this volume (CopyOnWriteArrayList for thread-safe reads)
+            volumeToSegments.computeIfAbsent(volumePath, k -> new CopyOnWriteArrayList<>());
 
             // Register with catalog if available
             if (catalog != null) {
@@ -448,8 +454,8 @@ public class VolumeManager {
         // Update segment -> volume mapping
         segmentToVolume.put(segmentId, volumePath);
 
-        // Update volume -> segments mapping
-        volumeToSegments.computeIfAbsent(volumePath, k -> new ArrayList<>())
+        // Update volume -> segments mapping (CopyOnWriteArrayList for thread-safety)
+        volumeToSegments.computeIfAbsent(volumePath, k -> new CopyOnWriteArrayList<>())
             .add(segmentId);
     }
 
@@ -525,6 +531,252 @@ public class VolumeManager {
         public String toString() {
             return String.format("Statistics{volumes=%d, segments=%d, activeVolumes=%d}",
                 volumeCount, totalSegments, activeVolumes);
+        }
+    }
+
+    // ==================== Disk Space Tracking ====================
+
+    /**
+     * Record representing disk space statistics for a volume.
+     *
+     * <p>Domain correctness guarantees:</p>
+     * <ul>
+     *   <li>All byte values are non-negative</li>
+     *   <li>usedBytes = totalBytes - availableBytes (when file system reports correctly)</li>
+     *   <li>Values represent actual disk capacity, not directory metadata size</li>
+     * </ul>
+     *
+     * @param totalBytes     Total disk capacity in bytes
+     * @param usedBytes      Used disk space in bytes (total - available)
+     * @param availableBytes Available disk space for the JVM in bytes
+     */
+    public record VolumeStats(
+        long totalBytes,
+        long usedBytes,
+        long availableBytes
+    ) {
+        /**
+         * Validates domain constraints on construction.
+         *
+         * @throws IllegalArgumentException if any value is negative
+         */
+        public VolumeStats {
+            if (totalBytes < 0) {
+                throw new IllegalArgumentException("totalBytes must be non-negative: " + totalBytes);
+            }
+            if (usedBytes < 0) {
+                throw new IllegalArgumentException("usedBytes must be non-negative: " + usedBytes);
+            }
+            if (availableBytes < 0) {
+                throw new IllegalArgumentException("availableBytes must be non-negative: " + availableBytes);
+            }
+        }
+
+        /**
+         * Returns the usage ratio (used / total).
+         *
+         * @return Usage ratio in range [0.0, 1.0], or 0.0 if total is 0
+         */
+        public double usageRatio() {
+            if (totalBytes == 0) {
+                return 0.0;
+            }
+            return Math.min(1.0, (double) usedBytes / totalBytes);
+        }
+
+        /**
+         * Returns the available ratio (available / total).
+         *
+         * @return Available ratio in range [0.0, 1.0], or 1.0 if total is 0
+         */
+        public double availableRatio() {
+            if (totalBytes == 0) {
+                return 1.0;
+            }
+            return Math.max(0.0, Math.min(1.0, (double) availableBytes / totalBytes));
+        }
+
+        @Override
+        public String toString() {
+            return String.format("VolumeStats{total=%d GB, used=%d GB, available=%d GB, usage=%.1f%%}",
+                totalBytes / (1024 * 1024 * 1024),
+                usedBytes / (1024 * 1024 * 1024),
+                availableBytes / (1024 * 1024 * 1024),
+                usageRatio() * 100);
+        }
+    }
+
+    /**
+     * Gets disk space statistics for a specific volume.
+     *
+     * <p>Uses {@link Files#getFileStore(Path)} to retrieve actual disk capacity
+     * and usage information, not directory metadata size.</p>
+     *
+     * <p><strong>Domain Correctness:</strong></p>
+     * <ul>
+     *   <li>totalBytes: Total disk capacity from {@link FileStore#getTotalSpace()}</li>
+     *   <li>availableBytes: Available space for JVM from {@link FileStore#getUsableSpace()}</li>
+     *   <li>usedBytes: Computed as totalBytes - availableBytes</li>
+     * </ul>
+     *
+     * @param volumePath The path to the volume directory
+     * @return VolumeStats with disk space information, or null if the volume doesn't exist or an error occurs
+     * @throws NullPointerException if volumePath is null
+     */
+    public VolumeStats getVolumeStats(Path volumePath) {
+        if (volumePath == null) {
+            throw new NullPointerException("Volume path cannot be null");
+        }
+
+        // Check if volume is registered
+        if (!hasVolume(volumePath)) {
+            return null;
+        }
+
+        try {
+            // Use Files.getFileStore() to get actual disk information
+            // This returns the file store for the underlying filesystem,
+            // not the directory metadata size
+            FileStore store = Files.getFileStore(volumePath);
+
+            long totalBytes = store.getTotalSpace();
+            long availableBytes = store.getUsableSpace();
+            long usedBytes = totalBytes - availableBytes;
+
+            // Ensure non-negative usedBytes (can happen with quotas or special filesystems)
+            usedBytes = Math.max(0, usedBytes);
+
+            return new VolumeStats(totalBytes, usedBytes, availableBytes);
+        } catch (IOException e) {
+            LOGGER.debug("Could not get file store for volume {}: {}", volumePath, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Gets disk space statistics for all registered volumes.
+     *
+     * <p>Aggregates statistics from all volumes registered with this manager.
+     * Volumes that cannot be queried are excluded from the result.</p>
+     *
+     * <p><strong>Thread Safety:</strong> This method acquires a read lock to
+     * safely iterate over registered volumes.</p>
+     *
+     * @return Map of volume path to VolumeStats, never null
+     */
+    public Map<Path, VolumeStats> getAllVolumeStats() {
+        Map<Path, VolumeStats> stats = new HashMap<>();
+
+        lock.readLock().lock();
+        try {
+            for (Path volumePath : volumeToSegments.keySet()) {
+                VolumeStats volumeStats = getVolumeStatsInternal(volumePath);
+                if (volumeStats != null) {
+                    stats.put(volumePath, volumeStats);
+                }
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+
+        return stats;
+    }
+
+    /**
+     * Gets aggregated disk space statistics across all volumes.
+     *
+     * <p>Computes the sum of total, used, and available bytes across all
+     * registered volumes. This is useful for monitoring overall storage health.</p>
+     *
+     * @return Aggregated VolumeStats, or VolumeStats(0, 0, 0) if no volumes registered
+     */
+    public VolumeStats getAggregatedVolumeStats() {
+        Map<Path, VolumeStats> allStats = getAllVolumeStats();
+
+        long totalBytes = 0;
+        long usedBytes = 0;
+        long availableBytes = 0;
+
+        for (VolumeStats stats : allStats.values()) {
+            totalBytes += stats.totalBytes();
+            usedBytes += stats.usedBytes();
+            availableBytes += stats.availableBytes();
+        }
+
+        return new VolumeStats(totalBytes, usedBytes, availableBytes);
+    }
+
+    /**
+     * Checks if a volume has sufficient disk space for a write operation.
+     *
+     * <p><strong>Domain Correctness:</strong> Returns false if:</p>
+     * <ul>
+     *   <li>Volume is not registered</li>
+     *   <li>Volume stats cannot be retrieved</li>
+     *   <li>Available space is less than required bytes</li>
+     * </ul>
+     *
+     * @param volumePath   The volume path to check
+     * @param requiredBytes Minimum required bytes
+     * @return true if the volume has at least requiredBytes available
+     */
+    public boolean hasAvailableSpace(Path volumePath, long requiredBytes) {
+        if (requiredBytes < 0) {
+            throw new IllegalArgumentException("Required bytes must be non-negative: " + requiredBytes);
+        }
+
+        VolumeStats stats = getVolumeStats(volumePath);
+        if (stats == null) {
+            return false;
+        }
+
+        return stats.availableBytes() >= requiredBytes;
+    }
+
+    /**
+     * Finds the volume with the most available disk space.
+     *
+     * <p>Useful for load balancing writes across volumes.</p>
+     *
+     * @return Path to the volume with most available space, or null if no volumes registered
+     */
+    public Path getVolumeWithMostSpace() {
+        Map<Path, VolumeStats> allStats = getAllVolumeStats();
+
+        Path bestVolume = null;
+        long maxAvailable = -1;
+
+        for (Map.Entry<Path, VolumeStats> entry : allStats.entrySet()) {
+            long available = entry.getValue().availableBytes();
+            if (available > maxAvailable) {
+                maxAvailable = available;
+                bestVolume = entry.getKey();
+            }
+        }
+
+        return bestVolume;
+    }
+
+    /**
+     * Internal method to get volume stats without lock acquisition.
+     *
+     * <p>Caller must hold appropriate lock.</p>
+     *
+     * @param volumePath The volume path
+     * @return VolumeStats or null if unavailable
+     */
+    private VolumeStats getVolumeStatsInternal(Path volumePath) {
+        try {
+            FileStore store = Files.getFileStore(volumePath);
+
+            long totalBytes = store.getTotalSpace();
+            long availableBytes = store.getUsableSpace();
+            long usedBytes = Math.max(0, totalBytes - availableBytes);
+
+            return new VolumeStats(totalBytes, usedBytes, availableBytes);
+        } catch (IOException e) {
+            LOGGER.debug("Could not get file store for volume {}: {}", volumePath, e.getMessage());
+            return null;
         }
     }
 }

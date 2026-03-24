@@ -484,18 +484,23 @@ public class HnswIntegrationWorker {
                 break;
             }
 
+            // Calculate entry size and end offset ONCE to ensure consistency
+            int entrySize = writeLog.entrySizeAt(currentOffset);
+            long entryEndOffset = currentOffset + entrySize;
+
             // Only integrate PUT operations with vector data
             if (entry.isPut() && entry.value().length > 0) {
                 float[] vector = extractVector(entry.value());
                 if (vector != null && vector.length > 0) {
                     vectors.add(vector);
-                    offsets.add(currentOffset);
+                    // Pass END offset (not START offset) so tracker knows where next entry begins
+                    offsets.add(entryEndOffset);
                     entriesRead++;
                 }
             }
 
-            // Move to next entry
-            currentOffset += writeLog.entrySizeAt(currentOffset);
+            // Move to next entry using pre-calculated entrySize
+            currentOffset = entryEndOffset;
             if (currentOffset < 0) {
                 break; // Safety check
             }

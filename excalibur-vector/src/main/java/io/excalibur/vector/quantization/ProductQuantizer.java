@@ -276,6 +276,44 @@ public final class ProductQuantizer {
     }
 
     /**
+     * Encodes a vector into PQ codes, returning null if the quantizer is not trained.
+     *
+     * <p>This method provides a graceful fallback option for encoding during the
+     * indexing phase when the codebook may not yet be trained. Callers can check
+     * for null and fall back to full-precision operations.</p>
+     *
+     * <h3>Use Case</h3>
+     * <p>Use this method during live indexing when:</p>
+     * <ul>
+     *   <li>The segment is in INDEXING or WARMING state</li>
+     *   <li>The codebook is being trained in the background</li>
+     *   <li>You want to optionally encode if possible, but continue if not</li>
+     * </ul>
+     *
+     * @param vector The vector to encode (must match originalDim)
+     * @return PQ codes as byte array, or null if quantizer is not trained
+     * @throws IllegalArgumentException if vector dimension doesn't match
+     */
+    public byte[] encodeOrNull(float[] vector) {
+        // Validate dimension first, regardless of training state
+        validateVector(vector);
+
+        if (!trained) {
+            return null;
+        }
+
+        byte[] codes = new byte[numSubspaces];
+
+        for (int s = 0; s < numSubspaces; s++) {
+            int startOffset = s * subvectorDim;
+            int nearestCentroid = findNearestCentroid(vector, startOffset, s);
+            codes[s] = (byte) nearestCentroid;
+        }
+
+        return codes;
+    }
+
+    /**
      * Encodes multiple vectors in batch.
      *
      * <p>More efficient than individual encoding for large batches due to
@@ -360,6 +398,58 @@ public final class ProductQuantizer {
         }
 
         return (float) totalDistance;
+    }
+
+    /**
+     * Computes distance between query and target, with graceful fallback for untrained quantizer.
+     *
+     * <p>This method implements the PQ graceful fallback requirement from the specification:</p>
+     * <blockquote>"if codebook is not yet trained (cold segment), distance computation uses
+     * full-precision vectors."</blockquote>
+     *
+     * <h3>Behavior</h3>
+     * <ul>
+     *   <li>If trained: Uses asymmetric PQ distance for efficiency (query is full-precision,
+     *       target is PQ-encoded on-the-fly)</li>
+     *   <li>If not trained: Computes exact L2 squared distance using full-precision vectors</li>
+     * </ul>
+     *
+     * <h3>Use Case</h3>
+     * <p>This method is designed for querying cold segments during the indexing phase,
+     * when the codebook may not yet be trained. It allows queries to proceed with
+     * full-precision computation until PQ is available.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Result is always non-negative (squared L2 distance)</li>
+     *   <li>Both vectors must have the same dimension as the quantizer</li>
+     *   <li>When trained, result is approximate (PQ quantization error)</li>
+     *   <li>When not trained, result is exact</li>
+     * </ul>
+     *
+     * @param query Full-precision query vector
+     * @param target Full-precision target vector
+     * @return Squared L2 distance (exact if untrained, approximate if trained)
+     * @throws IllegalArgumentException if vectors are null or wrong dimension
+     */
+    public float computeDistanceOrFallback(float[] query, float[] target) {
+        validateVector(query);
+        validateVector(target);
+
+        // If not trained, compute exact L2 distance
+        if (!trained) {
+            double totalDistance = 0.0;
+            for (int i = 0; i < originalDim; i++) {
+                double diff = (double) query[i] - (double) target[i];
+                totalDistance += diff * diff;
+            }
+            return (float) totalDistance;
+        }
+
+        // If trained, use asymmetric PQ distance
+        // Encode target on-the-fly and compute asymmetric distance
+        byte[] targetCodes = encode(target);
+        return asymmetricDistance(query, targetCodes);
     }
 
     /**

@@ -21,6 +21,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.random.RandomGenerator;
+import java.util.random.RandomGeneratorFactory;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -98,17 +100,73 @@ public class LLMHttpClient {
     /** Minimum embedding dimension */
     private static final int MIN_EMBEDDING_DIMENSION = 1;
 
-    /** Pattern to extract JSON array from response (handles markdown fences) */
-    private static final Pattern JSON_ARRAY_PATTERN = Pattern.compile("\\[[\\s\\S]*?\\]");
-
     /** Pattern to extract individual score objects from JSON array */
     private static final Pattern SCORE_OBJECT_PATTERN = Pattern.compile(
             "\\{\\s*\"index\"\\s*:\\s*(\\d+)\\s*,\\s*\"score\"\\s*:\\s*([0-9.eE+-]+)\\s*\\}");
+
+    // ==================== Retry with Exponential Backoff Configuration ====================
+
+    /**
+     * Base delay for first retry attempt (100ms).
+     * Domain correctness: 100ms is a reasonable minimum that avoids hammering
+     * a recovering service while keeping latency low.
+     */
+    private static final long RETRY_BASE_DELAY_MS = 100L;
+
+    /**
+     * Maximum delay between retries (30 seconds).
+     * Domain correctness: prevents unreasonably long waits while allowing
+     * sufficient time for rate limits to reset.
+     */
+    private static final long RETRY_MAX_DELAY_MS = 30_000L;
+
+    /**
+     * Exponential backoff multiplier (2x).
+     * Domain correctness: standard exponential backoff that doubles delay each attempt.
+     */
+    private static final double RETRY_BACKOFF_MULTIPLIER = 2.0;
+
+    /**
+     * Jitter factor (±25%).
+     * Domain correctness: jitter prevents thundering herd when multiple clients
+     * retry simultaneously. ±25% provides good randomization without excessive variance.
+     */
+    private static final double RETRY_JITTER_FACTOR = 0.25;
+
+    /** Random generator for jitter (thread-safe) */
+    private static final RandomGenerator RANDOM = RandomGeneratorFactory.getDefault().create();
 
     private final HttpClient httpClient;
     private final LLMClientConfig config;
     private final CircuitBreaker circuitBreaker;
     private final ResponseSanitizer responseSanitizer;
+
+    /**
+     * Lazy-initialized batch handler for splitting large candidate sets.
+     * Initialized on first use to avoid circular dependency in constructor
+     * (BatchHandler needs LLMHttpClient, LLMHttpClient needs BatchHandler).
+     *
+     * <p>Thread-safe via double-checked locking pattern.</p>
+     */
+    private volatile BatchHandler batchHandler;
+
+    /**
+     * Returns the lazy-initialized BatchHandler instance.
+     *
+     * <p>Uses double-checked locking for thread-safe lazy initialization.</p>
+     *
+     * @return BatchHandler instance (never null after initialization)
+     */
+    private BatchHandler getBatchHandler() {
+        if (batchHandler == null) {
+            synchronized (this) {
+                if (batchHandler == null) {
+                    batchHandler = new BatchHandler(this, config);
+                }
+            }
+        }
+        return batchHandler;
+    }
 
     /**
      * Creates a new LLMHttpClient with the given configuration.
@@ -259,9 +317,12 @@ public class LLMHttpClient {
     /**
      * Scores the relevancy of candidate passages against a query with correlation ID.
      *
-     * <p>Calls the OpenAI-compatible {@code /v1/chat/completions} endpoint with a
-     * prompt that asks the LLM to score each candidate from 0.0 to 1.0 based on
-     * relevance to the query.</p>
+     * <p>This method automatically batches candidates when the estimated token count
+     * exceeds the configured limit ({@link LLMClientConfig#getMaxBatchTokens()}).
+     * Large candidate sets are split into multiple API calls, and results are merged
+     * while preserving the original candidate order.</p>
+     *
+     * <p>For direct API calls without batching, use {@link #scoreRelevancyUnbatched(String, List, String)}.</p>
      *
      * <h3>Domain Correctness</h3>
      * <ul>
@@ -270,6 +331,7 @@ public class LLMHttpClient {
      *   <li>Correlation ID: optional, if non-empty will be included in request headers</li>
      *   <li>Output: list of RelevancyScore with scores clamped to [0.0, 1.0]</li>
      *   <li>Each score's index corresponds to the original candidate position</li>
+     *   <li>Batching preserves original candidate order across multiple API calls</li>
      * </ul>
      *
      * @param query The query text to score against (must not be null or empty)
@@ -290,7 +352,46 @@ public class LLMHttpClient {
             throw new IllegalArgumentException("Candidates cannot be empty");
         }
 
-        LOG.debug("Scoring relevancy for {} candidates, correlationId={}", candidates.size(), correlationId);
+        // Delegate to BatchHandler for automatic batching
+        return getBatchHandler().scoreWithBatching(query, candidates, correlationId);
+    }
+
+    /**
+     * Scores relevancy without automatic batching (single API call).
+     *
+     * <p>This is the raw implementation that makes a single API call to the LLM.
+     * Used internally by {@link BatchHandler} for each batch. External callers
+     * should use {@link #scoreRelevancy(String, List, String)} which handles
+     * batching automatically.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Query: non-null, non-empty string</li>
+     *   <li>Candidates: non-null, non-empty list of strings</li>
+     *   <li>Correlation ID: optional, if non-empty will be included in request headers</li>
+     *   <li>Output: list of RelevancyScore with scores clamped to [0.0, 1.0]</li>
+     *   <li>Each score's index corresponds to the candidate position in the input list</li>
+     * </ul>
+     *
+     * @param query The query text to score against (must not be null or empty)
+     * @param candidates List of candidate passages to score (must not be null or empty)
+     * @param correlationId Optional correlation ID for request tracing (may be null or empty)
+     * @return List of RelevancyScore objects, one per candidate
+     * @throws IllegalArgumentException if query or candidates is null/empty
+     * @throws LLMException if the API call fails or returns invalid data
+     */
+    List<RelevancyScore> scoreRelevancyUnbatched(String query, List<String> candidates, String correlationId) {
+        // Validate inputs
+        Objects.requireNonNull(query, "Query cannot be null");
+        Objects.requireNonNull(candidates, "Candidates cannot be null");
+        if (query.isEmpty()) {
+            throw new IllegalArgumentException("Query cannot be empty");
+        }
+        if (candidates.isEmpty()) {
+            throw new IllegalArgumentException("Candidates cannot be empty");
+        }
+
+        LOG.debug("Scoring relevancy for {} candidates (unbatched), correlationId={}", candidates.size(), correlationId);
 
         // Build the prompt
         String requestBody = buildRelevancyRequestBody(query, candidates, config.getChatModel());
@@ -305,7 +406,7 @@ public class LLMHttpClient {
         // Parse relevancy scores from response
         List<RelevancyScore> scores = parseRelevancyResponse(response.body(), candidates);
 
-        LOG.debug("Scored {} candidates, correlationId={}", scores.size(), correlationId);
+        LOG.debug("Scored {} candidates (unbatched), correlationId={}", scores.size(), correlationId);
         return scores;
     }
 
@@ -332,10 +433,10 @@ public class LLMHttpClient {
     /**
      * Scores relevancy with circuit breaker protection.
      *
-     * <p>This method wraps {@link #scoreRelevancy(String, List, String)} with
-     * circuit breaker protection. When the circuit breaker is open, requests
-     * fail fast with an {@link LLMException} of type
-     * {@link io.excalibur.llm.LLMException.ErrorType#CIRCUIT_OPEN}.</p>
+     * <p>This method automatically batches candidates when the estimated token count
+     * exceeds the configured limit. Each batch is protected by the circuit breaker.
+     * When the circuit breaker is open, requests fail fast with an {@link LLMException}
+     * of type {@link io.excalibur.llm.LLMException.ErrorType#CIRCUIT_OPEN}.</p>
      *
      * <h3>Sanitized Response Handling (CRITICAL)</h3>
      * <p>When the LLM returns a response with markdown fences or commentary
@@ -359,6 +460,37 @@ public class LLMHttpClient {
      */
     public List<RelevancyScore> scoreRelevancyWithCircuitBreaker(
             String query, List<String> candidates, String correlationId) {
+        // Validate inputs
+        Objects.requireNonNull(query, "Query cannot be null");
+        Objects.requireNonNull(candidates, "Candidates cannot be null");
+        if (query.isEmpty()) {
+            throw new IllegalArgumentException("Query cannot be empty");
+        }
+        if (candidates.isEmpty()) {
+            throw new IllegalArgumentException("Candidates cannot be empty");
+        }
+
+        // Delegate to BatchHandler for automatic batching with circuit breaker protection
+        return getBatchHandler().scoreWithBatchingAndCircuitBreaker(query, candidates, correlationId);
+    }
+
+    /**
+     * Scores relevancy with circuit breaker protection, without automatic batching.
+     *
+     * <p>This is the raw implementation that makes a single API call with circuit
+     * breaker protection. Used internally by {@link BatchHandler} for each batch.
+     * External callers should use {@link #scoreRelevancyWithCircuitBreaker(String, List, String)}
+     * which handles batching automatically.</p>
+     *
+     * @param query The query text to score against (must not be null or empty)
+     * @param candidates List of candidate passages to score (must not be null or empty)
+     * @param correlationId Optional correlation ID for request tracing (may be null or empty)
+     * @return List of RelevancyScore objects, one per candidate
+     * @throws IllegalArgumentException if query or candidates is null/empty
+     * @throws LLMException if the circuit is open or API call fails
+     */
+    List<RelevancyScore> scoreRelevancyUnbatchedWithCircuitBreaker(
+            String query, List<String> candidates, String correlationId) {
         // Check circuit breaker before making request
         if (!circuitBreaker.allowRequest()) {
             LOG.warn("Circuit breaker is OPEN, failing fast (correlationId={})", correlationId);
@@ -369,8 +501,8 @@ public class LLMHttpClient {
         }
 
         try {
-            // Call the underlying method
-            List<RelevancyScore> scores = scoreRelevancy(query, candidates, correlationId);
+            // Call the unbatched method
+            List<RelevancyScore> scores = scoreRelevancyUnbatched(query, candidates, correlationId);
 
             // Success! Record it (even if response required sanitization)
             circuitBreaker.recordSuccess();
@@ -468,13 +600,28 @@ public class LLMHttpClient {
     /**
      * Executes an HTTP POST request to the given URL with optional correlation ID.
      *
-     * <p>Domain Correctness:</p>
+     * <p>This method implements retry with exponential backoff for retryable errors.
+     * The number of retries is controlled by {@link LLMClientConfig#getMaxRetries()}.</p>
+     *
+     * <h3>Retry Behavior</h3>
+     * <ul>
+     *   <li>Base delay: 100ms</li>
+     *   <li>Exponential multiplier: 2x each retry</li>
+     *   <li>Max delay: 30 seconds</li>
+     *   <li>Jitter: ±25% randomization to prevent thundering herd</li>
+     *   <li>Retries on: NETWORK errors, RATE_LIMITED (429), HTTP 5xx errors</li>
+     *   <li>No retry on: AUTH_ERROR (401/403), INVALID_REQUEST (400), PARSE_ERROR</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
      * <ul>
      *   <li>Request timeout: uses configured timeout (must be positive)</li>
      *   <li>Request body: valid UTF-8 JSON</li>
      *   <li>Timeout error → NETWORK error type (retryable)</li>
      *   <li>IO error → NETWORK error type (retryable)</li>
-     *   <li>InterruptedException → preserves interrupt status</li>
+     *   <li>HTTP 5xx/429 → retryable</li>
+     *   <li>HTTP 401/403/400 → non-retryable, throw immediately</li>
+     *   <li>InterruptedException → preserves interrupt status, no retry</li>
      * </ul>
      *
      * <h3>DEBUG Logging for Request/Response Tracing</h3>
@@ -483,66 +630,202 @@ public class LLMHttpClient {
      *   <li>Request: URL, method, headers (with correlation ID), body preview</li>
      *   <li>Response: status code, headers, body preview</li>
      *   <li>Correlation ID is included in all log messages for trace correlation</li>
+     *   <li>Retry attempts with delay calculations</li>
      * </ul>
      *
      * @param url Target URL
      * @param requestBody JSON request body
      * @param correlationId Optional correlation ID for tracing (may be null or empty)
-     * @return HTTP response
-     * @throws LLMException if request fails or times out
+     * @return HTTP response with successful status code (2xx)
+     * @throws LLMException if all retries fail or request is non-retryable
      */
     private HttpResponse<String> executeRequest(String url, String requestBody, String correlationId) {
-        try {
-            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header(CONTENT_TYPE_HEADER, JSON_CONTENT_TYPE)
-                    .timeout(config.getTimeout())
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8));
+        int maxRetries = config.getMaxRetries();
+        LLMException lastException = null;
 
-            // Add authorization header if API key is configured
-            String apiKey = config.getApiKey();
-            if (apiKey != null && !apiKey.isEmpty()) {
-                requestBuilder.header(AUTHORIZATION_HEADER, "Bearer " + apiKey);
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .header(CONTENT_TYPE_HEADER, JSON_CONTENT_TYPE)
+                        .timeout(config.getTimeout())
+                        .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8));
+
+                // Add authorization header if API key is configured
+                String apiKey = config.getApiKey();
+                if (apiKey != null && !apiKey.isEmpty()) {
+                    requestBuilder.header(AUTHORIZATION_HEADER, "Bearer " + apiKey);
+                }
+
+                // Add correlation ID header if provided and non-blank
+                if (correlationId != null && !correlationId.isBlank()) {
+                    requestBuilder.header(CORRELATION_ID_HEADER, correlationId);
+                }
+
+                HttpRequest request = requestBuilder.build();
+
+                // DEBUG: Log request details for tracing (include attempt number)
+                if (LOG.isDebugEnabled()) {
+                    if (attempt > 0) {
+                        LOG.debug("Retry attempt {} of {} (correlationId={})",
+                                attempt, maxRetries, correlationId);
+                    }
+                    logRequest(url, request, requestBody, correlationId);
+                }
+
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+
+                // DEBUG: Log response details for tracing
+                if (LOG.isDebugEnabled()) {
+                    logResponse(response, correlationId);
+                }
+
+                // Check HTTP status code - handle retryable vs non-retryable errors
+                int statusCode = response.statusCode();
+                if (HttpStatus.isError(statusCode)) {
+                    if (isRetryableHttpStatus(statusCode)) {
+                        // Retryable HTTP error (5xx, 429) - continue retry loop
+                        ErrorType errorType = mapHttpStatusToErrorType(statusCode);
+                        lastException = new LLMException(
+                                "LLM API returned error status " + statusCode +
+                                " (" + HttpStatus.getReasonPhrase(statusCode) + ")",
+                                errorType, statusCode);
+                        LOG.warn("Retryable HTTP error {} on attempt {}/{} (correlationId={})",
+                                statusCode, attempt + 1, maxRetries + 1, correlationId);
+                        // Fall through to retry logic below
+                    } else {
+                        // Non-retryable HTTP error (401, 403, 400, etc.) - throw immediately
+                        throw new LLMException(
+                                "LLM API returned error status " + statusCode +
+                                " (" + HttpStatus.getReasonPhrase(statusCode) + ")",
+                                mapHttpStatusToErrorType(statusCode), statusCode);
+                    }
+                } else {
+                    // Success (2xx status) - return response
+                    return response;
+                }
+
+            } catch (HttpTimeoutException e) {
+                // Domain correctness: timeout is a network-level failure (retryable)
+                lastException = new LLMException(
+                        "LLM API request timed out after " + config.getTimeout().toMillis() + "ms to " + url,
+                        ErrorType.NETWORK, e);
+                LOG.warn("Request timeout on attempt {}/{} (correlationId={})",
+                        attempt + 1, maxRetries + 1, correlationId);
+
+            } catch (IOException e) {
+                // Domain correctness: IO error is a network-level failure (retryable)
+                lastException = new LLMException(
+                        "IO error during LLM API call to " + url + ": " + e.getMessage(),
+                        ErrorType.NETWORK, e);
+                LOG.warn("IO error on attempt {}/{}: {} (correlationId={})",
+                        attempt + 1, maxRetries + 1, e.getMessage(), correlationId);
+
+            } catch (InterruptedException e) {
+                // Preserve interrupt status per best practice - do NOT retry
+                Thread.currentThread().interrupt();
+                throw new LLMException("LLM API call interrupted", ErrorType.NETWORK, e);
             }
 
-            // Add correlation ID header if provided and non-blank
-            if (correlationId != null && !correlationId.isBlank()) {
-                requestBuilder.header(CORRELATION_ID_HEADER, correlationId);
+            // Check if we should retry
+            if (attempt < maxRetries) {
+                // Calculate delay with exponential backoff and jitter
+                long delayMs = calculateRetryDelay(attempt);
+                LOG.debug("Waiting {}ms before retry attempt {} (correlationId={})",
+                        delayMs, attempt + 2, correlationId);
+
+                try {
+                    Thread.sleep(delayMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new LLMException("Interrupted during retry delay", ErrorType.NETWORK, e);
+                }
             }
-
-            HttpRequest request = requestBuilder.build();
-
-            // DEBUG: Log request details for tracing
-            if (LOG.isDebugEnabled()) {
-                logRequest(url, request, requestBody, correlationId);
-            }
-
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-
-            // DEBUG: Log response details for tracing
-            if (LOG.isDebugEnabled()) {
-                logResponse(response, correlationId);
-            }
-
-            return response;
-
-        } catch (HttpTimeoutException e) {
-            // Domain correctness: timeout is a network-level failure (retryable)
-            String msg = "LLM API request timed out after " + config.getTimeout().toMillis() + "ms to " + url;
-            LOG.error(msg + " (correlationId={})", correlationId, e);
-            throw new LLMException(msg, ErrorType.NETWORK, e);
-        } catch (IOException e) {
-            // Domain correctness: IO error is a network-level failure (retryable)
-            String msg = "IO error during LLM API call to " + url + ": " + e.getMessage();
-            LOG.error(msg + " (correlationId={})", correlationId, e);
-            throw new LLMException(msg, ErrorType.NETWORK, e);
-        } catch (InterruptedException e) {
-            // Preserve interrupt status per best practice
-            Thread.currentThread().interrupt();
-            String msg = "LLM API call interrupted";
-            LOG.error(msg + " (correlationId={})", correlationId, e);
-            throw new LLMException(msg, ErrorType.NETWORK, e);
         }
+
+        // All retries exhausted
+        LOG.error("All {} retry attempts exhausted for request to {} (correlationId={})",
+                maxRetries + 1, url, correlationId);
+        throw lastException;
+    }
+
+    /**
+     * Determines if an HTTP status code is retryable.
+     *
+     * <p>Retryable status codes:</p>
+     * <ul>
+     *   <li>429 (Too Many Requests) - rate limited, may succeed after backoff</li>
+     *   <li>500-599 (Server Errors) - transient server issues</li>
+     * </ul>
+     *
+     * <p>Non-retryable status codes:</p>
+     * <ul>
+     *   <li>400 (Bad Request) - client error, won't succeed on retry</li>
+     *   <li>401 (Unauthorized) - authentication error</li>
+     *   <li>403 (Forbidden) - authorization error</li>
+     *   <li>404 (Not Found) - resource doesn't exist</li>
+     *   <li>Other 4xx - client errors</li>
+     * </ul>
+     *
+     * @param statusCode HTTP status code
+     * @return true if the status code indicates a retryable error
+     */
+    private boolean isRetryableHttpStatus(int statusCode) {
+        // 429 (Too Many Requests) - rate limited
+        if (statusCode == 429) {
+            return true;
+        }
+        // 5xx server errors
+        if (statusCode >= 500 && statusCode < 600) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Calculates the retry delay with exponential backoff and jitter.
+     *
+     * <p>Formula: {@code min(baseDelay * (2 ^ attempt), maxDelay) * (1 ± jitter)}</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Base delay: 100ms (RETRY_BASE_DELAY_MS)</li>
+     *   <li>Multiplier: 2x per attempt (RETRY_BACKOFF_MULTIPLIER)</li>
+     *   <li>Max delay: 30 seconds (RETRY_MAX_DELAY_MS)</li>
+     *   <li>Jitter: ±25% (RETRY_JITTER_FACTOR)</li>
+     *   <li>Result is always positive and &lt;= max delay</li>
+     * </ul>
+     *
+     * <h3>Example Delays</h3>
+     * <ul>
+     *   <li>Attempt 0: ~100ms (75-125ms with jitter)</li>
+     *   <li>Attempt 1: ~200ms (150-250ms with jitter)</li>
+     *   <li>Attempt 2: ~400ms (300-500ms with jitter)</li>
+     *   <li>Attempt 3: ~800ms (600-1000ms with jitter)</li>
+     *   <li>Attempt 4: ~1600ms (1200-2000ms with jitter)</li>
+     *   <li>Attempt 5+: capped at 30s with jitter</li>
+     * </ul>
+     *
+     * @param attempt Current attempt number (0-based)
+     * @return Delay in milliseconds
+     */
+    private long calculateRetryDelay(int attempt) {
+        // Use configurable retry base delay from config
+        long baseDelayMs = config.getRetryBaseDelay().toMillis();
+
+
+        // Calculate exponential delay: baseDelay * (multiplier ^ attempt)
+        double exponentialDelay = baseDelayMs *
+                Math.pow(RETRY_BACKOFF_MULTIPLIER, attempt);
+        // Cap at max delay
+        long cappedDelay = Math.min((long) exponentialDelay, RETRY_MAX_DELAY_MS);
+
+        // Apply jitter: ±25%
+        double jitter = 1.0 + (RANDOM.nextDouble() * 2 - 1) * RETRY_JITTER_FACTOR;
+        long delayWithJitter = (long) (cappedDelay * jitter);
+
+        // Ensure minimum delay (at least base delay after jitter)
+        return Math.max(delayWithJitter, RETRY_BASE_DELAY_MS);
     }
 
     /**
@@ -955,7 +1238,7 @@ public class LLMHttpClient {
         String content = extractMessageContent(responseBody);
 
         // Sanitize: strip markdown fences and extract JSON array
-        String sanitized = sanitizeRelevancyContent(content);
+        String sanitized = responseSanitizer.sanitize(content);
 
         if (sanitized == null || sanitized.isBlank()) {
             LOG.error("Could not extract JSON array from response: {}", truncate(responseBody, 500));
@@ -1070,44 +1353,6 @@ public class LLMHttpClient {
             }
         }
         return sb.toString();
-    }
-
-    /**
-     * Sanitizes LLM response content by stripping markdown fences and extracting JSON array.
-     *
-     * <p>Handles common LLM response patterns:</p>
-     * <ul>
-     *   <li>Plain JSON array: {@code [{"index": 0, "score": 0.85}]}</li>
-     *   <li>Markdown-wrapped: {@code ```json\n[{"index": 0, "score": 0.85}]\n```}</li>
-     *   <li>With commentary: {@code Here are the scores:\n[{"index": 0, "score": 0.85}]}</li>
-     * </ul>
-     *
-     * @param content Raw content from response
-     * @return Cleaned JSON array string, or null if not parseable
-     */
-    private String sanitizeRelevancyContent(String content) {
-        if (content == null || content.isBlank()) {
-            return null;
-        }
-
-        // Strip markdown code fences (```json ... ``` or ``` ... ```)
-        String cleaned = content.trim();
-        cleaned = cleaned.replaceAll("```(?:json)?\\s*\\n?", "");
-        cleaned = cleaned.replaceAll("\\n?```", "");
-        cleaned = cleaned.trim();
-
-        // Try to find a JSON array pattern using non-greedy match
-        Matcher matcher = JSON_ARRAY_PATTERN.matcher(cleaned);
-        if (matcher.find()) {
-            return matcher.group();
-        }
-
-        // If no array found, check if the whole content looks like an array
-        if (cleaned.startsWith("[") && cleaned.endsWith("]")) {
-            return cleaned;
-        }
-
-        return null;
     }
 
     /**

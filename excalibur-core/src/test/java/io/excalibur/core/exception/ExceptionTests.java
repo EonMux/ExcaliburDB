@@ -159,4 +159,26 @@ class ExceptionTests {
             assertThat(ex.getCause()).isEqualTo(cause);
         }
     }
+
+    @Nested
+    @DisplayName("MappedFileException Tests")
+    class MappedFileExceptionTests {
+
+        @Test
+        @DisplayName("Should create with message")
+        void shouldCreateWithMessage() {
+            MappedFileException ex = new MappedFileException("Mapping failed");
+            assertThat(ex.getMessage()).isEqualTo("Mapping failed");
+            assertThat(ex).isInstanceOf(ExcaliburException.class);
+        }
+
+        @Test
+        @DisplayName("Should create with message and cause")
+        void shouldCreateWithMessageAndCause() {
+            Throwable cause = new RuntimeException("IO error");
+            MappedFileException ex = new MappedFileException("Mapping failed", cause);
+            assertThat(ex.getMessage()).isEqualTo("Mapping failed");
+            assertThat(ex.getCause()).isEqualTo(cause);
+        }
+    }
 }

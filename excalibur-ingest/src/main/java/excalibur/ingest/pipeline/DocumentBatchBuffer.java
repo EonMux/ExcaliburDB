@@ -311,12 +311,14 @@ public final class DocumentBatchBuffer {
      * @param textChunk The original text chunk
      * @param writeLogOffset Offset in the write log where this chunk was written
      * @param embedding The embedding vector (may be null)
+     * @param entryId The unique entry ID for LSH indexing (defaults to -1 if not set)
      */
     public record ChunkEntry(
         String chunkId,
         TextChunk textChunk,
         long writeLogOffset,
-        float[] embedding
+        float[] embedding,
+        long entryId
     ) {
         public ChunkEntry {
             Objects.requireNonNull(chunkId, "chunkId must not be null");
@@ -326,12 +328,33 @@ public final class DocumentBatchBuffer {
             }
         }
 
+        /**
+         * Compact constructor for backward compatibility (entryId defaults to -1).
+         */
+        public ChunkEntry(String chunkId, TextChunk textChunk, long writeLogOffset, float[] embedding) {
+            this(chunkId, textChunk, writeLogOffset, embedding, -1);
+        }
+
         public boolean hasEmbedding() {
             return embedding != null && embedding.length > 0;
         }
 
         public int getEmbeddingDimension() {
             return embedding != null ? embedding.length : 0;
+        }
+
+        /**
+         * Returns true if this entry has a valid entry ID for LSH indexing.
+         */
+        public boolean hasEntryId() {
+            return entryId >= 0;
+        }
+
+        /**
+         * Creates a copy of this entry with a different entry ID.
+         */
+        public ChunkEntry withEntryId(long newEntryId) {
+            return new ChunkEntry(chunkId, textChunk, writeLogOffset, embedding, newEntryId);
         }
     }
 }

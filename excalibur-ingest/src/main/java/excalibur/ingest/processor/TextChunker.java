@@ -53,7 +53,6 @@ public class TextChunker {
 
     private static final int DEFAULT_TARGET_TOKENS = 512;
     private static final int DEFAULT_OVERLAP_TOKENS = 64;
-    private static final int CHARS_PER_TOKEN = 4;
     private static final double TOLERANCE_RATIO = 0.10;
 
     private final int targetTokens;
@@ -79,8 +78,8 @@ public class TextChunker {
         }
         this.targetTokens = targetTokens;
         this.overlapTokens = overlapTokens;
-        this.targetChars = targetTokens * CHARS_PER_TOKEN;
-        this.overlapChars = overlapTokens * CHARS_PER_TOKEN;
+        this.targetChars = WhitespaceTokenizer.estimateCharCount(targetTokens);
+        this.overlapChars = WhitespaceTokenizer.estimateCharCount(overlapTokens);
         this.minChunkChars = (int) (targetChars * (1.0 - TOLERANCE_RATIO));
         this.maxChunkChars = (int) (targetChars * (1.0 + TOLERANCE_RATIO));
     }
@@ -325,13 +324,13 @@ public class TextChunker {
     /**
      * Estimates the number of tokens in a text segment of the given character length.
      *
-     * <p>Uses the ~4 characters per token heuristic.</p>
+     * <p>Delegates to {@link WhitespaceTokenizer#estimateTokenCount(int)}.</p>
      *
      * @param charCount Number of characters
      * @return Estimated token count
      */
     private int estimateTokens(int charCount) {
-        return Math.max(1, (charCount + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN);
+        return WhitespaceTokenizer.estimateTokenCount(charCount);
     }
 
     public int getTargetTokens() {

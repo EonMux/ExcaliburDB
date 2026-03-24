@@ -231,9 +231,13 @@ public final class Config {
         // Document atomicity timeout in milliseconds
         public static final int DEFAULT_DOCUMENT_TIMEOUT_MS = 2000;
 
+        // Default for document atomicity enabled
+        public static final boolean DEFAULT_DOCUMENT_ATOMICITY = true;
+
         // All fields final for immutability
         private final long hnswQueueDepthLimit;
         private final int documentTimeoutMs;
+        private final boolean documentAtomicity;
 
         /**
          * Creates an Ingest config from properties.
@@ -243,6 +247,7 @@ public final class Config {
         public Ingest(Map<String, String> props) {
             this.hnswQueueDepthLimit = parseLong(props, "excalibur.ingest.hnsw-queue-depth-limit", DEFAULT_QUEUE_DEPTH_LIMIT);
             this.documentTimeoutMs = parseInt(props, "excalibur.ingest.document-atomicity-timeout-ms", DEFAULT_DOCUMENT_TIMEOUT_MS);
+            this.documentAtomicity = parseBoolean(props, "excalibur.ingest.document-atomicity", DEFAULT_DOCUMENT_ATOMICITY);
         }
 
         /**
@@ -261,9 +266,24 @@ public final class Config {
             return documentTimeoutMs;
         }
 
+        /**
+         * Checks if document atomicity is enabled.
+         *
+         * <p>When enabled, a document's chunks are buffered and published
+         * to the visibility epoch as a batch, ensuring queries never see
+         * partially-ingested documents.</p>
+         *
+         * @return true if document atomicity is enabled
+         */
+        public boolean isDocumentAtomicityEnabled() {
+            return documentAtomicity;
+        }
+
         @Override
         public String toString() {
-            return "Ingest{hnswQueueDepthLimit=" + hnswQueueDepthLimit + ", documentTimeoutMs=" + documentTimeoutMs + '}';
+            return "Ingest{hnswQueueDepthLimit=" + hnswQueueDepthLimit +
+                   ", documentTimeoutMs=" + documentTimeoutMs +
+                   ", documentAtomicity=" + documentAtomicity + '}';
         }
     }
 
@@ -438,14 +458,37 @@ public final class Config {
      * LLM client configuration.
      *
      * <p>This class is IMMUTABLE and thread-safe.</p>
+     *
+     * <h2>Configuration Properties</h2>
+     * <ul>
+     *   <li><code>excalibur.llm.base-url</code> - Base URL for the LLM API (default: OpenAI)</li>
+     *   <li><code>excalibur.llm.api-key</code> - API key for authentication (default: empty)</li>
+     *   <li><code>excalibur.llm.model</code> - Legacy generic model name (default: text-embedding-ada-002)</li>
+     *   <li><code>excalibur.llm.chat-model</code> - Model for chat completions (default: gpt-4o-mini)</li>
+     *   <li><code>excalibur.llm.embedding-model</code> - Model for embeddings (default: text-embedding-3-small)</li>
+     *   <li><code>excalibur.llm.embeddings-dimensions</code> - Embedding vector dimensions (default: 1536)</li>
+     *   <li><code>excalibur.llm.timeout-ms</code> - HTTP request timeout (default: 60000)</li>
+     *   <li><code>excalibur.llm.max-retries</code> - Maximum retry attempts (default: 3)</li>
+     *   <li><code>excalibur.llm.failure-threshold</code> - Failures before circuit opens (default: 5)</li>
+     *   <li><code>excalibur.llm.cooldown-period-ms</code> - Circuit breaker cooldown (default: 60000)</li>
+     *   <li><code>excalibur.llm.max-prompts-per-query</code> - Max prompts for relevancy scoring (default: 10)</li>
+     *   <li><code>excalibur.llm.relevancy-threshold</code> - Minimum relevancy score (default: 0.3)</li>
+     *   <li><code>excalibur.llm.max-batch-tokens</code> - Max tokens per batch (default: 4000)</li>
+     * </ul>
      */
     public static final class Llm {
 
         // Default OpenAI base URL
         public static final String DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
-        // Default model name
+        // Default model name (legacy)
         public static final String DEFAULT_MODEL = "text-embedding-ada-002";
+
+        // Default chat model
+        public static final String DEFAULT_CHAT_MODEL = "gpt-4o-mini";
+
+        // Default embedding model
+        public static final String DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small";
 
         // Default API key (empty for optional)
         public static final String DEFAULT_API_KEY = "";
@@ -456,12 +499,38 @@ public final class Config {
         // Default timeout in milliseconds
         public static final int DEFAULT_TIMEOUT_MS = 60000;
 
+        // Default max retries
+        public static final int DEFAULT_MAX_RETRIES = 3;
+
+        // Default circuit breaker failure threshold
+        public static final int DEFAULT_FAILURE_THRESHOLD = 5;
+
+        // Default circuit breaker cooldown period in milliseconds
+        public static final long DEFAULT_COOLDOWN_PERIOD_MS = 60000L;
+
+        // Default max prompts per query for relevancy scoring
+        public static final int DEFAULT_MAX_PROMPTS_PER_QUERY = 10;
+
+        // Default relevancy threshold (0.0 - 1.0)
+        public static final double DEFAULT_RELEVANCY_THRESHOLD = 0.3;
+
+        // Default max batch tokens
+        public static final int DEFAULT_MAX_BATCH_TOKENS = 4000;
+
         // All fields final for immutability
         private final String baseUrl;
         private final String apiKey;
         private final String model;
+        private final String chatModel;
+        private final String embeddingModel;
         private final int embeddingsDimensions;
         private final int timeoutMs;
+        private final int maxRetries;
+        private final int failureThreshold;
+        private final long cooldownPeriodMs;
+        private final int maxPromptsPerQuery;
+        private final double relevancyThreshold;
+        private final int maxBatchTokens;
 
         /**
          * Creates an Llm config from properties.
@@ -472,8 +541,16 @@ public final class Config {
             this.baseUrl = parseString(props, "excalibur.llm.base-url", DEFAULT_BASE_URL);
             this.apiKey = parseString(props, "excalibur.llm.api-key", DEFAULT_API_KEY);
             this.model = parseString(props, "excalibur.llm.model", DEFAULT_MODEL);
+            this.chatModel = parseString(props, "excalibur.llm.chat-model", DEFAULT_CHAT_MODEL);
+            this.embeddingModel = parseString(props, "excalibur.llm.embedding-model", DEFAULT_EMBEDDING_MODEL);
             this.embeddingsDimensions = parseInt(props, "excalibur.llm.embeddings-dimensions", DEFAULT_EMBEDDINGS_DIMENSIONS);
             this.timeoutMs = parseInt(props, "excalibur.llm.timeout-ms", DEFAULT_TIMEOUT_MS);
+            this.maxRetries = parseInt(props, "excalibur.llm.max-retries", DEFAULT_MAX_RETRIES);
+            this.failureThreshold = parseInt(props, "excalibur.llm.failure-threshold", DEFAULT_FAILURE_THRESHOLD);
+            this.cooldownPeriodMs = parseLong(props, "excalibur.llm.cooldown-period-ms", DEFAULT_COOLDOWN_PERIOD_MS);
+            this.maxPromptsPerQuery = parseInt(props, "excalibur.llm.max-prompts-per-query", DEFAULT_MAX_PROMPTS_PER_QUERY);
+            this.relevancyThreshold = parseDouble(props, "excalibur.llm.relevancy-threshold", DEFAULT_RELEVANCY_THRESHOLD);
+            this.maxBatchTokens = parseInt(props, "excalibur.llm.max-batch-tokens", DEFAULT_MAX_BATCH_TOKENS);
         }
 
         /**
@@ -491,10 +568,26 @@ public final class Config {
         }
 
         /**
-         * Gets the model name.
+         * Gets the legacy generic model name.
+         * @deprecated Use {@link #getChatModel()} or {@link #getEmbeddingModel()} instead.
          */
+        @Deprecated
         public String getModel() {
             return model;
+        }
+
+        /**
+         * Gets the chat model for completions/relevancy scoring.
+         */
+        public String getChatModel() {
+            return chatModel;
+        }
+
+        /**
+         * Gets the embedding model.
+         */
+        public String getEmbeddingModel() {
+            return embeddingModel;
         }
 
         /**
@@ -505,16 +598,65 @@ public final class Config {
         }
 
         /**
-         * Gets the timeout.
+         * Gets the timeout in milliseconds.
          */
         public int getTimeoutMs() {
             return timeoutMs;
         }
 
+        /**
+         * Gets the maximum retry attempts.
+         */
+        public int getMaxRetries() {
+            return maxRetries;
+        }
+
+        /**
+         * Gets the circuit breaker failure threshold.
+         * Number of consecutive failures before the circuit opens.
+         */
+        public int getFailureThreshold() {
+            return failureThreshold;
+        }
+
+        /**
+         * Gets the circuit breaker cooldown period in milliseconds.
+         * Time to wait before attempting to close the circuit after it opens.
+         */
+        public long getCooldownPeriodMs() {
+            return cooldownPeriodMs;
+        }
+
+        /**
+         * Gets the maximum number of prompts per query for relevancy scoring.
+         */
+        public int getMaxPromptsPerQuery() {
+            return maxPromptsPerQuery;
+        }
+
+        /**
+         * Gets the relevancy threshold (0.0 - 1.0).
+         * Results below this threshold are discarded.
+         */
+        public double getRelevancyThreshold() {
+            return relevancyThreshold;
+        }
+
+        /**
+         * Gets the maximum tokens per batch for relevancy scoring requests.
+         */
+        public int getMaxBatchTokens() {
+            return maxBatchTokens;
+        }
+
         @Override
         public String toString() {
-            return "Llm{baseUrl='" + baseUrl + "', apiKey='***', model='" + model +
-                   "', embeddingsDimensions=" + embeddingsDimensions + ", timeoutMs=" + timeoutMs + '}';
+            return "Llm{baseUrl='" + baseUrl + "', apiKey='***', chatModel='" + chatModel +
+                   "', embeddingModel='" + embeddingModel + "', embeddingsDimensions=" + embeddingsDimensions +
+                   ", timeoutMs=" + timeoutMs + ", maxRetries=" + maxRetries +
+                   ", failureThreshold=" + failureThreshold + ", cooldownPeriodMs=" + cooldownPeriodMs +
+                   ", maxPromptsPerQuery=" + maxPromptsPerQuery + ", relevancyThreshold=" + relevancyThreshold +
+                   ", maxBatchTokens=" + maxBatchTokens + '}';
         }
     }
 
@@ -555,13 +697,46 @@ public final class Config {
          * Creates a Shard config from properties.
          *
          * @param props The properties map
+         * @throws IllegalArgumentException if loadFactor is not in (0.0, 1.0]
          */
         public Shard(Map<String, String> props) {
-            this.loadFactor = parseDouble(props, "excalibur.shard.segment-load-factor", DEFAULT_LOAD_FACTOR);
-            this.efConstruction = parseInt(props, "excalibur.shard.default-ef-construction", DEFAULT_EF_CONSTRUCTION);
-            this.efSearch = parseInt(props, "excalibur.shard.default-ef-search", DEFAULT_EF_SEARCH);
-            this.compactDelayMs = parseInt(props, "excalibur.shard.compaction-delay-ms", DEFAULT_COMPACT_DELAY_MS);
-            this.hnswQueueLimit = parseInt(props, "excalibur.shard.hnsw-integration-queue-depth-limit", DEFAULT_HNSW_QUEUE_LIMIT);
+            double parsedLoadFactor = parseDouble(props, "excalibur.shard.segment-load-factor", DEFAULT_LOAD_FACTOR);
+            // Domain correctness: load factor must be in (0.0, 1.0]
+            // - 0 or negative: table would never split (broken behavior)
+            // - > 1.0: impossible for open addressing (can't exceed 100% fill)
+            if (Double.isNaN(parsedLoadFactor) || parsedLoadFactor <= 0.0 || parsedLoadFactor > 1.0) {
+                throw new IllegalArgumentException(
+                    "loadFactor must be in (0.0, 1.0], got: " + parsedLoadFactor);
+            }
+            this.loadFactor = parsedLoadFactor;
+
+            int parsedEfConstruction = parseInt(props, "excalibur.shard.default-ef-construction", DEFAULT_EF_CONSTRUCTION);
+            if (parsedEfConstruction < 1) {
+                throw new IllegalArgumentException(
+                    "efConstruction must be at least 1, got: " + parsedEfConstruction);
+            }
+            this.efConstruction = parsedEfConstruction;
+
+            int parsedEfSearch = parseInt(props, "excalibur.shard.default-ef-search", DEFAULT_EF_SEARCH);
+            if (parsedEfSearch < 1) {
+                throw new IllegalArgumentException(
+                    "efSearch must be at least 1, got: " + parsedEfSearch);
+            }
+            this.efSearch = parsedEfSearch;
+
+            int parsedCompactDelayMs = parseInt(props, "excalibur.shard.compaction-delay-ms", DEFAULT_COMPACT_DELAY_MS);
+            if (parsedCompactDelayMs < 0) {
+                throw new IllegalArgumentException(
+                    "compactDelayMs cannot be negative, got: " + parsedCompactDelayMs);
+            }
+            this.compactDelayMs = parsedCompactDelayMs;
+
+            int parsedHnswQueueLimit = parseInt(props, "excalibur.shard.hnsw-integration-queue-depth-limit", DEFAULT_HNSW_QUEUE_LIMIT);
+            if (parsedHnswQueueLimit < 1) {
+                throw new IllegalArgumentException(
+                    "hnswQueueLimit must be at least 1, got: " + parsedHnswQueueLimit);
+            }
+            this.hnswQueueLimit = parsedHnswQueueLimit;
         }
 
         /**

@@ -504,4 +504,208 @@ class VolumeManagerTest {
             assertThat(stats.coefficientOfVariation()).isLessThan(0.2);
         }
     }
+
+    // ==================== Disk Space Tracking Tests ====================
+
+    @Nested
+    @DisplayName("Disk Space Tracking")
+    class DiskSpaceTrackingTests {
+
+        @Test
+        @DisplayName("should get volume stats for registered volume")
+        void shouldGetVolumeStats() throws IOException {
+            manager.registerVolume(vol1);
+
+            VolumeManager.VolumeStats stats = manager.getVolumeStats(vol1);
+
+            assertThat(stats).isNotNull();
+            // totalBytes should be actual disk capacity, not 0 or 4096
+            assertThat(stats.totalBytes()).isGreaterThan(0L);
+            // availableBytes should be positive
+            assertThat(stats.availableBytes()).isGreaterThan(0L);
+            // usedBytes should be total - available (approximately)
+            assertThat(stats.usedBytes()).isGreaterThanOrEqualTo(0L);
+            assertThat(stats.usedBytes()).isLessThan(stats.totalBytes());
+        }
+
+        @Test
+        @DisplayName("should return null for unregistered volume")
+        void shouldReturnNullForUnregisteredVolume() {
+            VolumeManager.VolumeStats stats = manager.getVolumeStats(vol1);
+            assertThat(stats).isNull();
+        }
+
+        @Test
+        @DisplayName("should reject null path for volume stats")
+        void shouldRejectNullPathForVolumeStats() {
+            assertThatThrownBy(() -> manager.getVolumeStats(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Volume path cannot be null");
+        }
+
+        @Test
+        @DisplayName("should get all volume stats")
+        void shouldGetAllVolumeStats() throws IOException {
+            manager.registerVolume(vol1);
+            manager.registerVolume(vol2);
+
+            Map<Path, VolumeManager.VolumeStats> allStats = manager.getAllVolumeStats();
+
+            assertThat(allStats).hasSize(2);
+            assertThat(allStats).containsKeys(vol1, vol2);
+
+            // Each volume should have valid stats
+            for (VolumeManager.VolumeStats stats : allStats.values()) {
+                assertThat(stats.totalBytes()).isGreaterThan(0L);
+                assertThat(stats.availableBytes()).isGreaterThan(0L);
+            }
+        }
+
+        @Test
+        @DisplayName("should get aggregated volume stats")
+        void shouldGetAggregatedVolumeStats() throws IOException {
+            manager.registerVolume(vol1);
+            manager.registerVolume(vol2);
+
+            VolumeManager.VolumeStats aggregated = manager.getAggregatedVolumeStats();
+
+            // Aggregated stats should combine both volumes
+            assertThat(aggregated.totalBytes()).isGreaterThan(0L);
+            assertThat(aggregated.usedBytes()).isGreaterThanOrEqualTo(0L);
+            assertThat(aggregated.availableBytes()).isGreaterThan(0L);
+        }
+
+        @Test
+        @DisplayName("should return empty stats when no volumes registered")
+        void shouldReturnEmptyStatsWhenNoVolumes() {
+            VolumeManager.VolumeStats aggregated = manager.getAggregatedVolumeStats();
+
+            assertThat(aggregated.totalBytes()).isEqualTo(0L);
+            assertThat(aggregated.usedBytes()).isEqualTo(0L);
+            assertThat(aggregated.availableBytes()).isEqualTo(0L);
+        }
+
+        @Test
+        @DisplayName("should check available space")
+        void shouldCheckAvailableSpace() throws IOException {
+            manager.registerVolume(vol1);
+
+            // Should have at least 1MB available (reasonable assumption for any disk)
+            boolean hasSpace = manager.hasAvailableSpace(vol1, 1024 * 1024);
+            assertThat(hasSpace).isTrue();
+
+            // Should not have negative bytes
+            boolean hasZeroSpace = manager.hasAvailableSpace(vol1, 0);
+            assertThat(hasZeroSpace).isTrue();
+        }
+
+        @Test
+        @DisplayName("should return false for available space on unregistered volume")
+        void shouldReturnFalseForUnregisteredVolume() {
+            boolean hasSpace = manager.hasAvailableSpace(vol1, 1024);
+            assertThat(hasSpace).isFalse();
+        }
+
+        @Test
+        @DisplayName("should reject negative required bytes")
+        void shouldRejectNegativeRequiredBytes() throws IOException {
+            manager.registerVolume(vol1);
+
+            assertThatThrownBy(() -> manager.hasAvailableSpace(vol1, -1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Required bytes must be non-negative");
+        }
+
+        @Test
+        @DisplayName("should find volume with most space")
+        void shouldFindVolumeWithMostSpace() throws IOException {
+            manager.registerVolume(vol1);
+            manager.registerVolume(vol2);
+
+            Path volumeWithMostSpace = manager.getVolumeWithMostSpace();
+
+            assertThat(volumeWithMostSpace).isNotNull();
+            assertThat(volumeWithMostSpace).isIn(vol1, vol2);
+        }
+
+        @Test
+        @DisplayName("should return null for volume with most space when no volumes")
+        void shouldReturnNullForVolumeWithMostSpaceWhenNoVolumes() {
+            Path volumeWithMostSpace = manager.getVolumeWithMostSpace();
+            assertThat(volumeWithMostSpace).isNull();
+        }
+    }
+
+    // ==================== VolumeStats Record Tests ====================
+
+    @Nested
+    @DisplayName("VolumeStats Record")
+    class VolumeStatsRecordTests {
+
+        @Test
+        @DisplayName("should create valid VolumeStats")
+        void shouldCreateValidVolumeStats() {
+            VolumeManager.VolumeStats stats = new VolumeManager.VolumeStats(
+                1000L,  // totalBytes
+                500L,   // usedBytes
+                500L    // availableBytes
+            );
+
+            assertThat(stats.totalBytes()).isEqualTo(1000L);
+            assertThat(stats.usedBytes()).isEqualTo(500L);
+            assertThat(stats.availableBytes()).isEqualTo(500L);
+        }
+
+        @Test
+        @DisplayName("should reject negative totalBytes")
+        void shouldRejectNegativeTotalBytes() {
+            assertThatThrownBy(() -> new VolumeManager.VolumeStats(-1, 0, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("totalBytes must be non-negative");
+        }
+
+        @Test
+        @DisplayName("should reject negative usedBytes")
+        void shouldRejectNegativeUsedBytes() {
+            assertThatThrownBy(() -> new VolumeManager.VolumeStats(0, -1, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("usedBytes must be non-negative");
+        }
+
+        @Test
+        @DisplayName("should reject negative availableBytes")
+        void shouldRejectNegativeAvailableBytes() {
+            assertThatThrownBy(() -> new VolumeManager.VolumeStats(0, 0, -1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("availableBytes must be non-negative");
+        }
+
+        @Test
+        @DisplayName("should calculate usage ratio correctly")
+        void shouldCalculateUsageRatio() {
+            VolumeManager.VolumeStats stats = new VolumeManager.VolumeStats(1000L, 500L, 500L);
+            assertThat(stats.usageRatio()).isEqualTo(0.5);
+        }
+
+        @Test
+        @DisplayName("should handle zero total bytes in usage ratio")
+        void shouldHandleZeroTotalBytesInUsageRatio() {
+            VolumeManager.VolumeStats stats = new VolumeManager.VolumeStats(0L, 0L, 0L);
+            assertThat(stats.usageRatio()).isEqualTo(0.0);
+        }
+
+        @Test
+        @DisplayName("should calculate available ratio correctly")
+        void shouldCalculateAvailableRatio() {
+            VolumeManager.VolumeStats stats = new VolumeManager.VolumeStats(1000L, 500L, 500L);
+            assertThat(stats.availableRatio()).isEqualTo(0.5);
+        }
+
+        @Test
+        @DisplayName("should handle zero total bytes in available ratio")
+        void shouldHandleZeroTotalBytesInAvailableRatio() {
+            VolumeManager.VolumeStats stats = new VolumeManager.VolumeStats(0L, 0L, 0L);
+            assertThat(stats.availableRatio()).isEqualTo(1.0);
+        }
+    }
 }

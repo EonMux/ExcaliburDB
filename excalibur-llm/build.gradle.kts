@@ -16,4 +16,8 @@ dependencies {
 
     // Phase 1 dependency
     implementation(project(":excalibur-core"))
+
+    // Configuration module for Config.Llm integration
+    implementation(project(":excalibur-config"))
+    testImplementation(project(":excalibur-config"))
 }

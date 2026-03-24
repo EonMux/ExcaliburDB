@@ -169,6 +169,8 @@ public class TailOffsetTracker {
         java.util.List<IncrementalInsertResult> results = graph.insertBatchWithResults(vectors, writeLogOffsets);
 
         // Find maximum offset from successful insertions
+        // Consistent with integrateVector: offset represents the entry position,
+        // and lastIntegratedOffset is set to offset + 1 to indicate "all entries up to but not including this position are integrated"
         long maxOffset = lastIntegratedOffset.get();
         for (IncrementalInsertResult result : results) {
             if (result.isSuccess() && result.writeLogOffset() >= 0) {

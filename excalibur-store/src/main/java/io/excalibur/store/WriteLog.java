@@ -1,6 +1,8 @@
 package io.excalibur.store;
 
 import io.excalibur.core.checksum.CRC32Checksum;
+import io.excalibur.core.memory.Segment;
+import io.excalibur.core.memory.MemorySegmentFactory;
 import io.excalibur.store.format.LogEntry;
 import io.excalibur.store.hash.XxHash64;
 
@@ -96,6 +98,7 @@ public class WriteLog implements AutoCloseable {
 
     private volatile FileChannel fileChannel;
     private volatile MemorySegment mappedSegment;
+    private volatile Segment mappedSegmentWrapper;
     private volatile boolean closed;
 
     // ==================== Statistics ====================
@@ -177,22 +180,25 @@ public class WriteLog implements AutoCloseable {
      * The monotonicity constraint ensures the offset never goes backwards,
      * which is critical for correct tail scan behavior in Phase 6.</p>
      *
-     * @param offset The new last integrated offset (must be >= 0 and > current value)
+     * @param offset The new last integrated offset (must be >= 0 and >= current value)
      * @throws IllegalArgumentException if offset is negative
-     * @throws IllegalStateException if offset is not greater than current value
+     * @throws IllegalStateException if offset is less than current value
      */
     public void setLastIntegratedOffset(long offset) {
         if (offset < 0) {
             throw new IllegalArgumentException(
                 "lastIntegratedOffset must be non-negative, got: " + offset);
         }
-        if (offset <= this.lastIntegratedOffset) {
+        if (offset < this.lastIntegratedOffset) {
             throw new IllegalStateException(String.format(
-                "lastIntegratedOffset must be monotonically increasing: " +
+                "lastIntegratedOffset must not go backwards: " +
                 "attempted to set %d but current value is %d",
                 offset, this.lastIntegratedOffset));
         }
-        this.lastIntegratedOffset = offset;
+        // Only update if actually different (idempotent)
+        if (offset > this.lastIntegratedOffset) {
+            this.lastIntegratedOffset = offset;
+        }
     }
 
     /**
@@ -304,8 +310,11 @@ public class WriteLog implements AutoCloseable {
         // Allocate file space
         fileChannel.truncate(size);
 
-        // Memory-map the file
+        // Memory-map the file using Panama FFM
         mappedSegment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, size, arena);
+
+        // Create Segment wrapper for abstraction layer access
+        mappedSegmentWrapper = MemorySegmentFactory.wrapNative(mappedSegment);
     }
 
     /**
@@ -778,6 +787,110 @@ public class WriteLog implements AutoCloseable {
      */
     public Path path() {
         return logFilePath;
+    }
+
+    /**
+     * Returns the memory-mapped segment wrapper using the Segment abstraction.
+     *
+     * <p>This method provides access to the underlying memory through the
+     * {@link Segment} interface, which abstracts over Panama FFM and ByteBuffer
+     * implementations.</p>
+     *
+     * @return The Segment wrapper, or null if not initialized
+     */
+    public Segment getSegment() {
+        return mappedSegmentWrapper;
+    }
+
+    /**
+     * Returns the native MemorySegment (Panama FFM).
+     *
+     * <p>This method provides direct access to the native MemorySegment for
+     * advanced operations. Returns null if Panama FFM is not available.</p>
+     *
+     * @return The native MemorySegment, or null if not using Panama FFM
+     */
+    public MemorySegment getNativeSegment() {
+        return mappedSegment;
+    }
+
+    /**
+     * Reads the log entry at the specified offset using the Segment abstraction.
+     *
+     * <p>This is an overloaded version of {@link #readEntryAt(long)} that uses
+     * the Segment abstraction layer for better compatibility across different
+     * memory access implementations.</p>
+     *
+     * @param segment The segment to read from
+     * @param offset The byte offset within the log file
+     * @return The log entry, or null if offset is out of range or entry is corrupted
+     * @throws IllegalStateException if the log is closed
+     * @throws NullPointerException if segment is null
+     */
+    public LogEntry readEntryAt(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+        ensureOpen();
+
+        long endOffset = writeOffset.get();
+
+        // Check if offset is within valid range
+        if (offset < 0 || offset >= endOffset) {
+            return null;
+        }
+
+        // Check if we have enough bytes for a header
+        if (offset + LogEntry.HEADER_SIZE > endOffset) {
+            return null;
+        }
+
+        try {
+            // Read entry size first
+            int entrySize = LogEntry.sizeAt(segment, offset);
+
+            // Check if we have enough bytes for the full entry
+            if (offset + entrySize > endOffset) {
+                return null;
+            }
+
+            // Validate CRC32
+            if (!LogEntry.validateCrc32(segment, offset)) {
+                LOGGER.fine("CRC32 validation failed at offset " + offset);
+                return null;
+            }
+
+            // Read and return the entry
+            return LogEntry.readFromUnchecked(segment, offset);
+
+        } catch (Exception e) {
+            LOGGER.fine("Failed to read entry at offset " + offset + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Returns the size of the entry at the specified offset using the Segment abstraction.
+     *
+     * @param segment The segment to read from
+     * @param offset The byte offset within the log file
+     * @return The entry size in bytes, or -1 if offset is invalid
+     * @throws IllegalStateException if the log is closed
+     * @throws NullPointerException if segment is null
+     */
+    public int entrySizeAt(Segment segment, long offset) {
+        Objects.requireNonNull(segment, "Segment cannot be null");
+        ensureOpen();
+
+        long endOffset = writeOffset.get();
+
+        if (offset < 0 || offset + LogEntry.HEADER_SIZE > endOffset) {
+            return -1;
+        }
+
+        try {
+            return LogEntry.sizeAt(segment, offset);
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     // ==================== Statistics and Status ====================

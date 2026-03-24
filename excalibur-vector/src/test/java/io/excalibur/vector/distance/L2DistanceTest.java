@@ -153,27 +153,33 @@ class L2DistanceTest {
     class EdgeCases {
 
         @Test
-        @DisplayName("Empty vectors produce 0.0")
-        void emptyVectors_produceZero() {
+        @DisplayName("Empty vectors throw IllegalArgumentException")
+        void emptyVectors_throwException() {
             float[] a = {};
             float[] b = {};
-            assertThat(distance.compute(a, b)).isEqualTo(0.0f);
+            assertThatThrownBy(() -> distance.compute(a, b))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cannot be empty");
         }
 
         @Test
-        @DisplayName("NaN in first vector produces NaN")
-        void nanInFirstVector_producesNaN() {
+        @DisplayName("NaN in first vector throws IllegalArgumentException")
+        void nanInFirstVector_throwsException() {
             float[] a = {1.0f, Float.NaN, 3.0f};
             float[] b = {1.0f, 2.0f, 3.0f};
-            assertThat(distance.compute(a, b)).isNaN();
+            assertThatThrownBy(() -> distance.compute(a, b))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
         }
 
         @Test
-        @DisplayName("NaN in second vector produces NaN")
-        void nanInSecondVector_producesNaN() {
+        @DisplayName("NaN in second vector throws IllegalArgumentException")
+        void nanInSecondVector_throwsException() {
             float[] a = {1.0f, 2.0f, 3.0f};
             float[] b = {1.0f, Float.NaN, 3.0f};
-            assertThat(distance.compute(a, b)).isNaN();
+            assertThatThrownBy(() -> distance.compute(a, b))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-finite value");
         }
 
         @Test

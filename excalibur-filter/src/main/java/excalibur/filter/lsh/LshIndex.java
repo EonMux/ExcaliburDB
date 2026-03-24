@@ -2,6 +2,7 @@ package excalibur.filter.lsh;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
@@ -353,49 +354,157 @@ public class LshIndex {
         }
     }
 
+    /** Header size in bytes for the main index. */
+    private static final int HEADER_SIZE = 40;
+
+    /** Header field offsets. */
+    private static final int OFFSET_MAGIC = 0;
+    private static final int OFFSET_VERSION = 4;
+    private static final int OFFSET_DIMENSIONS = 8;
+    private static final int OFFSET_NUM_HASH_TABLES = 12;
+    private static final int OFFSET_NUM_HASH_FUNCTIONS = 16;
+    private static final int OFFSET_NUM_PROBES = 20;
+    private static final int OFFSET_SEED = 24;
+    private static final int OFFSET_ENTRY_COUNT = 32;
+    private static final int OFFSET_TABLE_DATA_START = 40;
+
     /**
      * Serializes this index to a MemorySegment.
-     * Note: This is a basic implementation for persistence.
+     * The format includes the header and all table data with hyperplanes.
+     *
+     * <p>Format:
+     * <ul>
+     *   <li>Header (40 bytes): magic, version, config, entryCount</li>
+     *   <li>For each table: length(4) + serialized LshHashTable data</li>
+     * </ul>
      *
      * @param arena The arena to allocate from
      * @return The memory segment containing serialized data
      */
     public MemorySegment toMemorySegment(Arena arena) {
-        // Calculate total size needed
-        // Header: magic(4) + version(4) + config fields (5 * 8 = 40) + entryCount(8) = 56 bytes
-        int headerSize = 56;
+        // First, serialize all tables to get their sizes
+        MemorySegment[] tableSegments = new MemorySegment[tables.length];
+        long totalTableSize = 0;
 
-        // For each table: table header + entries
-        long totalEntries = entryCount.get();
-        long estimatedSize = headerSize + (tables.length * 32L) + (totalEntries * 16L * tables.length);
+        for (int i = 0; i < tables.length; i++) {
+            tableSegments[i] = tables[i].toMemorySegment(arena);
+            totalTableSize += 4 + tableSegments[i].byteSize(); // 4 bytes for length prefix
+        }
 
-        MemorySegment segment = arena.allocate(estimatedSize);
-        long offset = 0;
+        // Total size: header + table data
+        long totalSize = HEADER_SIZE + totalTableSize;
+        MemorySegment segment = arena.allocate(totalSize);
 
         // Write header
-        segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, offset, MAGIC);
+        long offset = 0;
+        segment.set(ValueLayout.JAVA_INT_UNALIGNED, offset, MAGIC);
         offset += 4;
-        segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, offset, VERSION);
+        segment.set(ValueLayout.JAVA_INT_UNALIGNED, offset, VERSION);
         offset += 4;
-
-        // Write config
-        segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, offset, config.dimensions());
+        segment.set(ValueLayout.JAVA_INT_UNALIGNED, offset, config.dimensions());
         offset += 4;
-        segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, offset, config.numHashTables());
+        segment.set(ValueLayout.JAVA_INT_UNALIGNED, offset, config.numHashTables());
         offset += 4;
-        segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, offset, config.numHashFunctions());
+        segment.set(ValueLayout.JAVA_INT_UNALIGNED, offset, config.numHashFunctions());
         offset += 4;
-        segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, offset, config.numProbes());
+        segment.set(ValueLayout.JAVA_INT_UNALIGNED, offset, config.numProbes());
         offset += 4;
-        segment.set(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, offset, config.seed());
+        segment.set(ValueLayout.JAVA_LONG_UNALIGNED, offset, config.seed());
         offset += 8;
-        segment.set(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, offset, entryCount.get());
+        segment.set(ValueLayout.JAVA_LONG_UNALIGNED, offset, entryCount.get());
         offset += 8;
 
-        // Note: Full serialization would include each table's data
-        // For now, this provides a header for file-based persistence
+        // Write each table with length prefix
+        for (int i = 0; i < tables.length; i++) {
+            int tableSize = (int) tableSegments[i].byteSize();
+            segment.set(ValueLayout.JAVA_INT_UNALIGNED, offset, tableSize);
+            offset += 4;
+
+            // Copy table data
+            MemorySegment.copy(tableSegments[i], 0, segment, offset, tableSize);
+            offset += tableSize;
+        }
 
         return segment.asSlice(0, offset);
+    }
+
+    /**
+     * Deserializes an LshIndex from a MemorySegment.
+     *
+     * @param segment The memory segment containing serialized data
+     * @return A new LshIndex instance
+     * @throws IllegalArgumentException if the segment is invalid or corrupted
+     */
+    public static LshIndex fromMemorySegment(MemorySegment segment) {
+        if (segment == null) {
+            throw new IllegalArgumentException("segment cannot be null");
+        }
+        if (segment.byteSize() < HEADER_SIZE) {
+            throw new IllegalArgumentException(
+                "Segment too small: " + segment.byteSize() + " < " + HEADER_SIZE);
+        }
+
+        // Read and validate header
+        int magic = segment.get(ValueLayout.JAVA_INT_UNALIGNED, OFFSET_MAGIC);
+        if (magic != MAGIC) {
+            throw new IllegalArgumentException(
+                "Invalid magic number: 0x" + Integer.toHexString(magic) +
+                " (expected 0x" + Integer.toHexString(MAGIC) + ")");
+        }
+
+        int version = segment.get(ValueLayout.JAVA_INT_UNALIGNED, OFFSET_VERSION);
+        if (version != VERSION) {
+            throw new IllegalArgumentException(
+                "Unsupported version: " + version + " (expected " + VERSION + ")");
+        }
+
+        // Read config
+        int dimensions = segment.get(ValueLayout.JAVA_INT_UNALIGNED, OFFSET_DIMENSIONS);
+        int numHashTables = segment.get(ValueLayout.JAVA_INT_UNALIGNED, OFFSET_NUM_HASH_TABLES);
+        int numHashFunctions = segment.get(ValueLayout.JAVA_INT_UNALIGNED, OFFSET_NUM_HASH_FUNCTIONS);
+        int numProbes = segment.get(ValueLayout.JAVA_INT_UNALIGNED, OFFSET_NUM_PROBES);
+        long seed = segment.get(ValueLayout.JAVA_LONG_UNALIGNED, OFFSET_SEED);
+        long entryCount = segment.get(ValueLayout.JAVA_LONG_UNALIGNED, OFFSET_ENTRY_COUNT);
+
+        // Create config and index
+        LshConfig config = LshConfig.builder(dimensions)
+            .numHashTables(numHashTables)
+            .numHashFunctions(numHashFunctions)
+            .numProbes(numProbes)
+            .seed(seed)
+            .build();
+
+        LshIndex index = new LshIndex(config);
+
+        // Read each table
+        long offset = HEADER_SIZE;
+        for (int t = 0; t < numHashTables; t++) {
+            if (offset + 4 > segment.byteSize()) {
+                throw new IllegalArgumentException(
+                    "Unexpected end of segment reading table " + t + " size");
+            }
+
+            int tableSize = segment.get(ValueLayout.JAVA_INT_UNALIGNED, offset);
+            offset += 4;
+
+            if (offset + tableSize > segment.byteSize()) {
+                throw new IllegalArgumentException(
+                    "Unexpected end of segment reading table " + t + " data");
+            }
+
+            // Create a slice for the table data and deserialize
+            MemorySegment tableSlice = segment.asSlice(offset, tableSize);
+            LshHashTable deserializedTable = LshHashTable.fromMemorySegment(tableSlice);
+
+            // Replace the empty table with the deserialized one
+            index.tables[t] = deserializedTable;
+            offset += tableSize;
+        }
+
+        // Restore entry count (table deserialization sets individual counts, but we need the total)
+        index.entryCount.set(entryCount);
+
+        return index;
     }
 
     @Override

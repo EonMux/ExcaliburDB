@@ -1,5 +1,7 @@
 package excalibur.llm.client;
 
+import io.excalibur.config.Config;
+
 import java.time.Duration;
 import java.util.Objects;
 
@@ -35,6 +37,7 @@ public final class LLMClientConfig {
     private final double relevancyThreshold;
     private final int embeddingDimension;
     private final int maxBatchTokens;
+    private final Duration retryBaseDelay;
 
     private LLMClientConfig(Builder builder) {
         this.baseUrl = validateBaseUrl(builder.baseUrl);
@@ -49,6 +52,7 @@ public final class LLMClientConfig {
         this.relevancyThreshold = validateRelevancyThreshold(builder.relevancyThreshold);
         this.embeddingDimension = validateEmbeddingDimension(builder.embeddingDimension);
         this.maxBatchTokens = validateMaxBatchTokens(builder.maxBatchTokens);
+        this.retryBaseDelay = validateRetryBaseDelay(builder.retryBaseDelay);
     }
 
     // Getters
@@ -219,13 +223,26 @@ public final class LLMClientConfig {
         return tokens;
     }
 
+    private static Duration validateRetryBaseDelay(Duration delay) {
+        Objects.requireNonNull(delay, "Retry base delay cannot be null");
+        if (delay.isNegative() || delay.isZero()) {
+            throw new IllegalArgumentException(
+                "Retry base delay must be positive, got: " + delay);
+        }
+        return delay;
+    }
+
     /**
-     * Creates a new builder for LLMClientConfig.
+     * Returns the retry base delay for exponential backoff.
+     * <p>
+     * This value is used as the base delay for calculating exponential backoff
+     * when retrying failed requests. The delay doubles with each retry attempt.
+     * </p>
      *
-     * @return New builder instance
+     * @return Retry base delay (always positive, default 500ms)
      */
-    public static Builder builder() {
-        return new Builder();
+    public Duration getRetryBaseDelay() {
+        return retryBaseDelay;
     }
 
     /**
@@ -240,6 +257,50 @@ public final class LLMClientConfig {
             .chatModel("llama3.2")
             .embeddingModel("nomic-embed-text")
             .build();
+    }
+
+    /**
+     * Creates an LLMClientConfig from the application configuration.
+     *
+     * <p>This adapter method bridges the properties file configuration
+     * ({@link Config.Llm}) to the runtime LLM client configuration.
+     * It maps all configuration values from the properties file to
+     * the corresponding fields in LLMClientConfig.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <p>All values from the config are validated through the builder's
+     * validation methods, ensuring the resulting configuration is valid.</p>
+     *
+     * @param llmConfig The LLM configuration from the properties file
+     * @return A new LLMClientConfig instance with values from the config
+     * @throws NullPointerException if llmConfig is null
+     */
+    public static LLMClientConfig fromConfig(Config.Llm llmConfig) {
+        Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
+
+        return builder()
+            .baseUrl(llmConfig.getBaseUrl())
+            .apiKey(llmConfig.getApiKey())
+            .chatModel(llmConfig.getChatModel())
+            .embeddingModel(llmConfig.getEmbeddingModel())
+            .timeout(Duration.ofMillis(llmConfig.getTimeoutMs()))
+            .maxRetries(llmConfig.getMaxRetries())
+            .failureThreshold(llmConfig.getFailureThreshold())
+            .cooldownPeriod(Duration.ofMillis(llmConfig.getCooldownPeriodMs()))
+            .maxPromptsPerQuery(llmConfig.getMaxPromptsPerQuery())
+            .relevancyThreshold(llmConfig.getRelevancyThreshold())
+            .embeddingDimension(llmConfig.getEmbeddingsDimensions())
+            .maxBatchTokens(llmConfig.getMaxBatchTokens())
+            .build();
+    }
+
+    /**
+     * Creates a new builder for constructing LLMClientConfig instances.
+     *
+     * @return A new Builder instance
+     */
+    public static Builder builder() {
+        return new Builder();
     }
 
     /**
@@ -258,6 +319,7 @@ public final class LLMClientConfig {
         private double relevancyThreshold = 0.3;
         private int embeddingDimension = 1536;
         private int maxBatchTokens = 4000;
+        private Duration retryBaseDelay = Duration.ofMillis(500);
 
         public Builder baseUrl(String baseUrl) {
             this.baseUrl = baseUrl;
@@ -326,6 +388,17 @@ public final class LLMClientConfig {
          */
         public Builder maxBatchTokens(int maxBatchTokens) {
             this.maxBatchTokens = maxBatchTokens;
+            return this;
+        }
+
+        /**
+         * Sets the base delay for exponential backoff retries.
+         *
+         * @param retryBaseDelay Base delay for retries (must be positive)
+         * @return This builder
+         */
+        public Builder retryBaseDelay(Duration retryBaseDelay) {
+            this.retryBaseDelay = retryBaseDelay;
             return this;
         }
 
