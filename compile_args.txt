@@ -1,9 +1,0 @@
---module-path "/home/aeslampanah/Desktop/Projects/ExcaliburDB/excalibur-core/build/libs/excalibur-core-1.0.0-SNAPSHOT.jar"
--cp "/home/aeslampanah/.gradle/caches/modules-2/files-2.1/org.junit.jupiter/junit-jupiter-api/5.11.4/308315b28e667db4091b2ba1f7aa220d1ddadb97/junit-jupiter-api-5.11.4.jar:"
--d "test-classes"
-excalibur-test/src/main/java/excalibur/test/SyntheticTestGenerator.java
-excalibur-core/src/main/java/excalibur/core/schema/Document.java
-excalibur-core/src/main/java/excalibur/core/schema/Query.java
-excalibur-core/src/main/java/excalibur/core/schema/QueryResult.java
-excalibur-core/src/main/java/excalibur/core/schema/QueryResultEntry.java
-excalibur-test/src/test/java/excalibur/test/SyntheticTestGeneratorTest.java
