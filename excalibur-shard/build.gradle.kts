@@ -21,6 +21,9 @@ dependencies {
     implementation(project(":excalibur-store"))
     implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-vector"))
+
+    // Config module for Config.Shard
+    implementation(project(":excalibur-config"))
 }
 
 // Enable preview features for Java 21

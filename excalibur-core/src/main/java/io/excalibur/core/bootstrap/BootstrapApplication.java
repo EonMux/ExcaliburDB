@@ -1,7 +1,8 @@
 package io.excalibur.core.bootstrap;
 
-import io.excalibur.core.config.Config;
-import io.excalibur.core.config.ConfigLoader;
+import io.excalibur.config.Config;
+import io.excalibur.config.ConfigLoader;
+import io.excalibur.config.ConfigValidation;
 import io.excalibur.metrics.Metrics;
 import io.excalibur.metrics.MetricsRegistry;
 import org.slf4j.Logger;
@@ -92,15 +93,17 @@ public final class BootstrapApplication {
         try {
             // Load config with system environment variables for overrides
             config = ConfigLoader.load("excalibur.properties", System.getenv());
-            logger.info("Configuration loaded from excalibur.properties");
+            // Validate the loaded configuration
+            ConfigValidation.validate(config);
+            logger.info("Configuration loaded and validated from excalibur.properties");
             logger.info("Visibility epoch tick: {}ms", config.visibility().getEpochTickMs());
-            logger.info("Query include partial segments: {}", config.query().includePartialSegments());
+            logger.info("Query include partial segments: {}", config.query().isIncludePartialSegments());
             logger.info("Ingest HNSW queue depth limit: {}", config.ingest().getHnswQueueDepthLimit());
             logger.info("Health readiness threshold: {}", config.health().getReadinessThreshold());
         } catch (Exception e) {
             logger.warn("Failed to load configuration, using defaults: {}", e.getMessage());
-            // Fall back to loading with empty overrides
-            config = ConfigLoader.load("excalibur.properties", new HashMap<>());
+            // Fall back to creating a default config
+            config = new Config(new HashMap<>());
         }
     }
 
@@ -176,7 +179,7 @@ public final class BootstrapApplication {
         if (config != null) {
             System.out.println("Configuration:");
             System.out.println("  Epoch tick: " + config.visibility().getEpochTickMs() + "ms");
-            System.out.println("  Include partial segments: " + config.query().includePartialSegments());
+            System.out.println("  Include partial segments: " + config.query().isIncludePartialSegments());
             System.out.println("  HNSW queue depth limit: " + config.ingest().getHnswQueueDepthLimit());
             System.out.println("  Readiness threshold: " + config.health().getReadinessThreshold());
         }

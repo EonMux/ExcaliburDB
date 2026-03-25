@@ -5,10 +5,13 @@ import com.sun.net.httpserver.HttpExchange;
 import excalibur.query.*;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.pipeline.QueryPipeline;
+import io.excalibur.config.Config;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import static org.mockito.ArgumentCaptor.*;
+import static org.mockito.Mockito.*;;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -281,6 +284,199 @@ class QueryEndpointTest {
             endpointWithExecutor.shutdown();
 
             assertThat(executor.isShutdown()).isTrue();
+        }
+    }
+
+    @Nested
+    @DisplayName("Configuration wiring")
+    class ConfigurationWiring {
+
+        @Test
+        @DisplayName("uses config defaults for topK when not specified in request")
+        void usesConfigDefaultsForTopK() throws Exception {
+            // Create mock config with custom topK default
+            Config mockConfig = mock(Config.class);
+            Config.Query mockQueryConfig = mock(Config.Query.class);
+            when(mockConfig.query()).thenReturn(mockQueryConfig);
+            when(mockQueryConfig.getDefaultTopK()).thenReturn(50);
+            when(mockQueryConfig.getLlmTimeoutMs()).thenReturn(60000L);
+            when(mockQueryConfig.getRecallTarget()).thenReturn(0.9);
+            when(mockQueryConfig.getVectorDimensions()).thenReturn(128);
+            when(mockQueryConfig.isIncludePartialSegments()).thenReturn(true);
+
+            // Create visibility config mock
+            Config.Visibility mockVisibilityConfig = mock(Config.Visibility.class);
+            when(mockConfig.visibility()).thenReturn(mockVisibilityConfig);
+            when(mockVisibilityConfig.getQueryTimeoutMs()).thenReturn(60000L);
+
+            QueryEndpoint endpointWithConfig = new QueryEndpoint(queryPipeline, mockConfig);
+
+            // Request without top_k specified - should use config default
+            String json = "{\"vector\": [0.1, 0.2, 0.3]}";
+            ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
+
+            QueryResponse mockResponse = createMockResponse();
+            CompletableFuture<QueryResponse> future = CompletableFuture.completedFuture(mockResponse);
+
+            ArgumentCaptor<QueryRequest> requestCaptor = ArgumentCaptor.forClass(QueryRequest.class);
+            when(queryPipeline.execute(requestCaptor.capture(), any(CancellationToken.class)))
+                .thenReturn(future);
+
+            endpointWithConfig.handle(exchange);
+
+            // Verify the config default was used
+            QueryRequest capturedRequest = requestCaptor.getValue();
+            assertThat(capturedRequest.topK()).isEqualTo(50);
+        }
+
+        @Test
+        @DisplayName("uses config defaults for timeout when not specified in request")
+        void usesConfigDefaultsForTimeout() throws Exception {
+            // Create mock config with custom timeout default
+            Config mockConfig = mock(Config.class);
+            Config.Query mockQueryConfig = mock(Config.Query.class);
+            when(mockConfig.query()).thenReturn(mockQueryConfig);
+            when(mockQueryConfig.getDefaultTopK()).thenReturn(10);
+            when(mockQueryConfig.getLlmTimeoutMs()).thenReturn(45000L);
+            when(mockQueryConfig.getRecallTarget()).thenReturn(0.95);
+            when(mockQueryConfig.getVectorDimensions()).thenReturn(-1);
+            when(mockQueryConfig.isIncludePartialSegments()).thenReturn(true);
+
+            // Create visibility config mock
+            Config.Visibility mockVisibilityConfig = mock(Config.Visibility.class);
+            when(mockConfig.visibility()).thenReturn(mockVisibilityConfig);
+            when(mockVisibilityConfig.getQueryTimeoutMs()).thenReturn(45000L);
+
+            QueryEndpoint endpointWithConfig = new QueryEndpoint(queryPipeline, mockConfig);
+
+            // Request without timeout_ms specified - should use config default
+            String json = "{\"vector\": [0.1, 0.2, 0.3]}";
+            ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
+
+            QueryResponse mockResponse = createMockResponse();
+            CompletableFuture<QueryResponse> future = CompletableFuture.completedFuture(mockResponse);
+
+            ArgumentCaptor<QueryRequest> requestCaptor = ArgumentCaptor.forClass(QueryRequest.class);
+            when(queryPipeline.execute(requestCaptor.capture(), any(CancellationToken.class)))
+                .thenReturn(future);
+
+            endpointWithConfig.handle(exchange);
+
+            // Verify the config default was used
+            QueryRequest capturedRequest = requestCaptor.getValue();
+            assertThat(capturedRequest.timeoutMs()).isEqualTo(45000L);
+        }
+
+        @Test
+        @DisplayName("uses config defaults for recallTarget when not specified in request")
+        void usesConfigDefaultsForRecallTarget() throws Exception {
+            // Create mock config with custom recall target default
+            Config mockConfig = mock(Config.class);
+            Config.Query mockQueryConfig = mock(Config.Query.class);
+            when(mockConfig.query()).thenReturn(mockQueryConfig);
+            when(mockQueryConfig.getDefaultTopK()).thenReturn(10);
+            when(mockQueryConfig.getLlmTimeoutMs()).thenReturn(30000L);
+            when(mockQueryConfig.getRecallTarget()).thenReturn(0.85);
+            when(mockQueryConfig.getVectorDimensions()).thenReturn(-1);
+            when(mockQueryConfig.isIncludePartialSegments()).thenReturn(true);
+
+            // Create visibility config mock
+            Config.Visibility mockVisibilityConfig = mock(Config.Visibility.class);
+            when(mockConfig.visibility()).thenReturn(mockVisibilityConfig);
+            when(mockVisibilityConfig.getQueryTimeoutMs()).thenReturn(30000L);
+
+            QueryEndpoint endpointWithConfig = new QueryEndpoint(queryPipeline, mockConfig);
+
+            // Request without recall_target specified - should use config default
+            String json = "{\"vector\": [0.1, 0.2, 0.3]}";
+            ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
+
+            QueryResponse mockResponse = createMockResponse();
+            CompletableFuture<QueryResponse> future = CompletableFuture.completedFuture(mockResponse);
+
+            ArgumentCaptor<QueryRequest> requestCaptor = ArgumentCaptor.forClass(QueryRequest.class);
+            when(queryPipeline.execute(requestCaptor.capture(), any(CancellationToken.class)))
+                .thenReturn(future);
+
+            endpointWithConfig.handle(exchange);
+
+            // Verify the config default was used
+            QueryRequest capturedRequest = requestCaptor.getValue();
+            assertThat(capturedRequest.recallTarget()).isEqualTo(0.85);
+        }
+
+        @Test
+        @DisplayName("request values override config defaults")
+        void requestValuesOverrideConfigDefaults() throws Exception {
+            // Create mock config with defaults
+            Config mockConfig = mock(Config.class);
+            Config.Query mockQueryConfig = mock(Config.Query.class);
+            when(mockConfig.query()).thenReturn(mockQueryConfig);
+            when(mockQueryConfig.getDefaultTopK()).thenReturn(10);
+            when(mockQueryConfig.getLlmTimeoutMs()).thenReturn(30000L);
+            when(mockQueryConfig.getRecallTarget()).thenReturn(0.95);
+            when(mockQueryConfig.getVectorDimensions()).thenReturn(-1);
+            when(mockQueryConfig.isIncludePartialSegments()).thenReturn(true);
+
+            // Create visibility config mock
+            Config.Visibility mockVisibilityConfig = mock(Config.Visibility.class);
+            when(mockConfig.visibility()).thenReturn(mockVisibilityConfig);
+            when(mockVisibilityConfig.getQueryTimeoutMs()).thenReturn(30000L);
+
+            QueryEndpoint endpointWithConfig = new QueryEndpoint(queryPipeline, mockConfig);
+
+            // Request with explicit values - should override config defaults
+            String json = "{\"vector\": [0.1, 0.2, 0.3], \"top_k\": 100, \"timeout_ms\": 60000, \"recall_target\": 0.99}";
+            ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
+
+            QueryResponse mockResponse = createMockResponse();
+            CompletableFuture<QueryResponse> future = CompletableFuture.completedFuture(mockResponse);
+
+            ArgumentCaptor<QueryRequest> requestCaptor = ArgumentCaptor.forClass(QueryRequest.class);
+            when(queryPipeline.execute(requestCaptor.capture(), any(CancellationToken.class)))
+                .thenReturn(future);
+
+            endpointWithConfig.handle(exchange);
+
+            // Verify request values override config defaults
+            QueryRequest capturedRequest = requestCaptor.getValue();
+            assertThat(capturedRequest.topK()).isEqualTo(100);
+            assertThat(capturedRequest.timeoutMs()).isEqualTo(60000L);
+            assertThat(capturedRequest.recallTarget()).isEqualTo(0.99);
+        }
+
+        @Test
+        @DisplayName("validates vector dimensions when config specifies expected dimensions")
+        void validatesVectorDimensionsWhenConfigSpecifiesExpectedDimensions() throws Exception {
+            // Create mock config with expected vector dimensions
+            Config mockConfig = mock(Config.class);
+            Config.Query mockQueryConfig = mock(Config.Query.class);
+            when(mockConfig.query()).thenReturn(mockQueryConfig);
+            when(mockQueryConfig.getDefaultTopK()).thenReturn(10);
+            when(mockQueryConfig.getLlmTimeoutMs()).thenReturn(30000L);
+            when(mockQueryConfig.getRecallTarget()).thenReturn(0.95);
+            when(mockQueryConfig.getVectorDimensions()).thenReturn(128); // Expect 128 dimensions
+            when(mockQueryConfig.isIncludePartialSegments()).thenReturn(true);
+
+            // Create visibility config mock
+            Config.Visibility mockVisibilityConfig = mock(Config.Visibility.class);
+            when(mockConfig.visibility()).thenReturn(mockVisibilityConfig);
+            when(mockVisibilityConfig.getQueryTimeoutMs()).thenReturn(30000L);
+
+            QueryEndpoint endpointWithConfig = new QueryEndpoint(queryPipeline, mockConfig);
+
+            // Request with wrong vector dimensions
+            String json = "{\"vector\": [0.1, 0.2, 0.3]}"; // Only 3 dimensions, not 128
+            HttpExchange exchange = createMockExchange("POST", json);
+
+            endpointWithConfig.handle(exchange);
+
+            // Should return 400 for dimension mismatch
+            verify(exchange).sendResponseHeaders(eq(400), anyLong());
         }
     }
 

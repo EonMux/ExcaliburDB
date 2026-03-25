@@ -171,6 +171,11 @@ public class HnswGraph implements AutoCloseable {
     // This is a simple in-memory map; for production, consider disk-backed storage
     private volatile java.util.concurrent.ConcurrentHashMap<Long, byte[]> pqCodes;
 
+    // Node to document ID mapping for document atomicity filtering
+    // Maps internal HNSW node IDs to actual document IDs (e.g., "doc1", "source1:file1")
+    // This is critical for DocumentAtomicityFilter to correctly identify documents
+    private volatile NodeDocumentMapping nodeDocumentMapping;
+
     /**
      * Creates a new HNSW graph backed by a memory-mapped file.
      *
@@ -195,6 +200,9 @@ public class HnswGraph implements AutoCloseable {
         this.config = config;
         this.distanceFunction = distanceFunction;
         this.maxNodes = maxNodes;
+
+        // Initialize node-to-document mapping (in-memory by default)
+        this.nodeDocumentMapping = new NodeDocumentMapping();
 
         // Calculate initial file size
         // Header + node index + estimated data region
@@ -235,6 +243,7 @@ public class HnswGraph implements AutoCloseable {
         this.arena = arena;
         this.dataRegionOffset = dataRegionOffset;
         this.dataWriteOffset = 0; // Will be set by caller if needed
+        this.nodeDocumentMapping = new NodeDocumentMapping(); // In-memory by default
     }
 
     /**
@@ -823,7 +832,7 @@ public class HnswGraph implements AutoCloseable {
         }
 
         float entryDist = computeDistance(query, entry.vector());
-        HnswSearchResult entryResult = new HnswSearchResult(entry.nodeId(), entryDist);
+        HnswSearchResult entryResult = createSearchResult(entry.nodeId(), entryDist);
         candidates.add(entryResult);
         results.add(entryResult);
         visited.add(entry.nodeId());
@@ -944,7 +953,7 @@ public class HnswGraph implements AutoCloseable {
         }
 
         float entryDist = computeDistance(query, entry.vector());
-        HnswSearchResult entryResult = new HnswSearchResult(entry.nodeId(), entryDist);
+        HnswSearchResult entryResult = createSearchResult(entry.nodeId(), entryDist);
         candidates.add(entryResult);
         results.add(entryResult);
         visited.add(entry.nodeId());
@@ -2926,6 +2935,71 @@ public class HnswGraph implements AutoCloseable {
         // MappedFile uses Panama FFM internally, but doesn't expose the segment directly
         // This method is provided for API consistency
         return null;
+    }
+
+    // ==================== Node-to-Document Mapping ====================
+
+    /**
+     * Registers a document ID for a node.
+     *
+     * <p>This method associates an HNSW node ID with the actual document ID
+     * from the source document. This mapping is essential for the
+     * {@code DocumentAtomicityFilter} to correctly identify which document
+     * each query result belongs to.</p>
+     *
+     * <p><strong>Call this method after inserting a vector with a document ID.</strong></p>
+     *
+     * @param nodeId The HNSW node ID
+     * @param documentId The document ID (e.g., "doc1", "source1:file1")
+     * @throws IllegalArgumentException if nodeId is negative or documentId is null/empty
+     */
+    public void registerDocumentId(long nodeId, String documentId) {
+        if (nodeDocumentMapping != null) {
+            nodeDocumentMapping.register(nodeId, documentId);
+            LOGGER.trace("Registered documentId={} for nodeId={}", documentId, nodeId);
+        }
+    }
+
+    /**
+     * Gets the document ID for a node.
+     *
+     * @param nodeId The HNSW node ID
+     * @return The document ID, or null if not found
+     */
+    public String getDocumentId(long nodeId) {
+        return nodeDocumentMapping != null ? nodeDocumentMapping.getDocumentId(nodeId) : null;
+    }
+
+    /**
+     * Sets the node-to-document mapping for this graph.
+     *
+     * <p>This allows using a persistent mapping that can survive restarts.</p>
+     *
+     * @param mapping The mapping to use
+     */
+    public void setNodeDocumentMapping(NodeDocumentMapping mapping) {
+        this.nodeDocumentMapping = Objects.requireNonNull(mapping, "mapping cannot be null");
+    }
+
+    /**
+     * Gets the current node-to-document mapping.
+     *
+     * @return The current mapping, or null if not set
+     */
+    public NodeDocumentMapping getNodeDocumentMapping() {
+        return nodeDocumentMapping;
+    }
+
+    /**
+     * Creates a search result with the document ID populated from the mapping.
+     *
+     * @param nodeId The node ID
+     * @param distance The distance value
+     * @return An HnswSearchResult with the document ID included
+     */
+    private HnswSearchResult createSearchResult(long nodeId, float distance) {
+        String documentId = getDocumentId(nodeId);
+        return new HnswSearchResult(nodeId, distance, documentId);
     }
 
     @Override

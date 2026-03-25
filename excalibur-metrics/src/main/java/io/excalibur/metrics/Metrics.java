@@ -1,20 +1,21 @@
 package io.excalibur.metrics;
 
-import javax.management.MBeanServer;
-import javax.management.Notification;
+import javax.management.*;
 import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import javax.management.ObjectName;
 
 /**
  * Metrics registry for ExcaliburDB.
- * 
+ *
  * <h2>Thread-Safety</h2>
  * <p>This class is thread-safe for concurrent access. All methods use
  * synchronized operations or atomic variables to ensure thread safety.</p>
- * 
+ *
  * <h2>Features</h2>
  * <ul>
  *   <li>Query latency histogram with percentile support</li>
@@ -23,7 +24,7 @@ import javax.management.ObjectName;
  *   <li>JMX MBean registration</li>
  *   <li>Visibility epoch tracking</li>
  * </ul>
- * 
+ *
  * @author ExcaliburDB
  */
 public final class Metrics {
@@ -96,51 +97,51 @@ public final class Metrics {
     // ============================================
     // Query Latency
     // ============================================
-    
+
     private static final FixedBucketHistogram queryLatencyHistogram = new FixedBucketHistogram();
-    
+
     /**
      * Gets the query latency histogram.
      */
     public static FixedBucketHistogram QueryLatency() {
         return queryLatencyHistogram;
     }
-    
+
      /**
      * Gets the p50 query latency.
      */
     public static long getP50() {
         return FixedBucketHistogram.getP50();
     }
-    
+
     /**
      * Gets the p90 query latency.
      */
     public static long getP90() {
         return FixedBucketHistogram.getP90();
     }
-    
+
     /**
      * Gets the p95 query latency.
      */
     public static long getP95() {
         return FixedBucketHistogram.getP95();
     }
-    
+
     /**
      * Gets the p99 query latency.
      */
     public static long getP99() {
         return FixedBucketHistogram.getP99();
     }
-    
+
     /**
      * Gets the p99.9 query latency.
      */
     public static long getP999() {
         return FixedBucketHistogram.getP999();
     }
-    
+
     /**
      * Records a query latency measurement.
      *
@@ -171,56 +172,56 @@ public final class Metrics {
             latencyMs
         );
     }
-    
+
     // ============================================
     // Throughput Counters
     // ============================================
-    
+
     private static final AtomicLong entriesIngested = new AtomicLong(0);
     private static final AtomicLong queriesExecuted = new AtomicLong(0);
-    
+
     /**
      * Gets the total number of entries ingested.
      */
     public static long getEntriesIngested() {
         return entriesIngested.get();
     }
-    
+
     /**
      * Records an ingestion entry.
      */
     public static void recordIngestEntry() {
         entriesIngested.incrementAndGet();
     }
-    
+
     /**
      * Gets the total number of queries executed.
      */
     public static long getQueriesExecuted() {
         return queriesExecuted.get();
     }
-    
+
     /**
      * Records a query execution.
      */
     public static void recordQueryExecution() {
         queriesExecuted.incrementAndGet();
     }
-    
+
     // ============================================
     // System Health
     // ============================================
-    
+
     private static final AtomicReference<Double> healthScore = new AtomicReference<>(0.5);
     private static final AtomicBoolean isHealthy = new AtomicBoolean(true);
-    
+
     /**
      * Gets the system health score (0.0-1.0).
      */
     public static double getHealthScore() {
         return healthScore.get();
     }
-    
+
     /**
      * Sets the system health score.
      *
@@ -237,14 +238,14 @@ public final class Metrics {
             score
         );
     }
-    
+
     /**
      * Gets whether the system is healthy.
      */
     public static boolean isHealthy() {
         return isHealthy.get();
     }
-    
+
     /**
      * Sets the system health status.
      *
@@ -253,7 +254,7 @@ public final class Metrics {
     public static void setHealthy(boolean healthy) {
         isHealthy.set(healthy);
     }
-    
+
     /**
      * Updates health based on latency threshold.
      *
@@ -263,7 +264,7 @@ public final class Metrics {
     public static void updateHealth(long latencyMs, long thresholdMs) {
         double latencyRatio = (double) latencyMs / thresholdMs;
         double newScore = Math.max(0.0, 1.0 - latencyRatio);
-        
+
         synchronized (healthScore) {
             if (newScore < healthScore.get() - 0.01) {
                 isHealthy.set(newScore < 0.5);
@@ -271,20 +272,20 @@ public final class Metrics {
             healthScore.set(newScore);
         }
     }
-    
+
     // ============================================
     // Ingestion Queue Depth
     // ============================================
-    
+
     private static final AtomicLong queueDepth = new AtomicLong(0);
-    
+
     /**
      * Gets the current ingestion queue depth.
      */
     public static long getQueueDepth() {
         return queueDepth.get();
     }
-    
+
     /**
      * Records the current queue depth.
      *
@@ -299,7 +300,7 @@ public final class Metrics {
             depth
         );
     }
-    
+
     /**
      * Gets the queue depth percentage.
      *
@@ -311,41 +312,41 @@ public final class Metrics {
         double percent = (double) depth / limit * 100.0;
         return Math.max(0.0, Math.min(100.0, percent));
     }
-    
+
     /**
-     * Checks if the queue is under control (< 50% of limit).
+     * Checks if the queue is under control (&lt; 50% of limit).
      */
     public static boolean isUnderControl(long limit) {
         return getQueueDepth() < limit * 0.5;
     }
-    
+
     /**
-     * Checks if the queue is critical (> 80% of limit).
+     * Checks if the queue is critical (&gt; 80% of limit).
      */
     public static boolean isCritical(long limit) {
         return getQueueDepth() > limit * 0.8;
     }
-    
+
     /**
-     * Checks if the queue is full (> 100% of limit).
+     * Checks if the queue is full (&gt; 100% of limit).
      */
     public static boolean isFull(long limit) {
         return getQueueDepth() > limit;
     }
-    
+
     // ============================================
     // Visibility Epoch
     // ============================================
-    
+
     private static final AtomicLong currentEpoch = new AtomicLong(0);
-    
+
     /**
      * Gets the current visibility epoch.
      */
     public static long getCurrentEpoch() {
         return currentEpoch.get();
     }
-    
+
     /**
      * Records a new epoch.
      *
@@ -360,20 +361,20 @@ public final class Metrics {
             epoch
         );
     }
-    
+
     // ============================================
     // Estimated Coverage
     // ============================================
-    
+
     private static final AtomicReference<Double> estimatedCoverage = new AtomicReference<>(0.0);
-    
+
     /**
      * Gets the estimated corpus coverage.
      */
     public static double getEstimatedCoverage() {
         return estimatedCoverage.get();
     }
-    
+
     /**
      * Updates the estimated coverage.
      *
@@ -384,15 +385,15 @@ public final class Metrics {
         if (coverage > 1.0) coverage = 1.0;
         estimatedCoverage.set(coverage);
     }
-    
+
     // ============================================
     // Tail Scan Metrics
     // ============================================
-    
+
     private static final AtomicLong totalTailScanned = new AtomicLong(0);
     private static final AtomicLong tailScanEntries = new AtomicLong(0);
     private static final AtomicLong maxTailScanEntries = new AtomicLong(0);
-    
+
     /**
      * Records a tail scan entry.
      *
@@ -411,7 +412,7 @@ public final class Metrics {
         recordQueueDepth(depth);
         recordHnswDepth(depth);
     }
-    
+
     /**
      * Gets the average tail scan entries.
      *
@@ -425,7 +426,7 @@ public final class Metrics {
             return total / count;
         }
     }
-    
+
     /**
      * Gets the maximum tail scan entries.
      *
@@ -436,20 +437,20 @@ public final class Metrics {
             return maxTailScanEntries.get();
         }
     }
-    
+
     // ============================================
     // HNSW Queue Depth
     // ============================================
-    
+
     private static final AtomicLong hnswQueueDepth = new AtomicLong(0);
-    
+
     /**
      * Gets the current HNSW queue depth.
      */
     public static long getHnswQueueDepth() {
         return hnswQueueDepth.get();
     }
-    
+
     /**
      * Records the current HNSW queue depth.
      *
@@ -464,7 +465,7 @@ public final class Metrics {
             depth
         );
     }
-    
+
     /**
      * Gets the HNSW queue depth percentage.
      *
@@ -476,41 +477,39 @@ public final class Metrics {
         double percent = (double) depth / limit * 100.0;
         return Math.max(0.0, Math.min(100.0, percent));
     }
-    
+
     /**
-     * Checks if the HNSW queue is under control (< 50% of limit).
+     * Checks if the HNSW queue is under control (&lt; 50% of limit).
      */
     public static boolean isHnswUnderControl(long limit) {
         return getHnswQueueDepth() < limit * 0.5;
     }
-    
+
     /**
-     * Checks if the HNSW queue is critical (> 80% of limit).
+     * Checks if the HNSW queue is critical (&gt; 80% of limit).
      */
     public static boolean isHnswCritical(long limit) {
         return getHnswQueueDepth() > limit * 0.8;
     }
-    
+
      /**
-     * Checks if the HNSW queue is full (> 100% of limit).
+     * Checks if the HNSW queue is full (&gt; 100% of limit).
      */
     public static boolean isHnswFull(long limit) {
         return getHnswQueueDepth() > limit;
     }
-    
+
     /**
      * Gets total tail scan entries.
      */
     public static long getTotalTailScanned() {
         return totalTailScanned.get();
     }
-    
+
     // ============================================
     // JMX MBean Registration
     // ============================================
-    
-    /**
-     * Registers all metrics MBeans.
+
     /**
      * Registers the query latency MBean.
      *
@@ -518,9 +517,9 @@ public final class Metrics {
      * @throws Exception if registration fails
      */
     private static void registerQueryLatencyMBean(MetricsRegistry registry) throws Exception {
-        registry.registerMBean(new QueryLatencyMBean(), "io.excalibur:type=QueryLatency");
+        registry.registerMBean(queryLatencyMBeanInstance, "io.excalibur:type=QueryLatency");
     }
-    
+
     /**
      * Registers the system health MBean.
      *
@@ -528,9 +527,9 @@ public final class Metrics {
      * @throws Exception if registration fails
      */
     private static void registerSystemHealthMBean(MetricsRegistry registry) throws Exception {
-        registry.registerMBean(new SystemHealthMBean(), "io.excalibur:type=SystemHealth");
+        registry.registerMBean(systemHealthMBeanInstance, "io.excalibur:type=SystemHealth");
     }
-    
+
     /**
      * Registers the ingestion queue MBean.
      *
@@ -538,9 +537,9 @@ public final class Metrics {
      * @throws Exception if registration fails
      */
     private static void registerIngestionQueueMBean(MetricsRegistry registry) throws Exception {
-        registry.registerMBean(new IngestionQueueMBean(), "io.excalibur:type=IngestionQueue");
+        registry.registerMBean(ingestionQueueMBeanInstance, "io.excalibur:type=IngestionQueue");
     }
-    
+
     /**
      * Registers the visibility epoch MBean.
      *
@@ -548,26 +547,70 @@ public final class Metrics {
      * @throws Exception if registration fails
      */
     private static void registerVisibilityEpochMBean(MetricsRegistry registry) throws Exception {
-        registry.registerMBean(new VisibilityEpochMBean(), "io.excalibur:type=VisibilityEpoch");
+        registry.registerMBean(visibilityEpochMBeanInstance, "io.excalibur:type=VisibilityEpoch");
     }
-    
+
+    /**
+     * Registers the Cuckoo filter FP rate MBean.
+     *
+     * @param registry Metrics registry
+     * @throws Exception if registration fails
+     */
+    private static void registerCuckooFpRateMBean(MetricsRegistry registry) throws Exception {
+        registry.registerMBean(cuckooFpRateMBeanInstance, "io.excalibur:type=CuckooFpRate");
+    }
+
+    /**
+     * Registers the HNSW queue depth MBean.
+     *
+     * @param registry Metrics registry
+     * @throws Exception if registration fails
+     */
+    private static void registerHnswQueueDepthMBean(MetricsRegistry registry) throws Exception {
+        registry.registerMBean(hnswQueueDepthMBeanInstance, "io.excalibur:type=HnswQueueDepth");
+    }
+
+    /**
+     * Registers all metrics MBeans.
+     *
+     * @param registry Metrics registry instance
+     * @throws Exception if registration fails
+     */
+    public static void registerAll(MetricsRegistry registry) throws Exception {
+        registerQueryLatencyMBean(registry);
+        registerSystemHealthMBean(registry);
+        registerIngestionQueueMBean(registry);
+        registerVisibilityEpochMBean(registry);
+        registerCuckooFpRateMBean(registry);
+        registerHnswQueueDepthMBean(registry);
+    }
+
     // ============================================
-    // JMX MBean Implementations
+    // JMX MBean Implementations (DynamicMBean)
     // ============================================
-    
+
     /**
      * JMX MBean for query latency statistics.
+     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
      */
-    public static class QueryLatencyMBean implements MBeanServerProvider {
+    public static class QueryLatencyMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
             "QueryLatency",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY }
         );
 
-        public MBeanServer mbeanServer() {
-            return ManagementFactory.getPlatformMBeanServer();
-        }
+        private static final MBeanAttributeInfo[] ATTRIBUTES = {
+            new MBeanAttributeInfo("count", "long", "Total count", true, false, false),
+            new MBeanAttributeInfo("p50", "long", "50th percentile latency (ms)", true, false, false),
+            new MBeanAttributeInfo("p90", "long", "90th percentile latency (ms)", true, false, false),
+            new MBeanAttributeInfo("p95", "long", "95th percentile latency (ms)", true, false, false),
+            new MBeanAttributeInfo("p99", "long", "99th percentile latency (ms)", true, false, false),
+            new MBeanAttributeInfo("p99.9", "long", "99.9th percentile latency (ms)", true, false, false),
+            new MBeanAttributeInfo("average", "double", "Average latency (ms)", true, false, false),
+            new MBeanAttributeInfo("minimum", "long", "Minimum latency (ms)", true, false, false),
+            new MBeanAttributeInfo("maximum", "long", "Maximum latency (ms)", true, false, false)
+        };
 
         /**
          * Gets the notification broadcaster for this MBean.
@@ -578,10 +621,51 @@ public final class Metrics {
             return broadcaster;
         }
 
+        // ============================================
+        // Backward-compatible methods (MBeanServerProvider interface)
+        // ============================================
+
+        /**
+         * Adds a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info containing type and object name
+         * @param observer The observer to receive notifications
+         * @param putPending Whether to deliver pending notifications
+         */
+        public void addNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer, boolean putPending) {
+            broadcaster.addNotificationListener(info, observer, putPending);
+        }
+
+        /**
+         * Removes a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info
+         * @param observer The observer to remove
+         */
+        public void removeNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer) {
+            broadcaster.removeNotificationListener(info, observer);
+        }
+
+        /**
+         * Gets all available attribute names.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @return Set of attribute names
+         */
+        public Set<String> getAttributes() {
+            return Set.of("count", "p50", "p90", "p95", "p99", "p99.9", "average", "minimum", "maximum");
+        }
+
+        // ============================================
+        // DynamicMBean interface implementation
+        // ============================================
+
         @Override
-        public Object getAttribute(String name) throws AttributeException {
-            FixedBucketHistogram hist = FixedBucketHistogram.getInstance();
-            switch (name) {
+        public Object getAttribute(String attribute) throws AttributeNotFoundException, MBeanException, ReflectionException {
+            FixedBucketHistogram hist = queryLatencyHistogram;
+            switch (attribute) {
                 case "count":
                     return hist.getTotalCount();
                 case "p50":
@@ -601,46 +685,91 @@ public final class Metrics {
                 case "maximum":
                     return hist.getMaximum();
                 default:
-                    throw new AttributeException(name, "Unknown attribute");
+                    throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
         }
 
         @Override
-        public void setAttribute(String name, Object value) throws AttributeException {
-            throw new AttributeException(name, "Non-writable attribute");
+        public void setAttribute(Attribute attribute) throws AttributeNotFoundException, InvalidAttributeValueException, MBeanException, ReflectionException {
+            throw new AttributeNotFoundException("Read-only attribute: " + attribute.getName());
         }
 
         @Override
-        public void addNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer,
-            boolean putPending
-        ) {
-            broadcaster.addNotificationListener(info, observer, putPending);
+        public AttributeList getAttributes(String[] attributes) {
+            AttributeList list = new AttributeList();
+            for (String attr : attributes) {
+                try {
+                    list.add(new Attribute(attr, getAttribute(attr)));
+                } catch (Exception ignored) {
+                    // Skip attributes that fail
+                }
+            }
+            return list;
         }
 
         @Override
-        public void removeNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer
-        ) {
-            broadcaster.removeNotificationListener(info, observer);
+        public AttributeList setAttributes(AttributeList attributes) {
+            return new AttributeList(); // All read-only
+        }
+
+        @Override
+        public Object invoke(String actionName, Object[] params, String[] signature) throws MBeanException, ReflectionException {
+            throw new ReflectionException(new NoSuchMethodException("No operation: " + actionName));
+        }
+
+        @Override
+        public MBeanInfo getMBeanInfo() {
+            return new MBeanInfo(
+                this.getClass().getName(),
+                "Query Latency MBean",
+                ATTRIBUTES,
+                null, // constructors
+                null, // operations
+                broadcaster.getNotificationInfo() // notifications
+            );
+        }
+
+        // ============================================
+        // NotificationEmitter interface implementation
+        // ============================================
+
+        @Override
+        public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {
+            broadcaster.addNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public MBeanNotificationInfo[] getNotificationInfo() {
+            return broadcaster.getNotificationInfo();
         }
     }
-    
+
     /**
      * JMX MBean for system health.
+     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
      */
-    public static class SystemHealthMBean implements MBeanServerProvider {
+    public static class SystemHealthMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
             "SystemHealth",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.SYSTEM_HEALTH }
         );
 
-        public MBeanServer mbeanServer() {
-            return ManagementFactory.getPlatformMBeanServer();
-        }
+        private static final MBeanAttributeInfo[] ATTRIBUTES = {
+            new MBeanAttributeInfo("health", "double", "System health score (0.0-1.0)", true, false, false),
+            new MBeanAttributeInfo("isHealthy", "boolean", "Whether system is healthy", true, false, false),
+            new MBeanAttributeInfo("ready", "boolean", "Whether system is ready (health >= 0.5)", true, false, false)
+        };
 
         /**
          * Gets the notification broadcaster for this MBean.
@@ -651,9 +780,50 @@ public final class Metrics {
             return broadcaster;
         }
 
+        // ============================================
+        // Backward-compatible methods (MBeanServerProvider interface)
+        // ============================================
+
+        /**
+         * Adds a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info containing type and object name
+         * @param observer The observer to receive notifications
+         * @param putPending Whether to deliver pending notifications
+         */
+        public void addNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer, boolean putPending) {
+            broadcaster.addNotificationListener(info, observer, putPending);
+        }
+
+        /**
+         * Removes a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info
+         * @param observer The observer to remove
+         */
+        public void removeNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer) {
+            broadcaster.removeNotificationListener(info, observer);
+        }
+
+        /**
+         * Gets all available attribute names.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @return Set of attribute names
+         */
+        public Set<String> getAttributes() {
+            return Set.of("health", "isHealthy", "ready");
+        }
+
+        // ============================================
+        // DynamicMBean interface implementation
+        // ============================================
+
         @Override
-        public Object getAttribute(String name) throws AttributeException {
-            switch (name) {
+        public Object getAttribute(String attribute) throws AttributeNotFoundException, MBeanException, ReflectionException {
+            switch (attribute) {
                 case "health":
                     return Metrics.getHealthScore();
                 case "isHealthy":
@@ -661,46 +831,95 @@ public final class Metrics {
                 case "ready":
                     return Metrics.getHealthScore() >= 0.5;
                 default:
-                    throw new AttributeException(name, "Unknown attribute");
+                    throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
         }
 
         @Override
-        public void setAttribute(String name, Object value) throws AttributeException {
-            throw new AttributeException(name, "Non-writable attribute");
+        public void setAttribute(Attribute attribute) throws AttributeNotFoundException, InvalidAttributeValueException, MBeanException, ReflectionException {
+            throw new AttributeNotFoundException("Read-only attribute: " + attribute.getName());
         }
 
         @Override
-        public void addNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer,
-            boolean putPending
-        ) {
-            broadcaster.addNotificationListener(info, observer, putPending);
+        public AttributeList getAttributes(String[] attributes) {
+            AttributeList list = new AttributeList();
+            for (String attr : attributes) {
+                try {
+                    list.add(new Attribute(attr, getAttribute(attr)));
+                } catch (Exception ignored) {
+                    // Skip attributes that fail
+                }
+            }
+            return list;
         }
 
         @Override
-        public void removeNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer
-        ) {
-            broadcaster.removeNotificationListener(info, observer);
+        public AttributeList setAttributes(AttributeList attributes) {
+            return new AttributeList(); // All read-only
+        }
+
+        @Override
+        public Object invoke(String actionName, Object[] params, String[] signature) throws MBeanException, ReflectionException {
+            throw new ReflectionException(new NoSuchMethodException("No operation: " + actionName));
+        }
+
+        @Override
+        public MBeanInfo getMBeanInfo() {
+            return new MBeanInfo(
+                this.getClass().getName(),
+                "System Health MBean",
+                ATTRIBUTES,
+                null, // constructors
+                null, // operations
+                broadcaster.getNotificationInfo() // notifications
+            );
+        }
+
+        // ============================================
+        // NotificationEmitter interface implementation
+        // ============================================
+
+        @Override
+        public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {
+            broadcaster.addNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public MBeanNotificationInfo[] getNotificationInfo() {
+            return broadcaster.getNotificationInfo();
         }
     }
-    
+
     /**
      * JMX MBean for ingestion queue.
+     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
      */
-    public static class IngestionQueueMBean implements MBeanServerProvider {
+    public static class IngestionQueueMBean implements DynamicMBean, NotificationEmitter {
+
+        private static final long DEFAULT_LIMIT = 1000000;
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
             "IngestionQueue",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.INGESTION_QUEUE }
         );
 
-        public MBeanServer mbeanServer() {
-            return ManagementFactory.getPlatformMBeanServer();
-        }
+        private static final MBeanAttributeInfo[] ATTRIBUTES = {
+            new MBeanAttributeInfo("depth", "long", "Current queue depth", true, false, false),
+            new MBeanAttributeInfo("percent", "double", "Queue depth as percentage of limit", true, false, false),
+            new MBeanAttributeInfo("isUnderControl", "boolean", "Whether queue is under control (< 50%)", true, false, false),
+            new MBeanAttributeInfo("isCritical", "boolean", "Whether queue is critical (> 80%)", true, false, false),
+            new MBeanAttributeInfo("isFull", "boolean", "Whether queue is full (> 100%)", true, false, false)
+        };
 
         /**
          * Gets the notification broadcaster for this MBean.
@@ -711,60 +930,140 @@ public final class Metrics {
             return broadcaster;
         }
 
+        // ============================================
+        // Backward-compatible methods (MBeanServerProvider interface)
+        // ============================================
+
+        /**
+         * Adds a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info containing type and object name
+         * @param observer The observer to receive notifications
+         * @param putPending Whether to deliver pending notifications
+         */
+        public void addNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer, boolean putPending) {
+            broadcaster.addNotificationListener(info, observer, putPending);
+        }
+
+        /**
+         * Removes a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info
+         * @param observer The observer to remove
+         */
+        public void removeNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer) {
+            broadcaster.removeNotificationListener(info, observer);
+        }
+
+        /**
+         * Gets all available attribute names.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @return Set of attribute names
+         */
+        public Set<String> getAttributes() {
+            return Set.of("depth", "percent", "isUnderControl", "isCritical", "isFull");
+        }
+
+        // ============================================
+        // DynamicMBean interface implementation
+        // ============================================
+
         @Override
-        public Object getAttribute(String name) throws AttributeException {
-            switch (name) {
+        public Object getAttribute(String attribute) throws AttributeNotFoundException, MBeanException, ReflectionException {
+            switch (attribute) {
                 case "depth":
                     return Metrics.getQueueDepth();
                 case "percent":
-                    return Metrics.getQueueDepthPercent(1000000);
+                    return Metrics.getQueueDepthPercent(DEFAULT_LIMIT);
                 case "isUnderControl":
-                    return Metrics.isUnderControl(1000000);
+                    return Metrics.isUnderControl(DEFAULT_LIMIT);
                 case "isCritical":
-                    return Metrics.isCritical(1000000);
+                    return Metrics.isCritical(DEFAULT_LIMIT);
                 case "isFull":
-                    return Metrics.isFull(1000000);
+                    return Metrics.isFull(DEFAULT_LIMIT);
                 default:
-                    throw new AttributeException(name, "Unknown attribute");
+                    throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
         }
 
         @Override
-        public void setAttribute(String name, Object value) throws AttributeException {
-            throw new AttributeException(name, "Non-writable attribute");
+        public void setAttribute(Attribute attribute) throws AttributeNotFoundException, InvalidAttributeValueException, MBeanException, ReflectionException {
+            throw new AttributeNotFoundException("Read-only attribute: " + attribute.getName());
         }
 
         @Override
-        public void addNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer,
-            boolean putPending
-        ) {
-            broadcaster.addNotificationListener(info, observer, putPending);
+        public AttributeList getAttributes(String[] attributes) {
+            AttributeList list = new AttributeList();
+            for (String attr : attributes) {
+                try {
+                    list.add(new Attribute(attr, getAttribute(attr)));
+                } catch (Exception ignored) {
+                    // Skip attributes that fail
+                }
+            }
+            return list;
         }
 
         @Override
-        public void removeNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer
-        ) {
-            broadcaster.removeNotificationListener(info, observer);
+        public AttributeList setAttributes(AttributeList attributes) {
+            return new AttributeList(); // All read-only
+        }
+
+        @Override
+        public Object invoke(String actionName, Object[] params, String[] signature) throws MBeanException, ReflectionException {
+            throw new ReflectionException(new NoSuchMethodException("No operation: " + actionName));
+        }
+
+        @Override
+        public MBeanInfo getMBeanInfo() {
+            return new MBeanInfo(
+                this.getClass().getName(),
+                "Ingestion Queue MBean",
+                ATTRIBUTES,
+                null, // constructors
+                null, // operations
+                broadcaster.getNotificationInfo() // notifications
+            );
+        }
+
+        @Override
+        public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {
+            broadcaster.addNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public MBeanNotificationInfo[] getNotificationInfo() {
+            return broadcaster.getNotificationInfo();
         }
     }
-    
+
     /**
      * JMX MBean for visibility epoch.
+     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
      */
-    public static class VisibilityEpochMBean implements MBeanServerProvider {
+    public static class VisibilityEpochMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
             "VisibilityEpoch",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.VISIBILITY_EPOCH }
         );
 
-        public MBeanServer mbeanServer() {
-            return ManagementFactory.getPlatformMBeanServer();
-        }
+        private static final MBeanAttributeInfo[] ATTRIBUTES = {
+            new MBeanAttributeInfo("epoch", "long", "Current visibility epoch", true, false, false)
+        };
 
         /**
          * Gets the notification broadcaster for this MBean.
@@ -775,56 +1074,141 @@ public final class Metrics {
             return broadcaster;
         }
 
+        // ============================================
+        // Backward-compatible methods (MBeanServerProvider interface)
+        // ============================================
+
+        /**
+         * Adds a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info containing type and object name
+         * @param observer The observer to receive notifications
+         * @param putPending Whether to deliver pending notifications
+         */
+        public void addNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer, boolean putPending) {
+            broadcaster.addNotificationListener(info, observer, putPending);
+        }
+
+        /**
+         * Removes a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info
+         * @param observer The observer to remove
+         */
+        public void removeNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer) {
+            broadcaster.removeNotificationListener(info, observer);
+        }
+
+        /**
+         * Gets all available attribute names.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @return Set of attribute names
+         */
+        public Set<String> getAttributes() {
+            return Set.of("epoch");
+        }
+
+        // ============================================
+        // DynamicMBean interface implementation
+        // ============================================
+
         @Override
-        public Object getAttribute(String name) throws AttributeException {
-            switch (name) {
+        public Object getAttribute(String attribute) throws AttributeNotFoundException, MBeanException, ReflectionException {
+            switch (attribute) {
                 case "epoch":
                     return Metrics.getCurrentEpoch();
                 default:
-                    throw new AttributeException(name, "Unknown attribute");
+                    throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
         }
 
         @Override
-        public void setAttribute(String name, Object value) throws AttributeException {
-            throw new AttributeException(name, "Non-writable attribute");
+        public void setAttribute(Attribute attribute) throws AttributeNotFoundException, InvalidAttributeValueException, MBeanException, ReflectionException {
+            throw new AttributeNotFoundException("Read-only attribute: " + attribute.getName());
         }
 
         @Override
-        public void addNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer,
-            boolean putPending
-        ) {
-            broadcaster.addNotificationListener(info, observer, putPending);
+        public AttributeList getAttributes(String[] attributes) {
+            AttributeList list = new AttributeList();
+            for (String attr : attributes) {
+                try {
+                    list.add(new Attribute(attr, getAttribute(attr)));
+                } catch (Exception ignored) {
+                    // Skip attributes that fail
+                }
+            }
+            return list;
         }
 
         @Override
-        public void removeNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer
-        ) {
-            broadcaster.removeNotificationListener(info, observer);
+        public AttributeList setAttributes(AttributeList attributes) {
+            return new AttributeList(); // All read-only
+        }
+
+        @Override
+        public Object invoke(String actionName, Object[] params, String[] signature) throws MBeanException, ReflectionException {
+            throw new ReflectionException(new NoSuchMethodException("No operation: " + actionName));
+        }
+
+        @Override
+        public MBeanInfo getMBeanInfo() {
+            return new MBeanInfo(
+                this.getClass().getName(),
+                "Visibility Epoch MBean",
+                ATTRIBUTES,
+                null, // constructors
+                null, // operations
+                broadcaster.getNotificationInfo() // notifications
+            );
+        }
+
+        // ============================================
+        // NotificationEmitter interface implementation
+        // ============================================
+
+        @Override
+        public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {
+            broadcaster.addNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public MBeanNotificationInfo[] getNotificationInfo() {
+            return broadcaster.getNotificationInfo();
         }
     }
-    
-    // ============================================
-    // Cuckoo Filter FP Rate MBean
-    // ============================================
-    
+
     /**
      * JMX MBean for Cuckoo filter false positive rate.
+     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
      */
-    public static class CuckooFpRateMBean implements MBeanServerProvider {
+    public static class CuckooFpRateMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
             "CuckooFpRate",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.CUCKOO_FP_RATE }
         );
 
-        public MBeanServer mbeanServer() {
-            return ManagementFactory.getPlatformMBeanServer();
-        }
+        private static final MBeanAttributeInfo[] ATTRIBUTES = {
+            new MBeanAttributeInfo("fpRate", "double", "Current false positive rate", true, false, false),
+            new MBeanAttributeInfo("fpRateEpoch", "long", "Epoch of last FP rate measurement", true, false, false),
+            new MBeanAttributeInfo("fpRateCount", "long", "Count of FP rate measurements", true, false, false),
+            new MBeanAttributeInfo("avgFpRate", "double", "Average false positive rate", true, false, false),
+            new MBeanAttributeInfo("maxFpRate", "double", "Maximum false positive rate", true, false, false),
+            new MBeanAttributeInfo("currentEpoch", "long", "Current epoch", true, false, false)
+        };
 
         /**
          * Gets the notification broadcaster for this MBean.
@@ -835,10 +1219,51 @@ public final class Metrics {
             return broadcaster;
         }
 
+        // ============================================
+        // Backward-compatible methods (MBeanServerProvider interface)
+        // ============================================
+
+        /**
+         * Adds a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info containing type and object name
+         * @param observer The observer to receive notifications
+         * @param putPending Whether to deliver pending notifications
+         */
+        public void addNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer, boolean putPending) {
+            broadcaster.addNotificationListener(info, observer, putPending);
+        }
+
+        /**
+         * Removes a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info
+         * @param observer The observer to remove
+         */
+        public void removeNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer) {
+            broadcaster.removeNotificationListener(info, observer);
+        }
+
+        /**
+         * Gets all available attribute names.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @return Set of attribute names
+         */
+        public Set<String> getAttributes() {
+            return Set.of("fpRate", "fpRateEpoch", "fpRateCount", "avgFpRate", "maxFpRate", "currentEpoch");
+        }
+
+        // ============================================
+        // DynamicMBean interface implementation
+        // ============================================
+
         @Override
-        public Object getAttribute(String name) throws AttributeException {
+        public Object getAttribute(String attribute) throws AttributeNotFoundException, MBeanException, ReflectionException {
             FixedBucketHistogram hist = FixedBucketHistogram.getInstance();
-            switch (name) {
+            switch (attribute) {
                 case "fpRate":
                     return hist.getAverageFpRate();
                 case "fpRateEpoch":
@@ -852,50 +1277,94 @@ public final class Metrics {
                 case "currentEpoch":
                     return hist.getFpRateEpoch();
                 default:
-                    throw new AttributeException(name, "Unknown attribute");
+                    throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
         }
 
         @Override
-        public void setAttribute(String name, Object value) throws AttributeException {
-            throw new AttributeException(name, "Non-writable attribute");
+        public void setAttribute(Attribute attribute) throws AttributeNotFoundException, InvalidAttributeValueException, MBeanException, ReflectionException {
+            throw new AttributeNotFoundException("Read-only attribute: " + attribute.getName());
         }
 
         @Override
-        public void addNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer,
-            boolean putPending
-        ) {
-            broadcaster.addNotificationListener(info, observer, putPending);
+        public AttributeList getAttributes(String[] attributes) {
+            AttributeList list = new AttributeList();
+            for (String attr : attributes) {
+                try {
+                    list.add(new Attribute(attr, getAttribute(attr)));
+                } catch (Exception ignored) {
+                    // Skip attributes that fail
+                }
+            }
+            return list;
         }
 
         @Override
-        public void removeNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer
-        ) {
-            broadcaster.removeNotificationListener(info, observer);
+        public AttributeList setAttributes(AttributeList attributes) {
+            return new AttributeList(); // All read-only
+        }
+
+        @Override
+        public Object invoke(String actionName, Object[] params, String[] signature) throws MBeanException, ReflectionException {
+            throw new ReflectionException(new NoSuchMethodException("No operation: " + actionName));
+        }
+
+        @Override
+        public MBeanInfo getMBeanInfo() {
+            return new MBeanInfo(
+                this.getClass().getName(),
+                "Cuckoo Filter False Positive Rate MBean",
+                ATTRIBUTES,
+                null, // constructors
+                null, // operations
+                broadcaster.getNotificationInfo() // notifications
+            );
+        }
+
+        @Override
+        public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {
+            broadcaster.addNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public MBeanNotificationInfo[] getNotificationInfo() {
+            return broadcaster.getNotificationInfo();
         }
     }
-    
-    // ============================================
-    // HNSW Queue Depth MBean
-    // ============================================
-    
+
     /**
      * JMX MBean for HNSW graph queue depth.
+     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
      */
-    public static class HnswQueueDepthMBean implements MBeanServerProvider {
+    public static class HnswQueueDepthMBean implements DynamicMBean, NotificationEmitter {
+
+        private static final long DEFAULT_LIMIT = 100000;
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
             "HnswQueueDepth",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.HNSW_QUEUE_DEPTH }
         );
 
-        public MBeanServer mbeanServer() {
-            return ManagementFactory.getPlatformMBeanServer();
-        }
+        private static final MBeanAttributeInfo[] ATTRIBUTES = {
+            new MBeanAttributeInfo("depth", "long", "Current HNSW queue depth", true, false, false),
+            new MBeanAttributeInfo("percent", "double", "Queue depth as percentage of limit", true, false, false),
+            new MBeanAttributeInfo("isUnderControl", "boolean", "Whether queue is under control (< 50%)", true, false, false),
+            new MBeanAttributeInfo("isCritical", "boolean", "Whether queue is critical (> 80%)", true, false, false),
+            new MBeanAttributeInfo("isFull", "boolean", "Whether queue is full (> 100%)", true, false, false),
+            new MBeanAttributeInfo("averageTailScan", "long", "Average tail scan entries", true, false, false),
+            new MBeanAttributeInfo("maxTailScan", "long", "Maximum tail scan entries", true, false, false),
+            new MBeanAttributeInfo("totalTailScanned", "long", "Total tail scan entries", true, false, false)
+        };
 
         /**
          * Gets the notification broadcaster for this MBean.
@@ -906,19 +1375,60 @@ public final class Metrics {
             return broadcaster;
         }
 
+        // ============================================
+        // Backward-compatible methods (MBeanServerProvider interface)
+        // ============================================
+
+        /**
+         * Adds a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info containing type and object name
+         * @param observer The observer to receive notifications
+         * @param putPending Whether to deliver pending notifications
+         */
+        public void addNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer, boolean putPending) {
+            broadcaster.addNotificationListener(info, observer, putPending);
+        }
+
+        /**
+         * Removes a notification listener using the custom observer interface.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @param info Notification info
+         * @param observer The observer to remove
+         */
+        public void removeNotificationListener(ObjectNotificationInfo info, MBeanNotificationObserver observer) {
+            broadcaster.removeNotificationListener(info, observer);
+        }
+
+        /**
+         * Gets all available attribute names.
+         * This method provides backward compatibility with the MBeanServerProvider interface.
+         *
+         * @return Set of attribute names
+         */
+        public Set<String> getAttributes() {
+            return Set.of("depth", "percent", "isUnderControl", "isCritical", "isFull", "averageTailScan", "maxTailScan", "totalTailScanned");
+        }
+
+        // ============================================
+        // DynamicMBean interface implementation
+        // ============================================
+
         @Override
-        public Object getAttribute(String name) throws AttributeException {
-            switch (name) {
+        public Object getAttribute(String attribute) throws AttributeNotFoundException, MBeanException, ReflectionException {
+            switch (attribute) {
                 case "depth":
                     return Metrics.getHnswQueueDepth();
                 case "percent":
-                    return Metrics.getHnswQueueDepthPercent(100000);
+                    return Metrics.getHnswQueueDepthPercent(DEFAULT_LIMIT);
                 case "isUnderControl":
-                    return Metrics.isHnswUnderControl(100000);
+                    return Metrics.isHnswUnderControl(DEFAULT_LIMIT);
                 case "isCritical":
-                    return Metrics.isHnswCritical(100000);
+                    return Metrics.isHnswCritical(DEFAULT_LIMIT);
                 case "isFull":
-                    return Metrics.isHnswFull(100000);
+                    return Metrics.isHnswFull(DEFAULT_LIMIT);
                 case "averageTailScan":
                     return Metrics.getAverageTailScanEntries();
                 case "maxTailScan":
@@ -926,70 +1436,68 @@ public final class Metrics {
                 case "totalTailScanned":
                     return Metrics.getTotalTailScanned();
                 default:
-                    throw new AttributeException(name, "Unknown attribute");
+                    throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
         }
 
         @Override
-        public void setAttribute(String name, Object value) throws AttributeException {
-            throw new AttributeException(name, "Non-writable attribute");
+        public void setAttribute(Attribute attribute) throws AttributeNotFoundException, InvalidAttributeValueException, MBeanException, ReflectionException {
+            throw new AttributeNotFoundException("Read-only attribute: " + attribute.getName());
         }
 
         @Override
-        public void addNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer,
-            boolean putPending
-        ) {
-            broadcaster.addNotificationListener(info, observer, putPending);
+        public AttributeList getAttributes(String[] attributes) {
+            AttributeList list = new AttributeList();
+            for (String attr : attributes) {
+                try {
+                    list.add(new Attribute(attr, getAttribute(attr)));
+                } catch (Exception ignored) {
+                    // Skip attributes that fail
+                }
+            }
+            return list;
         }
 
         @Override
-        public void removeNotificationListener(
-            ObjectNotificationInfo info,
-            MBeanNotificationObserver observer
-        ) {
-            broadcaster.removeNotificationListener(info, observer);
+        public AttributeList setAttributes(AttributeList attributes) {
+            return new AttributeList(); // All read-only
         }
-    }
-    
-    // ============================================
-    // Updated MBean Registration Methods
-    // ============================================
-    
-    /**
-     * Registers the Cuckoo filter FP rate MBean.
-     *
-     * @param registry Metrics registry
-     * @throws Exception if registration fails
-     */
-    private static void registerCuckooFpRateMBean(MetricsRegistry registry) throws Exception {
-        registry.registerMBean(new CuckooFpRateMBean(), "io.excalibur:type=CuckooFpRate");
-    }
-    
-    /**
-     * Registers the HNSW queue depth MBean.
-     *
-     * @param registry Metrics registry
-     * @throws Exception if registration fails
-     */
-    private static void registerHnswQueueDepthMBean(MetricsRegistry registry) throws Exception {
-        registry.registerMBean(new HnswQueueDepthMBean(), "io.excalibur:type=HnswQueueDepth");
-    }
-    
-    /**
-     * Registers all metrics MBeans.
-     *
-     * @param registry Metrics registry instance
-     * @throws Exception if registration fails
-     */
-    public static void registerAll(MetricsRegistry metricsRegistry) throws Exception {
-        registerQueryLatencyMBean(metricsRegistry);
-        registerSystemHealthMBean(metricsRegistry);
-        registerIngestionQueueMBean(metricsRegistry);
-        registerVisibilityEpochMBean(metricsRegistry);
-        registerCuckooFpRateMBean(metricsRegistry);
-        registerHnswQueueDepthMBean(metricsRegistry);
+
+        @Override
+        public Object invoke(String actionName, Object[] params, String[] signature) throws MBeanException, ReflectionException {
+            throw new ReflectionException(new NoSuchMethodException("No operation: " + actionName));
+        }
+
+        @Override
+        public MBeanInfo getMBeanInfo() {
+            return new MBeanInfo(
+                this.getClass().getName(),
+                "HNSW Queue Depth MBean",
+                ATTRIBUTES,
+                null, // constructors
+                null, // operations
+                broadcaster.getNotificationInfo() // notifications
+            );
+        }
+
+        @Override
+        public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {
+            broadcaster.addNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public MBeanNotificationInfo[] getNotificationInfo() {
+            return broadcaster.getNotificationInfo();
+        }
     }
 }
-

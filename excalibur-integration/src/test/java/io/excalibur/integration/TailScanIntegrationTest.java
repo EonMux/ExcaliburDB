@@ -10,6 +10,7 @@ import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.HnswSearchResult;
 import excalibur.query.executor.QueryExecutor;
 import excalibur.query.executor.TailScanner;
+import excalibur.ingest.buffer.DocumentChunkBuffer;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -374,16 +375,96 @@ class TailScanIntegrationTest {
 
     /**
      * Encodes a vector to bytes with dimension prefix.
-     * Format: [dimension:4][vector:dim*4]
+     * Uses the production encoder from DocumentChunkBuffer to ensure
+     * the actual ingestion format is tested.
+     * Format (LITTLE-ENDIAN): [dimension:4][vector:dim*4]
      */
     private byte[] encodeVector(float[] vector) {
-        int dimension = vector.length;
-        ByteBuffer buffer = ByteBuffer.allocate(4 + dimension * Float.BYTES)
-            .order(ByteOrder.LITTLE_ENDIAN);
-        buffer.putInt(dimension);
-        for (float v : vector) {
-            buffer.putFloat(v);
+        return DocumentChunkBuffer.encodeVectorOnly(vector);
+    }
+
+    /**
+     * Encodes a vector with text using the production encoder.
+     * Format (LITTLE-ENDIAN): [dimension:4][vector:dim*4][text:variable]
+     */
+    private byte[] encodeVectorWithText(float[] vector, String text) {
+        return DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, vector);
+    }
+
+    /**
+     * Test: Verify round-trip encoding/decoding between DocumentChunkBuffer and TailScanner.
+     *
+     * <p>This test verifies the critical fix for the byte order mismatch bug:
+     * DocumentChunkBuffer must encode vectors in LITTLE_ENDIAN format to match
+     * TailScanner's expected format.</p>
+     */
+    @Test
+    void testEncodingRoundTrip() {
+        // Create a test vector
+        float[] originalVector = createRandomVector(dimension);
+        String testText = "This is a test chunk of text for the document.";
+
+        // Encode using the production encoder (with text)
+        byte[] encoded = encodeVectorWithText(originalVector, testText);
+
+        // Verify the encoding is not null and has correct minimum length
+        assertThat(encoded).isNotNull();
+        assertThat(encoded.length).isGreaterThanOrEqualTo(4 + dimension * Float.BYTES);
+
+        // Decode using DocumentChunkBuffer's public decode method
+        float[] decodedVector = DocumentChunkBuffer.decodeEmbedding(encoded, dimension);
+        String decodedText = DocumentChunkBuffer.decodeText(encoded);
+
+        // Verify round-trip
+        assertThat(decodedVector).isNotNull();
+        assertThat(decodedVector).hasSize(dimension);
+
+        // Verify vector values are preserved (within floating point precision)
+        for (int i = 0; i < dimension; i++) {
+            assertThat(decodedVector[i]).isEqualTo(originalVector[i]);
         }
-        return buffer.array();
+
+        // Verify text is preserved
+        assertThat(decodedText).isEqualTo(testText);
+    }
+
+    /**
+     * Test: Verify TailScanner can extract vectors encoded with text.
+     *
+     * <p>This test verifies that TailScanner.extractVector() correctly handles
+     * values that contain both a vector and text (the production format from
+     * DocumentChunkBuffer.encodeChunkWithEmbedding()).</p>
+     */
+    @Test
+    void testTailScannerHandlesTextInValue() throws IOException {
+        WriteLog writeLog = new WriteLog(writeLogPath, arena);
+
+        // Create vector with text (production format)
+        float[] vector = createRandomVector(dimension);
+        String text = "Sample document chunk content.";
+        byte[] encodedWithText = encodeVectorWithText(vector, text);
+
+        // Write to log
+        writeLog.appendPut("doc1:0".getBytes(), encodedWithText);
+        long writeLogHead = writeLog.writeOffset();
+
+        // Scan using TailScanner
+        TailScanner scanner = new TailScanner();
+        List<HnswSearchResult> results = scanner.performTailScan(
+            vector,  // Query with same vector - should find distance close to 0
+            writeLog,
+            0,
+            writeLogHead,
+            1,
+            distanceFunction
+        );
+
+        // Should find the entry despite text being in the value
+        assertThat(results).isNotEmpty();
+        // For CosineSimilarity, identical vectors return similarity = 1.0
+        // The distance field stores the similarity value (larger = more similar)
+        assertThat(results.get(0).distance()).isGreaterThan(0.999f);
+
+        writeLog.close();
     }
 }

@@ -381,22 +381,23 @@ public class QueryPipeline {
      * Stage 0: Capture visibility epoch and resolve queryable segments.
      *
      * <p>This stage captures a consistent snapshot of segment visibility
-     * at the current epoch. All subsequent stages operate on this snapshot.</p>
+     * at the current epoch using {@link QuerySnapshot#capture}. All subsequent
+     * stages operate on this snapshot.</p>
      */
     private PipelineContext stage0_EpochSnapshot(QueryRequest request, CancellationToken token) {
         token.checkCancelled("Stage 0 cancelled before epoch snapshot");
 
         LOGGER.trace("Stage 0: Capturing epoch snapshot");
 
-        // Capture visibility epoch
-        SegmentCatalog catalog = storageEngine.getCatalog();
-        long epoch = visibilityTracker.captureEpoch();
+        // Capture visibility snapshot using QuerySnapshot
+        QuerySnapshot snapshot = QuerySnapshot.capture(visibilityTracker, storageEngine.getCatalog(), storageEngine);
 
-        // Resolve queryable segments
-        Set<Long> visibleSegmentIds = visibilityTracker.visibleSegments(epoch);
+        // Resolve visible segments and build candidates
+        SegmentCatalog catalog = storageEngine.getCatalog();
         List<SegmentCandidate> candidates = new ArrayList<>();
 
-        for (Long segmentId : visibleSegmentIds) {
+        for (Segment segment : snapshot.resolveVisibleSegments()) {
+            long segmentId = segment.segmentId();
             SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
             if (metadata == null) continue;
 
@@ -408,21 +409,17 @@ public class QueryPipeline {
                 continue;
             }
 
-            // Get segment and graph
-            Segment segment = storageEngine.getSegment(segmentId);
             HnswGraph graph = graphProvider.getGraph(segmentId);
-
-            if (segment != null && graph != null) {
-                // Get LSH index from segment if available
+            if (graph != null) {
                 LshIndex lshIndex = segment.lshIndex();
                 candidates.add(new SegmentCandidate(segmentId, segment, graph, state, lshIndex));
             }
         }
 
         LOGGER.debug("Stage 0: Captured epoch {} with {} queryable segments",
-            epoch, candidates.size());
+            snapshot.epoch(), candidates.size());
 
-        return new PipelineContext(request, token, epoch, candidates);
+        return new PipelineContext(request, token, snapshot.epoch(), candidates);
     }
 
     /**

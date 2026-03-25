@@ -8,6 +8,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -387,6 +390,284 @@ class DocumentChunkBufferTest {
         
         // New doc should have chunks
         assertTrue(buffer.hasBufferedChunks("newdoc"));
+    }
+
+    // ==================== Encoding/Decoding Tests ====================
+
+    /**
+     * Test that encodeVectorOnly produces LITTLE_ENDIAN format.
+     * This is critical for compatibility with TailScanner.
+     */
+    @Test
+    void testEncodeVectorOnly_littleEndianFormat() {
+        float[] vector = {1.0f, 2.0f, 3.0f, 4.0f};
+        byte[] encoded = DocumentChunkBuffer.encodeVectorOnly(vector);
+
+        // Verify length: 4 bytes for dimension + 4 floats * 4 bytes = 20 bytes
+        assertEquals(20, encoded.length);
+
+        // Verify dimension is LITTLE_ENDIAN (low byte first)
+        ByteBuffer buffer = ByteBuffer.wrap(encoded).order(ByteOrder.LITTLE_ENDIAN);
+        int decodedDimension = buffer.getInt();
+        assertEquals(4, decodedDimension);
+
+        // Verify floats are LITTLE_ENDIAN
+        assertEquals(1.0f, buffer.getFloat(), 0.0001f);
+        assertEquals(2.0f, buffer.getFloat(), 0.0001f);
+        assertEquals(3.0f, buffer.getFloat(), 0.0001f);
+        assertEquals(4.0f, buffer.getFloat(), 0.0001f);
+    }
+
+    /**
+     * Test that encodeVectorOnly rejects null input.
+     */
+    @Test
+    void testEncodeVectorOnly_nullInput() {
+        assertThrows(NullPointerException.class, () -> DocumentChunkBuffer.encodeVectorOnly(null));
+    }
+
+    /**
+     * Test encodeChunkWithTextAndEmbedding produces correct format.
+     * Format: [dimension:4][vector:dim*4][text:variable]
+     */
+    @Test
+    void testEncodeChunkWithTextAndEmbedding_correctFormat() {
+        float[] vector = {0.5f, 0.6f, 0.7f};
+        String text = "Hello world";
+
+        byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, vector);
+
+        // Verify minimum length: 4 + 12 + text length
+        int textBytes = text.getBytes(StandardCharsets.UTF_8).length;
+        assertEquals(4 + 12 + textBytes, encoded.length);
+
+        // Verify dimension is LITTLE_ENDIAN
+        ByteBuffer buffer = ByteBuffer.wrap(encoded).order(ByteOrder.LITTLE_ENDIAN);
+        assertEquals(3, buffer.getInt());
+
+        // Verify floats
+        assertEquals(0.5f, buffer.getFloat(), 0.0001f);
+        assertEquals(0.6f, buffer.getFloat(), 0.0001f);
+        assertEquals(0.7f, buffer.getFloat(), 0.0001f);
+
+        // Verify text is appended after vector
+        byte[] textBytesArray = new byte[encoded.length - 16]; // 16 = 4 + 12
+        buffer.get(textBytesArray);
+        assertEquals(text, new String(textBytesArray, StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Test encodeChunkWithTextAndEmbedding rejects null inputs.
+     */
+    @Test
+    void testEncodeChunkWithTextAndEmbedding_nullInputs() {
+        float[] vector = {1.0f, 2.0f};
+        String text = "text";
+
+        assertThrows(NullPointerException.class,
+            () -> DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(null, vector));
+        assertThrows(NullPointerException.class,
+            () -> DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, null));
+    }
+
+    /**
+     * Test decodeEmbedding correctly decodes LITTLE_ENDIAN format.
+     */
+    @Test
+    void testDecodeEmbedding_littleEndianFormat() {
+        float[] original = {1.5f, 2.5f, 3.5f, 4.5f, 5.5f};
+
+        // Encode using production method
+        byte[] encoded = DocumentChunkBuffer.encodeVectorOnly(original);
+
+        // Decode
+        float[] decoded = DocumentChunkBuffer.decodeEmbedding(encoded, 5);
+
+        assertNotNull(decoded);
+        assertEquals(5, decoded.length);
+        for (int i = 0; i < 5; i++) {
+            assertEquals(original[i], decoded[i], 0.0001f);
+        }
+    }
+
+    /**
+     * Test decodeEmbedding handles null input.
+     */
+    @Test
+    void testDecodeEmbedding_nullInput() {
+        assertNull(DocumentChunkBuffer.decodeEmbedding(null, 128));
+    }
+
+    /**
+     * Test decodeEmbedding handles too short input.
+     */
+    @Test
+    void testDecodeEmbedding_tooShort() {
+        assertNull(DocumentChunkBuffer.decodeEmbedding(new byte[2], 128));
+        assertNull(DocumentChunkBuffer.decodeEmbedding(new byte[0], 128));
+    }
+
+    /**
+     * Test decodeEmbedding handles dimension mismatch.
+     */
+    @Test
+    void testDecodeEmbedding_dimensionMismatch() {
+        float[] vector = {1.0f, 2.0f, 3.0f};
+        byte[] encoded = DocumentChunkBuffer.encodeVectorOnly(vector);
+
+        // Request wrong dimension
+        assertNull(DocumentChunkBuffer.decodeEmbedding(encoded, 128));
+        assertNull(DocumentChunkBuffer.decodeEmbedding(encoded, 4));
+    }
+
+    /**
+     * Test decodeEmbedding handles value with text appended (production format).
+     */
+    @Test
+    void testDecodeEmbedding_withTextAppended() {
+        float[] vector = {0.1f, 0.2f, 0.3f};
+        String text = "Some chunk text here";
+
+        byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, vector);
+
+        // Should still decode vector correctly despite text being present
+        float[] decoded = DocumentChunkBuffer.decodeEmbedding(encoded, 3);
+
+        assertNotNull(decoded);
+        assertEquals(3, decoded.length);
+        for (int i = 0; i < 3; i++) {
+            assertEquals(vector[i], decoded[i], 0.0001f);
+        }
+    }
+
+    /**
+     * Test decodeText correctly extracts text from encoded value.
+     */
+    @Test
+    void testDecodeText_success() {
+        float[] vector = {1.0f, 2.0f, 3.0f};
+        String originalText = "This is the chunk text content.";
+
+        byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(originalText, vector);
+        String decodedText = DocumentChunkBuffer.decodeText(encoded);
+
+        assertEquals(originalText, decodedText);
+    }
+
+    /**
+     * Test decodeText handles null input.
+     */
+    @Test
+    void testDecodeText_nullInput() {
+        assertNull(DocumentChunkBuffer.decodeText(null));
+    }
+
+    /**
+     * Test decodeText handles too short input.
+     */
+    @Test
+    void testDecodeText_tooShort() {
+        assertNull(DocumentChunkBuffer.decodeText(new byte[2]));
+        assertNull(DocumentChunkBuffer.decodeText(new byte[0]));
+    }
+
+    /**
+     * Test decodeText handles vector-only encoding (no text).
+     */
+    @Test
+    void testDecodeText_vectorOnly() {
+        float[] vector = {1.0f, 2.0f};
+        byte[] encoded = DocumentChunkBuffer.encodeVectorOnly(vector);
+
+        // Should return empty string when no text is present
+        String text = DocumentChunkBuffer.decodeText(encoded);
+        assertEquals("", text);
+    }
+
+    /**
+     * Test getEncodedSize returns correct values.
+     */
+    @Test
+    void testGetEncodedSize() {
+        int textLength = 100;
+        int dimension = 128;
+
+        int expected = 4 + 128 * 4 + 100; // 4 + 512 + 100 = 616
+        assertEquals(expected, DocumentChunkBuffer.getEncodedSize(textLength, dimension));
+    }
+
+    /**
+     * CRITICAL TEST: Verify round-trip encoding matches TailScanner expectations.
+     *
+     * This test simulates what TailScanner.extractVector() does and verifies
+     * that the production encoding format is compatible.
+     */
+    @Test
+    void testEncodingCompatibleWithTailScanner() {
+        // Test vector
+        float[] originalVector = new float[128];
+        for (int i = 0; i < 128; i++) {
+            originalVector[i] = (float) Math.random();
+        }
+        String text = "Sample document chunk";
+
+        // Encode using production method (with text)
+        byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, originalVector);
+
+        // Simulate TailScanner.extractVector() logic
+        ByteBuffer buffer = ByteBuffer.wrap(encoded).order(ByteOrder.LITTLE_ENDIAN);
+        int dimension = buffer.getInt();
+
+        // Verify dimension matches
+        assertEquals(128, dimension);
+
+        // Verify minimum length check (allows extra bytes for text)
+        int expectedBytes = 4 + dimension * Float.BYTES;
+        assertTrue(encoded.length >= expectedBytes);
+
+        // Extract vector
+        float[] extractedVector = new float[dimension];
+        for (int i = 0; i < dimension; i++) {
+            extractedVector[i] = buffer.getFloat();
+        }
+
+        // Verify extracted vector matches original
+        for (int i = 0; i < 128; i++) {
+            assertEquals(originalVector[i], extractedVector[i], 0.0001f,
+                "Vector mismatch at index " + i);
+        }
+    }
+
+    /**
+     * CRITICAL TEST: Verify BIG_ENDIAN encoding would FAIL (regression test).
+     *
+     * This test demonstrates why the fix was necessary - BIG_ENDIAN encoding
+     * would cause TailScanner to read garbage values.
+     */
+    @Test
+    void testBigEndianWouldFail() {
+        float[] vector = {1.0f, 2.0f, 3.0f, 4.0f};
+
+        // Encode with BIG_ENDIAN (the OLD buggy format)
+        ByteBuffer bigEndianBuffer = ByteBuffer.allocate(4 + vector.length * 4)
+            .order(ByteOrder.BIG_ENDIAN);
+        bigEndianBuffer.putInt(vector.length);
+        for (float f : vector) {
+            bigEndianBuffer.putFloat(f);
+        }
+        byte[] bigEndianEncoded = bigEndianBuffer.array();
+
+        // Try to read with LITTLE_ENDIAN (what TailScanner does)
+        ByteBuffer littleEndianReader = ByteBuffer.wrap(bigEndianEncoded)
+            .order(ByteOrder.LITTLE_ENDIAN);
+        int dimension = littleEndianReader.getInt();
+
+        // Dimension would be completely wrong due to byte reversal
+        // 4 in BIG_ENDIAN = [0, 0, 0, 4]
+        // Read as LITTLE_ENDIAN = 4 * 256^3 = 67108864
+        assertNotEquals(4, dimension, "BIG_ENDIAN dimension should NOT match when read as LITTLE_ENDIAN");
+        // The value would be a huge garbage number
+        assertTrue(dimension > 1000000, "Dimension should be garbage value: " + dimension);
     }
 
     private TextChunk createChunk(String documentId, int chunkIndex, String text) {

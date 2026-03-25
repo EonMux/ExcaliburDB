@@ -1,10 +1,17 @@
 // excalibur-api (Phase 9) - API Surface
 plugins {
     `java-library`
+    application
+    id("com.github.johnrengelman.shadow") version "8.1.1"
 }
 
 group = "com.excaliburdb"
 version = "1.0.0-SNAPSHOT"
+
+// Application plugin configuration
+application {
+    mainClass.set("excalibur.api.ExcaliburApplication")
+}
 
 dependencies {
     // SLF4J API for logging
@@ -24,6 +31,7 @@ dependencies {
     implementation(project(":excalibur-ingest"))
     implementation(project(":excalibur-metrics"))
     implementation(project(":excalibur-config"))
+    implementation(project(":excalibur-vector"))
 }
 
 tasks.withType<JavaCompile> {
@@ -42,4 +50,38 @@ tasks.test {
         events("passed", "skipped", "failed")
         showStandardStreams = true
     }
+}
+
+// Shadow JAR configuration for fat JAR packaging
+tasks.shadowJar {
+    archiveBaseName.set("excalibur")
+    archiveVersion.set("")
+    archiveClassifier.set("")
+
+    // Merge service files
+    mergeServiceFiles()
+
+    // Exclude unnecessary files
+    exclude("META-INF/*.SF")
+    exclude("META-INF/*.DSA")
+    exclude("META-INF/*.RSA")
+
+    // Enable preview features for Java 21
+    manifest {
+        attributes["Main-Class"] = "excalibur.api.ExcaliburApplication"
+        attributes["Enable-Native-Access"] = "ALL-UNNAMED"
+    }
+}
+
+// Make the build task depend on shadowJar
+tasks.build {
+    dependsOn(tasks.shadowJar)
+}
+
+// Run configuration for development
+tasks.withType<JavaExec> {
+    jvmArgs(
+        "--enable-preview",
+        "--enable-native-access=ALL-UNNAMED"
+    )
 }

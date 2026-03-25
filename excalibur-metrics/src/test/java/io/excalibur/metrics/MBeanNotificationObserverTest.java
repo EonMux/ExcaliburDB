@@ -680,4 +680,94 @@ class MBeanNotificationObserverTest {
 
         obs.close();
     }
+
+    // ============================================
+    // getAttributes Tests
+    // ============================================
+
+    @Test
+    @DisplayName("All MBeans return non-empty getAttributes set")
+    void testAllMBeansReturnNonEmptyAttributesSet() {
+        // Verify all 6 MBeans have getAttributes() that return non-empty sets
+        assertTrue(Metrics.getQueryLatencyMBean().getAttributes().size() > 0,
+            "QueryLatencyMBean should have attributes");
+        assertTrue(Metrics.getSystemHealthMBean().getAttributes().size() > 0,
+            "SystemHealthMBean should have attributes");
+        assertTrue(Metrics.getIngestionQueueMBean().getAttributes().size() > 0,
+            "IngestionQueueMBean should have attributes");
+        assertTrue(Metrics.getVisibilityEpochMBean().getAttributes().size() > 0,
+            "VisibilityEpochMBean should have attributes");
+        assertTrue(Metrics.getCuckooFpRateMBean().getAttributes().size() > 0,
+            "CuckooFpRateMBean should have attributes");
+        assertTrue(Metrics.getHnswQueueDepthMBean().getAttributes().size() > 0,
+            "HnswQueueDepthMBean should have attributes");
+
+        // Verify expected attribute counts
+        assertEquals(9, Metrics.getQueryLatencyMBean().getAttributes().size(),
+            "QueryLatencyMBean should have 9 attributes");
+        assertEquals(3, Metrics.getSystemHealthMBean().getAttributes().size(),
+            "SystemHealthMBean should have 3 attributes");
+        assertEquals(5, Metrics.getIngestionQueueMBean().getAttributes().size(),
+            "IngestionQueueMBean should have 5 attributes");
+        assertEquals(1, Metrics.getVisibilityEpochMBean().getAttributes().size(),
+            "VisibilityEpochMBean should have 1 attribute");
+        assertEquals(6, Metrics.getCuckooFpRateMBean().getAttributes().size(),
+            "CuckooFpRateMBean should have 6 attributes");
+        assertEquals(8, Metrics.getHnswQueueDepthMBean().getAttributes().size(),
+            "HnswQueueDepthMBean should have 8 attributes");
+    }
+
+    @Test
+    @DisplayName("MBean getAttributes contains expected attribute names")
+    void testMBeanGetAttributesContainsExpectedNames() {
+        // QueryLatencyMBean attributes
+        java.util.Set<String> queryLatencyAttrs = Metrics.getQueryLatencyMBean().getAttributes();
+        assertTrue(queryLatencyAttrs.contains("count"), "Should contain 'count'");
+        assertTrue(queryLatencyAttrs.contains("p50"), "Should contain 'p50'");
+        assertTrue(queryLatencyAttrs.contains("p90"), "Should contain 'p90'");
+        assertTrue(queryLatencyAttrs.contains("p95"), "Should contain 'p95'");
+        assertTrue(queryLatencyAttrs.contains("p99"), "Should contain 'p99'");
+        assertTrue(queryLatencyAttrs.contains("p99.9"), "Should contain 'p99.9'");
+        assertTrue(queryLatencyAttrs.contains("average"), "Should contain 'average'");
+        assertTrue(queryLatencyAttrs.contains("minimum"), "Should contain 'minimum'");
+        assertTrue(queryLatencyAttrs.contains("maximum"), "Should contain 'maximum'");
+
+        // SystemHealthMBean attributes
+        java.util.Set<String> healthAttrs = Metrics.getSystemHealthMBean().getAttributes();
+        assertTrue(healthAttrs.contains("health"), "Should contain 'health'");
+        assertTrue(healthAttrs.contains("isHealthy"), "Should contain 'isHealthy'");
+        assertTrue(healthAttrs.contains("ready"), "Should contain 'ready'");
+
+        // IngestionQueueMBean attributes (this was missing before fix)
+        java.util.Set<String> ingestionAttrs = Metrics.getIngestionQueueMBean().getAttributes();
+        assertTrue(ingestionAttrs.contains("depth"), "Should contain 'depth'");
+        assertTrue(ingestionAttrs.contains("percent"), "Should contain 'percent'");
+        assertTrue(ingestionAttrs.contains("isUnderControl"), "Should contain 'isUnderControl'");
+        assertTrue(ingestionAttrs.contains("isCritical"), "Should contain 'isCritical'");
+        assertTrue(ingestionAttrs.contains("isFull"), "Should contain 'isFull'");
+
+        // VisibilityEpochMBean attributes (this was missing before fix)
+        java.util.Set<String> epochAttrs = Metrics.getVisibilityEpochMBean().getAttributes();
+        assertTrue(epochAttrs.contains("epoch"), "Should contain 'epoch'");
+
+        // CuckooFpRateMBean attributes (this was missing before fix)
+        java.util.Set<String> cuckooAttrs = Metrics.getCuckooFpRateMBean().getAttributes();
+        assertTrue(cuckooAttrs.contains("fpRate"), "Should contain 'fpRate'");
+        assertTrue(cuckooAttrs.contains("fpRateEpoch"), "Should contain 'fpRateEpoch'");
+        assertTrue(cuckooAttrs.contains("fpRateCount"), "Should contain 'fpRateCount'");
+        assertTrue(cuckooAttrs.contains("avgFpRate"), "Should contain 'avgFpRate'");
+        assertTrue(cuckooAttrs.contains("maxFpRate"), "Should contain 'maxFpRate'");
+        assertTrue(cuckooAttrs.contains("currentEpoch"), "Should contain 'currentEpoch'");
+
+        // HnswQueueDepthMBean attributes (this was missing before fix)
+        java.util.Set<String> hnswAttrs = Metrics.getHnswQueueDepthMBean().getAttributes();
+        assertTrue(hnswAttrs.contains("depth"), "Should contain 'depth'");
+        assertTrue(hnswAttrs.contains("percent"), "Should contain 'percent'");
+        assertTrue(hnswAttrs.contains("isUnderControl"), "Should contain 'isUnderControl'");
+        assertTrue(hnswAttrs.contains("isCritical"), "Should contain 'isCritical'");
+        assertTrue(hnswAttrs.contains("isFull"), "Should contain 'isFull'");
+        assertTrue(hnswAttrs.contains("averageTailScan"), "Should contain 'averageTailScan'");
+        assertTrue(hnswAttrs.contains("maxTailScan"), "Should contain 'maxTailScan'");
+        assertTrue(hnswAttrs.contains("totalTailScanned"), "Should contain 'totalTailScanned'");
+    }
 }

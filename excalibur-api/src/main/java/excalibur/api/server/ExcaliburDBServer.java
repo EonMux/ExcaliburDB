@@ -18,12 +18,16 @@ import excalibur.query.pipeline.QueryPipeline;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
 import io.excalibur.config.Config;
+import io.excalibur.config.ConfigLoader;
+import io.excalibur.config.ConfigValidation;
 import io.excalibur.llm.client.LLMHttpClient;
+import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -238,6 +242,125 @@ public class ExcaliburDBServer {
             port, volumeManager != null ? "enabled" : "disabled", config != null ? "enabled" : "disabled");
     }
 
+    // ==================== Static Factory Methods ====================
+
+    /**
+     * Creates an ExcaliburDBServer with full configuration including Config.Shard wiring.
+     *
+     * <p>This factory method creates an IndexOrchestrator using the Config.Shard settings,
+     * ensuring that shard configuration values are properly consumed by the system:</p>
+     * <ul>
+     *   <li>{@code hnswQueueLimit} → IndexOrchestrator's HNSW integration queue depth limit</li>
+     *   <li>{@code efConstruction} → HnswConfig's construction candidate list size</li>
+     *   <li>{@code efSearch} → HnswConfig's search candidate list size</li>
+     *   <li>{@code compactDelayMs} → Informational for compaction timing</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Creates IndexOrchestrator via factory method that consumes Config.Shard</li>
+     *   <li>All config values are validated by Config.Shard before being used</li>
+     *   <li>VolumeManager is required for proper disk space tracking</li>
+     * </ul>
+     *
+     * @param config The configuration object containing Shard settings
+     * @param catalog The segment catalog for index orchestration
+     * @param storageEngine The storage engine for data access
+     * @param volumeManager The volume manager for disk space tracking
+     * @param queryPipeline The query pipeline for executing queries
+     * @return A new ExcaliburDBServer with Config.Shard properly wired
+     * @throws NullPointerException if any required parameter is null
+     */
+    public static ExcaliburDBServer create(Config config,
+                                           SegmentCatalog catalog,
+                                           StorageEngine storageEngine,
+                                           VolumeManager volumeManager,
+                                           QueryPipeline queryPipeline) {
+        Objects.requireNonNull(config, "config cannot be null");
+        Objects.requireNonNull(catalog, "catalog cannot be null");
+        Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
+        Objects.requireNonNull(queryPipeline, "queryPipeline cannot be null");
+
+        // Create IndexOrchestrator from Config.Shard settings
+        IndexOrchestrator orchestrator = IndexOrchestrator.fromConfig(
+            catalog,
+            storageEngine,
+            volumeManager,
+            config.shard()
+        );
+
+        LOGGER.info("Created ExcaliburDBServer with Config.Shard: efConstruction={}, efSearch={}, hnswQueueLimit={}, loadFactor={}",
+            config.shard().getEfConstruction(),
+            config.shard().getEfSearch(),
+            config.shard().getHnswQueueLimit(),
+            config.shard().getLoadFactor());
+
+        return new ExcaliburDBServer(
+            DEFAULT_PORT,
+            DEFAULT_BACKLOG,
+            orchestrator,
+            storageEngine,
+            volumeManager,
+            config,
+            queryPipeline
+        );
+    }
+
+    /**
+     * Creates an ExcaliburDBServer with custom port and Config.Shard wiring.
+     *
+     * <p>This is a convenience overload that allows specifying a custom port while
+     * still wiring Config.Shard settings properly.</p>
+     *
+     * @param port The port to bind to (1-65535)
+     * @param config The configuration object containing Shard settings
+     * @param catalog The segment catalog for index orchestration
+     * @param storageEngine The storage engine for data access
+     * @param volumeManager The volume manager for disk space tracking
+     * @param queryPipeline The query pipeline for executing queries
+     * @return A new ExcaliburDBServer with Config.Shard properly wired
+     * @throws NullPointerException if any required parameter is null
+     * @throws IllegalArgumentException if port is out of range
+     */
+    public static ExcaliburDBServer create(int port,
+                                           Config config,
+                                           SegmentCatalog catalog,
+                                           StorageEngine storageEngine,
+                                           VolumeManager volumeManager,
+                                           QueryPipeline queryPipeline) {
+        Objects.requireNonNull(config, "config cannot be null");
+        Objects.requireNonNull(catalog, "catalog cannot be null");
+        Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
+        Objects.requireNonNull(queryPipeline, "queryPipeline cannot be null");
+        if (port < 0 || port > 65535) {
+            throw new IllegalArgumentException("Port must be in range 0-65535: " + port);
+        }
+
+        // Create IndexOrchestrator from Config.Shard settings
+        IndexOrchestrator orchestrator = IndexOrchestrator.fromConfig(
+            catalog,
+            storageEngine,
+            volumeManager,
+            config.shard()
+        );
+
+        LOGGER.info("Created ExcaliburDBServer on port {} with Config.Shard: efConstruction={}, efSearch={}, hnswQueueLimit={}",
+            port,
+            config.shard().getEfConstruction(),
+            config.shard().getEfSearch(),
+            config.shard().getHnswQueueLimit());
+
+        return new ExcaliburDBServer(
+            port,
+            DEFAULT_BACKLOG,
+            orchestrator,
+            storageEngine,
+            volumeManager,
+            config,
+            queryPipeline
+        );
+    }
+
     /**
      * Configures the LLM scorer for relevancy scoring in Stage 5 of the query pipeline.
      *
@@ -358,12 +481,75 @@ public class ExcaliburDBServer {
     }
 
     /**
+     * Creates a SourceResolver that delegates to the internal source registry.
+     *
+     * <p>This method provides a convenient way to create a SourceResolver that
+     * resolves sources from the internal {@link IngestEndpoint.InMemorySourceRegistry},
+     * enabling reindex operations for sources registered via /v1/ingest.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Only resolves sources that have been registered via /v1/ingest</li>
+     *   <li>Returns null for unregistered source IDs</li>
+     *   <li>Thread-safe delegation to the internal concurrent registry</li>
+     * </ul>
+     *
+     * @return A SourceResolver that resolves sources from the ingest registry
+     */
+    public SourceResolver createSourceResolver() {
+        return sourceId -> {
+            Source source = ingestSourceRegistry.get(sourceId);
+            return source;
+        };
+    }
+
+    /**
+     * Configures the document reindexer with automatic source resolution.
+     *
+     * <p>Creates a SourceResolver that delegates to the internal source registry,
+     * enabling reindex operations for sources registered via /v1/ingest.</p>
+     *
+     * <p>This is a convenience overload of {@link #withReindexer(DocumentReindexer, SourceResolver)}
+     * that automatically creates a SourceResolver using {@link #createSourceResolver()}.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Automatically creates SourceResolver that resolves from internal registry</li>
+     *   <li>Method must be called before {@link #start()} to take effect</li>
+     *   <li>SourceResolver delegates to the shared IngestEndpoint.SourceRegistry</li>
+     * </ul>
+     *
+     * <h3>Thread Safety</h3>
+     * <p>This method is NOT thread-safe and should only be called during initialization,
+     * before starting the server.</p>
+     *
+     * @param documentReindexer The document reindexer for executing reindex operations
+     * @throws IllegalStateException if the server is already running
+     * @throws NullPointerException if documentReindexer is null
+     */
+    public void withReindexer(DocumentReindexer documentReindexer) {
+        if (running.get()) {
+            throw new IllegalStateException("Cannot configure reindexer after server has started");
+        }
+        Objects.requireNonNull(documentReindexer, "documentReindexer cannot be null");
+        this.documentReindexer = documentReindexer;
+        this.sourceResolver = createSourceResolver();
+        LOGGER.info("Document reindexer configured with automatic source resolution");
+    }
+
+    /**
      * Configures the ingestion pipeline for background document processing.
      *
      * <p>When configured, the {@code POST /v1/ingest} endpoint will trigger actual
      * background ingestion: crawling, chunking, embedding, and indexing documents
      * from registered sources. Without this configuration, the endpoint only stores
      * source metadata without processing documents.</p>
+     *
+     * <h3>Configuration</h3>
+     * <p>This method reads the following configuration from the provided Config:</p>
+     * <ul>
+     *   <li>{@code excalibur.ingest.document-atomicity-timeout-ms} - Timeout for HNSW backpressure (default 2000ms)</li>
+     * </ul>
      *
      * <h3>Domain Correctness</h3>
      * <ul>
@@ -391,6 +577,11 @@ public class ExcaliburDBServer {
         this.textChunker = textChunker;
         this.llmClient = llmClient;
 
+        // Read document timeout from config, defaulting to 2000ms if not configured
+        int documentTimeoutMs = config != null
+            ? config.ingest().getDocumentTimeoutMs()
+            : IngestionOrchestrator.DEFAULT_DOCUMENT_TIMEOUT_MS;
+
         // Create the ingestion orchestrator with status registry adapter
         this.ingestionOrchestrator = new IngestionOrchestrator(
             textChunker,
@@ -415,10 +606,15 @@ public class ExcaliburDBServer {
                         }
                     };
                 }
-            }
+            },
+            null,  // lshIngestionService - not configured here
+            null,  // documentChunkBuffer - not configured here
+            null,  // visibilityTracker - not configured here
+            documentTimeoutMs
         );
 
-        LOGGER.info("Ingestion pipeline configured with TextChunker and LLMHttpClient");
+        LOGGER.info("Ingestion pipeline configured with TextChunker, LLMHttpClient, documentTimeoutMs={}ms",
+            documentTimeoutMs);
     }
 
     /**
@@ -522,13 +718,20 @@ public class ExcaliburDBServer {
      * Registers all API endpoints.
      */
     private void registerEndpoints() {
-        // Determine readiness threshold from config or use default
+        // Determine health config values from config or use defaults
         double readinessThreshold = config != null
             ? config.health().getReadinessThreshold()
             : HealthEndpoint.DEFAULT_READINESS_THRESHOLD;
+        double healthyThreshold = config != null
+            ? config.health().getHealthyThreshold()
+            : HealthEndpoint.DEFAULT_HEALTHY_THRESHOLD;
+        int maxLatencyMs = config != null
+            ? config.health().getMaxLatencyMs()
+            : HealthEndpoint.DEFAULT_MAX_LATENCY_MS;
 
-        // Core endpoints - use config for HealthEndpoint
-        HealthEndpoint healthEndpoint = new HealthEndpoint(indexOrchestrator, readinessThreshold);
+        // Core endpoints - use full health config for HealthEndpoint
+        HealthEndpoint healthEndpoint = new HealthEndpoint(
+            indexOrchestrator, readinessThreshold, healthyThreshold, maxLatencyMs);
         StatsEndpoint statsEndpoint = new StatsEndpoint(indexOrchestrator, storageEngine, volumeManager);
 
         // QueryEndpoint - pass config for include_partial_segments default
@@ -547,13 +750,18 @@ public class ExcaliburDBServer {
 
         // Create ReindexEndpoint with shared source registry for consistency
         // If documentReindexer is configured, actual reindexing will occur
+        // Auto-create sourceResolver if not explicitly set
         ReindexEndpoint reindexEndpoint;
-        if (documentReindexer != null && sourceResolver != null) {
+        if (documentReindexer != null) {
+            // Auto-create sourceResolver if not explicitly set
+            SourceResolver resolver = (sourceResolver != null)
+                ? sourceResolver
+                : createSourceResolver();
             reindexEndpoint = new ReindexEndpoint(
                 new SourceRegistryAdapter(ingestSourceRegistry),
                 reindexStatusRegistry,
                 documentReindexer,
-                sourceResolver
+                resolver
             );
             LOGGER.info("ReindexEndpoint configured with DocumentReindexer for actual reindex operations");
         } else {
@@ -595,6 +803,11 @@ public class ExcaliburDBServer {
         @Override
         public boolean isRegistered(String sourceId) {
             return delegate.isRegistered(sourceId);
+        }
+
+        @Override
+        public excalibur.ingest.source.Source get(String sourceId) {
+            return delegate.get(sourceId);
         }
     }
 

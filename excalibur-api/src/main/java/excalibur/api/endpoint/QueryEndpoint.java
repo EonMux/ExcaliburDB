@@ -73,8 +73,9 @@ public class QueryEndpoint implements HttpHandler {
 
     /**
      * Default timeout for queries in milliseconds.
+     * Initialized from config if available, otherwise falls back to 30 seconds.
      */
-    private static final long DEFAULT_TIMEOUT_MS = 30_000;
+    private final long defaultTimeoutMs;
 
     /**
      * Maximum request body size in bytes.
@@ -125,6 +126,10 @@ public class QueryEndpoint implements HttpHandler {
         this.queryPipeline = Objects.requireNonNull(queryPipeline, "QueryPipeline cannot be null");
         this.config = config;
         this.executorService = executorService != null ? executorService : Executors.newVirtualThreadPerTaskExecutor();
+        // Initialize default timeout from config visibility settings, fallback to 30 seconds
+        this.defaultTimeoutMs = config != null
+            ? config.visibility().getQueryTimeoutMs()
+            : 30_000L;
     }
 
     @Override
@@ -211,7 +216,7 @@ public class QueryEndpoint implements HttpHandler {
         float[] vector = extractFloatArray(json, "vector");
         int topK = extractInt(json, "top_k", 10);
         float threshold = extractFloat(json, "threshold", 0.0f);
-        long timeoutMs = extractLong(json, "timeout_ms", DEFAULT_TIMEOUT_MS);
+        long timeoutMs = extractLong(json, "timeout_ms", defaultTimeoutMs);
 
         // Use config default for include_partial_segments if config is provided
         boolean defaultIncludePartial = config != null
@@ -220,7 +225,12 @@ public class QueryEndpoint implements HttpHandler {
         boolean includePartial = extractBoolean(json, "include_partial_segments", defaultIncludePartial);
 
         boolean enableLlmScoring = extractBoolean(json, "enable_llm_scoring", true);
-        float llmThreshold = extractFloat(json, "llm_threshold", 0.3f);
+
+        // Use config default for llm_threshold if config is provided
+        float defaultLlmThreshold = config != null
+            ? (float) config.llm().getRelevancyThreshold()
+            : 0.3f;
+        float llmThreshold = extractFloat(json, "llm_threshold", defaultLlmThreshold);
 
         if (vector == null || vector.length == 0) {
             throw new IllegalArgumentException("Field 'vector' is required and must be non-empty");

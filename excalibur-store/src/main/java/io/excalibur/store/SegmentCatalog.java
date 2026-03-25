@@ -1,6 +1,8 @@
 package io.excalibur.store;
 
 import io.excalibur.store.catalog.CatalogFile;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -54,6 +56,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * @since 2.0
  */
 public class SegmentCatalog {
+
+    private static final Logger logger = LoggerFactory.getLogger(SegmentCatalog.class);
 
     // ==================== Entry State ====================
 
@@ -305,6 +309,100 @@ public class SegmentCatalog {
         persistSegment(metadata);
 
         return metadata;
+    }
+
+    /**
+     * Creates a new segment in BOOTSTRAPPING state for a specific source.
+     *
+     * <p>This method is used by the reindexer to create new segments for rolling
+     * replacement. The segment starts in BOOTSTRAPPING state and is invisible
+     * to queries until it transitions to INDEXING state.</p>
+     *
+     * <p><strong>Domain Correctness:</strong></p>
+     * <ul>
+     *   <li>Segment ID is generated atomically and is unique</li>
+     *   <li>Segment starts in BOOTSTRAPPING state (invisible to queries)</li>
+     *   <li>Creation time is set to current time</li>
+     *   <li>Source ID is associated for rolling replacement tracking</li>
+     * </ul>
+     *
+     * @param sourceId The source ID this segment belongs to
+     * @param volumePath Path to the segment file
+     * @return The created segment metadata with BOOTSTRAPPING state
+     * @throws NullPointerException if sourceId or volumePath is null
+     */
+    public SegmentMetadata create(String sourceId, Path volumePath) {
+        if (sourceId == null) {
+            throw new NullPointerException("sourceId cannot be null");
+        }
+        if (volumePath == null) {
+            throw new NullPointerException("volumePath cannot be null");
+        }
+
+        // Generate unique segment ID
+        long segmentId = segmentIdGenerator.incrementAndGet();
+
+        SegmentMetadata metadata = new SegmentMetadata(segmentId);
+        metadata.setVolumePath(volumePath);
+        metadata.setSourceId(sourceId);
+        metadata.setCreationTime(System.currentTimeMillis());
+        // Segment is in BOOTSTRAPPING state by default - invisible to queries
+        // Caller should call beginIndexing() to make it queryable
+
+        // Add to registry
+        segments.put(segmentId, metadata);
+
+        // Register in volume index
+        volumeToSegments.computeIfAbsent(volumePath, k -> new java.util.ArrayList<>())
+            .add(segmentId);
+
+        // Persist to disk
+        persistSegment(metadata);
+
+        logger.info("Created segment {} in BOOTSTRAPPING state for source {} at {}",
+            segmentId, sourceId, volumePath);
+
+        return metadata;
+    }
+
+    /**
+     * Gets all segments associated with a specific source.
+     *
+     * <p>This method is used by the reindexer to find old segments that should
+     * be tombstoned after a new segment for the same source becomes ACTIVE.</p>
+     *
+     * @param sourceId The source ID to filter by
+     * @return List of segment metadata for segments belonging to the source
+     */
+    public java.util.List<SegmentMetadata> getSegmentsBySource(String sourceId) {
+        if (sourceId == null) {
+            return java.util.Collections.emptyList();
+        }
+
+        return segments.values().stream()
+            .filter(m -> sourceId.equals(m.getSourceId()))
+            .collect(java.util.stream.Collectors.toList());
+    }
+
+    /**
+     * Gets all ACTIVE segments associated with a specific source.
+     *
+     * <p>This method is used by the reindexer to find old active segments that
+     * should be tombstoned after a new segment for the same source becomes ACTIVE.</p>
+     *
+     * @param sourceId The source ID to filter by
+     * @return List of segment IDs for ACTIVE segments belonging to the source
+     */
+    public java.util.List<Long> getActiveSegmentsBySource(String sourceId) {
+        if (sourceId == null) {
+            return java.util.Collections.emptyList();
+        }
+
+        return segments.values().stream()
+            .filter(m -> sourceId.equals(m.getSourceId()))
+            .filter(m -> m.getLifecycleState() == LifecycleState.ACTIVE)
+            .map(SegmentMetadata::getSegmentId)
+            .collect(java.util.stream.Collectors.toList());
     }
 
     /**
@@ -936,6 +1034,14 @@ public class SegmentCatalog {
         private LifecycleState lifecycleState = LifecycleState.BOOTSTRAPPING;
 
         /**
+         * Source ID that this segment belongs to.
+         * Used for rolling replacement during reindexing to track which segments
+         * should be tombstoned when a new segment for the same source becomes ACTIVE.
+         * Null for segments not associated with a specific source.
+         */
+        private volatile String sourceId;
+
+        /**
          * Atomic last integrated offset for thread-safe updates.
          * Uses AtomicLong to ensure monotonic increase and visibility across threads.
          *
@@ -1006,6 +1112,30 @@ public class SegmentCatalog {
          */
         public long getSegmentId() {
             return segmentId;
+        }
+
+        /**
+         * Gets the source ID that this segment belongs to.
+         *
+         * <p>Used for rolling replacement during reindexing to track which segments
+         * should be tombstoned when a new segment for the same source becomes ACTIVE.</p>
+         *
+         * @return Source ID, or null if not associated with a specific source
+         */
+        public String getSourceId() {
+            return sourceId;
+        }
+
+        /**
+         * Sets the source ID that this segment belongs to.
+         *
+         * <p>Should be set when creating a segment for reindexing operations
+         * to enable tracking and tombstoning of old segments for the same source.</p>
+         *
+         * @param sourceId Source ID (may be null)
+         */
+        public void setSourceId(String sourceId) {
+            this.sourceId = sourceId;
         }
 
         /**

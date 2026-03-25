@@ -467,7 +467,7 @@ class LLMClientConfigTest {
         @Test
         @DisplayName("fromConfig() validates all values through builder")
         void fromConfigValidatesAllValuesThroughBuilder() {
-            // Create Config.Llm with invalid values
+            // Create Config.Llm with invalid values - failure-threshold of 0 is below minimum
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "https://api.test.com");
             props.put("excalibur.llm.failure-threshold", "0"); // Invalid: must be >= 1
@@ -475,11 +475,108 @@ class LLMClientConfigTest {
             Config config = new Config(props);
             Config.Llm llmConfig = config.llm();
 
-            // Should throw due to validation in the builder
+            // Should throw due to validation in the builder (0 is below minimum of 1)
             assertThrows(
                 IllegalArgumentException.class,
                 () -> LLMClientConfig.fromConfig(llmConfig)
             );
+        }
+    }
+
+    @Nested
+    @DisplayName("Runtime Configuration Usage")
+    class RuntimeConfigurationUsageTests {
+
+        @Test
+        @DisplayName("maxPromptsPerQuery limits batch count in BatchHandler")
+        void maxPromptsPerQueryLimitsBatchCount() {
+            // Verify that the config value is properly accessible
+            // Domain correctness: maxPromptsPerQuery must be in range [1, 100]
+            LLMClientConfig config = LLMClientConfig.builder()
+                .baseUrl("https://api.test.com")
+                .maxPromptsPerQuery(3)
+                .build();
+
+            assertEquals(3, config.getMaxPromptsPerQuery(),
+                "maxPromptsPerQuery should be 3");
+
+            // Test boundary values
+            LLMClientConfig minConfig = LLMClientConfig.builder()
+                .baseUrl("https://api.test.com")
+                .maxPromptsPerQuery(1)
+                .build();
+            assertEquals(1, minConfig.getMaxPromptsPerQuery());
+
+            LLMClientConfig maxConfig = LLMClientConfig.builder()
+                .baseUrl("https://api.test.com")
+                .maxPromptsPerQuery(100)
+                .build();
+            assertEquals(100, maxConfig.getMaxPromptsPerQuery());
+        }
+
+        @Test
+        @DisplayName("relevancyThreshold is used as QueryRequest default")
+        void relevancyThresholdIsUsedAsDefault() {
+            // Verify that the config value is properly accessible
+            // Domain correctness: relevancyThreshold must be in range [0.0, 1.0]
+            LLMClientConfig config = LLMClientConfig.builder()
+                .baseUrl("https://api.test.com")
+                .relevancyThreshold(0.5)
+                .build();
+
+            assertEquals(0.5, config.getRelevancyThreshold(), 0.001,
+                "relevancyThreshold should be 0.5");
+
+            // Test boundary values
+            LLMClientConfig minConfig = LLMClientConfig.builder()
+                .baseUrl("https://api.test.com")
+                .relevancyThreshold(0.0)
+                .build();
+            assertEquals(0.0, minConfig.getRelevancyThreshold(), 0.001);
+
+            LLMClientConfig maxConfig = LLMClientConfig.builder()
+                .baseUrl("https://api.test.com")
+                .relevancyThreshold(1.0)
+                .build();
+            assertEquals(1.0, maxConfig.getRelevancyThreshold(), 0.001);
+        }
+
+        @Test
+        @DisplayName("Config.Llm relevancyThreshold maps to LLMClientConfig")
+        void configLlmRelevancyThresholdMapsToLLMClientConfig() {
+            // Create a Config.Llm with custom relevancy threshold
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.llm.base-url", "https://api.test.com");
+            props.put("excalibur.llm.relevancy-threshold", "0.75");
+
+            Config config = new Config(props);
+            Config.Llm llmConfig = config.llm();
+
+            // Verify Config.Llm has the correct value
+            assertEquals(0.75, llmConfig.getRelevancyThreshold(), 0.001);
+
+            // Verify LLMClientConfig.fromConfig() maps it correctly
+            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+            assertEquals(0.75, clientConfig.getRelevancyThreshold(), 0.001);
+        }
+
+        @Test
+        @DisplayName("Config.Llm maxPromptsPerQuery maps to LLMClientConfig")
+        void configLlmMaxPromptsPerQueryMapsToLLMClientConfig() {
+            // Create a Config.Llm with custom maxPromptsPerQuery
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.llm.base-url", "https://api.test.com");
+            props.put("excalibur.llm.max-prompts-per-query", "25");
+
+            Config config = new Config(props);
+            Config.Llm llmConfig = config.llm();
+
+            // Verify Config.Llm has the correct value
+            assertEquals(25, llmConfig.getMaxPromptsPerQuery());
+
+            // Verify LLMClientConfig.fromConfig() maps it correctly
+            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+            assertEquals(25, clientConfig.getMaxPromptsPerQuery());
         }
     }
 }

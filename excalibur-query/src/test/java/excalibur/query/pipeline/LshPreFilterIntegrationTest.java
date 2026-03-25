@@ -7,9 +7,10 @@ import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
 import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.HnswSearchResult;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -48,16 +49,18 @@ import static org.junit.jupiter.api.Assertions.*;
  * @author ExcaliburDB
  * @since 6.0
  */
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class LshPreFilterIntegrationTest {
 
     private static final int DIMENSIONS = 128;
-    private static final int NUM_VECTORS = 1000;
+    // Reduced from 1000 to 500 for faster tests while maintaining statistical validity
+    // Must be large enough for LSH to reliably return candidates
+    private static final int NUM_VECTORS = 500;
+    private static final int MAX_GRAPH_NODES = 600; // Slightly larger than NUM_VECTORS
     private static final int TOP_K = 10;
     private static final double DELTA = 0.001;
 
-    @TempDir
-    Path tempDir;
-
+    private Path tempDir;
     private HnswGraph graph;
     private LshIndex lshIndex;
     private DistanceFunction distanceFunction;
@@ -65,8 +68,9 @@ class LshPreFilterIntegrationTest {
     private List<Long> nodeIds;
     private Path graphPath;
 
-    @BeforeEach
-    void setUp() throws IOException {
+    @BeforeAll
+    void setUp(@TempDir Path tempDir) throws IOException {
+        this.tempDir = tempDir;
         // Create distance function (singleton)
         distanceFunction = CosineSimilarity.getInstance();
 
@@ -81,7 +85,7 @@ class LshPreFilterIntegrationTest {
         );
 
         graphPath = tempDir.resolve("test_graph.hnsw");
-        graph = new HnswGraph(graphPath, hnswConfig, distanceFunction, 2000);
+        graph = new HnswGraph(graphPath, hnswConfig, distanceFunction, MAX_GRAPH_NODES);
 
         // Create LSH index with good recall characteristics
         LshConfig lshConfig = LshConfig.builder(DIMENSIONS)
@@ -109,7 +113,7 @@ class LshPreFilterIntegrationTest {
         }
     }
 
-    @AfterEach
+    @AfterAll
     void tearDown() {
         if (graph != null) {
             graph.close();

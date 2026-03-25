@@ -128,6 +128,14 @@ public class BatchHandler {
         LOG.debug("Splitting into multiple batches (correlationId={})", correlationId);
         List<Batch> batches = splitIntoBatches(query, candidates, maxBatchTokens);
 
+        // Apply maxPromptsPerQuery limit to control API call volume
+        int maxPrompts = config.getMaxPromptsPerQuery();
+        if (batches.size() > maxPrompts) {
+            LOG.warn("Candidate set requires {} batches but maxPromptsPerQuery is {}, truncating to first {} batches (correlationId={})",
+                    batches.size(), maxPrompts, maxPrompts, correlationId);
+            batches = batches.subList(0, maxPrompts);
+        }
+
         LOG.debug("Created {} batches from {} candidates (correlationId={})",
                 batches.size(), candidates.size(), correlationId);
 
@@ -199,6 +207,15 @@ public class BatchHandler {
         }
 
         List<Batch> batches = splitIntoBatches(query, candidates, maxBatchTokens);
+
+        // Apply maxPromptsPerQuery limit to control API call volume
+        int maxPrompts = config.getMaxPromptsPerQuery();
+        if (batches.size() > maxPrompts) {
+            LOG.warn("Candidate set requires {} batches but maxPromptsPerQuery is {}, truncating to first {} batches (correlationId={})",
+                    batches.size(), maxPrompts, maxPrompts, correlationId);
+            batches = batches.subList(0, maxPrompts);
+        }
+
         List<RelevancyScore> allScores = new ArrayList<>(candidates.size());
 
         for (int batchIndex = 0; batchIndex < batches.size(); batchIndex++) {

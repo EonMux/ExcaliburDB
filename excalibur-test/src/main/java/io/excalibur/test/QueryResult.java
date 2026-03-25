@@ -1,15 +1,16 @@
 /*
  * excalibur-test - Query Result Verification Service
- * 
+ *
  * Package: io.excalibur.test
- * 
- * Thread Safety: 
+ *
+ * Thread Safety:
  *   - QueryResult: Thread-safe, immutable
  */
 
 package io.excalibur.test;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Immutable representation of actual query results.
@@ -42,7 +43,105 @@ public class QueryResult {
         this.metadata = (metadata == null) ? Collections.emptyMap() : new HashMap<>(metadata);
         this.indexCoverage = (indexCoverage == null) ? IndexCoverage.empty() : indexCoverage;
     }
-    
+
+    /**
+     * Create a QueryResult from an excalibur.query.QueryResponse.
+     *
+     * <p>This factory method converts the query pipeline's response format
+     * into the test framework's verification format, enabling users to
+     * verify actual query results without manual field-by-field conversion.</p>
+     *
+     * <h3>Field Mapping</h3>
+     * <ul>
+     *   <li>{@code documentId}: Prefers string ID if available, falls back to numeric ID as string</li>
+     *   <li>{@code score}: Copied directly</li>
+     *   <li>{@code metadata}: Includes segmentId and nodeId from query result</li>
+     *   <li>{@code content/source/chunkIndex}: Not available from QueryResponse, set to defaults</li>
+     *   <li>{@code IndexCoverage}: Converted from long to int segment counts</li>
+     * </ul>
+     *
+     * @param response The query response from the query pipeline (must not be null)
+     * @param queryId  Unique identifier for this query (must not be null)
+     * @return A QueryResult suitable for verification in test frameworks
+     * @throws NullPointerException if response or queryId is null
+     */
+    public static QueryResult fromQueryResponse(excalibur.query.QueryResponse response, String queryId) {
+        Objects.requireNonNull(response, "QueryResponse cannot be null");
+        Objects.requireNonNull(queryId, "QueryId cannot be null");
+
+        // Convert each QueryResultItem from query pipeline to test framework format
+        List<QueryResultItem> items = response.results().stream()
+            .map(r -> {
+                // Prefer string document ID if available, otherwise convert numeric ID
+                String docId = r.documentIdStr() != null
+                    ? r.documentIdStr()
+                    : String.valueOf(r.documentId());
+
+                // Build metadata with available information from query result
+                Map<String, Object> metadata = new HashMap<>();
+                metadata.put("segmentId", r.segmentId());
+                metadata.put("nodeId", r.nodeId());
+                metadata.put("hasPayload", r.hasPayload());
+
+                return new QueryResultItem(
+                    docId,
+                    r.score(),
+                    metadata,
+                    null,  // content - not available from QueryResponse (payload would need decoding)
+                    null,  // source - not available from QueryResponse
+                    -1     // chunkIndex - not available from QueryResponse
+                );
+            })
+            .collect(Collectors.toList());
+
+        // Convert IndexCoverage from query pipeline to test framework format
+        excalibur.query.IndexCoverage queryCoverage = response.coverage();
+        IndexCoverage coverage = new IndexCoverage(
+            safeLongToInt(queryCoverage.totalSegments()),
+            safeLongToInt(queryCoverage.activeSegments()),
+            safeLongToInt(queryCoverage.indexingSegments()),
+            safeLongToInt(queryCoverage.warmingSegments()),
+            queryCoverage.estimatedCorpusCoverage(),
+            queryCoverage.degraded()
+        );
+
+        // Build metadata with query response information
+        Map<String, Object> responseMetadata = new HashMap<>();
+        responseMetadata.put("queryTimeMs", response.queryTimeMs());
+        responseMetadata.put("fromCache", response.fromCache());
+        responseMetadata.put("timedOut", response.timedOut());
+        responseMetadata.put("isDegraded", response.isDegraded());
+        responseMetadata.put("resultCount", response.resultCount());
+        // Include additional coverage information not mapped to test IndexCoverage
+        responseMetadata.put("compactingSegments", queryCoverage.compactingSegments());
+        responseMetadata.put("tombstonedSegments", queryCoverage.tombstonedSegments());
+        responseMetadata.put("tailScanEntries", queryCoverage.tailScanEntries());
+        responseMetadata.put("segmentsSearched", queryCoverage.segmentsSearched());
+        responseMetadata.put("segmentsWithErrors", queryCoverage.segmentsWithErrors());
+        responseMetadata.put("segmentsTimedOut", queryCoverage.segmentsTimedOut());
+
+        return new QueryResult(queryId, items, PartialResult.empty(), responseMetadata, coverage);
+    }
+
+    /**
+     * Safely convert a long to int, clamping to int range if necessary.
+     *
+     * <p>Domain correctness: segment counts should realistically fit in an int
+     * (max ~2B segments), but we clamp to avoid overflow exceptions.</p>
+     *
+     * @param value The long value to convert
+     * @return The int value, clamped to Integer.MAX_VALUE if too large
+     */
+    private static int safeLongToInt(long value) {
+        if (value > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        if (value < Integer.MIN_VALUE) {
+            return Integer.MIN_VALUE;
+        }
+        return (int) value;
+    }
+
     /**
      * Get the query identifier.
      * 

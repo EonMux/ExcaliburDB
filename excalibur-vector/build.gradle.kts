@@ -18,6 +18,8 @@ dependencies {
     implementation(project(":excalibur-core"))
     // Phase 3 dependency
     implementation(project(":excalibur-filter"))
+    // Config module for Config.Shard
+    implementation(project(":excalibur-config"))
 }
 
 // Enable Vector API incubator module for SIMD operations

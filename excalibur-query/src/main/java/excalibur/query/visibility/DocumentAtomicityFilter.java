@@ -240,20 +240,25 @@ public final class DocumentAtomicityFilter {
     /**
      * Extracts the document ID from a query result.
      *
-     * <p>The document ID is extracted from the result's documentId field,
-     * which is a long that is converted to a string format that matches
-     * the tracker's expected format.</p>
+     * <p>The document ID is extracted from the result's documentIdStr field,
+     * which contains the actual string document ID (e.g., "doc1", "source1:file1")
+     * from the ingestion pipeline. This is populated via the HNSW node-to-document
+     * mapping during search.</p>
      *
-     * <p><strong>Note:</strong> The query result's documentId (long) is converted
-     * to a string. For this to work correctly with the visibility checker,
-     * documents should be registered with string document IDs that match the
-     * string representation of their numeric IDs (e.g., register document "1"
-     * for query results with documentId=1L).</p>
+     * <p><strong>Fallback:</strong> If documentIdStr is null (for backward compatibility
+     * with older data), the numeric documentId is converted to a string. This should
+     * rarely happen in production with properly indexed data.</p>
      *
      * @param result The query result
-     * @return The document ID string
+     * @return The document ID string, or null if not available
      */
     private String extractDocumentId(QueryResultItem result) {
+        // Prefer the string document ID (actual document identifier like "doc1")
+        String docIdStr = result.documentIdStr();
+        if (docIdStr != null) {
+            return docIdStr;
+        }
+        // Fallback to numeric ID converted to string (backward compatibility)
         return String.valueOf(result.documentId());
     }
 

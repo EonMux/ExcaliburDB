@@ -229,12 +229,18 @@ public class QueryExecutor {
     private List<QueryResultItem> convertResults(List<HnswSearchResult> searchResults) {
         List<QueryResultItem> results = new ArrayList<>(searchResults.size());
         for (HnswSearchResult sr : searchResults) {
+            // Get the actual document ID string from the HNSW result
+            // This is populated from the node-to-document mapping during search
+            String documentIdStr = sr.documentId();
+            long nodeId = sr.nodeId();
+
             results.add(new QueryResultItem(
-                sr.nodeId(),
+                nodeId, // Numeric ID for backward compatibility
+                documentIdStr, // Actual string document ID
                 sr.distance(),
                 null, // Payload would be fetched separately
                 -1,   // Segment ID would be tracked
-                sr.nodeId()
+                nodeId
             ));
         }
         return results;

@@ -433,7 +433,21 @@ public class ReindexEndpoint implements HttpHandler {
      * Registry interface for looking up sources.
      */
     public interface SourceRegistry {
+        /**
+         * Checks if a source ID is registered.
+         *
+         * @param sourceId The source ID to check
+         * @return true if the source is registered
+         */
         boolean isRegistered(String sourceId);
+
+        /**
+         * Gets a source by ID.
+         *
+         * @param sourceId The source ID
+         * @return The source, or null if not found
+         */
+        Source get(String sourceId);
     }
 
     /**
@@ -450,21 +464,55 @@ public class ReindexEndpoint implements HttpHandler {
 
     /**
      * In-memory implementation of SourceRegistry.
+     *
+     * <p>This implementation stores both source IDs and Source instances,
+     * enabling full reindex functionality when used with a DocumentReindexer.</p>
      */
     public static class InMemorySourceRegistry implements SourceRegistry {
-        private final Set<String> registeredSources = ConcurrentHashMap.newKeySet();
+        private final Set<String> registeredIds = ConcurrentHashMap.newKeySet();
+        private final ConcurrentHashMap<String, Source> sources = new ConcurrentHashMap<>();
 
+        /**
+         * Registers a source with its full instance.
+         *
+         * @param source The source to register
+         * @throws NullPointerException if source is null
+         */
+        public void register(Source source) {
+            Objects.requireNonNull(source, "Source cannot be null");
+            String sourceId = source.getSourceId();
+            registeredIds.add(sourceId);
+            sources.put(sourceId, source);
+        }
+
+        /**
+         * Registers a source by ID only (legacy method).
+         *
+         * <p>This method registers the source ID for tracking purposes but
+         * does not store the actual Source instance. The {@link #get(String)}
+         * method will return null for sources registered this way.</p>
+         *
+         * @param sourceId The source ID to register
+         * @deprecated Use {@link #register(Source)} for full functionality including reindex support
+         */
+        @Deprecated
         public void register(String sourceId) {
-            registeredSources.add(sourceId);
+            registeredIds.add(sourceId);
         }
 
         @Override
         public boolean isRegistered(String sourceId) {
-            return registeredSources.contains(sourceId);
+            return registeredIds.contains(sourceId);
+        }
+
+        @Override
+        public Source get(String sourceId) {
+            return sources.get(sourceId);
         }
 
         public void unregister(String sourceId) {
-            registeredSources.remove(sourceId);
+            registeredIds.remove(sourceId);
+            sources.remove(sourceId);
         }
     }
 

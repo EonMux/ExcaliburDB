@@ -203,6 +203,17 @@ public class ParallelQueryDispatcher {
                     false,
                     "Interrupted"
                 ));
+            } catch (java.util.concurrent.CancellationException e) {
+                // Future was cancelled due to invokeAll timeout
+                segmentsTimedOut++;
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    segmentInfo.segmentId,
+                    List.of(),
+                    0,
+                    0,
+                    false,
+                    "Timeout"
+                ));
             }
         }
 

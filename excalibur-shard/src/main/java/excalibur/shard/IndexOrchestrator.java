@@ -6,6 +6,7 @@ import excalibur.shard.allocator.VolumeManager;
 import excalibur.shard.worker.CuckooMaintenanceWorker;
 import excalibur.shard.worker.HnswIntegrationWorker;
 import excalibur.shard.worker.SegmentReindexScheduler;
+import io.excalibur.config.Config;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
@@ -16,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -249,6 +251,56 @@ public class IndexOrchestrator implements AutoCloseable {
 
         LOGGER.info("IndexOrchestrator created with hnswQueueDepthLimit={}, cuckooInterval={}ms, reindexInterval={}ms, epochTickInterval={}ms, volumeManager={}",
             hnswQueueDepthLimit, cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs, volumeManager != null);
+    }
+
+    // ==================== Factory Methods ====================
+
+    /**
+     * Creates an IndexOrchestrator configured from Config.Shard settings.
+     *
+     * <p>This factory method wires the shard configuration values to the appropriate
+     * orchestrator parameters:</p>
+     * <ul>
+     *   <li>{@code hnswQueueLimit} → HNSW integration queue depth limit</li>
+     *   <li>{@code compactDelayMs} → Used as additional context for compaction timing</li>
+     *   <li>{@code cuckooMaintenanceIntervalMs} → Uses default (5000ms)</li>
+     *   <li>{@code reindexCheckIntervalMs} → Uses default (60000ms)</li>
+     *   <li>{@code epochTickIntervalMs} → Uses default (100ms)</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>HNSW queue limit must be positive (enforced by Config.Shard validation)</li>
+     *   <li>Compact delay is informational; actual compaction uses segment lifecycle</li>
+     * </ul>
+     *
+     * @param catalog The segment catalog
+     * @param storageEngine The storage engine
+     * @param volumeManager The volume manager (optional, may be null)
+     * @param shard The shard configuration from Config.Shard
+     * @return A new IndexOrchestrator configured with shard settings
+     * @throws NullPointerException if catalog, storageEngine, or shard is null
+     */
+    public static IndexOrchestrator fromConfig(SegmentCatalog catalog,
+                                                StorageEngine storageEngine,
+                                                VolumeManager volumeManager,
+                                                Config.Shard shard) {
+        Objects.requireNonNull(catalog, "catalog cannot be null");
+        Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
+        Objects.requireNonNull(shard, "shard config cannot be null");
+
+        LOGGER.info("Creating IndexOrchestrator from Config.Shard: hnswQueueLimit={}, compactDelayMs={}",
+            shard.getHnswQueueLimit(), shard.getCompactDelayMs());
+
+        return new IndexOrchestrator(
+            catalog,
+            storageEngine,
+            volumeManager,
+            shard.getHnswQueueLimit(),        // HNSW queue depth limit from config
+            DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,  // Keep default: 5000ms
+            DEFAULT_REINDEX_CHECK_INTERVAL_MS,       // Keep default: 60000ms
+            DEFAULT_EPOCH_TICK_INTERVAL_MS           // Keep default: 100ms
+        );
     }
 
     // ==================== Lifecycle Management ====================

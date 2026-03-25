@@ -24,8 +24,10 @@ import java.util.Objects;
  * {
  *   "live": true,
  *   "ready": true,
+ *   "healthy": true,
  *   "epoch": 42,
- *   "coverage": 0.85
+ *   "coverage": 0.85,
+ *   "latencyMs": 5
  * }
  * }</pre>
  *
@@ -33,17 +35,21 @@ import java.util.Objects;
  * <ul>
  *   <li>{@code live} - Always true if the process can respond (HTTP 200)</li>
  *   <li>{@code ready} - true if coverage >= readiness threshold (default 0.5)</li>
+ *   <li>{@code healthy} - true if coverage >= healthy threshold (default 0.9)</li>
  *   <li>{@code epoch} - Current visibility epoch (monotonically increasing)</li>
  *   <li>{@code coverage} - Estimated corpus coverage (0.0 to 1.0)</li>
+ *   <li>{@code latencyMs} - Time taken to compute health status in milliseconds</li>
  * </ul>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Always returns HTTP 200 OK if process is alive</li>
  *   <li>{@code live} is always true (process wouldn't respond otherwise)</li>
- *   <li>{@code ready} computed from coverage vs threshold</li>
+ *   <li>{@code ready} computed from coverage vs readiness threshold (lower bar for traffic)</li>
+ *   <li>{@code healthy} computed from coverage vs healthy threshold (higher bar for full health)</li>
  *   <li>{@code epoch} is current visibility epoch (non-negative)</li>
  *   <li>{@code coverage} is clamped to [0.0, 1.0]</li>
+ *   <li>{@code latencyMs} is non-negative; if exceeds maxLatencyMs, system is degraded</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -62,18 +68,32 @@ public class HealthEndpoint implements HttpHandler {
      */
     public static final double DEFAULT_READINESS_THRESHOLD = 0.5;
 
+    /**
+     * Default healthy threshold.
+     * System is considered fully healthy when coverage >= this value.
+     */
+    public static final double DEFAULT_HEALTHY_THRESHOLD = 0.9;
+
+    /**
+     * Default maximum latency in milliseconds.
+     * Health check should complete within this time.
+     */
+    public static final int DEFAULT_MAX_LATENCY_MS = 5000;
+
     private final VisibilityTracker visibilityTracker;
     private final SegmentCatalog segmentCatalog;
     private final double readinessThreshold;
+    private final double healthyThreshold;
+    private final int maxLatencyMs;
 
     /**
-     * Creates a new HealthEndpoint with default readiness threshold.
+     * Creates a new HealthEndpoint with default thresholds.
      *
      * @param indexOrchestrator The index orchestrator for visibility tracking
      * @throws NullPointerException if indexOrchestrator is null
      */
     public HealthEndpoint(IndexOrchestrator indexOrchestrator) {
-        this(indexOrchestrator, DEFAULT_READINESS_THRESHOLD);
+        this(indexOrchestrator, DEFAULT_READINESS_THRESHOLD, DEFAULT_HEALTHY_THRESHOLD, DEFAULT_MAX_LATENCY_MS);
     }
 
     /**
@@ -85,17 +105,36 @@ public class HealthEndpoint implements HttpHandler {
      * @throws IllegalArgumentException if readinessThreshold is out of range
      */
     public HealthEndpoint(IndexOrchestrator indexOrchestrator, double readinessThreshold) {
+        this(indexOrchestrator, readinessThreshold, DEFAULT_HEALTHY_THRESHOLD, DEFAULT_MAX_LATENCY_MS);
+    }
+
+    /**
+     * Creates a new HealthEndpoint with full health configuration.
+     *
+     * @param indexOrchestrator The index orchestrator for visibility tracking
+     * @param readinessThreshold The coverage threshold for readiness (0.0 to 1.0)
+     * @param healthyThreshold The coverage threshold for full health (0.0 to 1.0)
+     * @param maxLatencyMs Maximum acceptable latency for health computation (ms)
+     * @throws NullPointerException if indexOrchestrator is null
+     * @throws IllegalArgumentException if thresholds are out of range
+     */
+    public HealthEndpoint(IndexOrchestrator indexOrchestrator, double readinessThreshold,
+                          double healthyThreshold, int maxLatencyMs) {
         Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
-        if (Double.isNaN(readinessThreshold) || readinessThreshold < 0.0 || readinessThreshold > 1.0) {
-            throw new IllegalArgumentException(
-                "Readiness threshold must be in range [0.0, 1.0]: " + readinessThreshold);
+        validateThreshold(readinessThreshold, "Readiness threshold");
+        validateThreshold(healthyThreshold, "Healthy threshold");
+        if (maxLatencyMs < 0) {
+            throw new IllegalArgumentException("maxLatencyMs must be non-negative: " + maxLatencyMs);
         }
 
         this.visibilityTracker = indexOrchestrator.getVisibilityTracker();
         this.segmentCatalog = getCatalogFromOrchestrator(indexOrchestrator);
         this.readinessThreshold = readinessThreshold;
+        this.healthyThreshold = healthyThreshold;
+        this.maxLatencyMs = maxLatencyMs;
 
-        LOGGER.debug("HealthEndpoint created with readinessThreshold={}", readinessThreshold);
+        LOGGER.debug("HealthEndpoint created with readinessThreshold={}, healthyThreshold={}, maxLatencyMs={}",
+            readinessThreshold, healthyThreshold, maxLatencyMs);
     }
 
     /**
@@ -110,31 +149,62 @@ public class HealthEndpoint implements HttpHandler {
      * @throws NullPointerException if any required parameter is null
      * @throws IllegalArgumentException if readinessThreshold is out of range
      */
-    public HealthEndpoint(VisibilityTracker visibilityTracker, 
-                          SegmentCatalog segmentCatalog, 
+    public HealthEndpoint(VisibilityTracker visibilityTracker,
+                          SegmentCatalog segmentCatalog,
                           double readinessThreshold) {
+        this(visibilityTracker, segmentCatalog, readinessThreshold, DEFAULT_HEALTHY_THRESHOLD, DEFAULT_MAX_LATENCY_MS);
+    }
+
+    /**
+     * Creates a new HealthEndpoint with explicit dependencies and full health configuration.
+     *
+     * @param visibilityTracker The visibility tracker for epoch information
+     * @param segmentCatalog The segment catalog for coverage information
+     * @param readinessThreshold The coverage threshold for readiness (0.0 to 1.0)
+     * @param healthyThreshold The coverage threshold for full health (0.0 to 1.0)
+     * @param maxLatencyMs Maximum acceptable latency for health computation (ms)
+     * @throws NullPointerException if any required parameter is null
+     * @throws IllegalArgumentException if thresholds are out of range
+     */
+    public HealthEndpoint(VisibilityTracker visibilityTracker,
+                          SegmentCatalog segmentCatalog,
+                          double readinessThreshold,
+                          double healthyThreshold,
+                          int maxLatencyMs) {
         Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
         Objects.requireNonNull(segmentCatalog, "SegmentCatalog cannot be null");
-        if (Double.isNaN(readinessThreshold) || readinessThreshold < 0.0 || readinessThreshold > 1.0) {
-            throw new IllegalArgumentException(
-                "Readiness threshold must be in range [0.0, 1.0]: " + readinessThreshold);
+        validateThreshold(readinessThreshold, "Readiness threshold");
+        validateThreshold(healthyThreshold, "Healthy threshold");
+        if (maxLatencyMs < 0) {
+            throw new IllegalArgumentException("maxLatencyMs must be non-negative: " + maxLatencyMs);
         }
 
         this.visibilityTracker = visibilityTracker;
         this.segmentCatalog = segmentCatalog;
         this.readinessThreshold = readinessThreshold;
+        this.healthyThreshold = healthyThreshold;
+        this.maxLatencyMs = maxLatencyMs;
+    }
+
+    private static void validateThreshold(double threshold, String name) {
+        if (Double.isNaN(threshold) || threshold < 0.0 || threshold > 1.0) {
+            throw new IllegalArgumentException(
+                name + " must be in range [0.0, 1.0]: " + threshold);
+        }
     }
 
     @Override
     public void handle(HttpExchange exchange) throws IOException {
+        long startTime = System.currentTimeMillis();
         try {
             // Health endpoint always returns 200 if process is alive,
             // regardless of HTTP method (useful for load balancers/K8s probes)
-            HealthStatus status = computeHealthStatus();
+            HealthStatus status = computeHealthStatus(startTime);
             sendResponse(exchange, status);
         } catch (Exception e) {
+            long latencyMs = System.currentTimeMillis() - startTime;
             LOGGER.error("Error computing health status, returning degraded status: {}", e.getMessage(), e);
-            sendDegradedResponse(exchange);
+            sendDegradedResponse(exchange, latencyMs);
         }
     }
 
@@ -147,16 +217,21 @@ public class HealthEndpoint implements HttpHandler {
      *   <li>{@code epoch} is current visibility epoch (non-negative)</li>
      *   <li>{@code coverage} is clamped to [0.0, 1.0]</li>
      *   <li>{@code ready} = coverage >= readinessThreshold</li>
+     *   <li>{@code healthy} = coverage >= healthyThreshold</li>
+     *   <li>{@code latencyMs} is non-negative; system is degraded if > maxLatencyMs</li>
      * </ul>
      *
+     * @param startTime The start time of the health check (for latency calculation)
      * @return The current health status
      */
-    private HealthStatus computeHealthStatus() {
+    private HealthStatus computeHealthStatus(long startTime) {
         long epoch = visibilityTracker.currentEpoch();
         double coverage = computeCoverage();
         boolean ready = coverage >= readinessThreshold;
+        boolean healthy = coverage >= healthyThreshold;
+        long latencyMs = System.currentTimeMillis() - startTime;
 
-        return new HealthStatus(true, ready, epoch, coverage);
+        return new HealthStatus(true, ready, healthy, epoch, coverage, latencyMs);
     }
 
     /**
@@ -238,9 +313,12 @@ public class HealthEndpoint implements HttpHandler {
      *
      * <p>The response indicates the process is live but not ready, with epoch 0 and
      * coverage 0.0 to signal degraded state.</p>
+     *
+     * @param exchange The HTTP exchange
+     * @param latencyMs The time taken before the error occurred
      */
-    private void sendDegradedResponse(HttpExchange exchange) throws IOException {
-        HealthStatus degraded = new HealthStatus(true, false, 0, 0.0);
+    private void sendDegradedResponse(HttpExchange exchange, long latencyMs) throws IOException {
+        HealthStatus degraded = new HealthStatus(true, false, false, 0, 0.0, latencyMs);
         sendResponse(exchange, degraded);
     }
 
@@ -251,11 +329,13 @@ public class HealthEndpoint implements HttpHandler {
      */
     private String toJson(HealthStatus status) {
         return String.format(
-            "{\"live\": %s, \"ready\": %s, \"epoch\": %d, \"coverage\": %.4f}",
+            "{\"live\": %s, \"ready\": %s, \"healthy\": %s, \"epoch\": %d, \"coverage\": %.4f, \"latencyMs\": %d}",
             status.live(),
             status.ready(),
+            status.healthy(),
             status.epoch(),
-            status.coverage()
+            status.coverage(),
+            status.latencyMs()
         );
     }
 
@@ -263,15 +343,19 @@ public class HealthEndpoint implements HttpHandler {
      * Immutable record representing health status.
      *
      * @param live     Always true if process is alive
-     * @param ready    true if coverage >= readiness threshold
+     * @param ready    true if coverage >= readiness threshold (lower bar for traffic)
+     * @param healthy  true if coverage >= healthy threshold (higher bar for full health)
      * @param epoch    Current visibility epoch
      * @param coverage Estimated corpus coverage (0.0 to 1.0)
+     * @param latencyMs Time taken to compute health status in milliseconds
      */
     public record HealthStatus(
         boolean live,
         boolean ready,
+        boolean healthy,
         long epoch,
-        double coverage
+        double coverage,
+        long latencyMs
     ) {
         /**
          * Validates domain constraints on construction.
@@ -282,6 +366,9 @@ public class HealthEndpoint implements HttpHandler {
             }
             if (Double.isNaN(coverage) || coverage < 0.0 || coverage > 1.0) {
                 throw new IllegalArgumentException("Coverage must be in range [0.0, 1.0]: " + coverage);
+            }
+            if (latencyMs < 0) {
+                throw new IllegalArgumentException("latencyMs must be non-negative: " + latencyMs);
             }
         }
     }

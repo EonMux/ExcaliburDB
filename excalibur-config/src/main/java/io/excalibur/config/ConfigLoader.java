@@ -2,6 +2,7 @@ package io.excalibur.config;
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,6 +25,15 @@ import java.util.Map;
  * </ul>
  * The key transformation replaces <code>-</code> with <code>_</code> and converts to uppercase.</p>
  *
+ * <h2>Loading Strategy</h2>
+ * <p>Configuration files are loaded in the following order:
+ * <ol>
+ *   <li>First, try to load from filesystem path (absolute or relative)</li>
+ *   <li>If not found on filesystem, try to load from classpath</li>
+ *   <li>If neither location has the file, throw IOException</li>
+ * </ol>
+ * </p>
+ *
  * @author ExcaliburDB
  */
 public final class ConfigLoader {
@@ -31,10 +41,13 @@ public final class ConfigLoader {
     /**
      * Loads configuration from a properties file with environment variable overrides.
      *
-     * @param configPath Path to the properties file
+     * <p>The loader first attempts to read from the filesystem path. If the file
+     * does not exist on the filesystem, it falls back to loading from the classpath.</p>
+     *
+     * @param configPath Path to the properties file (filesystem path or classpath resource)
      * @param envOverrides Additional environment variable overrides
      * @return Loaded configuration object
-     * @throws IOException if the file cannot be read
+     * @throws IOException if the file cannot be read from filesystem or classpath
      * @throws IllegalStateException if the file format is invalid
      */
     public static Config load(String configPath, Map<String, String> envOverrides) throws IOException {
@@ -45,10 +58,23 @@ public final class ConfigLoader {
         // Resolve path relative to current directory if not absolute
         Path configFilePath = Paths.get(configPath).toAbsolutePath();
 
-        // Read properties from file
+        // Read properties from file or classpath
         Map<String, String> properties = new HashMap<>();
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(Files.newInputStream(configFilePath)))) {
+
+        InputStream inputStream;
+        if (Files.exists(configFilePath)) {
+            // Load from filesystem
+            inputStream = Files.newInputStream(configFilePath);
+        } else {
+            // Fall back to classpath
+            inputStream = ConfigLoader.class.getClassLoader().getResourceAsStream(configPath);
+            if (inputStream == null) {
+                throw new IOException("Configuration file not found: " + configPath +
+                    " (tried filesystem: " + configFilePath + " and classpath)");
+            }
+        }
+
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 line = line.trim();

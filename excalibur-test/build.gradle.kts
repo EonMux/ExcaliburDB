@@ -20,7 +20,8 @@ repositories {
 
 dependencies {
     implementation("org.slf4j:slf4j-api:2.0.16")
-    
+    implementation(project(":excalibur-query"))
+
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.junit.jupiter:junit-jupiter-params:5.11.3")

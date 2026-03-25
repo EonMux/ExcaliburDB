@@ -36,12 +36,13 @@ import java.util.PriorityQueue;
  * When the limit is reached, scanning stops and a warning flag is set in results.</p>
  *
  * <h2>Vector Storage in Write Log</h2>
- * <p>Vectors are stored in the write log's value field as:
+ * <p>Vectors are stored in the write log's value field (LITTLE-ENDIAN) as:
  * <pre>
- * [dimension:4][vector:dim*4]
+ * [dimension:4][vector:dim*4][optional text bytes]
  * </pre>
  * The first 4 bytes are the dimension (int, little-endian), followed by
- * the vector components (floats, little-endian).</p>
+ * the vector components (floats, little-endian). Optional text bytes may follow
+ * the vector when using DocumentChunkBuffer.encodeChunkWithEmbedding().</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -318,7 +319,11 @@ public class TailScanner {
     /**
      * Extracts a vector from the write log entry's value field.
      *
-     * <p>Value format: [dimension:4][vector:dim*4]</p>
+     * <p>Value format (LITTLE-ENDIAN): [dimension:4][vector:dim*4][optional text bytes]</p>
+     *
+     * <p>The value may contain additional bytes after the vector (e.g., chunk text from
+     * DocumentChunkBuffer.encodeChunkWithEmbedding). This method only extracts the vector
+     * portion and ignores any trailing bytes.</p>
      *
      * @param value The value bytes from the log entry
      * @param expectedDimension The expected vector dimension
@@ -339,11 +344,13 @@ public class TailScanner {
                 return null;
             }
 
+            // Check minimum length (allows extra bytes for text after the vector)
             int expectedBytes = DIMENSION_SIZE + dimension * Float.BYTES;
             if (value.length < expectedBytes) {
-                LOGGER.trace("Value too short: {} bytes, expected {}", value.length, expectedBytes);
+                LOGGER.trace("Value too short: {} bytes, expected at least {}", value.length, expectedBytes);
                 return null;
             }
+            // Note: Extra bytes after the vector (chunk text) are ignored
 
             float[] vector = new float[dimension];
             for (int i = 0; i < dimension; i++) {

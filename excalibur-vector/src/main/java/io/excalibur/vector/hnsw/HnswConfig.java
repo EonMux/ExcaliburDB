@@ -1,5 +1,7 @@
 package io.excalibur.vector.hnsw;
 
+import io.excalibur.config.Config;
+
 /**
  * Configuration for HNSW (Hierarchical Navigable Small World) graph.
  *
@@ -179,6 +181,47 @@ public final class HnswConfig {
             DEFAULT_EF_CONSTRUCTION,
             efSearch,
             DEFAULT_ML,
+            dimension
+        );
+    }
+
+    /**
+     * Creates an HnswConfig configured from Config.Shard settings.
+     *
+     * <p>This factory method wires the shard configuration values to the appropriate
+     * HNSW parameters:</p>
+     * <ul>
+     *   <li>{@code efConstruction} → Size of candidate list during graph construction</li>
+     *   <li>{@code efSearch} → Size of candidate list during search</li>
+     *   <li>{@code maxConnections} → Uses default (16)</li>
+     *   <li>{@code maxConnectionsLayer0} → Uses default (32)</li>
+     *   <li>{@code mL} → Uses default (1 / ln(M))</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>efConstruction and efSearch must be at least 1 (enforced by Config.Shard validation)</li>
+     *   <li>Values from config override HnswConfig defaults for user-configurability</li>
+     *   <li>Graph connectivity (maxConnections) uses proven defaults from HNSW paper</li>
+     * </ul>
+     *
+     * @param dimension Vector dimension (must be in range [1, 4096])
+     * @param shard The shard configuration from Config.Shard
+     * @return A new HnswConfig configured with shard settings
+     * @throws IllegalArgumentException if dimension is invalid
+     * @throws NullPointerException if shard is null
+     */
+    public static HnswConfig fromShardConfig(int dimension, Config.Shard shard) {
+        if (shard == null) {
+            throw new NullPointerException("shard config cannot be null");
+        }
+
+        return new HnswConfig(
+            DEFAULT_MAX_CONNECTIONS,           // Keep default: 16 (HNSW paper recommendation)
+            DEFAULT_MAX_CONNECTIONS_LAYER0,    // Keep default: 32 (2x maxConnections)
+            shard.getEfConstruction(),         // Use config value
+            shard.getEfSearch(),               // Use config value
+            DEFAULT_ML,                        // Keep default: 1/ln(M)
             dimension
         );
     }

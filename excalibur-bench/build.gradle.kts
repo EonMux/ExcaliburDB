@@ -66,6 +66,7 @@ tasks.test {
     }
     jvmArgs("--enable-preview")
     jvmArgs("--enable-native-access=ALL-UNNAMED")
+    jvmArgs("--add-modules=jdk.incubator.vector")
 }
 
 // Task to run the JMH benchmark for Segment
@@ -218,6 +219,21 @@ tasks.register<JavaExec>("runEndToEndQueryBenchmark") {
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
+        "-Xms2g",
+        "-Xmx2g"
+    )
+}
+
+// Task to run the JMH benchmark for Vector Layout (Phase 10)
+tasks.register<JavaExec>("runVectorLayoutBenchmark") {
+    group = "benchmark"
+    description = "Runs the JMH benchmark for Vector Layout operations (SoA vs AoS)"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("excalibur.bench.VectorLayoutBenchmarkRunner")
+    jvmArgs = listOf(
+        "--enable-preview",
+        "--enable-native-access=ALL-UNNAMED",
+        "--add-modules=jdk.incubator.vector",
         "-Xms2g",
         "-Xmx2g"
     )

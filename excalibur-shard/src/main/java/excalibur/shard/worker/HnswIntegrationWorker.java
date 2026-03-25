@@ -471,9 +471,10 @@ public class HnswIntegrationWorker {
             return 0; // No entries to integrate
         }
 
-        // Collect vectors and offsets for batch integration
+        // Collect vectors, offsets, and document IDs for batch integration
         List<float[]> vectors = new ArrayList<>(batchSize);
         List<Long> offsets = new ArrayList<>(batchSize);
+        List<String> documentIds = new ArrayList<>(batchSize);
 
         long currentOffset = lastIntegrated;
         int entriesRead = 0;
@@ -495,6 +496,9 @@ public class HnswIntegrationWorker {
                     vectors.add(vector);
                     // Pass END offset (not START offset) so tracker knows where next entry begins
                     offsets.add(entryEndOffset);
+                    // Extract document ID from entry key (format: documentId:chunkIndex)
+                    String documentId = extractDocumentId(entry.key());
+                    documentIds.add(documentId);
                     entriesRead++;
                 }
             }
@@ -519,9 +523,18 @@ public class HnswIntegrationWorker {
             List<IncrementalInsertResult> results = tracker.integrateBatch(vectors, offsets);
 
             int successCount = 0;
-            for (IncrementalInsertResult result : results) {
+            for (int i = 0; i < results.size(); i++) {
+                IncrementalInsertResult result = results.get(i);
                 if (result.isSuccess()) {
                     successCount++;
+                    // Register the node-to-document mapping for atomicity filtering
+                    // This maps the HNSW node ID to the actual document ID string
+                    String documentId = documentIds.get(i);
+                    if (documentId != null) {
+                        graph.registerDocumentId(result.nodeId(), documentId);
+                        LOGGER.trace("Registered nodeId={} -> documentId={}",
+                            result.nodeId(), documentId);
+                    }
                 } else {
                     LOGGER.debug("Vector integration failed at offset {} (nodeId={})",
                         result.writeLogOffset(), result.nodeId());
@@ -581,6 +594,44 @@ public class HnswIntegrationWorker {
 
         } catch (Exception e) {
             LOGGER.debug("Failed to extract vector from value: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Extracts the document ID from an entry key.
+     *
+     * <p>The entry key format is {@code documentId:chunkIndex}, where:</p>
+     * <ul>
+     *   <li>{@code documentId} - The actual document identifier (e.g., "doc1", "source1:file1")</li>
+     *   <li>{@code chunkIndex} - The chunk index within the document (e.g., "0", "1", "2")</li>
+     * </ul>
+     *
+     * <p>This method extracts just the document ID portion for use in the
+     * node-to-document mapping, which is required for document atomicity filtering.</p>
+     *
+     * @param key The entry key bytes (UTF-8 encoded)
+     * @return The document ID string, or null if extraction fails
+     */
+    private String extractDocumentId(byte[] key) {
+        if (key == null || key.length == 0) {
+            return null;
+        }
+
+        try {
+            String keyStr = new String(key, java.nio.charset.StandardCharsets.UTF_8);
+            // Key format: documentId:chunkIndex
+            // For documentId like "doc1" with chunkIndex "0", key would be "doc1:0"
+            // For documentId like "source1:file1" with chunkIndex "2", key would be "source1:file1:2"
+            // So we need to find the LAST colon and strip the chunk index
+            int lastColon = keyStr.lastIndexOf(':');
+            if (lastColon > 0) {
+                return keyStr.substring(0, lastColon);
+            }
+            // No colon found - return the whole key as document ID
+            return keyStr;
+        } catch (Exception e) {
+            LOGGER.debug("Failed to extract document ID from key: {}", e.getMessage());
             return null;
         }
     }

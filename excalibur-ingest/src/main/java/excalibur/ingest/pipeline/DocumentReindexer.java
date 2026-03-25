@@ -12,10 +12,14 @@ import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
 import io.excalibur.llm.client.LLMHttpClient;
 import io.excalibur.llm.LLMException;
+import io.excalibur.store.LifecycleState;
+import io.excalibur.store.SegmentCatalog;
+import io.excalibur.store.SegmentLifecycleManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -93,6 +97,11 @@ public class DocumentReindexer {
     private final DocumentBatchPublisher batchPublisher;
     private final OffsetAwareStorageWriter offsetAwareWriter;
 
+    // Optional segment lifecycle management for rolling replacement
+    private final SegmentCatalog segmentCatalog;
+    private final SegmentLifecycleManager lifecycleManager;
+    private final VisibilityTracker visibilityTracker;
+
     /**
      * Functional interface for writing chunks to storage.
      * Allows decoupling from the actual storage implementation.
@@ -137,6 +146,9 @@ public class DocumentReindexer {
         this.storageWriter = Objects.requireNonNull(storageWriter, "storageWriter must not be null");
         this.batchPublisher = null;
         this.offsetAwareWriter = null;
+        this.segmentCatalog = null;
+        this.lifecycleManager = null;
+        this.visibilityTracker = null;
     }
 
     /**
@@ -172,8 +184,65 @@ public class DocumentReindexer {
         this.storageWriter = (chunkId, content, embedding) -> offsetAwareWriter.writeChunkWithOffset(chunkId, content, embedding) >= 0;
         this.offsetAwareWriter = Objects.requireNonNull(offsetAwareWriter, "offsetAwareWriter must not be null");
         this.batchPublisher = Objects.requireNonNull(batchPublisher, "batchPublisher must not be null");
+        this.segmentCatalog = null;
+        this.lifecycleManager = null;
+        this.visibilityTracker = null;
 
         LOG.info("DocumentReindexer configured with atomic batch publication support");
+    }
+
+    /**
+     * Creates a new DocumentReindexer with full segment lifecycle management for
+     * zero-downtime rolling replacement.
+     *
+     * <p>This constructor enables the complete rolling replacement workflow:</p>
+     * <ol>
+     *   <li>Creates new segments in BOOTSTRAPPING state</li>
+     *   <li>Old segments continue serving queries during reindexing</li>
+     *   <li>New segments progress through INDEXING → WARMING → ACTIVE</li>
+     *   <li>Old segments are tombstoned after new segments become ACTIVE</li>
+     * </ol>
+     *
+     * <p><strong>Domain Correctness:</strong></p>
+     * <ul>
+     *   <li>Segments are created with unique IDs and associated with sourceId</li>
+     *   <li>Segments start in BOOTSTRAPPING state (invisible to queries)</li>
+     *   <li>State transitions follow the lifecycle state machine</li>
+     *   <li>Old segments are tombstoned with proper epoch tracking</li>
+     * </ul>
+     *
+     * @param chunker Text chunker for splitting documents
+     * @param llmClient LLM client for generating embeddings
+     * @param upsertHandler Handler for tombstoning old chunks
+     * @param registry Document registry for metadata tracking
+     * @param offsetAwareWriter Storage writer that returns write log offsets
+     * @param batchPublisher Publisher for atomic batch publication
+     * @param segmentCatalog Segment catalog for managing segment metadata
+     * @param lifecycleManager Lifecycle manager for state transitions
+     * @param visibilityTracker Visibility tracker for epoch management
+     * @throws NullPointerException if any required parameter is null
+     */
+    public DocumentReindexer(TextChunker chunker,
+                            LLMHttpClient llmClient,
+                            UpsertHandler upsertHandler,
+                            DocumentRegistry registry,
+                            OffsetAwareStorageWriter offsetAwareWriter,
+                            DocumentBatchPublisher batchPublisher,
+                            SegmentCatalog segmentCatalog,
+                            SegmentLifecycleManager lifecycleManager,
+                            VisibilityTracker visibilityTracker) {
+        this.chunker = Objects.requireNonNull(chunker, "chunker must not be null");
+        this.llmClient = Objects.requireNonNull(llmClient, "llmClient must not be null");
+        this.upsertHandler = Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
+        this.registry = Objects.requireNonNull(registry, "registry must not be null");
+        this.storageWriter = (chunkId, content, embedding) -> offsetAwareWriter.writeChunkWithOffset(chunkId, content, embedding) >= 0;
+        this.offsetAwareWriter = Objects.requireNonNull(offsetAwareWriter, "offsetAwareWriter must not be null");
+        this.batchPublisher = Objects.requireNonNull(batchPublisher, "batchPublisher must not be null");
+        this.segmentCatalog = Objects.requireNonNull(segmentCatalog, "segmentCatalog must not be null");
+        this.lifecycleManager = Objects.requireNonNull(lifecycleManager, "lifecycleManager must not be null");
+        this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
+
+        LOG.info("DocumentReindexer configured with rolling replacement support (segment lifecycle enabled)");
     }
 
     /**
@@ -183,6 +252,231 @@ public class DocumentReindexer {
      */
     public boolean hasAtomicPublication() {
         return batchPublisher != null && offsetAwareWriter != null;
+    }
+
+    /**
+     * Returns true if this reindexer is configured with rolling replacement support.
+     *
+     * <p>Rolling replacement enables zero-downtime reindexing by:</p>
+     * <ul>
+     *   <li>Creating new segments in BOOTSTRAPPING state</li>
+     *   <li>Keeping old segments queryable during reindexing</li>
+     *   <li>Tombstoning old segments after new segments become ACTIVE</li>
+     * </ul>
+     *
+     * @return true if rolling replacement is enabled
+     */
+    public boolean hasRollingReplacement() {
+        return segmentCatalog != null && lifecycleManager != null && visibilityTracker != null;
+    }
+
+    /**
+     * Re-indexes all documents from a source with zero-downtime rolling replacement.
+     *
+     * <p>This method implements the complete rolling replacement workflow:</p>
+     * <ol>
+     *   <li>Creates a new segment in BOOTSTRAPPING state for the source</li>
+     *   <li>Transitions the segment to INDEXING (becomes queryable)</li>
+     *   <li>Re-indexes all documents into the new segment</li>
+     *   <li>Transitions the segment through WARMING → ACTIVE</li>
+     *   <li>Tombstones old segments for the same source</li>
+     * </ol>
+     *
+     * <p><strong>Zero-Downtime Guarantee:</strong> Old segments remain queryable
+     * throughout the entire reindexing process. New segments become queryable
+     * only after they contain data. Old segments are tombstoned only after
+     * new segments are fully ACTIVE.</p>
+     *
+     * <p><strong>Prerequisites:</strong> This method requires rolling replacement
+     * support to be enabled (see
+     * {@link #DocumentReindexer(TextChunker, LLMHttpClient, UpsertHandler, DocumentRegistry, OffsetAwareStorageWriter, DocumentBatchPublisher, SegmentCatalog, SegmentLifecycleManager, VisibilityTracker)}).
+     * If rolling replacement is not configured, falls back to regular reindexing.</p>
+     *
+     * @param source The source to re-index
+     * @param volumePath The path where the new segment file should be created
+     * @return Result containing counts, new segment ID, and any errors
+     * @throws SourceException if crawling or fetching fails catastrophically
+     * @throws NullPointerException if source or volumePath is null
+     */
+    public RollingReindexResult reindexWithRollingReplacement(Source source, Path volumePath) throws SourceException {
+        Objects.requireNonNull(source, "source must not be null");
+        Objects.requireNonNull(volumePath, "volumePath must not be null");
+
+        String sourceId = source.getSourceId();
+        long startTime = System.currentTimeMillis();
+
+        // Fall back to regular reindex if rolling replacement not configured
+        if (!hasRollingReplacement()) {
+            LOG.warn("Rolling replacement not configured for source {}, falling back to regular reindex", sourceId);
+            ReindexResult basicResult = reindexAll(source);
+            return new RollingReindexResult(basicResult, -1, List.of());
+        }
+
+        LOG.info("Starting rolling reindex for source: {} with volume: {}", sourceId, volumePath);
+
+        // Step 1: Create new segment in BOOTSTRAPPING state
+        SegmentCatalog.SegmentMetadata newSegment;
+        try {
+            newSegment = segmentCatalog.create(sourceId, volumePath);
+            LOG.info("Created new segment {} in BOOTSTRAPPING state for source {}", newSegment.getSegmentId(), sourceId);
+        } catch (Exception e) {
+            LOG.error("Failed to create new segment for source {}: {}", sourceId, e.getMessage());
+            throw new SourceException("Failed to create new segment: " + e.getMessage(), e);
+        }
+
+        long newSegmentId = newSegment.getSegmentId();
+        List<Long> oldSegmentIds = new ArrayList<>();
+
+        try {
+            // Step 2: Find old segments for this source (to tombstone later)
+            List<SegmentCatalog.SegmentMetadata> existingSegments = segmentCatalog.getSegmentsBySource(sourceId);
+            for (SegmentCatalog.SegmentMetadata seg : existingSegments) {
+                if (seg.getSegmentId() != newSegmentId &&
+                    seg.getLifecycleState() != LifecycleState.TOMBSTONED &&
+                    seg.getLifecycleState() != LifecycleState.PURGED) {
+                    oldSegmentIds.add(seg.getSegmentId());
+                }
+            }
+            LOG.info("Found {} existing segments for source {} to tombstone after reindex", oldSegmentIds.size(), sourceId);
+
+            // Step 3: Transition new segment to INDEXING (makes it queryable)
+            segmentCatalog.beginIndexing(newSegmentId);
+            LOG.info("Segment {} transitioned from BOOTSTRAPPING to INDEXING", newSegmentId);
+
+            // Step 4: Perform the actual reindexing
+            ReindexResult reindexResult = reindexAll(source);
+
+            if (reindexResult.hasErrors() && reindexResult.getDocumentsIndexed() == 0) {
+                // Complete failure - mark segment for cleanup
+                LOG.error("Reindex failed completely for source {}, tombstoning new segment {}", sourceId, newSegmentId);
+                segmentCatalog.tombstone(newSegmentId, visibilityTracker.currentEpoch());
+                return new RollingReindexResult(reindexResult, newSegmentId, List.of());
+            }
+
+            // Step 5: Transition new segment through WARMING → ACTIVE
+            segmentCatalog.completeIndexing(newSegmentId);
+            LOG.info("Segment {} transitioned from INDEXING to WARMING", newSegmentId);
+
+            segmentCatalog.completeWarmup(newSegmentId);
+            LOG.info("Segment {} transitioned from WARMING to ACTIVE", newSegmentId);
+
+            // Step 6: Tombstone old segments for this source
+            List<Long> tombstonedSegments = new ArrayList<>();
+            long currentEpoch = visibilityTracker.currentEpoch();
+
+            for (Long oldSegmentId : oldSegmentIds) {
+                try {
+                    segmentCatalog.tombstone(oldSegmentId, currentEpoch);
+                    tombstonedSegments.add(oldSegmentId);
+                    LOG.info("Tombstoned old segment {} for source {} at epoch {}", oldSegmentId, sourceId, currentEpoch);
+                } catch (Exception e) {
+                    LOG.warn("Failed to tombstone old segment {} for source {}: {}", oldSegmentId, sourceId, e.getMessage());
+                }
+            }
+
+            // Step 7: Advance epoch to make changes visible
+            visibilityTracker.advanceEpoch();
+
+            long elapsed = System.currentTimeMillis() - startTime;
+            LOG.info("Rolling reindex complete for source {}: new segment={}, {} docs indexed, {} old segments tombstoned, {}ms",
+                sourceId, newSegmentId, reindexResult.getDocumentsIndexed(), tombstonedSegments.size(), elapsed);
+
+            return new RollingReindexResult(reindexResult, newSegmentId, tombstonedSegments);
+
+        } catch (Exception e) {
+            LOG.error("Rolling reindex failed for source {}: {}", sourceId, e.getMessage(), e);
+            // Try to tombstone the new segment if it was created
+            try {
+                segmentCatalog.tombstone(newSegmentId, visibilityTracker.currentEpoch());
+            } catch (Exception cleanupError) {
+                LOG.warn("Failed to tombstone segment {} during cleanup: {}", newSegmentId, cleanupError.getMessage());
+            }
+            throw new SourceException("Rolling reindex failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Result of a rolling reindex operation.
+     *
+     * <p>Contains the basic reindex result plus segment lifecycle information
+     * for tracking the rolling replacement process.</p>
+     */
+    public static final class RollingReindexResult {
+        private final ReindexResult basicResult;
+        private final long newSegmentId;
+        private final List<Long> tombstonedSegmentIds;
+
+        public RollingReindexResult(ReindexResult basicResult, long newSegmentId, List<Long> tombstonedSegmentIds) {
+            this.basicResult = Objects.requireNonNull(basicResult);
+            this.newSegmentId = newSegmentId;
+            this.tombstonedSegmentIds = List.copyOf(tombstonedSegmentIds != null ? tombstonedSegmentIds : List.of());
+        }
+
+        /**
+         * Returns the basic reindex result.
+         */
+        public ReindexResult getBasicResult() {
+            return basicResult;
+        }
+
+        /**
+         * Returns the ID of the new segment created during rolling replacement.
+         *
+         * @return New segment ID, or -1 if rolling replacement was not used
+         */
+        public long getNewSegmentId() {
+            return newSegmentId;
+        }
+
+        /**
+         * Returns the IDs of old segments that were tombstoned.
+         *
+         * @return List of tombstoned segment IDs (may be empty)
+         */
+        public List<Long> getTombstonedSegmentIds() {
+            return tombstonedSegmentIds;
+        }
+
+        /**
+         * Returns the source ID from the basic result.
+         */
+        public String getSourceId() {
+            return basicResult.getSourceId();
+        }
+
+        /**
+         * Returns the number of documents indexed.
+         */
+        public int getDocumentsIndexed() {
+            return basicResult.getDocumentsIndexed();
+        }
+
+        /**
+         * Returns the number of chunks created.
+         */
+        public int getChunksCreated() {
+            return basicResult.getChunksCreated();
+        }
+
+        /**
+         * Returns true if there were any errors.
+         */
+        public boolean hasErrors() {
+            return basicResult.hasErrors();
+        }
+
+        /**
+         * Returns the number of errors.
+         */
+        public int getErrorCount() {
+            return basicResult.getErrorCount();
+        }
+
+        @Override
+        public String toString() {
+            return String.format("RollingReindexResult[source=%s, newSegment=%d, indexed=%d, tombstoned=%d, errors=%d]",
+                getSourceId(), newSegmentId, getDocumentsIndexed(), tombstonedSegmentIds.size(), getErrorCount());
+        }
     }
 
     /**

@@ -195,8 +195,13 @@ public class EndToEndQueryBenchmark {
     public void tearDown() throws IOException {
         // Clean up QueryPipeline resources
         queryPipeline = null;
-        benchmarkStorageEngine = null;
         benchmarkVisibilityTracker = null;
+
+        // Close benchmark storage engine segments before cleaning up
+        if (benchmarkStorageEngine != null) {
+            benchmarkStorageEngine.closeSegments();
+            benchmarkStorageEngine = null;
+        }
 
         // Close HNSW graphs
         for (HnswGraph graph : graphs) {
@@ -472,13 +477,30 @@ public class EndToEndQueryBenchmark {
     /**
      * Minimal StorageEngine implementation for benchmarking.
      * Provides catalog and segment access for the QueryPipeline.
+     *
+     * <p><strong>Domain Correctness:</strong> Creates real Segment objects with proper
+     * segment IDs that match the catalog metadata, enabling the QueryPipeline to
+     * execute actual end-to-end queries.</p>
      */
     private static class BenchmarkStorageEngine extends StorageEngine {
         private final BenchmarkSegmentCatalog catalog;
+        private final Map<Long, Segment> segments = new ConcurrentHashMap<>();
+        private final List<Path> segmentFiles = new ArrayList<>();
 
         BenchmarkStorageEngine(int segmentCount, Path tempDir, Arena arena) throws IOException {
             super(tempDir, arena);
             this.catalog = new BenchmarkSegmentCatalog(segmentCount);
+
+            // Create real Segment objects for each segment
+            // Domain constraint: Segment IDs are auto-generated starting from 0
+            // Creating segments in order 0..segmentCount-1 ensures segmentId() matches catalog ID
+            for (int i = 0; i < segmentCount; i++) {
+                Path segmentPath = Files.createTempFile(tempDir, "segment_" + i + "_", ".dat");
+                segmentFiles.add(segmentPath);
+                // 1MB capacity is sufficient for benchmark purposes
+                Segment segment = new Segment(segmentPath, 1024 * 1024, arena);
+                segments.put((long) i, segment);
+            }
         }
 
         @Override
@@ -488,9 +510,31 @@ public class EndToEndQueryBenchmark {
 
         @Override
         public Segment getSegment(long segmentId) {
-            // Return null - the QueryPipeline uses graphProvider for HNSW access
-            // and only uses Segment for LSH index access which we skip in this benchmark
-            return null;
+            return segments.get(segmentId);
+        }
+
+        /**
+         * Closes all segments and cleans up resources.
+         */
+        void closeSegments() {
+            for (Segment segment : segments.values()) {
+                try {
+                    segment.close();
+                } catch (Exception e) {
+                    // Ignore close errors during cleanup
+                }
+            }
+            segments.clear();
+
+            // Clean up segment files
+            for (Path file : segmentFiles) {
+                try {
+                    Files.deleteIfExists(file);
+                } catch (Exception e) {
+                    // Ignore cleanup errors
+                }
+            }
+            segmentFiles.clear();
         }
     }
 

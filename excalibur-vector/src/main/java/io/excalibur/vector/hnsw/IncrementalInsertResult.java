@@ -16,6 +16,7 @@ import java.util.List;
  *   <li>{@code dataOffset} - The offset in the data region where node is stored</li>
  *   <li>{@code connectionsMade} - Number of bidirectional connections established</li>
  *   <li>{@code writeLogOffset} - The write log offset this insertion corresponds to (for recovery)</li>
+ *   <li>{@code documentId} - The document ID this vector belongs to</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -30,7 +31,7 @@ public final class IncrementalInsertResult {
      * Empty result for failed insertions.
      */
     public static final IncrementalInsertResult FAILED = new IncrementalInsertResult(
-        -1, -1, -1, 0, -1, List.of()
+        -1, -1, -1, 0, -1, List.of(), null
     );
 
     private final long nodeId;
@@ -39,6 +40,7 @@ public final class IncrementalInsertResult {
     private final int connectionsMade;
     private final long writeLogOffset;
     private final List<Long> connectedNodes;
+    private final String documentId;
 
     /**
      * Creates a new incremental insert result.
@@ -53,6 +55,23 @@ public final class IncrementalInsertResult {
     public IncrementalInsertResult(long nodeId, int level, long dataOffset,
                                    int connectionsMade, long writeLogOffset,
                                    List<Long> connectedNodes) {
+        this(nodeId, level, dataOffset, connectionsMade, writeLogOffset, connectedNodes, null);
+    }
+
+    /**
+     * Creates a new incremental insert result with document ID.
+     *
+     * @param nodeId The ID of the inserted node
+     * @param level The level of the inserted node
+     * @param dataOffset The data region offset
+     * @param connectionsMade Number of connections established
+     * @param writeLogOffset The corresponding write log offset (-1 if not from write log)
+     * @param connectedNodes List of node IDs this node connected to
+     * @param documentId The document ID this vector belongs to (may be null)
+     */
+    public IncrementalInsertResult(long nodeId, int level, long dataOffset,
+                                   int connectionsMade, long writeLogOffset,
+                                   List<Long> connectedNodes, String documentId) {
         this.nodeId = nodeId;
         this.level = level;
         this.dataOffset = dataOffset;
@@ -61,6 +80,7 @@ public final class IncrementalInsertResult {
         this.connectedNodes = connectedNodes != null
             ? Collections.unmodifiableList(connectedNodes)
             : Collections.emptyList();
+        this.documentId = documentId;
     }
 
     /**
@@ -121,6 +141,19 @@ public final class IncrementalInsertResult {
     }
 
     /**
+     * Returns the document ID this node belongs to.
+     *
+     * <p>The document ID is the actual identifier from the source document,
+     * such as "doc1" or "source1:file1". This is used for document atomicity
+     * filtering in the query pipeline.</p>
+     *
+     * @return The document ID, or null if not available
+     */
+    public String documentId() {
+        return documentId;
+    }
+
+    /**
      * Returns true if this insertion was successful.
      *
      * @return true if successful, false if failed
@@ -137,15 +170,28 @@ public final class IncrementalInsertResult {
      */
     public IncrementalInsertResult withWriteLogOffset(long newWriteLogOffset) {
         return new IncrementalInsertResult(
-            nodeId, level, dataOffset, connectionsMade, newWriteLogOffset, connectedNodes
+            nodeId, level, dataOffset, connectionsMade, newWriteLogOffset, connectedNodes, documentId
+        );
+    }
+
+    /**
+     * Creates a new result with a document ID.
+     *
+     * @param newDocumentId The new document ID
+     * @return New IncrementalInsertResult with the document ID
+     */
+    public IncrementalInsertResult withDocumentId(String newDocumentId) {
+        return new IncrementalInsertResult(
+            nodeId, level, dataOffset, connectionsMade, writeLogOffset, connectedNodes, newDocumentId
         );
     }
 
     @Override
     public String toString() {
         return String.format("IncrementalInsertResult{nodeId=%d, level=%d, " +
-            "dataOffset=%d, connections=%d, writeLogOffset=%d}",
-            nodeId, level, dataOffset, connectionsMade, writeLogOffset);
+            "dataOffset=%d, connections=%d, writeLogOffset=%d, documentId=%s}",
+            nodeId, level, dataOffset, connectionsMade, writeLogOffset,
+            documentId != null ? "\"" + documentId + "\"" : "null");
     }
 
     @Override
@@ -158,7 +204,8 @@ public final class IncrementalInsertResult {
             dataOffset == that.dataOffset &&
             connectionsMade == that.connectionsMade &&
             writeLogOffset == that.writeLogOffset &&
-            connectedNodes.equals(that.connectedNodes);
+            connectedNodes.equals(that.connectedNodes) &&
+            java.util.Objects.equals(documentId, that.documentId);
     }
 
     @Override
@@ -169,6 +216,7 @@ public final class IncrementalInsertResult {
         result = 31 * result + connectionsMade;
         result = 31 * result + Long.hashCode(writeLogOffset);
         result = 31 * result + connectedNodes.hashCode();
+        result = 31 * result + (documentId != null ? documentId.hashCode() : 0);
         return result;
     }
 }

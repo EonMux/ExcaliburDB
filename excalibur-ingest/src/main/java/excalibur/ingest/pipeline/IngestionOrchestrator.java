@@ -1,22 +1,29 @@
 package excalibur.ingest.pipeline;
 
+import excalibur.ingest.buffer.AtomicDocumentBatch;
+import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.source.FetchedDocument;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
 import excalibur.ingest.source.DocumentNotFoundException;
+import excalibur.ingest.lsh.LshIngestionService;
+import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.shard.IndexOrchestrator;
 import io.excalibur.llm.client.LLMHttpClient;
 import io.excalibur.llm.LLMException;
 import io.excalibur.store.StorageEngine;
+import io.excalibur.store.log.WriteLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -103,9 +110,24 @@ public class IngestionOrchestrator {
     private final StorageEngine storageEngine;
     private final IndexOrchestrator indexOrchestrator;
     private final StatusRegistry statusRegistry;
+    private final LshIngestionService lshIngestionService; // optional, nullable
+    private final DocumentChunkBuffer documentChunkBuffer; // optional, nullable - for atomic batching
+    private final DocumentVisibilityTracker visibilityTracker; // optional, nullable - for visibility epoch
+
+    /**
+     * Timeout for awaiting backpressure release from the HNSW integration queue.
+     * Configured via excalibur.ingest.document-atomicity-timeout-ms (default 2000ms).
+     */
+    private final int documentTimeoutMs;
 
     private final Set<String> activeIngestions;
     private final AtomicBoolean shutdown;
+
+    /**
+     * Default document timeout in milliseconds.
+     * Used when no config is provided. Matches Config.Ingest.DEFAULT_DOCUMENT_TIMEOUT_MS.
+     */
+    public static final int DEFAULT_DOCUMENT_TIMEOUT_MS = 2000;
 
     /**
      * Creates a new IngestionOrchestrator with required dependencies.
@@ -122,15 +144,114 @@ public class IngestionOrchestrator {
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry) {
+        this(textChunker, llmClient, storageEngine, indexOrchestrator, statusRegistry, null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+    }
+
+
+    /**
+     * Creates a new IngestionOrchestrator with LSH ingestion support.
+     *
+     * <p>This constructor enables LSH index population during ingestion. When provided,
+     * vectors are inserted into their segment's LSH index for efficient
+     * approximate nearest neighbor pre-filtering during queries.</p>
+     *
+     * @param textChunker Text chunker for splitting documents
+     * @param llmClient LLM client for generating embeddings
+     * @param storageEngine Storage engine for persisting entries
+     * @param indexOrchestrator Index orchestrator for coordinating indexing
+     * @param statusRegistry Status registry for tracking progress
+     * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
+     * @throws NullPointerException if required parameters are null
+     */
+    public IngestionOrchestrator(TextChunker textChunker,
+                                  LLMHttpClient llmClient,
+                                  StorageEngine storageEngine,
+                                  IndexOrchestrator indexOrchestrator,
+                                  StatusRegistry statusRegistry,
+                                  LshIngestionService lshIngestionService) {
+        this(textChunker, llmClient, storageEngine, indexOrchestrator, statusRegistry,
+             lshIngestionService, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+    }
+
+    /**
+     * Creates a new IngestionOrchestrator with full document atomicity support.
+     *
+     * <p>This constructor enables document-atomic visibility: all chunks of a document
+     * become visible to queries at the same visibility epoch. When provided:</p>
+     * <ul>
+     *   <li>Chunks are buffered in memory per document</li>
+     *   <li>On commit, all chunks are written atomically to the write log</li>
+     *   <li>The batch is registered with the visibility tracker</li>
+     *   <li>Queries never see partially-ingested documents</li>
+     * </ul>
+     *
+     * <p><strong>Important:</strong> When using atomic batching, the documentChunkBuffer
+     * should be backed by a WriteLog that syncs appropriately. The storageEngine is still
+     * used for LSH index population.</p>
+     *
+     * @param textChunker Text chunker for splitting documents
+     * @param llmClient LLM client for generating embeddings
+     * @param storageEngine Storage engine for persisting entries
+     * @param indexOrchestrator Index orchestrator for coordinating indexing
+     * @param statusRegistry Status registry for tracking progress
+     * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
+     * @param documentChunkBuffer Buffer for atomic document batching (may be null for non-atomic mode)
+     * @param visibilityTracker Tracker for document visibility epochs (may be null for non-atomic mode)
+     * @throws NullPointerException if required parameters are null
+     */
+    public IngestionOrchestrator(TextChunker textChunker,
+                                  LLMHttpClient llmClient,
+                                  StorageEngine storageEngine,
+                                  IndexOrchestrator indexOrchestrator,
+                                  StatusRegistry statusRegistry,
+                                  LshIngestionService lshIngestionService,
+                                  DocumentChunkBuffer documentChunkBuffer,
+                                  DocumentVisibilityTracker visibilityTracker) {
+        this(textChunker, llmClient, storageEngine, indexOrchestrator, statusRegistry,
+             lshIngestionService, documentChunkBuffer, visibilityTracker, DEFAULT_DOCUMENT_TIMEOUT_MS);
+    }
+
+    /**
+     * Creates a new IngestionOrchestrator with full configuration including timeout.
+     *
+     * <p>This is the most complete constructor, allowing all parameters to be configured.</p>
+     *
+     * @param textChunker Text chunker for splitting documents
+     * @param llmClient LLM client for generating embeddings
+     * @param storageEngine Storage engine for persisting entries
+     * @param indexOrchestrator Index orchestrator for coordinating indexing
+     * @param statusRegistry Status registry for tracking progress
+     * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
+     * @param documentChunkBuffer Buffer for atomic document batching (may be null for non-atomic mode)
+     * @param visibilityTracker Tracker for document visibility epochs (may be null for non-atomic mode)
+     * @param documentTimeoutMs Timeout for awaiting backpressure release in milliseconds
+     * @throws NullPointerException if required parameters are null
+     */
+    public IngestionOrchestrator(TextChunker textChunker,
+                                  LLMHttpClient llmClient,
+                                  StorageEngine storageEngine,
+                                  IndexOrchestrator indexOrchestrator,
+                                  StatusRegistry statusRegistry,
+                                  LshIngestionService lshIngestionService,
+                                  DocumentChunkBuffer documentChunkBuffer,
+                                  DocumentVisibilityTracker visibilityTracker,
+                                  int documentTimeoutMs) {
         this.textChunker = Objects.requireNonNull(textChunker, "TextChunker cannot be null");
         this.llmClient = Objects.requireNonNull(llmClient, "LLMHttpClient cannot be null");
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.indexOrchestrator = Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
         this.statusRegistry = Objects.requireNonNull(statusRegistry, "StatusRegistry cannot be null");
+        this.lshIngestionService = lshIngestionService; // may be null
+        this.documentChunkBuffer = documentChunkBuffer; // may be null
+        this.visibilityTracker = visibilityTracker; // may be null
+        this.documentTimeoutMs = documentTimeoutMs > 0 ? documentTimeoutMs : DEFAULT_DOCUMENT_TIMEOUT_MS;
         this.activeIngestions = ConcurrentHashMap.newKeySet();
         this.shutdown = new AtomicBoolean(false);
 
-        LOGGER.info("IngestionOrchestrator initialized");
+        LOGGER.info("IngestionOrchestrator initialized with LSH={}, atomicBatching={}, documentTimeoutMs={}",
+            (lshIngestionService != null ? "enabled" : "disabled"),
+            (documentChunkBuffer != null && visibilityTracker != null ? "enabled" : "disabled"),
+            this.documentTimeoutMs);
     }
 
     /**
@@ -230,35 +351,149 @@ public class IngestionOrchestrator {
                     // Chunk the content
                     List<TextChunk> chunks = textChunker.chunk(documentId, content);
 
-                    // Process each chunk
-                    for (int i = 0; i < chunks.size(); i++) {
-                        TextChunk chunk = chunks.get(i);
+                    // Check if atomic batching is enabled
+                    boolean useAtomicBatching = documentChunkBuffer != null && visibilityTracker != null;
+
+                    if (useAtomicBatching) {
+                        // === ATOMIC BATCHING MODE ===
+                        // Buffer all chunks and commit atomically with visibility epoch
+
+                        Map<Integer, float[]> embeddings = new HashMap<>();
+                        boolean allEmbeddingsGenerated = true;
+
+                        // Generate all embeddings first
+                        for (int i = 0; i < chunks.size(); i++) {
+                            TextChunk chunk = chunks.get(i);
+                            try {
+                                float[] embedding = llmClient.generateEmbedding(chunk.getText());
+                                embeddings.put(i, embedding);
+                            } catch (LLMException e) {
+                                LOGGER.warn("[{}] Failed to embed chunk {} of {}: {}",
+                                    sourceId, i, documentId, e.getMessage());
+                                allEmbeddingsGenerated = false;
+                                break;
+                            }
+                        }
+
+                        if (!allEmbeddingsGenerated || chunks.isEmpty()) {
+                            // Skip this document if any embedding failed
+                            processedDocs++;
+                            continue;
+                        }
+
+                        // Buffer all chunks for the document
+                        for (TextChunk chunk : chunks) {
+                            documentChunkBuffer.bufferChunk(chunk);
+                        }
 
                         try {
-                            // Generate embedding
-                            float[] embedding = llmClient.generateEmbedding(chunk.getText());
+                            // Commit atomically with embeddings
+                            AtomicDocumentBatch batch = documentChunkBuffer.commitDocumentWithEmbeddings(
+                                documentId, embeddings);
 
-                            // Create chunk ID
-                            String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
+                            // Sync the write log for durability
+                            WriteLog writeLog = documentChunkBuffer.getWriteLog();
+                            if (writeLog != null) {
+                                writeLog.sync();
+                            }
 
-                            // Write to storage (key = chunk ID, value = chunk text)
-                            // In a real implementation, we'd store the embedding vector too
-                            byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
-                            byte[] valueBytes = chunk.getText().getBytes(StandardCharsets.UTF_8);
-                            storageEngine.put(keyBytes, valueBytes);
+                            // Advance epoch and register with visibility tracker
+                            long epoch = visibilityTracker.advanceEpoch();
+                            visibilityTracker.registerAtomicDocument(batch, epoch);
 
-                            totalIngested++;
-                            processedChunks++;
+                            LOGGER.debug("[{}] Document {} committed atomically with {} chunks at epoch {}",
+                                sourceId, documentId, batch.getChunkCount(), epoch);
 
-                            // Update progress
-                            double progress = (double) processedChunks / estimatedTotalChunks;
-                            status.update("embedding", Math.min(1.0, progress), totalIngested,
-                                totalPending - processedDocs);
+                            // Insert into LSH index for each chunk
+                            if (lshIngestionService != null) {
+                                for (int i = 0; i < chunks.size(); i++) {
+                                    try {
+                                        TextChunk chunk = chunks.get(i);
+                                        float[] embedding = embeddings.get(i);
+                                        String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
+                                        byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
 
-                        } catch (LLMException e) {
-                            LOGGER.warn("[{}] Failed to embed chunk {} of {}: {}",
-                                sourceId, i, documentId, e.getMessage());
-                            // Continue with next chunk
+                                        long keyHash = io.excalibur.store.hash.XxHash64.hash(keyBytes);
+                                        int segmentIndex = (int) (keyHash & (storageEngine.getSegmentCount() - 1));
+
+                                        io.excalibur.store.Segment segment = storageEngine.getSegment((long) segmentIndex);
+                                        if (segment != null) {
+                                            long entryId = chunkId.hashCode() & 0xFFFFFFFFL;
+                                            lshIngestionService.insertVector(segment, embedding, entryId);
+                                        }
+                                    } catch (Exception lshError) {
+                                        LOGGER.warn("[{}] Failed to insert vector into LSH index for chunk {}: {}",
+                                            sourceId, i, lshError.getMessage());
+                                    }
+                                }
+                            }
+
+                            totalIngested += chunks.size();
+                            processedChunks += chunks.size();
+
+                        } catch (IOException e) {
+                            LOGGER.error("[{}] Failed to commit document {} atomically: {}",
+                                sourceId, documentId, e.getMessage());
+                            // Abort the document on failure
+                            documentChunkBuffer.abortDocument(documentId);
+                        }
+
+                    } else {
+                        // === NON-ATOMIC MODE (LEGACY) ===
+                        // Process each chunk individually without atomic batching
+
+                        for (int i = 0; i < chunks.size(); i++) {
+                            TextChunk chunk = chunks.get(i);
+
+                            try {
+                                // Generate embedding
+                                float[] embedding = llmClient.generateEmbedding(chunk.getText());
+
+                                // Create chunk ID
+                                String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
+
+                                // Encode embedding with text using little-endian format
+                                // Format: [dimension:4 bytes LE][vector:dim*4 bytes LE][text:variable UTF-8]
+                                // This format is compatible with HnswIntegrationWorker.extractVector()
+                                byte[] valueBytes = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(
+                                    chunk.getText(), embedding);
+                                byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
+                                storageEngine.put(keyBytes, valueBytes);
+
+                                // Insert into LSH index for vector similarity search
+                                if (lshIngestionService != null) {
+                                    try {
+                                        // Calculate segment index using same hash as StorageEngine
+                                        long keyHash = io.excalibur.store.hash.XxHash64.hash(keyBytes);
+                                        int segmentIndex = (int) (keyHash & (storageEngine.getSegmentCount() - 1));
+
+                                        // Get the segment and insert vector into its LSH index
+                                        io.excalibur.store.Segment segment = storageEngine.getSegment((long) segmentIndex);
+                                        if (segment != null) {
+                                            // Use stable hash of chunkId as entry ID for LSH lookups
+                                            long entryId = chunkId.hashCode() & 0xFFFFFFFFL;
+                                            lshIngestionService.insertVector(segment, embedding, entryId);
+                                        }
+                                    } catch (Exception lshError) {
+                                        // Log warning but don't fail ingestion - LSH is for pre-filtering optimization
+                                        LOGGER.warn("[{}] Failed to insert vector into LSH index for chunk {}: {}",
+                                            sourceId, i, lshError.getMessage());
+                                    }
+                                }
+
+                                totalIngested++;
+                                processedChunks++;
+
+                                // Update progress
+                                double progress = (double) processedChunks / estimatedTotalChunks;
+                                status.update("embedding", Math.min(1.0, progress), totalIngested,
+                                    totalPending - processedDocs);
+
+                            } catch (LLMException e) {
+                                LOGGER.warn("[{}] Failed to embed chunk {} of {}: {}",
+                                    sourceId, i, documentId, e.getMessage());
+                                // Continue with next chunk
+                            }
                         }
                     }
 
@@ -284,8 +519,8 @@ public class IngestionOrchestrator {
 
             // Wait for backpressure to clear before marking complete
             if (indexOrchestrator.isBackpressured()) {
-                LOGGER.info("[{}] Waiting for HNSW integration queue to drain", sourceId);
-                indexOrchestrator.awaitBackpressureRelease(30_000);
+                LOGGER.info("[{}] Waiting for HNSW integration queue to drain (timeout={}ms)", sourceId, documentTimeoutMs);
+                indexOrchestrator.awaitBackpressureRelease(documentTimeoutMs);
             }
 
             // Complete

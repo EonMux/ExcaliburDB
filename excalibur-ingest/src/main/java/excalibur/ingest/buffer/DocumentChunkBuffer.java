@@ -6,6 +6,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -464,32 +466,180 @@ public class DocumentChunkBuffer {
     /**
      * Encodes chunk text with embedding into a byte array.
      *
-     * <p>Format: [4 bytes: embedding length][embedding floats][chunk text]</p>
+     * <p>Format (LITTLE-ENDIAN): [4 bytes: dimension][dimension * 4 bytes: embedding floats][text bytes]</p>
+     *
+     * <p><strong>Byte Order:</strong> This method uses LITTLE_ENDIAN byte order for both
+     * the dimension integer and the embedding floats. This matches the TailScanner's
+     * expected format and ensures consistency between ingestion and query pipelines.</p>
+     *
+     * @param text The chunk text to encode
+     * @param embedding The embedding vector
+     * @return Encoded byte array
      */
     private static byte[] encodeChunkWithEmbedding(String text, float[] embedding) {
         byte[] textBytes = text.getBytes(StandardCharsets.UTF_8);
-        int embeddingBytes = embedding.length * 4;
-        int totalLength = 4 + embeddingBytes + textBytes.length;
 
-        byte[] result = new byte[totalLength];
-        int pos = 0;
+        // Use ByteBuffer with LITTLE_ENDIAN to match TailScanner format
+        // Format: [dimension:4][vector:dim*4][text:variable]
+        ByteBuffer buffer = ByteBuffer.allocate(4 + embedding.length * Float.BYTES + textBytes.length)
+            .order(ByteOrder.LITTLE_ENDIAN);
 
-        result[pos++] = (byte) (embedding.length >> 24);
-        result[pos++] = (byte) (embedding.length >> 16);
-        result[pos++] = (byte) (embedding.length >> 8);
-        result[pos++] = (byte) embedding.length;
-
+        buffer.putInt(embedding.length);  // dimension as little-endian
         for (float f : embedding) {
-            int bits = Float.floatToIntBits(f);
-            result[pos++] = (byte) (bits >> 24);
-            result[pos++] = (byte) (bits >> 16);
-            result[pos++] = (byte) (bits >> 8);
-            result[pos++] = (byte) bits;
+            buffer.putFloat(f);  // floats as little-endian
+        }
+        buffer.put(textBytes);
+
+        return buffer.array();
+    }
+
+    /**
+     * Decodes an embedding vector from an encoded chunk value.
+     *
+     * <p>This method extracts the embedding vector from the value format:
+     * [dimension:4][vector:dim*4][text:variable]</p>
+     *
+     * <p><strong>Byte Order:</strong> Uses LITTLE_ENDIAN to match the encoding format.</p>
+     *
+     * @param value The encoded value bytes
+     * @param expectedDimension The expected vector dimension for validation
+     * @return The embedding vector, or null if decoding fails or dimension mismatches
+     */
+    public static float[] decodeEmbedding(byte[] value, int expectedDimension) {
+        if (value == null || value.length < 4) {
+            return null;
         }
 
-        System.arraycopy(textBytes, 0, result, pos, textBytes.length);
+        try {
+            ByteBuffer buffer = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);
+            int dimension = buffer.getInt();
 
-        return result;
+            // Validate dimension
+            if (dimension != expectedDimension) {
+                return null;
+            }
+
+            int expectedBytes = 4 + dimension * Float.BYTES;
+            if (value.length < expectedBytes) {
+                return null;
+            }
+
+            float[] embedding = new float[dimension];
+            for (int i = 0; i < dimension; i++) {
+                embedding[i] = buffer.getFloat();
+            }
+
+            return embedding;
+
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Decodes the chunk text from an encoded chunk value.
+     *
+     * <p>This method extracts the text portion from the value format:
+     * [dimension:4][vector:dim*4][text:variable]</p>
+     *
+     * <p><strong>Byte Order:</strong> Uses LITTLE_ENDIAN to read the dimension header.</p>
+     *
+     * @param value The encoded value bytes
+     * @return The chunk text, or null if decoding fails
+     */
+    public static String decodeText(byte[] value) {
+        if (value == null || value.length < 4) {
+            return null;
+        }
+
+        try {
+            ByteBuffer buffer = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);
+            int dimension = buffer.getInt();
+
+            int vectorEndOffset = 4 + dimension * Float.BYTES;
+            if (value.length < vectorEndOffset) {
+                return null;
+            }
+
+            // Extract text bytes (everything after the vector)
+            byte[] textBytes = new byte[value.length - vectorEndOffset];
+            System.arraycopy(value, vectorEndOffset, textBytes, 0, textBytes.length);
+
+            return new String(textBytes, StandardCharsets.UTF_8);
+
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Gets the expected encoded size for a chunk with embedding.
+     *
+     * @param textLength The text length in bytes
+     * @param dimension The embedding dimension
+     * @return The total encoded size in bytes
+     */
+    public static int getEncodedSize(int textLength, int dimension) {
+        return 4 + dimension * Float.BYTES + textLength;
+    }
+
+    /**
+     * Encodes chunk text with embedding into a byte array.
+     *
+     * <p>This is a public version of the encoding method for use by tests and
+     * other components that need to encode data in the same format as the
+     * ingestion pipeline.</p>
+     *
+     * <p>Format (LITTLE-ENDIAN): [dimension:4][vector:dim*4][text:variable]</p>
+     *
+     * @param text The chunk text to encode
+     * @param embedding The embedding vector
+     * @return Encoded byte array
+     * @throws NullPointerException if text or embedding is null
+     */
+    public static byte[] encodeChunkWithTextAndEmbedding(String text, float[] embedding) {
+        Objects.requireNonNull(text, "text must not be null");
+        Objects.requireNonNull(embedding, "embedding must not be null");
+
+        byte[] textBytes = text.getBytes(StandardCharsets.UTF_8);
+
+        // Use ByteBuffer with LITTLE_ENDIAN to match TailScanner format
+        ByteBuffer buffer = ByteBuffer.allocate(4 + embedding.length * Float.BYTES + textBytes.length)
+            .order(ByteOrder.LITTLE_ENDIAN);
+
+        buffer.putInt(embedding.length);
+        for (float f : embedding) {
+            buffer.putFloat(f);
+        }
+        buffer.put(textBytes);
+
+        return buffer.array();
+    }
+
+    /**
+     * Encodes only the embedding vector without text.
+     *
+     * <p>This method is useful for tests and scenarios where only the vector
+     * needs to be stored without accompanying text.</p>
+     *
+     * <p>Format (LITTLE-ENDIAN): [dimension:4][vector:dim*4]</p>
+     *
+     * @param embedding The embedding vector to encode
+     * @return Encoded byte array containing only the vector
+     * @throws NullPointerException if embedding is null
+     */
+    public static byte[] encodeVectorOnly(float[] embedding) {
+        Objects.requireNonNull(embedding, "embedding must not be null");
+
+        ByteBuffer buffer = ByteBuffer.allocate(4 + embedding.length * Float.BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN);
+
+        buffer.putInt(embedding.length);
+        for (float f : embedding) {
+            buffer.putFloat(f);
+        }
+
+        return buffer.array();
     }
 
     /**

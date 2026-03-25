@@ -136,10 +136,11 @@ public class ResultAggregator {
         }
 
         // Phase 1: Collect all results and deduplicate, keeping the best score for each document
-        // Using a map ensures we keep the best (lowest distance) result for each document ID
-        // This handles the case where the same document appears in multiple segments
+        // We use string document IDs for deduplication when available (actual document IDs like "doc1")
+        // This correctly handles the case where the same document appears in multiple segments
         // during re-indexing or segment overlap scenarios
-        Map<Long, QueryResultItem> bestResultsByDocId = new HashMap<>();
+        // Fallback to nodeId-based deduplication for backward compatibility
+        Map<String, QueryResultItem> bestResultsByDocIdStr = new HashMap<>();
 
         // Process results from all segments
         for (SegmentQueryTask.SegmentQueryResult segmentResult : segmentResults) {
@@ -154,20 +155,25 @@ public class ResultAggregator {
                     continue;
                 }
 
-                long documentId = hnswResult.nodeId();
+                // Get the actual document ID string from the HNSW result
+                // This is populated from the node-to-document mapping during search
+                String documentIdStr = hnswResult.documentId();
+                long nodeId = hnswResult.nodeId();
 
-                // Create result item
+                // Create result item with string document ID for atomicity filtering
                 QueryResultItem item = new QueryResultItem(
-                    documentId,
+                    nodeId, // Numeric ID for backward compatibility
+                    documentIdStr, // Actual string document ID
                     hnswResult.distance(),
                     null, // Payload would be fetched separately
                     segmentResult.segmentId(),
-                    hnswResult.nodeId()
+                    nodeId
                 );
 
                 // Keep the best (lowest distance) result for each document ID
-                // This ensures no duplicates and best score is retained
-                bestResultsByDocId.merge(documentId, item, (existing, newItem) ->
+                // Use string document ID for deduplication when available
+                String dedupeKey = documentIdStr != null ? documentIdStr : String.valueOf(nodeId);
+                bestResultsByDocIdStr.merge(dedupeKey, item, (existing, newItem) ->
                     newItem.score() < existing.score() ? newItem : existing
                 );
             }
@@ -180,7 +186,7 @@ public class ResultAggregator {
             Comparator.comparingDouble(QueryResultItem::score).reversed()
         );
 
-        for (QueryResultItem item : bestResultsByDocId.values()) {
+        for (QueryResultItem item : bestResultsByDocIdStr.values()) {
             if (topResults.size() < topK) {
                 topResults.add(item);
             } else if (item.score() < topResults.peek().score()) {
@@ -194,7 +200,7 @@ public class ResultAggregator {
         results.sort(Comparator.comparingDouble(QueryResultItem::score));
 
         LOGGER.trace("Aggregated {} results from {} segments ({} unique documents)",
-            results.size(), segmentResults.size(), bestResultsByDocId.size());
+            results.size(), segmentResults.size(), bestResultsByDocIdStr.size());
 
         return results;
     }
