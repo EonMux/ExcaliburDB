@@ -2,7 +2,6 @@ package excalibur.integration;
 
 import excalibur.filter.CuckooFilter;
 import excalibur.filter.HierarchicalCuckooFilter;
-import excalibur.filter.cuckoo.CuckooFilter8Bit;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -71,7 +70,7 @@ class DeletionCorrectnessIntegrationTest {
         @Test
         @DisplayName("deleted entries not found by contains")
         void deletedEntriesNotFoundByContains() {
-            CuckooFilter filter = CuckooFilter8Bit.create(DEFAULT_CAPACITY);
+            CuckooFilter filter = CuckooFilter.create(DEFAULT_CAPACITY);
 
             // Insert entries
             Set<String> keys = new HashSet<>();
@@ -137,7 +136,7 @@ class DeletionCorrectnessIntegrationTest {
         @Test
         @DisplayName("delete non-existent key returns false")
         void deleteNonExistentKeyReturnsFalse() {
-            CuckooFilter filter = CuckooFilter8Bit.create(DEFAULT_CAPACITY);
+            CuckooFilter filter = CuckooFilter.create(DEFAULT_CAPACITY);
 
             // Insert some keys
             for (int i = 0; i < 100; i++) {
@@ -161,7 +160,7 @@ class DeletionCorrectnessIntegrationTest {
         @Test
         @DisplayName("insert after delete works correctly")
         void insertAfterDeleteWorksCorrectly() {
-            CuckooFilter filter = CuckooFilter8Bit.create(DEFAULT_CAPACITY);
+            CuckooFilter filter = CuckooFilter.create(DEFAULT_CAPACITY);
 
             String key = "reinsert-key";
             byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
@@ -191,7 +190,7 @@ class DeletionCorrectnessIntegrationTest {
         @Test
         @DisplayName("multiple insert/delete cycles work correctly")
         void multipleInsertDeleteCyclesWorkCorrectly() {
-            CuckooFilter filter = CuckooFilter8Bit.create(DEFAULT_CAPACITY);
+            CuckooFilter filter = CuckooFilter.create(DEFAULT_CAPACITY);
 
             String key = "cycle-key";
             byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
@@ -228,7 +227,7 @@ class DeletionCorrectnessIntegrationTest {
         @Test
         @DisplayName("bulk deletion removes all specified keys")
         void bulkDeletionRemovesAllSpecifiedKeys() {
-            CuckooFilter filter = CuckooFilter8Bit.create(DEFAULT_CAPACITY);
+            CuckooFilter filter = CuckooFilter.create(DEFAULT_CAPACITY);
 
             // Insert keys
             Set<String> allKeys = new HashSet<>();
@@ -285,7 +284,7 @@ class DeletionCorrectnessIntegrationTest {
         @Test
         @DisplayName("deletion at high load factor")
         void deletionAtHighLoadFactor() {
-            CuckooFilter filter = CuckooFilter8Bit.create(1000); // Small capacity
+            CuckooFilter filter = CuckooFilter.create(1000); // Small capacity
 
             // Insert to high load factor
             Set<String> insertedKeys = new HashSet<>();
@@ -443,7 +442,7 @@ class DeletionCorrectnessIntegrationTest {
         @Test
         @DisplayName("false positive rate within bounds after deletions")
         void falsePositiveRateWithinBoundsAfterDeletions() {
-            CuckooFilter filter = CuckooFilter8Bit.create(DEFAULT_CAPACITY);
+            CuckooFilter filter = CuckooFilter.create(DEFAULT_CAPACITY);
 
             // Insert keys
             Set<String> insertedKeys = new HashSet<>();

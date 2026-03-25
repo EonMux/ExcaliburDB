@@ -1,13 +1,9 @@
 package excalibur.integration;
 
-import excalibur.llm.client.CircuitBreaker;
-import excalibur.llm.client.CircuitBreakerState;
+import io.excalibur.llm.client.CircuitBreaker;
+import io.excalibur.llm.client.CircuitBreakerState;
 import excalibur.llm.client.LLMClientConfig;
-import excalibur.llm.client.LLMHttpClient;
-import excalibur.llm.protocol.ChatCompletionRequest;
-import excalibur.llm.protocol.ChatCompletionResponse;
-import excalibur.llm.protocol.EmbeddingRequest;
-import excalibur.llm.protocol.EmbeddingResponse;
+import io.excalibur.llm.client.LLMHttpClient;
 import io.excalibur.llm.LLMException;
 import excalibur.query.IndexCoverage;
 import excalibur.query.QueryRequest;
@@ -128,7 +124,7 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("circuit opens after N consecutive failures")
         void circuitOpensAfterConsecutiveFailures() {
-            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, COOLDOWN_PERIOD);
+            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, COOLDOWN_PERIOD, "test");
 
             // Initial state is CLOSED
             assertThat(breaker.getState()).isEqualTo(CircuitBreakerState.CLOSED);
@@ -157,7 +153,7 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("circuit allows test request after cooldown")
         void circuitAllowsTestRequestAfterCooldown() throws InterruptedException {
-            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, Duration.ofMillis(100));
+            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, Duration.ofMillis(100), "test");
 
             // Open the circuit
             for (int i = 0; i < FAILURE_THRESHOLD; i++) {
@@ -181,7 +177,7 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("circuit closes after successful test request")
         void circuitClosesAfterSuccessfulTestRequest() throws InterruptedException {
-            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, Duration.ofMillis(100));
+            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, Duration.ofMillis(100), "test");
 
             // Open the circuit
             for (int i = 0; i < FAILURE_THRESHOLD; i++) {
@@ -206,7 +202,7 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("circuit reopens if test request fails")
         void circuitReopensIfTestRequestFails() throws InterruptedException {
-            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, Duration.ofMillis(100));
+            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, Duration.ofMillis(100), "test");
 
             // Open the circuit
             for (int i = 0; i < FAILURE_THRESHOLD; i++) {
@@ -231,7 +227,7 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("failure count resets on success")
         void failureCountResetsOnSuccess() {
-            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, COOLDOWN_PERIOD);
+            CircuitBreaker breaker = new CircuitBreaker(FAILURE_THRESHOLD, COOLDOWN_PERIOD, "test");
 
             // Record some failures (not enough to open)
             for (int i = 0; i < FAILURE_THRESHOLD - 1; i++) {
@@ -266,7 +262,7 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("LLM client throws when circuit is open")
         void llmClientThrowsWhenCircuitIsOpen() {
-            CircuitBreaker breaker = new CircuitBreaker(1, COOLDOWN_PERIOD);
+            CircuitBreaker breaker = new CircuitBreaker(1, COOLDOWN_PERIOD, "test");
             breaker.recordFailure(); // Open immediately
 
             assertThat(breaker.allowRequest()).isFalse();

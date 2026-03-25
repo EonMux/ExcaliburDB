@@ -18,7 +18,7 @@ import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
-import io.excalibur.store.WriteLog;
+import io.excalibur.store.log.WriteLog;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
@@ -178,7 +178,7 @@ class FullPipelineIntegrationTest {
 
                 // Insert vector into HNSW graph
                 graph.insert(vector);
-                graph.setLastIntegratedOffset(writeLog.writeOffset());
+                graph.setLastIntegratedOffset(writeLog.writeHead());
 
                 // Advance visibility epoch
                 visibilityTracker.advanceEpoch();
@@ -285,7 +285,7 @@ class FullPipelineIntegrationTest {
             assertThat(response.results()).isNotEmpty();
             for (excalibur.query.QueryResultItem result : response.results()) {
                 assertThat(result.documentId()).isNotNull();
-                assertThat(result.documentId()).isNotEmpty();
+                assertThat(result.documentId()).isGreaterThanOrEqualTo(0);
             }
 
             graph.close();
@@ -455,7 +455,7 @@ class FullPipelineIntegrationTest {
             return null;
         }
 
-        void close() {
+        public void close() {
             // Cleanup
         }
     }
