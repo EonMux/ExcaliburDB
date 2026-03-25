@@ -621,20 +621,23 @@ public class MockLLMServer implements AutoCloseable {
     /**
      * Creates a handler that never responds (for timeout testing).
      *
-     * <p>WARNING: This handler holds the connection open. Ensure your client
-     * has a reasonable timeout configured to avoid tests hanging.</p>
+     * <p>Uses Object.wait() to block indefinitely until interrupted, which
+     * happens when the client times out and closes the connection. This is
+     * faster than Thread.sleep() because it responds immediately to interruption.</p>
      *
      * @return HTTP handler that never sends a response
      */
     public HttpHandler timeoutHandler() {
         return exchange -> {
-            // Never send response - simulates network timeout
-            try {
-                Thread.sleep(MAX_DELAY_MS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            // Use wait() on a lock object - blocks until interrupted when client closes connection
+            synchronized (exchange) {
+                try {
+                    exchange.wait(); // Blocks until interrupted
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
-            // Still don't respond
+            // Never respond - connection will be closed by client timeout
         };
     }
 

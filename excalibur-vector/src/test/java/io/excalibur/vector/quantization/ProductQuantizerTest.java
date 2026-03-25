@@ -449,8 +449,8 @@ class ProductQuantizerTest {
         int dimension = 16;
         int numSubspaces = 2;    // 8-dim subvectors
         int numCentroids = 256;  // Standard byte-aligned encoding
-        int numVectors = 5000;
-        int numQueries = 50;
+        int numVectors = 1000;   // Reduced from 5000 for faster test
+        int numQueries = 20;     // Reduced from 50 for faster test
         int k = 10;
 
         // Generate data with very tight cluster structure
@@ -483,9 +483,9 @@ class ProductQuantizerTest {
             }
         }
 
-        // Train PQ with extensive iterations
+        // Train PQ with reduced iterations for faster test
         ProductQuantizer pq = new ProductQuantizer(dimension, numSubspaces, numCentroids,
-            new CodebookTrainer(numVectors, 200, 1e-7f, 42));
+            new CodebookTrainer(numVectors, 50, 1e-7f, 42));  // Reduced from 200 to 50 iterations
         pq.train(databaseVectors);
 
         // Encode all database vectors

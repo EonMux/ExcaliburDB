@@ -38,7 +38,8 @@ import static org.junit.jupiter.api.Assertions.*;
 @Timeout(value = 30)
 class CircuitBreakerStateTransitionTest {
 
-    private static final Duration SHORT_COOLDOWN = Duration.ofMillis(150);
+    // Use minimum allowed cooldown (100ms) for faster tests
+    private static final Duration SHORT_COOLDOWN = Duration.ofMillis(100);
     private static final int SINGLE_FAILURE_THRESHOLD = 1;
     private static final int MULTI_FAILURE_THRESHOLD = 3;
 
@@ -74,7 +75,7 @@ class CircuitBreakerStateTransitionTest {
             assertTrue(cb.getOpenedAtMillis() > 0, "openedAtMillis must be set when circuit opens");
 
             // Phase 3: Wait for cooldown
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
 
             // Phase 4: OPEN → HALF_OPEN (via allowRequest)
             assertTrue(cb.allowRequest(), "Request must be allowed after cooldown (transition to HALF_OPEN)");
@@ -101,7 +102,7 @@ class CircuitBreakerStateTransitionTest {
             long firstOpenedAt = cb.getOpenedAtMillis();
 
             // Phase 2: Wait and transition to HALF_OPEN
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
@@ -113,7 +114,7 @@ class CircuitBreakerStateTransitionTest {
                 "openedAtMillis must be reset on HALF_OPEN → OPEN transition");
 
             // Phase 4: Wait and transition to HALF_OPEN again
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
@@ -139,7 +140,7 @@ class CircuitBreakerStateTransitionTest {
                     "Cycle " + cycle + ": Must transition to OPEN");
 
                 // Wait for cooldown
-                Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+                Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
 
                 // OPEN → HALF_OPEN
                 assertTrue(cb.allowRequest());
@@ -254,7 +255,7 @@ class CircuitBreakerStateTransitionTest {
 
             // Trip and wait for cooldown
             cb.recordFailure();
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
 
             // Multiple allowRequest calls should all succeed in HALF_OPEN
@@ -271,7 +272,7 @@ class CircuitBreakerStateTransitionTest {
             CircuitBreaker cb = new CircuitBreaker(SINGLE_FAILURE_THRESHOLD, SHORT_COOLDOWN, "success-test");
 
             cb.recordFailure();
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
@@ -290,7 +291,7 @@ class CircuitBreakerStateTransitionTest {
             CircuitBreaker cb = new CircuitBreaker(SINGLE_FAILURE_THRESHOLD, SHORT_COOLDOWN, "failure-test");
 
             cb.recordFailure();
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
@@ -309,7 +310,7 @@ class CircuitBreakerStateTransitionTest {
             CircuitBreaker cb = new CircuitBreaker(SINGLE_FAILURE_THRESHOLD, SHORT_COOLDOWN, "concurrent-probe-test");
 
             cb.recordFailure();
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
@@ -579,7 +580,7 @@ class CircuitBreakerStateTransitionTest {
 
             // Test reset from HALF_OPEN
             cb.recordFailure();
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
             cb.reset();
@@ -664,7 +665,7 @@ class CircuitBreakerStateTransitionTest {
             assertEquals(CircuitBreakerState.OPEN, cb.getState());
 
             // OPEN → HALF_OPEN (via cooldown + allowRequest)
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
@@ -686,7 +687,7 @@ class CircuitBreakerStateTransitionTest {
             assertEquals(CircuitBreakerState.OPEN, cb.getState());
 
             // OPEN → HALF_OPEN
-            Thread.sleep(SHORT_COOLDOWN.toMillis() + 50);
+            Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 

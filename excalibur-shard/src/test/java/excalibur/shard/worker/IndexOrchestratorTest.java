@@ -885,21 +885,21 @@ class IndexOrchestratorTest {
         });
 
         SegmentReindexScheduler scheduler = schedulerHolder[0];
-        // Use very short intervals for testing: 100ms check, 150ms reindex interval
+        // Use very short intervals for testing: 20ms check, 30ms reindex interval
         // Using unchecked methods to bypass production domain constraints for faster tests
-        scheduler.setCheckIntervalMsUnchecked(100);
-        scheduler.setDefaultReindexIntervalMsUnchecked(150);
+        scheduler.setCheckIntervalMsUnchecked(20);
+        scheduler.setDefaultReindexIntervalMsUnchecked(30);
 
-        scheduler.registerSourceUnchecked(1L, 150);
+        scheduler.registerSourceUnchecked(1L, 30);
         scheduler.start();
 
         // Wait for multiple reindex cycles to occur
-        // With 100ms check interval and 150ms reindex interval:
-        // - First check at ~100ms: triggers reindex (count=1)
-        // - Second check at ~200ms: timeSinceLastReindex ~100ms < 150ms, no trigger
-        // - Third check at ~300ms: timeSinceLastReindex ~200ms >= 150ms, triggers (count=2)
+        // With 20ms check interval and 30ms reindex interval:
+        // - First check at ~20ms: triggers reindex (count=1)
+        // - Second check at ~40ms: timeSinceLastReindex ~20ms < 30ms, no trigger
+        // - Third check at ~60ms: timeSinceLastReindex ~40ms >= 30ms, triggers (count=2)
         // Need enough time for at least 2 checks after the first reindex
-        Thread.sleep(700);
+        Thread.sleep(100);
 
         scheduler.stop();
         catalog.close();
@@ -928,14 +928,14 @@ class IndexOrchestratorTest {
 
         // Use very short intervals for testing
         // Using unchecked methods to bypass production domain constraints for faster tests
-        scheduler.setCheckIntervalMsUnchecked(100);
-        scheduler.setDefaultReindexIntervalMsUnchecked(150);
+        scheduler.setCheckIntervalMsUnchecked(20);
+        scheduler.setDefaultReindexIntervalMsUnchecked(30);
 
-        scheduler.registerSourceUnchecked(1L, 150);
+        scheduler.registerSourceUnchecked(1L, 30);
         scheduler.start();
 
         // Wait for multiple potential reindex cycles
-        Thread.sleep(500);
+        Thread.sleep(80);
 
         scheduler.stop();
         catalog.close();

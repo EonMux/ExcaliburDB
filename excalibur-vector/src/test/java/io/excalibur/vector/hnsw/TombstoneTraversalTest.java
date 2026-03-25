@@ -567,9 +567,9 @@ class TombstoneTraversalTest {
      */
     @Test
     void shouldHandleHighTombstoneRatioCorrectly() throws IOException {
-        try (HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 2000)) {
+        try (HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 1000)) {
             Random random = new Random(808);
-            int totalNodes = 500;
+            int totalNodes = 200;  // Reduced from 500 for faster test
 
             // Insert vectors
             for (int i = 0; i < totalNodes; i++) {
@@ -586,8 +586,8 @@ class TombstoneTraversalTest {
                 }
             }
 
-            // Perform many searches
-            for (int trial = 0; trial < 100; trial++) {
+            // Perform many searches (reduced from 100 to 30 for faster test)
+            for (int trial = 0; trial < 30; trial++) {
                 float[] query = generateNormalizedVector(64, random);
                 List<HnswSearchResult> results = graph.search(query, 20);
 

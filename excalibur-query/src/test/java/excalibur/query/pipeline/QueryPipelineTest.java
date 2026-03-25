@@ -524,14 +524,10 @@ class QueryPipelineTest {
     class DefaultConstants {
 
         @Test
-        @DisplayName("DEFAULT_COVERAGE_THRESHOLD is 0.5")
-        void defaultCoverageThresholdIs05() {
+        @DisplayName("Default constants have correct values")
+        void defaultConstantsHaveCorrectValues() {
+            // Combined into single test to avoid Mockito initialization overhead per test method
             assertThat(QueryPipeline.DEFAULT_COVERAGE_THRESHOLD).isEqualTo(0.5);
-        }
-
-        @Test
-        @DisplayName("DEFAULT_LLM_THRESHOLD is 0.3")
-        void defaultLlmThresholdIs03() {
             assertThat(QueryPipeline.DEFAULT_LLM_THRESHOLD).isEqualTo(0.3f);
         }
     }

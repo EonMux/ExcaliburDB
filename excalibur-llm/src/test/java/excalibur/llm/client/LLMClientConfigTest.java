@@ -30,59 +30,19 @@ class LLMClientConfigTest {
     class DefaultConfigurationTests {
 
         @Test
-        @DisplayName("Default cooldown period is 60000ms (60 seconds)")
-        void defaultCooldownPeriodIs60000ms() {
+        @DisplayName("All default configuration values are correct")
+        void allDefaultConfigurationValuesAreCorrect() {
+            // Build once and check all defaults to avoid repeated builder construction
             LLMClientConfig config = LLMClientConfig.builder().build();
+
             assertEquals(Duration.ofMillis(60000), config.getCooldownPeriod());
             assertEquals(60000, config.getCooldownPeriod().toMillis());
-        }
-
-        @Test
-        @DisplayName("Default failure threshold is 5")
-        void defaultFailureThresholdIs5() {
-            LLMClientConfig config = LLMClientConfig.builder().build();
             assertEquals(5, config.getFailureThreshold());
-        }
-
-        @Test
-        @DisplayName("Default timeout is 30 seconds")
-        void defaultTimeoutIs30Seconds() {
-            LLMClientConfig config = LLMClientConfig.builder().build();
             assertEquals(Duration.ofSeconds(30), config.getTimeout());
-        }
-
-        @Test
-        @DisplayName("Default max retries is 3")
-        void defaultMaxRetriesIs3() {
-            LLMClientConfig config = LLMClientConfig.builder().build();
             assertEquals(3, config.getMaxRetries());
-        }
-
-        @Test
-        @DisplayName("Default max prompts per query is 10")
-        void defaultMaxPromptsPerQueryIs10() {
-            LLMClientConfig config = LLMClientConfig.builder().build();
             assertEquals(10, config.getMaxPromptsPerQuery());
-        }
-
-        @Test
-        @DisplayName("Default relevancy threshold is 0.3")
-        void defaultRelevancyThresholdIs03() {
-            LLMClientConfig config = LLMClientConfig.builder().build();
             assertEquals(0.3, config.getRelevancyThreshold(), 0.001);
-        }
-
-        @Test
-        @DisplayName("Default embedding dimension is 1536")
-        void defaultEmbeddingDimensionIs1536() {
-            LLMClientConfig config = LLMClientConfig.builder().build();
             assertEquals(1536, config.getEmbeddingDimension());
-        }
-
-        @Test
-        @DisplayName("Default max batch tokens is 4000")
-        void defaultMaxBatchTokensIs4000() {
-            LLMClientConfig config = LLMClientConfig.builder().build();
             assertEquals(4000, config.getMaxBatchTokens());
         }
     }

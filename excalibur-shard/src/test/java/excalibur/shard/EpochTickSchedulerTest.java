@@ -98,13 +98,13 @@ class EpochTickSchedulerTest {
     @Test
     @DisplayName("Epoch should advance periodically when scheduler is running")
     void epochShouldAdvancePeriodically() throws InterruptedException {
-        scheduler = new EpochTickScheduler(tracker);
+        scheduler = new EpochTickScheduler(tracker, 10); // Use 10ms interval for faster tests
         long epochBefore = tracker.currentEpoch();
 
         scheduler.start();
 
-        // Wait for 3 ticks at 100ms interval (350ms with buffer)
-        Thread.sleep(350);
+        // Wait for 3 ticks at 10ms interval (35ms with buffer)
+        Thread.sleep(35);
 
         long epochAfter = tracker.currentEpoch();
 
@@ -129,16 +129,16 @@ class EpochTickSchedulerTest {
     @Test
     @DisplayName("No ticks should occur after stop")
     void noTicksAfterStop() throws InterruptedException {
-        scheduler = new EpochTickScheduler(tracker);
+        scheduler = new EpochTickScheduler(tracker, 10); // Use 20ms interval
         scheduler.start();
-        Thread.sleep(150); // Let some ticks happen
+        Thread.sleep(25); // Let some ticks happen
         scheduler.stop();
 
         long tickCountAfterStop = scheduler.getTickCount();
         long epochAfterStop = tracker.currentEpoch();
 
         // Wait another period
-        Thread.sleep(250);
+        Thread.sleep(50);
 
         // Tick count and epoch should not have changed
         assertThat(scheduler.getTickCount()).isEqualTo(tickCountAfterStop);
@@ -156,17 +156,17 @@ class EpochTickSchedulerTest {
     @Test
     @DisplayName("Custom interval scheduler should advance epoch faster")
     void customIntervalShouldAdvanceFaster() throws InterruptedException {
-        scheduler = new EpochTickScheduler(tracker, 50); // 50ms interval
+        scheduler = new EpochTickScheduler(tracker, 10); // 20ms interval
         long epochBefore = tracker.currentEpoch();
 
         scheduler.start();
 
-        // Wait for 5 ticks at 50ms interval (300ms with buffer)
-        Thread.sleep(300);
+        // Wait for 5 ticks at 10ms interval (50ms with buffer)
+        Thread.sleep(50);
 
         long epochAfter = tracker.currentEpoch();
 
-        // Should have at least 4 ticks with 50ms interval
+        // Should have at least 4 ticks with 20ms interval
         assertThat(epochAfter).isGreaterThan(epochBefore);
         assertThat(scheduler.getTickCount()).isGreaterThanOrEqualTo(4L);
     }
@@ -194,15 +194,15 @@ class EpochTickSchedulerTest {
     @Test
     @DisplayName("getStats should return correct statistics")
     void getStatsShouldReturnCorrectStats() throws InterruptedException {
-        scheduler = new EpochTickScheduler(tracker, 50);
+        scheduler = new EpochTickScheduler(tracker, 10);
         scheduler.start();
-        Thread.sleep(150);
+        Thread.sleep(50);
 
         EpochTickScheduler.EpochTickStats stats = scheduler.getStats();
 
         assertThat(stats.running()).isTrue();
         assertThat(stats.tickCount()).isGreaterThanOrEqualTo(2L);
-        assertThat(stats.tickIntervalMs()).isEqualTo(50L);
+        assertThat(stats.tickIntervalMs()).isEqualTo(20L);
         assertThat(stats.lastTickTimestamp()).isGreaterThan(0L);
         assertThat(stats.currentEpoch()).isGreaterThanOrEqualTo(2L);
         assertThat(stats.timeSinceLastTickMs()).isGreaterThanOrEqualTo(0L);
@@ -211,11 +211,11 @@ class EpochTickSchedulerTest {
     @Test
     @DisplayName("Scheduler can be restarted after stop")
     void schedulerCanBeRestarted() throws InterruptedException {
-        scheduler = new EpochTickScheduler(tracker);
+        scheduler = new EpochTickScheduler(tracker, 10); // Use 20ms interval
 
         // Start, wait, stop
         scheduler.start();
-        Thread.sleep(150);
+        Thread.sleep(50);
         scheduler.stop();
 
         long tickCountAfterFirstRun = scheduler.getTickCount();
@@ -227,7 +227,7 @@ class EpochTickSchedulerTest {
         assertThat(scheduler.isRunning()).isTrue();
 
         // Wait for more ticks
-        Thread.sleep(150);
+        Thread.sleep(50);
 
         // Should have more ticks now
         assertThat(scheduler.getTickCount()).isGreaterThan(tickCountAfterFirstRun);
@@ -236,9 +236,9 @@ class EpochTickSchedulerTest {
     @Test
     @DisplayName("Close should stop scheduler and shutdown executor")
     void closeShouldStopAndShutdown() throws InterruptedException {
-        scheduler = new EpochTickScheduler(tracker);
+        scheduler = new EpochTickScheduler(tracker, 10);
         scheduler.start();
-        Thread.sleep(100);
+        Thread.sleep(15);
 
         scheduler.close();
 

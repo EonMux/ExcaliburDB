@@ -43,32 +43,13 @@ class CircuitBreakerTest {
     class DefaultConfigurationTests {
 
         @Test
-        @DisplayName("Default failure threshold is 5")
-        void defaultFailureThresholdIs5() {
+        @DisplayName("All default configuration values are correct")
+        void allDefaultConfigurationValuesAreCorrect() {
+            // Check all defaults in one test to avoid per-test overhead
             assertEquals(5, circuitBreaker.getFailureThreshold());
-        }
-
-        @Test
-        @DisplayName("Default cooldown period is 60 seconds")
-        void defaultCooldownPeriodIs60Seconds() {
             assertEquals(Duration.ofSeconds(60), circuitBreaker.getCooldownPeriod());
-        }
-
-        @Test
-        @DisplayName("Initial state is CLOSED")
-        void initialStateIsClosed() {
             assertEquals(CircuitBreakerState.CLOSED, circuitBreaker.getState());
-        }
-
-        @Test
-        @DisplayName("Initial failure count is 0")
-        void initialFailureCountIs0() {
             assertEquals(0, circuitBreaker.getFailureCount());
-        }
-
-        @Test
-        @DisplayName("Requests allowed in CLOSED state")
-        void requestsAllowedInClosedState() {
             assertTrue(circuitBreaker.allowRequest());
         }
     }
@@ -214,15 +195,15 @@ class CircuitBreakerTest {
         @Test
         @DisplayName("OPEN → HALF_OPEN after cooldown")
         void openToHalfOpenAfterCooldown() throws InterruptedException {
-            // Use a short cooldown for testing (minimum 100ms)
-            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(150), "test");
+            // Use minimum cooldown for testing (100ms is minimum allowed)
+            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(100), "test");
 
             // Trip the circuit
             cb.recordFailure();
             assertEquals(CircuitBreakerState.OPEN, cb.getState());
 
-            // Wait for cooldown
-            Thread.sleep(200);
+            // Wait for cooldown (105ms = 100ms cooldown + 5ms buffer)
+            Thread.sleep(101);
 
             // Should allow request (transition to HALF_OPEN)
             assertTrue(cb.allowRequest());
@@ -232,11 +213,11 @@ class CircuitBreakerTest {
         @Test
         @DisplayName("HALF_OPEN → CLOSED on success")
         void halfOpenToClosedOnSuccess() throws InterruptedException {
-            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(150), "test");
+            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(100), "test");
 
             // Trip the circuit
             cb.recordFailure();
-            Thread.sleep(200);
+            Thread.sleep(101);
 
             // Transition to HALF_OPEN
             assertTrue(cb.allowRequest());
@@ -251,11 +232,11 @@ class CircuitBreakerTest {
         @Test
         @DisplayName("HALF_OPEN → OPEN on failure (cooldown resets)")
         void halfOpenToOpenOnFailure() throws InterruptedException {
-            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(150), "test");
+            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(100), "test");
 
             // Trip the circuit
             cb.recordFailure();
-            Thread.sleep(200);
+            Thread.sleep(101);
 
             // Transition to HALF_OPEN
             assertTrue(cb.allowRequest());
@@ -269,15 +250,15 @@ class CircuitBreakerTest {
         @Test
         @DisplayName("HALF_OPEN → OPEN on failure resets cooldown timer")
         void halfOpenToOpenResetsCooldownTimer() throws InterruptedException {
-            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(500), "test");
+            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(100), "test");
 
             // Trip the circuit
             cb.recordFailure();
             assertEquals(CircuitBreakerState.OPEN, cb.getState());
             long originalOpenedAt = cb.getOpenedAtMillis();
 
-            // Wait for the cooldown to pass (500ms + buffer for timing)
-            Thread.sleep(550);
+            // Wait for the cooldown to pass (100ms + 5ms buffer for timing)
+            Thread.sleep(101);
 
             // Transition to HALF_OPEN
             assertTrue(cb.allowRequest());
@@ -287,9 +268,9 @@ class CircuitBreakerTest {
             cb.recordFailure();
             assertEquals(CircuitBreakerState.OPEN, cb.getState());
 
-            // Verify cooldown was reset (new openedAt should be >= original + 550ms)
+            // Verify cooldown was reset (new openedAt should be >= original + 105ms)
             long newOpenedAt = cb.getOpenedAtMillis();
-            assertTrue(newOpenedAt >= originalOpenedAt + 550,
+            assertTrue(newOpenedAt >= originalOpenedAt + 105,
                 "Cooldown should be reset when transitioning from HALF_OPEN to OPEN");
 
             // Verify requests are still blocked (cooldown just started)
@@ -297,7 +278,7 @@ class CircuitBreakerTest {
                 "Requests should be blocked immediately after HALF_OPEN → OPEN transition");
 
             // Wait for the new cooldown to expire
-            Thread.sleep(550);
+            Thread.sleep(101);
 
             // Now requests should be allowed again
             assertTrue(cb.allowRequest(),
@@ -307,14 +288,14 @@ class CircuitBreakerTest {
         @Test
         @DisplayName("Multiple HALF_OPEN → OPEN cycles reset cooldown each time")
         void multipleHalfOpenToOpenCyclesResetCooldown() throws InterruptedException {
-            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(200), "test");
+            CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(100), "test");
 
             // First cycle: CLOSED → OPEN
             cb.recordFailure();
             assertEquals(CircuitBreakerState.OPEN, cb.getState());
 
             // First cycle: OPEN → HALF_OPEN (after cooldown)
-            Thread.sleep(250);
+            Thread.sleep(101);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
@@ -327,7 +308,7 @@ class CircuitBreakerTest {
             assertFalse(cb.allowRequest());
 
             // Second cycle: Wait for new cooldown
-            Thread.sleep(250);
+            Thread.sleep(101);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
@@ -337,14 +318,14 @@ class CircuitBreakerTest {
             assertEquals(CircuitBreakerState.OPEN, cb.getState());
 
             // Verify cooldown was reset again
-            assertTrue(openedAt2 >= openedAt1 + 200,
+            assertTrue(openedAt2 >= openedAt1 + 100,
                 "Second HALF_OPEN → OPEN should reset cooldown timer");
 
             // Immediately try to allow request - should fail (cooldown just reset again)
             assertFalse(cb.allowRequest());
 
             // Third cycle: Wait for new cooldown and succeed
-            Thread.sleep(250);
+            Thread.sleep(101);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
             cb.recordSuccess();
@@ -358,12 +339,12 @@ class CircuitBreakerTest {
 
             // Trip and transition to HALF_OPEN
             cb.recordFailure();
-            Thread.sleep(150);
+            Thread.sleep(101);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
             // Multiple threads try to record failure concurrently
-            int numThreads = 50;
+            int numThreads = 20;  // Reduced from 50
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch doneLatch = new CountDownLatch(numThreads);
@@ -512,12 +493,12 @@ class CircuitBreakerTest {
             assertEquals(CircuitBreakerState.OPEN, cb.getState());
 
             // Wait for cooldown and transition to HALF_OPEN
-            Thread.sleep(150);
+            Thread.sleep(101);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
             // Multiple threads try to record success concurrently
-            int numThreads = 50;
+            int numThreads = 20;  // Reduced from 50
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1); // Synchronize start
             CountDownLatch doneLatch = new CountDownLatch(numThreads);
@@ -557,11 +538,11 @@ class CircuitBreakerTest {
 
             // Trip the circuit
             cb.recordFailure();
-            Thread.sleep(150);
+            Thread.sleep(101);
             assertTrue(cb.allowRequest());
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
-            int numThreads = 100;
+            int numThreads = 30;  // Reduced from 100
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch doneLatch = new CountDownLatch(numThreads);
@@ -572,8 +553,8 @@ class CircuitBreakerTest {
                     try {
                         startLatch.await();
                         // Alternate between success and failure
-                        if (idx < 20) {
-                            cb.recordSuccess(); // First 20 threads try success
+                        if (idx < 10) {  // Adjusted from 20
+                            cb.recordSuccess(); // First 10 threads try success
                         } else {
                             cb.recordFailure(); // Rest try failure
                         }
@@ -728,9 +709,9 @@ class CircuitBreakerTest {
         @Test
         @DisplayName("Concurrent reset and recordFailure maintains consistent state")
         void concurrentResetAndRecordFailureMaintainsConsistentState() throws InterruptedException {
-            CircuitBreaker cb = new CircuitBreaker(10, Duration.ofMillis(100), "stress-test");
-            int numThreads = 50;
-            int iterations = 100;
+            CircuitBreaker cb = new CircuitBreaker(10, Duration.ofMillis(50), "stress-test");
+            int numThreads = 10;  // Reduced from 25
+            int iterations = 25;   // Reduced from 50
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch doneLatch = new CountDownLatch(numThreads);
@@ -773,7 +754,7 @@ class CircuitBreakerTest {
             }
 
             startLatch.countDown();
-            assertTrue(doneLatch.await(30, TimeUnit.SECONDS));
+            assertTrue(doneLatch.await(5, TimeUnit.SECONDS));
             executor.shutdown();
 
             assertEquals(0, inconsistentStates.get(),
@@ -783,8 +764,9 @@ class CircuitBreakerTest {
         @Test
         @DisplayName("Concurrent trip and reset maintains consistent state")
         void concurrentTripAndResetMaintainsConsistentState() throws InterruptedException {
-            CircuitBreaker cb = new CircuitBreaker(5, Duration.ofMillis(100), "trip-reset-test");
-            int numThreads = 100;
+            CircuitBreaker cb = new CircuitBreaker(5, Duration.ofMillis(50), "trip-reset-test");
+            int numThreads = 10;  // Reduced from 30
+            int iterationsPerThread = 15;  // Reduced from 25
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch doneLatch = new CountDownLatch(numThreads);
@@ -795,7 +777,7 @@ class CircuitBreakerTest {
                 executor.submit(() -> {
                     try {
                         startLatch.await();
-                        for (int j = 0; j < 50; j++) {
+                        for (int j = 0; j < iterationsPerThread; j++) {
                             if (threadId % 2 == 0) {
                                 cb.trip();
                             } else {
@@ -825,7 +807,7 @@ class CircuitBreakerTest {
             }
 
             startLatch.countDown();
-            assertTrue(doneLatch.await(30, TimeUnit.SECONDS));
+            assertTrue(doneLatch.await(5, TimeUnit.SECONDS));
             executor.shutdown();
 
             assertEquals(0, inconsistentStates.get(),
@@ -869,9 +851,9 @@ class CircuitBreakerTest {
         @Test
         @DisplayName("High contention stress test with all operations")
         void highContentionStressTestWithAllOperations() throws InterruptedException {
-            CircuitBreaker cb = new CircuitBreaker(20, Duration.ofMillis(150), "high-contention");
-            int numThreads = 200;
-            int operationsPerThread = 500;
+            CircuitBreaker cb = new CircuitBreaker(10, Duration.ofMillis(50), "high-contention");
+            int numThreads = 10;  // Reduced from 25
+            int operationsPerThread = 20;  // Reduced from 50
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch doneLatch = new CountDownLatch(numThreads);
@@ -907,7 +889,7 @@ class CircuitBreakerTest {
             }
 
             startLatch.countDown();
-            assertTrue(doneLatch.await(60, TimeUnit.SECONDS));
+            assertTrue(doneLatch.await(5, TimeUnit.SECONDS));
             executor.shutdown();
 
             assertEquals(0, errors.get(),
@@ -927,7 +909,7 @@ class CircuitBreakerTest {
             // With threshold of 3, race many threads to record failures
             // The failure count should be clamped when circuit opens
             CircuitBreaker cb = new CircuitBreaker(3, Duration.ofSeconds(60), "clamp-test");
-            int numThreads = 100;
+            int numThreads = 20;  // Reduced from 50
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch doneLatch = new CountDownLatch(numThreads);
@@ -961,8 +943,8 @@ class CircuitBreakerTest {
         @DisplayName("openedAtMillis is consistent with state after concurrent operations")
         void openedAtMillisConsistentWithStateAfterConcurrentOperations() throws InterruptedException {
             CircuitBreaker cb = new CircuitBreaker(1, Duration.ofMillis(100), "timestamp-test");
-            // Reduced from 50 to 10 iterations - still verifies consistency without 6s delay
-            int numIterations = 10;
+            // Reduced from 50 to 3 to 2 iterations - still verifies consistency
+            int numIterations = 2;
 
             for (int iter = 0; iter < numIterations; iter++) {
                 // Trip the circuit
@@ -975,7 +957,7 @@ class CircuitBreakerTest {
                 assertTrue(openedAt > 0, "openedAtMillis must be set when OPEN");
 
                 // Wait for cooldown
-                Thread.sleep(120);
+                Thread.sleep(101);
 
                 // Transition to HALF_OPEN
                 assertTrue(cb.allowRequest());

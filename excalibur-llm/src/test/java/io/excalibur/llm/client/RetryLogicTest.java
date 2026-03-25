@@ -452,7 +452,7 @@ public class RetryLogicTest {
                     .embeddingModel("test-embedding")
                     .timeout(Duration.ofSeconds(5))
                     .maxRetries(10)
-                    .retryBaseDelay(Duration.ofMillis(5)) // Very short for testing
+                    .retryBaseDelay(Duration.ofMillis(1)) // Minimal delay for fast testing
                     .build();
             client = new LLMHttpClient(config);
 

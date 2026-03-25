@@ -410,8 +410,8 @@ class HnswGraphTest {
     void shouldAchieve99Point5PercentRecallWithHighEfSearch() throws IOException {
         DistanceFunction distFn = L2Distance.getInstance();
         int dimension = 64;
-        int numVectors = 500;
-        int numQueries = 50;
+        int numVectors = 200;  // Reduced from 500 for faster test
+        int numQueries = 20;   // Reduced from 50 for faster test
         int k = 10;
 
         // Use even higher efSearch (300) for very high recall

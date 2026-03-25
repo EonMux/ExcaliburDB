@@ -1461,14 +1461,14 @@ public class LLMHttpClientTest {
                 .baseUrl(server.getBaseUrl())
                 .chatModel("test-model")
                 .embeddingModel("test-embedding")
-                .timeout(Duration.ofMillis(100)) // Very short timeout
+                .timeout(Duration.ofMillis(50)) // Short timeout
                 .maxRetries(0)
                 .build();
         client = new LLMHttpClient(config);
 
-        // Handler that delays longer than timeout
+        // Handler that delays longer than timeout (200ms > 50ms timeout)
         server.setEmbeddingHandler(server.delayedHandler(
-                server.successEmbeddingHandler(new float[]{0.1f, 0.2f}), 5000));
+                server.successEmbeddingHandler(new float[]{0.1f, 0.2f}), 200));
 
         LLMException ex = assertThrows(LLMException.class,
                 () -> client.generateEmbedding("Test"));
@@ -1486,14 +1486,14 @@ public class LLMHttpClientTest {
                 .baseUrl(server.getBaseUrl())
                 .chatModel("test-model")
                 .embeddingModel("test-embedding")
-                .timeout(Duration.ofMillis(100))
+                .timeout(Duration.ofMillis(50))
                 .maxRetries(0)
                 .build();
         client = new LLMHttpClient(config);
 
-        // Handler that delays longer than timeout
+        // Handler that delays longer than timeout (200ms > 50ms timeout)
         server.setChatHandler(server.delayedHandler(
-                server.successRelevancyHandler(0.5), 5000));
+                server.successRelevancyHandler(0.5), 200));
 
         LLMException ex = assertThrows(LLMException.class,
                 () -> client.scoreRelevancy("query", List.of("test")));
