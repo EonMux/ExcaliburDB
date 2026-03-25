@@ -1347,4 +1347,340 @@ public class LLMHttpClientTest {
         // Verify config uses the custom retry base delay
         assertEquals(Duration.ofMillis(200), config.getRetryBaseDelay());
     }
+
+    // ============= Exception Documentation Tests ==================
+    // Tests that verify HTTP requests return valid responses or throw documented exceptions
+
+    @Test
+    @DisplayName("Exception: server handler exception results in network error")
+    void serverHandlerException_resultsInNetworkError() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0) // No retries for faster test
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Create a handler that throws a runtime exception
+        // The mock server closes the connection when handler throws, resulting in network error
+        server.setEmbeddingHandler(exchange -> {
+            throw new RuntimeException("Simulated server error");
+        });
+
+        // Server-side exceptions close the connection - client sees network error
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+
+        // Verify it's a network error (connection closed when handler throws)
+        assertEquals(LLMException.ErrorType.NETWORK, ex.getErrorType());
+    }
+
+    @Test
+    @DisplayName("Exception: all retry attempts exhausted throws LLMException with proper type")
+    void allRetriesExhausted_throwsLLMException() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(2)
+                .retryBaseDelay(Duration.ofMillis(10))
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Handler that always fails with retryable error
+        server.setEmbeddingHandler(server.errorHandler(503, "Service Unavailable"));
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+
+        // Verify documented exception type
+        assertEquals(LLMException.ErrorType.HTTP_ERROR, ex.getErrorType());
+        assertEquals(503, ex.getStatusCode());
+        assertTrue(ex.getMessage().contains("503"));
+    }
+
+    @Test
+    @DisplayName("Exception: LLMException contains retryable flag for transient errors")
+    void llmException_retryableFlag_correctForTransientErrors() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Test 5xx server error (retryable)
+        server.setEmbeddingHandler(server.errorHandler(500, "Internal Server Error"));
+        LLMException serverError = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+        assertTrue(serverError.isRetryable(), "5xx errors should be retryable");
+
+        // Test 429 rate limit (retryable)
+        server.setEmbeddingHandler(server.errorHandler(429, "Too Many Requests"));
+        LLMException rateLimit = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+        assertTrue(rateLimit.isRetryable(), "429 rate limit should be retryable");
+    }
+
+    @Test
+    @DisplayName("Exception: LLMException contains retryable flag for non-retryable errors")
+    void llmException_retryableFlag_correctForNonRetryableErrors() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Test 401 unauthorized (not retryable)
+        server.setEmbeddingHandler(server.unauthorizedHandler());
+        LLMException authError = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+        assertFalse(authError.isRetryable(), "401 auth error should not be retryable");
+
+        // Test 400 bad request (not retryable)
+        server.setEmbeddingHandler(server.errorHandler(400, "Bad Request"));
+        LLMException badRequest = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+        assertFalse(badRequest.isRetryable(), "400 bad request should not be retryable");
+    }
+
+    // ============= Timeout Handling Tests =============
+
+    @Test
+    @DisplayName("Timeout: client timeout with slow server throws NETWORK error")
+    void generateEmbedding_slowServer_throwsNetworkError() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofMillis(100)) // Very short timeout
+                .maxRetries(0)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Handler that delays longer than timeout
+        server.setEmbeddingHandler(server.delayedHandler(
+                server.successEmbeddingHandler(new float[]{0.1f, 0.2f}), 5000));
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.generateEmbedding("Test"));
+
+        assertEquals(LLMException.ErrorType.NETWORK, ex.getErrorType(),
+                "Timeout should result in NETWORK error type");
+        assertTrue(ex.getMessage().contains("timed out"),
+                "Exception message should mention timeout");
+    }
+
+    @Test
+    @DisplayName("Timeout: relevancy scoring with slow server throws NETWORK error")
+    void scoreRelevancy_slowServer_throwsNetworkError() throws IOException {
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofMillis(100))
+                .maxRetries(0)
+                .build();
+        client = new LLMHttpClient(config);
+
+        // Handler that delays longer than timeout
+        server.setChatHandler(server.delayedHandler(
+                server.successRelevancyHandler(0.5), 5000));
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> client.scoreRelevancy("query", List.of("test")));
+
+        assertEquals(LLMException.ErrorType.NETWORK, ex.getErrorType(),
+                "Timeout should result in NETWORK error type");
+    }
+
+    // ============= Connection Failure Tests =============
+
+    @Test
+    @DisplayName("Connection: server stopped throws NETWORK error")
+    void generateEmbedding_serverStopped_throwsNetworkError() throws IOException {
+        // Create a client pointing to a server that will be stopped
+        MockLLMServer tempServer = MockLLMServer.create().start();
+        config = LLMClientConfig.builder()
+                .baseUrl(tempServer.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofSeconds(2))
+                .maxRetries(0)
+                .build();
+        LLMHttpClient tempClient = new LLMHttpClient(config);
+
+        // Stop the server before making request
+        tempServer.stop();
+
+        // Request should fail with NETWORK error
+        LLMException ex = assertThrows(LLMException.class,
+                () -> tempClient.generateEmbedding("Test"));
+
+        assertEquals(LLMException.ErrorType.NETWORK, ex.getErrorType(),
+                "Connection refused should result in NETWORK error type");
+    }
+
+    @Test
+    @DisplayName("Connection: invalid URL throws NETWORK error")
+    void generateEmbedding_invalidUrl_throwsNetworkError() {
+        config = LLMClientConfig.builder()
+                .baseUrl("http://localhost:1") // Invalid port - no server there
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .timeout(Duration.ofMillis(500))
+                .maxRetries(0)
+                .build();
+        LLMHttpClient tempClient = new LLMHttpClient(config);
+
+        LLMException ex = assertThrows(LLMException.class,
+                () -> tempClient.generateEmbedding("Test"));
+
+        assertEquals(LLMException.ErrorType.NETWORK, ex.getErrorType(),
+                "Connection to invalid URL should result in NETWORK error type");
+    }
+
+    // ============= Large Response Handling Tests =============
+
+    @Test
+    @DisplayName("Large response: large embedding (4096 dimensions) parses correctly")
+    void generateEmbedding_largeEmbedding_parsesCorrectly() {
+        // Create a max-dimension embedding (4096 dimensions)
+        float[] largeEmbedding = new float[4096];
+        for (int i = 0; i < 4096; i++) {
+            largeEmbedding[i] = (float) (Math.sin(i * 0.001) * 0.5);
+        }
+
+        // Configure client for 4096 dimensions
+        config = LLMClientConfig.builder()
+                .baseUrl(server.getBaseUrl())
+                .chatModel("test-model")
+                .embeddingModel("test-embedding")
+                .embeddingDimension(4096)
+                .timeout(Duration.ofSeconds(5))
+                .maxRetries(0)
+                .build();
+        client = new LLMHttpClient(config);
+
+        server.setEmbeddingHandler(server.successEmbeddingHandler(largeEmbedding));
+
+        float[] result = client.generateEmbedding("Large embedding test");
+
+        assertNotNull(result);
+        assertEquals(4096, result.length);
+        // Verify some sample values
+        assertEquals(largeEmbedding[0], result[0], 0.0001f);
+        assertEquals(largeEmbedding[1000], result[1000], 0.0001f);
+        assertEquals(largeEmbedding[4095], result[4095], 0.0001f);
+    }
+
+    @Test
+    @DisplayName("Large response: large batch of relevancy scores parses correctly")
+    void scoreRelevancy_largeBatch_parsesCorrectly() {
+        // Create a large batch of candidates (50 items)
+        List<String> candidates = new java.util.ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+            candidates.add("Candidate passage number " + i + " for testing large batch handling.");
+        }
+
+        // Build expected scores JSON
+        StringBuilder jsonBuilder = new StringBuilder("[");
+        double[] scores = new double[50];
+        for (int i = 0; i < 50; i++) {
+            if (i > 0) jsonBuilder.append(", ");
+            scores[i] = Math.max(0.0, Math.min(1.0, 0.3 + (i * 0.01)));
+            jsonBuilder.append("{\"index\": ").append(i).append(", \"score\": ").append(scores[i]).append("}");
+        }
+        jsonBuilder.append("]");
+
+        server.setChatHandler(server.successChatHandler(jsonBuilder.toString()));
+
+        List<RelevancyScore> result = client.scoreRelevancy("Large batch query", candidates);
+
+        assertNotNull(result);
+        assertEquals(50, result.size());
+        for (int i = 0; i < 50; i++) {
+            assertEquals(i, result.get(i).getIndex());
+            assertEquals(scores[i], result.get(i).getScore(), 0.001);
+        }
+    }
+
+    // ============= Edge Case Tests =============
+
+    @Test
+    @DisplayName("Edge case: embedding with negative values parses correctly")
+    void generateEmbedding_negativeValues_parsesCorrectly() {
+        float[] expected = new float[]{-0.5f, -0.3f, 0.0f, 0.2f, 0.8f};
+        server.setEmbeddingHandler(server.successEmbeddingHandler(expected));
+
+        float[] result = client.generateEmbedding("Negative values test");
+
+        assertNotNull(result);
+        assertEquals(5, result.length);
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(expected[i], result[i], 0.0001f);
+        }
+    }
+
+    @Test
+    @DisplayName("Edge case: embedding with very small values parses correctly")
+    void generateEmbedding_verySmallValues_parsesCorrectly() {
+        float[] expected = new float[]{1e-10f, 1e-20f, -1e-15f, 0.0f};
+        server.setEmbeddingHandler(server.successEmbeddingHandler(expected));
+
+        float[] result = client.generateEmbedding("Small values test");
+
+        assertNotNull(result);
+        assertEquals(4, result.length);
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(expected[i], result[i], 1e-25f);
+        }
+    }
+
+    @Test
+    @DisplayName("Edge case: relevancy scores at boundaries")
+    void scoreRelevancy_boundaryScores_parsedCorrectly() {
+        // Test scores at exact boundaries [0.0, 1.0]
+        server.setChatHandler(server.successRelevancyHandler(0.0, 1.0, 0.5));
+
+        List<String> candidates = List.of("Zero", "One", "Half");
+        List<RelevancyScore> scores = client.scoreRelevancy("Boundary test", candidates);
+
+        assertEquals(3, scores.size());
+        assertEquals(0.0, scores.get(0).getScore(), 0.001);
+        assertEquals(1.0, scores.get(1).getScore(), 0.001);
+        assertEquals(0.5, scores.get(2).getScore(), 0.001);
+    }
+
+    @Test
+    @DisplayName("Edge case: request with very long text produces valid JSON")
+    void generateEmbedding_veryLongText_producesValidJson() {
+        // Create a very long text (10KB)
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 1000; i++) {
+            sb.append("This is test sentence number ").append(i).append(". ");
+        }
+        String longText = sb.toString();
+
+        server.setEmbeddingHandler(server.successEmbeddingHandler(new float[]{0.1f, 0.2f}));
+
+        // Should handle long text without issues
+        float[] result = client.generateEmbedding(longText);
+
+        assertNotNull(result);
+
+        // Verify the request body was valid JSON
+        List<MockLLMServer.CapturedRequest> requests = server.getCapturedEmbeddingRequests();
+        assertEquals(1, requests.size());
+        assertTrue(JsonWriter.isValidJson(requests.get(0).getBody()),
+                "Request body with long text should be valid JSON");
+    }
 }

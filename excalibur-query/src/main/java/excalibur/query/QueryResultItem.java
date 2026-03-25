@@ -18,6 +18,13 @@ import java.util.Objects;
  *   <li><strong>Inner product:</strong> Higher scores are better</li>
  * </ul>
  *
+ * <h2>Domain Correctness</h2>
+ * <ul>
+ *   <li>Score must be finite (not NaN or Infinity)</li>
+ *   <li>Segment ID and Node ID should be non-negative or -1 for unknown</li>
+ *   <li>Payload is defensively copied on input and output</li>
+ * </ul>
+ *
  * <h2>Thread Safety</h2>
  * <p>This class is immutable and thread-safe.</p>
  *
@@ -37,15 +44,16 @@ public final class QueryResultItem {
      * Creates a new QueryResultItem.
      *
      * @param documentId The document identifier (numeric, for backward compatibility)
-     * @param score The similarity score or distance
+     * @param score The similarity score or distance (must be finite)
      * @param payload Optional payload data (may be null)
      * @param segmentId The segment that produced this result
      * @param nodeId The node ID within the segment's HNSW graph
+     * @throws IllegalArgumentException if score is NaN or Infinity
      */
     public QueryResultItem(long documentId, float score, byte[] payload, long segmentId, long nodeId) {
         this.documentId = documentId;
         this.documentIdStr = null;
-        this.score = score;
+        this.score = validateScore(score);
         this.payload = payload != null ? payload.clone() : null;
         this.segmentId = segmentId;
         this.nodeId = nodeId;
@@ -58,15 +66,16 @@ public final class QueryResultItem {
      * (e.g., "doc1", "source1:file1") from the ingestion pipeline.</p>
      *
      * @param documentIdStr The string document identifier (may be null)
-     * @param score The similarity score or distance
+     * @param score The similarity score or distance (must be finite)
      * @param payload Optional payload data (may be null)
      * @param segmentId The segment that produced this result
      * @param nodeId The node ID within the segment's HNSW graph
+     * @throws IllegalArgumentException if score is NaN or Infinity
      */
     public QueryResultItem(String documentIdStr, float score, byte[] payload, long segmentId, long nodeId) {
         this.documentId = nodeId; // Use nodeId as fallback for backward compatibility
         this.documentIdStr = documentIdStr;
-        this.score = score;
+        this.score = validateScore(score);
         this.payload = payload != null ? payload.clone() : null;
         this.segmentId = segmentId;
         this.nodeId = nodeId;
@@ -77,15 +86,16 @@ public final class QueryResultItem {
      *
      * @param documentId The numeric document identifier (for backward compatibility)
      * @param documentIdStr The string document identifier (actual document ID)
-     * @param score The similarity score or distance
+     * @param score The similarity score or distance (must be finite)
      * @param payload Optional payload data (may be null)
      * @param segmentId The segment that produced this result
      * @param nodeId The node ID within the segment's HNSW graph
+     * @throws IllegalArgumentException if score is NaN or Infinity
      */
     public QueryResultItem(long documentId, String documentIdStr, float score, byte[] payload, long segmentId, long nodeId) {
         this.documentId = documentId;
         this.documentIdStr = documentIdStr;
-        this.score = score;
+        this.score = validateScore(score);
         this.payload = payload != null ? payload.clone() : null;
         this.segmentId = segmentId;
         this.nodeId = nodeId;
@@ -184,11 +194,31 @@ public final class QueryResultItem {
     /**
      * Creates a new QueryResultItem with a different score.
      *
-     * @param newScore The new score value
+     * @param newScore The new score value (must be finite)
      * @return A new QueryResultItem with the updated score
+     * @throws IllegalArgumentException if newScore is NaN or Infinity
      */
     public QueryResultItem withScore(float newScore) {
-        return new QueryResultItem(documentId, documentIdStr, newScore, payload, segmentId, nodeId);
+        return new QueryResultItem(documentId, documentIdStr, validateScore(newScore), payload, segmentId, nodeId);
+    }
+
+    /**
+     * Validates that a score value is finite (not NaN or Infinity).
+     *
+     * <p><strong>Domain Correctness:</strong> Scores must be finite for meaningful
+     * comparison and ranking. NaN and Infinity values indicate computation errors
+     * or invalid input vectors.</p>
+     *
+     * @param score The score to validate
+     * @return The validated score
+     * @throws IllegalArgumentException if score is not finite
+     */
+    private static float validateScore(float score) {
+        if (!Float.isFinite(score)) {
+            throw new IllegalArgumentException(
+                "Score must be finite (not NaN or Infinity): " + score);
+        }
+        return score;
     }
 
     /**

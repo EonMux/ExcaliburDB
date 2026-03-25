@@ -209,6 +209,15 @@ public class QueryEndpoint implements HttpHandler {
      *
      * <p>This is a minimal JSON parser - production code would use
      * a proper JSON library.</p>
+     *
+     * <p><strong>Domain Correctness:</strong> Validates that:</p>
+     * <ul>
+     *   <li>Vector is non-null and non-empty</li>
+     *   <li>All vector values are finite (not NaN or Infinity)</li>
+     *   <li>topK is positive</li>
+     *   <li>threshold is in [0.0, 1.0]</li>
+     *   <li>timeoutMs is positive</li>
+     * </ul>
      */
     private QueryRequest parseRequest(String json, String correlationId) {
         // Simple JSON parsing (in production, use a proper JSON parser)
@@ -232,8 +241,32 @@ public class QueryEndpoint implements HttpHandler {
             : 0.3f;
         float llmThreshold = extractFloat(json, "llm_threshold", defaultLlmThreshold);
 
+        // Domain correctness validation
         if (vector == null || vector.length == 0) {
             throw new IllegalArgumentException("Field 'vector' is required and must be non-empty");
+        }
+
+        // Validate all vector values are finite
+        validateVectorValues(vector);
+
+        // Validate topK
+        if (topK <= 0) {
+            throw new IllegalArgumentException("Field 'top_k' must be positive: " + topK);
+        }
+
+        // Validate threshold
+        if (Float.isNaN(threshold) || threshold < 0.0f || threshold > 1.0f) {
+            throw new IllegalArgumentException("Field 'threshold' must be in range [0.0, 1.0]: " + threshold);
+        }
+
+        // Validate timeoutMs
+        if (timeoutMs <= 0) {
+            throw new IllegalArgumentException("Field 'timeout_ms' must be positive: " + timeoutMs);
+        }
+
+        // Validate llmThreshold
+        if (Float.isNaN(llmThreshold) || llmThreshold < 0.0f || llmThreshold > 1.0f) {
+            throw new IllegalArgumentException("Field 'llm_threshold' must be in range [0.0, 1.0]: " + llmThreshold);
         }
 
         return QueryRequest.builder()
@@ -247,6 +280,26 @@ public class QueryEndpoint implements HttpHandler {
             .llmThreshold(llmThreshold)
             .correlationId(correlationId)
             .build();
+    }
+
+    /**
+     * Validates that all values in a vector are finite.
+     *
+     * <p><strong>Domain Correctness:</strong> Vector values must be finite for
+     * meaningful distance computation. NaN and Infinity values produce undefined
+     * results in similarity calculations.</p>
+     *
+     * @param vector The vector to validate
+     * @throws IllegalArgumentException if any value is NaN or Infinity
+     */
+    private void validateVectorValues(float[] vector) {
+        for (int i = 0; i < vector.length; i++) {
+            if (!Float.isFinite(vector[i])) {
+                throw new IllegalArgumentException(
+                    "Vector contains non-finite value at index " + i + ": " + vector[i] +
+                    ". All vector values must be finite (not NaN or Infinity).");
+            }
+        }
     }
 
     /**

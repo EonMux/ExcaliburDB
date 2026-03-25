@@ -171,6 +171,66 @@ class QueryResultItemTest {
             QueryResultItem item = new QueryResultItem(1L, 1000.0f);
             assertThat(item.score()).isEqualTo(1000.0f);
         }
+
+        @Test
+        @DisplayName("rejects NaN score in constructor")
+        void rejectsNanScore() {
+            assertThatIllegalArgumentException()
+                .isThrownBy(() -> new QueryResultItem(1L, Float.NaN))
+                .withMessageContaining("Score must be finite");
+        }
+
+        @Test
+        @DisplayName("rejects positive infinity score in constructor")
+        void rejectsPositiveInfinityScore() {
+            assertThatIllegalArgumentException()
+                .isThrownBy(() -> new QueryResultItem(1L, Float.POSITIVE_INFINITY))
+                .withMessageContaining("Score must be finite");
+        }
+
+        @Test
+        @DisplayName("rejects negative infinity score in constructor")
+        void rejectsNegativeInfinityScore() {
+            assertThatIllegalArgumentException()
+                .isThrownBy(() -> new QueryResultItem(1L, Float.NEGATIVE_INFINITY))
+                .withMessageContaining("Score must be finite");
+        }
+
+        @Test
+        @DisplayName("rejects NaN score in string document ID constructor")
+        void rejectsNanScoreStringDocId() {
+            assertThatIllegalArgumentException()
+                .isThrownBy(() -> new QueryResultItem("doc1", Float.NaN, null, 1L, 1L))
+                .withMessageContaining("Score must be finite");
+        }
+
+        @Test
+        @DisplayName("rejects NaN score in full constructor")
+        void rejectsNanScoreFullConstructor() {
+            assertThatIllegalArgumentException()
+                .isThrownBy(() -> new QueryResultItem(1L, "doc1", Float.NaN, null, 1L, 1L))
+                .withMessageContaining("Score must be finite");
+        }
+
+        @Test
+        @DisplayName("rejects NaN score in withScore method")
+        void rejectsNanScoreInWithScore() {
+            QueryResultItem original = new QueryResultItem(1L, 0.5f);
+
+            assertThatIllegalArgumentException()
+                .isThrownBy(() -> original.withScore(Float.NaN))
+                .withMessageContaining("Score must be finite");
+        }
+
+        @Test
+        @DisplayName("rejects infinity score in withScore method")
+        void rejectsInfinityScoreInWithScore() {
+            QueryResultItem original = new QueryResultItem(1L, 0.5f);
+
+            assertThatIllegalArgumentException()
+                .isThrownBy(() -> original.withScore(Float.POSITIVE_INFINITY))
+                .withMessageContaining("Score must be finite");
+        }
     }
 
     @Nested

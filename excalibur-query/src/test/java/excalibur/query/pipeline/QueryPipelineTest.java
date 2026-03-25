@@ -1,0 +1,538 @@
+package excalibur.query.pipeline;
+
+import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.ingest.visibility.DocumentVisibilityChecker;
+import excalibur.query.QueryRequest;
+import excalibur.query.QueryResponse;
+import excalibur.query.executor.CancellationToken;
+import excalibur.shard.VisibilityTracker;
+import io.excalibur.store.StorageEngine;
+import io.excalibur.vector.distance.DistanceFunction;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+/**
+ * Unit tests for QueryPipeline.
+ *
+ * <p>Tests verify basic functionality, configuration, and error handling.</p>
+ */
+@DisplayName("QueryPipeline")
+@ExtendWith(MockitoExtension.class)
+class QueryPipelineTest {
+
+    @Mock
+    private StorageEngine storageEngine;
+
+    @Mock
+    private VisibilityTracker visibilityTracker;
+
+    @Mock
+    private DocumentVisibilityChecker visibilityChecker;
+
+    @Mock
+    private QueryPipeline.HnswGraphProvider graphProvider;
+
+    @Mock
+    private DistanceFunction distanceFunction;
+
+    @Mock
+    private QueryPipeline.LlmScorer llmScorer;
+
+    @Mock
+    private HierarchicalCuckooFilter hierarchicalFilter;
+
+    private QueryPipeline pipeline;
+
+    @BeforeEach
+    void setUp() {
+        lenient().when(visibilityTracker.currentEpoch()).thenReturn(1L);
+
+        // Use the simplest constructor
+        pipeline = new QueryPipeline(
+            storageEngine,
+            visibilityTracker,
+            graphProvider,
+            distanceFunction
+        );
+    }
+
+    @Nested
+    @DisplayName("Constructor - 4 params")
+    class Constructor4Params {
+
+        @Test
+        @DisplayName("rejects null storage engine")
+        void rejectsNullStorageEngine() {
+            assertThatThrownBy(() -> new QueryPipeline(
+                null,
+                visibilityTracker,
+                graphProvider,
+                distanceFunction
+            )).isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("rejects null visibility tracker")
+        void rejectsNullVisibilityTracker() {
+            assertThatThrownBy(() -> new QueryPipeline(
+                storageEngine,
+                null,
+                graphProvider,
+                distanceFunction
+            )).isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("rejects null graph provider")
+        void rejectsNullGraphProvider() {
+            assertThatThrownBy(() -> new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                null,
+                distanceFunction
+            )).isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("rejects null distance function")
+        void rejectsNullDistanceFunction() {
+            assertThatThrownBy(() -> new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                graphProvider,
+                null
+            )).isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("creates pipeline with valid params")
+        void createsPipelineWithValidParams() {
+            QueryPipeline p = new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                graphProvider,
+                distanceFunction
+            );
+
+            assertThat(p).isNotNull();
+            assertThat(p.getLlmScorer()).isNull();
+            assertThat(p.getVisibilityChecker()).isNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("Constructor - 5 params")
+    class Constructor5Params {
+
+        @Test
+        @DisplayName("creates pipeline with visibility checker")
+        void createsPipelineWithVisibilityChecker() {
+            QueryPipeline p = new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                visibilityChecker,
+                graphProvider,
+                distanceFunction
+            );
+
+            assertThat(p).isNotNull();
+            assertThat(p.getVisibilityChecker()).isEqualTo(visibilityChecker);
+        }
+
+        @Test
+        @DisplayName("accepts null visibility checker")
+        void acceptsNullVisibilityChecker() {
+            QueryPipeline p = new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                null,
+                graphProvider,
+                distanceFunction
+            );
+
+            assertThat(p).isNotNull();
+            assertThat(p.getVisibilityChecker()).isNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("Constructor - 6 params")
+    class Constructor6Params {
+
+        @Test
+        @DisplayName("creates pipeline with LLM scorer")
+        void createsPipelineWithLlmScorer() {
+                QueryPipeline p = new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                graphProvider,
+                distanceFunction,
+                llmScorer,
+                0.5
+                );
+
+                assertThat(p).isNotNull();
+                assertThat(p.getLlmScorer()).isEqualTo(llmScorer);
+        }
+
+        @Test
+        @DisplayName("accepts null LLM scorer")
+        void acceptsNullLlmScorer() {
+                QueryPipeline p = new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                graphProvider,
+                distanceFunction,
+                null,
+                0.5
+                );
+
+                assertThat(p).isNotNull();
+                assertThat(p.getLlmScorer()).isNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("Constructor - 7 params")
+    class Constructor7Params {
+
+        @Test
+        @DisplayName("creates pipeline with all options")
+        void createsPipelineWithAllOptions() {
+            QueryPipeline p = new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                visibilityChecker,
+                graphProvider,
+                distanceFunction,
+                llmScorer,
+                0.75
+            );
+
+            assertThat(p).isNotNull();
+            assertThat(p.getVisibilityChecker()).isEqualTo(visibilityChecker);
+            assertThat(p.getLlmScorer()).isEqualTo(llmScorer);
+        }
+    }
+
+    @Nested
+    @DisplayName("Constructor - 8 params")
+    class Constructor8Params {
+
+        @Test
+        @DisplayName("creates pipeline with hierarchical filter")
+        void createsPipelineWithHierarchicalFilter() {
+            QueryPipeline p = new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                visibilityChecker,
+                graphProvider,
+                distanceFunction,
+                llmScorer,
+                0.75,
+                hierarchicalFilter
+            );
+
+            assertThat(p).isNotNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("withLlmScorer()")
+    class WithLlmScorer {
+
+        @Test
+        @DisplayName("sets LLM scorer and returns new instance")
+        void setsLlmScorerAndReturnsNewInstance() {
+            QueryPipeline newPipeline = pipeline.withLlmScorer(llmScorer);
+
+            assertThat(newPipeline).isNotNull();
+            assertThat(newPipeline).isNotSameAs(pipeline);
+            assertThat(newPipeline.getLlmScorer()).isEqualTo(llmScorer);
+        }
+
+        @Test
+        @DisplayName("accepts null LLM scorer")
+        void acceptsNullLlmScorer() {
+            QueryPipeline newPipeline = pipeline.withLlmScorer(null);
+
+            assertThat(newPipeline).isNotNull();
+            assertThat(newPipeline.getLlmScorer()).isNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("withVisibilityChecker()")
+    class WithVisibilityChecker {
+
+        @Test
+        @DisplayName("sets visibility checker and returns New instance")
+        void setsVisibilityCheckerAndReturnsNewInstance() {
+            DocumentVisibilityChecker newChecker = mock(DocumentVisibilityChecker.class);
+            QueryPipeline newPipeline = pipeline.withVisibilityChecker(newChecker);
+
+            assertThat(newPipeline).isNotNull();
+            assertThat(newPipeline).isNotSameAs(pipeline);
+            assertThat(newPipeline.getVisibilityChecker()).isEqualTo(newChecker);
+        }
+
+        @Test
+        @DisplayName("accepts null visibility checker")
+        void acceptsNullVisibilityChecker() {
+            QueryPipeline newPipeline = pipeline.withVisibilityChecker(null);
+
+            assertThat(newPipeline).isNotNull();
+            assertThat(newPipeline.getVisibilityChecker()).isNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("getLlmScorer()")
+    class GetLlmScorer {
+
+        @Test
+        @DisplayName("returns null when not set")
+        void returnsNullWhenNotSet() {
+            assertThat(pipeline.getLlmScorer()).isNull();
+        }
+
+        @Test
+        @DisplayName("returns set LLM scorer")
+        void returnsSetLlmScorer() {
+            QueryPipeline newPipeline = pipeline.withLlmScorer(llmScorer);
+            assertThat(newPipeline.getLlmScorer()).isEqualTo(llmScorer);
+        }
+    }
+
+    @Nested
+    @DisplayName("getVisibilityChecker()")
+    class GetVisibilityChecker {
+
+        @Test
+        @DisplayName("returns null when not set")
+        void returnsNullWhenNotSet() {
+            assertThat(pipeline.getVisibilityChecker()).isNull();
+        }
+
+        @Test
+        @DisplayName("returns set visibility checker")
+        void returnsSetVisibilityChecker() {
+            QueryPipeline newPipeline = pipeline.withVisibilityChecker(visibilityChecker);
+            assertThat(newPipeline.getVisibilityChecker()).isEqualTo(visibilityChecker);
+        }
+    }
+
+    @Nested
+    @DisplayName("execute()")
+    class Execute {
+
+        @Test
+        @DisplayName("rejects null request")
+        void rejectsNullRequest() {
+            CancellationToken token = new CancellationToken();
+
+            assertThatThrownBy(() -> pipeline.execute(null, token))
+                .isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("rejects null cancellation token")
+        void rejectsNullCancellationToken() {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .build();
+
+            assertThatThrownBy(() -> pipeline.execute(request, null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("CancellationToken cannot be null");
+        }
+
+        @Test
+        @DisplayName("returns CompletableFuture")
+        void returnsCompletableFuture() {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            CompletableFuture<QueryResponse> future = pipeline.execute(request, token);
+
+            assertThat(future).isNotNull();
+        }
+
+        @Test
+        @DisplayName("returns response with coverage info")
+        void returnsResponseWithCoverageInfo() throws Exception {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            CompletableFuture<QueryResponse> future = pipeline.execute(request, token);
+            QueryResponse response = future.get(5, TimeUnit.SECONDS);
+
+            assertThat(response).isNotNull();
+            assertThat(response.coverage()).isNotNull();
+            assertThat(response.results()).isNotNull();
+            assertThat(response.timedOut()).isFalse();
+        }
+
+        @Test
+        @DisplayName("handles cancellation")
+        void handlesCancellation() throws Exception {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .build();
+            CancellationToken token = new CancellationToken();
+            token.cancel("Test cancellation");
+
+            CompletableFuture<QueryResponse> future = pipeline.execute(request, token);
+            QueryResponse response = future.get(5, TimeUnit.SECONDS);
+
+            // Should complete quickly due to cancellation
+            assertThat(response).isNotNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("executeSync()")
+    class ExecuteSync {
+
+        @Test
+        @DisplayName("rejects null request")
+        void rejectsNullRequest() {
+            CancellationToken token = new CancellationToken();
+
+            assertThatThrownBy(() -> pipeline.executeSync(null, token))
+                .isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("returns QueryResponse")
+        void returnsQueryResponse() {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            QueryResponse response = pipeline.executeSync(request, token);
+
+            assertThat(response).isNotNull();
+            assertThat(response.coverage()).isNotNull();
+            assertThat(response.results()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("returns empty results for no segments")
+        void returnsEmptyResultsForNoSegments() {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            QueryResponse response = pipeline.executeSync(request, token);
+
+            assertThat(response.results()).isEmpty();
+            assertThat(response.coverage().totalSegments()).isEqualTo(0);
+        }
+    }
+
+    @Nested
+    @DisplayName("Query parameters")
+    class QueryParameters {
+
+        @Test
+        @DisplayName("respects topK parameter")
+        void respectsTopKParameter() {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(5)
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            QueryResponse response = pipeline.executeSync(request, token);
+
+            // With no segments, results are empty
+            assertThat(response.results().size()).isLessThanOrEqualTo(5);
+        }
+
+        @Test
+        @DisplayName("accepts query text")
+        void acceptsQueryText() {
+            QueryRequest request = QueryRequest.builder()
+                .queryText("test query")
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            QueryResponse response = pipeline.executeSync(request, token);
+
+            assertThat(response).isNotNull();
+        }
+
+        @Test
+        @DisplayName("accepts include partial segments flag")
+        void acceptsIncludePartialSegmentsFlag() {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .includePartialSegments(true)
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            QueryResponse response = pipeline.executeSync(request, token);
+
+            assertThat(response).isNotNull();
+        }
+
+        @Test
+        @DisplayName("accepts enable LLM scoring flag")
+        void acceptsEnableLlmScoringFlag() {
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .enableLlmScoring(true)
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            QueryResponse response = pipeline.executeSync(request, token);
+
+            assertThat(response).isNotNull();
+        }
+    }
+
+    @Nested
+    @DisplayName("Default constants")
+    class DefaultConstants {
+
+        @Test
+        @DisplayName("DEFAULT_COVERAGE_THRESHOLD is 0.5")
+        void defaultCoverageThresholdIs05() {
+            assertThat(QueryPipeline.DEFAULT_COVERAGE_THRESHOLD).isEqualTo(0.5);
+        }
+
+        @Test
+        @DisplayName("DEFAULT_LLM_THRESHOLD is 0.3")
+        void defaultLlmThresholdIs03() {
+            assertThat(QueryPipeline.DEFAULT_LLM_THRESHOLD).isEqualTo(0.3f);
+        }
+    }
+}

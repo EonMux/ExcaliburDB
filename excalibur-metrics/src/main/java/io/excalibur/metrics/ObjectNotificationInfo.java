@@ -5,6 +5,10 @@ import java.util.Map;
 
 /**
  * MBean notification info.
+ *
+ * <h2>Thread Safety</h2>
+ * <p>This class is NOT thread-safe. Instances should not be modified after creation.
+ * The public fields are directly accessible and modifications are not synchronized.</p>
  */
 public class ObjectNotificationInfo {
 

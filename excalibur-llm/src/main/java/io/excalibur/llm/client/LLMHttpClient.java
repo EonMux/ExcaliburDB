@@ -746,6 +746,15 @@ public class LLMHttpClient {
         // All retries exhausted
         LOG.error("All {} retry attempts exhausted for request to {} (correlationId={})",
                 maxRetries + 1, url, correlationId);
+
+        // Domain correctness: ensure we always throw a documented exception
+        // This should never be null in practice, but defensive programming ensures
+        // we throw a documented LLMException rather than NullPointerException
+        if (lastException == null) {
+            throw new LLMException(
+                "Request failed after " + (maxRetries + 1) + " attempts with unknown error",
+                ErrorType.NETWORK);
+        }
         throw lastException;
     }
 

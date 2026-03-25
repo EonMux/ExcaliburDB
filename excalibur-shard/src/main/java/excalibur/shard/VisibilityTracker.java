@@ -51,6 +51,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>Creation epoch is always <= current epoch</li>
  *   <li>Tombstone epoch is Long.MAX_VALUE for non-tombstoned segments</li>
  *   <li>visibleSegments returns immutable sets</li>
+ *   <li>Epoch overflow is detected and logged</li>
  * </ul>
  *
  * @author ExcaliburDB
@@ -185,10 +186,31 @@ public class VisibilityTracker implements io.excalibur.store.VisibilityTracker {
      *   <li>After segment state transitions</li>
      * </ul>
      *
+     * <p><strong>Domain Correctness:</strong> Epochs must monotonically increase.
+     * If overflow is detected (epoch approaching Long.MAX_VALUE), a warning is logged.
+     * The epoch will wrap to Long.MIN_VALUE on overflow, which is handled by the
+     * comparison logic in visibility checks.</p>
+     *
      * @return The new epoch value after advancement
      */
     public long advanceEpoch() {
+        long previousEpoch = globalEpoch.get();
         long newEpoch = globalEpoch.incrementAndGet();
+
+        // Domain correctness: detect overflow
+        if (newEpoch < previousEpoch && previousEpoch > 0) {
+            // Epoch overflow detected - this is extremely unlikely in practice
+            // (would require ~9.2e18 advances) but we log it for debugging
+            LOGGER.warn("Epoch overflow detected: {} -> {}. Visibility tracking may be compromised.",
+                previousEpoch, newEpoch);
+        }
+
+        // Validate monotonicity
+        if (newEpoch <= previousEpoch && previousEpoch >= 0 && newEpoch >= 0) {
+            LOGGER.error("Epoch did not advance monotonically: {} -> {}. This indicates a bug.",
+                previousEpoch, newEpoch);
+        }
+
         LOGGER.trace("Epoch advanced to {}", newEpoch);
         return newEpoch;
     }
@@ -198,11 +220,22 @@ public class VisibilityTracker implements io.excalibur.store.VisibilityTracker {
      *
      * <p>This is a conditional advance that can be used for optimistic updates.</p>
      *
-     * @param expectedEpoch The expected current epoch
+     * <p><strong>Domain Correctness:</strong> Validates that the expected epoch is
+     * non-negative and that the advancement maintains monotonicity.</p>
+     *
+     * @param expectedEpoch The expected current epoch (must be non-negative)
      * @return true if the epoch was advanced, false if the current epoch didn't match
+     * @throws IllegalArgumentException if expectedEpoch is negative
      */
     public boolean compareAndAdvanceEpoch(long expectedEpoch) {
-        return globalEpoch.compareAndSet(expectedEpoch, expectedEpoch + 1);
+        if (expectedEpoch < 0) {
+            throw new IllegalArgumentException("Expected epoch must be non-negative: " + expectedEpoch);
+        }
+        boolean success = globalEpoch.compareAndSet(expectedEpoch, expectedEpoch + 1);
+        if (success) {
+            LOGGER.trace("Epoch advanced from {} to {} via CAS", expectedEpoch, expectedEpoch + 1);
+        }
+        return success;
     }
 
     // ==================== Segment Registration ====================

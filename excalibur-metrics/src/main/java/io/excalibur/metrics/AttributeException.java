@@ -2,6 +2,10 @@ package io.excalibur.metrics;
 
 /**
  * JMX attribute exception.
+ *
+ * <h2>Thread Safety</h2>
+ * <p>This class is immutable and thread-safe. Once constructed, the exception's
+ * state (message and cause) cannot be modified.</p>
  */
 public class AttributeException extends Exception {
 
