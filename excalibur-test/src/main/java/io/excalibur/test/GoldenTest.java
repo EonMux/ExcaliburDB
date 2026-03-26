@@ -1,13 +1,13 @@
 /*
  * excalibur-test - Query Result Verification Service
- * 
+ *
  * Package: io.excalibur.test
- * 
- * Thread Safety: 
+ *
+ * Thread Safety:
  *   - GoldenTest: Thread-safe for test execution, each test instance is independent
  *   - ResultComparator: Thread-safe, stateless comparison operations
  *   - ExpectedResult: Thread-safe, immutable result builder
- *   - VerificationReport: Thread-safe for creation, NOT thread-safe for concurrent modification
+ *   - ResultComparator.Difference: Thread-safe, immutable difference representation
  */
 
 package io.excalibur.test;

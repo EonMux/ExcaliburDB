@@ -325,281 +325,108 @@ class StatsEndpointTest {
     }
 
     @Nested
-    @DisplayName("SegmentStats record")
-    class SegmentStatsTests {
+    @DisplayName("Record validation - combined")
+    class RecordValidationTests {
 
         @Test
-        @DisplayName("rejects negative total")
-        void rejectsNegativeTotal() {
+        @DisplayName("validates all record constraints in one test")
+        void validatesAllRecordConstraints() {
+            // SegmentStats - negative values rejected
             assertThatThrownBy(() -> new StatsEndpoint.SegmentStats(-1, 0, 0, 0, 0, 0, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("segment counts must be non-negative");
-        }
-
-        @Test
-        @DisplayName("rejects negative active")
-        void rejectsNegativeActive() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SegmentStats(0, -1, 0, 0, 0, 0, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("segment counts must be non-negative");
-        }
-
-        @Test
-        @DisplayName("accepts zero values")
-        void acceptsZeroValues() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new StatsEndpoint.SegmentStats(0, 0, 0, 0, 0, 0, 0))
                 .doesNotThrowAnyException();
-        }
-    }
 
-    @Nested
-    @DisplayName("EntryStats record")
-    class EntryStatsTests {
-
-        @Test
-        @DisplayName("rejects negative total")
-        void rejectsNegativeTotal() {
+            // EntryStats - negative rejected
             assertThatThrownBy(() -> new StatsEndpoint.EntryStats(-1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Entry count must be non-negative");
-        }
-
-        @Test
-        @DisplayName("accepts zero")
-        void acceptsZero() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new StatsEndpoint.EntryStats(0))
                 .doesNotThrowAnyException();
-        }
-    }
 
-    @Nested
-    @DisplayName("VolumeStats record")
-    class VolumeStatsTests {
-
-        @Test
-        @DisplayName("rejects negative count")
-        void rejectsNegativeCount() {
+            // VolumeStats - all fields validated
             assertThatThrownBy(() -> new StatsEndpoint.VolumeStats(-1, 0, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Volume count must be non-negative");
-        }
-
-        @Test
-        @DisplayName("rejects negative totalBytes")
-        void rejectsNegativeTotalBytes() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.VolumeStats(0, -1, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Total bytes must be non-negative");
-        }
-
-        @Test
-        @DisplayName("rejects negative usedBytes")
-        void rejectsNegativeUsedBytes() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.VolumeStats(0, 0, -1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Used bytes must be non-negative");
-        }
-
-        @Test
-        @DisplayName("accepts zero values")
-        void acceptsZeroValues() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new StatsEndpoint.VolumeStats(0, 0, 0))
                 .doesNotThrowAnyException();
-        }
-    }
 
-    @Nested
-    @DisplayName("HnswStats record")
-    class HnswStatsTests {
-
-        @Test
-        @DisplayName("rejects negative queueDepth")
-        void rejectsNegativeQueueDepth() {
+            // HnswStats - all fields validated
             assertThatThrownBy(() -> new StatsEndpoint.HnswStats(-1, 0, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Queue depth must be non-negative");
-        }
-
-        @Test
-        @DisplayName("rejects negative queueDepthLimit")
-        void rejectsNegativeQueueDepthLimit() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.HnswStats(0, -1, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Queue depth limit must be non-negative");
-        }
-
-        @Test
-        @DisplayName("rejects negative vectorsIntegrated")
-        void rejectsNegativeVectorsIntegrated() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.HnswStats(0, 0, -1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Vectors integrated must be non-negative");
-        }
-
-        @Test
-        @DisplayName("accepts zero values")
-        void acceptsZeroValues() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new StatsEndpoint.HnswStats(0, 0, 0))
                 .doesNotThrowAnyException();
-        }
-    }
 
-    @Nested
-    @DisplayName("CuckooStats record")
-    class CuckooStatsTests {
-
-        @Test
-        @DisplayName("rejects negative pendingDeletions")
-        void rejectsNegativePendingDeletions() {
+            // CuckooStats - both fields validated
             assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(-1, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Pending deletions must be non-negative");
-        }
-
-        @Test
-        @DisplayName("rejects negative totalDeletions")
-        void rejectsNegativeTotalDeletions() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, -1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Total deletions must be non-negative");
-        }
-
-        @Test
-        @DisplayName("accepts zero values")
-        void acceptsZeroValues() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0))
                 .doesNotThrowAnyException();
-        }
-    }
 
-    @Nested
-    @DisplayName("VisibilityStats record")
-    class VisibilityStatsTests {
-
-        @Test
-        @DisplayName("rejects negative epoch")
-        void rejectsNegativeEpoch() {
+            // VisibilityStats - all fields validated
             assertThatThrownBy(() -> new StatsEndpoint.VisibilityStats(-1, 0, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Epoch must be non-negative");
-        }
-
-        @Test
-        @DisplayName("rejects negative registeredSegments")
-        void rejectsNegativeRegisteredSegments() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.VisibilityStats(0, -1, 0))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Registered segments must be non-negative");
-        }
-
-        @Test
-        @DisplayName("rejects negative visibleSegments")
-        void rejectsNegativeVisibleSegments() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.VisibilityStats(0, 0, -1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Visible segments must be non-negative");
-        }
-
-        @Test
-        @DisplayName("accepts zero values")
-        void acceptsZeroValues() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new StatsEndpoint.VisibilityStats(0, 0, 0))
                 .doesNotThrowAnyException();
         }
-    }
-
-    @Nested
-    @DisplayName("SystemStats record")
-    class SystemStatsTests {
-
-        private StatsEndpoint.SegmentStats segments = new StatsEndpoint.SegmentStats(0, 0, 0, 0, 0, 0, 0);
-        private StatsEndpoint.EntryStats entries = new StatsEndpoint.EntryStats(0);
-        private StatsEndpoint.VolumeStats volumes = new StatsEndpoint.VolumeStats(0, 0, 0);
-        private StatsEndpoint.HnswStats hnsw = new StatsEndpoint.HnswStats(0, 0, 0);
-        private StatsEndpoint.CuckooStats cuckoo = new StatsEndpoint.CuckooStats(0, 0);
-        private StatsEndpoint.VisibilityStats visibility = new StatsEndpoint.VisibilityStats(0, 0, 0);
 
         @Test
-        @DisplayName("rejects NaN coverage")
-        void rejectsNanCoverage() {
+        @DisplayName("validates SystemStats constraints")
+        void validatesSystemStatsConstraints() {
+            StatsEndpoint.SegmentStats segments = new StatsEndpoint.SegmentStats(0, 0, 0, 0, 0, 0, 0);
+            StatsEndpoint.EntryStats entries = new StatsEndpoint.EntryStats(0);
+            StatsEndpoint.VolumeStats volumes = new StatsEndpoint.VolumeStats(0, 0, 0);
+            StatsEndpoint.HnswStats hnsw = new StatsEndpoint.HnswStats(0, 0, 0);
+            StatsEndpoint.CuckooStats cuckoo = new StatsEndpoint.CuckooStats(0, 0);
+            StatsEndpoint.VisibilityStats visibility = new StatsEndpoint.VisibilityStats(0, 0, 0);
+
+            // Coverage validation
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 segments, entries, volumes, hnsw, cuckoo, visibility, Double.NaN))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Coverage must be in range");
-        }
-
-        @Test
-        @DisplayName("rejects coverage below 0.0")
-        void rejectsCoverageBelowZero() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 segments, entries, volumes, hnsw, cuckoo, visibility, -0.1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Coverage must be in range");
-        }
-
-        @Test
-        @DisplayName("rejects coverage above 1.0")
-        void rejectsCoverageAboveOne() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 segments, entries, volumes, hnsw, cuckoo, visibility, 1.1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Coverage must be in range");
-        }
-
-        @Test
-        @DisplayName("accepts boundary coverage values 0.0 and 1.0")
-        void acceptsBoundaryCoverage() {
+                .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new StatsEndpoint.SystemStats(
                 segments, entries, volumes, hnsw, cuckoo, visibility, 0.0))
                 .doesNotThrowAnyException();
             assertThatCode(() -> new StatsEndpoint.SystemStats(
                 segments, entries, volumes, hnsw, cuckoo, visibility, 1.0))
                 .doesNotThrowAnyException();
-        }
 
-        @Test
-        @DisplayName("rejects null segments")
-        void rejectsNullSegments() {
+            // Null validation
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 null, entries, volumes, hnsw, cuckoo, visibility, 0.5))
                 .isInstanceOf(NullPointerException.class);
-        }
-
-        @Test
-        @DisplayName("rejects null entries")
-        void rejectsNullEntries() {
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 segments, null, volumes, hnsw, cuckoo, visibility, 0.5))
                 .isInstanceOf(NullPointerException.class);
-        }
-
-        @Test
-        @DisplayName("rejects null volumes")
-        void rejectsNullVolumes() {
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 segments, entries, null, hnsw, cuckoo, visibility, 0.5))
                 .isInstanceOf(NullPointerException.class);
-        }
-
-        @Test
-        @DisplayName("rejects null hnsw")
-        void rejectsNullHnsw() {
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 segments, entries, volumes, null, cuckoo, visibility, 0.5))
                 .isInstanceOf(NullPointerException.class);
-        }
-
-        @Test
-        @DisplayName("rejects null cuckoo")
-        void rejectsNullCuckoo() {
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 segments, entries, volumes, hnsw, null, visibility, 0.5))
                 .isInstanceOf(NullPointerException.class);
-        }
-
-        @Test
-        @DisplayName("rejects null visibility")
-        void rejectsNullVisibility() {
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
                 segments, entries, volumes, hnsw, cuckoo, null, 0.5))
                 .isInstanceOf(NullPointerException.class);

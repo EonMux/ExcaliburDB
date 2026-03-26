@@ -264,6 +264,22 @@ public class Segment implements AutoCloseable {
     private excalibur.filter.sketch.CountMinSketch termFrequencySketch;
 
     /**
+     * HNSW graph for approximate nearest neighbor search.
+     * This graph stores vectors and enables efficient ANN queries.
+     * Attached during segment initialization by the HNSW initializer.
+     * Volatile to ensure visibility across threads after attachment.
+     */
+    private volatile io.excalibur.vector.hnsw.HnswGraph hnswGraph;
+
+    /**
+     * Tail offset tracker for the HNSW graph.
+     * Tracks the write log offset up to which entries have been integrated
+     * into the HNSW graph. Used for tail scan during queries.
+     * Volatile to ensure visibility across threads after attachment.
+     */
+    private volatile io.excalibur.vector.hnsw.TailOffsetTracker tailOffsetTracker;
+
+    /**
      * Split state for copy-on-write splitting.
      * A segment can be in one of three states:
      * - NORMAL: No split in progress
@@ -2349,6 +2365,102 @@ public class Segment implements AutoCloseable {
      */
     public excalibur.filter.sketch.CountMinSketch getTermFrequencySketch() {
         return termFrequencySketch;
+    }
+
+    // ==================== HNSW Graph Methods ====================
+
+    /**
+     * Attaches an HNSW graph for approximate nearest neighbor search.
+     *
+     * <p>The HNSW graph is used for efficient vector similarity search.
+     * It is incrementally populated during ingestion as vectors are written
+     * to the segment.</p>
+     *
+     * @param graph The HNSW graph to attach (must not be null)
+     * @throws NullPointerException if graph is null
+     * @throws IllegalStateException if segment is closed
+     */
+    public void attachHnswGraph(io.excalibur.vector.hnsw.HnswGraph graph) {
+        Objects.requireNonNull(graph, "HnswGraph cannot be null");
+        validateNotClosed();
+
+        lock.writeLock().lock();
+        try {
+            this.hnswGraph = graph;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Returns the HNSW graph attached to this segment.
+     *
+     * <p>The HNSW graph enables efficient approximate nearest neighbor
+     * search over vectors stored in this segment. Returns null if no
+     * graph has been attached.</p>
+     *
+     * @return The HNSW graph, or null if none is attached
+     */
+    public io.excalibur.vector.hnsw.HnswGraph hnswGraph() {
+        return hnswGraph;
+    }
+
+    /**
+     * Returns the HNSW graph attached to this segment.
+     *
+     * <p>This is an alias for {@link #hnswGraph()} for API consistency.</p>
+     *
+     * @return The HNSW graph, or null if none is attached
+     */
+    public io.excalibur.vector.hnsw.HnswGraph getHnswGraph() {
+        return hnswGraph;
+    }
+
+    /**
+     * Attaches a tail offset tracker for the HNSW graph.
+     *
+     * <p>The tail offset tracker manages the {@code lastIntegratedOffset} which
+     * tracks the write log offset up to which all entries have been linked into
+     * the HNSW graph. This is critical for the live-indexing tail scan.</p>
+     *
+     * @param tracker The tail offset tracker to attach (must not be null)
+     * @throws NullPointerException if tracker is null
+     * @throws IllegalStateException if segment is closed
+     */
+    public void attachTailOffsetTracker(io.excalibur.vector.hnsw.TailOffsetTracker tracker) {
+        Objects.requireNonNull(tracker, "TailOffsetTracker cannot be null");
+        validateNotClosed();
+
+        lock.writeLock().lock();
+        try {
+            this.tailOffsetTracker = tracker;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Returns the tail offset tracker for the HNSW graph.
+     *
+     * <p>The tracker manages the write log offset up to which entries have
+     * been integrated into the HNSW graph. Used for tail scan during queries
+     * to find un-integrated entries.</p>
+     *
+     * @return The tail offset tracker, or null if none is attached
+     */
+    public io.excalibur.vector.hnsw.TailOffsetTracker tailOffsetTracker() {
+        return tailOffsetTracker;
+    }
+
+    /**
+     * Returns the tail offset tracker for the HNSW graph.
+     *
+     * <p>This is an alias for {@link #tailOffsetTracker()} for API consistency.</p>
+     *
+     * @return The tail offset tracker, or null if none is attached
+     */
+    public io.excalibur.vector.hnsw.TailOffsetTracker getTailOffsetTracker() {
+        return tailOffsetTracker;
     }
 
     /**

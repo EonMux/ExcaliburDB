@@ -10,17 +10,23 @@ import excalibur.api.endpoint.ReindexEndpoint;
 import excalibur.api.endpoint.IngestStatusEndpoint;
 import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
+import excalibur.ingest.registry.DocumentRegistry;
+import excalibur.shard.ReindexOperationHandler;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceResolver;
 import excalibur.ingest.visibility.DocumentVisibilityChecker;
+import excalibur.ingest.visibility.DocumentVisibilityTracker;
+import excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import excalibur.query.pipeline.QueryPipeline;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
+import io.excalibur.vector.hnsw.HnswConfigFactory;
 import io.excalibur.config.Config;
 import io.excalibur.config.ConfigLoader;
 import io.excalibur.config.ConfigValidation;
 import io.excalibur.llm.client.LLMHttpClient;
+import excalibur.llm.embedding.EmbeddingClient;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -110,7 +116,12 @@ public class ExcaliburDBServer {
     // Optional ingestion pipeline components (may be null for stub mode)
     private TextChunker textChunker;
     private LLMHttpClient llmClient;
+    private EmbeddingClient embeddingClient;
     private IngestionOrchestrator ingestionOrchestrator;
+    private DocumentVisibilityTracker documentVisibilityTracker;  // Shared with query pipeline for atomicity
+
+    // HNSW configuration factory for creating graphs with proper config
+    private final HnswConfigFactory hnswConfigFactory;
 
     private HttpServer server;
     private final AtomicBoolean running;
@@ -238,8 +249,14 @@ public class ExcaliburDBServer {
         this.reindexStatusRegistry = new ReindexEndpoint.InMemoryReindexStatusRegistry();
         this.ingestionStatusRegistry = new IngestStatusEndpoint.InMemoryIngestionStatusRegistry();
 
-        LOGGER.debug("ExcaliburDBServer configured for port {} with VolumeManager: {}, Config: {}",
-            port, volumeManager != null ? "enabled" : "disabled", config != null ? "enabled" : "disabled");
+        // Initialize HNSW config factory from Config.Shard if available
+        this.hnswConfigFactory = config != null
+            ? HnswConfigFactory.fromShardConfig(config.shard())
+            : HnswConfigFactory.withDefaults();
+
+        LOGGER.debug("ExcaliburDBServer configured for port {} with VolumeManager: {}, Config: {}, HnswConfigFactory: efConstruction={}, efSearch={}",
+            port, volumeManager != null ? "enabled" : "disabled", config != null ? "enabled" : "disabled",
+            hnswConfigFactory.getEfConstruction(), hnswConfigFactory.getEfSearch());
     }
 
     // ==================== Static Factory Methods ====================
@@ -451,6 +468,16 @@ public class ExcaliburDBServer {
      * configuration, the endpoint operates in stub mode (accepts requests but
      * performs no actual reindexing).</p>
      *
+     * <h3>Zero-Downtime Rolling Replacement</h3>
+     * <p>If VolumeManager and SegmentCatalog are available, scheduled reindexes
+     * will use rolling replacement:</p>
+     * <ul>
+     *   <li>New segments are created in BOOTSTRAPPING state</li>
+     *   <li>Old segments continue serving queries during reindexing</li>
+     *   <li>New segments progress through INDEXING → WARMING → ACTIVE</li>
+     *   <li>Old segments are tombstoned after new segments become ACTIVE</li>
+     * </ul>
+     *
      * <h3>Domain Correctness</h3>
      * <ul>
      *   <li>DocumentReindexer and SourceResolver must both be non-null or both be null</li>
@@ -477,6 +504,49 @@ public class ExcaliburDBServer {
         }
         this.documentReindexer = documentReindexer;
         this.sourceResolver = sourceResolver;
+
+        // Wire the reindexer to the scheduler for automatic scheduled reindexing
+        if (documentReindexer != null && sourceResolver != null) {
+            indexOrchestrator.setReindexOperationHandler(sourceId -> {
+                try {
+                    Source source = sourceResolver.resolve(sourceId);
+                    if (source == null) {
+                        LOGGER.warn("ReindexOperationHandler: Source not found: {}", sourceId);
+                        return false;
+                    }
+
+                    // Use rolling replacement if available
+                    boolean useRollingReplacement = volumeManager != null
+                        && storageEngine.getCatalog() != null
+                        && documentReindexer.hasRollingReplacement();
+
+                    if (useRollingReplacement) {
+                        // Select a volume for the new segment
+                        java.nio.file.Path volumePath = volumeManager.getVolumeWithMostSpace();
+                        if (volumePath == null) {
+                            LOGGER.warn("ReindexOperationHandler: No volume available for source: {}", sourceId);
+                            return false;
+                        }
+                        DocumentReindexer.RollingReindexResult result =
+                            documentReindexer.reindexWithRollingReplacement(source, volumePath);
+                        // Success if no errors OR if some documents were indexed (partial success)
+                        return !result.hasErrors() || result.getDocumentsIndexed() > 0;
+                    } else {
+                        // Fall back to standard reindex
+                        DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
+                        // Success if no errors OR if some documents were indexed (partial success)
+                        return !result.hasErrors() || result.getDocumentsIndexed() > 0;
+                    }
+                } catch (Exception e) {
+                    LOGGER.error("ReindexOperationHandler failed for source {}: {}", sourceId, e.getMessage());
+                    return false;
+                }
+            });
+        } else {
+            // Clear the handler if reindexer is being disabled
+            indexOrchestrator.setReindexOperationHandler(null);
+        }
+
         LOGGER.info("Document reindexer configured: {}", documentReindexer != null ? "enabled" : "disabled (stub mode)");
     }
 
@@ -512,6 +582,16 @@ public class ExcaliburDBServer {
      * <p>This is a convenience overload of {@link #withReindexer(DocumentReindexer, SourceResolver)}
      * that automatically creates a SourceResolver using {@link #createSourceResolver()}.</p>
      *
+     * <h3>Zero-Downtime Rolling Replacement</h3>
+     * <p>If VolumeManager and SegmentCatalog are available, scheduled reindexes
+     * will use rolling replacement:</p>
+     * <ul>
+     *   <li>New segments are created in BOOTSTRAPPING state</li>
+     *   <li>Old segments continue serving queries during reindexing</li>
+     *   <li>New segments progress through INDEXING → WARMING → ACTIVE</li>
+     *   <li>Old segments are tombstoned after new segments become ACTIVE</li>
+     * </ul>
+     *
      * <h3>Domain Correctness</h3>
      * <ul>
      *   <li>Automatically creates SourceResolver that resolves from internal registry</li>
@@ -534,7 +614,45 @@ public class ExcaliburDBServer {
         Objects.requireNonNull(documentReindexer, "documentReindexer cannot be null");
         this.documentReindexer = documentReindexer;
         this.sourceResolver = createSourceResolver();
-        LOGGER.info("Document reindexer configured with automatic source resolution");
+
+        // Wire the handler to enable scheduled reindex operations
+        this.indexOrchestrator.setReindexOperationHandler(sourceId -> {
+            try {
+                Source source = this.sourceResolver.resolve(sourceId);
+                if (source == null) {
+                    LOGGER.warn("ReindexOperationHandler: Source not found: {}", sourceId);
+                    return false;
+                }
+
+                // Use rolling replacement if available
+                boolean useRollingReplacement = volumeManager != null
+                    && storageEngine.getCatalog() != null
+                    && documentReindexer.hasRollingReplacement();
+
+                if (useRollingReplacement) {
+                    // Select a volume for the new segment
+                    java.nio.file.Path volumePath = volumeManager.getVolumeWithMostSpace();
+                    if (volumePath == null) {
+                        LOGGER.warn("ReindexOperationHandler: No volume available for source: {}", sourceId);
+                        return false;
+                    }
+                    DocumentReindexer.RollingReindexResult result =
+                        documentReindexer.reindexWithRollingReplacement(source, volumePath);
+                    // Success if no errors OR if some documents were indexed (partial success)
+                    return !result.hasErrors() || result.getDocumentsIndexed() > 0;
+                } else {
+                    // Fall back to standard reindex
+                    DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
+                    // Success if no errors OR if some documents were indexed (partial success)
+                    return !result.hasErrors() || result.getDocumentsIndexed() > 0;
+                }
+            } catch (Exception e) {
+                LOGGER.error("ReindexOperationHandler failed for source {}: {}", sourceId, e.getMessage());
+                return false;
+            }
+        });
+
+        LOGGER.info("Document reindexer configured with automatic source resolution and scheduled reindex support");
     }
 
     /**
@@ -544,6 +662,12 @@ public class ExcaliburDBServer {
      * background ingestion: crawling, chunking, embedding, and indexing documents
      * from registered sources. Without this configuration, the endpoint only stores
      * source metadata without processing documents.</p>
+     *
+     * <h3>Document Atomicity</h3>
+     * <p>This method creates a DocumentVisibilityTracker that ensures documents become
+     * visible atomically - all chunks at once. The tracker is also wired to the query
+     * pipeline via the visibility checker, enabling the DocumentAtomicityFilter to
+     * exclude partial documents from query results.</p>
      *
      * <h3>Configuration</h3>
      * <p>This method reads the following configuration from the provided Config:</p>
@@ -556,6 +680,7 @@ public class ExcaliburDBServer {
      *   <li>TextChunker, LLMHttpClient must both be non-null</li>
      *   <li>Method must be called before {@link #start()} to take effect</li>
      *   <li>Ingestion runs in virtual threads for efficient concurrency</li>
+     *   <li>Document visibility is epoch-based for consistent query snapshots</li>
      * </ul>
      *
      * <h3>Thread Safety</h3>
@@ -577,15 +702,22 @@ public class ExcaliburDBServer {
         this.textChunker = textChunker;
         this.llmClient = llmClient;
 
+        // Create dedicated EmbeddingClient from LLMHttpClient's config
+        this.embeddingClient = new EmbeddingClient(llmClient.getConfig());
+
         // Read document timeout from config, defaulting to 2000ms if not configured
         int documentTimeoutMs = config != null
             ? config.ingest().getDocumentTimeoutMs()
             : IngestionOrchestrator.DEFAULT_DOCUMENT_TIMEOUT_MS;
 
-        // Create the ingestion orchestrator with status registry adapter
+        // Create document visibility tracker for atomic document-level visibility
+        // This ensures queries never see partially-ingested documents
+        this.documentVisibilityTracker = new DocumentVisibilityTracker(new DocumentRegistry());
+
+        // Create the ingestion orchestrator with status registry adapter and visibility tracker
         this.ingestionOrchestrator = new IngestionOrchestrator(
             textChunker,
-            llmClient,
+            embeddingClient,
             storageEngine,
             indexOrchestrator,
             new IngestionOrchestrator.StatusRegistry() {
@@ -609,12 +741,101 @@ public class ExcaliburDBServer {
             },
             null,  // lshIngestionService - not configured here
             null,  // documentChunkBuffer - not configured here
-            null,  // visibilityTracker - not configured here
+            documentVisibilityTracker,  // Wire visibility tracker for document atomicity
             documentTimeoutMs
         );
 
-        LOGGER.info("Ingestion pipeline configured with TextChunker, LLMHttpClient, documentTimeoutMs={}ms",
+        // Wire the visibility tracker to the query pipeline for atomicity filtering
+        // This enables DocumentAtomicityFilter to exclude partial documents from query results
+        if (this.queryPipeline.getVisibilityChecker() == null) {
+            this.queryPipeline = queryPipeline.withVisibilityChecker(
+                new DocumentVisibilityTrackerAdapter(documentVisibilityTracker)
+            );
+            LOGGER.info("Query pipeline wired with document visibility checker for atomicity filtering");
+        }
+
+        LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, documentTimeoutMs={}ms, documentAtomicity=enabled",
             documentTimeoutMs);
+    }
+
+    /**
+     * Configures the ingestion pipeline with an externally provided visibility tracker.
+     *
+     * <p>This overload allows sharing a DocumentVisibilityTracker between the application
+     * and the server, ensuring consistent document atomicity across the entire system.</p>
+     *
+     * <h3>Use Case</h3>
+     * <p>Use this method when ExcaliburApplication creates the visibility tracker and
+     * passes it to the server for ingestion pipeline configuration.</p>
+     *
+     * <h3>Thread Safety</h3>
+     * <p>This method is NOT thread-safe and should only be called during initialization,
+     * before starting the server.</p>
+     *
+     * @param textChunker The text chunker for splitting documents into chunks
+     * @param embeddingClient The embedding client for generating embeddings
+     * @param visibilityTracker The document visibility tracker for atomic visibility (may be null)
+     * @throws IllegalStateException if the server is already running
+     * @throws NullPointerException if textChunker or embeddingClient is null
+     */
+    public void withIngestionPipeline(TextChunker textChunker, EmbeddingClient embeddingClient,
+                                      DocumentVisibilityTracker visibilityTracker) {
+        if (running.get()) {
+            throw new IllegalStateException("Cannot configure ingestion pipeline after server has started");
+        }
+        Objects.requireNonNull(textChunker, "TextChunker cannot be null");
+        Objects.requireNonNull(embeddingClient, "EmbeddingClient cannot be null");
+
+        this.textChunker = textChunker;
+        this.embeddingClient = embeddingClient;
+        this.documentVisibilityTracker = visibilityTracker;
+
+        // Read document timeout from config, defaulting to 2000ms if not configured
+        int documentTimeoutMs = config != null
+            ? config.ingest().getDocumentTimeoutMs()
+            : IngestionOrchestrator.DEFAULT_DOCUMENT_TIMEOUT_MS;
+
+        // Create the ingestion orchestrator with status registry adapter and visibility tracker
+        this.ingestionOrchestrator = new IngestionOrchestrator(
+            textChunker,
+            embeddingClient,
+            storageEngine,
+            indexOrchestrator,
+            new IngestionOrchestrator.StatusRegistry() {
+                @Override
+                public IngestionOrchestrator.IngestionStatus getOrCreate(String sourceId) {
+                    final IngestStatusEndpoint.IngestionStatus delegate =
+                        ingestionStatusRegistry.getOrCreate(sourceId);
+                    return new IngestionOrchestrator.IngestionStatus() {
+                        @Override
+                        public void update(String state, double progress,
+                                           long entriesIngested, long entriesPending) {
+                            delegate.update(state, progress, entriesIngested, entriesPending);
+                        }
+
+                        @Override
+                        public void setError(String error) {
+                            delegate.setError(error);
+                        }
+                    };
+                }
+            },
+            null,  // lshIngestionService - not configured here
+            null,  // documentChunkBuffer - not configured here
+            visibilityTracker,  // Use provided visibility tracker (may be null)
+            documentTimeoutMs
+        );
+
+        // Wire the visibility tracker to the query pipeline for atomicity filtering
+        if (visibilityTracker != null && this.queryPipeline.getVisibilityChecker() == null) {
+            this.queryPipeline = queryPipeline.withVisibilityChecker(
+                new DocumentVisibilityTrackerAdapter(visibilityTracker)
+            );
+            LOGGER.info("Query pipeline wired with shared document visibility checker for atomicity filtering");
+        }
+
+        LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, documentTimeoutMs={}ms, documentAtomicity={}",
+            documentTimeoutMs, visibilityTracker != null ? "enabled" : "disabled");
     }
 
     /**
@@ -715,6 +936,62 @@ public class ExcaliburDBServer {
     }
 
     /**
+     * Returns the HNSW configuration factory for creating graphs with proper config.
+     *
+     * <p>This factory creates {@link io.excalibur.vector.hnsw.HnswConfig} instances
+     * that are configured with the values from the Config.Shard settings:</p>
+     * <ul>
+     *   <li>{@code efConstruction} - Size of candidate list during graph construction</li>
+     *   <li>{@code efSearch} - Size of candidate list during search</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>If Config was provided at construction, uses Config.Shard values</li>
+     *   <li>If no Config was provided, uses default values (efConstruction=128, efSearch=64)</li>
+     *   <li>All values are validated by Config.Shard before being used</li>
+     * </ul>
+     *
+     * @return The HNSW configuration factory (never null)
+     */
+    public HnswConfigFactory getHnswConfigFactory() {
+        return hnswConfigFactory;
+    }
+
+    /**
+     * Returns the index orchestrator for visibility and worker metrics.
+     *
+     * <p>This provides access to the orchestrator for testing and advanced
+     * configuration purposes, including:</p>
+     * <ul>
+     *   <li>Visibility epoch tracking</li>
+     *   <li>Background worker metrics</li>
+     *   <li>Reindex scheduler configuration</li>
+     * </ul>
+     *
+     * @return The index orchestrator (never null)
+     */
+    public IndexOrchestrator getIndexOrchestrator() {
+        return indexOrchestrator;
+    }
+
+    /**
+     * Returns the document visibility tracker for atomic document-level visibility.
+     *
+     * <p>The visibility tracker ensures that:</p>
+     * <ul>
+     *   <li>Documents become visible atomically (all chunks at once)</li>
+     *   <li>Queries never see partially-ingested documents</li>
+     *   <li>Visibility is epoch-based for consistent query snapshots</li>
+     * </ul>
+     *
+     * @return The document visibility tracker, or null if not configured
+     */
+    public DocumentVisibilityTracker getDocumentVisibilityTracker() {
+        return documentVisibilityTracker;
+    }
+
+    /**
      * Registers all API endpoints.
      */
     private void registerEndpoints() {
@@ -751,6 +1028,7 @@ public class ExcaliburDBServer {
         // Create ReindexEndpoint with shared source registry for consistency
         // If documentReindexer is configured, actual reindexing will occur
         // Auto-create sourceResolver if not explicitly set
+        // Pass VolumeManager and SegmentCatalog for zero-downtime rolling replacement
         ReindexEndpoint reindexEndpoint;
         if (documentReindexer != null) {
             // Auto-create sourceResolver if not explicitly set
@@ -761,9 +1039,13 @@ public class ExcaliburDBServer {
                 new SourceRegistryAdapter(ingestSourceRegistry),
                 reindexStatusRegistry,
                 documentReindexer,
-                resolver
+                resolver,
+                volumeManager,              // For selecting volumes for new segments
+                storageEngine.getCatalog()  // For segment lifecycle management
             );
-            LOGGER.info("ReindexEndpoint configured with DocumentReindexer for actual reindex operations");
+            boolean hasRollingReplacement = volumeManager != null && storageEngine.getCatalog() != null;
+            LOGGER.info("ReindexEndpoint configured with DocumentReindexer for actual reindex operations, rolling replacement: {}",
+                hasRollingReplacement ? "enabled" : "disabled");
         } else {
             reindexEndpoint = new ReindexEndpoint(
                 new SourceRegistryAdapter(ingestSourceRegistry),

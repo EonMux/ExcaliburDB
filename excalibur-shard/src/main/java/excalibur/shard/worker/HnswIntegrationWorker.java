@@ -5,6 +5,7 @@ import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.WriteLog;
 import io.excalibur.store.format.LogEntry;
+import io.excalibur.metrics.Metrics;
 import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.IncrementalInsertResult;
 import io.excalibur.vector.hnsw.TailOffsetTracker;
@@ -401,6 +402,9 @@ public class HnswIntegrationWorker {
     private boolean checkBackpressure() {
         long queueDepth = calculateTotalQueueDepth();
         currentQueueDepth.set(queueDepth);
+
+        // Record HNSW queue depth in JMX metrics for observability
+        Metrics.recordHnswDepth(queueDepth);
 
         if (queueDepth > queueDepthLimit) {
             if (!backpressured.get()) {

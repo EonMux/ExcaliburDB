@@ -526,15 +526,18 @@ class ColdStartIntegrationTest {
 
     /**
      * Minimal StorageEngine for testing.
+     * Creates a temporary directory to satisfy parent constructor requirements.
      */
     private static class TestStorageEngine extends StorageEngine {
-        TestStorageEngine() {
-            super(null, null);
+        private final TestSegmentCatalog testCatalog = new TestSegmentCatalog();
+
+        TestStorageEngine() throws IOException {
+            super(Files.createTempDirectory("test-storage"), Arena.ofShared());
         }
 
         @Override
         public SegmentCatalog getCatalog() {
-            return new TestSegmentCatalog();
+            return testCatalog;
         }
     }
 
@@ -560,7 +563,7 @@ class ColdStartIntegrationTest {
         private final AtomicLong epoch = new AtomicLong(1);
 
         TestVisibilityTracker() {
-            super(null);
+            super(new TestSegmentCatalog());
         }
 
         @Override

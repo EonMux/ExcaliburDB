@@ -6,8 +6,13 @@ import excalibur.shard.allocator.VolumeManager;
 import excalibur.shard.worker.CuckooMaintenanceWorker;
 import excalibur.shard.worker.HnswIntegrationWorker;
 import excalibur.shard.worker.SegmentReindexScheduler;
+import excalibur.shard.worker.WarmingPhaseWorker;
+import io.excalibur.vector.quantization.PQConfig;
 import io.excalibur.config.Config;
+import io.excalibur.store.CompactionWorker;
 import io.excalibur.store.LifecycleState;
+import java.lang.foreign.Arena;
+import java.nio.file.Path;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
@@ -115,6 +120,13 @@ public class IndexOrchestrator implements AutoCloseable {
     private final HnswIntegrationWorker hnswWorker;
     private final CuckooMaintenanceWorker cuckooWorker;
     private final SegmentReindexScheduler reindexScheduler;
+    private final CompactionWorker compactionWorker;
+
+    /**
+     * Warming phase worker for PQ codebook training.
+     * Trains ProductQuantizer during the WARMING phase of segment lifecycle.
+     */
+    private final WarmingPhaseWorker warmingWorker;
 
     /**
      * Volume manager for disk space tracking and segment-to-volume assignment.
@@ -249,6 +261,29 @@ public class IndexOrchestrator implements AutoCloseable {
             sourceId -> onReindexNeeded(sourceId),
             reindexCheckIntervalMs, 3600000);
 
+        // Create compaction worker for background tombstone cleanup
+        // Uses Arena from storage engine for memory allocation
+        Arena arena = storageEngine.arena();
+        if (arena != null) {
+            this.compactionWorker = new CompactionWorker(arena, (oldSegment, newSegment) -> {
+                onCompactionComplete(oldSegment, newSegment);
+            });
+            LOGGER.info("CompactionWorker initialized with Panama FFM Arena");
+        } else {
+            // Fallback: Create CompactionWorker with a shared arena for non-Panama environments
+            this.compactionWorker = new CompactionWorker(Arena.ofShared(), (oldSegment, newSegment) -> {
+                onCompactionComplete(oldSegment, newSegment);
+            });
+            LOGGER.info("CompactionWorker initialized with fallback shared Arena");
+        }
+
+        // Create warming phase worker for PQ codebook training
+        // This worker handles the WARMING → ACTIVE transition with PQ training
+        this.warmingWorker = new WarmingPhaseWorker(catalog,
+            (segmentId, pqSuccess, vectorCount) -> onWarmingComplete(segmentId, pqSuccess, vectorCount),
+            100, 100, null);
+        LOGGER.info("WarmingPhaseWorker initialized for PQ training");
+
         LOGGER.info("IndexOrchestrator created with hnswQueueDepthLimit={}, cuckooInterval={}ms, reindexInterval={}ms, epochTickInterval={}ms, volumeManager={}",
             hnswQueueDepthLimit, cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs, volumeManager != null);
     }
@@ -308,7 +343,7 @@ public class IndexOrchestrator implements AutoCloseable {
     /**
      * Starts all background workers.
      *
-     * <p>Workers are started in order: EpochTickScheduler → CuckooMaintenanceWorker → HnswIntegrationWorker → SegmentReindexScheduler</p>
+     * <p>Workers are started in order: EpochTickScheduler → CuckooMaintenanceWorker → HnswIntegrationWorker → WarmingPhaseWorker → SegmentReindexScheduler</p>
      *
      * @return true if all workers were started, false if already running
      */
@@ -324,7 +359,9 @@ public class IndexOrchestrator implements AutoCloseable {
             // Start workers in order
             cuckooWorker.start();
             hnswWorker.start();
+            warmingWorker.start();
             reindexScheduler.start();
+            compactionWorker.start();
 
             LOGGER.info("Index orchestrator started successfully");
             return true;
@@ -335,7 +372,7 @@ public class IndexOrchestrator implements AutoCloseable {
     /**
      * Stops all background workers.
      *
-     * <p>Workers are stopped in reverse order: SegmentReindexScheduler → HnswIntegrationWorker → CuckooMaintenanceWorker → EpochTickScheduler</p>
+     * <p>Workers are stopped in reverse order: CompactionWorker → SegmentReindexScheduler → WarmingPhaseWorker → HnswIntegrationWorker → CuckooMaintenanceWorker → EpochTickScheduler</p>
      */
     public void stop() {
         if (stopped.compareAndSet(false, true)) {
@@ -344,16 +381,19 @@ public class IndexOrchestrator implements AutoCloseable {
             LOGGER.info("Stopping index orchestrator...");
 
             // Stop workers in reverse order
+            compactionWorker.stop();
             reindexScheduler.stop();
+            warmingWorker.stop();
             hnswWorker.stop();
             cuckooWorker.stop();
 
             // Stop epoch tick scheduler last
             epochTickScheduler.stop();
 
-            LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Cuckoo deletions: {}, Reindexes: {}, Epoch ticks: {}",
+            LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Cuckoo deletions: {}, Reindexes: {}, Compactions: {}, PQ trained: {}, Epoch ticks: {}",
                 hnswWorker.getTotalIntegrated(), cuckooWorker.getTotalDeletions(),
-                reindexScheduler.getTotalReindexesTriggered(), epochTickScheduler.getTickCount());
+                reindexScheduler.getTotalReindexesTriggered(), compactionWorker.getCompactionCount(),
+                warmingWorker.getTotalPqTrained(), epochTickScheduler.getTickCount());
         }
     }
 
@@ -380,6 +420,8 @@ public class IndexOrchestrator implements AutoCloseable {
      * <ul>
      *   <li>HNSW integration (if it has a graph)</li>
      *   <li>Cuckoo maintenance (if it has a filter)</li>
+     *   <li>Compaction worker (for tombstone cleanup)</li>
+     *   <li>Warming phase worker (for PQ training during WARMING state)</li>
      * </ul>
      *
      * @param segmentId The segment ID
@@ -403,12 +445,17 @@ public class IndexOrchestrator implements AutoCloseable {
         // Register with HNSW worker if graph exists
         if (graph != null && tracker != null) {
             hnswWorker.registerSegment(segment, graph, tracker);
+            // Register with warming worker for PQ training during WARMING phase
+            warmingWorker.registerSegment(segmentId, segment, graph, tracker);
         }
 
         // Register with Cuckoo worker if filter exists
         if (filter != null) {
             cuckooWorker.registerFilter(segmentId, filter);
         }
+
+        // Register with compaction worker for background tombstone cleanup
+        compactionWorker.registerSegment(segment);
 
         LOGGER.debug("Registered segment {} with index orchestrator", segmentId);
     }
@@ -426,8 +473,11 @@ public class IndexOrchestrator implements AutoCloseable {
 
             if (info.graph != null) {
                 hnswWorker.unregisterSegment(info.segment);
+                // Unregister from warming worker
+                warmingWorker.unregisterSegment(segmentId);
             }
             cuckooWorker.unregisterFilter(segmentId);
+            compactionWorker.unregisterSegment(info.segment);
             LOGGER.debug("Unregistered segment {} from index orchestrator", segmentId);
         }
     }
@@ -709,6 +759,104 @@ public class IndexOrchestrator implements AutoCloseable {
     }
 
     /**
+     * Called when a segment completes the warming phase.
+     *
+     * <p>This method is invoked after PQ codebook training completes
+     * (or fails with fallback to full-precision vectors).</p>
+     *
+     * @param segmentId   The segment ID
+     * @param pqSuccess   True if PQ training succeeded
+     * @param vectorCount Number of vectors encoded (0 if PQ failed)
+     */
+    private void onWarmingComplete(long segmentId, boolean pqSuccess, int vectorCount) {
+        if (pqSuccess) {
+            LOGGER.info("Segment {} warming complete: PQ trained, {} vectors encoded", segmentId, vectorCount);
+        } else {
+            LOGGER.info("Segment {} warming complete: using full-precision vectors", segmentId);
+        }
+
+        // Update segment index info if present
+        SegmentIndexInfo info = segmentIndexInfo.get(segmentId);
+        if (info != null) {
+            info.pqTrained = pqSuccess;
+        }
+    }
+
+    /**
+     * Called when compaction completes for a segment.
+     *
+     * <p>This method handles the atomic swap of the old segment for the new
+     * compacted segment. It:</p>
+     * <ol>
+     *   <li>Renames the new segment file from .compact to .dat</li>
+     *   <li>Updates the StorageEngine's segment registry</li>
+     *   <li>Updates the segmentIndexInfo map</li>
+     *   <li>Updates the catalog to complete compaction</li>
+     * </ol>
+     *
+     * <h3>Thread Safety</h3>
+     * <p>This method is called from the CompactionWorker's background thread.
+     * All updates to shared state are thread-safe.</p>
+     *
+     * @param oldSegment The old segment (closed, to be replaced)
+     * @param newSegment The new compacted segment (active, to be used)
+     */
+    private void onCompactionComplete(Segment oldSegment, Segment newSegment) {
+        LOGGER.info("Compaction complete: {} -> {}", oldSegment.path(), newSegment.path());
+
+        // Find the segment ID for the old segment
+        Long segmentId = null;
+        for (Map.Entry<Long, SegmentIndexInfo> entry : segmentIndexInfo.entrySet()) {
+            if (entry.getValue().segment == oldSegment) {
+                segmentId = entry.getKey();
+                break;
+            }
+        }
+
+        if (segmentId == null) {
+            LOGGER.warn("Could not find segment ID for compacted segment: {}", oldSegment.path());
+            return;
+        }
+
+        // Rename the new segment file from .compact to .dat
+        Path compactPath = newSegment.path();
+        if (compactPath.toString().endsWith(".compact")) {
+            Path finalPath = Path.of(compactPath.toString().substring(0,
+                compactPath.toString().length() - 8) + ".dat");
+            try {
+                java.nio.file.Files.move(compactPath, finalPath,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                LOGGER.debug("Renamed compacted segment: {} -> {}", compactPath, finalPath);
+            } catch (java.io.IOException e) {
+                LOGGER.error("Failed to rename compacted segment: {} -> {}", compactPath, finalPath, e);
+                // Continue with the swap anyway - the segment is still valid
+            }
+        }
+
+        // Update StorageEngine's segment registry
+        boolean replaced = storageEngine.replaceSegment(segmentId, oldSegment, newSegment);
+        if (!replaced) {
+            LOGGER.warn("Failed to replace segment in StorageEngine registry for segment {}", segmentId);
+        }
+
+        // Update segmentIndexInfo with the new segment
+        SegmentIndexInfo oldInfo = segmentIndexInfo.get(segmentId);
+        if (oldInfo != null) {
+            SegmentIndexInfo newInfo = new SegmentIndexInfo(
+                segmentId, newSegment, oldInfo.graph, oldInfo.filter, oldInfo.tracker);
+            segmentIndexInfo.put(segmentId, newInfo);
+            LOGGER.debug("Updated segmentIndexInfo for segment {}", segmentId);
+        }
+
+        // Update catalog to complete compaction transition
+        catalog.completeCompaction(segmentId);
+
+        LOGGER.info("Compaction swap complete for segment {}: {} entries, registry updated",
+            segmentId, newSegment.entryCount());
+    }
+
+    /**
      * Called when a re-index is needed for a source.
      *
      * <p>This method triggers the re-index operation and properly manages
@@ -817,6 +965,15 @@ public class IndexOrchestrator implements AutoCloseable {
     }
 
     /**
+     * Returns the compaction worker for background tombstone cleanup.
+     *
+     * @return Compaction worker
+     */
+    public CompactionWorker getCompactionWorker() {
+        return compactionWorker;
+    }
+
+    /**
      * Sets the hierarchical Cuckoo filter for deletion propagation.
      *
      * <p>When set, the Cuckoo maintenance worker will propagate deletions through
@@ -840,6 +997,44 @@ public class IndexOrchestrator implements AutoCloseable {
         return reindexScheduler;
     }
 
+    /**
+     * Returns the warming phase worker for PQ training.
+     *
+     * @return Warming phase worker
+     */
+    public WarmingPhaseWorker getWarmingWorker() {
+        return warmingWorker;
+    }
+
+    /**
+     * Returns the total number of segments with PQ successfully trained.
+     *
+     * @return Total PQ trained count
+     */
+    public long getTotalPqTrained() {
+        return warmingWorker.getTotalPqTrained();
+    }
+
+    /**
+     * Returns the total number of segments where PQ training failed.
+     *
+     * @return Total PQ failed count
+     */
+    public long getTotalPqFailed() {
+        return warmingWorker.getTotalPqFailed();
+    }
+
+    /**
+     * Sets the PQ configuration for warming phase training.
+     *
+     * @param pqConfig The PQ configuration
+     * @throws NullPointerException if pqConfig is null
+     */
+    public void setPqConfig(io.excalibur.vector.quantization.PQConfig pqConfig) {
+        this.warmingWorker.setPqConfig(pqConfig);
+        LOGGER.info("PQ configuration updated: {}", pqConfig);
+    }
+
     // ==================== Internal Classes ====================
 
     /**
@@ -854,6 +1049,7 @@ public class IndexOrchestrator implements AutoCloseable {
 
         volatile long vectorsIntegrated;
         volatile long filterDeletions;
+        volatile boolean pqTrained;
 
         SegmentIndexInfo(long segmentId, Segment segment, HnswGraph graph,
                           CuckooFilter filter, TailOffsetTracker tracker) {
@@ -864,6 +1060,7 @@ public class IndexOrchestrator implements AutoCloseable {
             this.tracker = tracker;
             this.vectorsIntegrated = 0;
             this.filterDeletions = 0;
+            this.pqTrained = false;
         }
     }
 

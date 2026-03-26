@@ -34,6 +34,30 @@ class TailScanAnalyzerTest {
         analyzer = new TailScanAnalyzer();
     }
 
+    // Helper method to create mock segment with writeLogHead
+    private Segment mockSegmentWithHead(long writeLogHead) {
+        Segment segment = mock(Segment.class);
+        when(segment.getWriteLogHead()).thenReturn(writeLogHead);
+        return segment;
+    }
+
+    // Helper method to create mock graph with lastIntegratedOffset
+    private HnswGraph mockGraphWithOffset(long lastIntegratedOffset) {
+        HnswGraph graph = mock(HnswGraph.class);
+        when(graph.getLastIntegratedOffset()).thenReturn(lastIntegratedOffset);
+        return graph;
+    }
+
+    // Helper method to create SegmentCandidate
+    private SegmentCandidate candidate(long segmentId, long writeLogHead, long lastIntegratedOffset, LifecycleState state) {
+        return new SegmentCandidate(
+            segmentId,
+            writeLogHead >= 0 ? mockSegmentWithHead(writeLogHead) : null,
+            lastIntegratedOffset >= 0 ? mockGraphWithOffset(lastIntegratedOffset) : null,
+            state
+        );
+    }
+
     // ==================== TailScanRequirement Tests ====================
 
     @Test
@@ -190,15 +214,7 @@ class TailScanAnalyzerTest {
     @Test
     @DisplayName("analyzeSegments: analyzes single segment needing tail scan")
     void testAnalyzeSingleSegmentNeedingTailScan() {
-        // Create mock segment and graph
-        Segment segment = mock(Segment.class);
-        HnswGraph graph = mock(HnswGraph.class);
-
-        when(segment.getWriteLogHead()).thenReturn(2000L);
-        when(graph.getLastIntegratedOffset()).thenReturn(1000L);
-
-        SegmentCandidate candidate = new SegmentCandidate(
-            SEGMENT_ID_1, segment, graph, LifecycleState.ACTIVE);
+        SegmentCandidate candidate = candidate(SEGMENT_ID_1, 2000L, 1000L, LifecycleState.ACTIVE);
 
         List<TailScanRequirement> results = analyzer.analyzeSegments(List.of(candidate));
 
@@ -214,11 +230,8 @@ class TailScanAnalyzerTest {
     @Test
     @DisplayName("analyzeSegments: handles null segment gracefully")
     void testAnalyzeNullSegment() {
-        HnswGraph graph = mock(HnswGraph.class);
-        when(graph.getLastIntegratedOffset()).thenReturn(1000L);
-
-        SegmentCandidate candidate = new SegmentCandidate(
-            SEGMENT_ID_1, null, graph, LifecycleState.ACTIVE);
+        HnswGraph graph = mockGraphWithOffset(1000L);
+        SegmentCandidate candidate = new SegmentCandidate(SEGMENT_ID_1, null, graph, LifecycleState.ACTIVE);
 
         List<TailScanRequirement> results = analyzer.analyzeSegments(List.of(candidate));
 
@@ -229,11 +242,8 @@ class TailScanAnalyzerTest {
     @Test
     @DisplayName("analyzeSegments: handles null graph gracefully")
     void testAnalyzeNullGraph() {
-        Segment segment = mock(Segment.class);
-        when(segment.getWriteLogHead()).thenReturn(2000L);
-
-        SegmentCandidate candidate = new SegmentCandidate(
-            SEGMENT_ID_1, segment, null, LifecycleState.ACTIVE);
+        Segment segment = mockSegmentWithHead(2000L);
+        SegmentCandidate candidate = new SegmentCandidate(SEGMENT_ID_1, segment, null, LifecycleState.ACTIVE);
 
         List<TailScanRequirement> results = analyzer.analyzeSegments(List.of(candidate));
 
@@ -244,28 +254,10 @@ class TailScanAnalyzerTest {
     @Test
     @DisplayName("analyzeSegments: multiple segments with mixed requirements")
     void testAnalyzeMultipleSegments() {
-        // Segment 1: needs tail scan (1000 -> 2000)
-        Segment segment1 = mock(Segment.class);
-        HnswGraph graph1 = mock(HnswGraph.class);
-        when(segment1.getWriteLogHead()).thenReturn(2000L);
-        when(graph1.getLastIntegratedOffset()).thenReturn(1000L);
-
-        // Segment 2: no tail scan needed (equal offsets)
-        Segment segment2 = mock(Segment.class);
-        HnswGraph graph2 = mock(HnswGraph.class);
-        when(segment2.getWriteLogHead()).thenReturn(3000L);
-        when(graph2.getLastIntegratedOffset()).thenReturn(3000L);
-
-        // Segment 3: no tail scan needed (integrated ahead)
-        Segment segment3 = mock(Segment.class);
-        HnswGraph graph3 = mock(HnswGraph.class);
-        when(segment3.getWriteLogHead()).thenReturn(1000L);
-        when(graph3.getLastIntegratedOffset()).thenReturn(4000L);
-
         List<SegmentCandidate> candidates = List.of(
-            new SegmentCandidate(SEGMENT_ID_1, segment1, graph1, LifecycleState.ACTIVE),
-            new SegmentCandidate(SEGMENT_ID_2, segment2, graph2, LifecycleState.INDEXING),
-            new SegmentCandidate(SEGMENT_ID_3, segment3, graph3, LifecycleState.WARMING)
+            candidate(SEGMENT_ID_1, 2000L, 1000L, LifecycleState.ACTIVE),
+            candidate(SEGMENT_ID_2, 3000L, 3000L, LifecycleState.INDEXING),
+            candidate(SEGMENT_ID_3, 1000L, 4000L, LifecycleState.WARMING)
         );
 
         List<TailScanRequirement> results = analyzer.analyzeSegments(candidates);
@@ -290,28 +282,10 @@ class TailScanAnalyzerTest {
     @Test
     @DisplayName("analyzeWithSummary: computes correct statistics")
     void testAnalyzeWithSummary() {
-        // Segment 1: needs tail scan (1000 bytes)
-        Segment segment1 = mock(Segment.class);
-        HnswGraph graph1 = mock(HnswGraph.class);
-        when(segment1.getWriteLogHead()).thenReturn(2000L);
-        when(graph1.getLastIntegratedOffset()).thenReturn(1000L);
-
-        // Segment 2: no tail scan
-        Segment segment2 = mock(Segment.class);
-        HnswGraph graph2 = mock(HnswGraph.class);
-        when(segment2.getWriteLogHead()).thenReturn(3000L);
-        when(graph2.getLastIntegratedOffset()).thenReturn(3000L);
-
-        // Segment 3: needs tail scan (500 bytes)
-        Segment segment3 = mock(Segment.class);
-        HnswGraph graph3 = mock(HnswGraph.class);
-        when(segment3.getWriteLogHead()).thenReturn(3500L);
-        when(graph3.getLastIntegratedOffset()).thenReturn(3000L);
-
         List<SegmentCandidate> candidates = List.of(
-            new SegmentCandidate(SEGMENT_ID_1, segment1, graph1, LifecycleState.ACTIVE),
-            new SegmentCandidate(SEGMENT_ID_2, segment2, graph2, LifecycleState.INDEXING),
-            new SegmentCandidate(SEGMENT_ID_3, segment3, graph3, LifecycleState.WARMING)
+            candidate(SEGMENT_ID_1, 2000L, 1000L, LifecycleState.ACTIVE),
+            candidate(SEGMENT_ID_2, 3000L, 3000L, LifecycleState.INDEXING),
+            candidate(SEGMENT_ID_3, 3500L, 3000L, LifecycleState.WARMING)
         );
 
         TailScanAnalyzer.AnalysisResult result = analyzer.analyzeWithSummary(candidates);
@@ -346,25 +320,12 @@ class TailScanAnalyzerTest {
     @Test
     @DisplayName("filterSegmentsNeedingTailScan: returns only segments needing tail scan")
     void testFilterSegmentsNeedingTailScan() {
-        // Segment 1: needs tail scan
-        Segment segment1 = mock(Segment.class);
-        HnswGraph graph1 = mock(HnswGraph.class);
-        when(segment1.getWriteLogHead()).thenReturn(2000L);
-        when(graph1.getLastIntegratedOffset()).thenReturn(1000L);
+        List<SegmentCandidate> candidates = List.of(
+            candidate(SEGMENT_ID_1, 2000L, 1000L, LifecycleState.ACTIVE),
+            candidate(SEGMENT_ID_2, 3000L, 3000L, LifecycleState.ACTIVE)
+        );
 
-        // Segment 2: no tail scan
-        Segment segment2 = mock(Segment.class);
-        HnswGraph graph2 = mock(HnswGraph.class);
-        when(segment2.getWriteLogHead()).thenReturn(3000L);
-        when(graph2.getLastIntegratedOffset()).thenReturn(3000L);
-
-        SegmentCandidate candidate1 = new SegmentCandidate(
-            SEGMENT_ID_1, segment1, graph1, LifecycleState.ACTIVE);
-        SegmentCandidate candidate2 = new SegmentCandidate(
-            SEGMENT_ID_2, segment2, graph2, LifecycleState.ACTIVE);
-
-        List<SegmentCandidate> filtered = analyzer.filterSegmentsNeedingTailScan(
-            List.of(candidate1, candidate2));
+        List<SegmentCandidate> filtered = analyzer.filterSegmentsNeedingTailScan(candidates);
 
         assertEquals(1, filtered.size());
         assertEquals(SEGMENT_ID_1, filtered.get(0).segmentId());
@@ -373,21 +334,9 @@ class TailScanAnalyzerTest {
     @Test
     @DisplayName("computeTotalTailSize: sums tail sizes correctly")
     void testComputeTotalTailSize() {
-        // Segment 1: 500 byte tail
-        Segment segment1 = mock(Segment.class);
-        HnswGraph graph1 = mock(HnswGraph.class);
-        when(segment1.getWriteLogHead()).thenReturn(1500L);
-        when(graph1.getLastIntegratedOffset()).thenReturn(1000L);
-
-        // Segment 2: 300 byte tail
-        Segment segment2 = mock(Segment.class);
-        HnswGraph graph2 = mock(HnswGraph.class);
-        when(segment2.getWriteLogHead()).thenReturn(800L);
-        when(graph2.getLastIntegratedOffset()).thenReturn(500L);
-
         List<SegmentCandidate> candidates = List.of(
-            new SegmentCandidate(SEGMENT_ID_1, segment1, graph1, LifecycleState.ACTIVE),
-            new SegmentCandidate(SEGMENT_ID_2, segment2, graph2, LifecycleState.ACTIVE)
+            candidate(SEGMENT_ID_1, 1500L, 1000L, LifecycleState.ACTIVE),
+            candidate(SEGMENT_ID_2, 800L, 500L, LifecycleState.ACTIVE)
         );
 
         long totalSize = analyzer.computeTotalTailSize(candidates);

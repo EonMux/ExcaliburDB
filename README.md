@@ -241,9 +241,36 @@ excaliburdb/
 # Run all benchmarks
 ./gradlew :excalibur-bench:jmh
 
-# Run specific benchmark
-./gradlew :excalibur-bench:jmh --tests "MappedFileBenchmark"
+# Run HNSW recall@10 benchmark (Phase 4 validation - target: ≥99% recall)
+./gradlew :excalibur-bench:runHnswRecallBenchmark
+
+# Run storage segment lookup benchmark (Phase 2 validation - target: ≥1B lookups/sec)
+./gradlew :excalibur-bench:runBenchmark
+
+# Run Cuckoo filter benchmarks (Phase 3 validation - target: FP rate ≤0.1%)
+./gradlew :excalibur-bench:runCuckooFilterBenchmark
+./gradlew :excalibur-bench:runCuckooFilterFPRateBenchmark
+
+# Run distance function benchmarks (Phase 4)
+./gradlew :excalibur-bench:runDistanceBenchmark
+
+# Run tail scan benchmark (Phase 6)
+./gradlew :excalibur-bench:runTailScanBenchmark
+
+# Run end-to-end query latency benchmark (Phase 10)
+./gradlew :excalibur-bench:runEndToEndQueryBenchmark
 ```
+
+### Benchmark Locations
+
+| Benchmark | Location | Target |
+|-----------|----------|--------|
+| HNSW Recall@10 | `excalibur-bench/src/main/java/excalibur/bench/benchmark/HnswRecallBenchmark.java` | ≥99% recall@10 |
+| Segment Lookup | `excalibur-bench/src/main/java/excalibur/bench/benchmark/SegmentBenchmark.java` | ≥1B lookups/sec |
+| Cuckoo Filter | `excalibur-bench/src/main/java/excalibur/bench/benchmark/CuckooFilterBenchmark.java` | High throughput |
+| Cuckoo FP Rate | `excalibur-bench/src/main/java/excalibur/bench/benchmark/CuckooFilterFPRateBenchmark.java` | FP rate ≤0.1% |
+| Distance Functions | `excalibur-bench/src/main/java/excalibur/bench/benchmark/DistanceBenchmark.java` | Vectorized ops |
+| Tail Scan | `excalibur-bench/src/main/java/excalibur/bench/benchmark/TailScanBenchmarkRunner.java` | Brute-force throughput |
 
 ### Test Coverage
 

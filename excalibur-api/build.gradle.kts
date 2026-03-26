@@ -23,8 +23,12 @@ dependencies {
     testImplementation("org.mockito:mockito-core:5.14.2")
     testImplementation("org.mockito:mockito-junit-jupiter:5.14.2")
 
-    // Phase 2, 5, 6, 7, 8 dependencies
+    // Phase 1 (core primitives) - for memory segment abstraction
+    implementation(project(":excalibur-core"))
+
+    // Phase 2, 3, 4, 5, 6, 7, 8 dependencies
     implementation(project(":excalibur-store"))
+    implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-shard"))
     implementation(project(":excalibur-query"))
     implementation(project(":excalibur-llm"))

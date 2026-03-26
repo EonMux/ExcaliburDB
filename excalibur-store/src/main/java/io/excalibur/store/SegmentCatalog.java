@@ -133,10 +133,27 @@ public class SegmentCatalog {
      *
      * <p><strong>Warning:</strong> Using this constructor means all catalog
      * metadata will be lost on restart. For persistent catalogs, use
-     * {@link #SegmentCatalog(Path, Arena)} instead.</p>
+     * {@link #SegmentCatalog(Path)} instead.</p>
      */
     public SegmentCatalog() {
         this.catalogFile = null;
+    }
+
+    /**
+     * Creates a new catalog with persistent storage.
+     *
+     * <p>The catalog file is created if it doesn't exist, or opened if it does.
+     * Call {@link #recover()} after construction to load persisted metadata.</p>
+     *
+     * @param catalogPath Path to the catalog file
+     * @throws UncheckedIOException if the catalog file cannot be created or opened
+     */
+    public SegmentCatalog(Path catalogPath) {
+        try {
+            this.catalogFile = new CatalogFile(catalogPath);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to open catalog file: " + catalogPath, e);
+        }
     }
 
     /**
@@ -539,6 +556,29 @@ public class SegmentCatalog {
         metadata.setLifecycleState(LifecycleState.ACTIVE);
         metadata.setEntryState(ENTRY_STATE_ACTIVE);
         metadata.setLastCompactionTime(System.currentTimeMillis());
+        persistSegment(metadata);
+    }
+
+    /**
+     * Updates the path for a segment after compaction.
+     *
+     * <p>This method should be called when a compaction worker creates
+     * a new segment file to replace the old one. The path is updated
+     * to point to the new segment file.</p>
+     *
+     * @param segmentId Unique segment identifier
+     * @param newPath The new path to the segment file
+     * @throws IllegalArgumentException if segment not found or path is null
+     */
+    public void updatePath(long segmentId, Path newPath) {
+        if (newPath == null) {
+            throw new IllegalArgumentException("New path cannot be null");
+        }
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata == null) {
+            throw new IllegalArgumentException("Segment not found: " + segmentId);
+        }
+        metadata.setVolumePath(newPath);
         persistSegment(metadata);
     }
 

@@ -1,5 +1,9 @@
 package excalibur.integration;
 
+import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpExchange;
+
 import io.excalibur.llm.client.CircuitBreaker;
 import io.excalibur.llm.client.CircuitBreakerState;
 import excalibur.llm.client.LLMClientConfig;
@@ -10,9 +14,11 @@ import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.pipeline.QueryPipeline;
+import excalibur.query.scorer.LlmRelevancyScorer;
 import excalibur.shard.VisibilityTracker;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
+import io.excalibur.store.LifecycleState;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
@@ -26,16 +32,20 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.lang.foreign.Arena;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -541,6 +551,176 @@ class LLMUnavailabilityIntegrationTest {
         }
     }
 
+    @Nested
+    @DisplayName("LLM Unavailability Fallback")
+    class LlmUnavailabilityFallback {
+
+        /**
+         * Test: LLM client handles server errors and propagates exceptions.
+         *
+         * <p>Domain correctness:</p>
+         * <ul>
+         *   <li>LLM client must throw LLMException when server returns 5xx errors</li>
+         *   <li>Exception must have correct error type (HTTP_ERROR)</li>
+         *   <li>Exception allows caller to implement fallback behavior</li>
+         * </ul>
+         */
+        @Test
+        @DisplayName("LLM client throws LLMException on server errors for fallback handling")
+        void llmClientThrowsOnServerErrors() throws Exception {
+            // Start mock LLM server that always fails
+            HttpServer mockServer = HttpServer.create(new InetSocketAddress(0), 0);
+            mockServer.createContext("/v1/chat/completions", exchange -> {
+                // Return 503 Service Unavailable
+                String response = "{\"error\": \"Service unavailable\"}";
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(503, response.getBytes(StandardCharsets.UTF_8).length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(response.getBytes(StandardCharsets.UTF_8));
+                }
+            });
+            mockServer.start();
+            int port = mockServer.getAddress().getPort();
+
+            try {
+                // Create LLM client
+                CircuitBreaker breaker = new CircuitBreaker(5, Duration.ofMillis(100), "test-llm");
+                LLMClientConfig llmConfig = LLMClientConfig.builder()
+                    .baseUrl("http://localhost:" + port)
+                    .apiKey("test-key")
+                    .timeout(Duration.ofSeconds(2))
+                    .maxRetries(0)  // No retries
+                    .build();
+
+                LLMHttpClient llmClient = new LLMHttpClient(llmConfig, breaker);
+                List<String> candidates = List.of("candidate 1", "candidate 2");
+
+                // Request should fail with LLMException
+                assertThatThrownBy(() -> llmClient.scoreRelevancy("test query", candidates))
+                    .isInstanceOf(LLMException.class)
+                    .satisfies(e -> {
+                        LLMException llme = (LLMException) e;
+                        assertThat(llme.getErrorType()).isEqualTo(LLMException.ErrorType.HTTP_ERROR);
+                    });
+
+                System.out.println("LLM client correctly threw HTTP_ERROR exception for server failure");
+
+            } finally {
+                mockServer.stop(0);
+            }
+        }
+
+        /**
+         * Test: LLM scorer handles client exceptions gracefully.
+         *
+         * <p>Domain correctness: LlmRelevancyScorer should propagate LLMExceptions
+         * to allow caller to implement fallback behavior.</p>
+         */
+        @Test
+        @DisplayName("LLM scorer propagates exceptions for fallback handling")
+        void llmScorerPropagatesExceptionsForFallback() throws Exception {
+            // Start mock LLM server that always fails
+            HttpServer mockServer = HttpServer.create(new InetSocketAddress(0), 0);
+            mockServer.createContext("/v1/chat/completions", exchange -> {
+                // Return 503 Service Unavailable
+                String response = "{\"error\": \"Service temporarily unavailable\"}";
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(503, response.getBytes(StandardCharsets.UTF_8).length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(response.getBytes(StandardCharsets.UTF_8));
+                }
+            });
+            mockServer.start();
+            int port = mockServer.getAddress().getPort();
+
+            try {
+                // Create LLM client with circuit breaker
+                CircuitBreaker breaker = new CircuitBreaker(5, Duration.ofMillis(100), "scorer-test");
+                LLMClientConfig llmConfig = LLMClientConfig.builder()
+                    .baseUrl("http://localhost:" + port)
+                    .apiKey("test-key")
+                    .timeout(Duration.ofSeconds(2))
+                    .maxRetries(0)
+                    .build();
+
+                LLMHttpClient llmClient = new LLMHttpClient(llmConfig, breaker);
+                LlmRelevancyScorer scorer = new LlmRelevancyScorer(llmClient);
+
+                // Create test results
+                List<excalibur.query.QueryResultItem> results = new ArrayList<>();
+                results.add(new excalibur.query.QueryResultItem(
+                    1L, 0.9f, "test candidate 1".getBytes(StandardCharsets.UTF_8), 0L, 1L));
+                results.add(new excalibur.query.QueryResultItem(
+                    2L, 0.8f, "test candidate 2".getBytes(StandardCharsets.UTF_8), 0L, 2L));
+
+                // Score results - should throw LLMException
+                assertThatThrownBy(() -> scorer.scoreResults("test query", results, 0.3f))
+                    .isInstanceOf(LLMException.class);
+
+                System.out.println("LLM scorer correctly propagated exception for fallback handling");
+
+            } finally {
+                mockServer.stop(0);
+            }
+        }
+
+        /**
+         * Test: LLM client works correctly when server is available.
+         *
+         * <p>Domain correctness: LLM client should return valid scores when server responds correctly.</p>
+         */
+        @Test
+        @DisplayName("LLM client returns scores when server is available")
+        void llmClientReturnsScoresWhenServerAvailable() throws Exception {
+            // Start mock LLM server
+            HttpServer mockServer = HttpServer.create(new InetSocketAddress(0), 0);
+            mockServer.createContext("/v1/chat/completions", exchange -> {
+                // Return valid OpenAI chat completions response with relevancy scores
+                String relevancyJson = "[{\"index\": 0, \"score\": 0.85}, {\"index\": 1, \"score\": 0.75}]";
+                String response = "{\"choices\":[{\"message\":{\"content\":\"" +
+                    relevancyJson.replace("\"", "\\\"") + "\"}}]}";
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, response.getBytes(StandardCharsets.UTF_8).length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(response.getBytes(StandardCharsets.UTF_8));
+                }
+            });
+            mockServer.start();
+            int port = mockServer.getAddress().getPort();
+
+            try {
+                // Create LLM client
+                CircuitBreaker breaker = new CircuitBreaker(3, Duration.ofMillis(100), "test-llm");
+                LLMClientConfig llmConfig = LLMClientConfig.builder()
+                    .baseUrl("http://localhost:" + port)
+                    .apiKey("test-key")
+                    .timeout(Duration.ofSeconds(2))
+                    .maxRetries(0)
+                    .build();
+
+                LLMHttpClient llmClient = new LLMHttpClient(llmConfig, breaker);
+                List<String> candidates = List.of("candidate 1", "candidate 2");
+
+                // Request should succeed
+                List<io.excalibur.llm.RelevancyScore> scores = llmClient.scoreRelevancy("test query", candidates);
+
+                assertThat(scores).hasSize(2);
+                assertThat(scores.get(0).getIndex()).isEqualTo(0);
+                assertThat(scores.get(0).getScore()).isEqualTo(0.85);
+                assertThat(scores.get(1).getIndex()).isEqualTo(1);
+                assertThat(scores.get(1).getScore()).isEqualTo(0.75);
+
+                // Circuit should remain closed after success
+                assertThat(breaker.getState()).isEqualTo(CircuitBreakerState.CLOSED);
+
+                System.out.println("LLM client returned " + scores.size() + " scores successfully");
+
+            } finally {
+                mockServer.stop(0);
+            }
+        }
+    }
+
     // ==================== Helper Methods ====================
 
     private float[] createRandomVector(int dimension) {
@@ -563,42 +743,105 @@ class LLMUnavailabilityIntegrationTest {
     // ==================== Test Infrastructure ====================
 
     /**
-     * Minimal StorageEngine for testing.
+     * Minimal StorageEngine for testing that doesn't require a valid data directory.
+     *
+     * <p>This test implementation overrides all methods that require valid storage state
+     * instead of calling the parent constructor with null values, which would fail validation.</p>
      */
     private static class TestStorageEngine extends StorageEngine {
+        private final TestSegmentCatalog catalog = new TestSegmentCatalog();
+
+        /**
+         * Creates a test storage engine with a temporary directory.
+         * This avoids the null validation in the parent constructor.
+         */
         TestStorageEngine() {
-            super(null, null);
+            super(createTempDataDir(), Arena.ofShared(), 1);
+        }
+
+        private static Path createTempDataDir() {
+            try {
+                Path tempDir = Files.createTempDirectory("excalibur-test-storage-");
+                tempDir.toFile().deleteOnExit();
+                return tempDir;
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to create temp data directory", e);
+            }
         }
 
         @Override
         public SegmentCatalog getCatalog() {
-            return new TestSegmentCatalog();
+            return catalog;
         }
     }
 
     /**
      * Minimal SegmentCatalog for testing.
+     *
+     * <p>Provides a single ACTIVE segment for query testing.</p>
      */
     private static class TestSegmentCatalog extends SegmentCatalog {
+        private final Map<Long, SegmentMetadata> segments = new ConcurrentHashMap<>();
+
+        TestSegmentCatalog() {
+            // Add a default active segment for testing
+            // Must follow proper lifecycle: BOOTSTRAPPING → INDEXING → WARMING → ACTIVE
+            SegmentMetadata defaultSegment = new SegmentMetadata(0L);
+            defaultSegment.setLifecycleState(LifecycleState.INDEXING);  // BOOTSTRAPPING → INDEXING
+            defaultSegment.setLifecycleState(LifecycleState.WARMING);   // INDEXING → WARMING
+            defaultSegment.setLifecycleState(LifecycleState.ACTIVE);    // WARMING → ACTIVE
+            defaultSegment.setEntryCount(100);
+            segments.put(0L, defaultSegment);
+        }
+
         @Override
         public SegmentMetadata get(long segmentId) {
-            return null;
+            return segments.get(segmentId);
         }
 
         @Override
         public Map<Long, SegmentMetadata> getAll() {
-            return Collections.emptyMap();
+            return Collections.unmodifiableMap(segments);
+        }
+
+        @Override
+        public int size() {
+            return segments.size();
+        }
+
+        void addSegment(long segmentId, LifecycleState state) {
+            SegmentMetadata metadata = new SegmentMetadata(segmentId);
+            // Follow proper lifecycle transitions
+            if (state.isQueryable()) {
+                metadata.setLifecycleState(LifecycleState.INDEXING);
+                if (state != LifecycleState.INDEXING) {
+                    metadata.setLifecycleState(LifecycleState.WARMING);
+                    if (state == LifecycleState.ACTIVE || state == LifecycleState.COMPACTING) {
+                        metadata.setLifecycleState(LifecycleState.ACTIVE);
+                        if (state == LifecycleState.COMPACTING) {
+                            metadata.setLifecycleState(LifecycleState.COMPACTING);
+                        }
+                    }
+                }
+            }
+            metadata.setEntryCount(100);
+            segments.put(segmentId, metadata);
         }
     }
 
     /**
      * Test VisibilityTracker implementation.
+     *
+     * <p>Provides visibility for segment 0 by default to support query testing.</p>
      */
     private static class TestVisibilityTracker extends VisibilityTracker {
         private final AtomicLong epoch = new AtomicLong(1);
+        private final Set<Long> visibleSegmentIds = ConcurrentHashMap.newKeySet();
 
         TestVisibilityTracker() {
-            super(null);
+            super(new TestSegmentCatalog());
+            // Make segment 0 visible by default
+            visibleSegmentIds.add(0L);
         }
 
         @Override
@@ -618,7 +861,21 @@ class LLMUnavailabilityIntegrationTest {
 
         @Override
         public Set<Long> visibleSegments(long queryEpoch) {
-            return Collections.emptySet();
+            return Collections.unmodifiableSet(visibleSegmentIds);
+        }
+
+        /**
+         * Adds a segment to the visible set.
+         */
+        void addVisibleSegment(long segmentId) {
+            visibleSegmentIds.add(segmentId);
+        }
+
+        /**
+         * Removes a segment from the visible set.
+         */
+        void removeVisibleSegment(long segmentId) {
+            visibleSegmentIds.remove(segmentId);
         }
     }
 }

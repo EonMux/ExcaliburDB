@@ -35,6 +35,9 @@ dependencies {
 
     // Phase 8 dependency for document visibility tracking
     implementation(project(":excalibur-ingest"))
+
+    // Metrics module for JMX observability
+    implementation(project(":excalibur-metrics"))
 }
 
 tasks.withType<JavaCompile> {

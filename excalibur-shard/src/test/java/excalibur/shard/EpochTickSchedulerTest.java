@@ -202,7 +202,7 @@ class EpochTickSchedulerTest {
 
         assertThat(stats.running()).isTrue();
         assertThat(stats.tickCount()).isGreaterThanOrEqualTo(2L);
-        assertThat(stats.tickIntervalMs()).isEqualTo(20L);
+        assertThat(stats.tickIntervalMs()).isEqualTo(10L);
         assertThat(stats.lastTickTimestamp()).isGreaterThan(0L);
         assertThat(stats.currentEpoch()).isGreaterThanOrEqualTo(2L);
         assertThat(stats.timeSinceLastTickMs()).isGreaterThanOrEqualTo(0L);

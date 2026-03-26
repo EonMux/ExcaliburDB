@@ -7,10 +7,10 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 /**
- * Tests for SegmentVarHandle.
+ * Tests for ReflectionVarHandle.
  */
-@DisplayName("SegmentVarHandle Tests")
-class SegmentVarHandleMemoryTest {
+@DisplayName("ReflectionVarHandle Tests")
+class ReflectionVarHandleTest {
 
     @Nested
     @DisplayName("GetVarHandle Tests")
@@ -19,7 +19,7 @@ class SegmentVarHandleMemoryTest {
         @Test
         @DisplayName("Should reject non-existent field")
         void shouldRejectNonExistentField() {
-            assertThatThrownBy(() -> SegmentVarHandle.getVarHandle(String.class, "nonexistent"))
+            assertThatThrownBy(() -> ReflectionVarHandle.getVarHandle(String.class, "nonexistent"))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Failed to create VarHandle");
         }
@@ -27,7 +27,14 @@ class SegmentVarHandleMemoryTest {
         @Test
         @DisplayName("Should reject null class")
         void shouldRejectNullClass() {
-            assertThatThrownBy(() -> SegmentVarHandle.getVarHandle(null, "value"))
+            assertThatThrownBy(() -> ReflectionVarHandle.getVarHandle(null, "value"))
+                .isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("Should reject null field name")
+        void shouldRejectNullFieldName() {
+            assertThatThrownBy(() -> ReflectionVarHandle.getVarHandle(String.class, null))
                 .isInstanceOf(NullPointerException.class);
         }
     }

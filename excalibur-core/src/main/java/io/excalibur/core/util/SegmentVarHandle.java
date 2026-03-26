@@ -2,40 +2,77 @@ package io.excalibur.core.util;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
+import java.nio.ByteOrder;
 
 /**
  * VarHandle-based utility class for atomic operations on MemorySegment.
  *
- * <p>MemorySegment is a zero-copy abstraction over direct byte buffers.
- * This class provides thread-safe read/write operations using VarHandle
- * to avoid copying data to heap.</p>
+ * <p>This class provides thread-safe read/write operations using VarHandle
+ * with volatile semantics for MemorySegment access.</p>
+ *
+ * <h2>Memory Ordering</h2>
+ * <p>Read operations use volatile (acquire) semantics via {@code getVolatile}.
+ * Write operations use volatile (release) semantics via {@code setVolatile}.
+ * Compare-and-set operations provide full atomic CAS guarantees.</p>
  *
  * <h2>Thread Safety</h2>
- * <p>All methods are thread-safe. Multiple threads may read from or
- * write to a MemorySegment concurrently without synchronization.</p>
+ * <p>All read/write methods are thread-safe with volatile memory ordering.
+ * Compare-and-set and get-and-add operations are fully atomic.</p>
+ *
+ * <h2>Implementation Note</h2>
+ * <p>In Java 21's FFM API, VarHandles from ValueLayout have 1 coordinate (MemorySegment).
+ * This implementation uses MemorySegment slicing to provide offset-based access.
+ * The slice operation is zero-cost as it creates a view, not a copy.</p>
  *
  * @author ExcaliburDB
+ * @see MemorySegment
+ * @see VarHandle
  */
-public class SegmentVarHandle {
+public final class SegmentVarHandle {
 
-    private static final ValueLayout.OfInt INT_LAYOUT = ValueLayout.JAVA_INT_UNALIGNED;
-    private static final ValueLayout.OfLong LONG_LAYOUT = ValueLayout.JAVA_LONG_UNALIGNED;
-    private static final ValueLayout.OfFloat FLOAT_LAYOUT = ValueLayout.JAVA_FLOAT_UNALIGNED;
-    private static final ValueLayout.OfDouble DOUBLE_LAYOUT = ValueLayout.JAVA_DOUBLE_UNALIGNED;
+    // VarHandles for atomic access with volatile semantics
+    // Using BIG_ENDIAN for consistent cross-platform behavior
+    private static final VarHandle INT_HANDLE = ValueLayout.JAVA_INT
+        .withOrder(ByteOrder.BIG_ENDIAN)
+        .varHandle();
+    private static final VarHandle LONG_HANDLE = ValueLayout.JAVA_LONG
+        .withOrder(ByteOrder.BIG_ENDIAN)
+        .varHandle();
+    private static final VarHandle FLOAT_HANDLE = ValueLayout.JAVA_FLOAT
+        .withOrder(ByteOrder.BIG_ENDIAN)
+        .varHandle();
+    private static final VarHandle DOUBLE_HANDLE = ValueLayout.JAVA_DOUBLE
+        .withOrder(ByteOrder.BIG_ENDIAN)
+        .varHandle();
+    private static final VarHandle BYTE_HANDLE = ValueLayout.JAVA_BYTE.varHandle();
+    private static final VarHandle BOOLEAN_HANDLE = ValueLayout.JAVA_BOOLEAN.varHandle();
+
+    // Layouts for direct MemorySegment access (for non-volatile operations)
+    private static final ValueLayout.OfInt INT_LAYOUT = ValueLayout.JAVA_INT
+        .withOrder(ByteOrder.BIG_ENDIAN);
+    private static final ValueLayout.OfLong LONG_LAYOUT = ValueLayout.JAVA_LONG
+        .withOrder(ByteOrder.BIG_ENDIAN);
+    private static final ValueLayout.OfFloat FLOAT_LAYOUT = ValueLayout.JAVA_FLOAT
+        .withOrder(ByteOrder.BIG_ENDIAN);
+    private static final ValueLayout.OfDouble DOUBLE_LAYOUT = ValueLayout.JAVA_DOUBLE
+        .withOrder(ByteOrder.BIG_ENDIAN);
     private static final ValueLayout.OfByte BYTE_LAYOUT = ValueLayout.JAVA_BYTE;
     private static final ValueLayout.OfBoolean BOOLEAN_LAYOUT = ValueLayout.JAVA_BOOLEAN;
 
+    private SegmentVarHandle() {
+        // Utility class - prevent instantiation
+    }
+
+    // ==================== Int Operations ====================
+
     /**
-     * Reads an int value from a MemorySegment at the specified offset.
+     * Atomically reads an int from a MemorySegment at the specified offset
+     * with volatile (acquire) semantics.
      *
      * @param segment The source memory segment
      * @param offset  Offset in bytes
-     * @return The int value
+     * @return The int value (big-endian)
      * @throws NullPointerException if segment is null
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
@@ -43,15 +80,18 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        return segment.get(INT_LAYOUT, offset);
+        checkBounds(segment, offset, 4);
+        MemorySegment slice = segment.asSlice(offset, 4);
+        return (int) INT_HANDLE.getVolatile(slice);
     }
 
     /**
-     * Writes an int value to a MemorySegment at the specified offset.
+     * Atomically writes an int to a MemorySegment at the specified offset
+     * with volatile (release) semantics.
      *
      * @param segment The target memory segment
      * @param offset  Offset in bytes
-     * @param value   The int value to write
+     * @param value   The int value to write (big-endian)
      * @throws NullPointerException if segment is null
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
@@ -59,15 +99,77 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        segment.set(INT_LAYOUT, offset, value);
+        checkBounds(segment, offset, 4);
+        MemorySegment slice = segment.asSlice(offset, 4);
+        INT_HANDLE.setVolatile(slice, value);
     }
 
     /**
-     * Reads a long value from a MemorySegment at the specified offset.
+     * Atomically compares and sets an int value.
+     *
+     * <p>This operation is atomic and provides the same memory ordering
+     * guarantees as {@link java.util.concurrent.atomic.AtomicInteger#compareAndSet}.</p>
+     *
+     * @param segment  The memory segment
+     * @param offset   Offset in bytes
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static boolean compareAndSetInt(MemorySegment segment, long offset,
+                                           int expected, int newValue) {
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        checkBounds(segment, offset, 4);
+        MemorySegment slice = segment.asSlice(offset, 4);
+        return INT_HANDLE.compareAndSet(slice, expected, newValue);
+    }
+
+    /**
+     * Atomically adds a delta to an int value and returns the previous value.
+     *
+     * @param segment The memory segment
+     * @param offset  Offset in bytes
+     * @param delta   The value to add
+     * @return The previous value before addition
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static int getAndAddInt(MemorySegment segment, long offset, int delta) {
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        checkBounds(segment, offset, 4);
+        MemorySegment slice = segment.asSlice(offset, 4);
+        return (int) INT_HANDLE.getAndAdd(slice, delta);
+    }
+
+    /**
+     * Atomically adds a delta to an int value and returns the new value.
+     *
+     * @param segment The memory segment
+     * @param offset  Offset in bytes
+     * @param delta   The value to add
+     * @return The new value after addition
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static int addGetInt(MemorySegment segment, long offset, int delta) {
+        return getAndAddInt(segment, offset, delta) + delta;
+    }
+
+    // ==================== Long Operations ====================
+
+    /**
+     * Atomically reads a long from a MemorySegment at the specified offset
+     * with volatile (acquire) semantics.
      *
      * @param segment The source memory segment
      * @param offset  Offset in bytes
-     * @return The long value
+     * @return The long value (big-endian)
      * @throws NullPointerException if segment is null
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
@@ -75,15 +177,18 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        return segment.get(LONG_LAYOUT, offset);
+        checkBounds(segment, offset, 8);
+        MemorySegment slice = segment.asSlice(offset, 8);
+        return (long) LONG_HANDLE.getVolatile(slice);
     }
 
     /**
-     * Writes a long value to a MemorySegment at the specified offset.
+     * Atomically writes a long to a MemorySegment at the specified offset
+     * with volatile (release) semantics.
      *
      * @param segment The target memory segment
      * @param offset  Offset in bytes
-     * @param value   The long value to write
+     * @param value   The long value to write (big-endian)
      * @throws NullPointerException if segment is null
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
@@ -91,15 +196,77 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        segment.set(LONG_LAYOUT, offset, value);
+        checkBounds(segment, offset, 8);
+        MemorySegment slice = segment.asSlice(offset, 8);
+        LONG_HANDLE.setVolatile(slice, value);
     }
 
     /**
-     * Reads a float value from a MemorySegment at the specified offset.
+     * Atomically compares and sets a long value.
+     *
+     * <p>This operation is atomic and provides the same memory ordering
+     * guarantees as {@link java.util.concurrent.atomic.AtomicLong#compareAndSet}.</p>
+     *
+     * @param segment  The memory segment
+     * @param offset   Offset in bytes
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static boolean compareAndSetLong(MemorySegment segment, long offset,
+                                            long expected, long newValue) {
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        checkBounds(segment, offset, 8);
+        MemorySegment slice = segment.asSlice(offset, 8);
+        return LONG_HANDLE.compareAndSet(slice, expected, newValue);
+    }
+
+    /**
+     * Atomically adds a delta to a long value and returns the previous value.
+     *
+     * @param segment The memory segment
+     * @param offset  Offset in bytes
+     * @param delta   The value to add
+     * @return The previous value before addition
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static long getAndAddLong(MemorySegment segment, long offset, long delta) {
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        checkBounds(segment, offset, 8);
+        MemorySegment slice = segment.asSlice(offset, 8);
+        return (long) LONG_HANDLE.getAndAdd(slice, delta);
+    }
+
+    /**
+     * Atomically adds a delta to a long value and returns the new value.
+     *
+     * @param segment The memory segment
+     * @param offset  Offset in bytes
+     * @param delta   The value to add
+     * @return The new value after addition
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static long addGetLong(MemorySegment segment, long offset, long delta) {
+        return getAndAddLong(segment, offset, delta) + delta;
+    }
+
+    // ==================== Float Operations ====================
+
+    /**
+     * Atomically reads a float from a MemorySegment at the specified offset
+     * with volatile (acquire) semantics.
      *
      * @param segment The source memory segment
      * @param offset  Offset in bytes
-     * @return The float value
+     * @return The float value (big-endian)
      * @throws NullPointerException if segment is null
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
@@ -107,15 +274,18 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        return segment.get(FLOAT_LAYOUT, offset);
+        checkBounds(segment, offset, 4);
+        MemorySegment slice = segment.asSlice(offset, 4);
+        return (float) FLOAT_HANDLE.getVolatile(slice);
     }
 
     /**
-     * Writes a float value to a MemorySegment at the specified offset.
+     * Atomically writes a float to a MemorySegment at the specified offset
+     * with volatile (release) semantics.
      *
      * @param segment The target memory segment
      * @param offset  Offset in bytes
-     * @param value   The float value to write
+     * @param value   The float value to write (big-endian)
      * @throws NullPointerException if segment is null
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
@@ -123,15 +293,44 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        segment.set(FLOAT_LAYOUT, offset, value);
+        checkBounds(segment, offset, 4);
+        MemorySegment slice = segment.asSlice(offset, 4);
+        FLOAT_HANDLE.setVolatile(slice, value);
     }
 
     /**
-     * Reads a double value from a MemorySegment at the specified offset.
+     * Atomically compares and sets a float value.
+     *
+     * <p>Uses bitwise comparison for floating-point values, following the semantics
+     * of Float.floatToRawIntBits(). NaN values are compared bitwise, not numerically.</p>
+     *
+     * @param segment  The memory segment
+     * @param offset   Offset in bytes
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static boolean compareAndSetFloat(MemorySegment segment, long offset,
+                                             float expected, float newValue) {
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        checkBounds(segment, offset, 4);
+        MemorySegment slice = segment.asSlice(offset, 4);
+        return FLOAT_HANDLE.compareAndSet(slice, expected, newValue);
+    }
+
+    // ==================== Double Operations ====================
+
+    /**
+     * Atomically reads a double from a MemorySegment at the specified offset
+     * with volatile (acquire) semantics.
      *
      * @param segment The source memory segment
      * @param offset  Offset in bytes
-     * @return The double value
+     * @return The double value (big-endian)
      * @throws NullPointerException if segment is null
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
@@ -139,15 +338,18 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        return segment.get(DOUBLE_LAYOUT, offset);
+        checkBounds(segment, offset, 8);
+        MemorySegment slice = segment.asSlice(offset, 8);
+        return (double) DOUBLE_HANDLE.getVolatile(slice);
     }
 
     /**
-     * Writes a double value to a MemorySegment at the specified offset.
+     * Atomically writes a double to a MemorySegment at the specified offset
+     * with volatile (release) semantics.
      *
      * @param segment The target memory segment
      * @param offset  Offset in bytes
-     * @param value   The double value to write
+     * @param value   The double value to write (big-endian)
      * @throws NullPointerException if segment is null
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
@@ -155,11 +357,39 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        segment.set(DOUBLE_LAYOUT, offset, value);
+        checkBounds(segment, offset, 8);
+        MemorySegment slice = segment.asSlice(offset, 8);
+        DOUBLE_HANDLE.setVolatile(slice, value);
     }
 
     /**
-     * Reads a byte value from a MemorySegment at the specified offset.
+     * Atomically compares and sets a double value.
+     *
+     * <p>Uses bitwise comparison for floating-point values, following the semantics
+     * of Double.doubleToRawLongBits(). NaN values are compared bitwise, not numerically.</p>
+     *
+     * @param segment  The memory segment
+     * @param offset   Offset in bytes
+     * @param expected The expected current value
+     * @param newValue The new value to set if comparison succeeds
+     * @return true if the comparison succeeded and value was updated
+     * @throws NullPointerException if segment is null
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static boolean compareAndSetDouble(MemorySegment segment, long offset,
+                                              double expected, double newValue) {
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        checkBounds(segment, offset, 8);
+        MemorySegment slice = segment.asSlice(offset, 8);
+        return DOUBLE_HANDLE.compareAndSet(slice, expected, newValue);
+    }
+
+    // ==================== Byte Operations ====================
+
+    /**
+     * Reads a byte from a MemorySegment at the specified offset.
      *
      * @param segment The source memory segment
      * @param offset  Offset in bytes
@@ -175,7 +405,7 @@ public class SegmentVarHandle {
     }
 
     /**
-     * Writes a byte value to a MemorySegment at the specified offset.
+     * Writes a byte to a MemorySegment at the specified offset.
      *
      * @param segment The target memory segment
      * @param offset  Offset in bytes
@@ -190,8 +420,10 @@ public class SegmentVarHandle {
         segment.set(BYTE_LAYOUT, offset, value);
     }
 
+    // ==================== Boolean Operations ====================
+
     /**
-     * Reads a boolean value from a MemorySegment at the specified offset.
+     * Reads a boolean from a MemorySegment at the specified offset.
      *
      * @param segment The source memory segment
      * @param offset  Offset in bytes
@@ -207,7 +439,7 @@ public class SegmentVarHandle {
     }
 
     /**
-     * Writes a boolean value to a MemorySegment at the specified offset.
+     * Writes a boolean to a MemorySegment at the specified offset.
      *
      * @param segment The target memory segment
      * @param offset  Offset in bytes
@@ -222,8 +454,11 @@ public class SegmentVarHandle {
         segment.set(BOOLEAN_LAYOUT, offset, value);
     }
 
+    // ==================== Legacy Compatibility Methods ====================
+
     /**
      * Gets the current value from a MemorySegment at the specified offset.
+     * Equivalent to {@link #readInt(MemorySegment, long)}.
      *
      * @param segment The memory segment
      * @param offset  Offset in bytes
@@ -232,11 +467,12 @@ public class SegmentVarHandle {
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
     public static int get(MemorySegment segment, long offset) {
-        return segment.get(INT_LAYOUT, offset);
+        return readInt(segment, offset);
     }
 
     /**
      * Sets a value in a MemorySegment at the specified offset.
+     * Equivalent to {@link #writeInt(MemorySegment, long, int)}.
      *
      * @param segment The memory segment
      * @param offset  Offset in bytes
@@ -245,8 +481,10 @@ public class SegmentVarHandle {
      * @throws IndexOutOfBoundsException if offset is out of bounds
      */
     public static void set(MemorySegment segment, long offset, int value) {
-        segment.set(INT_LAYOUT, offset, value);
+        writeInt(segment, offset, value);
     }
+
+    // ==================== Bulk Operations ====================
 
     /**
      * Reads a value from a MemorySegment as a MemorySegment slice.
@@ -262,8 +500,8 @@ public class SegmentVarHandle {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
-        if (length <= 0) {
-            throw new IllegalArgumentException("Length must be positive");
+        if (length < 0) {
+            throw new IllegalArgumentException("Length cannot be negative: " + length);
         }
         if (offset + length > segment.byteSize()) {
             throw new IndexOutOfBoundsException(
@@ -318,35 +556,114 @@ public class SegmentVarHandle {
         MemorySegment.copy(source, 0, target, offset, source.byteSize());
     }
 
-    // ==================== Factory Methods ====================
+    // ==================== Spin-Lock Utilities ====================
 
     /**
-     * Gets a VarHandle for AtomicInteger.
+     * Performs a spin-loop CAS until successful or max retries exceeded.
      *
-     * @return VarHandle for AtomicInteger
-     * @throws NoSuchFieldException if field not found
+     * @param segment    The memory segment
+     * @param offset     Offset in bytes
+     * @param expected   The expected current value
+     * @param newValue   The new value to set
+     * @param maxRetries Maximum number of CAS attempts
+     * @return true if successful, false if max retries exceeded
      */
-    public static VarHandle intAtomicVarHandle() throws NoSuchFieldException, IllegalAccessException {
-        return MethodHandles.lookup().findVarHandle(AtomicInteger.class, "value", int.class);
+    public static boolean spinCasInt(MemorySegment segment, long offset,
+                                     int expected, int newValue, int maxRetries) {
+        int currentExpected = expected;
+        for (int i = 0; i < maxRetries; i++) {
+            if (compareAndSetInt(segment, offset, currentExpected, newValue)) {
+                return true;
+            }
+            // Re-read current value for next attempt
+            currentExpected = readInt(segment, offset);
+        }
+        return false;
     }
 
     /**
-     * Gets a VarHandle for AtomicLong.
+     * Performs a spin-loop CAS until successful or max retries exceeded.
      *
-     * @return VarHandle for AtomicLong
-     * @throws NoSuchFieldException if field not found
+     * @param segment    The memory segment
+     * @param offset     Offset in bytes
+     * @param expected   The expected current value
+     * @param newValue   The new value to set
+     * @param maxRetries Maximum number of CAS attempts
+     * @return true if successful, false if max retries exceeded
      */
-    public static VarHandle longAtomicVarHandle() throws NoSuchFieldException, IllegalAccessException {
-        return MethodHandles.lookup().findVarHandle(AtomicLong.class, "value", long.class);
+    public static boolean spinCasLong(MemorySegment segment, long offset,
+                                      long expected, long newValue, int maxRetries) {
+        long currentExpected = expected;
+        for (int i = 0; i < maxRetries; i++) {
+            if (compareAndSetLong(segment, offset, currentExpected, newValue)) {
+                return true;
+            }
+            // Re-read current value for next attempt
+            currentExpected = readLong(segment, offset);
+        }
+        return false;
+    }
+
+    // ==================== VarHandle Accessors ====================
+
+    /**
+     * Gets the VarHandle for int access with volatile semantics.
+     * @return The int VarHandle
+     */
+    public static VarHandle intHandle() {
+        return INT_HANDLE;
     }
 
     /**
-     * Gets a VarHandle for AtomicReference.
-     *
-     * @return VarHandle for AtomicReference
-     * @throws NoSuchFieldException if field not found
+     * Gets the VarHandle for long access with volatile semantics.
+     * @return The long VarHandle
      */
-    public static VarHandle referenceVarHandle() throws NoSuchFieldException, IllegalAccessException {
-        return MethodHandles.lookup().findVarHandle(AtomicReference.class, "value", Object.class);
+    public static VarHandle longHandle() {
+        return LONG_HANDLE;
+    }
+
+    /**
+     * Gets the VarHandle for float access with volatile semantics.
+     * @return The float VarHandle
+     */
+    public static VarHandle floatHandle() {
+        return FLOAT_HANDLE;
+    }
+
+    /**
+     * Gets the VarHandle for double access with volatile semantics.
+     * @return The double VarHandle
+     */
+    public static VarHandle doubleHandle() {
+        return DOUBLE_HANDLE;
+    }
+
+    /**
+     * Gets the VarHandle for byte access.
+     * @return The byte VarHandle
+     */
+    public static VarHandle byteHandle() {
+        return BYTE_HANDLE;
+    }
+
+    // ==================== Helper Methods ====================
+
+    /**
+     * Checks bounds for memory access.
+     *
+     * @param segment The memory segment
+     * @param offset  The offset to validate
+     * @param size    The size of the access
+     * @throws IndexOutOfBoundsException if access is out of bounds
+     */
+    private static void checkBounds(MemorySegment segment, long offset, int size) {
+        if (offset < 0) {
+            throw new IndexOutOfBoundsException("Offset cannot be negative: " + offset);
+        }
+        if (offset + size > segment.byteSize()) {
+            throw new IndexOutOfBoundsException(
+                "Access out of bounds: offset=" + offset + ", size=" + size +
+                ", segmentSize=" + segment.byteSize());
+        }
     }
 }

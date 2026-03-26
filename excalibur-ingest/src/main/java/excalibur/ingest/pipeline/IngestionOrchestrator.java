@@ -10,8 +10,8 @@ import excalibur.ingest.source.SourceException;
 import excalibur.ingest.source.DocumentNotFoundException;
 import excalibur.ingest.lsh.LshIngestionService;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
+import excalibur.llm.embedding.EmbeddingClient;
 import excalibur.shard.IndexOrchestrator;
-import io.excalibur.llm.client.LLMHttpClient;
 import io.excalibur.llm.LLMException;
 import io.excalibur.store.StorageEngine;
 import io.excalibur.store.log.WriteLog;
@@ -106,7 +106,7 @@ public class IngestionOrchestrator {
     }
 
     private final TextChunker textChunker;
-    private final LLMHttpClient llmClient;
+    private final EmbeddingClient embeddingClient;
     private final StorageEngine storageEngine;
     private final IndexOrchestrator indexOrchestrator;
     private final StatusRegistry statusRegistry;
@@ -133,18 +133,18 @@ public class IngestionOrchestrator {
      * Creates a new IngestionOrchestrator with required dependencies.
      *
      * @param textChunker Text chunker for splitting documents
-     * @param llmClient LLM client for generating embeddings
+     * @param embeddingClient Embedding client for generating embeddings
      * @param storageEngine Storage engine for persisting entries
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
      * @throws NullPointerException if any parameter is null
      */
     public IngestionOrchestrator(TextChunker textChunker,
-                                  LLMHttpClient llmClient,
+                                  EmbeddingClient embeddingClient,
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry) {
-        this(textChunker, llmClient, storageEngine, indexOrchestrator, statusRegistry, null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+        this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry, null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
 
@@ -156,7 +156,7 @@ public class IngestionOrchestrator {
      * approximate nearest neighbor pre-filtering during queries.</p>
      *
      * @param textChunker Text chunker for splitting documents
-     * @param llmClient LLM client for generating embeddings
+     * @param embeddingClient Embedding client for generating embeddings
      * @param storageEngine Storage engine for persisting entries
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
@@ -164,12 +164,12 @@ public class IngestionOrchestrator {
      * @throws NullPointerException if required parameters are null
      */
     public IngestionOrchestrator(TextChunker textChunker,
-                                  LLMHttpClient llmClient,
+                                  EmbeddingClient embeddingClient,
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry,
                                   LshIngestionService lshIngestionService) {
-        this(textChunker, llmClient, storageEngine, indexOrchestrator, statusRegistry,
+        this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
              lshIngestionService, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
@@ -190,7 +190,7 @@ public class IngestionOrchestrator {
      * used for LSH index population.</p>
      *
      * @param textChunker Text chunker for splitting documents
-     * @param llmClient LLM client for generating embeddings
+     * @param embeddingClient Embedding client for generating embeddings
      * @param storageEngine Storage engine for persisting entries
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
@@ -200,14 +200,14 @@ public class IngestionOrchestrator {
      * @throws NullPointerException if required parameters are null
      */
     public IngestionOrchestrator(TextChunker textChunker,
-                                  LLMHttpClient llmClient,
+                                  EmbeddingClient embeddingClient,
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry,
                                   LshIngestionService lshIngestionService,
                                   DocumentChunkBuffer documentChunkBuffer,
                                   DocumentVisibilityTracker visibilityTracker) {
-        this(textChunker, llmClient, storageEngine, indexOrchestrator, statusRegistry,
+        this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
              lshIngestionService, documentChunkBuffer, visibilityTracker, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
@@ -217,7 +217,7 @@ public class IngestionOrchestrator {
      * <p>This is the most complete constructor, allowing all parameters to be configured.</p>
      *
      * @param textChunker Text chunker for splitting documents
-     * @param llmClient LLM client for generating embeddings
+     * @param embeddingClient Embedding client for generating embeddings
      * @param storageEngine Storage engine for persisting entries
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
@@ -228,7 +228,7 @@ public class IngestionOrchestrator {
      * @throws NullPointerException if required parameters are null
      */
     public IngestionOrchestrator(TextChunker textChunker,
-                                  LLMHttpClient llmClient,
+                                  EmbeddingClient embeddingClient,
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry,
@@ -237,7 +237,7 @@ public class IngestionOrchestrator {
                                   DocumentVisibilityTracker visibilityTracker,
                                   int documentTimeoutMs) {
         this.textChunker = Objects.requireNonNull(textChunker, "TextChunker cannot be null");
-        this.llmClient = Objects.requireNonNull(llmClient, "LLMHttpClient cannot be null");
+        this.embeddingClient = Objects.requireNonNull(embeddingClient, "EmbeddingClient cannot be null");
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.indexOrchestrator = Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
         this.statusRegistry = Objects.requireNonNull(statusRegistry, "StatusRegistry cannot be null");
@@ -365,7 +365,7 @@ public class IngestionOrchestrator {
                         for (int i = 0; i < chunks.size(); i++) {
                             TextChunk chunk = chunks.get(i);
                             try {
-                                float[] embedding = llmClient.generateEmbedding(chunk.getText());
+                                float[] embedding = embeddingClient.embed(chunk.getText());
                                 embeddings.put(i, embedding);
                             } catch (LLMException e) {
                                 LOGGER.warn("[{}] Failed to embed chunk {} of {}: {}",
@@ -447,7 +447,7 @@ public class IngestionOrchestrator {
 
                             try {
                                 // Generate embedding
-                                float[] embedding = llmClient.generateEmbedding(chunk.getText());
+                                float[] embedding = embeddingClient.embed(chunk.getText());
 
                                 // Create chunk ID
                                 String chunkId = sourceId + ":" + documentId + ":chunk:" + i;

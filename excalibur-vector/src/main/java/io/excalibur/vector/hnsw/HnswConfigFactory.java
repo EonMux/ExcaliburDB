@@ -1,0 +1,279 @@
+package io.excalibur.vector.hnsw;
+
+import io.excalibur.config.Config;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Objects;
+
+/**
+ * Factory for creating HnswConfig instances from configuration settings.
+ *
+ * <p>This factory bridges the {@link Config.Shard} configuration properties
+ * to the {@link HnswConfig} class, ensuring that property file values for
+ * {@code excalibur.shard.default-ef-construction} and
+ * {@code excalibur.shard.default-ef-search} are automatically applied
+ * when creating HNSW graphs.</p>
+ *
+ * <h2>Usage</h2>
+ * <pre>{@code
+ * // Create factory from Config.Shard
+ * HnswConfigFactory factory = HnswConfigFactory.fromShardConfig(config.shard());
+ *
+ * // Create HnswConfig for a specific dimension
+ * HnswConfig config = factory.create(1536);
+ *
+ * // Use config to create HNSW graph
+ * HnswGraph graph = new HnswGraph(path, config, distanceFunction, maxNodes);
+ * }</pre>
+ *
+ * <h2>Configuration Properties</h2>
+ * <ul>
+ *   <li>{@code excalibur.shard.default-ef-construction} - efConstruction parameter (default: 128)</li>
+ *   <li>{@code excalibur.shard.default-ef-search} - efSearch parameter (default: 64)</li>
+ * </ul>
+ *
+ * <h2>Domain Correctness</h2>
+ * <ul>
+ *   <li>efConstruction and efSearch must be at least 1 (enforced by Config.Shard validation)</li>
+ *   <li>maxConnections uses default (16) from HNSW paper recommendations</li>
+ *   <li>maxConnectionsLayer0 uses default (32) = 2x maxConnections</li>
+ *   <li>mL uses default (1/ln(M)) for proper level distribution</li>
+ * </ul>
+ *
+ * <h2>Thread Safety</h2>
+ * <p><strong>This class is immutable and thread-safe.</strong></p>
+ *
+ * @author ExcaliburDB
+ * @since 4.0
+ * @see HnswConfig
+ * @see Config.Shard
+ */
+public final class HnswConfigFactory {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(HnswConfigFactory.class);
+
+    /**
+     * Creates a factory with default values.
+     *
+     * <p>This uses the Config.Shard defaults: efConstruction=128, efSearch=64.</p>
+     *
+     * @return A new HnswConfigFactory with default values
+     */
+    public static HnswConfigFactory withDefaults() {
+        return new HnswConfigFactory(Config.Shard.DEFAULT_EF_CONSTRUCTION, Config.Shard.DEFAULT_EF_SEARCH);
+    }
+
+    /**
+     * The efConstruction parameter from configuration.
+     * Controls the size of the dynamic candidate list during graph construction.
+     * Higher values produce better recall at the cost of slower construction.
+     */
+    private final int efConstruction;
+
+    /**
+     * The efSearch parameter from configuration.
+     * Controls the size of the dynamic candidate list during search.
+     * Higher values produce better recall at the cost of slower search.
+     */
+    private final int efSearch;
+
+    /**
+     * Creates a new HnswConfigFactory with the specified parameters.
+     *
+     * @param efConstruction The efConstruction parameter
+     * @param efSearch The efSearch parameter
+     * @throws IllegalArgumentException if parameters are invalid
+     */
+    public HnswConfigFactory(int efConstruction, int efSearch) {
+        if (efConstruction < 1) {
+            throw new IllegalArgumentException(
+                "efConstruction must be at least 1, got: " + efConstruction);
+        }
+        if (efSearch < 1) {
+            throw new IllegalArgumentException(
+                "efSearch must be at least 1, got: " + efSearch);
+        }
+
+        this.efConstruction = efConstruction;
+        this.efSearch = efSearch;
+
+        LOGGER.debug("HnswConfigFactory created with efConstruction={}, efSearch={}",
+            efConstruction, efSearch);
+    }
+
+    /**
+     * Creates an HnswConfigFactory from Config.Shard settings.
+     *
+     * <p>This factory method is the primary integration point between
+     * the configuration system and the HNSW graph configuration. It reads
+     * the efConstruction and efSearch values from the shard configuration
+     * and makes them available for creating HnswConfig instances.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>efConstruction and efSearch are validated by Config.Shard</li>
+     *   <li>Values are used directly from configuration (no transformation)</li>
+     * </ul>
+     *
+     * @param shard The shard configuration from Config.Shard
+     * @return A new HnswConfigFactory configured with shard settings
+     * @throws NullPointerException if shard is null
+     */
+    public static HnswConfigFactory fromShardConfig(Config.Shard shard) {
+        Objects.requireNonNull(shard, "shard config cannot be null");
+
+        LOGGER.info("Creating HnswConfigFactory from Config.Shard: efConstruction={}, efSearch={}",
+            shard.getEfConstruction(), shard.getEfSearch());
+
+        return new HnswConfigFactory(
+            shard.getEfConstruction(),
+            shard.getEfSearch()
+        );
+    }
+
+    /**
+     * Creates an HnswConfigFactory with default values.
+     *
+     * <p>Uses the default efConstruction (128) and efSearch (64) from
+     * Config.Shard defaults.</p>
+     *
+     * @return A new HnswConfigFactory with default settings
+     */
+    public static HnswConfigFactory defaults() {
+        return new HnswConfigFactory(
+            Config.Shard.DEFAULT_EF_CONSTRUCTION,
+            Config.Shard.DEFAULT_EF_SEARCH
+        );
+    }
+
+    /**
+     * Creates an HnswConfig for the specified dimension using the factory settings.
+     *
+     * <p>The created config uses:</p>
+     * <ul>
+     *   <li>maxConnections = 16 (from HNSW paper for good recall/performance tradeoff)</li>
+     *   <li>maxConnectionsLayer0 = 32 (2x maxConnections for better base layer connectivity)</li>
+     *   <li>efConstruction = from this factory (from Config.Shard)</li>
+     *   <li>efSearch = from this factory (from Config.Shard)</li>
+     *   <li>mL = 1/ln(M) (normalization factor for level generation)</li>
+     * </ul>
+     *
+     * @param dimension The vector dimension (must be in range [1, 4096])
+     * @return A new HnswConfig configured with factory settings
+     * @throws IllegalArgumentException if dimension is invalid
+     */
+    public HnswConfig create(int dimension) {
+        LOGGER.debug("Creating HnswConfig: dimension={}, efConstruction={}, efSearch={}",
+            dimension, efConstruction, efSearch);
+
+        return new HnswConfig(
+            HnswConfig.DEFAULT_MAX_CONNECTIONS,           // Keep default: 16
+            HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0,    // Keep default: 32
+            efConstruction,                               // From Config.Shard
+            efSearch,                                     // From Config.Shard
+            HnswConfig.DEFAULT_ML,                        // Keep default: 1/ln(M)
+            dimension
+        );
+    }
+
+    /**
+     * Creates an HnswConfig with a custom efSearch override.
+     *
+     * <p>This is useful when a specific query needs higher or lower recall
+     * than the default configured value.</p>
+     *
+     * @param dimension The vector dimension
+     * @param customEfSearch The custom efSearch value to use
+     * @return A new HnswConfig with the custom efSearch
+     * @throws IllegalArgumentException if parameters are invalid
+     */
+    public HnswConfig createWithEfSearch(int dimension, int customEfSearch) {
+        if (customEfSearch < 1) {
+            throw new IllegalArgumentException(
+                "customEfSearch must be at least 1, got: " + customEfSearch);
+        }
+
+        LOGGER.debug("Creating HnswConfig with custom efSearch: dimension={}, efConstruction={}, efSearch={}",
+            dimension, efConstruction, customEfSearch);
+
+        return new HnswConfig(
+            HnswConfig.DEFAULT_MAX_CONNECTIONS,
+            HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0,
+            efConstruction,
+            customEfSearch,
+            HnswConfig.DEFAULT_ML,
+            dimension
+        );
+    }
+
+    /**
+     * Creates an HnswConfig with a custom efConstruction override.
+     *
+     * <p>This is useful when building a graph that needs different
+     * construction quality than the default.</p>
+     *
+     * @param dimension The vector dimension
+     * @param customEfConstruction The custom efConstruction value to use
+     * @return A new HnswConfig with the custom efConstruction
+     * @throws IllegalArgumentException if parameters are invalid
+     */
+    public HnswConfig createWithEfConstruction(int dimension, int customEfConstruction) {
+        if (customEfConstruction < 1) {
+            throw new IllegalArgumentException(
+                "customEfConstruction must be at least 1, got: " + customEfConstruction);
+        }
+
+        LOGGER.debug("Creating HnswConfig with custom efConstruction: dimension={}, efConstruction={}, efSearch={}",
+            dimension, customEfConstruction, efSearch);
+
+        return new HnswConfig(
+            HnswConfig.DEFAULT_MAX_CONNECTIONS,
+            HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0,
+            customEfConstruction,
+            efSearch,
+            HnswConfig.DEFAULT_ML,
+            dimension
+        );
+    }
+
+    /**
+     * Returns the efConstruction value used by this factory.
+     *
+     * @return The efConstruction parameter
+     */
+    public int getEfConstruction() {
+        return efConstruction;
+    }
+
+    /**
+     * Returns the efSearch value used by this factory.
+     *
+     * @return The efSearch parameter
+     */
+    public int getEfSearch() {
+        return efSearch;
+    }
+
+    @Override
+    public String toString() {
+        return "HnswConfigFactory{" +
+            "efConstruction=" + efConstruction +
+            ", efSearch=" + efSearch +
+            '}';
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        HnswConfigFactory that = (HnswConfigFactory) o;
+        return efConstruction == that.efConstruction &&
+               efSearch == that.efSearch;
+    }
+
+    @Override
+    public int hashCode() {
+        return 31 * efConstruction + efSearch;
+    }
+}

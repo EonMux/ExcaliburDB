@@ -126,15 +126,18 @@ public class QueryResultItem {
     
     /**
      * Check if this item matches another item.
-     * 
-     * @param other  The other item to compare against
+     *
+     * @param other  The other item to compare against (must not be null)
      * @param tolerance  Tolerance for score comparison
      * @return true if items match within tolerance
      */
     public boolean matches(QueryResultItem other, double tolerance) {
-        return documentId.equals(other.getDocumentId()) &&
+        if (other == null) {
+            return false;
+        }
+        return Objects.equals(documentId, other.getDocumentId()) &&
                Math.abs(score - other.getScore()) <= tolerance &&
-               source.equals(other.getSource()) &&
+               Objects.equals(source, other.getSource()) &&
                chunkIndex == other.getChunkIndex() &&
                Objects.equals(content, other.getContent());
     }

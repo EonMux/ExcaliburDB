@@ -5,6 +5,8 @@ import com.sun.net.httpserver.HttpHandler;
 import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceResolver;
+import excalibur.shard.allocator.VolumeManager;
+import io.excalibur.store.SegmentCatalog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -12,6 +14,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -73,6 +76,10 @@ public class ReindexEndpoint implements HttpHandler {
     private final SourceResolver sourceResolver;
     private final ExecutorService reindexExecutor;
 
+    // Optional components for zero-downtime rolling replacement
+    private final VolumeManager volumeManager;
+    private final SegmentCatalog segmentCatalog;
+
     /**
      * Creates a new ReindexEndpoint with full reindexing capability.
      *
@@ -90,14 +97,51 @@ public class ReindexEndpoint implements HttpHandler {
                            ReindexStatusRegistry reindexStatusRegistry,
                            DocumentReindexer documentReindexer,
                            SourceResolver sourceResolver) {
+        this(sourceRegistry, reindexStatusRegistry, documentReindexer, sourceResolver, null, null);
+    }
+
+    /**
+     * Creates a new ReindexEndpoint with zero-downtime rolling replacement support.
+     *
+     * <p>When VolumeManager and SegmentCatalog are provided in addition to
+     * DocumentReindexer, reindex operations will use rolling replacement:</p>
+     * <ol>
+     *   <li>New segments are created in BOOTSTRAPPING state</li>
+     *   <li>Old segments continue serving queries during reindexing</li>
+     *   <li>New segments progress through INDEXING → WARMING → ACTIVE</li>
+     *   <li>Old segments are tombstoned after new segments become ACTIVE</li>
+     * </ol>
+     *
+     * <p><strong>Zero-Downtime Guarantee:</strong> Data is never unavailable
+     * during reindexing because old segments remain queryable until new
+     * segments are fully active.</p>
+     *
+     * @param sourceRegistry The registry for looking up sources
+     * @param reindexStatusRegistry The registry for tracking reindex status
+     * @param documentReindexer The document reindexer for executing reindex operations
+     * @param sourceResolver The source resolver for obtaining Source instances
+     * @param volumeManager The volume manager for selecting volumes for new segments (may be null)
+     * @param segmentCatalog The segment catalog for managing segment lifecycle (may be null)
+     * @throws NullPointerException if sourceRegistry or reindexStatusRegistry is null
+     */
+    public ReindexEndpoint(SourceRegistry sourceRegistry,
+                           ReindexStatusRegistry reindexStatusRegistry,
+                           DocumentReindexer documentReindexer,
+                           SourceResolver sourceResolver,
+                           VolumeManager volumeManager,
+                           SegmentCatalog segmentCatalog) {
         this.sourceRegistry = Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
         this.reindexStatusRegistry = Objects.requireNonNull(reindexStatusRegistry, "ReindexStatusRegistry cannot be null");
         this.documentReindexer = documentReindexer;
         this.sourceResolver = sourceResolver;
-        this.reindexExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        this.reindexExecutor = documentReindexer != null ? Executors.newVirtualThreadPerTaskExecutor() : null;
+        this.volumeManager = volumeManager;
+        this.segmentCatalog = segmentCatalog;
 
-        LOGGER.info("ReindexEndpoint configured with document reindexer: {}",
-            documentReindexer != null ? "enabled" : "disabled (stub mode)");
+        boolean hasRollingReplacement = volumeManager != null && segmentCatalog != null;
+        LOGGER.info("ReindexEndpoint configured with document reindexer: {}, rolling replacement: {}",
+            documentReindexer != null ? "enabled" : "disabled (stub mode)",
+            hasRollingReplacement ? "enabled" : "disabled");
     }
 
     /**
@@ -116,6 +160,8 @@ public class ReindexEndpoint implements HttpHandler {
         this.documentReindexer = null;
         this.sourceResolver = null;
         this.reindexExecutor = null;
+        this.volumeManager = null;
+        this.segmentCatalog = null;
     }
 
     /**
@@ -300,10 +346,22 @@ public class ReindexEndpoint implements HttpHandler {
      * sent. It performs the actual reindexing by:</p>
      * <ol>
      *   <li>Resolving the source using SourceResolver</li>
-     *   <li>Invoking DocumentReindexer.reindexAll(source)</li>
+     *   <li>Selecting a volume for new segments (if rolling replacement is enabled)</li>
+     *   <li>Invoking DocumentReindexer.reindexWithRollingReplacement() for zero-downtime reindexing</li>
+     *   <li>Falling back to reindexAll() if rolling replacement is not configured</li>
      *   <li>Updating status registry as reindex progresses</li>
      *   <li>Calling completeReindex() or failReindex() when done</li>
      * </ol>
+     *
+     * <h2>Zero-Downtime Rolling Replacement</h2>
+     * <p>When VolumeManager and SegmentCatalog are configured, this method uses
+     * rolling replacement which ensures:</p>
+     * <ul>
+     *   <li>New segments are created in BOOTSTRAPPING state</li>
+     *   <li>Old segments continue serving queries during reindexing</li>
+     *   <li>New segments progress through INDEXING → WARMING → ACTIVE</li>
+     *   <li>Old segments are tombstoned only after new segments are ACTIVE</li>
+     * </ul>
      *
      * @param sourceId The source ID to reindex
      */
@@ -321,32 +379,85 @@ public class ReindexEndpoint implements HttpHandler {
                 return;
             }
 
-            // Update status to indicate embedding phase
+            // Update status to indicate crawling phase
             reindexStatusRegistry.updateProgress(sourceId, "crawling", 0.1, 0, 0);
-            LOGGER.debug("[reindex-{}] Source resolved, starting reindexAll for: {}", threadName, sourceId);
 
-            // Execute the reindex
-            reindexStatusRegistry.updateProgress(sourceId, "embedding", 0.3, 0, 0);
-            DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
+            // Check if rolling replacement is configured
+            boolean useRollingReplacement = volumeManager != null && segmentCatalog != null && documentReindexer.hasRollingReplacement();
 
-            // Update status to indicate indexing phase
-            reindexStatusRegistry.updateProgress(sourceId, "indexing", 0.7,
-                result.getDocumentsIndexed(), result.getDocumentsIndexed() + result.getChunksFailed());
+            if (useRollingReplacement) {
+                // Zero-downtime rolling replacement
+                LOGGER.info("[reindex-{}] Using rolling replacement for zero-downtime reindex of source: {}", threadName, sourceId);
 
-            if (result.hasErrors()) {
-                String error = String.format("Reindex completed with %d errors: %s",
-                    result.getErrorCount(),
-                    result.getErrors().stream()
-                        .map(DocumentReindexer.ReindexResult.OperationError::getMessage)
-                        .reduce((a, b) -> a + "; " + b)
-                        .orElse("unknown"));
-                LOGGER.warn("[reindex-{}] Reindex completed with errors for {}: {}",
-                    threadName, sourceId, error);
-                reindexStatusRegistry.failReindex(sourceId, error);
+                // Select a volume for the new segment
+                Path volumePath = volumeManager.getVolumeWithMostSpace();
+                if (volumePath == null) {
+                    String error = "No volume available for reindex";
+                    LOGGER.error("[reindex-{}] {} for source: {}", threadName, error, sourceId);
+                    reindexStatusRegistry.failReindex(sourceId, error);
+                    return;
+                }
+
+                LOGGER.info("[reindex-{}] Selected volume {} for new segment of source: {}", threadName, volumePath, sourceId);
+
+                // Update status to indicate embedding phase
+                reindexStatusRegistry.updateProgress(sourceId, "embedding", 0.3, 0, 0);
+
+                // Execute rolling replacement reindex
+                DocumentReindexer.RollingReindexResult result = documentReindexer.reindexWithRollingReplacement(source, volumePath);
+
+                // Update status to indicate indexing phase
+                reindexStatusRegistry.updateProgress(sourceId, "indexing", 0.7,
+                    result.getDocumentsIndexed(), result.getDocumentsIndexed() + result.getBasicResult().getChunksFailed());
+
+                if (result.hasErrors() && result.getDocumentsIndexed() == 0) {
+                    // Complete failure
+                    String error = String.format("Reindex failed completely with %d errors: %s",
+                        result.getErrorCount(),
+                        result.getBasicResult().getErrors().stream()
+                            .map(DocumentReindexer.ReindexResult.OperationError::getMessage)
+                            .reduce((a, b) -> a + "; " + b)
+                            .orElse("unknown"));
+                    LOGGER.error("[reindex-{}] {} for source: {}", threadName, error, sourceId);
+                    reindexStatusRegistry.failReindex(sourceId, error);
+                } else if (result.hasErrors()) {
+                    // Partial success - log warning but mark as complete
+                    LOGGER.warn("[reindex-{}] Rolling reindex completed with {} errors for source {}: {} docs indexed, {} old segments tombstoned, new segment {}",
+                        threadName, result.getErrorCount(), sourceId, result.getDocumentsIndexed(),
+                        result.getTombstonedSegmentIds().size(), result.getNewSegmentId());
+                    reindexStatusRegistry.completeReindex(sourceId);
+                } else {
+                    LOGGER.info("[reindex-{}] Rolling reindex completed successfully for source {}: {} docs indexed, {} old segments tombstoned, new segment {}",
+                        threadName, sourceId, result.getDocumentsIndexed(),
+                        result.getTombstonedSegmentIds().size(), result.getNewSegmentId());
+                    reindexStatusRegistry.completeReindex(sourceId);
+                }
+
             } else {
-                LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs indexed, {} chunks created",
-                    threadName, sourceId, result.getDocumentsIndexed(), result.getChunksCreated());
-                reindexStatusRegistry.completeReindex(sourceId);
+                // Fall back to non-rolling reindex
+                LOGGER.info("[reindex-{}] Using standard reindex (rolling replacement not configured) for source: {}", threadName, sourceId);
+                reindexStatusRegistry.updateProgress(sourceId, "embedding", 0.3, 0, 0);
+                DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
+
+                // Update status to indicate indexing phase
+                reindexStatusRegistry.updateProgress(sourceId, "indexing", 0.7,
+                    result.getDocumentsIndexed(), result.getDocumentsIndexed() + result.getChunksFailed());
+
+                if (result.hasErrors()) {
+                    String error = String.format("Reindex completed with %d errors: %s",
+                        result.getErrorCount(),
+                        result.getErrors().stream()
+                            .map(DocumentReindexer.ReindexResult.OperationError::getMessage)
+                            .reduce((a, b) -> a + "; " + b)
+                            .orElse("unknown"));
+                    LOGGER.warn("[reindex-{}] Reindex completed with errors for {}: {}",
+                        threadName, sourceId, error);
+                    reindexStatusRegistry.failReindex(sourceId, error);
+                } else {
+                    LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs indexed, {} chunks created",
+                        threadName, sourceId, result.getDocumentsIndexed(), result.getChunksCreated());
+                    reindexStatusRegistry.completeReindex(sourceId);
+                }
             }
 
         } catch (Exception e) {

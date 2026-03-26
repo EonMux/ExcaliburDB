@@ -97,9 +97,10 @@ public class WriteLog implements AutoCloseable {
     private final AtomicLong writeOffset;
 
     private volatile FileChannel fileChannel;
-    private volatile MemorySegment mappedSegment;
-    private volatile Segment mappedSegmentWrapper;
+    private volatile MemorySegment mappedSegment; // Native Panama segment (may be null in fallback mode)
+    private volatile Segment mappedSegmentWrapper; // Abstraction layer - always set
     private volatile boolean closed;
+    private final boolean usingPanama; // Track which implementation is in use
 
     // ==================== Statistics ====================
 
@@ -232,7 +233,43 @@ public class WriteLog implements AutoCloseable {
     // ==================== Constructors ====================
 
     /**
-     * Creates or opens a write-ahead log at the specified path.
+     * Creates or opens a write-ahead log at the specified path using automatic
+     * implementation selection.
+     *
+     * <p>This constructor uses {@link MemorySegmentFactory} to automatically select
+     * the appropriate memory segment implementation:</p>
+     * <ul>
+     *   <li>Uses Panama FFM (native MemorySegment) when available (Java 21+ with native access)</li>
+     *   <li>Falls back to ByteBuffer-based implementation when Panama is unavailable</li>
+     * </ul>
+     *
+     * <p>If the log file exists, it will be opened and the next LSN will be
+     * determined by scanning existing entries. If the file does not exist,
+     * it will be created.</p>
+     *
+     * @param logFilePath The path to the log file
+     * @throws IOException if the file cannot be created or opened
+     * @throws NullPointerException if logFilePath is null
+     */
+    public WriteLog(Path logFilePath) throws IOException {
+        Objects.requireNonNull(logFilePath, "Log file path cannot be null");
+
+        this.logFilePath = logFilePath;
+        this.usingPanama = MemorySegmentFactory.isPanamaAvailable();
+        this.arena = usingPanama ? Arena.ofShared() : null;
+        this.appendLock = new ReentrantLock();
+        this.nextLsn = new AtomicLong(0);
+        this.writeOffset = new AtomicLong(0);
+        this.closed = false;
+
+        initializeLogFile();
+
+        LOGGER.log(Level.INFO, "WriteLog initialized at {0} using {1} implementation",
+            new Object[] { logFilePath, usingPanama ? "Panama FFM" : "ByteBuffer fallback" });
+    }
+
+    /**
+     * Creates or opens a write-ahead log at the specified path with an explicit Arena.
      *
      * <p>If the log file exists, it will be opened and the next LSN will be
      * determined by scanning existing entries. If the file does not exist,
@@ -249,6 +286,7 @@ public class WriteLog implements AutoCloseable {
 
         this.logFilePath = logFilePath;
         this.arena = arena;
+        this.usingPanama = true;
         this.appendLock = new ReentrantLock();
         this.nextLsn = new AtomicLong(0);
         this.writeOffset = new AtomicLong(0);
@@ -296,6 +334,9 @@ public class WriteLog implements AutoCloseable {
     /**
      * Opens the file channel and memory-maps the file.
      *
+     * <p>This method uses the memory segment abstraction layer to support both
+     * Panama FFM and ByteBuffer fallback implementations.</p>
+     *
      * @param size The size to allocate for the file
      * @throws IOException if opening fails
      */
@@ -310,11 +351,17 @@ public class WriteLog implements AutoCloseable {
         // Allocate file space
         fileChannel.truncate(size);
 
-        // Memory-map the file using Panama FFM
-        mappedSegment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, size, arena);
+        if (usingPanama) {
+            // Memory-map the file using Panama FFM
+            mappedSegment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, size, arena);
 
-        // Create Segment wrapper for abstraction layer access
-        mappedSegmentWrapper = MemorySegmentFactory.wrapNative(mappedSegment);
+            // Create Segment wrapper for abstraction layer access
+            mappedSegmentWrapper = MemorySegmentFactory.wrapNative(mappedSegment);
+        } else {
+            // Use fallback implementation via MemorySegmentFactory
+            mappedSegment = null; // Not available in fallback mode
+            mappedSegmentWrapper = MemorySegmentFactory.mapChannel(fileChannel, size);
+        }
     }
 
     /**
@@ -326,7 +373,7 @@ public class WriteLog implements AutoCloseable {
     private void scanExistingEntries() {
         long offset = 0;
         long maxLsn = -1;
-        long fileSize = mappedSegment.byteSize();
+        long fileSize = mappedSegmentWrapper.byteSize();
 
         while (offset < fileSize) {
             // Check if we have enough bytes for a header
@@ -336,7 +383,7 @@ public class WriteLog implements AutoCloseable {
 
             try {
                 // Read key_len and value_len to determine entry size
-                int entrySize = LogEntry.sizeAt(mappedSegment, offset);
+                int entrySize = LogEntry.sizeAt(mappedSegmentWrapper, offset);
 
                 // Check if we have enough bytes for the full entry
                 if (offset + entrySize > fileSize) {
@@ -344,7 +391,7 @@ public class WriteLog implements AutoCloseable {
                 }
 
                 // Validate CRC32
-                if (!LogEntry.validateCrc32(mappedSegment, offset)) {
+                if (!LogEntry.validateCrc32(mappedSegmentWrapper, offset)) {
                     // Corrupted entry, stop scanning
                     LOGGER.log(Level.WARNING,
                         "Corrupted log entry found at offset {0}, stopping scan", offset);
@@ -352,7 +399,7 @@ public class WriteLog implements AutoCloseable {
                 }
 
                 // Read the entry to get the LSN
-                LogEntry entry = LogEntry.readFromUnchecked(mappedSegment, offset);
+                LogEntry entry = LogEntry.readFromUnchecked(mappedSegmentWrapper, offset);
                 maxLsn = Math.max(maxLsn, entry.lsn());
 
                 offset += entrySize;
@@ -420,7 +467,7 @@ public class WriteLog implements AutoCloseable {
 
             // Write entry to memory-mapped file
             long offset = writeOffset.get();
-            entry.writeTo(mappedSegment, offset);
+            entry.writeTo(mappedSegmentWrapper, offset);
 
             // Update write offset and statistics
             writeOffset.set(offset + entrySize);
@@ -505,7 +552,7 @@ public class WriteLog implements AutoCloseable {
 
             try {
                 // Read key_len and value_len to determine entry size
-                int entrySize = LogEntry.sizeAt(mappedSegment, offset);
+                int entrySize = LogEntry.sizeAt(mappedSegmentWrapper, offset);
 
                 // Check if we have enough bytes for the full entry
                 if (offset + entrySize > endOffset) {
@@ -513,7 +560,7 @@ public class WriteLog implements AutoCloseable {
                 }
 
                 // Validate CRC32
-                if (!LogEntry.validateCrc32(mappedSegment, offset)) {
+                if (!LogEntry.validateCrc32(mappedSegmentWrapper, offset)) {
                     // Corrupted entry, skip
                     entriesSkipped++;
                     domainCorrect = false;
@@ -527,7 +574,7 @@ public class WriteLog implements AutoCloseable {
                 }
 
                 // Read and process the entry
-                LogEntry entry = LogEntry.readFrom(mappedSegment, offset);
+                LogEntry entry = LogEntry.readFrom(mappedSegmentWrapper, offset);
                 handler.accept(entry);
                 entriesRecovered++;
 
@@ -644,7 +691,7 @@ public class WriteLog implements AutoCloseable {
      */
     private void ensureCapacity(int requiredBytes) throws IOException {
         long currentOffset = writeOffset.get();
-        long currentSize = mappedSegment.byteSize();
+        long currentSize = mappedSegmentWrapper.byteSize();
 
         if (currentOffset + requiredBytes > currentSize) {
             // Calculate new size (double or minimum required)
@@ -653,8 +700,13 @@ public class WriteLog implements AutoCloseable {
             // Extend the file
             fileChannel.truncate(newSize);
 
-            // Re-map the file
-            mappedSegment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, newSize, arena);
+            // Re-map the file using the abstraction layer
+            if (usingPanama) {
+                mappedSegment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, newSize, arena);
+                mappedSegmentWrapper = MemorySegmentFactory.wrapNative(mappedSegment);
+            } else {
+                mappedSegmentWrapper = MemorySegmentFactory.mapChannel(fileChannel, newSize);
+            }
 
             LOGGER.log(Level.FINE, "Extended log file to {0} bytes", newSize);
         }
@@ -724,7 +776,7 @@ public class WriteLog implements AutoCloseable {
 
         try {
             // Read entry size first
-            int entrySize = LogEntry.sizeAt(mappedSegment, offset);
+            int entrySize = LogEntry.sizeAt(mappedSegmentWrapper, offset);
 
             // Check if we have enough bytes for the full entry
             if (offset + entrySize > endOffset) {
@@ -732,13 +784,13 @@ public class WriteLog implements AutoCloseable {
             }
 
             // Validate CRC32
-            if (!LogEntry.validateCrc32(mappedSegment, offset)) {
+            if (!LogEntry.validateCrc32(mappedSegmentWrapper, offset)) {
                 LOGGER.fine("CRC32 validation failed at offset " + offset);
                 return null;
             }
 
             // Read and return the entry
-            return LogEntry.readFromUnchecked(mappedSegment, offset);
+            return LogEntry.readFromUnchecked(mappedSegmentWrapper, offset);
 
         } catch (Exception e) {
             LOGGER.fine("Failed to read entry at offset " + offset + ": " + e.getMessage());
@@ -765,7 +817,7 @@ public class WriteLog implements AutoCloseable {
         }
 
         try {
-            return LogEntry.sizeAt(mappedSegment, offset);
+            return LogEntry.sizeAt(mappedSegmentWrapper, offset);
         } catch (Exception e) {
             return -1;
         }
@@ -777,7 +829,7 @@ public class WriteLog implements AutoCloseable {
      * @return The file size in bytes
      */
     public long fileSize() {
-        return mappedSegment != null ? mappedSegment.byteSize() : 0;
+        return mappedSegmentWrapper != null ? mappedSegmentWrapper.byteSize() : 0;
     }
 
     /**

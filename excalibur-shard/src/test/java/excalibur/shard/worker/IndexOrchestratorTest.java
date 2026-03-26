@@ -2,6 +2,7 @@ package excalibur.shard.worker;
 
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
+import excalibur.filter.HierarchicalCuckooFilter;
 import excalibur.shard.IndexOrchestrator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
@@ -1012,6 +1013,162 @@ class IndexOrchestratorTest {
             "No reindexes should have failed");
 
         orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    // ==================== Hierarchical Cuckoo Filter Wiring Tests ====================
+
+    @Test
+    @DisplayName("IndexOrchestrator should wire hierarchical Cuckoo filter to maintenance worker")
+    void testIndexOrchestratorHierarchicalCuckooFilterWiring() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data17");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        // Initially, the cuckoo worker should have no hierarchical filter
+        CuckooMaintenanceWorker cuckooWorker = orchestrator.getCuckooWorker();
+        assertNull(cuckooWorker.getHierarchicalFilter(),
+            "CuckooMaintenanceWorker should start with null hierarchical filter");
+
+        // Create and wire a hierarchical filter
+        HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(
+            1_000_000L,  // corpus capacity
+            13,          // fingerprint bits
+            100_000,     // cluster capacity
+            10_000       // segment capacity
+        );
+        orchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
+
+        // Verify the filter is now wired to the cuckoo worker
+        assertSame(hierarchicalFilter, cuckooWorker.getHierarchicalFilter(),
+            "Hierarchical filter should be wired to CuckooMaintenanceWorker");
+
+        // Verify we can clear it
+        orchestrator.setHierarchicalCuckooFilter(null);
+        assertNull(cuckooWorker.getHierarchicalFilter(),
+            "Hierarchical filter should be clearable");
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("Scheduled reindex should use ReindexOperationHandler when configured")
+    void scheduledReindexUsesReindexOperationHandler() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data19");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        // Track handler invocation
+        java.util.concurrent.atomic.AtomicBoolean handlerCalled = new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.atomic.AtomicReference<String> capturedSourceId = new java.util.concurrent.atomic.AtomicReference<>();
+
+        // Configure the handler
+        orchestrator.setReindexOperationHandler(sourceId -> {
+            handlerCalled.set(true);
+            capturedSourceId.set(sourceId);
+            return true;
+        });
+
+        // Verify handler is set
+        assertNotNull(orchestrator.getReindexOperationHandler(),
+            "ReindexOperationHandler should be configured");
+
+        // Register a source and trigger reindex via the scheduler
+        orchestrator.getReindexScheduler().registerSourceUnchecked(42L, 1000L);
+        boolean result = orchestrator.getReindexScheduler().triggerReindexNow(42L);
+
+        // Verify the handler was invoked
+        assertTrue(result, "Reindex should succeed");
+        assertTrue(handlerCalled.get(), "ReindexOperationHandler should have been called");
+        assertEquals("42", capturedSourceId.get(), "Handler should receive correct source ID");
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("ReindexOperationHandler should support clearing")
+    void reindexOperationHandlerCanBeCleared() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data20");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        // Initially null
+        assertNull(orchestrator.getReindexOperationHandler(),
+            "Handler should initially be null");
+
+        // Set handler
+        orchestrator.setReindexOperationHandler(sourceId -> true);
+        assertNotNull(orchestrator.getReindexOperationHandler(),
+            "Handler should be set");
+
+        // Clear handler
+        orchestrator.setReindexOperationHandler(null);
+        assertNull(orchestrator.getReindexOperationHandler(),
+            "Handler should be cleared");
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("CuckooMaintenanceWorker should use hierarchical filter for deletions when set")
+    void testCuckooWorkerUsesHierarchicalFilterForDeletions() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data18");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+
+        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
+
+        // Create and wire hierarchical filter
+        HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(10_000L, 13, 1_000, 100);
+        worker.setHierarchicalFilter(hierarchicalFilter);
+
+        // Register a segment in the hierarchy
+        String segmentId = "test-segment-1";
+        String clusterId = "test-cluster-1";
+        hierarchicalFilter.registerSegment(segmentId, clusterId);
+
+        // Insert a test item
+        byte[] testKey = "test-key".getBytes();
+        assertTrue(hierarchicalFilter.insert(testKey, segmentId),
+            "Insert into hierarchical filter should succeed");
+
+        // Verify the item is in the filter
+        assertTrue(hierarchicalFilter.mightContain(testKey),
+            "Item should be present in corpus filter");
+        assertTrue(hierarchicalFilter.mightContainInSegment(testKey, segmentId),
+            "Item should be present in segment filter");
+
+        // Delete from hierarchy
+        boolean deleted = hierarchicalFilter.deleteFromHierarchy(testKey, segmentId);
+        assertTrue(deleted, "Delete from hierarchy should succeed");
+
+        // Verify the item is no longer in the filter
+        assertFalse(hierarchicalFilter.mightContainInSegment(testKey, segmentId),
+            "Item should no longer be present in segment filter after deletion");
+
+        worker.stop();
         storageEngine.close();
         arena.close();
         catalog.close();

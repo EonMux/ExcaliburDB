@@ -1,5 +1,7 @@
 package io.excalibur.store;
 
+import io.excalibur.core.memory.MemorySegmentFactory;
+
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -9,6 +11,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * StorageEngine manages segments that form the keyspace for the ExcaliburDB storage engine.
@@ -51,6 +55,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * @see LifecycleState
  */
 public class StorageEngine implements AutoCloseable {
+
+    private static final Logger LOGGER = Logger.getLogger(StorageEngine.class.getName());
 
     // ==================== Constants ====================
 
@@ -105,8 +111,18 @@ public class StorageEngine implements AutoCloseable {
      *
      * <p>The Arena controls the lifecycle of the MemorySegment backing each segment.
      * This Arena must outlive the StorageEngine for proper resource cleanup.</p>
+     *
+     * <p>May be null when using the fallback ByteBuffer-based implementation.</p>
      */
     private final Arena arena;
+
+    /**
+     * Flag indicating whether Panama FFM is being used.
+     *
+     * <p>When true, the engine uses native Panama FFM MemorySegments.
+     * When false, the engine uses the ByteBuffer-based fallback implementation.</p>
+     */
+    private final boolean usingPanama;
 
     /**
      * Registry of active segments.
@@ -167,6 +183,12 @@ public class StorageEngine implements AutoCloseable {
     private volatile boolean started = false;
 
     /**
+     * HNSW initializer for creating HNSW graphs for segments.
+     * May be null if HNSW initialization is disabled.
+     */
+    private volatile HnswInitializer hnswInitializer;
+
+    /**
      * Background split worker for automatic capacity management.
      *
      * <p>The split worker monitors registered segments and performs
@@ -186,7 +208,62 @@ public class StorageEngine implements AutoCloseable {
     // ==================== Constructors ====================
 
     /**
-     * Creates a new StorageEngine with default configuration.
+     * Creates a new StorageEngine with default configuration using automatic
+     * implementation selection.
+     *
+     * <p>This constructor uses {@link MemorySegmentFactory} to automatically select
+     * the appropriate memory segment implementation:</p>
+     * <ul>
+     *   <li>Uses Panama FFM (native MemorySegment) when available (Java 21+ with native access)</li>
+     *   <li>Falls back to ByteBuffer-based implementation when Panama is unavailable</li>
+     * </ul>
+     *
+     * <p>Default configuration:
+     * <ul>
+     *   <li>Data directory: must exist</li>
+     *   <li>Initial segments: 64 (pre-allocated on start)</li>
+     *   <li>Visibility epoch: starts at 0</li>
+     * </ul>
+     *
+     * @param dataDir Directory for storing segment files (must exist)
+     * @throws IllegalArgumentException if dataDir is null or doesn't exist
+     */
+    public StorageEngine(Path dataDir) {
+        if (dataDir == null) {
+            throw new IllegalArgumentException("Data directory cannot be null");
+        }
+        if (!java.nio.file.Files.isDirectory(dataDir)) {
+            throw new IllegalArgumentException(
+                "Data directory must exist: " + dataDir);
+        }
+
+        this.dataDir = dataDir;
+        this.usingPanama = MemorySegmentFactory.isPanamaAvailable();
+        this.arena = usingPanama ? Arena.ofShared() : null;
+        this.catalog = new SegmentCatalog(dataDir.resolve("catalog.dat"));
+        this.segments = new HashMap<>(DEFAULT_INITIAL_SEGMENTS);
+
+        // Initialize split worker with listener that updates segment registry
+        // This enables automatic capacity management when segments reach load factor threshold
+        if (usingPanama) {
+            this.splitWorker = new SplitWorker(arena, new SplitWorker.SplitListener() {
+                @Override
+                public void onSplitComplete(Segment parent, Segment leftChild, Segment rightChild) {
+                    handleSplitComplete(parent, leftChild, rightChild);
+                }
+            });
+        } else {
+            // Split worker not available in fallback mode
+            // Segment splitting requires Panama FFM for memory-mapped file operations
+            this.splitWorker = null;
+        }
+
+        LOGGER.log(Level.INFO, "StorageEngine initialized using {0} implementation",
+            usingPanama ? "Panama FFM" : "ByteBuffer fallback");
+    }
+
+    /**
+     * Creates a new StorageEngine with default configuration and explicit Arena.
      *
      * <p>Default configuration:
      * <ul>
@@ -213,6 +290,7 @@ public class StorageEngine implements AutoCloseable {
 
         this.dataDir = dataDir;
         this.arena = arena;
+        this.usingPanama = true;
         this.catalog = new SegmentCatalog(dataDir.resolve("catalog.dat"), arena);
         this.segments = new HashMap<>(DEFAULT_INITIAL_SEGMENTS);
 
@@ -588,6 +666,18 @@ public class StorageEngine implements AutoCloseable {
                 WriteLog writeLog = new WriteLog(writeLogPath, arena);
                 segment.attachWriteLog(writeLog);
 
+                // Initialize HNSW graph for the segment if initializer is configured
+                if (hnswInitializer != null) {
+                    try {
+                        hnswInitializer.initializeForSegment(segment);
+                        LOGGER.fine("HNSW graph initialized for segment " + segmentIndex);
+                    } catch (IOException e) {
+                        LOGGER.warning("Failed to initialize HNSW graph for segment " +
+                            segmentIndex + ": " + e.getMessage());
+                        // Continue without HNSW - segment is still functional for KV operations
+                    }
+                }
+
                 segments.put((long) segmentIndex, segment);
 
                 // Add to catalog with initial INDEXING state
@@ -959,6 +1049,39 @@ public class StorageEngine implements AutoCloseable {
     }
 
     /**
+     * Atomically replaces a segment with a new compacted segment.
+     *
+     * <p>This method is called by the compaction worker after successfully
+     * compacting a segment. It atomically swaps the old segment for the new
+     * one in the segment registry.</p>
+     *
+     * <p><strong>Thread Safety:</strong> This method is synchronized to ensure
+     * atomic replacement. Reads during the swap will either see the old or
+     * new segment, but never an inconsistent state.</p>
+     *
+     * @param segmentIndex The segment index
+     * @param oldSegment The old segment being replaced (used for verification)
+     * @param newSegment The new compacted segment
+     * @return true if replacement was successful, false if segment index not found
+     *         or old segment doesn't match
+     */
+    public synchronized boolean replaceSegment(long segmentIndex, Segment oldSegment, Segment newSegment) {
+        Segment current = segments.get(segmentIndex);
+        if (current == null) {
+            LOGGER.log(Level.WARNING, "Cannot replace segment {0}: not found in registry", segmentIndex);
+            return false;
+        }
+        if (current != oldSegment) {
+            LOGGER.log(Level.WARNING, "Cannot replace segment {0}: old segment mismatch", segmentIndex);
+            return false;
+        }
+        segments.put(segmentIndex, newSegment);
+        LOGGER.log(Level.INFO, "Replaced segment {0}: {1} entries in new segment",
+            new Object[] { segmentIndex, newSegment.entryCount() });
+        return true;
+    }
+
+    /**
      * Gets all active segments.
      *
      * @return Map of segment index to segment instance
@@ -1100,6 +1223,31 @@ public class StorageEngine implements AutoCloseable {
     }
 
     /**
+     * Sets the HNSW initializer for creating HNSW graphs for segments.
+     *
+     * <p>When configured, the initializer is called for each new segment
+     * to create and attach an HNSW graph for vector indexing. This enables
+     * the HNSW integration worker to integrate vectors from the write log.</p>
+     *
+     * <p>Set to null to disable HNSW graph creation for new segments.</p>
+     *
+     * @param initializer The HNSW initializer, or null to disable
+     */
+    public void setHnswInitializer(HnswInitializer initializer) {
+        this.hnswInitializer = initializer;
+        LOGGER.info("HNSW initializer " + (initializer != null ? "configured" : "disabled"));
+    }
+
+    /**
+     * Returns the HNSW initializer.
+     *
+     * @return The HNSW initializer, or null if not configured
+     */
+    public HnswInitializer getHnswInitializer() {
+        return hnswInitializer;
+    }
+
+    /**
      * Returns the segment catalog.
      *
      * @return The catalog
@@ -1120,7 +1268,9 @@ public class StorageEngine implements AutoCloseable {
     /**
      * Returns the Arena used for memory allocation.
      *
-     * @return The Arena
+     * <p>May be null if using the ByteBuffer-based fallback implementation.</p>
+     *
+     * @return The Arena, or null if not using Panama FFM
      */
     public Arena arena() {
         return arena;

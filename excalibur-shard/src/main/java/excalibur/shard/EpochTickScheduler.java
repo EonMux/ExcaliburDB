@@ -1,5 +1,6 @@
 package excalibur.shard;
 
+import io.excalibur.metrics.Metrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -219,7 +220,15 @@ public class EpochTickScheduler implements AutoCloseable {
             tickCount.incrementAndGet();
             lastTickTimestamp.set(System.currentTimeMillis());
 
-            LOGGER.trace("Epoch tick: {} -> {}", previousEpoch, newEpoch);
+            // Record epoch in JMX metrics for observability
+            Metrics.recordEpoch(newEpoch);
+
+            // Calculate and record estimated coverage based on visible segment ratio
+            VisibilityTracker.VisibilityStats stats = visibilityTracker.getStats();
+            double coverage = stats.visibilityRatio();
+            Metrics.setEstimatedCoverage(coverage);
+
+            LOGGER.trace("Epoch tick: {} -> {}, coverage={}", previousEpoch, newEpoch, coverage);
 
         } catch (Exception e) {
             LOGGER.error("Error during epoch tick: {}", e.getMessage(), e);
@@ -240,7 +249,15 @@ public class EpochTickScheduler implements AutoCloseable {
         tickCount.incrementAndGet();
         lastTickTimestamp.set(System.currentTimeMillis());
 
-        LOGGER.trace("Immediate epoch tick: new epoch = {}", newEpoch);
+        // Record epoch in JMX metrics for observability
+        Metrics.recordEpoch(newEpoch);
+
+        // Calculate and record estimated coverage based on visible segment ratio
+        VisibilityTracker.VisibilityStats stats = visibilityTracker.getStats();
+        double coverage = stats.visibilityRatio();
+        Metrics.setEstimatedCoverage(coverage);
+
+        LOGGER.trace("Immediate epoch tick: new epoch = {}, coverage = {}", newEpoch, coverage);
         return newEpoch;
     }
 

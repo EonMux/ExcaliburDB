@@ -5,6 +5,7 @@ import excalibur.filter.lsh.LshIndex;
 import excalibur.filter.sketch.CountMinSketch;
 import excalibur.ingest.visibility.DocumentVisibilityChecker;
 import excalibur.query.IndexCoverage;
+import excalibur.query.QueryOptions;
 import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
 import excalibur.query.plan.SelectivityEstimator;
@@ -17,6 +18,7 @@ import excalibur.query.visibility.DocumentAtomicityFilter;
 import excalibur.query.visibility.QuerySnapshot;
 import excalibur.shard.VisibilityTracker;
 import io.excalibur.core.text.TermExtractor;
+import io.excalibur.metrics.Metrics;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
@@ -97,6 +99,9 @@ public class QueryPipeline {
     private final LlmScorer llmScorer;
     private final double coverageThreshold;
     private final HierarchicalCuckooFilter hierarchicalFilter;
+
+    // Lazily initialized dispatcher for parallel query execution
+    private volatile ParallelQueryDispatcher dispatcher;
 
     /**
      * Creates a new QueryPipeline.
@@ -208,6 +213,58 @@ public class QueryPipeline {
         this.llmScorer = llmScorer;
         this.coverageThreshold = coverageThreshold;
         this.hierarchicalFilter = hierarchicalFilter;
+        // Dispatcher is lazily initialized on first use
+    }
+
+    /**
+     * Private constructor for creating modified pipeline instances.
+     *
+     * <p>This constructor preserves the dispatcher when creating new pipeline
+     * instances via the with*() methods.</p>
+     */
+    private QueryPipeline(
+            StorageEngine storageEngine,
+            VisibilityTracker visibilityTracker,
+            DocumentVisibilityChecker visibilityChecker,
+            HnswGraphProvider graphProvider,
+            DistanceFunction distanceFunction,
+            LlmScorer llmScorer,
+            double coverageThreshold,
+            HierarchicalCuckooFilter hierarchicalFilter,
+            ParallelQueryDispatcher dispatcher) {
+
+        this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
+        this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
+        this.visibilityChecker = visibilityChecker;
+        this.graphProvider = Objects.requireNonNull(graphProvider, "GraphProvider cannot be null");
+        this.distanceFunction = Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
+        this.llmScorer = llmScorer;
+        this.coverageThreshold = coverageThreshold;
+        this.hierarchicalFilter = hierarchicalFilter;
+        this.dispatcher = dispatcher;
+    }
+
+    /**
+     * Returns the parallel query dispatcher, initializing it lazily if needed.
+     *
+     * <p>The dispatcher is created on first access to support testing with
+     * mocked storage engines.</p>
+     *
+     * @return The parallel query dispatcher
+     */
+    private ParallelQueryDispatcher getDispatcher() {
+        if (dispatcher == null) {
+            synchronized (this) {
+                if (dispatcher == null) {
+                    dispatcher = new ParallelQueryDispatcher(
+                        storageEngine.getCatalog(),
+                        storageEngine.getSegments(),
+                        graphProvider::getGraph
+                    );
+                }
+            }
+        }
+        return dispatcher;
     }
 
     // ==================== Configuration Methods ====================
@@ -237,7 +294,8 @@ public class QueryPipeline {
             this.distanceFunction,
             llmScorer,
             this.coverageThreshold,
-            this.hierarchicalFilter
+            this.hierarchicalFilter,
+            this.dispatcher
         );
     }
 
@@ -266,7 +324,8 @@ public class QueryPipeline {
             this.distanceFunction,
             this.llmScorer,
             this.coverageThreshold,
-            this.hierarchicalFilter
+            this.hierarchicalFilter,
+            this.dispatcher
         );
     }
 
@@ -286,6 +345,23 @@ public class QueryPipeline {
      */
     public DocumentVisibilityChecker getVisibilityChecker() {
         return visibilityChecker;
+    }
+
+    /**
+     * Shuts down the query pipeline and releases resources.
+     *
+     * <p>This method shuts down the internal parallel query dispatcher,
+     * which terminates the virtual thread executor used for parallel
+     * segment searches.</p>
+     *
+     * <p>After calling shutdown(), the pipeline should not be used for
+     * query execution.</p>
+     */
+    public void shutdown() {
+        if (dispatcher != null) {
+            dispatcher.shutdown();
+            LOGGER.debug("QueryPipeline shutdown complete");
+        }
     }
 
     // ==================== Main Execution Method ====================
@@ -345,6 +421,10 @@ public class QueryPipeline {
         // Handle result
         return timeoutFuture.handle((context, error) -> {
             long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+
+            // Record query latency for JMX observability
+            // This enables monitoring of p50/p90/p95/p99 latencies
+            Metrics.recordQueryLatency(durationMs);
 
             if (error != null) {
                 return handlePipelineError(error, request, durationMs, token);
@@ -754,72 +834,47 @@ public class QueryPipeline {
      * For segments where lastIntegratedOffset < writeLogHead, also performs
      * brute-force tail scan over un-integrated entries.</p>
      *
-     * <p><strong>Offset Comparison:</strong> Uses {@link TailScanAnalyzer} to compare
-     * lastIntegratedOffset vs writeLogHead for each candidate segment. This determines
-     * which segments have un-integrated entries that need tail scanning.</p>
+     * <p><strong>Parallel Execution:</strong> Uses {@link ParallelQueryDispatcher} to
+     * dispatch segment searches in parallel using virtual threads. Each segment's
+     * HNSW search and optional tail scan execute concurrently for improved latency.</p>
+     *
+     * <p><strong>Offset Comparison:</strong> The dispatcher's {@link SegmentQueryTask}
+     * handles tail scan offset comparison internally, comparing lastIntegratedOffset
+     * vs writeLogHead for each segment to determine if tail scanning is needed.</p>
      */
     private PipelineContext stage3_HnswVectorSearch(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 3 cancelled before HNSW search");
 
-        LOGGER.trace("Stage 3: Running HNSW vector search");
+        LOGGER.trace("Stage 3: Running HNSW vector search with parallel dispatch");
 
-        // Use TailScanAnalyzer to compare lastIntegratedOffset vs writeLogHead for each segment
-        TailScanAnalyzer analyzer = new TailScanAnalyzer();
-        TailScanAnalyzer.AnalysisResult analysis = analyzer.analyzeWithSummary(context.candidates);
+        // Build QueryOptions from request
+        int oversamplingFactor = (int) Math.max(1, context.request.recallTarget() * 2);
+        QueryOptions options = QueryOptions.builder()
+            .topK(context.request.topK())
+            .threshold(context.request.threshold())
+            .includePartialSegments(context.request.includePartialSegments())
+            .timeout(context.request.timeout())
+            .oversamplingFactor(oversamplingFactor)
+            .build();
 
-        LOGGER.debug("Stage 3: Tail scan analysis - {} of {} segments need tail scan, total tail size: {} bytes",
-            analysis.segmentsNeedingTailScan(), analysis.totalSegments(), analysis.totalTailSize());
+        // Dispatch queries in parallel using virtual threads
+        ParallelQueryDispatcher.DispatchResult dispatchResult = getDispatcher().dispatchRaw(
+            context.request.queryVectorUnsafe(),
+            options,
+            distanceFunction
+        );
 
-        List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
-        long totalTailScanEntries = analysis.totalTailSize();
+        // Get raw segment results for subsequent stages
+        List<SegmentQueryTask.SegmentQueryResult> segmentResults = dispatchResult.segmentResults();
 
-        float[] queryVector = context.request.queryVectorUnsafe();
-        int oversamplingFactor = (int) (context.request.recallTarget() * 2); // Approximate oversampling
-
-        // Process each candidate with its tail scan requirement
-        List<TailScanRequirement> requirements = analysis.requirements();
-        for (int i = 0; i < context.candidates.size(); i++) {
-            SegmentCandidate candidate = context.candidates.get(i);
-            TailScanRequirement requirement = requirements.get(i);
-
-            token.checkCancelled("Stage 3 cancelled during segment search");
-
-            try {
-                // Search segment
-                List<HnswSearchResult> results = searchSegment(
-                    queryVector,
-                    candidate,
-                    context.request.topK() * oversamplingFactor,
-                    requirement
-                );
-
-                // Use the pre-computed tail size from the requirement
-                long tailEntries = requirement.isTailScanNeeded() ? requirement.tailSize() : 0;
-
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    candidate.segmentId(),
-                    results,
-                    tailEntries,
-                    0, // duration computed separately
-                    true,
-                    null
-                ));
-
-            } catch (Exception e) {
-                LOGGER.warn("Segment {} search failed: {}", candidate.segmentId(), e.getMessage());
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    candidate.segmentId(),
-                    Collections.emptyList(),
-                    0,
-                    0,
-                    false,
-                    e.getMessage()
-                ));
-            }
+        // Calculate total tail scan entries from segment results
+        long totalTailScanEntries = 0;
+        for (SegmentQueryTask.SegmentQueryResult result : segmentResults) {
+            totalTailScanEntries += result.tailScanEntries();
         }
 
-        LOGGER.debug("Stage 3: Searched {} segments, {} tail scan entries",
-            segmentResults.size(), totalTailScanEntries);
+        LOGGER.debug("Stage 3: Parallel search completed - {} segments, {} tail scan entries, {}ms",
+            segmentResults.size(), totalTailScanEntries, dispatchResult.durationMs());
 
         return context.withSegmentResults(segmentResults, totalTailScanEntries);
     }

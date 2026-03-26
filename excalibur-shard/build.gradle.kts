@@ -24,6 +24,9 @@ dependencies {
 
     // Config module for Config.Shard
     implementation(project(":excalibur-config"))
+
+    // Metrics module for JMX observability
+    implementation(project(":excalibur-metrics"))
 }
 
 // Enable preview features for Java 21

@@ -331,45 +331,35 @@ class HealthEndpointTest {
     }
 
     @Nested
-    @DisplayName("HealthStatus record")
+    @DisplayName("HealthStatus record validation")
     class HealthStatusTests {
 
         @Test
-        @DisplayName("rejects negative epoch")
-        void rejectsNegativeEpoch() {
-            // HealthStatus(live, ready, healthy, epoch, coverage, latencyMs)
+        @DisplayName("validates all HealthStatus constraints")
+        void validatesAllHealthStatusConstraints() {
+            // Combined validation tests to reduce test count
+
+            // Test negative epoch rejection
             assertThatThrownBy(() -> new HealthEndpoint.HealthStatus(true, false, false, -1L, 0.5, 0L))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Epoch must be non-negative");
-        }
 
-        @Test
-        @DisplayName("rejects NaN coverage")
-        void rejectsNanCoverage() {
+            // Test NaN coverage rejection
             assertThatThrownBy(() -> new HealthEndpoint.HealthStatus(true, false, false, 0L, Double.NaN, 0L))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Coverage must be in range");
-        }
 
-        @Test
-        @DisplayName("rejects coverage below 0.0")
-        void rejectsCoverageBelowZero() {
+            // Test coverage below 0.0 rejection
             assertThatThrownBy(() -> new HealthEndpoint.HealthStatus(true, false, false, 0L, -0.1, 0L))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Coverage must be in range");
-        }
 
-        @Test
-        @DisplayName("rejects coverage above 1.0")
-        void rejectsCoverageAboveOne() {
+            // Test coverage above 1.0 rejection
             assertThatThrownBy(() -> new HealthEndpoint.HealthStatus(true, false, false, 0L, 1.1, 0L))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Coverage must be in range");
-        }
 
-        @Test
-        @DisplayName("accepts boundary coverage values 0.0 and 1.0")
-        void acceptsBoundaryCoverage() {
+            // Test boundary coverage values 0.0 and 1.0 are accepted
             assertThatCode(() -> new HealthEndpoint.HealthStatus(true, false, false, 0L, 0.0, 0L))
                 .doesNotThrowAnyException();
             assertThatCode(() -> new HealthEndpoint.HealthStatus(true, true, true, 0L, 1.0, 0L))

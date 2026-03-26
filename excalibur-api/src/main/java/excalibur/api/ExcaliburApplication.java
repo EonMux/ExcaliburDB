@@ -1,16 +1,26 @@
 package excalibur.api;
 
 import excalibur.api.server.ExcaliburDBServer;
+import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.ingest.registry.DocumentRegistry;
+import excalibur.ingest.visibility.DocumentVisibilityChecker;
+import excalibur.ingest.visibility.DocumentVisibilityTracker;
+import excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import excalibur.query.pipeline.QueryPipeline;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
 import io.excalibur.config.Config;
 import io.excalibur.config.ConfigLoader;
+import io.excalibur.core.memory.MemorySegmentFactory;
+import io.excalibur.metrics.Metrics;
+import io.excalibur.metrics.MetricsRegistry;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
+import io.excalibur.vector.hnsw.HnswConfigFactory;
 import io.excalibur.vector.hnsw.HnswGraph;
+import io.excalibur.vector.hnsw.TailOffsetTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,6 +96,32 @@ public final class ExcaliburApplication {
     private final QueryPipeline queryPipeline;
     private final ExcaliburDBServer server;
     private final int port;
+    private final HnswConfigFactory hnswConfigFactory;
+
+    /**
+     * Hierarchical Cuckoo filter for corpus → cluster → segment membership testing.
+     * Shared between ingestion (inserts) and maintenance worker (deletions).
+     */
+    private final HierarchicalCuckooFilter hierarchicalFilter;
+
+    /**
+     * Document visibility tracker for atomic document-level visibility.
+     * Tracks when documents become fully visible to queries, ensuring no partial
+     * documents appear in query results.
+     */
+    private final DocumentVisibilityTracker documentVisibilityTracker;
+
+    /**
+     * Adapter that exposes DocumentVisibilityTracker as DocumentVisibilityChecker.
+     * Passed to the query pipeline for document atomicity filtering.
+     */
+    private final DocumentVisibilityChecker documentVisibilityChecker;
+
+    /**
+     * Metrics registry for JMX MBean management.
+     * All JMX MBeans are registered through this registry for observability.
+     */
+    private final MetricsRegistry metricsRegistry;
 
     private volatile boolean shutdownRequested = false;
 
@@ -136,16 +172,46 @@ public final class ExcaliburApplication {
         // Load configuration
         this.config = loadConfiguration(configPath);
 
+        // Initialize metrics registry and register JMX MBeans
+        // This enables observability for query latency, queue depth, coverage, etc.
+        this.metricsRegistry = new MetricsRegistry();
+        try {
+            Metrics.registerAll(metricsRegistry);
+            LOGGER.info("JMX MBeans registered successfully");
+        } catch (Exception e) {
+            LOGGER.warn("Failed to register JMX MBeans: {}. Metrics will not be available via JMX.", e.getMessage());
+        }
+        // Initialize health score and coverage to sensible defaults
+        Metrics.setHealthScore(0.5);
+        Metrics.setEstimatedCoverage(0.0);
+        Metrics.recordEpoch(0);
+
+        // Initialize HNSW config factory from Config.Shard settings
+        // This ensures property file values (efConstruction, efSearch) are used for HNSW graphs
+        this.hnswConfigFactory = HnswConfigFactory.fromShardConfig(config.shard());
+        LOGGER.info("HNSW config factory initialized: efConstruction={}, efSearch={}",
+            hnswConfigFactory.getEfConstruction(), hnswConfigFactory.getEfSearch());
+
+        // Initialize document visibility tracker for atomic document visibility
+        // This ensures queries never see partially-ingested documents
+        this.documentVisibilityTracker = new DocumentVisibilityTracker(new DocumentRegistry());
+        this.documentVisibilityChecker = new DocumentVisibilityTrackerAdapter(documentVisibilityTracker);
+        LOGGER.info("Document visibility tracker initialized for document atomicity");
+
         // Determine server port from config or use default
         this.port = determinePort();
 
-        // Create arena for memory allocation (must be global scope for long-lived segments)
-        this.arena = Arena.ofShared();
+        // Check Panama FFM availability and create Arena only if available
+        boolean panamaAvailable = MemorySegmentFactory.isPanamaAvailable();
+        this.arena = panamaAvailable ? Arena.ofShared() : null;
+
+        LOGGER.info("Using {} memory implementation",
+            panamaAvailable ? "Panama FFM" : "ByteBuffer fallback");
 
         // Initialize data directory
         Path dataDir = initializeDataDirectory();
 
-        // Initialize storage engine
+        // Initialize storage engine (uses fallback constructor if Arena is null)
         this.storageEngine = createStorageEngine(dataDir);
 
         // Initialize volume manager
@@ -153,6 +219,22 @@ public final class ExcaliburApplication {
 
         // Initialize index orchestrator
         this.indexOrchestrator = createIndexOrchestrator();
+
+        // Initialize hierarchical Cuckoo filter and wire it to the maintenance worker
+        this.hierarchicalFilter = createHierarchicalCuckooFilter();
+        indexOrchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
+
+        // Wire compaction callback from lifecycle manager to compaction worker
+        wireCompactionCallback();
+
+        // Configure HNSW initializer for creating HNSW graphs on new segments
+        configureHnswInitializer();
+
+        // Register existing segments with IndexOrchestrator for HNSW integration
+        registerExistingSegmentsWithOrchestrator();
+
+        // Start the segment lifecycle manager for background compaction
+        storageEngine.startLifecycleManager();
 
         // Initialize query pipeline
         this.queryPipeline = createQueryPipeline();
@@ -239,7 +321,11 @@ public final class ExcaliburApplication {
     private StorageEngine createStorageEngine(Path dataDir) {
         LOGGER.info("Initializing storage engine...");
 
-        StorageEngine engine = new StorageEngine(dataDir, arena);
+        // Use fallback constructor when Arena is null (ByteBuffer-based implementation)
+        // Use Arena constructor when Panama FFM is available
+        StorageEngine engine = (arena != null)
+            ? new StorageEngine(dataDir, arena)
+            : new StorageEngine(dataDir);
         engine.start();
 
         LOGGER.info("Storage engine initialized with {} segments", engine.getSegmentCount());
@@ -290,6 +376,173 @@ public final class ExcaliburApplication {
     }
 
     /**
+     * Creates the hierarchical Cuckoo filter for corpus → cluster → segment membership.
+     *
+     * <p>The hierarchical filter enables efficient segment pruning during queries
+     * and proper deletion propagation through all filter levels when documents
+     * are tombstoned.</p>
+     *
+     * <h3>Domain Constraints</h3>
+     * <ul>
+     *   <li>Corpus capacity: 10 million entries (configurable via excalibur.filter.corpus-capacity)</li>
+     *   <li>Fingerprint bits: 13 (provides ~0.1% false positive rate)</li>
+     *   <li>Cluster capacity: 100,000 entries per cluster</li>
+     *   <li>Segment capacity: 10,000 entries per segment</li>
+     * </ul>
+     *
+     * @return Initialized hierarchical Cuckoo filter
+     */
+    private HierarchicalCuckooFilter createHierarchicalCuckooFilter() {
+        LOGGER.info("Initializing hierarchical Cuckoo filter...");
+
+        // Use configurable corpus capacity or default to 10 million entries
+        // This should be sized based on expected corpus size for optimal false positive rate
+        long corpusCapacity = getLongProperty("excalibur.filter.corpus-capacity", 10_000_000L);
+
+        // Default parameters tuned for ~0.1% false positive rate
+        int fingerprintBits = 13;
+        int clusterCapacity = 100_000;
+        int segmentCapacity = 10_000;
+
+        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(
+            corpusCapacity,
+            fingerprintBits,
+            clusterCapacity,
+            segmentCapacity
+        );
+
+        LOGGER.info("Hierarchical Cuckoo filter initialized: corpusCapacity={}, fingerprintBits={}, clusterCapacity={}, segmentCapacity={}",
+            corpusCapacity, fingerprintBits, clusterCapacity, segmentCapacity);
+
+        return filter;
+    }
+
+    /**
+     * Gets a long property from system properties or returns the default.
+     *
+     * @param key The property key
+     * @param defaultValue The default value if property is not set
+     * @return The property value or default
+     */
+    private long getLongProperty(String key, long defaultValue) {
+        String value = System.getProperty(key);
+        if (value != null && !value.isEmpty()) {
+            try {
+                return Long.parseLong(value.trim());
+            } catch (NumberFormatException e) {
+                LOGGER.warn("Invalid value for property {}: '{}', using default: {}", key, value, defaultValue);
+            }
+        }
+        return defaultValue;
+    }
+
+    /**
+     * Wires the compaction callback from the lifecycle manager to the compaction worker.
+     *
+     * <p>This sets up the connection between the SegmentLifecycleManager (which detects
+     * when segments need compaction) and the CompactionWorker (which performs the
+     * actual compaction).</p>
+     */
+    private void wireCompactionCallback() {
+        LOGGER.info("Wiring compaction callback...");
+
+        // Get the lifecycle manager from the storage engine
+        var lifecycleManager = storageEngine.getLifecycleManager();
+
+        // Set up the compaction callback
+        // When the lifecycle manager detects a segment needs compaction,
+        // it will call the compaction worker to perform the actual compaction
+        lifecycleManager.setCompactionCallback(segmentId -> {
+            // Get the segment from the storage engine
+            var segment = storageEngine.getSegment(segmentId);
+            if (segment == null) {
+                LOGGER.warn("Compaction callback received for unknown segment: {}", segmentId);
+                return false;
+            }
+
+            // Request compaction from the compaction worker
+            indexOrchestrator.getCompactionWorker().requestCompaction(segment);
+            LOGGER.debug("Compaction requested for segment {} via lifecycle callback", segmentId);
+            return true;
+        });
+
+        LOGGER.info("Compaction callback wired successfully");
+    }
+
+    /**
+     * Configures the HNSW initializer for the storage engine.
+     *
+     * <p>This sets up HNSW graph creation for new segments using the
+     * configuration from Config.Shard (efConstruction, efSearch).</p>
+     */
+    private void configureHnswInitializer() {
+        LOGGER.info("Configuring HNSW initializer...");
+
+        // Get vector dimensions from config (default to 1536 for OpenAI embeddings)
+        int dimension = config.query().getVectorDimensions();
+        if (dimension <= 0) {
+            dimension = io.excalibur.store.HnswInitializer.DEFAULT_VECTOR_DIMENSION;
+        }
+
+        // Create HNSW initializer with configuration from Config.Shard
+        io.excalibur.store.HnswInitializer initializer =
+            new io.excalibur.store.HnswInitializer(
+                hnswConfigFactory,
+                CosineSimilarity.getInstance(),
+                dimension,
+                io.excalibur.store.HnswInitializer.DEFAULT_MAX_NODES,
+                arena  // May be null for ByteBuffer fallback
+            );
+
+        // Configure storage engine to use the initializer
+        storageEngine.setHnswInitializer(initializer);
+
+        LOGGER.info("HNSW initializer configured: dimension={}, maxNodes={}",
+            initializer.getDimension(), initializer.getMaxNodes());
+    }
+
+    /**
+     * Registers existing segments with the IndexOrchestrator for HNSW integration.
+     *
+     * <p>This method iterates through all existing segments in the storage engine
+     * and registers those with HNSW graphs with the IndexOrchestrator. This enables
+     * the HnswIntegrationWorker to integrate vectors from the write log.</p>
+     *
+     * <p>Segments without HNSW graphs (created before HNSW was enabled) are skipped.</p>
+     */
+    private void registerExistingSegmentsWithOrchestrator() {
+        LOGGER.info("Registering existing segments with IndexOrchestrator...");
+
+        int registeredCount = 0;
+        long segmentCount = storageEngine.getSegmentCount();
+
+        for (long segmentId = 0; segmentId < segmentCount; segmentId++) {
+            io.excalibur.store.Segment segment = storageEngine.getSegment(segmentId);
+            if (segment == null) {
+                continue;
+            }
+
+            HnswGraph graph = segment.getHnswGraph();
+            io.excalibur.vector.hnsw.TailOffsetTracker tracker = segment.getTailOffsetTracker();
+
+            if (graph != null && tracker != null) {
+                indexOrchestrator.registerSegment(
+                    segmentId,
+                    segment,
+                    graph,
+                    null, // CuckooFilter - handled separately
+                    tracker
+                );
+                registeredCount++;
+                LOGGER.debug("Registered segment {} with IndexOrchestrator", segmentId);
+            }
+        }
+
+        LOGGER.info("Registered {} segments with IndexOrchestrator for HNSW integration",
+            registeredCount);
+    }
+
+    /**
      * Creates the query pipeline.
      *
      * @return Initialized query pipeline
@@ -311,11 +564,12 @@ public final class ExcaliburApplication {
         QueryPipeline pipeline = new QueryPipeline(
             storageEngine,
             indexOrchestrator.getVisibilityTracker(),
+            documentVisibilityChecker,  // Document atomicity filter for query pipeline
             graphProvider,
             distanceFunction
         );
 
-        LOGGER.info("Query pipeline initialized");
+        LOGGER.info("Query pipeline initialized with document atomicity enabled");
         return pipeline;
     }
 
@@ -401,9 +655,11 @@ public final class ExcaliburApplication {
             LOGGER.info("Closing storage engine...");
             storageEngine.close();
 
-            // Close arena (releases all memory-mapped segments)
-            LOGGER.info("Releasing memory-mapped segments...");
-            arena.close();
+            // Close arena only if using Panama FFM (releases all memory-mapped segments)
+            if (arena != null) {
+                LOGGER.info("Releasing memory-mapped segments...");
+                arena.close();
+            }
 
             LOGGER.info("ExcaliburDB shutdown complete");
 
@@ -455,5 +711,91 @@ public final class ExcaliburApplication {
      */
     public int getPort() {
         return port;
+    }
+
+    /**
+     * Gets the HNSW configuration factory.
+     *
+     * <p>This factory creates {@link io.excalibur.vector.hnsw.HnswConfig} instances
+     * configured with values from the Config.Shard settings:</p>
+     * <ul>
+     *   <li>{@code excalibur.shard.default-ef-construction} - efConstruction parameter</li>
+     *   <li>{@code excalibur.shard.default-ef-search} - efSearch parameter</li>
+     * </ul>
+     *
+     * @return The HNSW configuration factory
+     */
+    public HnswConfigFactory getHnswConfigFactory() {
+        return hnswConfigFactory;
+    }
+
+    /**
+     * Gets the hierarchical Cuckoo filter for corpus → cluster → segment membership.
+     *
+     * <p>This filter is shared between:</p>
+     * <ul>
+     *   <li>Ingestion pipeline - inserts entries during document ingestion</li>
+     *   <li>CuckooMaintenanceWorker - propagates deletions through the hierarchy</li>
+     * </ul>
+     *
+     * <p>Use this to pass the same filter instance to ingestion components,
+     * ensuring that entries inserted during ingestion can be properly cleaned
+     * up when segments are tombstoned.</p>
+     *
+     * @return The hierarchical Cuckoo filter
+     */
+    public HierarchicalCuckooFilter getHierarchicalFilter() {
+        return hierarchicalFilter;
+    }
+
+    /**
+     * Gets the document visibility tracker for atomic document-level visibility.
+     *
+     * <p>The visibility tracker ensures that:</p>
+     * <ul>
+     *   <li>Documents become visible atomically (all chunks at once)</li>
+     *   <li>Queries never see partially-ingested documents</li>
+     *   <li>Visibility is epoch-based for consistent query snapshots</li>
+     * </ul>
+     *
+     * <p>Use this to pass the same tracker instance to ingestion components,
+     * ensuring that document atomicity is maintained across the system.</p>
+     *
+     * @return The document visibility tracker
+     */
+    public DocumentVisibilityTracker getDocumentVisibilityTracker() {
+        return documentVisibilityTracker;
+    }
+
+    /**
+     * Gets the document visibility checker for query pipeline atomicity filtering.
+     *
+     * <p>This is an adapter around the document visibility tracker that implements
+     * the DocumentVisibilityChecker interface for use in the query pipeline.</p>
+     *
+     * @return The document visibility checker
+     */
+    public DocumentVisibilityChecker getDocumentVisibilityChecker() {
+        return documentVisibilityChecker;
+    }
+
+    /**
+     * Gets the metrics registry for JMX MBean management.
+     *
+     * <p>The metrics registry provides access to all registered JMX MBeans
+     * for observability and monitoring:</p>
+     * <ul>
+     *   <li>Query latency (p50, p90, p95, p99)</li>
+     *   <li>System health score</li>
+     *   <li>Ingestion queue depth</li>
+     *   <li>Visibility epoch</li>
+     *   <li>Cuckoo filter false positive rate</li>
+     *   <li>HNSW queue depth</li>
+     * </ul>
+     *
+     * @return The metrics registry
+     */
+    public MetricsRegistry getMetricsRegistry() {
+        return metricsRegistry;
     }
 }

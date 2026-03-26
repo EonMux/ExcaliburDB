@@ -31,6 +31,9 @@ dependencies {
     // Phase 3 dependencies (for LSH integration)
     implementation(project(":excalibur-filter"))
 
+    // Phase 4 dependencies (for HNSW graph integration)
+    implementation(project(":excalibur-vector"))
+
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")

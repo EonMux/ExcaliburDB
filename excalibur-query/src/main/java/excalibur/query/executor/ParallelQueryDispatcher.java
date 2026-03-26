@@ -352,6 +352,219 @@ public class ParallelQueryDispatcher {
     }
 
     /**
+     * Dispatches a query to all queryable segments and returns raw segment results.
+     *
+     * <p>This method is similar to {@link #dispatch(float[], QueryOptions, DistanceFunction)}
+     * but returns the raw segment results alongside the merged results. This is useful
+     * for pipelines that need access to per-segment results for subsequent stages
+     * (e.g., reranking, LLM scoring).</p>
+     *
+     * @param queryVector The query vector
+     * @param options Query options
+     * @param distanceFunction The distance function
+     * @return DispatchResult with raw segment results, merged results, and coverage
+     */
+    public DispatchResult dispatchRaw(
+            float[] queryVector,
+            QueryOptions options,
+            DistanceFunction distanceFunction) {
+
+        Objects.requireNonNull(queryVector, "Query vector cannot be null");
+        Objects.requireNonNull(options, "Query options cannot be null");
+        Objects.requireNonNull(distanceFunction, "Distance function cannot be null");
+
+        long startTime = System.nanoTime();
+
+        // Get queryable segments
+        List<SegmentInfo> queryableSegments = getQueryableSegments(options.includePartialSegments());
+
+        if (queryableSegments.isEmpty()) {
+            LOGGER.debug("No queryable segments available");
+            IndexCoverage coverage = IndexCoverage.builder()
+                .computeCoverage()
+                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
+                .build();
+            return new DispatchResult(
+                List.of(),
+                List.of(),
+                coverage,
+                0
+            );
+        }
+
+        LOGGER.trace("Dispatching query to {} segments", queryableSegments.size());
+
+        // Create tasks for each segment
+        List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks = new ArrayList<>();
+        for (SegmentInfo info : queryableSegments) {
+            SegmentQueryTask task = new SegmentQueryTask(
+                info.segmentId,
+                info.segment,
+                info.graph,
+                queryVector,
+                options.topK(),
+                options.oversamplingFactor(),
+                distanceFunction
+            );
+            tasks.add(task);
+        }
+
+        // Dispatch tasks in parallel with timeout
+        List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
+        List<Future<SegmentQueryTask.SegmentQueryResult>> futures;
+
+        try {
+            futures = executor.invokeAll(tasks, options.timeout().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.warn("Query dispatch interrupted");
+            IndexCoverage coverage = IndexCoverage.builder()
+                .degraded(true)
+                .computeCoverage()
+                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
+                .build();
+            return new DispatchResult(
+                List.of(),
+                List.of(),
+                coverage,
+                System.nanoTime() - startTime
+            );
+        }
+
+        // Collect results
+        int segmentsTimedOut = 0;
+        for (int i = 0; i < futures.size(); i++) {
+            Future<SegmentQueryTask.SegmentQueryResult> future = futures.get(i);
+            SegmentInfo segmentInfo = queryableSegments.get(i);
+
+            try {
+                if (future.isDone()) {
+                    SegmentQueryTask.SegmentQueryResult result = future.get();
+                    segmentResults.add(result);
+                } else {
+                    // Timeout - create error result
+                    segmentsTimedOut++;
+                    segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                        segmentInfo.segmentId,
+                        List.of(),
+                        0,
+                        options.timeout().toMillis(),
+                        false,
+                        "Timeout"
+                    ));
+                    future.cancel(true);
+                }
+            } catch (ExecutionException e) {
+                LOGGER.warn("Segment {} query failed: {}", segmentInfo.segmentId, e.getCause().getMessage());
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    segmentInfo.segmentId,
+                    List.of(),
+                    0,
+                    0,
+                    false,
+                    e.getCause().getMessage()
+                ));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                segmentsTimedOut++;
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    segmentInfo.segmentId,
+                    List.of(),
+                    0,
+                    0,
+                    false,
+                    "Interrupted"
+                ));
+            } catch (java.util.concurrent.CancellationException e) {
+                // Future was cancelled due to invokeAll timeout
+                segmentsTimedOut++;
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    segmentInfo.segmentId,
+                    List.of(),
+                    0,
+                    0,
+                    false,
+                    "Timeout"
+                ));
+            }
+        }
+
+        // Aggregate results
+        ResultAggregator aggregator = new ResultAggregator(options);
+        List<QueryResultItem> mergedResults = aggregator.mergeAndRank(segmentResults);
+
+        // Build coverage
+        IndexCoverage coverage = buildCoverage(segmentResults, segmentsTimedOut);
+
+        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+
+        LOGGER.trace("Query completed: {} results, {}ms, coverage={}",
+            mergedResults.size(), durationMs, coverage.estimatedCorpusCoverage());
+
+        return new DispatchResult(
+            segmentResults,
+            mergedResults,
+            coverage,
+            durationMs
+        );
+    }
+
+    /**
+     * Result of a parallel dispatch operation.
+     *
+     * <p>Contains both the raw segment results and the merged/aggregated results.</p>
+     */
+    public static final class DispatchResult {
+        private final List<SegmentQueryTask.SegmentQueryResult> segmentResults;
+        private final List<QueryResultItem> mergedResults;
+        private final IndexCoverage coverage;
+        private final long durationMs;
+
+        public DispatchResult(
+                List<SegmentQueryTask.SegmentQueryResult> segmentResults,
+                List<QueryResultItem> mergedResults,
+                IndexCoverage coverage,
+                long durationMs) {
+            this.segmentResults = segmentResults != null
+                ? List.copyOf(segmentResults)
+                : List.of();
+            this.mergedResults = mergedResults != null
+                ? List.copyOf(mergedResults)
+                : List.of();
+            this.coverage = coverage;
+            this.durationMs = durationMs;
+        }
+
+        /**
+         * Returns the raw results from each segment.
+         */
+        public List<SegmentQueryTask.SegmentQueryResult> segmentResults() {
+            return segmentResults;
+        }
+
+        /**
+         * Returns the merged and ranked results from all segments.
+         */
+        public List<QueryResultItem> mergedResults() {
+            return mergedResults;
+        }
+
+        /**
+         * Returns the index coverage information.
+         */
+        public IndexCoverage coverage() {
+            return coverage;
+        }
+
+        /**
+         * Returns the total duration in milliseconds.
+         */
+        public long durationMs() {
+            return durationMs;
+        }
+    }
+
+    /**
      * Shuts down the dispatcher.
      */
     public void shutdown() {

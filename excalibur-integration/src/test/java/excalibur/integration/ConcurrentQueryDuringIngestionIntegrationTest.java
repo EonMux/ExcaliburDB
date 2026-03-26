@@ -983,7 +983,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
         private final ConcurrentHashMap<Long, Long> tombstoneEpochs = new ConcurrentHashMap<>();
 
         TestVisibilityTracker() {
-            super(null);
+            super(new TestSegmentCatalog());
         }
 
         @Override
