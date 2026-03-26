@@ -343,4 +343,188 @@ public final class DistanceValidator {
             default -> "unknown";
         };
     }
+
+    // ============================================================
+    // SCORE NORMALIZATION METHODS
+    // ============================================================
+
+    /**
+     * Normalizes a cosine similarity value to a score in the range [0.0, 1.0].
+     *
+     * <p>Transforms cosine similarity from [-1.0, 1.0] to [0.0, 1.0] using the formula:</p>
+     * <pre>
+     * normalizedScore = (cosineSimilarity + 1) / 2
+     * </pre>
+     *
+     * <p>This transformation preserves ordering: higher cosine similarity → higher score.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Cosine 1.0 (identical vectors) → Score 1.0 (perfect match)</li>
+     *   <li>Cosine 0.0 (orthogonal vectors) → Score 0.5 (neutral)</li>
+     *   <li>Cosine -1.0 (opposite vectors) → Score 0.0 (worst match)</li>
+     *   <li>NaN input → NaN output</li>
+     * </ul>
+     *
+     * @param cosineSimilarity The cosine similarity value in [-1.0, 1.0]
+     * @return The normalized score in [0.0, 1.0], or NaN if input is NaN
+     */
+    public static float normalizeCosineToScore(float cosineSimilarity) {
+        if (Float.isNaN(cosineSimilarity)) {
+            return Float.NaN;
+        }
+        // Clamp first to ensure input is in valid range
+        float clamped = clampCosineSimilarity(cosineSimilarity);
+        // Transform [-1, 1] to [0, 1]: (x + 1) / 2
+        return (clamped + 1.0f) / 2.0f;
+    }
+
+    /**
+     * Normalizes an L2 distance value to a score in the range [0.0, 1.0].
+     *
+     * <p>Transforms L2 distance from [0.0, +infinity) to [0.0, 1.0] using the formula:</p>
+     * <pre>
+     * normalizedScore = 1 / (1 + l2Distance)
+     * </pre>
+     *
+     * <p>This transformation inverts the ordering: lower L2 distance → higher score.
+     * A distance of 0 (identical vectors) produces a score of 1.0.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>L2 distance 0.0 (identical) → Score 1.0 (perfect match)</li>
+     *   <li>L2 distance 1.0 → Score 0.5</li>
+     *   <li>L2 distance → +infinity → Score → 0.0</li>
+     *   <li>NaN input → NaN output</li>
+     * </ul>
+     *
+     * @param l2Distance The L2 distance value in [0.0, +infinity)
+     * @return The normalized score in [0.0, 1.0], or NaN if input is NaN
+     */
+    public static float normalizeL2ToScore(float l2Distance) {
+        if (Float.isNaN(l2Distance)) {
+            return Float.NaN;
+        }
+        // Clamp first to ensure input is non-negative
+        float clamped = clampL2Distance(l2Distance);
+        // Transform [0, inf) to (0, 1]: 1 / (1 + x)
+        // Using 1 + x ensures we never divide by zero and produces (0, 1]
+        return 1.0f / (1.0f + clamped);
+    }
+
+    /**
+     * Normalizes an inner product value to a score in the range [0.0, 1.0].
+     *
+     * <p>Transforms inner product from (-infinity, +infinity) to [0.0, 1.0] using
+     * a sigmoid function:</p>
+     * <pre>
+     * normalizedScore = 1 / (1 + exp(-innerProduct))
+     * </pre>
+     *
+     * <p>This transformation preserves ordering: higher inner product → higher score.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Inner product → +infinity → Score → 1.0</li>
+     *   <li>Inner product 0.0 → Score 0.5 (neutral)</li>
+     *   <li>Inner product → -infinity → Score → 0.0</li>
+     *   <li>NaN input → NaN output</li>
+     * </ul>
+     *
+     * @param innerProduct The inner product value
+     * @return The normalized score in [0.0, 1.0], or NaN if input is NaN
+     */
+    public static float normalizeInnerProductToScore(float innerProduct) {
+        if (Float.isNaN(innerProduct)) {
+            return Float.NaN;
+        }
+        // Handle infinity cases explicitly to avoid numerical issues
+        if (innerProduct == Float.POSITIVE_INFINITY) {
+            return 1.0f;
+        }
+        if (innerProduct == Float.NEGATIVE_INFINITY) {
+            return 0.0f;
+        }
+        // Sigmoid: 1 / (1 + exp(-x))
+        // This maps (-inf, +inf) to (0, 1) smoothly
+        double sigmoid = 1.0 / (1.0 + Math.exp(-innerProduct));
+        return (float) sigmoid;
+    }
+
+    /**
+     * Normalizes a distance value to a score in the range [0.0, 1.0] based on the
+     * distance function type.
+     *
+     * <p>This is the primary method for converting raw distance values to normalized
+     * scores suitable for ranking and presentation. The transformation depends on
+     * the distance metric:</p>
+     *
+     * <table border="1">
+     *   <tr><th>Distance Type</th><th>Input Range</th><th>Output Range</th><th>Formula</th></tr>
+     *   <tr><td>Cosine</td><td>[-1, 1]</td><td>[0, 1]</td><td>(x + 1) / 2</td></tr>
+     *   <tr><td>L2</td><td>[0, inf)</td><td>(0, 1]</td><td>1 / (1 + x)</td></tr>
+     *   <tr><td>Inner Product</td><td>(-inf, inf)</td><td>(0, 1)</td><td>sigmoid(x)</td></tr>
+     * </table>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>All outputs are guaranteed to be in [0.0, 1.0] for valid inputs</li>
+     *   <li>Higher scores always indicate better matches (closer vectors)</li>
+     *   <li>NaN input → NaN output</li>
+     *   <li>Infinity handled gracefully</li>
+     * </ul>
+     *
+     * @param distance The raw distance value
+     * @param distanceFunction The distance function used to compute the value
+     * @return The normalized score in [0.0, 1.0], or NaN if input is NaN
+     * @throws NullPointerException if distanceFunction is null
+     */
+    public static float normalizeToScore(float distance, DistanceFunction distanceFunction) {
+        if (distanceFunction == null) {
+            throw new NullPointerException("DistanceFunction cannot be null");
+        }
+
+        String name = distanceFunction.name();
+        return switch (name) {
+            case "cosine" -> normalizeCosineToScore(distance);
+            case "l2" -> normalizeL2ToScore(distance);
+            case "inner_product" -> normalizeInnerProductToScore(distance);
+            default -> {
+                // Unknown distance type - apply a generic normalization
+                // For unknown types, we assume higher = better and apply sigmoid
+                yield normalizeInnerProductToScore(distance);
+            }
+        };
+    }
+
+    /**
+     * Validates, clamps, and normalizes a distance value to a score in [0.0, 1.0].
+     *
+     * <p>This is a convenience method that combines validation, clamping, and
+     * normalization in a single call. It is the recommended method for converting
+     * raw distance values to final scores.</p>
+     *
+     * <h3>Processing Steps</h3>
+     * <ol>
+     *   <li>Clamp distance to valid range for the metric type</li>
+     *   <li>Normalize to [0.0, 1.0] score range</li>
+     * </ol>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Output is guaranteed to be in [0.0, 1.0] (or NaN for invalid inputs)</li>
+     *   <li>Higher scores indicate better matches</li>
+     * </ul>
+     *
+     * @param distance The raw distance value
+     * @param distanceFunction The distance function used to compute the value
+     * @return The normalized score in [0.0, 1.0], or NaN if input is NaN
+     * @throws NullPointerException if distanceFunction is null
+     */
+    public static float validateClampAndNormalize(float distance, DistanceFunction distanceFunction) {
+        // First clamp to valid range
+        float clamped = clampDistance(distance, distanceFunction);
+        // Then normalize to [0, 1]
+        return normalizeToScore(clamped, distanceFunction);
+    }
 }

@@ -215,6 +215,8 @@ public class TailScanner {
                         float distance = distanceFunction.compute(queryVector, vector);
 
                         // Validate and clamp distance to ensure domain correctness
+                        // Note: We store raw distances here; normalization happens in
+                        // VectorReranker to ensure consistency with HNSW results.
                         // Cosine similarity ∈ [-1, 1], L2 distance ∈ [0, ∞)
                         distance = DistanceValidator.validateAndClamp(distance, distanceFunction);
 

@@ -384,6 +384,235 @@ class DistanceValidatorTest {
         }
     }
 
+    // ==================== Score Normalization ====================
+
+    @Nested
+    @DisplayName("Score Normalization")
+    class ScoreNormalization {
+
+        @Nested
+        @DisplayName("Cosine Similarity Normalization")
+        class CosineNormalization {
+
+            @Test
+            @DisplayName("Cosine 1.0 (identical) normalizes to score 1.0")
+            void identicalVectors() {
+                assertThat(DistanceValidator.normalizeCosineToScore(1.0f)).isEqualTo(1.0f);
+            }
+
+            @Test
+            @DisplayName("Cosine 0.0 (orthogonal) normalizes to score 0.5")
+            void orthogonalVectors() {
+                assertThat(DistanceValidator.normalizeCosineToScore(0.0f)).isEqualTo(0.5f);
+            }
+
+            @Test
+            @DisplayName("Cosine -1.0 (opposite) normalizes to score 0.0")
+            void oppositeVectors() {
+                assertThat(DistanceValidator.normalizeCosineToScore(-1.0f)).isEqualTo(0.0f);
+            }
+
+            @Test
+            @DisplayName("Cosine 0.5 normalizes to score 0.75")
+            void positiveSimilarity() {
+                assertThat(DistanceValidator.normalizeCosineToScore(0.5f)).isEqualTo(0.75f);
+            }
+
+            @Test
+            @DisplayName("Cosine -0.5 normalizes to score 0.25")
+            void negativeSimilarity() {
+                assertThat(DistanceValidator.normalizeCosineToScore(-0.5f)).isEqualTo(0.25f);
+            }
+
+            @Test
+            @DisplayName("NaN input produces NaN output")
+            void nanInput() {
+                assertThat(DistanceValidator.normalizeCosineToScore(Float.NaN)).isNaN();
+            }
+
+            @Test
+            @DisplayName("Out of range values are clamped before normalization")
+            void outOfRangeClamped() {
+                // 1.5 clamped to 1.0 → normalized to 1.0
+                assertThat(DistanceValidator.normalizeCosineToScore(1.5f)).isEqualTo(1.0f);
+                // -1.5 clamped to -1.0 → normalized to 0.0
+                assertThat(DistanceValidator.normalizeCosineToScore(-1.5f)).isEqualTo(0.0f);
+            }
+        }
+
+        @Nested
+        @DisplayName("L2 Distance Normalization")
+        class L2Normalization {
+
+            @Test
+            @DisplayName("L2 distance 0.0 (identical) normalizes to score 1.0")
+            void identicalVectors() {
+                assertThat(DistanceValidator.normalizeL2ToScore(0.0f)).isEqualTo(1.0f);
+            }
+
+            @Test
+            @DisplayName("L2 distance 1.0 normalizes to score 0.5")
+            void distanceOne() {
+                assertThat(DistanceValidator.normalizeL2ToScore(1.0f)).isEqualTo(0.5f);
+            }
+
+            @Test
+            @DisplayName("Higher L2 distance produces lower score")
+            void higherDistanceLowerScore() {
+                float score0 = DistanceValidator.normalizeL2ToScore(0.0f);
+                float score1 = DistanceValidator.normalizeL2ToScore(1.0f);
+                float score2 = DistanceValidator.normalizeL2ToScore(2.0f);
+
+                assertThat(score0).isGreaterThan(score1);
+                assertThat(score1).isGreaterThan(score2);
+            }
+
+            @Test
+            @DisplayName("NaN input produces NaN output")
+            void nanInput() {
+                assertThat(DistanceValidator.normalizeL2ToScore(Float.NaN)).isNaN();
+            }
+
+            @Test
+            @DisplayName("Negative values are clamped to 0 before normalization")
+            void negativeClamped() {
+                // -1.0 clamped to 0.0 → normalized to 1.0
+                assertThat(DistanceValidator.normalizeL2ToScore(-1.0f)).isEqualTo(1.0f);
+            }
+
+            @Test
+            @DisplayName("Large distances produce scores close to 0")
+            void largeDistance() {
+                float score = DistanceValidator.normalizeL2ToScore(1000.0f);
+                assertThat(score).isGreaterThan(0.0f);
+                assertThat(score).isLessThan(0.01f);
+            }
+        }
+
+        @Nested
+        @DisplayName("Inner Product Normalization")
+        class InnerProductNormalization {
+
+            @Test
+            @DisplayName("Inner product 0.0 normalizes to score 0.5")
+            void zeroProduct() {
+                assertThat(DistanceValidator.normalizeInnerProductToScore(0.0f)).isEqualTo(0.5f);
+            }
+
+            @Test
+            @DisplayName("Positive infinity produces score 1.0")
+            void positiveInfinity() {
+                assertThat(DistanceValidator.normalizeInnerProductToScore(Float.POSITIVE_INFINITY)).isEqualTo(1.0f);
+            }
+
+            @Test
+            @DisplayName("Negative infinity produces score 0.0")
+            void negativeInfinity() {
+                assertThat(DistanceValidator.normalizeInnerProductToScore(Float.NEGATIVE_INFINITY)).isEqualTo(0.0f);
+            }
+
+            @Test
+            @DisplayName("NaN input produces NaN output")
+            void nanInput() {
+                assertThat(DistanceValidator.normalizeInnerProductToScore(Float.NaN)).isNaN();
+            }
+
+            @Test
+            @DisplayName("Higher inner product produces higher score")
+            void higherProductHigherScore() {
+                float scoreNeg = DistanceValidator.normalizeInnerProductToScore(-10.0f);
+                float score0 = DistanceValidator.normalizeInnerProductToScore(0.0f);
+                float scorePos = DistanceValidator.normalizeInnerProductToScore(10.0f);
+
+                assertThat(scoreNeg).isLessThan(score0);
+                assertThat(score0).isLessThan(scorePos);
+            }
+
+            @Test
+            @DisplayName("All outputs are in valid range [0, 1]")
+            void outputsInValidRange() {
+                for (float ip : new float[]{-100.0f, -10.0f, -1.0f, 0.0f, 1.0f, 10.0f, 100.0f}) {
+                    float score = DistanceValidator.normalizeInnerProductToScore(ip);
+                    assertThat(score).isGreaterThanOrEqualTo(0.0f);
+                    assertThat(score).isLessThanOrEqualTo(1.0f);
+                }
+            }
+        }
+
+        @Nested
+        @DisplayName("Generic Normalization")
+        class GenericNormalization {
+
+            @Test
+            @DisplayName("normalizeToScore with CosineSimilarity")
+            void withCosine() {
+                DistanceFunction cosine = CosineSimilarity.getInstance();
+                assertThat(DistanceValidator.normalizeToScore(1.0f, cosine)).isEqualTo(1.0f);
+                assertThat(DistanceValidator.normalizeToScore(0.0f, cosine)).isEqualTo(0.5f);
+                assertThat(DistanceValidator.normalizeToScore(-1.0f, cosine)).isEqualTo(0.0f);
+            }
+
+            @Test
+            @DisplayName("normalizeToScore with L2Distance")
+            void withL2() {
+                DistanceFunction l2 = L2Distance.getInstance();
+                assertThat(DistanceValidator.normalizeToScore(0.0f, l2)).isEqualTo(1.0f);
+                assertThat(DistanceValidator.normalizeToScore(1.0f, l2)).isEqualTo(0.5f);
+            }
+
+            @Test
+            @DisplayName("normalizeToScore with InnerProduct")
+            void withInnerProduct() {
+                DistanceFunction ip = InnerProduct.getInstance();
+                assertThat(DistanceValidator.normalizeToScore(0.0f, ip)).isEqualTo(0.5f);
+            }
+
+            @Test
+            @DisplayName("normalizeToScore with null throws NPE")
+            void withNull() {
+                assertThatThrownBy(() -> DistanceValidator.normalizeToScore(0.0f, null))
+                    .isInstanceOf(NullPointerException.class);
+            }
+        }
+
+        @Nested
+        @DisplayName("Validate Clamp and Normalize")
+        class ValidateClampAndNormalize {
+
+            @Test
+            @DisplayName("Clamps and normalizes out-of-range cosine values")
+            void cosineOutOfRange() {
+                DistanceFunction cosine = CosineSimilarity.getInstance();
+                // 2.0 clamped to 1.0 → normalized to 1.0
+                assertThat(DistanceValidator.validateClampAndNormalize(2.0f, cosine)).isEqualTo(1.0f);
+                // -2.0 clamped to -1.0 → normalized to 0.0
+                assertThat(DistanceValidator.validateClampAndNormalize(-2.0f, cosine)).isEqualTo(0.0f);
+            }
+
+            @Test
+            @DisplayName("Clamps and normalizes negative L2 values")
+            void l2Negative() {
+                DistanceFunction l2 = L2Distance.getInstance();
+                // -5.0 clamped to 0.0 → normalized to 1.0
+                assertThat(DistanceValidator.validateClampAndNormalize(-5.0f, l2)).isEqualTo(1.0f);
+            }
+
+            @Test
+            @DisplayName("Preserves NaN")
+            void preservesNaN() {
+                DistanceFunction cosine = CosineSimilarity.getInstance();
+                assertThat(DistanceValidator.validateClampAndNormalize(Float.NaN, cosine)).isNaN();
+            }
+
+            @Test
+            @DisplayName("With null throws NPE")
+            void withNull() {
+                assertThatThrownBy(() -> DistanceValidator.validateClampAndNormalize(0.0f, null))
+                    .isInstanceOf(NullPointerException.class);
+            }
+        }
+    }
+
     // ==================== Constructor ====================
 
     @Nested

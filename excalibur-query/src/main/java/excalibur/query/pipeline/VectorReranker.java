@@ -110,11 +110,14 @@ public class VectorReranker {
         for (QueryResultItem candidate : candidates) {
             long nodeId = candidate.nodeId();
 
-            // Skip tail scan results - they already have exact distances
+            // Handle tail scan results - normalize their scores to [0.0, 1.0] range
             // (Tail scan computes exact distances on full-precision vectors from write log)
             if (TailScanner.isTailScanResult(nodeId)) {
-                // Keep the existing exact distance from tail scan
-                reranked.add(candidate);
+                // Normalize the raw distance to [0.0, 1.0] score for consistency with HNSW results
+                // This ensures all results use the same scoring semantics
+                float normalizedScore = DistanceValidator.validateClampAndNormalize(
+                    candidate.score(), distanceFunction);
+                reranked.add(candidate.withScore(normalizedScore));
                 continue;
             }
 
@@ -151,11 +154,13 @@ public class VectorReranker {
                 // Compute exact distance
                 float exactDistance = distanceFunction.compute(queryVector, storedVector);
 
-                // Validate and clamp distance to ensure domain correctness
-                exactDistance = DistanceValidator.validateAndClamp(exactDistance, distanceFunction);
+                // Validate, clamp, and normalize to [0.0, 1.0] score range
+                // This ensures all scores are in the valid [0.0, 1.0] range for ranking
+                float normalizedScore = DistanceValidator.validateClampAndNormalize(
+                    exactDistance, distanceFunction);
 
-                // Create new result with exact distance
-                reranked.add(candidate.withScore(exactDistance));
+                // Create new result with normalized score
+                reranked.add(candidate.withScore(normalizedScore));
 
             } catch (Exception e) {
                 LOGGER.debug("Error reranking node {}: {}", nodeId, e.getMessage());
@@ -163,8 +168,9 @@ public class VectorReranker {
             }
         }
 
-        // Sort by exact distance (closest first)
-        reranked.sort(Comparator.comparingDouble(QueryResultItem::score));
+        // Sort by normalized score descending (highest/best first)
+        // Normalized scores are in [0.0, 1.0] where higher is better
+        reranked.sort(Comparator.comparingDouble(QueryResultItem::score).reversed());
 
         // Limit to topK
         if (reranked.size() > topK) {

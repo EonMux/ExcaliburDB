@@ -3,6 +3,8 @@ package excalibur.query.executor;
 import excalibur.query.IndexCoverage;
 import excalibur.query.QueryOptions;
 import excalibur.query.QueryResultItem;
+import io.excalibur.vector.distance.DistanceFunction;
+import io.excalibur.vector.distance.DistanceValidator;
 import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -102,6 +104,109 @@ public class ResultAggregator {
     }
 
     /**
+     * Merges results from multiple segment queries with score normalization.
+     *
+     * <p>This method normalizes raw distance values to [0.0, 1.0] scores where
+     * higher is always better, regardless of the underlying distance metric.</p>
+     *
+     * <h3>Normalization</h3>
+     * <ul>
+     *   <li>Cosine similarity [-1, 1] → normalized score [0, 1] via (x+1)/2</li>
+     *   <li>L2 distance [0, inf) → normalized score (0, 1] via 1/(1+x)</li>
+     *   <li>Inner product → normalized score via sigmoid</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>All scores are in range [0.0, 1.0]</li>
+     *   <li>Results are sorted by score descending (highest/best first)</li>
+     *   <li>Threshold is applied to normalized scores (filter out scores below threshold)</li>
+     *   <li>No duplicate document IDs in output</li>
+     * </ul>
+     *
+     * @param segmentResults Results from each segment
+     * @param distanceFunction The distance function used (for normalization)
+     * @return Aggregated and ranked results with normalized scores (at most topK items)
+     */
+    public List<QueryResultItem> mergeAndRankWithNormalization(
+            List<SegmentQueryTask.SegmentQueryResult> segmentResults,
+            DistanceFunction distanceFunction) {
+
+        Objects.requireNonNull(segmentResults, "Segment results cannot be null");
+        Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
+
+        if (segmentResults.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        // Phase 1: Collect all results, normalize scores, and deduplicate
+        // Keep the best (highest normalized score) for each document
+        Map<String, QueryResultItem> bestResultsByDocId = new HashMap<>();
+
+        for (SegmentQueryTask.SegmentQueryResult segmentResult : segmentResults) {
+            if (!segmentResult.success()) {
+                LOGGER.debug("Skipping failed segment {} results", segmentResult.segmentId());
+                continue;
+            }
+
+            for (HnswSearchResult hnswResult : segmentResult.results()) {
+                // Normalize the raw distance to [0.0, 1.0] score
+                float normalizedScore = DistanceValidator.validateClampAndNormalize(
+                    hnswResult.distance(), distanceFunction);
+
+                // Apply threshold filter on normalized score (lower = worse, so filter out)
+                if (threshold > 0 && normalizedScore < threshold) {
+                    continue;
+                }
+
+                String documentIdStr = hnswResult.documentId();
+                long nodeId = hnswResult.nodeId();
+
+                // Create result item with normalized score
+                QueryResultItem item = new QueryResultItem(
+                    nodeId,
+                    documentIdStr,
+                    normalizedScore,
+                    null,
+                    segmentResult.segmentId(),
+                    nodeId
+                );
+
+                // Keep the best (highest normalized score) result for each document
+                String dedupeKey = documentIdStr != null ? documentIdStr : String.valueOf(nodeId);
+                bestResultsByDocId.merge(dedupeKey, item, (existing, newItem) ->
+                    newItem.score() > existing.score() ? newItem : existing
+                );
+            }
+        }
+
+        // Phase 2: Select top-k results using a min-heap
+        // Min-heap: keep smallest at top so we can remove the worst
+        PriorityQueue<QueryResultItem> topResults = new PriorityQueue<>(
+            topK,
+            Comparator.comparingDouble(QueryResultItem::score)
+        );
+
+        for (QueryResultItem item : bestResultsByDocId.values()) {
+            if (topResults.size() < topK) {
+                topResults.add(item);
+            } else if (item.score() > topResults.peek().score()) {
+                topResults.poll();
+                topResults.add(item);
+            }
+        }
+
+        // Phase 3: Convert heap to sorted list (highest score first)
+        List<QueryResultItem> results = new ArrayList<>(topResults);
+        results.sort(Comparator.comparingDouble(QueryResultItem::score).reversed());
+
+        LOGGER.trace("Aggregated {} results from {} segments ({} unique documents)",
+            results.size(), segmentResults.size(), bestResultsByDocId.size());
+
+        return results;
+    }
+
+    /**
      * Merges results from multiple segment queries.
      *
      * <p>This method takes the list of segment query results and produces
@@ -127,7 +232,9 @@ public class ResultAggregator {
      *
      * @param segmentResults Results from each segment
      * @return Aggregated and ranked results (at most topK items)
+     * @deprecated Use {@link #mergeAndRankWithNormalization} for proper [0,1] score normalization
      */
+    @Deprecated
     public List<QueryResultItem> mergeAndRank(List<SegmentQueryTask.SegmentQueryResult> segmentResults) {
         Objects.requireNonNull(segmentResults, "Segment results cannot be null");
 

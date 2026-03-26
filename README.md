@@ -1,18 +1,17 @@
 # ExcaliburDB
 
-A disk-backed data relevancy retrieval engine for LLMs. ExcaliburDB provides efficient vector similarity search with intelligent filtering and LLM-based relevancy scoring.
+A disk-backed vector similarity search engine with LLM-based relevancy scoring. ExcaliburDB provides efficient approximate nearest neighbor (ANN) search over large document corpora using memory-mapped files and hierarchical filtering.
 
 ## Overview
 
-ExcaliburDB is designed for large-scale semantic search over document corpora. It combines:
+ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-copy, memory-mapped file I/O. It handles vector indexes larger than available RAM by keeping data on disk and navigating graphs directly from memory-mapped regions.
 
-- **HNSW (Hierarchical Navigable Small World) graphs** for approximate nearest neighbor search
-- **Cuckoo filters** for efficient term existence testing with deletion support
-- **LSH (Locality-Sensitive Hashing)** for coarse vector similarity pre-filtering
-- **Product Quantization** for compressed vector storage and fast approximate distances
+Key components:
+- **HNSW graphs** for approximate nearest neighbor search with configurable efConstruction and efSearch
+- **Cuckoo filters** for probabilistic set membership with deletion support
+- **LSH (Locality-Sensitive Hashing)** for coarse vector pre-filtering
+- **Product quantization** for compressed vector storage
 - **Epoch-based visibility tracking** for consistent query snapshots
-
-The system is built on Java 21's Panama Foreign Function & Memory API for zero-copy, memory-mapped file I/O, enabling it to handle indexes larger than available RAM.
 
 ## Requirements
 
@@ -77,7 +76,7 @@ Configuration is loaded from `excalibur.properties` in the working directory by 
 
 ### Environment Variable Overrides
 
-Properties can be overridden via environment variables using uppercase with underscores. For example, to override the LLM API key:
+Properties can be overridden via environment variables using uppercase with underscores:
 
 ```bash
 export EXCALIBUR_LLM_API_KEY=sk-your-api-key-here
@@ -124,7 +123,10 @@ curl -X POST http://localhost:8080/v1/query \
   "coverage": {
     "total_segments": 1024,
     "active_segments": 980,
+    "indexing_segments": 40,
+    "warming_segments": 2,
     "estimated_corpus_coverage": 0.96,
+    "tail_scan_entries": 12500,
     "degraded": false
   },
   "timed_out": false,
@@ -208,10 +210,10 @@ Queries execute through a 6-stage pipeline:
 
 Data is organized into segments, each backed by memory-mapped files:
 
-- **Hash-based routing** provides O(1) segment lookup
-- **Append-only write log** with CRC32 checksums
-- **Background compaction** removes tombstones without blocking reads
-- **Elastic segment splitting** based on load factor thresholds
+- Hash-based routing provides O(1) segment lookup
+- Append-only write log with CRC32 checksums
+- Background compaction removes tombstones without blocking reads
+- Elastic segment splitting based on load factor thresholds
 
 ## Development
 
@@ -241,36 +243,9 @@ excaliburdb/
 # Run all benchmarks
 ./gradlew :excalibur-bench:jmh
 
-# Run HNSW recall@10 benchmark (Phase 4 validation - target: ≥99% recall)
-./gradlew :excalibur-bench:runHnswRecallBenchmark
-
-# Run storage segment lookup benchmark (Phase 2 validation - target: ≥1B lookups/sec)
-./gradlew :excalibur-bench:runBenchmark
-
-# Run Cuckoo filter benchmarks (Phase 3 validation - target: FP rate ≤0.1%)
-./gradlew :excalibur-bench:runCuckooFilterBenchmark
-./gradlew :excalibur-bench:runCuckooFilterFPRateBenchmark
-
-# Run distance function benchmarks (Phase 4)
-./gradlew :excalibur-bench:runDistanceBenchmark
-
-# Run tail scan benchmark (Phase 6)
-./gradlew :excalibur-bench:runTailScanBenchmark
-
-# Run end-to-end query latency benchmark (Phase 10)
-./gradlew :excalibur-bench:runEndToEndQueryBenchmark
+# Run specific benchmark
+./gradlew :excalibur-bench:jmh --tests "MappedFileBenchmark"
 ```
-
-### Benchmark Locations
-
-| Benchmark | Location | Target |
-|-----------|----------|--------|
-| HNSW Recall@10 | `excalibur-bench/src/main/java/excalibur/bench/benchmark/HnswRecallBenchmark.java` | ≥99% recall@10 |
-| Segment Lookup | `excalibur-bench/src/main/java/excalibur/bench/benchmark/SegmentBenchmark.java` | ≥1B lookups/sec |
-| Cuckoo Filter | `excalibur-bench/src/main/java/excalibur/bench/benchmark/CuckooFilterBenchmark.java` | High throughput |
-| Cuckoo FP Rate | `excalibur-bench/src/main/java/excalibur/bench/benchmark/CuckooFilterFPRateBenchmark.java` | FP rate ≤0.1% |
-| Distance Functions | `excalibur-bench/src/main/java/excalibur/bench/benchmark/DistanceBenchmark.java` | Vectorized ops |
-| Tail Scan | `excalibur-bench/src/main/java/excalibur/bench/benchmark/TailScanBenchmarkRunner.java` | Brute-force throughput |
 
 ### Test Coverage
 

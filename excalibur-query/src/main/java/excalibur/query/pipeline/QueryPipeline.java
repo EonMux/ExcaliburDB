@@ -834,47 +834,83 @@ public class QueryPipeline {
      * For segments where lastIntegratedOffset < writeLogHead, also performs
      * brute-force tail scan over un-integrated entries.</p>
      *
-     * <p><strong>Parallel Execution:</strong> Uses {@link ParallelQueryDispatcher} to
-     * dispatch segment searches in parallel using virtual threads. Each segment's
-     * HNSW search and optional tail scan execute concurrently for improved latency.</p>
+     * <p><strong>Candidate-Based Execution:</strong> Uses the candidates from
+     * stages 0-2 which have been filtered by visibility tracking, Cuckoo filter
+     * cascade, and LSH pre-filtering. This ensures that only segments visible
+     * at the captured epoch are searched.</p>
      *
-     * <p><strong>Offset Comparison:</strong> The dispatcher's {@link SegmentQueryTask}
-     * handles tail scan offset comparison internally, comparing lastIntegratedOffset
-     * vs writeLogHead for each segment to determine if tail scanning is needed.</p>
+     * <p><strong>Parallel Execution:</strong> Searches are executed in parallel
+     * using virtual threads for improved latency across multiple segments.</p>
+     *
+     * <p><strong>Offset Comparison:</strong> For each segment, compares
+     * lastIntegratedOffset vs writeLogHead to determine if tail scanning is needed.</p>
      */
     private PipelineContext stage3_HnswVectorSearch(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 3 cancelled before HNSW search");
 
-        LOGGER.trace("Stage 3: Running HNSW vector search with parallel dispatch");
+        LOGGER.trace("Stage 3: Running HNSW vector search with {} candidates", context.candidates.size());
 
-        // Build QueryOptions from request
+        float[] queryVector = context.request.queryVectorUnsafe();
+        int k = context.request.topK();
         int oversamplingFactor = (int) Math.max(1, context.request.recallTarget() * 2);
-        QueryOptions options = QueryOptions.builder()
-            .topK(context.request.topK())
-            .threshold(context.request.threshold())
-            .includePartialSegments(context.request.includePartialSegments())
-            .timeout(context.request.timeout())
-            .oversamplingFactor(oversamplingFactor)
-            .build();
+        int searchK = k * oversamplingFactor;
 
-        // Dispatch queries in parallel using virtual threads
-        ParallelQueryDispatcher.DispatchResult dispatchResult = getDispatcher().dispatchRaw(
-            context.request.queryVectorUnsafe(),
-            options,
-            distanceFunction
-        );
-
-        // Get raw segment results for subsequent stages
-        List<SegmentQueryTask.SegmentQueryResult> segmentResults = dispatchResult.segmentResults();
-
-        // Calculate total tail scan entries from segment results
+        // Use candidates from context (filtered by stages 0-2) instead of dispatcher
+        // This ensures visibility tracking is respected
+        List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
         long totalTailScanEntries = 0;
-        for (SegmentQueryTask.SegmentQueryResult result : segmentResults) {
-            totalTailScanEntries += result.tailScanEntries();
+        long startTime = System.nanoTime();
+
+        for (SegmentCandidate candidate : context.candidates) {
+            token.checkCancelled("Stage 3 cancelled during segment search");
+
+            try {
+                // Determine tail scan requirement
+                TailScanRequirement requirement = TailScanRequirement.noTailScan(candidate.segmentId());
+                if (candidate.segment() != null && candidate.graph() != null) {
+                    long lastIntegratedOffset = candidate.graph().getLastIntegratedOffset();
+                    long writeLogHead = candidate.segment().getWriteLogHead();
+                    if (lastIntegratedOffset < writeLogHead) {
+                        requirement = TailScanRequirement.compare(
+                            candidate.segmentId(), lastIntegratedOffset, writeLogHead);
+                    }
+                }
+
+                // Search the segment using the existing searchSegment method
+                List<HnswSearchResult> results = searchSegment(
+                    queryVector, candidate, searchK, requirement);
+
+                // Count tail scan entries
+                long tailScanEntries = requirement.isTailScanNeeded() ? requirement.estimatedEntryCount() : 0;
+
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    candidate.segmentId(),
+                    results,
+                    tailScanEntries,
+                    0, // durationMs - individual segment timing not needed here
+                    true,
+                    null
+                ));
+
+                totalTailScanEntries += tailScanEntries;
+
+            } catch (Exception e) {
+                LOGGER.warn("Segment {} search failed: {}", candidate.segmentId(), e.getMessage());
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    candidate.segmentId(),
+                    List.of(),
+                    0,
+                    0,
+                    false,
+                    e.getMessage()
+                ));
+            }
         }
 
-        LOGGER.debug("Stage 3: Parallel search completed - {} segments, {} tail scan entries, {}ms",
-            segmentResults.size(), totalTailScanEntries, dispatchResult.durationMs());
+        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+
+        LOGGER.debug("Stage 3: Search completed - {} segments, {} tail scan entries, {}ms",
+            segmentResults.size(), totalTailScanEntries, durationMs);
 
         return context.withSegmentResults(segmentResults, totalTailScanEntries);
     }
@@ -1123,7 +1159,8 @@ public class QueryPipeline {
             coverageThreshold
         );
 
-        List<QueryResultItem> candidates = aggregator.mergeAndRank(context.segmentResults);
+        List<QueryResultItem> candidates = aggregator.mergeAndRankWithNormalization(
+            context.segmentResults, distanceFunction);
 
         if (candidates.isEmpty()) {
             LOGGER.debug("Stage 4: No candidates to rerank");
@@ -1287,6 +1324,13 @@ public class QueryPipeline {
 
     /**
      * Builds the final response from pipeline context.
+     *
+     * <h3>Domain Correctness Validation</h3>
+     * <p>This method validates that empty results are only returned when legitimately
+     * expected. If empty results are returned unexpectedly, diagnostic information
+     * is logged to help identify the root cause.</p>
+     *
+     * <p><strong>Empty results are ONLY acceptable when no documents match the query vector.</strong></p>
      */
     private QueryResponse buildResponse(PipelineContext context, long durationMs) {
         // Build coverage from segment results
@@ -1330,13 +1374,82 @@ public class QueryPipeline {
             .computeDegraded(coverageThreshold)
             .build();
 
-        return new QueryResponse(
+        QueryResponse response = new QueryResponse(
             context.mergedResults,
             coverage,
             durationMs,
             false,
             false
         );
+
+        // DOMAIN CORRECTNESS VALIDATION:
+        // Empty results are ONLY acceptable when no documents match the query vector
+        // Log diagnostic information when empty results are returned to help identify issues
+        if (response.isEmpty()) {
+            validateAndLogEmptyResults(context, coverage, response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Validates that empty results are legitimate and logs diagnostic information.
+     *
+     * <p>This method enforces the domain correctness constraint that empty results
+     * should only be returned when no documents match the query vector.</p>
+     *
+     * @param context The pipeline context
+     * @param coverage The computed index coverage
+     * @param response The query response (for validation)
+     */
+    private void validateAndLogEmptyResults(PipelineContext context, IndexCoverage coverage, QueryResponse response) {
+        // Use EmptyResultValidator to diagnose the cause of empty results
+        // Adapt the HnswGraphProvider interface using a lambda
+        excalibur.query.visibility.EmptyResultValidator.ValidationResult validationResult =
+            excalibur.query.visibility.EmptyResultValidator.validate(
+                response,
+                context.request,
+                storageEngine,
+                visibilityTracker,
+                context.segmentResults,
+                graphProvider::getGraph  // Adapt to EmptyResultValidator.HnswGraphProvider
+            );
+
+        if (validationResult.isLegitimate()) {
+            LOGGER.debug("Query returned empty results (legitimate): {}", validationResult.oneLineSummary());
+        } else {
+            // Log at WARN level for unexpected empty results to help diagnose issues
+            LOGGER.warn("Query returned empty results unexpectedly - potential bug detected%n{}",
+                validationResult.diagnosticSummary());
+
+            // Also run HNSW graph diagnostic for segments with vectors but empty results
+            for (SegmentQueryTask.SegmentQueryResult segmentResult : context.segmentResults) {
+                if (segmentResult.success() && segmentResult.results().isEmpty()) {
+                    HnswGraph graph = graphProvider.getGraph(segmentResult.segmentId());
+                    if (graph != null && graph.activeNodeCount() > 0) {
+                        // Segment has vectors but search returned empty - diagnose the graph
+                        LOGGER.warn("Segment {} has {} active nodes but search returned empty - running HNSW diagnostic",
+                            segmentResult.segmentId(), graph.activeNodeCount());
+
+                        try {
+                            excalibur.query.visibility.HnswGraphDiagnostic.GraphDiagnosticResult graphDiagnostic =
+                                excalibur.query.visibility.HnswGraphDiagnostic.runFullDiagnostic(
+                                    graph, null, 0);
+
+                            LOGGER.warn("HNSW diagnostic for segment {}: {}", segmentResult.segmentId(),
+                                graphDiagnostic.summary());
+
+                            for (excalibur.query.visibility.HnswGraphDiagnostic.GraphDiagnosticIssue issue : graphDiagnostic.issues()) {
+                                LOGGER.warn("  Issue: {}", issue);
+                            }
+                        } catch (Exception e) {
+                            LOGGER.warn("Failed to run HNSW diagnostic for segment {}: {}",
+                                segmentResult.segmentId(), e.getMessage());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ==================== Inner Classes ====================

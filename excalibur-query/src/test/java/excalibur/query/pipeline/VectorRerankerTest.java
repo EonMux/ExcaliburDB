@@ -13,6 +13,7 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
@@ -88,6 +89,8 @@ class VectorRerankerTest {
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
         float[] storedVector = new float[]{0.8f, 0.0f, 0.0f};
         float exactDistance = 0.2f;
+        // For L2 distance, normalized score = 1 / (1 + distance)
+        float expectedNormalizedScore = 1.0f / (1.0f + exactDistance); // = 0.8333333f
 
         // Setup mocks
         when(graph.readNode(1L)).thenReturn(nodeView);
@@ -109,7 +112,8 @@ class VectorRerankerTest {
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).nodeId()).isEqualTo(1L);
-        assertThat(result.get(0).score()).isEqualTo(exactDistance);  // Should be exact, not 0.5
+        // Score should be normalized to [0, 1] range where higher is better
+        assertThat(result.get(0).score()).isCloseTo(expectedNormalizedScore, within(0.001f));
         verify(distanceFunction).compute(queryVector, storedVector);
     }
 
@@ -161,14 +165,17 @@ class VectorRerankerTest {
             10
         );
 
-        // Results should be sorted by exact distance: 0.1, 0.3, 0.5
+        // Results should be sorted by normalized score descending (higher is better)
+        // L2 distance 0.1 → normalized score 1/(1+0.1) ≈ 0.909
+        // L2 distance 0.3 → normalized score 1/(1+0.3) ≈ 0.769
+        // L2 distance 0.5 → normalized score 1/(1+0.5) ≈ 0.667
         assertThat(result).hasSize(3);
-        assertThat(result.get(0).nodeId()).isEqualTo(1L);
-        assertThat(result.get(0).score()).isEqualTo(0.1f);
-        assertThat(result.get(1).nodeId()).isEqualTo(3L);
-        assertThat(result.get(1).score()).isEqualTo(0.3f);
-        assertThat(result.get(2).nodeId()).isEqualTo(2L);
-        assertThat(result.get(2).score()).isEqualTo(0.5f);
+        assertThat(result.get(0).nodeId()).isEqualTo(1L);  // Best score (distance 0.1)
+        assertThat(result.get(0).score()).isCloseTo(1.0f / 1.1f, within(0.001f));
+        assertThat(result.get(1).nodeId()).isEqualTo(3L);  // Second best (distance 0.3)
+        assertThat(result.get(1).score()).isCloseTo(1.0f / 1.3f, within(0.001f));
+        assertThat(result.get(2).nodeId()).isEqualTo(2L);  // Worst (distance 0.5)
+        assertThat(result.get(2).score()).isCloseTo(1.0f / 1.5f, within(0.001f));
     }
 
     @Test
@@ -377,8 +384,8 @@ class VectorRerankerTest {
     // ==================== Tail Scan Result Tests ====================
 
     @Test
-    @DisplayName("Rerank preserves tail scan results (already exact)")
-    void testRerankPreservesTailScanResults() {
+    @DisplayName("Rerank normalizes tail scan results to [0, 1] score range")
+    void testRerankNormalizesTailScanResults() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
         VectorReranker reranker = new VectorReranker(distanceFunction);
@@ -397,9 +404,13 @@ class VectorRerankerTest {
         when(node1.vector()).thenReturn(vec1);
         when(distanceFunction.compute(queryVector, vec1)).thenReturn(0.1f);
 
+        // Tail scan result has raw L2 distance 0.3, should be normalized to 1/(1+0.3) ≈ 0.769
+        float tailRawDistance = 0.3f;
+        float expectedTailNormalizedScore = 1.0f / (1.0f + tailRawDistance);  // ≈ 0.769
+
         List<QueryResultItem> candidates = Arrays.asList(
             new QueryResultItem(1L, 0.5f, null, 100L, 1L),       // HNSW result
-            new QueryResultItem(2L, 0.3f, null, 100L, tailScanNodeId)  // Tail scan result
+            new QueryResultItem(2L, tailRawDistance, null, 100L, tailScanNodeId)  // Tail scan result
         );
 
         List<QueryResultItem> result = reranker.rerank(
@@ -410,13 +421,16 @@ class VectorRerankerTest {
         );
 
         assertThat(result).hasSize(2);
-        // Tail scan result should keep its distance
+        // Tail scan result should now have normalized score in [0, 1] range
         QueryResultItem tailResult = result.stream()
             .filter(r -> r.nodeId() == tailScanNodeId)
             .findFirst()
             .orElse(null);
         assertThat(tailResult).isNotNull();
-        assertThat(tailResult.score()).isEqualTo(0.3f);  // Preserved
+        // Score should be normalized to [0, 1] range
+        assertThat(tailResult.score()).isCloseTo(expectedTailNormalizedScore, within(0.001f));
+        assertThat(tailResult.score()).isGreaterThanOrEqualTo(0.0f);
+        assertThat(tailResult.score()).isLessThanOrEqualTo(1.0f);
     }
 
     // ==================== Null Argument Tests ====================
@@ -478,7 +492,7 @@ class VectorRerankerTest {
     // ==================== Domain Correctness Tests ====================
 
     @Test
-    @DisplayName("Rerank produces exact L2 distances")
+    @DisplayName("Rerank produces normalized scores from L2 distances")
     void testRerankExactL2Distances() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
@@ -488,13 +502,15 @@ class VectorRerankerTest {
         float[] storedVector = new float[]{2.0f, 3.0f, 4.0f};
 
         // L2 distance: sqrt((2-1)^2 + (3-2)^2 + (4-3)^2) = sqrt(3) ≈ 1.732
-        float expectedL2Distance = 1.7320508f;
+        float rawL2Distance = 1.7320508f;
+        // Normalized score: 1 / (1 + 1.732) ≈ 0.366
+        float expectedNormalizedScore = 1.0f / (1.0f + rawL2Distance);
 
         NodeView node = mock(NodeView.class);
         when(graph.readNode(1L)).thenReturn(node);
         when(node.isTombstoned()).thenReturn(false);
         when(node.vector()).thenReturn(storedVector);
-        when(distanceFunction.compute(queryVector, storedVector)).thenReturn(expectedL2Distance);
+        when(distanceFunction.compute(queryVector, storedVector)).thenReturn(rawL2Distance);
 
         List<QueryResultItem> candidates = List.of(
             new QueryResultItem(1L, 0.5f, null, 100L, 1L)  // Approximate distance
@@ -508,7 +524,8 @@ class VectorRerankerTest {
         );
 
         assertThat(result).hasSize(1);
-        assertThat(result.get(0).score()).isEqualTo(expectedL2Distance);
+        // Score should be normalized to [0, 1] range
+        assertThat(result.get(0).score()).isCloseTo(expectedNormalizedScore, within(0.001f));
     }
 
     @Test
@@ -521,11 +538,15 @@ class VectorRerankerTest {
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
         float[] storedVector = new float[]{0.8f, 0.0f, 0.0f};
 
+        float rawDistance = 0.2f;
+        // For L2, normalized score = 1 / (1 + distance)
+        float expectedNormalizedScore = 1.0f / (1.0f + rawDistance); // = 0.8333...
+
         NodeView node = mock(NodeView.class);
         when(graph.readNode(1L)).thenReturn(node);
         when(node.isTombstoned()).thenReturn(false);
         when(node.vector()).thenReturn(storedVector);
-        when(distanceFunction.compute(queryVector, storedVector)).thenReturn(0.2f);
+        when(distanceFunction.compute(queryVector, storedVector)).thenReturn(rawDistance);
 
         byte[] payload = new byte[]{1, 2, 3};
         List<QueryResultItem> candidates = List.of(
@@ -544,6 +565,7 @@ class VectorRerankerTest {
         assertThat(item.documentId()).isEqualTo(42L);
         assertThat(item.segmentId()).isEqualTo(100L);
         assertThat(item.nodeId()).isEqualTo(1L);
-        assertThat(item.score()).isEqualTo(0.2f);  // New exact distance
+        // Score should be normalized to [0, 1] range
+        assertThat(item.score()).isCloseTo(expectedNormalizedScore, within(0.001f));
     }
 }
