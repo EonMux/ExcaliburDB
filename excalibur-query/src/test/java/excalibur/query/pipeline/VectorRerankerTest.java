@@ -41,7 +41,7 @@ class VectorRerankerTest {
 
     @BeforeEach
     void setUp() {
-        when(distanceFunction.name()).thenReturn("l2");
+        // Note: distanceFunction.name() stubbing removed - tests that need it create their own mocks
         reranker = new VectorReranker(distanceFunction);
     }
 

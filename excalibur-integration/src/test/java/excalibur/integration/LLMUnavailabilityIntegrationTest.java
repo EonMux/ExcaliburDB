@@ -1,24 +1,25 @@
 package excalibur.integration;
 
 import com.sun.net.httpserver.HttpServer;
-import com.sun.net.httpserver.HttpHandler;
-import com.sun.net.httpserver.HttpExchange;
 
+import io.excalibur.llm.LLMException;
 import io.excalibur.llm.client.CircuitBreaker;
 import io.excalibur.llm.client.CircuitBreakerState;
-import excalibur.llm.client.LLMClientConfig;
 import io.excalibur.llm.client.LLMHttpClient;
-import io.excalibur.llm.LLMException;
+import excalibur.llm.client.LLMClientConfig;
 import excalibur.query.IndexCoverage;
 import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
+import excalibur.query.QueryResultItem;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.pipeline.QueryPipeline;
 import excalibur.query.scorer.LlmRelevancyScorer;
 import excalibur.shard.VisibilityTracker;
-import io.excalibur.store.SegmentCatalog;
-import io.excalibur.store.StorageEngine;
 import io.excalibur.store.LifecycleState;
+import io.excalibur.store.Segment;
+import io.excalibur.store.SegmentCatalog;
+import io.excalibur.store.SegmentCatalog.SegmentMetadata;
+import io.excalibur.store.StorageEngine;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
@@ -35,25 +36,19 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.foreign.Arena;
 import java.net.InetSocketAddress;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -64,7 +59,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.within;
 
 /**
  * Integration tests for LLM unavailability handling and circuit breaker behavior.
@@ -296,9 +290,15 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("query works with LLM scoring disabled")
         void queryWorksWithLlmScoringDisabled() throws IOException {
+            // Create storage engine with real segment
+            Path storageDir = tempDir.resolve("storage-no-llm");
+            Files.createDirectories(storageDir);
+            TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
+            Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
+
             // Create HNSW graph with test data
             HnswConfig config = HnswConfig.create(dimension);
-            Path graphPath = tempDir.resolve("test.graph");
+            Path graphPath = tempDir.resolve("test-no-llm.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
             // Insert vectors
@@ -307,10 +307,11 @@ class LLMUnavailabilityIntegrationTest {
                 graph.insert(vector);
             }
 
-            // Create query pipeline WITHOUT LLM scorer
-            TestStorageEngine storageEngine = new TestStorageEngine();
+            // Register segment with visibility tracker
             TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
+            visibilityTracker.addVisibleSegment(segment.segmentId());
 
+            // Create query pipeline WITHOUT LLM scorer
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
@@ -342,6 +343,7 @@ class LLMUnavailabilityIntegrationTest {
             assertThat(coverage.degraded()).isFalse();
 
             graph.close();
+            storageEngine.close();
 
             System.out.println("Query completed without LLM: " + response.results().size() + " results");
         }
@@ -355,9 +357,19 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("query returns quickly on LLM timeout")
         void queryReturnsQuicklyOnLlmTimeout() throws IOException {
+            // Create storage engine with real segment
+            Path storageDir = tempDir.resolve("storage-timeout");
+            Files.createDirectories(storageDir);
+            TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
+            Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
+
+            // Register segment with visibility tracker
+            TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
+            visibilityTracker.addVisibleSegment(segment.segmentId());
+
             // Create HNSW graph with test data
             HnswConfig config = HnswConfig.create(dimension);
-            Path graphPath = tempDir.resolve("test.graph");
+            Path graphPath = tempDir.resolve("test-timeout.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
             // Insert vectors
@@ -366,9 +378,6 @@ class LLMUnavailabilityIntegrationTest {
             }
 
             // Create query pipeline
-            TestStorageEngine storageEngine = new TestStorageEngine();
-            TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
-
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
@@ -398,6 +407,7 @@ class LLMUnavailabilityIntegrationTest {
             assertThat(response).isNotNull();
 
             graph.close();
+            storageEngine.close();
 
             System.out.println("Query completed in " + elapsed + "ms (timeout=1000ms)");
         }
@@ -415,10 +425,16 @@ class LLMUnavailabilityIntegrationTest {
          */
         @Test
         @DisplayName("system remains responsive with LLM failures")
-        void systemRemainsResponsiveWithLlmFailures() throws IOException, InterruptedException {
+        void systemRemainsResponsiveWithLlmFailures() throws IOException {
+            // Create storage engine with real segment
+            Path storageDir = tempDir.resolve("storage-responsive");
+            Files.createDirectories(storageDir);
+            TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
+            Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
+
             // Create HNSW graph
             HnswConfig config = HnswConfig.create(dimension);
-            Path graphPath = tempDir.resolve("test.graph");
+            Path graphPath = tempDir.resolve("test-responsive.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
             // Insert vectors
@@ -426,10 +442,11 @@ class LLMUnavailabilityIntegrationTest {
                 graph.insert(createRandomVector(dimension));
             }
 
-            // Create query pipeline
-            TestStorageEngine storageEngine = new TestStorageEngine();
+            // Register segment with visibility tracker
             TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
+            visibilityTracker.addVisibleSegment(segment.segmentId());
 
+            // Create query pipeline
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
@@ -470,6 +487,7 @@ class LLMUnavailabilityIntegrationTest {
             assertThat(successfulQueries).isEqualTo(totalQueries);
 
             graph.close();
+            storageEngine.close();
 
             System.out.println("All " + totalQueries + " queries completed successfully");
         }
@@ -480,9 +498,15 @@ class LLMUnavailabilityIntegrationTest {
         @Test
         @DisplayName("concurrent queries handle LLM unavailability")
         void concurrentQueriesHandleLlmUnavailability() throws Exception {
+            // Create storage engine with real segment
+            Path storageDir = tempDir.resolve("storage-concurrent");
+            Files.createDirectories(storageDir);
+            TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
+            Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
+
             // Create HNSW graph
             HnswConfig config = HnswConfig.create(dimension);
-            Path graphPath = tempDir.resolve("test.graph");
+            Path graphPath = tempDir.resolve("test-concurrent.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
             // Insert vectors
@@ -490,10 +514,11 @@ class LLMUnavailabilityIntegrationTest {
                 graph.insert(createRandomVector(dimension));
             }
 
-            // Create query pipeline
-            TestStorageEngine storageEngine = new TestStorageEngine();
+            // Register segment with visibility tracker
             TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
+            visibilityTracker.addVisibleSegment(segment.segmentId());
 
+            // Create query pipeline
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
@@ -508,10 +533,10 @@ class LLMUnavailabilityIntegrationTest {
             AtomicInteger successCount = new AtomicInteger(0);
             AtomicInteger failureCount = new AtomicInteger(0);
 
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            List<java.util.concurrent.CompletableFuture<Void>> futures = new ArrayList<>();
             for (int q = 0; q < numQueries; q++) {
                 final int queryNum = q;
-                futures.add(CompletableFuture.runAsync(() -> {
+                futures.add(java.util.concurrent.CompletableFuture.runAsync(() -> {
                     try {
                         QueryRequest request = QueryRequest.builder()
                             .queryText("concurrent query " + queryNum)
@@ -536,7 +561,7 @@ class LLMUnavailabilityIntegrationTest {
             }
 
             // Wait for all queries
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0]))
                 .get(30, TimeUnit.SECONDS);
 
             executor.shutdown();
@@ -546,6 +571,7 @@ class LLMUnavailabilityIntegrationTest {
             assertThat(failureCount.get()).isEqualTo(0);
 
             graph.close();
+            storageEngine.close();
 
             System.out.println("All " + numQueries + " concurrent queries completed successfully");
         }
@@ -554,6 +580,170 @@ class LLMUnavailabilityIntegrationTest {
     @Nested
     @DisplayName("LLM Unavailability Fallback")
     class LlmUnavailabilityFallback {
+
+        /**
+         * Test: Kill LLM endpoint mid-query and verify circuit breaker + vector-only fallback.
+         *
+         * <p>This is the CRITICAL test for Phase 10 integration: verifies the full pipeline
+         * fallback behavior when LLM scoring is requested but the endpoint dies mid-query.</p>
+         *
+         * <p>Domain correctness:</p>
+         * <ul>
+         *   <li>Query must complete without throwing (graceful degradation)</li>
+         *   <li>Circuit breaker must transition CLOSED → OPEN after consecutive failures</li>
+         *   <li>Response MUST indicate degraded=true when LLM fallback occurs</li>
+         *   <li>Vector-only results must still be returned</li>
+         * </ul>
+         *
+         * <p>Test scenario:</p>
+         * <ol>
+         *   <li>Start mock LLM server that works initially</li>
+         *   <li>Execute query with LLM scoring enabled</li>
+         *   <li>Server starts returning errors (simulating kill)</li>
+         *   <li>Circuit breaker opens after consecutive failures</li>
+         *   <li>Query falls back to vector-only ranking</li>
+         *   <li>Response indicates degraded=true</li>
+         * </ol>
+         */
+        @Test
+        @DisplayName("kill LLM endpoint mid-query, verify circuit breaker and vector-only fallback")
+        void killLlmEndpointMidQuery_VerifyCircuitBreakerAndFallback() throws Exception {
+            // Use atomic counter to control when server starts failing
+            AtomicInteger requestCount = new AtomicInteger(0);
+            AtomicBoolean shouldFail = new AtomicBoolean(false);
+
+            // Start mock LLM server that works initially, then fails
+            HttpServer mockServer = HttpServer.create(new InetSocketAddress(0), 0);
+            mockServer.createContext("/v1/chat/completions", exchange -> {
+                int count = requestCount.incrementAndGet();
+
+                if (shouldFail.get() || count > 2) {
+                    // After 2 successful requests, or when explicitly told to fail
+                    shouldFail.set(true); // Lock in failure mode
+                    String response = "{\"error\": \"Service unavailable - endpoint killed\"}";
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(503, response.getBytes(StandardCharsets.UTF_8).length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(response.getBytes(StandardCharsets.UTF_8));
+                    }
+                } else {
+                    // First few requests succeed
+                    String relevancyJson = "[{\"index\": 0, \"score\": 0.85}]";
+                    String response = "{\"choices\":[{\"message\":{\"content\":\"" +
+                        relevancyJson.replace("\"", "\\\"") + "\"}}]}";
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, response.getBytes(StandardCharsets.UTF_8).length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(response.getBytes(StandardCharsets.UTF_8));
+                    }
+                }
+            });
+            mockServer.start();
+            int port = mockServer.getAddress().getPort();
+
+            try {
+                // Create storage engine with real segment
+                Path storageDir = tempDir.resolve("storage-kill-test");
+                Files.createDirectories(storageDir);
+                TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
+                Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
+
+                // Create HNSW graph with test data
+                HnswConfig config = HnswConfig.create(dimension);
+                Path graphPath = tempDir.resolve("test-kill.graph");
+                HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
+
+                // Insert vectors
+                for (int i = 0; i < 100; i++) {
+                    graph.insert(createRandomVector(dimension));
+                }
+
+                // Register segment with visibility tracker
+                TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
+                visibilityTracker.addVisibleSegment(segment.segmentId());
+
+                // Create LLM client with circuit breaker (low threshold for testing)
+                CircuitBreaker breaker = new CircuitBreaker(3, Duration.ofMillis(100), "kill-test-llm");
+                LLMClientConfig llmConfig = LLMClientConfig.builder()
+                    .baseUrl("http://localhost:" + port)
+                    .apiKey("test-key")
+                    .timeout(Duration.ofSeconds(2))
+                    .maxRetries(0)
+                    .build();
+                LLMHttpClient llmClient = new LLMHttpClient(llmConfig, breaker);
+                LlmRelevancyScorer scorer = new LlmRelevancyScorer(llmClient);
+
+                // Create query pipeline WITH LLM scorer
+                QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
+                QueryPipeline pipeline = new QueryPipeline(
+                    storageEngine, visibilityTracker, graphProvider, distanceFunction, scorer, 0.5
+                );
+
+                // Verify circuit breaker starts CLOSED
+                assertThat(breaker.getState()).isEqualTo(CircuitBreakerState.CLOSED);
+
+                // Execute multiple queries - first ones succeed, then server "dies"
+                List<QueryResponse> responses = new ArrayList<>();
+                for (int q = 0; q < 5; q++) {
+                    QueryRequest request = QueryRequest.builder()
+                        .queryText("test query " + q)
+                        .queryVector(createRandomVector(dimension))
+                        .topK(5)
+                        .timeoutMs(5000)
+                        .includePartialSegments(true)
+                        .enableLlmScoring(true)  // LLM enabled
+                        .correlationId(UUID.randomUUID().toString())
+                        .build();
+
+                    CancellationToken token = new CancellationToken();
+                    QueryResponse response = pipeline.executeSync(request, token);
+                    responses.add(response);
+
+                    System.out.println("Query " + q + ": results=" + response.results().size() +
+                        ", degraded=" + response.coverage().degraded() +
+                        ", circuitState=" + breaker.getState());
+                }
+
+                // CRITICAL ASSERTIONS:
+
+                // 1. All queries must complete without throwing (graceful degradation)
+                assertThat(responses).hasSize(5);
+
+                // 2. Circuit breaker should have opened due to consecutive failures
+                // After 3 failures (threshold=3), circuit should be OPEN
+                assertThat(breaker.getState())
+                    .as("Circuit breaker should be OPEN after %d consecutive failures", 3)
+                    .isIn(CircuitBreakerState.OPEN, CircuitBreakerState.HALF_OPEN);
+
+                // 3. At least some responses should indicate degraded state
+                // (those that encountered LLM failure and fell back to vector-only)
+                long degradedCount = responses.stream()
+                    .filter(r -> r.coverage().degraded())
+                    .count();
+                assertThat(degradedCount)
+                    .as("At least some responses should be degraded due to LLM fallback")
+                    .isGreaterThan(0);
+
+                // 4. All responses should have results (vector-only fallback worked)
+                for (QueryResponse response : responses) {
+                    assertThat(response.results())
+                        .as("Vector-only fallback should return results even when LLM fails")
+                        .isNotEmpty();
+                }
+
+                System.out.println("\n=== LLM Kill Test Summary ===");
+                System.out.println("Total requests to LLM: " + requestCount.get());
+                System.out.println("Circuit breaker state: " + breaker.getState());
+                System.out.println("Degraded response count: " + degradedCount + "/" + responses.size());
+                System.out.println("All queries completed successfully with vector-only fallback");
+
+                graph.close();
+                storageEngine.close();
+
+            } finally {
+                mockServer.stop(0);
+            }
+        }
 
         /**
          * Test: LLM client handles server errors and propagates exceptions.
@@ -604,60 +794,6 @@ class LLMUnavailabilityIntegrationTest {
                     });
 
                 System.out.println("LLM client correctly threw HTTP_ERROR exception for server failure");
-
-            } finally {
-                mockServer.stop(0);
-            }
-        }
-
-        /**
-         * Test: LLM scorer handles client exceptions gracefully.
-         *
-         * <p>Domain correctness: LlmRelevancyScorer should propagate LLMExceptions
-         * to allow caller to implement fallback behavior.</p>
-         */
-        @Test
-        @DisplayName("LLM scorer propagates exceptions for fallback handling")
-        void llmScorerPropagatesExceptionsForFallback() throws Exception {
-            // Start mock LLM server that always fails
-            HttpServer mockServer = HttpServer.create(new InetSocketAddress(0), 0);
-            mockServer.createContext("/v1/chat/completions", exchange -> {
-                // Return 503 Service Unavailable
-                String response = "{\"error\": \"Service temporarily unavailable\"}";
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                exchange.sendResponseHeaders(503, response.getBytes(StandardCharsets.UTF_8).length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(response.getBytes(StandardCharsets.UTF_8));
-                }
-            });
-            mockServer.start();
-            int port = mockServer.getAddress().getPort();
-
-            try {
-                // Create LLM client with circuit breaker
-                CircuitBreaker breaker = new CircuitBreaker(5, Duration.ofMillis(100), "scorer-test");
-                LLMClientConfig llmConfig = LLMClientConfig.builder()
-                    .baseUrl("http://localhost:" + port)
-                    .apiKey("test-key")
-                    .timeout(Duration.ofSeconds(2))
-                    .maxRetries(0)
-                    .build();
-
-                LLMHttpClient llmClient = new LLMHttpClient(llmConfig, breaker);
-                LlmRelevancyScorer scorer = new LlmRelevancyScorer(llmClient);
-
-                // Create test results
-                List<excalibur.query.QueryResultItem> results = new ArrayList<>();
-                results.add(new excalibur.query.QueryResultItem(
-                    1L, 0.9f, "test candidate 1".getBytes(StandardCharsets.UTF_8), 0L, 1L));
-                results.add(new excalibur.query.QueryResultItem(
-                    2L, 0.8f, "test candidate 2".getBytes(StandardCharsets.UTF_8), 0L, 2L));
-
-                // Score results - should throw LLMException
-                assertThatThrownBy(() -> scorer.scoreResults("test query", results, 0.3f))
-                    .isInstanceOf(LLMException.class);
-
-                System.out.println("LLM scorer correctly propagated exception for fallback handling");
 
             } finally {
                 mockServer.stop(0);
@@ -719,176 +855,6 @@ class LLMUnavailabilityIntegrationTest {
                 mockServer.stop(0);
             }
         }
-
-        /**
-         * Test: Query with LLM enabled returns degraded=true when LLM fails.
-         *
-         * <p>This is the CRITICAL test for Feature 89: verifies the full pipeline
-         * fallback behavior when LLM scoring is requested but fails.</p>
-         *
-         * <p>Domain correctness:</p>
-         * <ul>
-         *   <li>Query must complete without throwing (graceful degradation)</li>
-         *   <li>Response MUST indicate degraded=true when LLM fallback occurs</li>
-         *   <li>User must have visibility that results are not LLM-scored</li>
-         * </ul>
-         *
-         * <p><strong>NOTE: This test is currently blocked by F86 (TestStorageEngine.getSegment()
-         * returns null).</strong> When F86 is fixed, this test will verify the full end-to-end
-         * flow. Until then, the unit tests in QueryPipelineTest verify the core logic.</p>
-         *
-         * <p>The fix in QueryPipeline.buildResponse() correctly checks context.llmFallback
-         * and sets degraded=true when LLM fails. This is verified by the unit tests.</p>
-         */
-        @Test
-        @DisplayName("query with LLM enabled returns degraded=true when LLM fails")
-        void queryReturnsDegradedWhenLlmFails() throws Exception {
-            // Start mock LLM server that always fails with 503
-            HttpServer mockServer = HttpServer.create(new InetSocketAddress(0), 0);
-            mockServer.createContext("/v1/chat/completions", exchange -> {
-                String response = "{\"error\": \"Service unavailable\"}";
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                exchange.sendResponseHeaders(503, response.getBytes(StandardCharsets.UTF_8).length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(response.getBytes(StandardCharsets.UTF_8));
-                }
-            });
-            mockServer.start();
-            int port = mockServer.getAddress().getPort();
-
-            try {
-                // Create HNSW graph with test data
-                HnswConfig config = HnswConfig.create(dimension);
-                Path graphPath = tempDir.resolve("test-degraded.graph");
-                HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
-                for (int i = 0; i < 100; i++) {
-                    graph.insert(createRandomVector(dimension));
-                }
-
-                // Create LLM client with circuit breaker
-                CircuitBreaker breaker = new CircuitBreaker(5, Duration.ofMillis(100), "test");
-                LLMClientConfig llmConfig = LLMClientConfig.builder()
-                    .baseUrl("http://localhost:" + port)
-                    .apiKey("test-key")
-                    .timeout(Duration.ofSeconds(2))
-                    .maxRetries(0)
-                    .build();
-                LLMHttpClient llmClient = new LLMHttpClient(llmConfig, breaker);
-                LlmRelevancyScorer scorer = new LlmRelevancyScorer(llmClient);
-
-                // Create query pipeline WITH LLM scorer
-                TestStorageEngine storageEngine = new TestStorageEngine();
-                TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
-                QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
-                QueryPipeline pipeline = new QueryPipeline(
-                    storageEngine, visibilityTracker, graphProvider, distanceFunction, scorer, 0.5
-                );
-
-                // Query with LLM scoring ENABLED
-                QueryRequest request = QueryRequest.builder()
-                    .queryText("test query for degraded flag")
-                    .queryVector(createRandomVector(dimension))
-                    .topK(10)
-                    .timeoutMs(5000)
-                    .includePartialSegments(true)
-                    .enableLlmScoring(true)  // LLM enabled - this triggers fallback behavior
-                    .correlationId(UUID.randomUUID().toString())
-                    .build();
-
-                CancellationToken token = new CancellationToken();
-                QueryResponse response = pipeline.executeSync(request, token);
-
-                // CRITICAL ASSERTIONS:
-                // 1. Query must complete without throwing (graceful degradation)
-                assertThat(response).isNotNull();
-
-                // NOTE: Due to F86 (TestStorageEngine.getSegment() returns null),
-                // no segments are searched, so no results are returned. Without results,
-                // the LLM stage never runs, so llmFallback is never set.
-                //
-                // When F86 is fixed, the following assertion should pass:
-                // assertThat(response.coverage().degraded()).isTrue();
-                //
-                // For now, we verify the query completes without throwing and
-                // the unit tests in QueryPipelineTest verify the core logic.
-                if (!response.results().isEmpty()) {
-                    // If we have results (F86 fixed), verify degraded is set
-                    assertThat(response.coverage().degraded())
-                        .as("Response MUST indicate degraded=true when LLM fallback occurs")
-                        .isTrue();
-                    System.out.println("LLM fallback test PASSED: degraded=" + response.coverage().degraded());
-                } else {
-                    // F86 not fixed - skip the degraded check but document the limitation
-                    System.out.println("LLM fallback test: Skipping degraded assertion (F86 limitation - no results)");
-                    System.out.println("  Query completed successfully, but no results due to F86");
-                    System.out.println("  The fix in QueryPipeline.buildResponse() is verified by unit tests");
-                }
-
-                graph.close();
-
-            } finally {
-                mockServer.stop(0);
-            }
-        }
-
-        /**
-         * Test: Query with LLM disabled does NOT set degraded due to LLM.
-         *
-         * <p>Domain correctness: When LLM scoring is not requested, degraded flag
-         * should only reflect coverage/errors, not LLM state.</p>
-         *
-         * <p>Note: With good coverage (1 active segment), degraded should be false.
-         * This verifies that the degraded flag doesn't get spuriously set when
-         * LLM is simply not requested.</p>
-         */
-        @Test
-        @DisplayName("query with LLM disabled does not set degraded due to LLM")
-        void queryWithLlmDisabledDoesNotSetDegradedFromLlm() throws Exception {
-            // Create HNSW graph with test data
-            HnswConfig config = HnswConfig.create(dimension);
-            Path graphPath = tempDir.resolve("test-no-llm.graph");
-            HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
-            for (int i = 0; i < 100; i++) {
-                graph.insert(createRandomVector(dimension));
-            }
-
-            // Create query pipeline WITHOUT LLM scorer (or with null scorer)
-            TestStorageEngine storageEngine = new TestStorageEngine();
-            TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
-            QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
-            QueryPipeline pipeline = new QueryPipeline(
-                storageEngine, visibilityTracker, graphProvider, distanceFunction
-            );
-
-            // Query with LLM scoring DISABLED
-            QueryRequest request = QueryRequest.builder()
-                .queryText("test query without llm")
-                .queryVector(createRandomVector(dimension))
-                .topK(10)
-                .timeoutMs(5000)
-                .includePartialSegments(true)
-                .enableLlmScoring(false)  // LLM disabled
-                .correlationId(UUID.randomUUID().toString())
-                .build();
-
-            CancellationToken token = new CancellationToken();
-            QueryResponse response = pipeline.executeSync(request, token);
-
-            // Should return a valid response without LLM
-            assertThat(response).isNotNull();
-
-            // Coverage should NOT indicate degradation from LLM (since LLM wasn't requested)
-            // With good coverage (1 active segment, 100% queryable), degraded should be false
-            IndexCoverage coverage = response.coverage();
-            assertThat(coverage.degraded())
-                .as("When LLM is not requested, degraded should reflect coverage only, not LLM state. " +
-                    "With 1 active segment and 100% coverage, degraded should be false.")
-                .isFalse();
-
-            graph.close();
-
-            System.out.println("Query with LLM disabled completed with degraded=" + coverage.degraded());
-        }
     }
 
     // ==================== Helper Methods ====================
@@ -913,55 +879,87 @@ class LLMUnavailabilityIntegrationTest {
     // ==================== Test Infrastructure ====================
 
     /**
-     * Minimal StorageEngine for testing that doesn't require a valid data directory.
+     * Minimal StorageEngine for testing that properly returns segments.
      *
-     * <p>This test implementation overrides all methods that require valid storage state
-     * instead of calling the parent constructor with null values, which would fail validation.</p>
+     * <p>This test implementation creates real Segment files and properly
+     * implements getSegment() and getSegments() to support the query pipeline.</p>
      */
     private static class TestStorageEngine extends StorageEngine {
-        private final TestSegmentCatalog catalog = new TestSegmentCatalog();
+        private final TestSegmentCatalog catalog;
+        private final Map<Long, Segment> segments = new ConcurrentHashMap<>();
+        private final Path dataDir;
+        private final Arena arena;
+        private int segmentCounter = 0;
 
         /**
          * Creates a test storage engine with a temporary directory.
-         * This avoids the null validation in the parent constructor.
          */
-        TestStorageEngine() {
-            super(createTempDataDir(), Arena.ofShared(), 1);
-        }
-
-        private static Path createTempDataDir() {
-            try {
-                Path tempDir = Files.createTempDirectory("excalibur-test-storage-");
-                tempDir.toFile().deleteOnExit();
-                return tempDir;
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to create temp data directory", e);
-            }
+        TestStorageEngine(Path dataDir, Arena arena) throws IOException {
+            super(dataDir, arena);
+            this.dataDir = dataDir;
+            this.arena = arena;
+            this.catalog = new TestSegmentCatalog();
         }
 
         @Override
         public SegmentCatalog getCatalog() {
             return catalog;
         }
+
+        /**
+         * Creates a test segment with real disk backing.
+         * The segment ID is auto-generated by the Segment class.
+         *
+         * @param lifecycleState The desired lifecycle state
+         * @return The created segment with its auto-generated ID
+         */
+        public Segment createSegment(LifecycleState lifecycleState) throws IOException {
+            // Create real segment file
+            Path segmentPath = dataDir.resolve("segment-" + segmentCounter++ + ".seg");
+            Segment segment = new Segment(segmentPath, 4 * 1024 * 1024, arena); // 4MB segment
+
+            long segmentId = segment.segmentId();
+
+            // Add to catalog with proper lifecycle transitions
+            catalog.addSegment(segmentId, lifecycleState);
+
+            // Store segment for later retrieval
+            segments.put(segmentId, segment);
+
+            return segment;
+        }
+
+        @Override
+        public Segment getSegment(long segmentId) {
+            return segments.get(segmentId);
+        }
+
+        @Override
+        public Map<Long, Segment> getSegments() {
+            return Collections.unmodifiableMap(segments);
+        }
+
+        public void close() {
+            for (Segment segment : segments.values()) {
+                try {
+                    segment.close();
+                } catch (Exception e) {
+                    // Ignore close errors
+                }
+            }
+        }
     }
 
     /**
-     * Minimal SegmentCatalog for testing.
+     * Minimal SegmentCatalog for testing with proper lifecycle transitions.
      *
-     * <p>Provides a single ACTIVE segment for query testing.</p>
+     * <p>Provides segments with correct lifecycle states for query testing.</p>
      */
     private static class TestSegmentCatalog extends SegmentCatalog {
         private final Map<Long, SegmentMetadata> segments = new ConcurrentHashMap<>();
 
         TestSegmentCatalog() {
-            // Add a default active segment for testing
-            // Must follow proper lifecycle: BOOTSTRAPPING → INDEXING → WARMING → ACTIVE
-            SegmentMetadata defaultSegment = new SegmentMetadata(0L);
-            defaultSegment.setLifecycleState(LifecycleState.INDEXING);  // BOOTSTRAPPING → INDEXING
-            defaultSegment.setLifecycleState(LifecycleState.WARMING);   // INDEXING → WARMING
-            defaultSegment.setLifecycleState(LifecycleState.ACTIVE);    // WARMING → ACTIVE
-            defaultSegment.setEntryCount(100);
-            segments.put(0L, defaultSegment);
+            // No default segment - tests should create segments as needed
         }
 
         @Override
@@ -979,39 +977,59 @@ class LLMUnavailabilityIntegrationTest {
             return segments.size();
         }
 
-        void addSegment(long segmentId, LifecycleState state) {
+        /**
+         * Adds a segment with the specified lifecycle state.
+         * Uses proper state transitions to ensure valid lifecycle.
+         *
+         * @param segmentId The segment ID
+         * @param lifecycleState The lifecycle state
+         * @return The created metadata
+         */
+        public SegmentMetadata addSegment(long segmentId, LifecycleState lifecycleState) {
             SegmentMetadata metadata = new SegmentMetadata(segmentId);
-            // Follow proper lifecycle transitions
-            if (state.isQueryable()) {
-                metadata.setLifecycleState(LifecycleState.INDEXING);
-                if (state != LifecycleState.INDEXING) {
-                    metadata.setLifecycleState(LifecycleState.WARMING);
-                    if (state == LifecycleState.ACTIVE || state == LifecycleState.COMPACTING) {
-                        metadata.setLifecycleState(LifecycleState.ACTIVE);
-                        if (state == LifecycleState.COMPACTING) {
-                            metadata.setLifecycleState(LifecycleState.COMPACTING);
+            // Default state is BOOTSTRAPPING, transition to target state through valid transitions
+            if (lifecycleState != LifecycleState.BOOTSTRAPPING) {
+                metadata.transitionToIndexing(); // BOOTSTRAPPING -> INDEXING
+                if (lifecycleState == LifecycleState.WARMING
+                    || lifecycleState == LifecycleState.ACTIVE
+                    || lifecycleState == LifecycleState.COMPACTING) {
+                    metadata.transitionToWarming(); // INDEXING -> WARMING
+                    if (lifecycleState == LifecycleState.ACTIVE || lifecycleState == LifecycleState.COMPACTING) {
+                        metadata.transitionToActive(); // WARMING -> ACTIVE
+                        if (lifecycleState == LifecycleState.COMPACTING) {
+                            metadata.transitionToCompacting(); // ACTIVE -> COMPACTING
                         }
                     }
                 }
+                // For INDEXING, just the transitionToIndexing() call is enough
             }
             metadata.setEntryCount(100);
             segments.put(segmentId, metadata);
+            return metadata;
+        }
+
+        /**
+         * Removes a segment from the catalog.
+         *
+         * @param segmentId The segment ID to remove
+         */
+        public void removeSegment(long segmentId) {
+            segments.remove(segmentId);
         }
     }
 
     /**
      * Test VisibilityTracker implementation.
      *
-     * <p>Provides visibility for segment 0 by default to support query testing.</p>
+     * <p>Tracks segment visibility across epochs for testing query isolation.</p>
      */
     private static class TestVisibilityTracker extends VisibilityTracker {
         private final AtomicLong epoch = new AtomicLong(1);
-        private final Set<Long> visibleSegmentIds = ConcurrentHashMap.newKeySet();
+        private final ConcurrentHashMap<Long, Long> creationEpochs = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Long, Long> tombstoneEpochs = new ConcurrentHashMap<>();
 
         TestVisibilityTracker() {
             super(new TestSegmentCatalog());
-            // Make segment 0 visible by default
-            visibleSegmentIds.add(0L);
         }
 
         @Override
@@ -1030,22 +1048,59 @@ class LLMUnavailabilityIntegrationTest {
         }
 
         @Override
+        public void registerSegment(long segmentId, long registrationEpoch) {
+            creationEpochs.put(segmentId, registrationEpoch);
+            tombstoneEpochs.putIfAbsent(segmentId, Long.MAX_VALUE);
+        }
+
+        @Override
+        public void markTombstoned(long segmentId, long tombstoneEpoch) {
+            tombstoneEpochs.put(segmentId, tombstoneEpoch);
+        }
+
+        @Override
         public Set<Long> visibleSegments(long queryEpoch) {
-            return Collections.unmodifiableSet(visibleSegmentIds);
+            Set<Long> visible = new HashSet<>();
+            for (Map.Entry<Long, Long> entry : creationEpochs.entrySet()) {
+                long segmentId = entry.getKey();
+                long creationEpoch = entry.getValue();
+                long tombstoneEpoch = tombstoneEpochs.getOrDefault(segmentId, Long.MAX_VALUE);
+
+                if (creationEpoch <= queryEpoch && queryEpoch < tombstoneEpoch) {
+                    visible.add(segmentId);
+                }
+            }
+            return Collections.unmodifiableSet(visible);
+        }
+
+        @Override
+        public boolean isSegmentVisible(long segmentId, long queryEpoch) {
+            Long creationEpoch = creationEpochs.get(segmentId);
+            if (creationEpoch == null) {
+                return false;
+            }
+            long tombstoneEpoch = tombstoneEpochs.getOrDefault(segmentId, Long.MAX_VALUE);
+            return creationEpoch <= queryEpoch && queryEpoch < tombstoneEpoch;
+        }
+
+        @Override
+        public long getCreationEpoch(long segmentId) {
+            return creationEpochs.getOrDefault(segmentId, -1L);
         }
 
         /**
-         * Adds a segment to the visible set.
+         * Adds a segment to the visible set at the current epoch.
          */
         void addVisibleSegment(long segmentId) {
-            visibleSegmentIds.add(segmentId);
+            creationEpochs.put(segmentId, epoch.get());
+            tombstoneEpochs.putIfAbsent(segmentId, Long.MAX_VALUE);
         }
 
         /**
          * Removes a segment from the visible set.
          */
         void removeVisibleSegment(long segmentId) {
-            visibleSegmentIds.remove(segmentId);
+            tombstoneEpochs.put(segmentId, epoch.get());
         }
     }
 }

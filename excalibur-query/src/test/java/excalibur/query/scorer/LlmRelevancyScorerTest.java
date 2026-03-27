@@ -115,18 +115,18 @@ class LlmRelevancyScorerTest {
                 new RelevancyScore(1, 0.3)    // Second item is less relevant
             );
 
-            when(llmClient.scoreRelevancy(eq(queryText), anyList())).thenReturn(llmScores);
+            when(llmClient.scoreRelevancyWithCircuitBreaker(eq(queryText), anyList(), any())).thenReturn(llmScores);
 
             // Execute
             List<QueryResultItem> result = scorer.scoreResults(queryText, items, 0.5f);
 
             // Verify LLM was called with correct candidates
-            verify(llmClient).scoreRelevancy(eq(queryText), argThat(candidates -> {
+            verify(llmClient).scoreRelevancyWithCircuitBreaker(eq(queryText), argThat(candidates -> {
                 List<String> c = (List<String>) candidates;
                 return c.size() == 2 &&
                     c.get(0).equals("Machine learning is a subset of AI.") &&
                     c.get(1).equals("Python is a programming language.");
-            }));
+            }), any());
 
             // Verify results - only first item passes threshold of 0.5
             assertThat(result).hasSize(1);
@@ -149,7 +149,7 @@ class LlmRelevancyScorerTest {
                 new RelevancyScore(2, 0.7)    // Above threshold
             );
 
-            when(llmClient.scoreRelevancy(anyString(), anyList())).thenReturn(llmScores);
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any())).thenReturn(llmScores);
 
             List<QueryResultItem> result = scorer.scoreResults("query", items, 0.5f);
 
@@ -174,7 +174,7 @@ class LlmRelevancyScorerTest {
                 new RelevancyScore(2, 0.75)
             );
 
-            when(llmClient.scoreRelevancy(anyString(), anyList())).thenReturn(llmScores);
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any())).thenReturn(llmScores);
 
             List<QueryResultItem> result = scorer.scoreResults("query", items, 0.5f);
 
@@ -201,17 +201,17 @@ class LlmRelevancyScorerTest {
                 new RelevancyScore(1, 0.8)
             );
 
-            when(llmClient.scoreRelevancy(anyString(), anyList())).thenReturn(llmScores);
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any())).thenReturn(llmScores);
 
             scorer.scoreResults("query", items, 0.3f);
 
             // Verify LLM was called with empty string for null payload
-            verify(llmClient).scoreRelevancy(anyString(), argThat(candidates -> {
+            verify(llmClient).scoreRelevancyWithCircuitBreaker(anyString(), argThat(candidates -> {
                 List<String> c = (List<String>) candidates;
                 return c.size() == 2 &&
                     c.get(0).isEmpty() &&
                     c.get(1).equals("Valid content");
-            }));
+            }), any());
         }
 
         @Test
@@ -219,7 +219,7 @@ class LlmRelevancyScorerTest {
         void preservesOriginalMetadata() throws Exception {
             QueryResultItem original = createItem(42L, 0.8f, "content", 10L, 100L);
 
-            when(llmClient.scoreRelevancy(anyString(), anyList()))
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any()))
                 .thenReturn(List.of(new RelevancyScore(0, 0.9)));
 
             List<QueryResultItem> result = scorer.scoreResults("query", List.of(original), 0.5f);
@@ -239,7 +239,7 @@ class LlmRelevancyScorerTest {
                 createItem(1L, 0.8f, "content", 1L, 1L)
             );
 
-            when(llmClient.scoreRelevancy(anyString(), anyList()))
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any()))
                 .thenThrow(new LLMException("LLM unavailable", LLMException.ErrorType.NETWORK));
 
             assertThatThrownBy(() -> scorer.scoreResults("query", items, 0.5f))
@@ -255,7 +255,7 @@ class LlmRelevancyScorerTest {
             );
 
             // Score of 0.5 should pass even with out-of-range thresholds after clamping
-            when(llmClient.scoreRelevancy(anyString(), anyList()))
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any()))
                 .thenReturn(List.of(new RelevancyScore(0, 0.5)));
 
             // Threshold > 1.0 is clamped to 1.0, so score 0.5 should NOT pass (0.5 < 1.0)
@@ -263,7 +263,7 @@ class LlmRelevancyScorerTest {
             assertThat(result).isEmpty(); // 0.5 < 1.0 so filtered out
 
             // Threshold < 0.0 is clamped to 0.0, so all scores >= 0 should pass
-            when(llmClient.scoreRelevancy(anyString(), anyList()))
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any()))
                 .thenReturn(List.of(new RelevancyScore(0, 0.5)));
 
             result = scorer.scoreResults("query", items, -1.0f);

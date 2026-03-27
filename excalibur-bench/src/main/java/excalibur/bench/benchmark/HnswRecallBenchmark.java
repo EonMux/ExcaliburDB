@@ -80,9 +80,10 @@ public class HnswRecallBenchmark {
 
     /**
      * efSearch values to test.
+     * Tests the full range from low recall/high QPS to high recall/lower QPS.
      * Default (200) should achieve ≥99% recall@10.
      */
-    @Param({"100", "200", "300"})
+    @Param({"50", "100", "150", "200", "250", "300", "400"})
     public int efSearch;
 
     // Benchmark state
@@ -93,7 +94,11 @@ public class HnswRecallBenchmark {
     private int queryCount = 100;
 
     // Pre-computed ground truth for recall calculation
+    // Indexed by query index, contains the true top-K node IDs
     private List<List<Long>> groundTruth;
+
+    // Map from query index to ground truth (for O(1) lookup in combined benchmark)
+    private Map<Integer, List<Long>> groundTruthMap;
 
     // Distance function
     private DistanceFunction distanceFunction;
@@ -153,8 +158,11 @@ public class HnswRecallBenchmark {
         // Compute ground truth via brute force
         System.out.println("Computing ground truth via brute force...");
         groundTruth = new ArrayList<>();
+        groundTruthMap = new HashMap<>();
         for (int q = 0; q < queryCount; q++) {
-            groundTruth.add(computeTrueTopK(queries[q], K));
+            List<Long> truth = computeTrueTopK(queries[q], K);
+            groundTruth.add(truth);
+            groundTruthMap.put(q, truth);
         }
 
         // Log setup info
@@ -197,6 +205,8 @@ public class HnswRecallBenchmark {
 
     /**
      * Helper method to measure recall without Blackhole (for setup/verification).
+     *
+     * <p>Domain correctness: Returns value in range [0.0, 1.0]</p>
      */
     private double measureRecallInternal() {
         int totalFound = 0;
@@ -217,12 +227,49 @@ public class HnswRecallBenchmark {
             }
         }
 
-        return (double) totalFound / totalExpected;
+        double recall = (double) totalFound / totalExpected;
+
+        // Clamp to valid range [0.0, 1.0] for domain correctness
+        return clampRecall(recall);
+    }
+
+    /**
+     * Clamps a recall value to the valid range [0.0, 1.0].
+     *
+     * <p>This ensures domain correctness: recall represents a percentage
+     * of correctly retrieved items and must be between 0% and 100%.</p>
+     *
+     * @param recall The raw recall value
+     * @return Recall clamped to [0.0, 1.0]
+     */
+    public static double clampRecall(double recall) {
+        return Math.max(0.0, Math.min(1.0, recall));
+    }
+
+    /**
+     * Validates that a measured recall meets the target threshold (≥99%).
+     *
+     * <p>Domain correctness: The input recall should be in range [0.0, 1.0].
+     * If outside this range, it will be clamped before validation.</p>
+     *
+     * @param measuredRecall The measured recall value
+     * @return true if recall meets target (≥0.99)
+     */
+    public static boolean validateRecall(double measuredRecall) {
+        double clampedRecall = clampRecall(measuredRecall);
+        return clampedRecall >= TARGET_RECALL_10;
     }
 
     /**
      * Benchmark: Measure recall@10 for HNSW search.
      * This is the primary metric for Phase 4 validation.
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Recall is clamped to range [0.0, 1.0] to ensure valid percentage</li>
+     *   <li>Target: ≥99% recall@10 (TARGET_RECALL_10 = 0.99)</li>
+     *   <li>Mathematically: recall = |HNSW results ∩ True top-k| / k</li>
+     * </ul>
      */
     @Benchmark
     public double measureRecall(Blackhole bh) {
@@ -245,6 +292,11 @@ public class HnswRecallBenchmark {
         }
 
         double recall = (double) totalFound / totalExpected;
+
+        // Clamp recall to valid range [0.0, 1.0] for domain correctness
+        // This ensures the value is always a valid percentage between 0% and 100%
+        recall = Math.max(0.0, Math.min(1.0, recall));
+
         bh.consume(recall);
         return recall;
     }
@@ -272,6 +324,78 @@ public class HnswRecallBenchmark {
         }
         bh.consume(resultCount);
         return resultCount;
+    }
+
+    /**
+     * Benchmark: Combined recall and throughput measurement.
+     *
+     * <p>This benchmark measures both recall@10 and QPS in a single run to clearly
+     * show the recall vs throughput tradeoff at different efSearch values.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Recall is in range [0.0, 1.0] - validated by arithmetic</li>
+     *   <li>QPS is a positive number (queries per second)</li>
+     *   <li>Result contains both metrics for correlation analysis</li>
+     * </ul>
+     *
+     * @return RecallQpsResult containing both recall@10 and query count
+     */
+    @Benchmark
+    @OperationsPerInvocation(100)
+    public RecallQpsResult recallAndThroughput(Blackhole bh) {
+        int totalFound = 0;
+        int totalExpected = 100 * K;
+        int resultCount = 0;
+
+        for (int q = 0; q < 100; q++) {
+            int queryIdx = q % queryCount;
+            List<HnswSearchResult> results = graph.search(queries[queryIdx], K);
+            resultCount += results.size();
+
+            Set<Long> resultIds = new HashSet<>();
+            for (HnswSearchResult r : results) {
+                resultIds.add(r.nodeId());
+            }
+
+            // Count how many true top-k are in the results
+            for (Long trueId : groundTruth.get(queryIdx)) {
+                if (resultIds.contains(trueId)) {
+                    totalFound++;
+                }
+            }
+        }
+
+        double recall = (double) totalFound / totalExpected;
+
+        // Clamp recall to valid range [0.0, 1.0] for domain correctness
+        recall = Math.max(0.0, Math.min(1.0, recall));
+
+        RecallQpsResult result = new RecallQpsResult(recall, resultCount);
+        bh.consume(result);
+        return result;
+    }
+
+    /**
+     * Record containing both recall and result count for combined benchmark.
+     *
+     * <p>This allows JMH to report both metrics together, making it easy to
+     * see the recall vs throughput tradeoff at each efSearch value.</p>
+     */
+    public record RecallQpsResult(double recall, int resultCount) {
+        /**
+         * Checks if this result meets the ≥99% recall@10 target.
+         */
+        public boolean meetsTarget() {
+            return recall >= TARGET_RECALL_10;
+        }
+
+        /**
+         * Returns the recall as a percentage string.
+         */
+        public String recallPercent() {
+            return String.format("%.2f%%", recall * 100);
+        }
     }
 
     // ==================== Helper Methods ====================
@@ -323,23 +447,22 @@ public class HnswRecallBenchmark {
      */
     private record NodeDistance(long nodeId, float distance) {}
 
-    // ==================== Validation Methods ====================
+    // ==================== Additional Validation Methods ====================
 
     /**
-     * Validates that recall meets the target threshold.
-     * Called externally to verify benchmark results.
-     *
-     * @param measuredRecall The measured recall value
-     * @return true if recall meets target (≥99%)
-     */
-    public static boolean validateRecall(double measuredRecall) {
-        return measuredRecall >= TARGET_RECALL_10;
-    }
-
-    /**
-     * Gets the target recall@10 threshold.
+     * Gets the target recall@10 threshold (0.99 = 99%).
      */
     public static double getTargetRecall() {
         return TARGET_RECALL_10;
+    }
+
+    /**
+     * Formats a recall value as a percentage string.
+     *
+     * @param recall Recall value in range [0.0, 1.0]
+     * @return Formatted percentage string (e.g., "99.23%")
+     */
+    public static String formatRecallPercent(double recall) {
+        return String.format("%.2f%%", clampRecall(recall) * 100);
     }
 }

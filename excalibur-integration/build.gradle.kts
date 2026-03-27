@@ -24,11 +24,15 @@ dependencies {
     implementation(project(":excalibur-llm"))
     implementation(project(":excalibur-ingest"))
     implementation(project(":excalibur-api"))
+
+    // Test utilities (FailureCategorizer, FailureReportingExtension)
+    testImplementation(project(":excalibur-test"))
 }
 
 tasks.withType<JavaCompile> {
     options.encoding = "UTF-8"
     options.release.set(21)
+    options.compilerArgs.add("--enable-preview")
 }
 
 tasks.jar {

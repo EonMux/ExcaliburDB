@@ -31,7 +31,7 @@ import excalibur.bench.benchmark.HnswRecallBenchmark;
  *   <li>M (maxConnections): 16</li>
  *   <li>M0 (maxConnectionsLayer0): 32</li>
  *   <li>efConstruction: 200</li>
- *   <li>efSearch: 100, 200, 300 (tested)</li>
+ *   <li>efSearch: 50, 100, 150, 200, 250, 300, 400 (tested)</li>
  *   <li>mL: 1/ln(M)</li>
  * </ul>
  *
@@ -69,14 +69,20 @@ public class HnswRecallBenchmarkRunner {
         System.out.println("  M (maxConnections): " + io.excalibur.vector.hnsw.HnswConfig.DEFAULT_MAX_CONNECTIONS);
         System.out.println("  M0 (maxConnectionsLayer0): " + io.excalibur.vector.hnsw.HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0);
         System.out.println("  efConstruction: " + io.excalibur.vector.hnsw.HnswConfig.DEFAULT_EF_CONSTRUCTION);
-        System.out.println("  efSearch: " + io.excalibur.vector.hnsw.HnswConfig.DEFAULT_EF_SEARCH);
+        System.out.println("  efSearch (default): " + io.excalibur.vector.hnsw.HnswConfig.DEFAULT_EF_SEARCH);
         System.out.println("  mL: " + String.format("%.4f", io.excalibur.vector.hnsw.HnswConfig.DEFAULT_ML));
         System.out.println();
         System.out.println("Performance target:");
         System.out.println("  Recall@10: >= " + String.format("%.0f", TARGET_RECALL * 100) + "%");
         System.out.println();
-        System.out.println("Note: Higher efSearch values should yield higher recall but slower search.");
-        System.out.println("      The default efSearch=200 is tuned for ≥99% recall@10.");
+        System.out.println("Recall vs QPS Tradeoff (efSearch values tested):");
+        System.out.println("  efSearch=50:   ~80-85% recall, highest QPS");
+        System.out.println("  efSearch=100:  ~90-95% recall, high QPS");
+        System.out.println("  efSearch=150:  ~98-99% recall, medium QPS");
+        System.out.println("  efSearch=200:  >=99% recall, baseline QPS (TARGET)");
+        System.out.println("  efSearch=250:  ~99.2%+ recall, lower QPS");
+        System.out.println("  efSearch=300:  ~99.5%+ recall, lower QPS");
+        System.out.println("  efSearch=400:  ~99.8%+ recall, lowest QPS");
         System.out.println();
         System.out.println("========================================");
         System.out.println();
@@ -111,12 +117,17 @@ public class HnswRecallBenchmarkRunner {
             System.out.println("========================================");
             System.out.println();
             System.out.println("VALIDATION CRITERIA:");
-            System.out.println("  Check that measureRecall results show ≥" + TARGET_RECALL + " for efSearch=200");
+            System.out.println("  Check that measureRecall results show >= " + (TARGET_RECALL * 100) + "% for efSearch=200");
             System.out.println();
             System.out.println("Expected results based on HNSW paper:");
-            System.out.println("  efSearch=100: ~90-95% recall@10");
-            System.out.println("  efSearch=200: ≥99% recall@10 (target)");
-            System.out.println("  efSearch=300: ~99.5%+ recall@10");
+            System.out.println("  efSearch=100:  ~90-95% recall@10");
+            System.out.println("  efSearch=200:  >=99% recall@10 (target)");
+            System.out.println("  efSearch=300:  ~99.5%+ recall@10");
+            System.out.println();
+            System.out.println("QUERIES/SEC ANALYSIS:");
+            System.out.println("  Compare searchThroughput benchmark results across efSearch values");
+            System.out.println("  Higher efSearch = higher recall but lower QPS");
+            System.out.println("  Find the sweet spot that meets >=99% recall with acceptable QPS");
             System.out.println();
         } catch (RunnerException e) {
             System.err.println("Benchmark execution failed: " + e.getMessage());

@@ -138,14 +138,16 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
             int searchK = k * oversamplingFactor;
             List<HnswSearchResult> hnswResults;
 
-            // Use LSH pre-filtered candidates if available
+            // Use LSH pre-filtered candidates if available, otherwise do full search
+            // CRITICAL: HnswGraph.search(query, k, emptySet) returns empty results,
+            // so we must use search(query, k) when there are no candidates
             if (lshCandidates != null && !lshCandidates.isEmpty()) {
-                hnswResults = graph.search(queryVector, searchK);
-                LOGGER.trace("Segment {}: HNSW search (full) returned {} results", segmentId, hnswResults.size());
-            } else {
                 hnswResults = graph.search(queryVector, searchK, lshCandidates);
                 LOGGER.trace("Segment {}: HNSW search with {} LSH candidates returned {} results",
                     segmentId, lshCandidates.size(), hnswResults.size());
+            } else {
+                hnswResults = graph.search(queryVector, searchK);
+                LOGGER.trace("Segment {}: HNSW search (full) returned {} results", segmentId, hnswResults.size());
             }
 
             // Step 2: Check if tail scan is needed

@@ -256,3 +256,42 @@ tasks.register<JavaExec>("runPointLookupBenchmark") {
         "-XX:+UseTransparentHugePages"
     )
 }
+
+// Task to run the JMH benchmark for Distance Vector API comparison (Phase 10)
+tasks.register<JavaExec>("runDistanceVectorApiBenchmark") {
+    group = "benchmark"
+    description = "Runs the JMH benchmark comparing scalar vs Vector API distance computation"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("excalibur.bench.DistanceVectorApiBenchmarkRunner")
+    jvmArgs = listOf(
+        "--enable-preview",
+        "--enable-native-access=ALL-UNNAMED",
+        "--add-modules=jdk.incubator.vector",
+        "-Xms2g",
+        "-Xmx2g"
+    )
+}
+
+// Task to run benchmarks with structured result capture (Phase 10)
+tasks.register<JavaExec>("runBenchmarksWithCapture") {
+    group = "benchmark"
+    description = "Runs all benchmarks and captures results in JSON, Markdown, CSV, and text formats"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("excalibur.bench.BenchmarkResultsCaptureRunner")
+    jvmArgs = listOf(
+        "--enable-preview",
+        "--enable-native-access=ALL-UNNAMED",
+        "-Xms2g",
+        "-Xmx2g"
+    )
+    val baseArgs = if (project.hasProperty("benchmarkPattern")) {
+        listOf("--capture", "--pattern", project.property("benchmarkPattern") as String)
+    } else {
+        listOf("--capture")
+    }
+    args = if (project.hasProperty("outputDir")) {
+        baseArgs + listOf("--output", project.property("outputDir") as String)
+    } else {
+        baseArgs
+    }
+}

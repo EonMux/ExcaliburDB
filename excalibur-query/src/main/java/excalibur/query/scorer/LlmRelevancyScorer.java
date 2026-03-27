@@ -107,10 +107,11 @@ public final class LlmRelevancyScorer implements LlmScorer {
         // Extract candidate text from result payloads
         List<String> candidates = extractCandidates(results);
 
-        // Call LLM for relevancy scoring
+        // Call LLM for relevancy scoring with circuit breaker protection
+        // This ensures failures are tracked and the circuit opens after consecutive failures
         List<RelevancyScore> scores;
         try {
-            scores = llmClient.scoreRelevancy(queryText, candidates);
+            scores = llmClient.scoreRelevancyWithCircuitBreaker(queryText, candidates, null);
         } catch (LLMException e) {
             LOGGER.warn("LLM relevancy scoring failed: {}", e.getMessage());
             throw e;

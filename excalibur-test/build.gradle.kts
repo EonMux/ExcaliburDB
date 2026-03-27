@@ -22,6 +22,10 @@ dependencies {
     implementation("org.slf4j:slf4j-api:2.0.16")
     implementation(project(":excalibur-query"))
 
+    // JUnit Platform API for FailureReportingExtension (needed in main scope)
+    implementation("org.junit.jupiter:junit-jupiter-api:5.11.3")
+    implementation("org.junit.platform:junit-platform-commons:1.11.3")
+
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.junit.jupiter:junit-jupiter-params:5.11.3")

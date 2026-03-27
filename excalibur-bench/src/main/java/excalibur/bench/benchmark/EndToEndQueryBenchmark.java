@@ -1,5 +1,6 @@
 package excalibur.bench.benchmark;
 
+import excalibur.bench.metric.LatencyPercentileValidator;
 import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
 import excalibur.query.executor.CancellationToken;
@@ -421,23 +422,64 @@ public class EndToEndQueryBenchmark {
     // ==================== Percentile Helpers ====================
 
     /**
-     * Gets the p50 latency from collected samples.
+     * Gets the p50 latency from collected samples (in milliseconds).
      * Call this after benchmark completion to get percentiles.
+     *
+     * @return p50 latency in milliseconds, or 0.0 if no samples collected
      */
     public double getP50Latency() {
         return calculatePercentile(50);
     }
 
     /**
-     * Gets the p99 latency from collected samples.
+     * Gets the p99 latency from collected samples (in milliseconds).
      * Call this after benchmark completion to get percentiles.
+     *
+     * @return p99 latency in milliseconds, or 0.0 if no samples collected
      */
     public double getP99Latency() {
         return calculatePercentile(99);
     }
 
     /**
+     * Gets the number of latency samples collected.
+     *
+     * @return sample count
+     */
+    public int getSampleCount() {
+        return latencySamples.size();
+    }
+
+    /**
+     * Validates the collected latency percentiles for domain correctness.
+     *
+     * <p>Ensures:</p>
+     * <ul>
+     *   <li>p50 &lt; p99 (strict ordering for non-constant distributions)</li>
+     *   <li>Both values are non-negative</li>
+     *   <li>Both values are in milliseconds (reasonable range)</li>
+     * </ul>
+     *
+     * @return validation result indicating success or failure with details
+     */
+    public LatencyPercentileValidator.ValidationResult validateLatencyPercentiles() {
+        return LatencyPercentileValidator.validate(getP50Latency(), getP99Latency(), latencySamples.size());
+    }
+
+    /**
+     * Gets a formatted summary of latency percentiles with validation status.
+     *
+     * @return human-readable summary string
+     */
+    public String formatLatencySummary() {
+        return LatencyPercentileValidator.formatSummary(getP50Latency(), getP99Latency());
+    }
+
+    /**
      * Calculates a latency percentile from collected samples.
+     *
+     * @param percentile the percentile to calculate (0-100)
+     * @return the latency value in milliseconds, or 0.0 if no samples
      */
     private double calculatePercentile(int percentile) {
         if (latencySamples.isEmpty()) {
