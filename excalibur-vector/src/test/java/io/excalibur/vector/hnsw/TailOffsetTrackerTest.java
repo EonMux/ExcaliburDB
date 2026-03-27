@@ -202,14 +202,16 @@ class TailOffsetTrackerTest {
 
     @Test
     void shouldMarkIntegratedResult() {
-        // Insert a vector with write log offset
+        // Insert a vector with write log END offset (first byte after entry)
         float[] vector = randomVector(64);
+        // Pass END offset = 100 (meaning entry ends at byte 99, next starts at 100)
         IncrementalInsertResult result = graph.insertWithResult(vector, 100);
 
         // Mark as integrated
         boolean marked = tracker.markIntegrated(result);
         assertThat(marked).isTrue();
-        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(101); // offset + 1
+        // With END offset semantics: lastIntegratedOffset = 100 (the END offset)
+        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(100);
     }
 
     @Test
@@ -240,16 +242,18 @@ class TailOffsetTrackerTest {
     void shouldMarkBatchIntegrated() {
         List<IncrementalInsertResult> results = new ArrayList<>();
 
-        // Insert several vectors with write log offsets
+        // Insert several vectors with write log END offsets
         for (int i = 0; i < 5; i++) {
             float[] vector = randomVector(64);
+            // Pass END offsets (first byte after each entry)
             IncrementalInsertResult result = graph.insertWithResult(vector, i * 100);
             results.add(result);
         }
 
         int count = tracker.markBatchIntegrated(results);
         assertThat(count).isEqualTo(5);
-        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(401); // (4 * 100) + 1
+        // With END offset semantics: max END offset is 400
+        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(400);
     }
 
     @Test
@@ -270,11 +274,13 @@ class TailOffsetTrackerTest {
     @Test
     void shouldIntegrateSingleVector() {
         float[] vector = randomVector(64);
+        // Pass END offset = 100 (first byte after entry)
         IncrementalInsertResult result = tracker.integrateVector(vector, 100);
 
         assertThat(result.isSuccess()).isTrue();
         assertThat(result.writeLogOffset()).isEqualTo(100);
-        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(101);
+        // With END offset semantics: lastIntegratedOffset = 100
+        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(100);
     }
 
     @Test
@@ -284,28 +290,30 @@ class TailOffsetTrackerTest {
 
         for (int i = 0; i < 10; i++) {
             vectors.add(randomVector(64));
+            // Pass END offsets (first byte after each entry)
             offsets.add((long) i * 50);
         }
 
         List<IncrementalInsertResult> results = tracker.integrateBatch(vectors, offsets);
 
         assertThat(results).hasSize(10);
-        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(451); // (9 * 50) + 1
+        // With END offset semantics: max END offset is 9 * 50 = 450
+        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(450);
     }
 
     @Test
     void shouldMaintainOffsetAcrossMultipleIntegrations() {
-        // First integration
+        // First integration with END offset 100
         tracker.integrateVector(randomVector(64), 100);
-        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(101);
+        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(100);
 
-        // Second integration with higher offset
+        // Second integration with higher END offset
         tracker.integrateVector(randomVector(64), 200);
-        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(201);
+        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(200);
 
-        // Third with lower offset - should not decrease
+        // Third with lower END offset - should not decrease
         tracker.integrateVector(randomVector(64), 150);
-        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(201);
+        assertThat(tracker.getLastIntegratedOffset()).isEqualTo(200);
     }
 
     // ==================== Thread Safety Tests ====================

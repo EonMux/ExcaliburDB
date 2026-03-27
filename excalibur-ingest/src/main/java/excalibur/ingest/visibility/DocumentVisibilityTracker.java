@@ -444,6 +444,18 @@ public class DocumentVisibilityTracker {
     }
 
     /**
+     * Returns the document registry used by this tracker.
+     *
+     * <p>The document registry contains metadata for all registered documents
+     * and is used by the reindexer to look up existing document information.</p>
+     *
+     * @return The document registry
+     */
+    public DocumentRegistry getRegistry() {
+        return documentRegistry;
+    }
+
+    /**
      * Visibility information for a document.
      *
      * @param documentId The document identifier

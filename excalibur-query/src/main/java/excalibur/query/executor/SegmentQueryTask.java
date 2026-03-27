@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Callable;
 
 /**
@@ -49,6 +50,7 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     private final int oversamplingFactor;
     private final DistanceFunction distanceFunction;
     private final TailScanner tailScanner;
+    private final Set<Long> lshCandidates;
 
     /**
      * Creates a new SegmentQueryTask.
@@ -72,6 +74,38 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
             int oversamplingFactor,
             DistanceFunction distanceFunction) {
 
+        this(segmentId, segment, graph, queryVector, k, oversamplingFactor, distanceFunction, null);
+    }
+
+    /**
+     * Creates a new SegmentQueryTask with LSH pre-filtered candidates.
+     *
+     * <p>This constructor allows passing a set of LSH pre-filtered candidate
+     * node IDs to constrain the HNSW search. When LSH candidates are provided,
+     * the HNSW search only considers those specific nodes rather than searching
+     * the entire graph.</p>
+     *
+     * @param segmentId The segment identifier
+     * @param segment The segment to search
+     * @param graph The HNSW graph for the segment
+     * @param queryVector The query vector
+     * @param k The number of results to retrieve
+     * @param oversamplingFactor The oversampling factor for HNSW search
+     * @param distanceFunction The distance function
+     * @param lshCandidates The set of LSH pre-filtered candidate node IDs (may be null or empty)
+     * @throws NullPointerException if any required parameter is null
+     * @throws IllegalArgumentException if k is not positive
+     */
+    public SegmentQueryTask(
+            long segmentId,
+            Segment segment,
+            HnswGraph graph,
+            float[] queryVector,
+            int k,
+            int oversamplingFactor,
+            DistanceFunction distanceFunction,
+            Set<Long> lshCandidates) {
+
         this.segmentId = segmentId;
         this.segment = Objects.requireNonNull(segment, "Segment cannot be null");
         this.graph = Objects.requireNonNull(graph, "Graph cannot be null");
@@ -88,6 +122,7 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
         this.k = k;
         this.oversamplingFactor = oversamplingFactor;
         this.tailScanner = new TailScanner();
+        this.lshCandidates = lshCandidates != null ? lshCandidates : Collections.emptySet();
     }
 
     @Override
@@ -101,9 +136,17 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
         try {
             // Step 1: Perform HNSW graph search with oversampling
             int searchK = k * oversamplingFactor;
-            List<HnswSearchResult> hnswResults = graph.search(queryVector, searchK);
+            List<HnswSearchResult> hnswResults;
 
-            LOGGER.trace("Segment {}: HNSW search returned {} results", segmentId, hnswResults.size());
+            // Use LSH pre-filtered candidates if available
+            if (lshCandidates != null && !lshCandidates.isEmpty()) {
+                hnswResults = graph.search(queryVector, searchK);
+                LOGGER.trace("Segment {}: HNSW search (full) returned {} results", segmentId, hnswResults.size());
+            } else {
+                hnswResults = graph.search(queryVector, searchK, lshCandidates);
+                LOGGER.trace("Segment {}: HNSW search with {} LSH candidates returned {} results",
+                    segmentId, lshCandidates.size(), hnswResults.size());
+            }
 
             // Step 2: Check if tail scan is needed
             long lastIntegratedOffset = graph.getLastIntegratedOffset();

@@ -156,6 +156,12 @@ public final class Config {
         // Query timeout in milliseconds
         public static final int DEFAULT_QUERY_TIMEOUT_MS = 30000;
 
+        // Minimum and maximum values for validation (used by ConfigValidation)
+        public static final long MIN_EPOCH_TICK_MS = 10;
+        public static final long MAX_EPOCH_TICK_MS = 10000;
+        public static final int MIN_QUERY_TIMEOUT_MS = 1000;
+        public static final int MAX_QUERY_TIMEOUT_MS = 300000;
+
         // All fields final for immutability
         private final long epochTickMs;
         private final int queryTimeoutMs;
@@ -234,10 +240,20 @@ public final class Config {
         // Default for document atomicity enabled
         public static final boolean DEFAULT_DOCUMENT_ATOMICITY = true;
 
+        // Default reindex interval in milliseconds (1 hour)
+        public static final long DEFAULT_REINDEX_INTERVAL_MS = 3600000L;
+
+        // Minimum and maximum values for validation (used by ConfigValidation)
+        public static final long MIN_QUEUE_DEPTH_LIMIT = 10000L;
+        public static final long MAX_QUEUE_DEPTH_LIMIT = 1000000L;
+        public static final int MIN_DOCUMENT_TIMEOUT_MS = 1000;
+        public static final int MAX_DOCUMENT_TIMEOUT_MS = 30000;
+
         // All fields final for immutability
         private final long hnswQueueDepthLimit;
         private final int documentTimeoutMs;
         private final boolean documentAtomicity;
+        private final long reindexIntervalMs;
 
         /**
          * Creates an Ingest config from properties.
@@ -248,6 +264,7 @@ public final class Config {
             this.hnswQueueDepthLimit = parseLong(props, "excalibur.ingest.hnsw-queue-depth-limit", DEFAULT_QUEUE_DEPTH_LIMIT);
             this.documentTimeoutMs = parseInt(props, "excalibur.ingest.document-atomicity-timeout-ms", DEFAULT_DOCUMENT_TIMEOUT_MS);
             this.documentAtomicity = parseBoolean(props, "excalibur.ingest.document-atomicity", DEFAULT_DOCUMENT_ATOMICITY);
+            this.reindexIntervalMs = parseLong(props, "excalibur.ingest.reindex-interval-ms", DEFAULT_REINDEX_INTERVAL_MS);
         }
 
         /**
@@ -279,11 +296,24 @@ public final class Config {
             return documentAtomicity;
         }
 
+        /**
+         * Gets the reindex interval in milliseconds.
+         *
+         * <p>This is the default interval between automatic reindex operations
+         * for sources registered via the /v1/ingest endpoint.</p>
+         *
+         * @return Reindex interval in milliseconds
+         */
+        public long getReindexIntervalMs() {
+            return reindexIntervalMs;
+        }
+
         @Override
         public String toString() {
             return "Ingest{hnswQueueDepthLimit=" + hnswQueueDepthLimit +
                    ", documentTimeoutMs=" + documentTimeoutMs +
-                   ", documentAtomicity=" + documentAtomicity + '}';
+                   ", documentAtomicity=" + documentAtomicity +
+                   ", reindexIntervalMs=" + reindexIntervalMs + '}';
         }
     }
 
@@ -306,6 +336,12 @@ public final class Config {
 
         // Maximum query latency in milliseconds
         public static final int DEFAULT_MAX_LATENCY_MS = 5000;
+
+        // Minimum and maximum values for validation (used by ConfigValidation)
+        public static final double MIN_THRESHOLD = 0.0;
+        public static final double MAX_THRESHOLD = 1.0;
+        public static final int MIN_MAX_LATENCY_MS = 100;
+        public static final int MAX_MAX_LATENCY_MS = 60000;
 
         // All fields final for immutability
         private final double readinessThreshold;
@@ -377,6 +413,16 @@ public final class Config {
 
         // Default LLM timeout
         public static final int DEFAULT_LLM_TIMEOUT_MS = 60000;
+
+        // Minimum and maximum values for validation (used by ConfigValidation)
+        public static final int MIN_TOP_K = 1;
+        public static final int MAX_TOP_K = 10000;
+        public static final double MIN_PROBABILITY = 0.0;
+        public static final double MAX_PROBABILITY = 1.0;
+        public static final int MIN_VECTOR_DIMENSIONS = 128;
+        public static final int MAX_VECTOR_DIMENSIONS = 4096;
+        public static final int MIN_LLM_TIMEOUT_MS = 5000;
+        public static final int MAX_LLM_TIMEOUT_MS = 300000;
 
         // All fields final for immutability
         private final int defaultTopK;
@@ -516,6 +562,24 @@ public final class Config {
 
         // Default max batch tokens
         public static final int DEFAULT_MAX_BATCH_TOKENS = 4000;
+
+        // Minimum and maximum values for validation
+        public static final int MIN_EMBEDDINGS_DIMENSIONS = 128;
+        public static final int MAX_EMBEDDINGS_DIMENSIONS = 4096;
+        public static final int MIN_TIMEOUT_MS = 1000;
+        public static final int MAX_TIMEOUT_MS = 300000;
+        public static final int MIN_MAX_RETRIES = 0;
+        public static final int MAX_MAX_RETRIES = 10;
+        public static final int MIN_FAILURE_THRESHOLD = 1;
+        public static final int MAX_FAILURE_THRESHOLD = 100;
+        public static final long MIN_COOLDOWN_PERIOD_MS = 1000L;
+        public static final long MAX_COOLDOWN_PERIOD_MS = 600000L;
+        public static final int MIN_MAX_PROMPTS_PER_QUERY = 1;
+        public static final int MAX_MAX_PROMPTS_PER_QUERY = 100;
+        public static final double MIN_RELEVANCY_THRESHOLD = 0.0;
+        public static final double MAX_RELEVANCY_THRESHOLD = 1.0;
+        public static final int MIN_MAX_BATCH_TOKENS = 100;
+        public static final int MAX_MAX_BATCH_TOKENS = 100000;
 
         // All fields final for immutability
         private final String baseUrl;

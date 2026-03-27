@@ -8,6 +8,7 @@ import io.excalibur.metrics.MetricsRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -88,22 +89,40 @@ public final class BootstrapApplication {
 
     /**
      * Loads configuration from excalibur.properties with environment variable overrides.
+     *
+     * <p>Validation failures are FATAL and will cause the application to exit.
+     * Only IO errors (missing config file, read errors) trigger fallback to defaults.</p>
+     *
+     * @throws IllegalStateException if configuration validation fails
      */
     private void loadConfiguration() {
         try {
             // Load config with system environment variables for overrides
             config = ConfigLoader.load("excalibur.properties", System.getenv());
-            // Validate the loaded configuration
+        } catch (IOException e) {
+            // File not found or read error - fall back to defaults
+            logger.warn("Failed to load configuration file, using defaults: {}", e.getMessage());
+            config = new Config(new HashMap<>());
+            // Even defaults need validation
+            ConfigValidation.validate(config);
+            return;
+        }
+
+        // Validate the loaded configuration
+        // This is FATAL - do NOT catch IllegalStateException
+        // Let it propagate to run() which calls System.exit(1)
+        try {
             ConfigValidation.validate(config);
             logger.info("Configuration loaded and validated from excalibur.properties");
             logger.info("Visibility epoch tick: {}ms", config.visibility().getEpochTickMs());
             logger.info("Query include partial segments: {}", config.query().isIncludePartialSegments());
             logger.info("Ingest HNSW queue depth limit: {}", config.ingest().getHnswQueueDepthLimit());
             logger.info("Health readiness threshold: {}", config.health().getReadinessThreshold());
-        } catch (Exception e) {
-            logger.warn("Failed to load configuration, using defaults: {}", e.getMessage());
-            // Fall back to creating a default config
-            config = new Config(new HashMap<>());
+        } catch (IllegalStateException e) {
+            // Validation failure - this is FATAL
+            logger.error("Configuration validation FAILED: {}", e.getMessage());
+            logger.error("Please fix the invalid configuration value and restart.");
+            throw e; // Re-throw to trigger System.exit(1) in run()
         }
     }
 

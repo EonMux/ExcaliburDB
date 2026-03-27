@@ -29,6 +29,9 @@ dependencies {
     implementation("org.openjdk.jmh:jmh-core:1.37")
     annotationProcessor("org.openjdk.jmh:jmh-generator-annprocess:1.37")
 
+    // Apache Commons Math3 for JMH statistical summaries
+    implementation("org.apache.commons:commons-math3:3.6.1")
+
     // Phase 1 core dependency for memory-mapped I/O
     implementation(project(":excalibur-core"))
 
@@ -236,5 +239,20 @@ tasks.register<JavaExec>("runVectorLayoutBenchmark") {
         "--add-modules=jdk.incubator.vector",
         "-Xms2g",
         "-Xmx2g"
+    )
+}
+
+// Task to run the JMH benchmark for Point Lookup throughput (Phase 10 - Feature 97)
+tasks.register<JavaExec>("runPointLookupBenchmark") {
+    group = "benchmark"
+    description = "Runs the JMH benchmark for point lookup throughput (target: >=1B ops/sec)"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("excalibur.bench.PointLookupBenchmarkRunner")
+    jvmArgs = listOf(
+        "--enable-preview",
+        "--enable-native-access=ALL-UNNAMED",
+        "-Xms2g",
+        "-Xmx2g",
+        "-XX:+UseTransparentHugePages"
     )
 }

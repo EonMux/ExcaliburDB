@@ -107,39 +107,39 @@ public final class Metrics {
         return queryLatencyHistogram;
     }
 
-     /**
+    /**
      * Gets the p50 query latency.
      */
     public static long getP50() {
-        return FixedBucketHistogram.getP50();
+        return queryLatencyHistogram.getPercentile(50.0);
     }
 
     /**
      * Gets the p90 query latency.
      */
     public static long getP90() {
-        return FixedBucketHistogram.getP90();
+        return queryLatencyHistogram.getPercentile(90.0);
     }
 
     /**
      * Gets the p95 query latency.
      */
     public static long getP95() {
-        return FixedBucketHistogram.getP95();
+        return queryLatencyHistogram.getPercentile(95.0);
     }
 
     /**
      * Gets the p99 query latency.
      */
     public static long getP99() {
-        return FixedBucketHistogram.getP99();
+        return queryLatencyHistogram.getPercentile(99.0);
     }
 
     /**
      * Gets the p99.9 query latency.
      */
     public static long getP999() {
-        return FixedBucketHistogram.getP999();
+        return queryLatencyHistogram.getPercentile(99.9);
     }
 
     /**
@@ -277,23 +277,34 @@ public final class Metrics {
     // Ingestion Queue Depth
     // ============================================
 
-    private static final AtomicLong queueDepth = new AtomicLong(0);
+    // Note: queueDepth AtomicLong retained for backward compatibility but no longer used.
+    // IngestionQueueMBean now delegates to HNSW queue depth methods.
 
     /**
      * Gets the current ingestion queue depth.
+     * Delegates to HNSW queue depth for consistency with actual ingestion backpressure tracking.
      */
     public static long getQueueDepth() {
-        return queueDepth.get();
+        return getHnswQueueDepth();
     }
 
     /**
      * Records the current queue depth.
+     * This method updates HNSW depth tracking and emits INGESTION_QUEUE notification
+     * to maintain consistency between IngestionQueueMBean and HnswQueueDepthMBean metrics.
      *
      * @param depth Current queue depth
      */
     public static void recordQueueDepth(long depth) {
-        queueDepth.set(depth);
-        // Emit notification
+        // Update HNSW depth tracking (used by both MBeans)
+        hnswQueueDepth.set(depth);
+        // Emit HNSW notification
+        hnswQueueDepthMBeanInstance.getBroadcaster().sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.HNSW_QUEUE_DEPTH,
+            "HNSW queue depth: " + depth,
+            depth
+        );
+        // Emit IngestionQueue notification for backward compatibility
         ingestionQueueMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.INGESTION_QUEUE,
             "Ingestion queue depth: " + depth,
@@ -303,35 +314,37 @@ public final class Metrics {
 
     /**
      * Gets the queue depth percentage.
+     * Delegates to HNSW queue depth for consistency.
      *
      * @param limit Maximum queue depth limit
      * @return Percentage of limit
      */
     public static double getQueueDepthPercent(long limit) {
-        long depth = getQueueDepth();
-        double percent = (double) depth / limit * 100.0;
-        return Math.max(0.0, Math.min(100.0, percent));
+        return getHnswQueueDepthPercent(limit);
     }
 
     /**
      * Checks if the queue is under control (&lt; 50% of limit).
+     * Delegates to HNSW queue for consistency.
      */
     public static boolean isUnderControl(long limit) {
-        return getQueueDepth() < limit * 0.5;
+        return isHnswUnderControl(limit);
     }
 
     /**
      * Checks if the queue is critical (&gt; 80% of limit).
+     * Delegates to HNSW queue for consistency.
      */
     public static boolean isCritical(long limit) {
-        return getQueueDepth() > limit * 0.8;
+        return isHnswCritical(limit);
     }
 
     /**
      * Checks if the queue is full (&gt; 100% of limit).
+     * Delegates to HNSW queue for consistency.
      */
     public static boolean isFull(long limit) {
-        return getQueueDepth() > limit;
+        return isHnswFull(limit);
     }
 
     // ============================================
@@ -390,52 +403,93 @@ public final class Metrics {
     // Tail Scan Metrics
     // ============================================
 
+    /**
+     * Total number of tail scan operations performed.
+     * Each call to recordTailScanMetrics() increments this by 1.
+     */
+    private static final AtomicLong totalTailScanCount = new AtomicLong(0);
+
+    /**
+     * Total number of entries scanned across all tail scan operations.
+     * This accumulates the entriesScanned values from all scans.
+     */
     private static final AtomicLong totalTailScanned = new AtomicLong(0);
-    private static final AtomicLong tailScanEntries = new AtomicLong(0);
+
+    /**
+     * Maximum number of entries scanned in a single tail scan operation.
+     * Updated atomically using CAS loop for thread safety.
+     */
     private static final AtomicLong maxTailScanEntries = new AtomicLong(0);
 
     /**
-     * Records a tail scan entry.
+     * Records metrics from a tail scan operation.
      *
-     * @param segmentId Segment identifier
+     * <p>This method should be called by TailScanner.performTailScan() after
+     * completing a scan over un-integrated write log entries. It tracks:</p>
+     * <ul>
+     *   <li>Total number of tail scan operations performed</li>
+     *   <li>Total entries scanned across all operations</li>
+     *   <li>Maximum entries scanned in a single operation</li>
+     * </ul>
+     *
+     * <p><strong>Domain correctness:</strong> Values should be non-negative.
+     * Entries scanned represents log entries; vector entries found represents
+     * entries with valid vectors. Typical values: 0-100,000 entries per scan
+     * (bounded by backpressure limit).</p>
+     *
+     * @param entriesScanned Number of log entries scanned (including non-vector entries)
+     * @param vectorEntriesFound Number of entries with valid vectors found
      */
-    public static void recordTailScan(long segmentId) {
-        long depth = getQueueDepth();
-        totalTailScanned.addAndGet(depth);
-        tailScanEntries.addAndGet(depth);
-        long newMax = tailScanEntries.get();
-        synchronized (maxTailScanEntries) {
-            if (newMax > maxTailScanEntries.get()) {
-                maxTailScanEntries.set(newMax);
+    public static void recordTailScanMetrics(int entriesScanned, int vectorEntriesFound) {
+        // Increment the count of tail scan operations
+        totalTailScanCount.incrementAndGet();
+
+        // Add to the total entries scanned
+        totalTailScanned.addAndGet(entriesScanned);
+
+        // Update max using CAS loop for thread safety without locks
+        long currentMax = maxTailScanEntries.get();
+        while (entriesScanned > currentMax) {
+            if (maxTailScanEntries.compareAndSet(currentMax, entriesScanned)) {
+                break;
             }
+            currentMax = maxTailScanEntries.get();
         }
-        recordQueueDepth(depth);
-        recordHnswDepth(depth);
     }
 
     /**
-     * Gets the average tail scan entries.
+     * Gets the average number of entries scanned per tail scan operation.
      *
-     * @return Average tail scan entries
+     * <p>Domain: Returns a value in range [0, 100000] (bounded by backpressure limit).
+     * Returns 0 if no tail scans have been performed.</p>
+     *
+     * @return Average entries scanned per operation, or 0 if no scans performed
      */
     public static long getAverageTailScanEntries() {
-        long total = tailScanEntries.get();
-        long count = totalTailScanned.get();
-        synchronized (maxTailScanEntries) {
-            if (count == 0) return 0;
-            return total / count;
-        }
+        long total = totalTailScanned.get();
+        long count = totalTailScanCount.get();
+        return count == 0 ? 0 : total / count;
     }
 
     /**
-     * Gets the maximum tail scan entries.
+     * Gets the maximum number of entries scanned in a single tail scan operation.
      *
-     * @return Maximum tail scan entries observed
+     * <p>Domain: Returns a value in range [0, 100000] (bounded by backpressure limit).
+     * Returns 0 if no tail scans have been performed.</p>
+     *
+     * @return Maximum entries scanned in any single operation
      */
     public static long getMaxTailScanEntries() {
-        synchronized (maxTailScanEntries) {
-            return maxTailScanEntries.get();
-        }
+        return maxTailScanEntries.get();
+    }
+
+    /**
+     * Gets the total number of tail scan operations performed.
+     *
+     * @return Total count of tail scan operations
+     */
+    public static long getTotalTailScanCount() {
+        return totalTailScanCount.get();
     }
 
     // ============================================
@@ -463,6 +517,39 @@ public final class Metrics {
             MBeanNotificationBroadcaster.NotificationTypes.HNSW_QUEUE_DEPTH,
             "HNSW queue depth: " + depth,
             depth
+        );
+    }
+
+    // ============================================
+    // Cuckoo Filter FP Rate
+    // ============================================
+
+    /**
+     * Records a Cuckoo filter false positive rate measurement.
+     *
+     * <p>This method should be called periodically by a background worker that
+     * samples FP rates from active Cuckoo filters across all segments.</p>
+     *
+     * <h3>Domain Constraints</h3>
+     * <ul>
+     *   <li>FP rate must be between 0.0 and 1.0 (values are clamped)</li>
+     *   <li>Expected range for well-configured filters: 0.0001 to 0.001 (0.01% to 0.1%)</li>
+     * </ul>
+     *
+     * @param fpRate False positive rate between 0.0 and 1.0
+     */
+    public static void recordCuckooFpRate(double fpRate) {
+        // Clamp to valid range [0.0, 1.0]
+        if (fpRate < 0.0) fpRate = 0.0;
+        if (fpRate > 1.0) fpRate = 1.0;
+
+        FixedBucketHistogram.getInstance().recordFpRate(fpRate);
+
+        // Emit notification for JMX listeners
+        cuckooFpRateMBeanInstance.getBroadcaster().sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.CUCKOO_FP_RATE,
+            "Cuckoo FP rate recorded: " + fpRate,
+            fpRate
         );
     }
 
@@ -500,7 +587,13 @@ public final class Metrics {
     }
 
     /**
-     * Gets total tail scan entries.
+     * Gets the total number of entries scanned across all tail scan operations.
+     *
+     * <p>This is the sum of all entriesScanned values reported via
+     * {@link #recordTailScanMetrics(int, int)}. Use this to understand
+     * cumulative tail scan activity over time.</p>
+     *
+     * @return Total entries scanned across all operations
      */
     public static long getTotalTailScanned() {
         return totalTailScanned.get();
@@ -973,17 +1066,18 @@ public final class Metrics {
 
         @Override
         public Object getAttribute(String attribute) throws AttributeNotFoundException, MBeanException, ReflectionException {
+            // Delegate to HNSW queue depth methods - ingestion queue is tracked via HNSW integration queue
             switch (attribute) {
                 case "depth":
-                    return Metrics.getQueueDepth();
+                    return Metrics.getHnswQueueDepth();
                 case "percent":
-                    return Metrics.getQueueDepthPercent(DEFAULT_LIMIT);
+                    return Metrics.getHnswQueueDepthPercent(DEFAULT_LIMIT);
                 case "isUnderControl":
-                    return Metrics.isUnderControl(DEFAULT_LIMIT);
+                    return Metrics.isHnswUnderControl(DEFAULT_LIMIT);
                 case "isCritical":
-                    return Metrics.isCritical(DEFAULT_LIMIT);
+                    return Metrics.isHnswCritical(DEFAULT_LIMIT);
                 case "isFull":
-                    return Metrics.isFull(DEFAULT_LIMIT);
+                    return Metrics.isHnswFull(DEFAULT_LIMIT);
                 default:
                     throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }

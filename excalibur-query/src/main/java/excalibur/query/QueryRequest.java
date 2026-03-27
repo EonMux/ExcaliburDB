@@ -97,6 +97,12 @@ public final class QueryRequest {
     private final float llmThreshold;
 
     /**
+     * Oversampling factor for HNSW search.
+     * Higher values improve recall at the cost of latency.
+     */
+    private final int oversamplingFactor;
+
+    /**
      * Request correlation ID for logging and tracing.
      */
     private final String correlationId;
@@ -115,6 +121,7 @@ public final class QueryRequest {
         this.threshold = builder.threshold;
         this.enableLlmScoring = builder.enableLlmScoring;
         this.llmThreshold = builder.llmThreshold;
+        this.oversamplingFactor = builder.oversamplingFactor;
         this.correlationId = builder.correlationId;
 
         validate();
@@ -143,6 +150,9 @@ public final class QueryRequest {
         }
         if (llmThreshold < 0.0f || llmThreshold > 1.0f) {
             throw new IllegalStateException("llmThreshold must be in [0.0, 1.0]: " + llmThreshold);
+        }
+        if (oversamplingFactor < 1) {
+            throw new IllegalStateException("oversamplingFactor must be at least 1: " + oversamplingFactor);
         }
     }
 
@@ -292,6 +302,19 @@ public final class QueryRequest {
     }
 
     /**
+     * Returns the oversampling factor for HNSW search.
+     *
+     * <p>Higher values improve recall at the cost of latency.
+     * The oversampling factor determines how many candidates are
+     * retrieved per segment: k * oversamplingFactor.</p>
+     *
+     * @return The oversampling factor (at least 1)
+     */
+    public int oversamplingFactor() {
+        return oversamplingFactor;
+    }
+
+    /**
      * Returns the correlation ID for this request.
      *
      * @return The correlation ID, or null if not set
@@ -313,6 +336,7 @@ public final class QueryRequest {
             .threshold(threshold)
             .includePartialSegments(includePartialSegments)
             .timeout(timeout())
+            .oversamplingFactor(oversamplingFactor)
             .build();
     }
 
@@ -330,6 +354,7 @@ public final class QueryRequest {
             Float.compare(that.threshold, threshold) == 0 &&
             enableLlmScoring == that.enableLlmScoring &&
             Float.compare(that.llmThreshold, llmThreshold) == 0 &&
+            oversamplingFactor == that.oversamplingFactor &&
             Objects.equals(queryText, that.queryText) &&
             Arrays.equals(queryVector, that.queryVector) &&
             Objects.equals(correlationId, that.correlationId);
@@ -338,7 +363,8 @@ public final class QueryRequest {
     @Override
     public int hashCode() {
         int result = Objects.hash(queryText, topK, recallTarget, timeoutMs,
-            includePartialSegments, threshold, enableLlmScoring, llmThreshold, correlationId);
+            includePartialSegments, threshold, enableLlmScoring, llmThreshold,
+            oversamplingFactor, correlationId);
         result = 31 * result + Arrays.hashCode(queryVector);
         return result;
     }
@@ -346,8 +372,8 @@ public final class QueryRequest {
     @Override
     public String toString() {
         return String.format(
-            "QueryRequest{dim=%d, topK=%d, recall=%.2f, timeout=%dms, partial=%s, threshold=%.2f}",
-            queryVector.length, topK, recallTarget, timeoutMs, includePartialSegments, threshold);
+            "QueryRequest{dim=%d, topK=%d, recall=%.2f, timeout=%dms, partial=%s, threshold=%.2f, oversampling=%d}",
+            queryVector.length, topK, recallTarget, timeoutMs, includePartialSegments, threshold, oversamplingFactor);
     }
 
     // ==================== Builder ====================
@@ -365,6 +391,7 @@ public final class QueryRequest {
         private float threshold = 0.0f;
         private boolean enableLlmScoring = true;
         private float llmThreshold = 0.3f;
+        private int oversamplingFactor = QueryOptions.DEFAULT_OVERSAMPLING_FACTOR;
         private String correlationId;
 
         private Builder() {}
@@ -496,6 +523,24 @@ public final class QueryRequest {
          */
         public Builder correlationId(String correlationId) {
             this.correlationId = correlationId;
+            return this;
+        }
+
+        /**
+         * Sets the oversampling factor for HNSW search.
+         *
+         * <p>Higher values improve recall at the cost of latency.
+         * Default value is {@link QueryOptions#DEFAULT_OVERSAMPLING_FACTOR} (2).</p>
+         *
+         * @param oversamplingFactor The oversampling factor (must be at least 1)
+         * @return This builder
+         * @throws IllegalArgumentException if oversamplingFactor is less than 1
+         */
+        public Builder oversamplingFactor(int oversamplingFactor) {
+            if (oversamplingFactor < 1) {
+                throw new IllegalArgumentException("oversamplingFactor must be at least 1: " + oversamplingFactor);
+            }
+            this.oversamplingFactor = oversamplingFactor;
             return this;
         }
 

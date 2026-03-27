@@ -13,6 +13,15 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * offset up to which all entries have been linked into the HNSW graph. Entries
  * beyond this offset exist in the write log but are not yet in the graph.</p>
  *
+ * <h2>Offset Semantics (CRITICAL)</h2>
+ * <p>All offsets passed to integration methods ({@link #integrateVector},
+ * {@link #integrateBatch}, {@link #markIntegrated}, {@link #markBatchIntegrated})
+ * MUST be <strong>END offsets</strong> - the first byte position after the entry.</p>
+ *
+ * <p>The {@code lastIntegratedOffset} represents "all entries up to but not including
+ * this position are integrated". This aligns with how the
+ * {@link excalibur.shard.worker.HnswIntegrationWorker} passes offsets.</p>
+ *
  * <h2>Purpose</h2>
  * <p>This offset is critical for the live-indexing tail scan (Phase 6):
  * <ul>
@@ -143,14 +152,19 @@ public class TailOffsetTracker {
      * <p>This is a convenience method that combines insertion and offset update
      * in a single atomic operation.</p>
      *
+     * <p><strong>Offset semantics:</strong> The writeLogOffset should be the END offset
+     * (the first byte position after the entry). This aligns with how
+     * {@link excalibur.shard.worker.HnswIntegrationWorker} passes offsets.</p>
+     *
      * @param vector The vector to integrate
-     * @param writeLogOffset The write log offset for this vector
+     * @param writeLogOffset The END offset for this vector (first byte after entry)
      * @return The insertion result
      */
     public IncrementalInsertResult integrateVector(float[] vector, long writeLogOffset) {
         IncrementalInsertResult result = graph.insertWithResult(vector, writeLogOffset);
         if (result.isSuccess() && writeLogOffset >= 0) {
-            compareAndSetOffset(writeLogOffset + 1);
+            // writeLogOffset is the END offset (first byte after entry), so use it directly
+            compareAndSetOffset(writeLogOffset);
         }
         return result;
     }
@@ -160,8 +174,13 @@ public class TailOffsetTracker {
      *
      * <p>This is a convenience method that combines batch insertion and offset update.</p>
      *
+     * <p><strong>Offset semantics:</strong> The writeLogOffsets should contain END offsets
+     * (the first byte position after each entry). This aligns with how
+     * {@link excalibur.shard.worker.HnswIntegrationWorker} passes offsets from its
+     * integration loop.</p>
+     *
      * @param vectors The vectors to integrate
-     * @param writeLogOffsets The corresponding write log offsets
+     * @param writeLogOffsets The corresponding END offsets (first byte after each entry)
      * @return List of insertion results
      */
     public java.util.List<IncrementalInsertResult> integrateBatch(
@@ -169,12 +188,12 @@ public class TailOffsetTracker {
         java.util.List<IncrementalInsertResult> results = graph.insertBatchWithResults(vectors, writeLogOffsets);
 
         // Find maximum offset from successful insertions
-        // Consistent with integrateVector: offset represents the entry position,
-        // and lastIntegratedOffset is set to offset + 1 to indicate "all entries up to but not including this position are integrated"
+        // writeLogOffsets are END offsets (first byte after entry), so use them directly
+        // lastIntegratedOffset represents "all entries up to but not including this position are integrated"
         long maxOffset = lastIntegratedOffset.get();
         for (IncrementalInsertResult result : results) {
             if (result.isSuccess() && result.writeLogOffset() >= 0) {
-                maxOffset = Math.max(maxOffset, result.writeLogOffset() + 1);
+                maxOffset = Math.max(maxOffset, result.writeLogOffset());
             }
         }
 
@@ -188,7 +207,10 @@ public class TailOffsetTracker {
     /**
      * Marks an insertion result as integrated by updating the offset.
      *
-     * @param result The insertion result to mark
+     * <p><strong>Offset semantics:</strong> The result's writeLogOffset should be
+     * the END offset (first byte after the entry).</p>
+     *
+     * @param result The insertion result to mark (must have END offset)
      * @return true if the offset was updated
      */
     public boolean markIntegrated(IncrementalInsertResult result) {
@@ -199,13 +221,17 @@ public class TailOffsetTracker {
         if (writeLogOffset < 0) {
             return false;
         }
-        return compareAndSetOffset(writeLogOffset + 1);
+        // writeLogOffset is the END offset, use directly
+        return compareAndSetOffset(writeLogOffset);
     }
 
     /**
      * Marks a batch of insertion results as integrated.
      *
-     * @param results The insertion results to mark
+     * <p><strong>Offset semantics:</strong> The results' writeLogOffsets should be
+     * END offsets (first byte after each entry).</p>
+     *
+     * @param results The insertion results to mark (must have END offsets)
      * @return The number of results that were marked
      */
     public int markBatchIntegrated(Iterable<IncrementalInsertResult> results) {
@@ -218,7 +244,8 @@ public class TailOffsetTracker {
 
         for (IncrementalInsertResult result : results) {
             if (result != null && result.isSuccess() && result.writeLogOffset() >= 0) {
-                long entryEndOffset = result.writeLogOffset() + 1;
+                // writeLogOffset is the END offset, use directly
+                long entryEndOffset = result.writeLogOffset();
                 if (entryEndOffset > maxOffset) {
                     maxOffset = entryEndOffset;
                 }

@@ -770,4 +770,138 @@ class MBeanNotificationObserverTest {
         assertTrue(hnswAttrs.contains("maxTailScan"), "Should contain 'maxTailScan'");
         assertTrue(hnswAttrs.contains("totalTailScanned"), "Should contain 'totalTailScanned'");
     }
+
+    // ============================================
+    // Standard JMX NotificationListener Tests
+    // ============================================
+
+    @Test
+    @DisplayName("Standard JMX NotificationListener can be removed")
+    void testStandardJmxListenerRemoval() throws Exception {
+        javax.management.NotificationListener listener = (notification, handback) -> {};
+
+        broadcaster.addNotificationListener(listener, null, null);
+        assertEquals(1, broadcaster.getListenerCount());
+
+        broadcaster.removeNotificationListener(listener);
+        assertEquals(0, broadcaster.getListenerCount());
+    }
+
+    @Test
+    @DisplayName("Standard JMX NotificationListener removal with filter and handback")
+    void testStandardJmxListenerRemovalWithFilterAndHandback() throws Exception {
+        javax.management.NotificationListener listener = (notification, handback) -> {};
+        javax.management.NotificationFilter filter = notification -> true;
+        Object handback = new Object();
+
+        broadcaster.addNotificationListener(listener, filter, handback);
+        assertEquals(1, broadcaster.getListenerCount());
+
+        broadcaster.removeNotificationListener(listener, filter, handback);
+        assertEquals(0, broadcaster.getListenerCount());
+    }
+
+    @Test
+    @DisplayName("Standard JMX NotificationListener removal throws when not found")
+    void testStandardJmxListenerRemovalThrowsWhenNotFound() {
+        javax.management.NotificationListener listener = (notification, handback) -> {};
+
+        assertThrows(javax.management.ListenerNotFoundException.class, () -> {
+            broadcaster.removeNotificationListener(listener);
+        });
+    }
+
+    @Test
+    @DisplayName("Standard JMX NotificationListener receives notifications")
+    void testStandardJmxListenerReceivesNotifications() throws Exception {
+        AtomicInteger notificationCount = new AtomicInteger(0);
+        javax.management.NotificationListener listener = (notification, handback) -> {
+            notificationCount.incrementAndGet();
+        };
+
+        broadcaster.addNotificationListener(listener, null, null);
+
+        broadcaster.sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY,
+            "Test",
+            1L
+        );
+
+        assertEquals(1, notificationCount.get());
+
+        broadcaster.removeNotificationListener(listener);
+    }
+
+    @Test
+    @DisplayName("Standard JMX NotificationListener filter works correctly")
+    void testStandardJmxListenerFilter() throws Exception {
+        AtomicInteger notificationCount = new AtomicInteger(0);
+        javax.management.NotificationFilter filter = notification ->
+            notification.getType().equals(MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY);
+        Object handback = "test-handback";
+
+        javax.management.NotificationListener listener = (notification, handbackObj) -> {
+            notificationCount.incrementAndGet();
+            assertEquals("test-handback", handbackObj);
+        };
+
+        broadcaster.addNotificationListener(listener, filter, handback);
+
+        // This should pass the filter
+        broadcaster.sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY,
+            "Query latency",
+            100L
+        );
+
+        // This should be filtered out
+        broadcaster.sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.SYSTEM_HEALTH,
+            "System health",
+            0.95
+        );
+
+        assertEquals(1, notificationCount.get());
+
+        broadcaster.removeNotificationListener(listener, filter, handback);
+    }
+
+    @Test
+    @DisplayName("Multiple standard JMX listeners can be added and removed individually")
+    void testMultipleStandardJmxListeners() throws Exception {
+        AtomicInteger count1 = new AtomicInteger(0);
+        AtomicInteger count2 = new AtomicInteger(0);
+
+        javax.management.NotificationListener listener1 = (n, h) -> count1.incrementAndGet();
+        javax.management.NotificationListener listener2 = (n, h) -> count2.incrementAndGet();
+
+        broadcaster.addNotificationListener(listener1, null, null);
+        broadcaster.addNotificationListener(listener2, null, null);
+        assertEquals(2, broadcaster.getListenerCount());
+
+        broadcaster.sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY,
+            "Test",
+            1L
+        );
+
+        assertEquals(1, count1.get());
+        assertEquals(1, count2.get());
+
+        // Remove first listener
+        broadcaster.removeNotificationListener(listener1);
+        assertEquals(1, broadcaster.getListenerCount());
+
+        broadcaster.sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY,
+            "Test2",
+            2L
+        );
+
+        assertEquals(1, count1.get()); // Should not increment
+        assertEquals(2, count2.get()); // Should increment
+
+        broadcaster.removeNotificationListener(listener2);
+        assertEquals(0, broadcaster.getListenerCount());
+    }
 }

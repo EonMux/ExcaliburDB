@@ -55,6 +55,72 @@ public interface OffsetAwareStorageWriter {
     long writeChunkWithOffset(String chunkId, String content, float[] embedding);
 
     /**
+     * Writes a chunk with its embedding to a specific segment and returns the write log offset.
+     *
+     * <p>This method is used during rolling replacement reindexing to write data
+     * to a newly created segment. The segmentId parameter allows routing writes
+     * to the correct segment during reindexing operations.</p>
+     *
+     * <p><strong>Domain Correctness:</strong></p>
+     * <ul>
+     *   <li>segmentId must be a valid, existing segment ID</li>
+     *   <li>Returned offset must be non-negative</li>
+     *   <li>Offsets must be monotonically increasing within a segment</li>
+     * </ul>
+     *
+     * @param segmentId The target segment ID for this write
+     * @param chunkId Unique chunk identifier (format: "{documentId}:chunk:{index}")
+     * @param content Chunk text content (UTF-8 encoded)
+     * @param embedding Embedding vector (dimension matches configured model)
+     * @return The write log offset where this chunk was written, or -1 if write failed
+     * @throws NullPointerException if chunkId or content is null
+     * @throws IllegalArgumentException if segmentId is invalid or embedding dimension doesn't match
+     */
+    default long writeChunkWithOffset(long segmentId, String chunkId, String content, float[] embedding) {
+        // Default implementation delegates to the segment-agnostic method
+        // Implementations that support segment targeting should override this
+        return writeChunkWithOffset(chunkId, content, embedding);
+    }
+
+    /**
+     * Creates a segment-targeted view of this writer.
+     *
+     * <p>This method returns a new OffsetAwareStorageWriter that routes all writes
+     * to the specified segment. This is used during rolling replacement reindexing
+     * to ensure data is written to the newly created segment.</p>
+     *
+     * <p><strong>Usage Example:</strong></p>
+     * <pre>{@code
+     * OffsetAwareStorageWriter segmentWriter = baseWriter.forSegment(newSegmentId);
+     * // All writes via segmentWriter go to newSegmentId
+     * }</pre>
+     *
+     * @param segmentId The target segment ID for all writes
+     * @return A new OffsetAwareStorageWriter that writes to the specified segment
+     */
+    default OffsetAwareStorageWriter forSegment(long segmentId) {
+        final OffsetAwareStorageWriter delegate = this;
+        return new OffsetAwareStorageWriter() {
+            @Override
+            public long writeChunkWithOffset(String chunkId, String content, float[] embedding) {
+                return delegate.writeChunkWithOffset(segmentId, chunkId, content, embedding);
+            }
+
+            @Override
+            public long writeChunkWithOffset(long segId, String chunkId, String content, float[] embedding) {
+                // Ignore the provided segId and always use the bound segmentId
+                return delegate.writeChunkWithOffset(segmentId, chunkId, content, embedding);
+            }
+
+            @Override
+            public OffsetAwareStorageWriter forSegment(long newSegmentId) {
+                // Create a new binding for the new segment
+                return delegate.forSegment(newSegmentId);
+            }
+        };
+    }
+
+    /**
      * Adapts a basic StorageWriter to OffsetAwareStorageWriter using a counter.
      *
      * <p><strong>WARNING:</strong> This adapter uses an atomic counter to simulate

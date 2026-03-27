@@ -2,15 +2,26 @@ package excalibur.api;
 
 import excalibur.api.server.ExcaliburDBServer;
 import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.ingest.lsh.LshIngestionService;
+import excalibur.ingest.pipeline.DocumentBatchPublisher;
+import excalibur.ingest.pipeline.DocumentReindexer;
+import excalibur.ingest.pipeline.IngestionOrchestrator;
+import excalibur.ingest.pipeline.OffsetAwareStorageWriter;
+import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.registry.DocumentRegistry;
+import excalibur.ingest.registry.UpsertHandler;
 import excalibur.ingest.visibility.DocumentVisibilityChecker;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
+import excalibur.llm.client.LLMClientConfig;
+import excalibur.llm.embedding.EmbeddingClient;
+import io.excalibur.llm.client.LLMHttpClient;
 import excalibur.query.pipeline.QueryPipeline;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
 import io.excalibur.config.Config;
 import io.excalibur.config.ConfigLoader;
+import io.excalibur.config.ConfigValidation;
 import io.excalibur.core.memory.MemorySegmentFactory;
 import io.excalibur.metrics.Metrics;
 import io.excalibur.metrics.MetricsRegistry;
@@ -239,6 +250,9 @@ public final class ExcaliburApplication {
         // Initialize query pipeline
         this.queryPipeline = createQueryPipeline();
 
+        // Configure document reindexer for actual reindex operations
+        configureReindexer();
+
         // Create HTTP server
         this.server = createServer();
 
@@ -248,24 +262,34 @@ public final class ExcaliburApplication {
     /**
      * Loads configuration from the specified path.
      *
+     * <p>This method loads the configuration and validates all values against
+     * their allowed ranges. If validation fails, an IllegalStateException is
+     * thrown and the application will not start.</p>
+     *
      * @param configPath Path to configuration file
      * @return Loaded configuration
      * @throws IOException if file cannot be read
+     * @throws IllegalStateException if configuration validation fails
      */
     private Config loadConfiguration(String configPath) throws IOException {
         LOGGER.info("Loading configuration from: {}", configPath);
 
+        Config cfg;
         try {
-            Config cfg = ConfigLoader.load(configPath, System.getenv());
-            LOGGER.info("Configuration loaded: visibility.epochTickMs={}, health.readinessThreshold={}",
-                cfg.visibility().getEpochTickMs(),
-                cfg.health().getReadinessThreshold());
-            return cfg;
+            cfg = ConfigLoader.load(configPath, System.getenv());
         } catch (IOException e) {
             LOGGER.warn("Could not load configuration file: {}. Using defaults.", e.getMessage());
             // Create default configuration
-            return new Config(configPath, System.getenv(), new java.util.HashMap<>());
+            cfg = new Config(configPath, System.getenv(), new java.util.HashMap<>());
         }
+
+        // Validate configuration - validation failures are fatal
+        // Do NOT catch IllegalStateException - let it propagate to main() which calls System.exit(1)
+        ConfigValidation.validate(cfg);
+        LOGGER.info("Configuration validated: visibility.epochTickMs={}, health.readinessThreshold={}",
+            cfg.visibility().getEpochTickMs(),
+            cfg.health().getReadinessThreshold());
+        return cfg;
     }
 
     /**
@@ -574,7 +598,159 @@ public final class ExcaliburApplication {
     }
 
     /**
+     * Configures the document reindexer for actual reindex operations.
+     *
+     * <p>Creates and wires DocumentReindexer with all required dependencies:
+     * TextChunker, LLMHttpClient, UpsertHandler, DocumentRegistry, and
+     * storage writers. Enables zero-downtime rolling replacement when
+     * VolumeManager and SegmentCatalog are available.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>TextChunker uses default 512 tokens / 64 overlap</li>
+     *   <li>LLMHttpClient configured from config.llm() settings</li>
+     *   <li>OffsetAwareStorageWriter writes to segments and returns write log offsets</li>
+     *   <li>DocumentBatchPublisher ensures atomic document visibility</li>
+     *   <li>Rolling replacement enabled when segment catalog and lifecycle manager are available</li>
+     * </ul>
+     */
+    private void configureReindexer() {
+        LOGGER.info("Configuring document reindexer...");
+
+        // Check if LLM API key is configured - required for generating embeddings during reindex
+        String llmApiKey = config.llm().getApiKey();
+        if (llmApiKey == null || llmApiKey.isEmpty()) {
+            LOGGER.warn("LLM API key not configured - reindexer will run in stub mode. " +
+                "Set excalibur.llm.api-key in config or EXCALIBUR_LLM_API_KEY environment variable.");
+            return;
+        }
+
+        try {
+            // Create text chunker (512 tokens / 64 overlap)
+            TextChunker chunker = new TextChunker();
+            LOGGER.debug("TextChunker created for reindexer");
+
+            // Create LLM client for embeddings
+            LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
+            LLMHttpClient llmClient = new LLMHttpClient(llmClientConfig);
+            LOGGER.debug("LLMHttpClient created for reindexer: baseUrl={}, embeddingModel={}",
+                config.llm().getBaseUrl(), config.llm().getEmbeddingModel());
+
+            // Create document registry from visibility tracker
+            DocumentRegistry registry = documentVisibilityTracker.getRegistry();
+
+            // Create upsert handler with hierarchical filter for tombstoning old chunks
+            UpsertHandler upsertHandler = new UpsertHandler(
+                registry,
+                hierarchicalFilter,
+                (UpsertHandler.StorageAdapter) key -> {
+                    // Delegate to storage engine for tombstone operations
+                    // Note: This is a simplified adapter; full implementation would
+                    // route to the correct segment based on the key
+                    return false; // Tombstone via storage engine not directly supported
+                }
+            );
+            LOGGER.debug("UpsertHandler created with hierarchical filter support");
+
+            // Create offset-aware storage writer that writes to segments
+            OffsetAwareStorageWriter offsetWriter = (chunkId, content, embedding) -> {
+                // Write to first available segment
+                // Full implementation would use volume manager for distribution
+                var segment = storageEngine.getSegment(0L);
+                if (segment == null) {
+                    LOGGER.warn("No segment available for writing chunk: {}", chunkId);
+                    return -1L;
+                }
+                try {
+                    // Build the value: content + embedding for storage
+                    // Format: [4-byte content length][content bytes][embedding floats]
+                    byte[] contentBytes = content.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    byte[] embeddingBytes = new byte[embedding.length * Float.BYTES];
+                    java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(embeddingBytes)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                    for (float f : embedding) {
+                        buffer.putFloat(f);
+                    }
+
+                    // Build the value: content length (4 bytes) + content + embedding
+                    byte[] value = new byte[4 + contentBytes.length + embeddingBytes.length];
+                    java.nio.ByteBuffer valueBuffer = java.nio.ByteBuffer.wrap(value)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                    valueBuffer.putInt(contentBytes.length);
+                    valueBuffer.put(contentBytes);
+                    valueBuffer.put(embeddingBytes);
+
+                    // Write to segment and get write log offset
+                    long offsetBefore = segment.writeLog() != null ? segment.writeLog().writeOffset() : 0L;
+                    segment.put(chunkId.getBytes(java.nio.charset.StandardCharsets.UTF_8), value);
+                    long offsetAfter = segment.writeLog() != null ? segment.writeLog().writeOffset() : offsetBefore + 1;
+
+                    return offsetAfter;
+                } catch (Exception e) {
+                    LOGGER.warn("Failed to write chunk {}: {}", chunkId, e.getMessage());
+                    return -1L;
+                }
+            };
+            LOGGER.debug("OffsetAwareStorageWriter created for segment writes");
+
+            // Create batch publisher for atomic document visibility
+            DocumentBatchPublisher batchPublisher = new DocumentBatchPublisher(
+                indexOrchestrator.getVisibilityTracker(),
+                registry,
+                hierarchicalFilter,
+                "0", // Default segment ID - will be overridden by withTargetSegment during rolling replacement
+                () -> { /* Write log sync */ },
+                null // No publication lock needed for single-threaded reindex
+            );
+            LOGGER.debug("DocumentBatchPublisher created for atomic publication");
+
+            // Check if rolling replacement is available
+            boolean hasRollingReplacement = volumeManager != null && storageEngine.getCatalog() != null;
+
+            DocumentReindexer reindexer;
+            if (hasRollingReplacement) {
+                // Full rolling replacement support
+                reindexer = new DocumentReindexer(
+                    chunker,
+                    llmClient,
+                    upsertHandler,
+                    registry,
+                    offsetWriter,
+                    batchPublisher,
+                    storageEngine.getCatalog(),
+                    storageEngine.getLifecycleManager(),
+                    indexOrchestrator.getVisibilityTracker()
+                );
+                LOGGER.info("DocumentReindexer configured with rolling replacement support");
+            } else {
+                // Basic reindexing without rolling replacement
+                reindexer = new DocumentReindexer(
+                    chunker,
+                    llmClient,
+                    upsertHandler,
+                    registry,
+                    offsetWriter,
+                    batchPublisher
+                );
+                LOGGER.info("DocumentReindexer configured with atomic publication (no rolling replacement)");
+            }
+
+            // Wire reindexer to server
+            server.withReindexer(reindexer);
+
+            LOGGER.info("Document reindexer configured successfully");
+
+        } catch (Exception e) {
+            LOGGER.warn("Failed to configure document reindexer: {}. Reindex will operate in stub mode.", e.getMessage());
+            // Continue without reindexer - endpoint will operate in stub mode
+        }
+    }
+
+    /**
      * Creates the HTTP server.
+     *
+     * <p>This method also wires the ingestion pipeline with LSH support, enabling
+     * the /v1/ingest endpoint to trigger full document processing with LSH indexing.</p>
      *
      * @return Initialized HTTP server
      */
@@ -591,8 +767,76 @@ public final class ExcaliburApplication {
             queryPipeline
         );
 
+        // Wire the ingestion pipeline with LSH support
+        // This enables /v1/ingest to trigger full document processing: chunking, embedding, storage
+        configureIngestionPipeline(srv);
+
         LOGGER.info("HTTP server created");
         return srv;
+    }
+
+    /**
+     * Configures the ingestion pipeline for background document processing.
+     *
+     * <p>This method creates and wires all ingestion components:</p>
+     * <ul>
+     *   <li>{@link TextChunker} - Splits documents into overlapping chunks</li>
+     *   <li>{@link EmbeddingClient} - Generates vector embeddings via LLM API</li>
+     *   <li>{@link LshIngestionService} - Inserts vectors into segment LSH indices</li>
+     *   <li>{@link IngestionOrchestrator} - Orchestrates the complete ingestion pipeline</li>
+     * </ul>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Vector dimensions from config must match LLM embedding dimensions</li>
+     *   <li>LSH parameters are tuned for ~0.1% false positive rate</li>
+     *   <li>Document visibility tracker is shared with query pipeline for atomicity</li>
+     * </ul>
+     *
+     * @param server The server to configure
+     */
+    private void configureIngestionPipeline(ExcaliburDBServer server) {
+        try {
+            // Create TextChunker for splitting documents into semantic chunks
+            // Default: 512 tokens with 64 token overlap (sentence-boundary-aware)
+            TextChunker textChunker = new TextChunker();
+            LOGGER.info("TextChunker created for document chunking");
+
+            // Check if LLM API key is configured before creating embedding client
+            // This is required for generating embeddings during ingestion
+            String llmApiKey = config.llm().getApiKey();
+            if (llmApiKey == null || llmApiKey.isEmpty()) {
+                LOGGER.warn("LLM API key not configured - ingestion will run in stub mode. " +
+                    "Set excalibur.llm.api-key in config or EXCALIBUR_LLM_API_KEY environment variable.");
+                return;
+            }
+
+            // Create EmbeddingClient from LLM configuration
+            // Uses base URL, API key, and embedding model from config
+            LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
+            EmbeddingClient embeddingClient = new EmbeddingClient(llmClientConfig);
+            LOGGER.info("EmbeddingClient created: baseUrl={}, model={}, dimensions={}",
+                config.llm().getBaseUrl(), config.llm().getEmbeddingModel(),
+                llmClientConfig.getEmbeddingDimension());
+
+            // Create LshIngestionService for inserting vectors into segment LSH indices
+            // Uses vector dimensions from query config (should match embedding dimensions)
+            int vectorDimensions = config.query().getVectorDimensions();
+            if (vectorDimensions <= 0) {
+                vectorDimensions = llmClientConfig.getEmbeddingDimension();
+            }
+            LshIngestionService lshIngestionService = new LshIngestionService(vectorDimensions);
+            LOGGER.info("LshIngestionService created with dimensions={}", vectorDimensions);
+
+            // Wire the ingestion pipeline
+            // This enables /v1/ingest to trigger full document processing with LSH indexing
+            server.withIngestionPipeline(textChunker, embeddingClient, lshIngestionService, documentVisibilityTracker);
+            LOGGER.info("Ingestion pipeline configured with LSH support and document atomicity");
+
+        } catch (Exception e) {
+            LOGGER.warn("Failed to configure ingestion pipeline: {}. Ingestion will operate in stub mode.", e.getMessage());
+            // Continue without ingestion pipeline - endpoint will operate in stub mode
+        }
     }
 
     /**

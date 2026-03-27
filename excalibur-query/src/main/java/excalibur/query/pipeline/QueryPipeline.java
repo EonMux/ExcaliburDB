@@ -32,6 +32,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -840,7 +841,8 @@ public class QueryPipeline {
      * at the captured epoch are searched.</p>
      *
      * <p><strong>Parallel Execution:</strong> Searches are executed in parallel
-     * using virtual threads for improved latency across multiple segments.</p>
+     * using the {@link ParallelQueryDispatcher} for improved latency across
+     * multiple segments.</p>
      *
      * <p><strong>Offset Comparison:</strong> For each segment, compares
      * lastIntegratedOffset vs writeLogHead to determine if tail scanning is needed.</p>
@@ -850,62 +852,53 @@ public class QueryPipeline {
 
         LOGGER.trace("Stage 3: Running HNSW vector search with {} candidates", context.candidates.size());
 
+        if (context.candidates.isEmpty()) {
+            LOGGER.debug("Stage 3: No candidates to search");
+            return context.withSegmentResults(List.of(), 0);
+        }
+
         float[] queryVector = context.request.queryVectorUnsafe();
         int k = context.request.topK();
-        int oversamplingFactor = (int) Math.max(1, context.request.recallTarget() * 2);
-        int searchK = k * oversamplingFactor;
+        int oversamplingFactor = context.request.oversamplingFactor();
 
-        // Use candidates from context (filtered by stages 0-2) instead of dispatcher
-        // This ensures visibility tracking is respected
-        List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
-        long totalTailScanEntries = 0;
         long startTime = System.nanoTime();
 
+        // Build QueryOptions from request
+        QueryOptions options = QueryOptions.builder()
+            .topK(k)
+            .oversamplingFactor(oversamplingFactor)
+            .timeout(java.time.Duration.ofMillis(context.request.timeoutMs()))
+            .includePartialSegments(context.request.includePartialSegments())
+            .build();
+
+        // Convert SegmentCandidates to SegmentInfo for the dispatcher
+        List<ParallelQueryDispatcher.SegmentInfo> segmentsToSearch = new ArrayList<>();
         for (SegmentCandidate candidate : context.candidates) {
-            token.checkCancelled("Stage 3 cancelled during segment search");
-
-            try {
-                // Determine tail scan requirement
-                TailScanRequirement requirement = TailScanRequirement.noTailScan(candidate.segmentId());
-                if (candidate.segment() != null && candidate.graph() != null) {
-                    long lastIntegratedOffset = candidate.graph().getLastIntegratedOffset();
-                    long writeLogHead = candidate.segment().getWriteLogHead();
-                    if (lastIntegratedOffset < writeLogHead) {
-                        requirement = TailScanRequirement.compare(
-                            candidate.segmentId(), lastIntegratedOffset, writeLogHead);
-                    }
-                }
-
-                // Search the segment using the existing searchSegment method
-                List<HnswSearchResult> results = searchSegment(
-                    queryVector, candidate, searchK, requirement);
-
-                // Count tail scan entries
-                long tailScanEntries = requirement.isTailScanNeeded() ? requirement.estimatedEntryCount() : 0;
-
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+            if (candidate.isValid()) {
+                segmentsToSearch.add(ParallelQueryDispatcher.createSegmentInfo(
                     candidate.segmentId(),
-                    results,
-                    tailScanEntries,
-                    0, // durationMs - individual segment timing not needed here
-                    true,
-                    null
-                ));
-
-                totalTailScanEntries += tailScanEntries;
-
-            } catch (Exception e) {
-                LOGGER.warn("Segment {} search failed: {}", candidate.segmentId(), e.getMessage());
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    candidate.segmentId(),
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    e.getMessage()
+                    candidate.segment(),
+                    candidate.graph()
                 ));
             }
         }
+
+        LOGGER.trace("Stage 3: Dispatching to {} valid segments", segmentsToSearch.size());
+
+        // Use ParallelQueryDispatcher for parallel execution
+        ParallelQueryDispatcher dispatcher = getDispatcher();
+        ParallelQueryDispatcher.DispatchResult dispatchResult = dispatcher.dispatchToSpecificSegments(
+            segmentsToSearch,
+            queryVector,
+            options,
+            distanceFunction
+        );
+
+        // Check cancellation after dispatch completes
+        token.checkCancelled("Stage 3 cancelled after segment search");
+
+        List<SegmentQueryTask.SegmentQueryResult> segmentResults = dispatchResult.segmentResults();
+        long totalTailScanEntries = dispatchResult.coverage().tailScanEntries();
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 
@@ -913,6 +906,67 @@ public class QueryPipeline {
             segmentResults.size(), totalTailScanEntries, durationMs);
 
         return context.withSegmentResults(segmentResults, totalTailScanEntries);
+    }
+
+    /**
+     * Searches a single segment and returns the result.
+     *
+     * <p>This method is used for both sequential and parallel execution in Stage 3.
+     * It handles tail scan requirement determination and result collection.</p>
+     *
+     * @param queryVector The query vector
+     * @param candidate The segment candidate to search
+     * @param searchK The number of results to retrieve (with oversampling)
+     * @return Segment query result with search results and tail scan metadata
+     */
+    private SegmentQueryTask.SegmentQueryResult searchSingleSegment(
+            float[] queryVector,
+            SegmentCandidate candidate,
+            int searchK) {
+
+        long segmentStartTime = System.nanoTime();
+
+        try {
+            // Determine tail scan requirement
+            TailScanRequirement requirement = TailScanRequirement.noTailScan(candidate.segmentId());
+            if (candidate.segment() != null && candidate.graph() != null) {
+                long lastIntegratedOffset = candidate.graph().getLastIntegratedOffset();
+                long writeLogHead = candidate.segment().getWriteLogHead();
+                if (lastIntegratedOffset < writeLogHead) {
+                    requirement = TailScanRequirement.compare(
+                        candidate.segmentId(), lastIntegratedOffset, writeLogHead);
+                }
+            }
+
+            // Search the segment using the existing searchSegment method
+            List<HnswSearchResult> results = searchSegment(
+                queryVector, candidate, searchK, requirement);
+
+            // Count tail scan entries
+            long tailScanEntries = requirement.isTailScanNeeded() ? requirement.estimatedEntryCount() : 0;
+
+            long segmentDurationMs = (System.nanoTime() - segmentStartTime) / 1_000_000;
+
+            return new SegmentQueryTask.SegmentQueryResult(
+                candidate.segmentId(),
+                results,
+                tailScanEntries,
+                segmentDurationMs,
+                true,
+                null
+            );
+
+        } catch (Exception e) {
+            LOGGER.warn("Segment {} search failed: {}", candidate.segmentId(), e.getMessage());
+            return new SegmentQueryTask.SegmentQueryResult(
+                candidate.segmentId(),
+                List.of(),
+                0,
+                (System.nanoTime() - segmentStartTime) / 1_000_000,
+                false,
+                e.getMessage()
+            );
+        }
     }
 
     /**
@@ -1026,7 +1080,10 @@ public class QueryPipeline {
             long startOffset = requirement.tailScanStartOffset();
             long endOffset = requirement.tailScanEndOffset();
 
-            return tailScanner.performTailScan(
+            // Note: Tail scan metrics are recorded internally by TailScanner.performTailScan()
+            // after the scan completes, providing accurate entriesScanned and vectorEntriesFound counts
+
+            List<HnswSearchResult> results = tailScanner.performTailScan(
                 queryVector,
                 segment.writeLog(),
                 startOffset,
@@ -1034,6 +1091,11 @@ public class QueryPipeline {
                 k,
                 distanceFunction
             );
+
+            LOGGER.debug("Segment {}: Tail scan completed, {} results from offset range [{}, {})",
+                candidate.segmentId(), results.size(), startOffset, endOffset);
+
+            return results;
 
         } catch (Exception e) {
             LOGGER.warn("Segment {}: Tail scan failed: {}",
@@ -1205,8 +1267,9 @@ public class QueryPipeline {
             rerankedResults.addAll(segmentReranked);
         }
 
-        // Step 4: Final sort by exact distance and limit to top-k
-        rerankedResults.sort(Comparator.comparingDouble(QueryResultItem::score));
+        // Step 4: Final sort by normalized score descending (highest/best first) and limit to top-k
+        // Normalized scores are in [0.0, 1.0] where higher is better (more similar)
+        rerankedResults = ResultAggregator.sortByRelevanceDescending(rerankedResults);
         if (rerankedResults.size() > context.request.topK()) {
             rerankedResults = new ArrayList<>(rerankedResults.subList(0, context.request.topK()));
         }
@@ -1359,6 +1422,17 @@ public class QueryPipeline {
             }
         }
 
+        // Build coverage with degraded flag that includes LLM fallback status
+        // Domain correctness: degraded must be true when:
+        // 1. Coverage is below threshold, OR
+        // 2. Segment errors occurred, OR
+        // 3. Segment timeouts occurred, OR
+        // 4. LLM scoring was requested but fell back to vector-only
+        //
+        // computeDegraded() handles conditions 1-3, we add condition 4 via context.llmFallback
+        boolean baseDegradedFromCompute = estimatedCorpusCoverageWouldBeDegraded(
+            activeSegments, indexingSegments, warmingSegments, compactingSegments,
+            totalSegments, tombstonedSegments, segmentsWithErrors, coverageThreshold);
         IndexCoverage coverage = IndexCoverage.builder()
             .totalSegments(totalSegments)
             .activeSegments(activeSegments)
@@ -1372,6 +1446,7 @@ public class QueryPipeline {
             .segmentsTimedOut(0)
             .computeCoverage()
             .computeDegraded(coverageThreshold)
+            .degraded(context.llmFallback || baseDegradedFromCompute)
             .build();
 
         QueryResponse response = new QueryResponse(
@@ -1390,6 +1465,39 @@ public class QueryPipeline {
         }
 
         return response;
+    }
+
+    /**
+     * Computes whether the degraded flag would be true based on coverage and error conditions.
+     *
+     * <p>This mirrors the logic in IndexCoverage.Builder.computeDegraded() but allows
+     * us to combine it with additional conditions like LLM fallback.</p>
+     *
+     * @param activeSegments Active segment count
+     * @param indexingSegments Indexing segment count
+     * @param warmingSegments Warming segment count
+     * @param compactingSegments Compacting segment count
+     * @param totalSegments Total segment count
+     * @param tombstonedSegments Tombstoned segment count
+     * @param segmentsWithErrors Segments with errors count
+     * @param threshold Coverage threshold
+     * @return true if degraded conditions are met
+     */
+    private boolean estimatedCorpusCoverageWouldBeDegraded(
+            long activeSegments, long indexingSegments, long warmingSegments, long compactingSegments,
+            long totalSegments, long tombstonedSegments, int segmentsWithErrors, double threshold) {
+        // Compute estimated corpus coverage (same logic as IndexCoverage.Builder.computeCoverage())
+        long nonPurged = totalSegments - tombstonedSegments;
+        double estimatedCorpusCoverage;
+        if (nonPurged <= 0) {
+            estimatedCorpusCoverage = 0.0;
+        } else {
+            long queryable = activeSegments + indexingSegments + warmingSegments + compactingSegments;
+            estimatedCorpusCoverage = Math.max(0.0, Math.min(1.0, (double) queryable / nonPurged));
+        }
+
+        // Check degraded conditions (same logic as IndexCoverage.Builder.computeDegraded())
+        return estimatedCorpusCoverage < threshold || segmentsWithErrors > 0;
     }
 
     /**

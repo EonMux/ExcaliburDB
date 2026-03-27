@@ -71,7 +71,9 @@ class CoverageData:
 
 def parse_jacoco_xml(xml_path: Path) -> CoverageData:
     """Parse a JaCoCo XML report and extract coverage metrics."""
-    module_name = xml_path.parent.parent.parent.parent.name
+    # Path structure: project_root / module / build / reports / jacoco / test / jacocoTestReport.xml
+    # Need 5 parents from file to get module name
+    module_name = xml_path.parent.parent.parent.parent.parent.name
     data = CoverageData(module_name)
 
     try:

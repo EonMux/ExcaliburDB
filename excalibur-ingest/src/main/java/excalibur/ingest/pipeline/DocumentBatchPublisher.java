@@ -350,6 +350,70 @@ public class DocumentBatchPublisher {
     }
 
     /**
+     * Creates a new DocumentBatchPublisher bound to a specific target segment.
+     *
+     * <p>This factory method is used during rolling replacement reindexing to create
+     * a publisher that writes all data to a newly created segment. The returned
+     * publisher has the same configuration as this publisher but with a different
+     * target segment ID for hierarchical filter operations.</p>
+     *
+     * <p><strong>Domain Correctness:</strong></p>
+     * <ul>
+     *   <li>The target segment must be in INDEXING state or later</li>
+     *   <li>The target segment must exist in the segment catalog</li>
+     *   <li>Publications to the new segment will use its hierarchical filter</li>
+     * </ul>
+     *
+     * <p><strong>Usage Example:</strong></p>
+     * <pre>{@code
+     * // During rolling replacement:
+     * long newSegmentId = segmentCatalog.create(sourceId, volumePath).getSegmentId();
+     * DocumentBatchPublisher segmentPublisher = basePublisher.withTargetSegment(newSegmentId);
+     * // All publications via segmentPublisher go to newSegmentId
+     * }</pre>
+     *
+     * @param targetSegmentId The segment ID to bind publications to
+     * @return A new DocumentBatchPublisher bound to the target segment
+     * @throws IllegalArgumentException if targetSegmentId is negative
+     */
+    public DocumentBatchPublisher withTargetSegment(long targetSegmentId) {
+        if (targetSegmentId < 0) {
+            throw new IllegalArgumentException("targetSegmentId must be non-negative: " + targetSegmentId);
+        }
+
+        String newSegmentId = String.valueOf(targetSegmentId);
+
+        // Create a new publisher with the same configuration but different segment ID
+        // Use the appropriate constructor based on whether hierarchical filter is configured
+        if (this.hierarchicalFilter != null) {
+            // Use hierarchical filter constructor with orchestrator
+            return new DocumentBatchPublisher(
+                this.visibilityTracker,
+                this.documentRegistry,
+                this.visibilityRegistry,
+                this.hierarchicalFilter,
+                newSegmentId,
+                this.writeLogAdapter,
+                this.publicationLock,
+                this.orchestrator
+            );
+        } else {
+            // Use cuckoo filter constructor with optional orchestrator and LSH
+            return new DocumentBatchPublisher(
+                this.visibilityTracker,
+                this.documentRegistry,
+                this.visibilityRegistry,
+                this.cuckooFilter,
+                this.writeLogAdapter,
+                this.publicationLock,
+                this.orchestrator,
+                this.lshIngestionService,
+                this.segmentProvider
+            );
+        }
+    }
+
+    /**
      * Publishes a document batch atomically to the visibility epoch.
      *
      * <p>This method ensures that all chunks in the buffer become visible

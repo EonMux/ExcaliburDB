@@ -14,10 +14,13 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Random;
@@ -869,7 +872,7 @@ public class HnswGraph implements AutoCloseable {
                 }
 
                 float dist = computeDistance(query, neighbor.vector());
-                HnswSearchResult result = new HnswSearchResult(neighborId, dist);
+                HnswSearchResult result = createSearchResult(neighborId, dist);
 
                 // Add to candidates if closer than furthest result, or if results not full
                 if (results.size() < ef || dist < results.peek().distance()) {
@@ -988,7 +991,7 @@ public class HnswGraph implements AutoCloseable {
                 }
 
                 float dist = computeDistance(query, neighbor.vector());
-                HnswSearchResult result = new HnswSearchResult(neighborId, dist);
+                HnswSearchResult result = createSearchResult(neighborId, dist);
 
                 // Add to candidates if closer than furthest result, or if results not full
                 if (results.size() < ef || dist < results.peek().distance()) {
@@ -1684,6 +1687,252 @@ public class HnswGraph implements AutoCloseable {
     public long activeNodeCount() {
         validateNotClosed();
         return nodeCount - tombstoneCount();
+    }
+
+    // ==================== Public API - Compaction ====================
+
+    /**
+     * Compacts the graph by removing tombstoned nodes and re-optimizing edges.
+     *
+     * <p>This method performs the following operations:</p>
+     * <ol>
+     *   <li>Creates a new graph file with only active (non-tombstoned) nodes</li>
+     *   <li>Rebuilds adjacency lists to exclude tombstoned neighbors</li>
+     *   <li>Atomically swaps the old graph file for the new one</li>
+     *   <li>Reclaims disk space from the old file</li>
+     * </ol>
+     *
+     * <p><strong>Thread Safety:</strong> This method acquires a write lock and
+     * blocks both reads and writes during compaction. For non-blocking compaction,
+     * use {@link #compactTo(Path)} to create a compacted copy.</p>
+     *
+     * <h3>Domain Constraints</h3>
+     * <ul>
+     *   <li>Compaction is only performed when tombstones exist</li>
+     *   <li>Document ID mappings are preserved across compaction</li>
+     *   <li>PQ codes are re-encoded for active nodes if PQ is enabled</li>
+     *   <li>Entry point is updated to the highest-level active node</li>
+     * </ul>
+     *
+     * @param tempDir Directory for temporary files during compaction
+     * @return The number of tombstoned nodes removed
+     * @throws IOException if compaction fails
+     * @throws IllegalStateException if graph is closed
+     */
+    public long compact(Path tempDir) throws IOException {
+        validateNotClosed();
+        Objects.requireNonNull(tempDir, "tempDir cannot be null");
+
+        lock.writeLock().lock();
+        try {
+            long removed = tombstoneCount();
+            if (removed == 0) {
+                LOGGER.debug("No tombstoned nodes to compact");
+                return 0; // Nothing to compact
+            }
+
+            // Create temporary graph file
+            Path compactPath = tempDir.resolve(path.getFileName() + ".compact");
+            Files.deleteIfExists(compactPath);
+
+            LOGGER.info("Starting HNSW compaction: {} tombstoned nodes to remove", removed);
+
+            // Store the current node-document mapping before closing
+            NodeDocumentMapping oldMapping = this.nodeDocumentMapping;
+            ProductQuantizer oldPq = this.pq;
+            java.util.concurrent.ConcurrentHashMap<Long, byte[]> oldPqCodes = this.pqCodes;
+
+            // Create new graph with same configuration
+            try (HnswGraph compacted = new HnswGraph(compactPath, config, distanceFunction, maxNodes)) {
+                // Copy node-to-document mapping
+                if (oldMapping != null) {
+                    compacted.setNodeDocumentMapping(oldMapping);
+                }
+
+                // Copy PQ if enabled
+                if (oldPq != null) {
+                    compacted.setProductQuantizer(oldPq);
+                }
+
+                // Re-insert all active nodes with their original vectors
+                Map<Long, Long> oldToNewId = new java.util.HashMap<>();
+                for (long oldNodeId = 0; oldNodeId < nodeCount; oldNodeId++) {
+                    if (isTombstoned(oldNodeId)) {
+                        continue;
+                    }
+
+                    NodeView node = readNode(oldNodeId);
+                    if (node == null) continue;
+
+                    float[] vector = node.vector();
+                    long newNodeId = compacted.insert(vector);
+                    oldToNewId.put(oldNodeId, newNodeId);
+
+                    // Transfer document ID mapping
+                    String docId = getDocumentId(oldNodeId);
+                    if (docId != null) {
+                        compacted.registerDocumentId(newNodeId, docId);
+                    }
+                }
+
+                // Copy PQ codes if enabled - re-encode with new node IDs
+                if (oldPq != null && oldPqCodes != null) {
+                    for (Map.Entry<Long, Long> entry : oldToNewId.entrySet()) {
+                        byte[] codes = oldPqCodes.get(entry.getKey());
+                        if (codes != null) {
+                            // Get the vector from the new graph and encode
+                            NodeView newNode = compacted.readNode(entry.getValue());
+                            if (newNode != null) {
+                                compacted.encodeAndStorePQCode(entry.getValue(), newNode.vector());
+                            }
+                        }
+                    }
+                }
+
+                compacted.flush();
+            }
+
+            // Store path before closing
+            Path originalPath = this.path;
+
+            // Close current graph
+            this.closed = true;
+            if (mappedFile != null) {
+                try {
+                    mappedFile.flush();
+                    mappedFile.close();
+                } catch (Exception e) {
+                    LOGGER.warn("Error closing mapped file during compaction: {}", e.getMessage());
+                }
+            }
+            if (arena != null) {
+                try {
+                    arena.close();
+                } catch (Exception e) {
+                    LOGGER.warn("Error closing arena during compaction: {}", e.getMessage());
+                }
+            }
+
+            // Atomic swap: rename compact to original
+            Files.move(compactPath, originalPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+
+            // Reopen the compacted graph
+            reopenAfterCompaction(originalPath);
+
+            LOGGER.info("Compacted HNSW graph: removed {} tombstoned nodes", removed);
+            return removed;
+
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Creates a compacted copy of the graph at the specified path.
+     *
+     * <p>This method does not block reads or writes to the current graph,
+     * making it suitable for creating backup copies or performing online
+     * compaction with minimal disruption.</p>
+     *
+     * <h3>Domain Constraints</h3>
+     * <ul>
+     *   <li>Destination path must not exist or will be overwritten</li>
+     *   <li>Only active (non-tombstoned) nodes are copied</li>
+     *   <li>Document ID mappings are NOT copied (use getNodeDocumentMapping() separately)</li>
+     * </ul>
+     *
+     * @param destPath Destination path for the compacted graph
+     * @return The number of tombstoned nodes that were skipped
+     * @throws IOException if compaction fails
+     * @throws IllegalStateException if graph is closed
+     */
+    public long compactTo(Path destPath) throws IOException {
+        validateNotClosed();
+        Objects.requireNonNull(destPath, "destPath cannot be null");
+
+        lock.readLock().lock();
+        try {
+            long skipped = tombstoneCount();
+
+            LOGGER.info("Creating compacted HNSW copy at {}: {} tombstoned nodes to skip", destPath, skipped);
+
+            // Delete existing file if present
+            Files.deleteIfExists(destPath);
+
+            try (HnswGraph compacted = new HnswGraph(destPath, config, distanceFunction, maxNodes)) {
+                // Copy all active nodes
+                for (long nodeId = 0; nodeId < nodeCount; nodeId++) {
+                    if (isTombstoned(nodeId)) {
+                        continue;
+                    }
+
+                    NodeView node = readNode(nodeId);
+                    if (node == null) continue;
+
+                    compacted.insert(node.vector());
+                }
+                compacted.flush();
+            }
+
+            LOGGER.info("Created compacted HNSW copy at {}: skipped {} tombstoned nodes", destPath, skipped);
+            return skipped;
+
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Reopens the graph after compaction.
+     *
+     * <p>This method reinitializes all internal state after the graph file
+     * has been replaced by a compacted version.</p>
+     *
+     * @param graphPath The path to the graph file
+     * @throws IOException if reopening fails
+     */
+    private void reopenAfterCompaction(Path graphPath) throws IOException {
+        // Create new arena
+        this.arena = Arena.ofShared();
+        this.path = graphPath;
+
+        // Reinitialize the mapped file - open existing file
+        this.mappedFile = MappedFile.open(graphPath);
+
+        // Read header to restore state
+        long magic = mappedFile.readLong(OFFSET_MAGIC);
+        if (magic != MAGIC) {
+            throw new IOException("Invalid HNSW graph file after compaction: bad magic number");
+        }
+
+        int version = mappedFile.readInt(OFFSET_VERSION);
+        if (version != VERSION) {
+            throw new IOException("Unsupported HNSW graph version after compaction: " + version);
+        }
+
+        int dimension = mappedFile.readInt(OFFSET_DIMENSION);
+        this.nodeCount = mappedFile.readLong(OFFSET_NODE_COUNT);
+        this.entryPointId = mappedFile.readLong(OFFSET_ENTRY_POINT);
+        this.maxLevel = mappedFile.readInt(OFFSET_MAX_LEVEL);
+        this.lastIntegratedOffset.set(mappedFile.readLong(OFFSET_LAST_INTEGRATED));
+
+        // Restore config (dimension might have been validated)
+        if (dimension != config.dimension()) {
+            throw new IOException("Dimension mismatch after compaction: expected " + config.dimension() + ", got " + dimension);
+        }
+
+        // Calculate data region offset
+        this.dataRegionOffset = HEADER_SIZE + (maxNodes * NODE_INDEX_ENTRY_SIZE);
+        this.dataWriteOffset = 0; // Will be recalculated if needed
+
+        // Update nodeIdGenerator to reflect existing nodes
+        this.nodeIdGenerator.set(nodeCount);
+
+        // Mark as open
+        this.closed = false;
+
+        LOGGER.debug("Reopened compacted HNSW graph: {} nodes, entryPoint={}, maxLevel={}",
+            nodeCount, entryPointId, maxLevel);
     }
 
     // ==================== Public API - Tail Offset Tracking ====================
@@ -2633,7 +2882,7 @@ public class HnswGraph implements AutoCloseable {
         }
 
         float entryDist = computeDistanceWithPQ(query, entry, distanceTable);
-        HnswSearchResult entryResult = new HnswSearchResult(entry.nodeId(), entryDist);
+        HnswSearchResult entryResult = createSearchResult(entry.nodeId(), entryDist);
         candidates.add(entryResult);
         results.add(entryResult);
         visited.add(entry.nodeId());
@@ -2664,7 +2913,7 @@ public class HnswGraph implements AutoCloseable {
                 }
 
                 float dist = computeDistanceWithPQ(query, neighbor, distanceTable);
-                HnswSearchResult result = new HnswSearchResult(neighborId, dist);
+                HnswSearchResult result = createSearchResult(neighborId, dist);
 
                 if (results.size() < ef || dist < results.peek().distance()) {
                     candidates.add(result);

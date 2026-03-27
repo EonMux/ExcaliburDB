@@ -6,6 +6,7 @@ import excalibur.ingest.pipeline.IngestionOrchestrator;
 import excalibur.ingest.source.FilesystemSource;
 import excalibur.ingest.source.HttpSource;
 import excalibur.ingest.source.Source;
+import excalibur.shard.worker.SegmentReindexScheduler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -527,11 +528,17 @@ public class IngestEndpoint implements HttpHandler {
      * <p>When an IngestionStatusRegistry is configured via
      * {@link #setStatusRegistry(IngestStatusEndpoint.IngestionStatusRegistry)},
      * status entries are automatically created when sources are registered.</p>
+     *
+     * <p>When a SegmentReindexScheduler is configured via
+     * {@link #setReindexScheduler(SegmentReindexScheduler, long)}, sources
+     * are automatically registered for periodic reindexing.</p>
      */
     public static class InMemorySourceRegistry implements SourceRegistry {
         private final ConcurrentHashMap<String, Source> sources = new ConcurrentHashMap<>();
         private volatile IngestionOrchestrator ingestionOrchestrator;
         private volatile IngestStatusEndpoint.IngestionStatusRegistry statusRegistry;
+        private volatile SegmentReindexScheduler reindexScheduler;
+        private volatile long reindexIntervalMs = SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
 
         /**
          * Sets the ingestion orchestrator for background processing.
@@ -554,6 +561,41 @@ public class IngestEndpoint implements HttpHandler {
             this.statusRegistry = statusRegistry;
         }
 
+        /**
+         * Sets the reindex scheduler for periodic source reindexing.
+         *
+         * <p>When set, sources registered via {@link #register(Source)} will
+         * be automatically registered with the scheduler for periodic reindexing.
+         * The scheduler will trigger reindex operations at the configured interval.</p>
+         *
+         * <h3>Domain Correctness</h3>
+         * <ul>
+         *   <li>Source IDs must be parseable as long integers for scheduler registration</li>
+         *   <li>Non-numeric source IDs will be logged as warnings but won't fail registration</li>
+         *   <li>The interval must be within scheduler's valid range (1 min to 24 hours)</li>
+         * </ul>
+         *
+         * @param scheduler The reindex scheduler (may be null to disable scheduled reindexing)
+         * @param reindexIntervalMs The reindex interval in milliseconds
+         */
+        public void setReindexScheduler(SegmentReindexScheduler scheduler, long reindexIntervalMs) {
+            this.reindexScheduler = scheduler;
+            this.reindexIntervalMs = reindexIntervalMs;
+        }
+
+        /**
+         * Sets the reindex scheduler with default interval.
+         *
+         * <p>This is a convenience overload that uses the scheduler's default reindex interval.</p>
+         *
+         * @param scheduler The reindex scheduler (may be null to disable scheduled reindexing)
+         */
+        public void setReindexScheduler(SegmentReindexScheduler scheduler) {
+            this.reindexScheduler = scheduler;
+            this.reindexIntervalMs = scheduler != null ? scheduler.getDefaultReindexIntervalMs() :
+                SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
+        }
+
         @Override
         public void register(Source source) {
             Objects.requireNonNull(source, "Source cannot be null");
@@ -567,6 +609,17 @@ public class IngestEndpoint implements HttpHandler {
                 // Initialize with idle state, will be updated by orchestrator if present
                 status.update("idle", 0.0, 0, 0);
                 LOGGER.debug("Created initial status entry for source: {}", sourceId);
+            }
+
+            // Register with reindex scheduler for periodic reindexing
+            if (reindexScheduler != null) {
+                try {
+                    long numericSourceId = Long.parseLong(sourceId);
+                    reindexScheduler.registerSource(numericSourceId, reindexIntervalMs);
+                    LOGGER.debug("Registered source {} with reindex scheduler (interval={}ms)", sourceId, reindexIntervalMs);
+                } catch (NumberFormatException e) {
+                    LOGGER.warn("Source ID '{}' is not numeric, cannot register with reindex scheduler", sourceId);
+                }
             }
 
             // Trigger background ingestion

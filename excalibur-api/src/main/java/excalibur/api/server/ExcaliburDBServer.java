@@ -5,11 +5,14 @@ import com.sun.net.httpserver.HttpHandler;
 import excalibur.api.endpoint.HealthEndpoint;
 import excalibur.api.endpoint.StatsEndpoint;
 import excalibur.api.endpoint.QueryEndpoint;
+import excalibur.api.endpoint.QueryCancelEndpoint;
 import excalibur.api.endpoint.IngestEndpoint;
 import excalibur.api.endpoint.ReindexEndpoint;
 import excalibur.api.endpoint.IngestStatusEndpoint;
+import excalibur.query.executor.QueryRegistry;
 import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
+import excalibur.ingest.lsh.LshIngestionService;
 import excalibur.ingest.registry.DocumentRegistry;
 import excalibur.shard.ReindexOperationHandler;
 import excalibur.ingest.processor.TextChunker;
@@ -18,9 +21,11 @@ import excalibur.ingest.source.SourceResolver;
 import excalibur.ingest.visibility.DocumentVisibilityChecker;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
+import excalibur.ingest.processor.TermFrequencyTracker;
 import excalibur.query.pipeline.QueryPipeline;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
+import excalibur.shard.worker.SegmentReindexScheduler;
 import io.excalibur.vector.hnsw.HnswConfigFactory;
 import io.excalibur.config.Config;
 import io.excalibur.config.ConfigLoader;
@@ -108,6 +113,9 @@ public class ExcaliburDBServer {
     private final IngestEndpoint.SourceRegistry ingestSourceRegistry;
     private final ReindexEndpoint.ReindexStatusRegistry reindexStatusRegistry;
     private final IngestStatusEndpoint.IngestionStatusRegistry ingestionStatusRegistry;
+
+    // Query registry for cancellation support
+    private final QueryRegistry queryRegistry;
 
     // Optional reindexing components (may be null for stub mode)
     private DocumentReindexer documentReindexer;
@@ -248,6 +256,9 @@ public class ExcaliburDBServer {
         this.ingestSourceRegistry = new IngestEndpoint.InMemorySourceRegistry();
         this.reindexStatusRegistry = new ReindexEndpoint.InMemoryReindexStatusRegistry();
         this.ingestionStatusRegistry = new IngestStatusEndpoint.InMemoryIngestionStatusRegistry();
+
+        // Initialize query registry for cancellation support
+        this.queryRegistry = new QueryRegistry();
 
         // Initialize HNSW config factory from Config.Shard if available
         this.hnswConfigFactory = config != null
@@ -714,6 +725,10 @@ public class ExcaliburDBServer {
         // This ensures queries never see partially-ingested documents
         this.documentVisibilityTracker = new DocumentVisibilityTracker(new DocumentRegistry());
 
+        // Create term frequency tracker for selectivity estimation
+        // This enables query optimization by tracking term frequencies in segment sketches
+        TermFrequencyTracker termFrequencyTracker = new TermFrequencyTracker();
+
         // Create the ingestion orchestrator with status registry adapter and visibility tracker
         this.ingestionOrchestrator = new IngestionOrchestrator(
             textChunker,
@@ -742,6 +757,7 @@ public class ExcaliburDBServer {
             null,  // lshIngestionService - not configured here
             null,  // documentChunkBuffer - not configured here
             documentVisibilityTracker,  // Wire visibility tracker for document atomicity
+            termFrequencyTracker,  // Term frequency tracker for selectivity estimation
             documentTimeoutMs
         );
 
@@ -754,7 +770,7 @@ public class ExcaliburDBServer {
             LOGGER.info("Query pipeline wired with document visibility checker for atomicity filtering");
         }
 
-        LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, documentTimeoutMs={}ms, documentAtomicity=enabled",
+        LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity=enabled",
             documentTimeoutMs);
     }
 
@@ -795,6 +811,10 @@ public class ExcaliburDBServer {
             ? config.ingest().getDocumentTimeoutMs()
             : IngestionOrchestrator.DEFAULT_DOCUMENT_TIMEOUT_MS;
 
+        // Create term frequency tracker for selectivity estimation
+        // This enables query optimization by tracking term frequencies in segment sketches
+        TermFrequencyTracker termFrequencyTracker = new TermFrequencyTracker();
+
         // Create the ingestion orchestrator with status registry adapter and visibility tracker
         this.ingestionOrchestrator = new IngestionOrchestrator(
             textChunker,
@@ -823,6 +843,7 @@ public class ExcaliburDBServer {
             null,  // lshIngestionService - not configured here
             null,  // documentChunkBuffer - not configured here
             visibilityTracker,  // Use provided visibility tracker (may be null)
+            termFrequencyTracker,  // Term frequency tracker for selectivity estimation
             documentTimeoutMs
         );
 
@@ -834,7 +855,99 @@ public class ExcaliburDBServer {
             LOGGER.info("Query pipeline wired with shared document visibility checker for atomicity filtering");
         }
 
-        LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, documentTimeoutMs={}ms, documentAtomicity={}",
+        LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity={}",
+            documentTimeoutMs, visibilityTracker != null ? "enabled" : "disabled");
+    }
+
+    /**
+     * Configures the ingestion pipeline with LSH support for approximate nearest neighbor pre-filtering.
+     *
+     * <p>This overload creates the full ingestion pipeline with LSH index population during document
+     * ingestion. Vectors inserted into segments are also indexed in the segment's LSH index for
+     * efficient Stage 2 pre-filtering during queries.</p>
+     *
+     * <h3>LSH Integration</h3>
+     * <p>When LSH is configured:</p>
+     * <ul>
+     *   <li>Every vector written to a segment is also inserted into its LSH index</li>
+     *   <li>Query Stage 2 (LSH pre-filter) can efficiently prune candidates</li>
+     *   <li>Tombstones are removed from LSH indices during deletion propagation</li>
+     * </ul>
+     *
+     * <h3>Thread Safety</h3>
+     * <p>This method is NOT thread-safe and should only be called during initialization,
+     * before starting the server.</p>
+     *
+     * @param textChunker The text chunker for splitting documents into chunks
+     * @param embeddingClient The embedding client for generating embeddings
+     * @param lshIngestionService The LSH ingestion service for vector indexing (may be null to disable LSH)
+     * @param visibilityTracker The document visibility tracker for atomic visibility (may be null)
+     * @throws IllegalStateException if the server is already running
+     * @throws NullPointerException if textChunker or embeddingClient is null
+     */
+    public void withIngestionPipeline(TextChunker textChunker, EmbeddingClient embeddingClient,
+                                      LshIngestionService lshIngestionService,
+                                      DocumentVisibilityTracker visibilityTracker) {
+        if (running.get()) {
+            throw new IllegalStateException("Cannot configure ingestion pipeline after server has started");
+        }
+        Objects.requireNonNull(textChunker, "TextChunker cannot be null");
+        Objects.requireNonNull(embeddingClient, "EmbeddingClient cannot be null");
+
+        this.textChunker = textChunker;
+        this.embeddingClient = embeddingClient;
+        this.documentVisibilityTracker = visibilityTracker;
+
+        // Read document timeout from config, defaulting to 2000ms if not configured
+        int documentTimeoutMs = config != null
+            ? config.ingest().getDocumentTimeoutMs()
+            : IngestionOrchestrator.DEFAULT_DOCUMENT_TIMEOUT_MS;
+
+        // Create term frequency tracker for selectivity estimation
+        // This enables query optimization by tracking term frequencies in segment sketches
+        TermFrequencyTracker termFrequencyTracker = new TermFrequencyTracker();
+
+        // Create the ingestion orchestrator with LSH support
+        this.ingestionOrchestrator = new IngestionOrchestrator(
+            textChunker,
+            embeddingClient,
+            storageEngine,
+            indexOrchestrator,
+            new IngestionOrchestrator.StatusRegistry() {
+                @Override
+                public IngestionOrchestrator.IngestionStatus getOrCreate(String sourceId) {
+                    final IngestStatusEndpoint.IngestionStatus delegate =
+                        ingestionStatusRegistry.getOrCreate(sourceId);
+                    return new IngestionOrchestrator.IngestionStatus() {
+                        @Override
+                        public void update(String state, double progress,
+                                           long entriesIngested, long entriesPending) {
+                            delegate.update(state, progress, entriesIngested, entriesPending);
+                        }
+
+                        @Override
+                        public void setError(String error) {
+                            delegate.setError(error);
+                        }
+                    };
+                }
+            },
+            lshIngestionService,  // Pass LSH ingestion service for vector indexing
+            null,  // documentChunkBuffer - not configured here
+            visibilityTracker,
+            termFrequencyTracker,  // Term frequency tracker for selectivity estimation
+            documentTimeoutMs
+        );
+
+        // Wire the visibility tracker to the query pipeline for atomicity filtering
+        if (visibilityTracker != null && this.queryPipeline.getVisibilityChecker() == null) {
+            this.queryPipeline = queryPipeline.withVisibilityChecker(
+                new DocumentVisibilityTrackerAdapter(visibilityTracker)
+            );
+            LOGGER.info("Query pipeline wired with shared document visibility checker for atomicity filtering");
+        }
+
+        LOGGER.info("Ingestion pipeline configured with LSH support: TextChunker, EmbeddingClient, LshIngestionService, TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity={}",
             documentTimeoutMs, visibilityTracker != null ? "enabled" : "disabled");
     }
 
@@ -871,12 +984,13 @@ public class ExcaliburDBServer {
 
         LOGGER.info("ExcaliburDB API server started successfully on port {}", port);
         LOGGER.info("Endpoints available:");
-        LOGGER.info("  GET  /health           - Health check");
-        LOGGER.info("  GET  /v1/stats         - System statistics");
-        LOGGER.info("  POST /v1/query         - Query execution");
-        LOGGER.info("  POST /v1/ingest        - Register ingestion source");
-        LOGGER.info("  POST /v1/reindex       - Force reindex");
-        LOGGER.info("  GET  /v1/ingest/status - Ingestion status");
+        LOGGER.info("  GET    /health           - Health check");
+        LOGGER.info("  GET    /v1/stats         - System statistics");
+        LOGGER.info("  POST   /v1/query         - Query execution");
+        LOGGER.info("  DELETE /v1/query/{id}    - Cancel in-progress query");
+        LOGGER.info("  POST   /v1/ingest        - Register ingestion source");
+        LOGGER.info("  POST   /v1/reindex       - Force reindex");
+        LOGGER.info("  GET    /v1/ingest/status - Ingestion status");
     }
 
     /**
@@ -1011,8 +1125,13 @@ public class ExcaliburDBServer {
             indexOrchestrator, readinessThreshold, healthyThreshold, maxLatencyMs);
         StatsEndpoint statsEndpoint = new StatsEndpoint(indexOrchestrator, storageEngine, volumeManager);
 
-        // QueryEndpoint - pass config for include_partial_segments default
-        QueryEndpoint queryEndpoint = new QueryEndpoint(queryPipeline, config);
+        // QueryEndpoint - pass config for include_partial_segments default and queryRegistry for cancellation
+        QueryEndpoint queryEndpoint = new QueryEndpoint(queryPipeline, config, null, queryRegistry);
+
+        // QueryCancelEndpoint for user-initiated query cancellation
+        // Note: This endpoint is registered at the same path as QueryEndpoint
+        // and handles DELETE requests while QueryEndpoint handles POST
+        QueryCancelEndpoint queryCancelEndpoint = new QueryCancelEndpoint(queryRegistry);
 
         // Ingestion endpoints - pass both status registry and orchestrator
         // This ensures status entries are created when sources are registered,
@@ -1024,6 +1143,22 @@ public class ExcaliburDBServer {
         );
         LOGGER.info("IngestEndpoint configured with status registry (orchestrator: {})",
             ingestionOrchestrator != null ? "enabled" : "disabled (stub mode)");
+
+        // Wire the reindex scheduler to the ingest source registry for periodic reindexing
+        // When sources are registered via /v1/ingest, they will be automatically
+        // registered with the scheduler for periodic reindexing at the configured interval
+        if (ingestSourceRegistry instanceof IngestEndpoint.InMemorySourceRegistry) {
+            IngestEndpoint.InMemorySourceRegistry inMemRegistry =
+                (IngestEndpoint.InMemorySourceRegistry) ingestSourceRegistry;
+            long reindexIntervalMs = config != null
+                ? config.ingest().getReindexIntervalMs()
+                : SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
+            inMemRegistry.setReindexScheduler(
+                indexOrchestrator.getReindexScheduler(),
+                reindexIntervalMs
+            );
+            LOGGER.info("IngestSourceRegistry wired to ReindexScheduler with interval={}ms", reindexIntervalMs);
+        }
 
         // Create ReindexEndpoint with shared source registry for consistency
         // If documentReindexer is configured, actual reindexing will occur
@@ -1059,14 +1194,15 @@ public class ExcaliburDBServer {
         // Register endpoints
         server.createContext("/health", wrapHandler(healthEndpoint));
         server.createContext("/v1/stats", wrapHandler(statsEndpoint));
-        server.createContext("/v1/query", wrapHandler(queryEndpoint));
+        // Create a composite handler for /v1/query that routes based on HTTP method
+        server.createContext("/v1/query", createQueryMethodRouter(queryEndpoint, queryCancelEndpoint));
         server.createContext("/v1/ingest", wrapHandler(ingestEndpoint));
         server.createContext("/v1/reindex", wrapHandler(reindexEndpoint));
         server.createContext("/v1/ingest/status", wrapHandler(ingestStatusEndpoint));
 
         server.createContext("/", this::handleNotFound);
 
-        LOGGER.debug("Registered endpoints: /health, /v1/stats, /v1/query, /v1/ingest, /v1/reindex, /v1/ingest/status");
+        LOGGER.debug("Registered endpoints: /health, /v1/stats, /v1/query (POST=query, DELETE=cancel), /v1/ingest, /v1/reindex, /v1/ingest/status");
     }
 
     /**
@@ -1106,10 +1242,58 @@ public class ExcaliburDBServer {
             long start = System.currentTimeMillis();
 
             try {
-                LOGGER.debug("Request: {} {} from {}", method, path, 
+                LOGGER.debug("Request: {} {} from {}", method, path,
                     exchange.getRemoteAddress().getAddress().getHostAddress());
 
                 handler.handle(exchange);
+
+                long duration = System.currentTimeMillis() - start;
+                LOGGER.debug("Response: {} {} - {}ms", method, path, duration);
+            } catch (Exception e) {
+                long duration = System.currentTimeMillis() - start;
+                LOGGER.error("Error handling {} {}: {} ({}ms)", method, path, e.getMessage(), duration, e);
+
+                if (!exchange.getResponseHeaders().containsKey("Content-Type")) {
+                    sendError(exchange, 500, "Internal Server Error");
+                }
+            } finally {
+                exchange.close();
+            }
+        };
+    }
+
+    /**
+     * Creates a method-based router for /v1/query endpoint.
+     *
+     * <p>Routes requests based on HTTP method:</p>
+     * <ul>
+     *   <li>POST - Query execution (delegates to QueryEndpoint)</li>
+     *   <li>DELETE - Query cancellation (delegates to QueryCancelEndpoint)</li>
+     * </ul>
+     *
+     * @param queryEndpoint The handler for POST requests
+     * @param cancelEndpoint The handler for DELETE requests
+     * @return A composite handler that routes based on HTTP method
+     */
+    private HttpHandler createQueryMethodRouter(HttpHandler queryEndpoint, HttpHandler cancelEndpoint) {
+        return exchange -> {
+            String method = exchange.getRequestMethod();
+            String path = exchange.getRequestURI().getPath();
+            long start = System.currentTimeMillis();
+
+            try {
+                LOGGER.debug("Request: {} {} from {}", method, path,
+                    exchange.getRemoteAddress().getAddress().getHostAddress());
+
+                // Route based on method
+                if ("POST".equalsIgnoreCase(method)) {
+                    queryEndpoint.handle(exchange);
+                } else if ("DELETE".equalsIgnoreCase(method)) {
+                    cancelEndpoint.handle(exchange);
+                } else {
+                    // Return method not allowed for other methods
+                    sendError(exchange, 405, "Method Not Allowed - Use POST for queries or DELETE for cancellation");
+                }
 
                 long duration = System.currentTimeMillis() - start;
                 LOGGER.debug("Response: {} {} - {}ms", method, path, duration);

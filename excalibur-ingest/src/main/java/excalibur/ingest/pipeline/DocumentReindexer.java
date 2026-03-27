@@ -15,6 +15,7 @@ import io.excalibur.llm.LLMException;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.SegmentLifecycleManager;
+import io.excalibur.store.VisibilityTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -343,8 +344,14 @@ public class DocumentReindexer {
             segmentCatalog.beginIndexing(newSegmentId);
             LOG.info("Segment {} transitioned from BOOTSTRAPPING to INDEXING", newSegmentId);
 
-            // Step 4: Perform the actual reindexing
-            ReindexResult reindexResult = reindexAll(source);
+            // Step 4: Create segment-targeted writers for the new segment
+            // This is CRITICAL: all reindexed data must go to the NEW segment, not the old one
+            OffsetAwareStorageWriter segmentWriter = offsetAwareWriter.forSegment(newSegmentId);
+            DocumentBatchPublisher segmentPublisher = batchPublisher.withTargetSegment(newSegmentId);
+            LOG.info("Created segment-targeted writers for segment {}", newSegmentId);
+
+            // Step 5: Perform the actual reindexing with segment-targeted writers
+            ReindexResult reindexResult = reindexAllWithSegmentWriter(source, segmentWriter, segmentPublisher);
 
             if (reindexResult.hasErrors() && reindexResult.getDocumentsIndexed() == 0) {
                 // Complete failure - mark segment for cleanup
@@ -353,14 +360,15 @@ public class DocumentReindexer {
                 return new RollingReindexResult(reindexResult, newSegmentId, List.of());
             }
 
-            // Step 5: Transition new segment through WARMING → ACTIVE
+            // Step 6: Transition new segment to WARMING state
+            // WarmingPhaseWorker will handle PQ training and the WARMING → ACTIVE transition asynchronously
             segmentCatalog.completeIndexing(newSegmentId);
-            LOG.info("Segment {} transitioned from INDEXING to WARMING", newSegmentId);
+            LOG.info("Segment {} transitioned from INDEXING to WARMING, awaiting PQ training by WarmingPhaseWorker", newSegmentId);
 
-            segmentCatalog.completeWarmup(newSegmentId);
-            LOG.info("Segment {} transitioned from WARMING to ACTIVE", newSegmentId);
+            // Note: completeWarmup() is called by WarmingPhaseWorker after PQ training completes
+            // This ensures PQ codebooks are trained before the segment becomes ACTIVE
 
-            // Step 6: Tombstone old segments for this source
+            // Step 7: Tombstone old segments for this source
             List<Long> tombstonedSegments = new ArrayList<>();
             long currentEpoch = visibilityTracker.currentEpoch();
 
@@ -374,7 +382,7 @@ public class DocumentReindexer {
                 }
             }
 
-            // Step 7: Advance epoch to make changes visible
+            // Step 8: Advance epoch to make changes visible
             visibilityTracker.advanceEpoch();
 
             long elapsed = System.currentTimeMillis() - startTime;
@@ -545,10 +553,230 @@ public class DocumentReindexer {
         }
         
         ReindexResult result = resultBuilder.build();
-        LOG.info("Re-index complete for {}: {} docs indexed, {} chunks created, {} errors", 
+        LOG.info("Re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
                 sourceId, result.getDocumentsIndexed(), result.getChunksCreated(), result.getErrorCount());
-        
+
         return result;
+    }
+
+    /**
+     * Re-indexes all changed and new documents from a source using segment-targeted writers.
+     *
+     * <p>This method is used during rolling replacement reindexing to ensure all
+     * reindexed data is written to the newly created segment. The segment-targeted
+     * writers route all writes to the specified segment instead of the default
+     * location.</p>
+     *
+     * <p><strong>Domain Correctness:</strong></p>
+     * <ul>
+     *   <li>All chunks are written to the target segment specified by the writer</li>
+     *   <li>Cuckoo filter insertions are scoped to the target segment</li>
+     *   <li>Document metadata correctly tracks the segment association</li>
+     *   <li>Visibility epoch advances after all documents are indexed</li>
+     * </ul>
+     *
+     * @param source The source to re-index
+     * @param segmentWriter Storage writer bound to the target segment
+     * @param segmentPublisher Publisher bound to the target segment
+     * @return Result containing counts and any errors
+     * @throws SourceException if crawling or fetching fails catastrophically
+     * @throws NullPointerException if any parameter is null
+     */
+    public ReindexResult reindexAllWithSegmentWriter(
+            Source source,
+            OffsetAwareStorageWriter segmentWriter,
+            DocumentBatchPublisher segmentPublisher) throws SourceException {
+
+        Objects.requireNonNull(source, "source must not be null");
+        Objects.requireNonNull(segmentWriter, "segmentWriter must not be null");
+        Objects.requireNonNull(segmentPublisher, "segmentPublisher must not be null");
+
+        String sourceId = source.getSourceId();
+        LOG.info("Starting segment-targeted re-index for source: {}", sourceId);
+
+        ChangeDetector detector = new ChangeDetector(registry);
+        ChangeSet changeSet = detector.detectChanges(source);
+
+        LOG.info("Change detection complete for {}: new={}, changed={}, deleted={}",
+                sourceId, changeSet.getNewCount(), changeSet.getChangedCount(),
+                changeSet.getDeletedCount());
+
+        ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId);
+
+        UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processChanges(changeSet);
+        resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
+        resultBuilder.chunksTombstoned(tombstoneResult.getChunksTombstoned());
+        tombstoneResult.getErrors().forEach(error ->
+            resultBuilder.addError("tombstone", error.getChunkId(), error.getMessage()));
+
+        // Index new documents using segment-targeted writers
+        for (String newDocId : changeSet.getNewDocuments()) {
+            try {
+                FetchedDocument fetched = source.fetch(newDocId);
+                DocumentResult docResult = reindexDocumentWithSegmentWriter(
+                    sourceId, newDocId, fetched, segmentWriter, segmentPublisher);
+                resultBuilder.addDocumentResult(docResult);
+            } catch (SourceException e) {
+                String msg = "Failed to fetch new document " + newDocId + ": " + e.getMessage();
+                LOG.error(msg, e);
+                resultBuilder.addError("fetch", newDocId, msg);
+            } catch (Exception e) {
+                String msg = "Failed to re-index new document " + newDocId + ": " + e.getMessage();
+                LOG.error(msg, e);
+                resultBuilder.addError("reindex", newDocId, msg);
+            }
+        }
+
+        // Index changed documents using segment-targeted writers
+        for (ChangeSet.ChangedDocument changed : changeSet.getChangedDocuments()) {
+            try {
+                FetchedDocument fetched = source.fetch(changed.getDocumentId());
+                DocumentResult docResult = reindexDocumentWithSegmentWriter(
+                    sourceId, changed.getDocumentId(), fetched, segmentWriter, segmentPublisher);
+                resultBuilder.addDocumentResult(docResult);
+            } catch (SourceException e) {
+                String msg = "Failed to fetch changed document " + changed.getDocumentId() + ": " + e.getMessage();
+                LOG.error(msg, e);
+                resultBuilder.addError("fetch", changed.getDocumentId(), msg);
+            } catch (Exception e) {
+                String msg = "Failed to re-index changed document " + changed.getDocumentId() + ": " + e.getMessage();
+                LOG.error(msg, e);
+                resultBuilder.addError("reindex", changed.getDocumentId(), msg);
+            }
+        }
+
+        ReindexResult result = resultBuilder.build();
+        LOG.info("Segment-targeted re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
+                sourceId, result.getDocumentsIndexed(), result.getChunksCreated(), result.getErrorCount());
+
+        return result;
+    }
+
+    /**
+     * Re-indexes a single document using segment-targeted writers.
+     *
+     * <p>This method is similar to {@link #reindexDocumentWithAtomicPublication} but
+     * accepts segment-targeted writers, ensuring all data is written to the correct
+     * segment during rolling replacement.</p>
+     *
+     * @param sourceId Source identifier
+     * @param documentId Document identifier
+     * @param fetched The fetched document content
+     * @param segmentWriter Storage writer bound to the target segment
+     * @param segmentPublisher Publisher bound to the target segment
+     * @return Result of re-indexing this document
+     */
+    private DocumentResult reindexDocumentWithSegmentWriter(
+            String sourceId,
+            String documentId,
+            FetchedDocument fetched,
+            OffsetAwareStorageWriter segmentWriter,
+            DocumentBatchPublisher segmentPublisher) {
+
+        long startTime = System.currentTimeMillis();
+
+        byte[] content = fetched.getContent();
+        if (content == null || content.length == 0) {
+            return new DocumentResult(documentId, 0, 0, 0,
+                System.currentTimeMillis() - startTime, "Empty content");
+        }
+
+        if (content.length > MAX_CONTENT_LENGTH) {
+            throw new IllegalArgumentException(
+                "Content length " + content.length + " exceeds maximum " + MAX_CONTENT_LENGTH);
+        }
+
+        String text = new String(content, StandardCharsets.UTF_8);
+
+        List<TextChunk> chunks = chunker.chunk(documentId, text);
+        if (chunks.isEmpty()) {
+            return new DocumentResult(documentId, 0, 0, 0,
+                System.currentTimeMillis() - startTime, "No chunks produced");
+        }
+
+        DocumentBatchBuffer batchBuffer = new DocumentBatchBuffer(documentId, sourceId);
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failureCount = new AtomicInteger(0);
+        List<String> errors = new ArrayList<>();
+        List<String> chunkIds = new ArrayList<>(chunks.size());
+
+        // Write all chunks to the TARGET SEGMENT and accumulate in batch buffer
+        for (int i = 0; i < chunks.size(); i++) {
+            TextChunk chunk = chunks.get(i);
+            String chunkId = generateChunkId(documentId, i);
+
+            try {
+                float[] embedding = llmClient.generateEmbedding(chunk.getText(),
+                    "reindex:" + sourceId + ":" + documentId);
+
+                // Write to the TARGET SEGMENT via segmentWriter
+                long writeLogOffset = segmentWriter.writeChunkWithOffset(chunkId, chunk.getText(), embedding);
+
+                if (writeLogOffset >= 0) {
+                    // Add to batch buffer for atomic publication
+                    batchBuffer.addChunk(chunkId, chunk, writeLogOffset, embedding);
+                    chunkIds.add(chunkId);
+                    successCount.incrementAndGet();
+                } else {
+                    failureCount.incrementAndGet();
+                    errors.add("Storage write failed for chunk " + i);
+                    LOG.warn("Failed to write chunk {} for document {} to target segment", i, documentId);
+                }
+            } catch (LLMException e) {
+                failureCount.incrementAndGet();
+                errors.add("Embedding failed for chunk " + i + ": " + e.getMessage());
+                LOG.error("Failed to generate embedding for chunk {} of document {}: {}",
+                    i, documentId, e.getMessage());
+            }
+        }
+
+        // If no chunks were written successfully, return failure
+        if (successCount.get() == 0) {
+            return new DocumentResult(documentId, chunks.size(), 0, failureCount.get(),
+                System.currentTimeMillis() - startTime, "All chunks failed: " + String.join("; ", errors));
+        }
+
+        // Seal the buffer for atomic publication
+        batchBuffer.seal();
+
+        // Build document metadata
+        long contentHash = DocumentRegistry.computeContentHash(content);
+        DocumentMetadata metadata = DocumentMetadata.builder()
+            .sourceId(sourceId)
+            .documentId(documentId)
+            .lastModifiedMillis(fetched.getLastModifiedMillis())
+            .contentHash(contentHash)
+            .contentLength(content.length)
+            .chunkIds(chunkIds)
+            .indexTimeMillis(System.currentTimeMillis())
+            .build();
+
+        // Publish atomically to the TARGET SEGMENT
+        try {
+            DocumentBatchPublisher.PublicationResult result = segmentPublisher.publish(batchBuffer, metadata);
+
+            long elapsed = System.currentTimeMillis() - startTime;
+            String errorMsg = errors.isEmpty() ? null : String.join("; ", errors);
+
+            LOG.info("Document {} published atomically to target segment at epoch {}: {} chunks ({} successful, {} failed) in {}ms",
+                documentId, result.epoch(), chunks.size(), successCount.get(), failureCount.get(), elapsed);
+
+            return new DocumentResult(documentId, chunks.size(), successCount.get(),
+                failureCount.get(), elapsed, errorMsg);
+
+        } catch (DocumentBatchPublisher.PublicationException e) {
+            // Publication failed - document should not be visible
+            String errorMsg = "Atomic publication to target segment failed: " + e.getMessage();
+            if (!errors.isEmpty()) {
+                errorMsg += "; " + String.join("; ", errors);
+            }
+
+            long elapsed = System.currentTimeMillis() - startTime;
+            LOG.error("Atomic publication to target segment failed for document {}: {}", documentId, e.getMessage());
+
+            return new DocumentResult(documentId, chunks.size(), 0, chunks.size(),
+                elapsed, errorMsg);
+        }
     }
 
     /**

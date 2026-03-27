@@ -4,8 +4,12 @@ import excalibur.query.QueryResultItem;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.HnswGraph.NodeView;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -24,7 +28,22 @@ import static org.mockito.Mockito.verify;
  * <p>Tests verify that VectorReranker correctly computes exact distances
  * from full-precision vectors stored in the HNSW graph.</p>
  */
+@ExtendWith(MockitoExtension.class)
 class VectorRerankerTest {
+
+    @Mock
+    private DistanceFunction distanceFunction;
+
+    @Mock
+    private HnswGraph graph;
+
+    private VectorReranker reranker;
+
+    @BeforeEach
+    void setUp() {
+        when(distanceFunction.name()).thenReturn("l2");
+        reranker = new VectorReranker(distanceFunction);
+    }
 
     // ==================== Constructor Tests ====================
 

@@ -4,6 +4,8 @@ import excalibur.filter.CuckooFilter;
 import excalibur.filter.HierarchicalCuckooFilter;
 import excalibur.shard.allocator.VolumeManager;
 import excalibur.shard.worker.CuckooMaintenanceWorker;
+import excalibur.shard.worker.CuckooMetricsWorker;
+import excalibur.shard.worker.HnswCompactionWorker;
 import excalibur.shard.worker.HnswIntegrationWorker;
 import excalibur.shard.worker.SegmentReindexScheduler;
 import excalibur.shard.worker.WarmingPhaseWorker;
@@ -36,8 +38,10 @@ import java.util.concurrent.locks.LockSupport;
  * <ul>
  *   <li>{@link HnswIntegrationWorker} - Integrates write log entries into HNSW graph</li>
  *   <li>{@link CuckooMaintenanceWorker} - Maintains Cuckoo filter consistency</li>
+ *   <li>{@link CuckooMetricsWorker} - Monitors and records Cuckoo filter FP rates</li>
  *   <li>{@link SegmentReindexScheduler} - Schedules stale segment re-indexing</li>
  *   <li>{@link EpochTickScheduler} - Advances visibility epoch periodically</li>
+ *   <li>{@link HnswCompactionWorker} - Compacts HNSW graphs by removing tombstoned nodes</li>
  * </ul>
  *
  * <h2>Visibility Tracking</h2>
@@ -48,8 +52,8 @@ import java.util.concurrent.locks.LockSupport;
  * <h2>Worker Coordination</h2>
  * <p>The orchestrator ensures workers are started and stopped in the correct order:</p>
  * <ol>
- *   <li>Start: VisibilityTracker → EpochTickScheduler → CuckooMaintenanceWorker → HnswIntegrationWorker → SegmentReindexScheduler</li>
- *   <li>Stop: SegmentReindexScheduler → HnswIntegrationWorker → CuckooMaintenanceWorker → EpochTickScheduler</li>
+ *   <li>Start: VisibilityTracker → EpochTickScheduler → CuckooMaintenanceWorker → CuckooMetricsWorker → HnswIntegrationWorker → HnswCompactionWorker → SegmentReindexScheduler</li>
+ *   <li>Stop: SegmentReindexScheduler → HnswCompactionWorker → HnswIntegrationWorker → CuckooMetricsWorker → CuckooMaintenanceWorker → EpochTickScheduler</li>
  * </ol>
  *
  * <h2>Metrics Exposure</h2>
@@ -57,6 +61,7 @@ import java.util.concurrent.locks.LockSupport;
  * <ul>
  *   <li>HNSW integration queue depth</li>
  *   <li>Pending Cuckoo filter deletions</li>
+ *   <li>Cuckoo filter false positive rates</li>
  *   <li>Scheduled re-index count</li>
  *   <li>Current visibility epoch</li>
  * </ul>
@@ -81,6 +86,7 @@ import java.util.concurrent.locks.LockSupport;
  * @since 5.0
  * @see HnswIntegrationWorker
  * @see CuckooMaintenanceWorker
+ * @see CuckooMetricsWorker
  * @see SegmentReindexScheduler
  * @see VisibilityTracker
  * @see EpochTickScheduler
@@ -123,10 +129,22 @@ public class IndexOrchestrator implements AutoCloseable {
     private final CompactionWorker compactionWorker;
 
     /**
+     * HNSW compaction worker for removing tombstoned nodes from graphs.
+     * Triggers compaction when tombstone ratio exceeds threshold.
+     */
+    private final HnswCompactionWorker hnswCompactionWorker;
+
+    /**
      * Warming phase worker for PQ codebook training.
      * Trains ProductQuantizer during the WARMING phase of segment lifecycle.
      */
     private final WarmingPhaseWorker warmingWorker;
+
+    /**
+     * Cuckoo metrics worker for FP rate monitoring.
+     * Periodically samples false positive rates from all registered Cuckoo filters.
+     */
+    private final CuckooMetricsWorker cuckooMetricsWorker;
 
     /**
      * Volume manager for disk space tracking and segment-to-volume assignment.
@@ -284,6 +302,16 @@ public class IndexOrchestrator implements AutoCloseable {
             100, 100, null);
         LOGGER.info("WarmingPhaseWorker initialized for PQ training");
 
+        // Create HNSW compaction worker for removing tombstoned nodes
+        // Uses default 1-minute interval and 20% tombstone threshold
+        this.hnswCompactionWorker = new HnswCompactionWorker();
+        LOGGER.info("HnswCompactionWorker initialized for graph compaction");
+
+        // Create Cuckoo metrics worker for FP rate monitoring
+        // Uses same interval as CuckooMaintenanceWorker for consistency
+        this.cuckooMetricsWorker = new CuckooMetricsWorker(cuckooMaintenanceIntervalMs);
+        LOGGER.info("CuckooMetricsWorker initialized for FP rate monitoring");
+
         LOGGER.info("IndexOrchestrator created with hnswQueueDepthLimit={}, cuckooInterval={}ms, reindexInterval={}ms, epochTickInterval={}ms, volumeManager={}",
             hnswQueueDepthLimit, cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs, volumeManager != null);
     }
@@ -358,8 +386,10 @@ public class IndexOrchestrator implements AutoCloseable {
 
             // Start workers in order
             cuckooWorker.start();
+            cuckooMetricsWorker.start();
             hnswWorker.start();
             warmingWorker.start();
+            hnswCompactionWorker.start();
             reindexScheduler.start();
             compactionWorker.start();
 
@@ -383,17 +413,21 @@ public class IndexOrchestrator implements AutoCloseable {
             // Stop workers in reverse order
             compactionWorker.stop();
             reindexScheduler.stop();
+            hnswCompactionWorker.stop();
             warmingWorker.stop();
             hnswWorker.stop();
+            cuckooMetricsWorker.stop();
             cuckooWorker.stop();
 
             // Stop epoch tick scheduler last
             epochTickScheduler.stop();
 
-            LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Cuckoo deletions: {}, Reindexes: {}, Compactions: {}, PQ trained: {}, Epoch ticks: {}",
+            LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Cuckoo deletions: {}, Reindexes: {}, Compactions: {}, HNSW compactions: {}, PQ trained: {}, Epoch ticks: {}, Cuckoo FP samples: {}",
                 hnswWorker.getTotalIntegrated(), cuckooWorker.getTotalDeletions(),
                 reindexScheduler.getTotalReindexesTriggered(), compactionWorker.getCompactionCount(),
-                warmingWorker.getTotalPqTrained(), epochTickScheduler.getTickCount());
+                hnswCompactionWorker.getCompactionCount(),
+                warmingWorker.getTotalPqTrained(), epochTickScheduler.getTickCount(),
+                cuckooMetricsWorker.getTotalSamplesRecorded());
         }
     }
 
@@ -420,6 +454,7 @@ public class IndexOrchestrator implements AutoCloseable {
      * <ul>
      *   <li>HNSW integration (if it has a graph)</li>
      *   <li>Cuckoo maintenance (if it has a filter)</li>
+     *   <li>Cuckoo metrics (for FP rate monitoring, if it has a filter)</li>
      *   <li>Compaction worker (for tombstone cleanup)</li>
      *   <li>Warming phase worker (for PQ training during WARMING state)</li>
      * </ul>
@@ -447,11 +482,15 @@ public class IndexOrchestrator implements AutoCloseable {
             hnswWorker.registerSegment(segment, graph, tracker);
             // Register with warming worker for PQ training during WARMING phase
             warmingWorker.registerSegment(segmentId, segment, graph, tracker);
+            // Register with HNSW compaction worker for tombstone cleanup
+            hnswCompactionWorker.registerGraph(graph);
         }
 
         // Register with Cuckoo worker if filter exists
         if (filter != null) {
             cuckooWorker.registerFilter(segmentId, filter);
+            // Register with Cuckoo metrics worker for FP rate monitoring
+            cuckooMetricsWorker.registerFilter(segmentId, filter);
         }
 
         // Register with compaction worker for background tombstone cleanup
@@ -475,8 +514,12 @@ public class IndexOrchestrator implements AutoCloseable {
                 hnswWorker.unregisterSegment(info.segment);
                 // Unregister from warming worker
                 warmingWorker.unregisterSegment(segmentId);
+                // Unregister from HNSW compaction worker
+                hnswCompactionWorker.unregisterGraph(info.graph);
             }
+            // Unregister from Cuckoo workers
             cuckooWorker.unregisterFilter(segmentId);
+            cuckooMetricsWorker.unregisterFilter(segmentId);
             compactionWorker.unregisterSegment(info.segment);
             LOGGER.debug("Unregistered segment {} from index orchestrator", segmentId);
         }
@@ -1004,6 +1047,15 @@ public class IndexOrchestrator implements AutoCloseable {
      */
     public WarmingPhaseWorker getWarmingWorker() {
         return warmingWorker;
+    }
+
+    /**
+     * Returns the HNSW compaction worker for removing tombstoned nodes.
+     *
+     * @return HNSW compaction worker
+     */
+    public HnswCompactionWorker getHnswCompactionWorker() {
+        return hnswCompactionWorker;
     }
 
     /**

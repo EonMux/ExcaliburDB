@@ -1,5 +1,6 @@
 package excalibur.query.executor;
 
+import io.excalibur.metrics.Metrics;
 import io.excalibur.store.WriteLog;
 import io.excalibur.store.format.LogEntry;
 import io.excalibur.vector.distance.DistanceFunction;
@@ -252,6 +253,10 @@ public class TailScanner {
                 currentOffset++;
             }
         }
+
+        // Record tail scan metrics for JMX observability
+        // This tracks: total scans performed, total entries scanned, max entries per scan
+        Metrics.recordTailScanMetrics(entriesScanned, vectorEntriesFound);
 
         // Convert max-heap to sorted list (closest first)
         List<HnswSearchResult> results = new ArrayList<>(topResults);

@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import excalibur.query.*;
 import excalibur.query.executor.CancellationToken;
+import excalibur.query.executor.QueryRegistry;
 import excalibur.query.pipeline.QueryPipeline;
 import io.excalibur.config.Config;
 import org.slf4j.Logger;
@@ -85,6 +86,7 @@ public class QueryEndpoint implements HttpHandler {
     private final QueryPipeline queryPipeline;
     private final ExecutorService executorService;
     private final Config config;
+    private final QueryRegistry queryRegistry;
 
     /**
      * Creates a new QueryEndpoint.
@@ -92,7 +94,7 @@ public class QueryEndpoint implements HttpHandler {
      * @param queryPipeline The query pipeline for executing queries
      */
     public QueryEndpoint(QueryPipeline queryPipeline) {
-        this(queryPipeline, null, null);
+        this(queryPipeline, null, null, null);
     }
 
     /**
@@ -102,7 +104,7 @@ public class QueryEndpoint implements HttpHandler {
      * @param config The configuration for default values (may be null)
      */
     public QueryEndpoint(QueryPipeline queryPipeline, Config config) {
-        this(queryPipeline, config, null);
+        this(queryPipeline, config, null, null);
     }
 
     /**
@@ -112,7 +114,7 @@ public class QueryEndpoint implements HttpHandler {
      * @param executorService The executor service for async operations
      */
     public QueryEndpoint(QueryPipeline queryPipeline, ExecutorService executorService) {
-        this(queryPipeline, null, executorService);
+        this(queryPipeline, null, executorService, null);
     }
 
     /**
@@ -123,9 +125,22 @@ public class QueryEndpoint implements HttpHandler {
      * @param executorService The executor service for async operations (may be null)
      */
     public QueryEndpoint(QueryPipeline queryPipeline, Config config, ExecutorService executorService) {
+        this(queryPipeline, config, executorService, null);
+    }
+
+    /**
+     * Creates a new QueryEndpoint with query registry for cancellation support.
+     *
+     * @param queryPipeline The query pipeline for executing queries
+     * @param config The configuration for default values (may be null)
+     * @param executorService The executor service for async operations (may be null)
+     * @param queryRegistry The query registry for cancellation support (may be null)
+     */
+    public QueryEndpoint(QueryPipeline queryPipeline, Config config, ExecutorService executorService, QueryRegistry queryRegistry) {
         this.queryPipeline = Objects.requireNonNull(queryPipeline, "QueryPipeline cannot be null");
         this.config = config;
         this.executorService = executorService != null ? executorService : Executors.newVirtualThreadPerTaskExecutor();
+        this.queryRegistry = queryRegistry;
         // Initialize default timeout from config visibility settings, fallback to 30 seconds
         this.defaultTimeoutMs = config != null
             ? config.visibility().getQueryTimeoutMs()
@@ -142,6 +157,7 @@ public class QueryEndpoint implements HttpHandler {
         }
 
         String correlationId = UUID.randomUUID().toString().substring(0, 8);
+        String queryId = UUID.randomUUID().toString();
         long startTime = System.nanoTime();
 
         try {
@@ -149,11 +165,16 @@ public class QueryEndpoint implements HttpHandler {
             String requestBody = readRequestBody(exchange);
             QueryRequest request = parseRequest(requestBody, correlationId);
 
-            LOGGER.debug("[{}] Processing query: topK={}, timeout={}ms",
-                correlationId, request.topK(), request.timeoutMs());
+            LOGGER.debug("[{}] Processing query: queryId={}, topK={}, timeout={}ms",
+                correlationId, queryId, request.topK(), request.timeoutMs());
 
             // Create cancellation token
             CancellationToken token = new CancellationToken();
+
+            // Register query with registry for cancellation support
+            if (queryRegistry != null) {
+                queryRegistry.register(queryId, token, correlationId);
+            }
 
             // Execute query with timeout
             CompletableFuture<QueryResponse> future = queryPipeline.execute(request, token);
@@ -162,20 +183,27 @@ public class QueryEndpoint implements HttpHandler {
             QueryResponse response;
             try {
                 response = future.get(request.timeoutMs(), TimeUnit.MILLISECONDS);
+                // Add queryId to response
+                response = response.withQueryId(queryId);
             } catch (TimeoutException e) {
                 // Cancel the token to propagate cancellation
                 token.cancel("Query timeout");
                 long durationMs = (System.nanoTime() - startTime) / 1_000_000;
                 LOGGER.warn("[{}] Query timed out after {}ms", correlationId, durationMs);
-                response = buildTimeoutResponse(durationMs);
+                response = buildTimeoutResponse(queryId, durationMs);
             } catch (CancellationException e) {
                 long durationMs = (System.nanoTime() - startTime) / 1_000_000;
                 LOGGER.info("[{}] Query cancelled after {}ms", correlationId, durationMs);
-                response = buildCancelledResponse(durationMs);
+                response = buildCancelledResponse(queryId, durationMs);
             } catch (ExecutionException e) {
                 long durationMs = (System.nanoTime() - startTime) / 1_000_000;
                 LOGGER.error("[{}] Query failed: {}", correlationId, e.getCause().getMessage());
-                response = buildErrorResponse(durationMs, e.getCause().getMessage());
+                response = buildErrorResponse(queryId, durationMs, e.getCause().getMessage());
+            } finally {
+                // Unregister query when complete
+                if (queryRegistry != null) {
+                    queryRegistry.unregister(queryId);
+                }
             }
 
             // Send response
@@ -241,6 +269,9 @@ public class QueryEndpoint implements HttpHandler {
             : 0.3f;
         float llmThreshold = extractFloat(json, "llm_threshold", defaultLlmThreshold);
 
+        // Parse oversampling_factor with default from QueryOptions
+        int oversamplingFactor = extractInt(json, "oversampling_factor", QueryOptions.DEFAULT_OVERSAMPLING_FACTOR);
+
         // Domain correctness validation
         if (vector == null || vector.length == 0) {
             throw new IllegalArgumentException("Field 'vector' is required and must be non-empty");
@@ -269,6 +300,11 @@ public class QueryEndpoint implements HttpHandler {
             throw new IllegalArgumentException("Field 'llm_threshold' must be in range [0.0, 1.0]: " + llmThreshold);
         }
 
+        // Validate oversamplingFactor
+        if (oversamplingFactor < 1) {
+            throw new IllegalArgumentException("Field 'oversampling_factor' must be at least 1: " + oversamplingFactor);
+        }
+
         return QueryRequest.builder()
             .queryText(query)
             .queryVector(vector)
@@ -278,6 +314,7 @@ public class QueryEndpoint implements HttpHandler {
             .includePartialSegments(includePartial)
             .enableLlmScoring(enableLlmScoring)
             .llmThreshold(llmThreshold)
+            .oversamplingFactor(oversamplingFactor)
             .correlationId(correlationId)
             .build();
     }
@@ -339,6 +376,11 @@ public class QueryEndpoint implements HttpHandler {
         StringBuilder sb = new StringBuilder();
         sb.append("{");
 
+        // Query ID (for cancellation support)
+        if (response.queryId() != null) {
+            sb.append(String.format("\"query_id\": \"%s\", ", escapeJson(response.queryId())));
+        }
+
         // Results
         sb.append("\"results\": [");
         for (int i = 0; i < response.results().size(); i++) {
@@ -381,7 +423,7 @@ public class QueryEndpoint implements HttpHandler {
     /**
      * Builds a timeout response.
      */
-    private QueryResponse buildTimeoutResponse(long durationMs) {
+    private QueryResponse buildTimeoutResponse(String queryId, long durationMs) {
         IndexCoverage coverage = IndexCoverage.builder()
             .degraded(true)
             .estimatedCorpusCoverage(0.0)
@@ -389,6 +431,7 @@ public class QueryEndpoint implements HttpHandler {
             .build();
 
         return new QueryResponse(
+            queryId,
             Collections.emptyList(),
             coverage,
             durationMs,
@@ -400,7 +443,7 @@ public class QueryEndpoint implements HttpHandler {
     /**
      * Builds a cancelled response.
      */
-    private QueryResponse buildCancelledResponse(long durationMs) {
+    private QueryResponse buildCancelledResponse(String queryId, long durationMs) {
         IndexCoverage coverage = IndexCoverage.builder()
             .degraded(true)
             .estimatedCorpusCoverage(0.0)
@@ -408,6 +451,7 @@ public class QueryEndpoint implements HttpHandler {
             .build();
 
         return new QueryResponse(
+            queryId,
             Collections.emptyList(),
             coverage,
             durationMs,
@@ -419,7 +463,7 @@ public class QueryEndpoint implements HttpHandler {
     /**
      * Builds an error response.
      */
-    private QueryResponse buildErrorResponse(long durationMs, String errorMessage) {
+    private QueryResponse buildErrorResponse(String queryId, long durationMs, String errorMessage) {
         IndexCoverage coverage = IndexCoverage.builder()
             .degraded(true)
             .estimatedCorpusCoverage(0.0)
@@ -427,6 +471,7 @@ public class QueryEndpoint implements HttpHandler {
             .build();
 
         return new QueryResponse(
+            queryId,
             Collections.emptyList(),
             coverage,
             durationMs,

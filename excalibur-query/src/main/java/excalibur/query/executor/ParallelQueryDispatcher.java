@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -362,12 +363,14 @@ public class ParallelQueryDispatcher {
      * @param queryVector The query vector
      * @param options Query options
      * @param distanceFunction The distance function
+     * @param lshCandidates Optional LSH pre-filtered candidate node IDs to constrain HNSW search
      * @return DispatchResult with raw segment results, merged results, and coverage
      */
     public DispatchResult dispatchRaw(
             float[] queryVector,
             QueryOptions options,
-            DistanceFunction distanceFunction) {
+            DistanceFunction distanceFunction,
+            Set<Long> lshCandidates) {
 
         Objects.requireNonNull(queryVector, "Query vector cannot be null");
         Objects.requireNonNull(options, "Query options cannot be null");
@@ -394,7 +397,7 @@ public class ParallelQueryDispatcher {
 
         LOGGER.trace("Dispatching query to {} segments", queryableSegments.size());
 
-        // Create tasks for each segment
+        // Create tasks for each segment with LSH candidates support
         List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks = new ArrayList<>();
         for (SegmentInfo info : queryableSegments) {
             SegmentQueryTask task = new SegmentQueryTask(
@@ -404,7 +407,8 @@ public class ParallelQueryDispatcher {
                 queryVector,
                 options.topK(),
                 options.oversamplingFactor(),
-                distanceFunction
+                distanceFunction,
+                null  // No LSH candidates at dispatcher level
             );
             tasks.add(task);
         }
@@ -620,7 +624,220 @@ public class ParallelQueryDispatcher {
     }
 
     /**
-     * Internal class holding segment information for querying.
+     * Dispatches a query to specific segments and returns raw segment results.
+     *
+     * <p>This method is designed for use by {@link excalibur.query.pipeline.QueryPipeline}
+     * when it has already filtered segments through earlier pipeline stages
+     * (visibility tracking, Cuckoo filter cascade, LSH pre-filtering).</p>
+     *
+     * <p>Unlike {@link #dispatchRaw(float[], QueryOptions, DistanceFunction)},
+     * this method accepts specific segments to search rather than determining
+     * queryable segments automatically.</p>
+     *
+     * @param segmentsToSearch List of segment IDs, segments, and graphs to search
+     * @param queryVector The query vector
+     * @param options Query options
+     * @param distanceFunction The distance function
+     * @return DispatchResult with raw segment results, merged results, and coverage
      */
-    private record SegmentInfo(long segmentId, Segment segment, HnswGraph graph) {}
+    public DispatchResult dispatchToSpecificSegments(
+            List<SegmentInfo> segmentsToSearch,
+            float[] queryVector,
+            QueryOptions options,
+            DistanceFunction distanceFunction) {
+
+        Objects.requireNonNull(segmentsToSearch, "Segments to search cannot be null");
+        Objects.requireNonNull(queryVector, "Query vector cannot be null");
+        Objects.requireNonNull(options, "Query options cannot be null");
+        Objects.requireNonNull(distanceFunction, "Distance function cannot be null");
+
+        long startTime = System.nanoTime();
+
+        if (segmentsToSearch.isEmpty()) {
+            LOGGER.debug("No segments to search");
+            IndexCoverage coverage = IndexCoverage.builder()
+                .computeCoverage()
+                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
+                .build();
+            return new DispatchResult(
+                List.of(),
+                List.of(),
+                coverage,
+                0
+            );
+        }
+
+        LOGGER.trace("Dispatching query to {} specific segments", segmentsToSearch.size());
+
+        // Create tasks for each segment
+        List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks = new ArrayList<>();
+        for (SegmentInfo info : segmentsToSearch) {
+            SegmentQueryTask task = new SegmentQueryTask(
+                info.segmentId(),
+                info.segment(),
+                info.graph(),
+                queryVector,
+                options.topK(),
+                options.oversamplingFactor(),
+                distanceFunction
+            );
+            tasks.add(task);
+        }
+
+        // Dispatch tasks in parallel with timeout
+        List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
+        List<Future<SegmentQueryTask.SegmentQueryResult>> futures;
+
+        try {
+            futures = executor.invokeAll(tasks, options.timeout().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.warn("Query dispatch interrupted");
+            IndexCoverage coverage = IndexCoverage.builder()
+                .degraded(true)
+                .computeCoverage()
+                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
+                .build();
+            return new DispatchResult(
+                List.of(),
+                List.of(),
+                coverage,
+                System.nanoTime() - startTime
+            );
+        }
+
+        // Collect results
+        int segmentsTimedOut = 0;
+        for (int i = 0; i < futures.size(); i++) {
+            Future<SegmentQueryTask.SegmentQueryResult> future = futures.get(i);
+            SegmentInfo segmentInfo = segmentsToSearch.get(i);
+
+            try {
+                if (future.isDone()) {
+                    SegmentQueryTask.SegmentQueryResult result = future.get();
+                    segmentResults.add(result);
+                } else {
+                    // Timeout - create error result
+                    segmentsTimedOut++;
+                    segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                        segmentInfo.segmentId(),
+                        List.of(),
+                        0,
+                        options.timeout().toMillis(),
+                        false,
+                        "Timeout"
+                    ));
+                    future.cancel(true);
+                }
+            } catch (ExecutionException e) {
+                LOGGER.warn("Segment {} query failed: {}", segmentInfo.segmentId(), e.getCause().getMessage());
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    segmentInfo.segmentId(),
+                    List.of(),
+                    0,
+                    0,
+                    false,
+                    e.getCause().getMessage()
+                ));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                segmentsTimedOut++;
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    segmentInfo.segmentId(),
+                    List.of(),
+                    0,
+                    0,
+                    false,
+                    "Interrupted"
+                ));
+            } catch (java.util.concurrent.CancellationException e) {
+                // Future was cancelled due to invokeAll timeout
+                segmentsTimedOut++;
+                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
+                    segmentInfo.segmentId(),
+                    List.of(),
+                    0,
+                    0,
+                    false,
+                    "Timeout"
+                ));
+            }
+        }
+
+        // Aggregate results
+        ResultAggregator aggregator = new ResultAggregator(options);
+        List<QueryResultItem> mergedResults = aggregator.mergeAndRank(segmentResults);
+
+        // Build coverage
+        IndexCoverage coverage = buildCoverageForSpecificSegments(segmentResults, segmentsTimedOut);
+
+        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+
+        LOGGER.trace("Query completed: {} results, {}ms, coverage={}",
+            mergedResults.size(), durationMs, coverage.estimatedCorpusCoverage());
+
+        return new DispatchResult(
+            segmentResults,
+            mergedResults,
+            coverage,
+            durationMs
+        );
+    }
+
+    /**
+     * Builds index coverage from segment results for specific segment searches.
+     *
+     * <p>Unlike {@link #buildCoverage(List, int)}, this method doesn't count
+     * segments by lifecycle state since we're only searching specific segments.</p>
+     */
+    private IndexCoverage buildCoverageForSpecificSegments(
+            List<SegmentQueryTask.SegmentQueryResult> segmentResults,
+            int segmentsTimedOut) {
+
+        long totalSegments = catalog.size();
+        long totalTailScanEntries = 0;
+        int segmentsSearched = 0;
+        int segmentsWithErrors = 0;
+
+        // Count search results
+        for (SegmentQueryTask.SegmentQueryResult result : segmentResults) {
+            if (result.success()) {
+                segmentsSearched++;
+                totalTailScanEntries += result.tailScanEntries();
+            } else {
+                segmentsWithErrors++;
+            }
+        }
+
+        return IndexCoverage.builder()
+            .totalSegments(totalSegments)
+            .tailScanEntries(totalTailScanEntries)
+            .segmentsSearched(segmentsSearched)
+            .segmentsWithErrors(segmentsWithErrors)
+            .segmentsTimedOut(segmentsTimedOut)
+            .computeCoverage()
+            .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
+            .build();
+    }
+
+    /**
+     * Creates a SegmentInfo for use with {@link #dispatchToSpecificSegments}.
+     *
+     * @param segmentId The segment ID
+     * @param segment The segment instance
+     * @param graph The HNSW graph for the segment
+     * @return A new SegmentInfo instance
+     */
+    public static SegmentInfo createSegmentInfo(long segmentId, Segment segment, HnswGraph graph) {
+        return new SegmentInfo(segmentId, segment, graph);
+    }
+
+    /**
+     * Internal class holding segment information for querying.
+     *
+     * <p><strong>Note:</strong> This class is now public to allow
+     * {@link excalibur.query.pipeline.QueryPipeline} to create instances
+     * for dispatching to specific segments.</p>
+     */
+    public record SegmentInfo(long segmentId, Segment segment, HnswGraph graph) {}
 }

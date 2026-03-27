@@ -4,6 +4,7 @@ import excalibur.ingest.buffer.AtomicDocumentBatch;
 import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.processor.TextChunker;
+import excalibur.ingest.processor.TermFrequencyTracker;
 import excalibur.ingest.source.FetchedDocument;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
@@ -115,6 +116,13 @@ public class IngestionOrchestrator {
     private final DocumentVisibilityTracker visibilityTracker; // optional, nullable - for visibility epoch
 
     /**
+     * Term frequency tracker for selectivity estimation during queries.
+     * Tracks term frequencies in segment Count-Min Sketches for query optimization.
+     * May be null if selectivity-based optimization is not needed.
+     */
+    private final TermFrequencyTracker termFrequencyTracker;
+
+    /**
      * Timeout for awaiting backpressure release from the HNSW integration queue.
      * Configured via excalibur.ingest.document-atomicity-timeout-ms (default 2000ms).
      */
@@ -144,7 +152,7 @@ public class IngestionOrchestrator {
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry) {
-        this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry, null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+        this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry, null, null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
 
@@ -170,7 +178,7 @@ public class IngestionOrchestrator {
                                   StatusRegistry statusRegistry,
                                   LshIngestionService lshIngestionService) {
         this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
-             lshIngestionService, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+             lshIngestionService, null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
     /**
@@ -208,7 +216,7 @@ public class IngestionOrchestrator {
                                   DocumentChunkBuffer documentChunkBuffer,
                                   DocumentVisibilityTracker visibilityTracker) {
         this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
-             lshIngestionService, documentChunkBuffer, visibilityTracker, DEFAULT_DOCUMENT_TIMEOUT_MS);
+             lshIngestionService, documentChunkBuffer, visibilityTracker, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
     /**
@@ -224,6 +232,7 @@ public class IngestionOrchestrator {
      * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
      * @param documentChunkBuffer Buffer for atomic document batching (may be null for non-atomic mode)
      * @param visibilityTracker Tracker for document visibility epochs (may be null for non-atomic mode)
+     * @param termFrequencyTracker Tracker for term frequencies in segment sketches (may be null to disable selectivity estimation)
      * @param documentTimeoutMs Timeout for awaiting backpressure release in milliseconds
      * @throws NullPointerException if required parameters are null
      */
@@ -235,6 +244,7 @@ public class IngestionOrchestrator {
                                   LshIngestionService lshIngestionService,
                                   DocumentChunkBuffer documentChunkBuffer,
                                   DocumentVisibilityTracker visibilityTracker,
+                                  TermFrequencyTracker termFrequencyTracker,
                                   int documentTimeoutMs) {
         this.textChunker = Objects.requireNonNull(textChunker, "TextChunker cannot be null");
         this.embeddingClient = Objects.requireNonNull(embeddingClient, "EmbeddingClient cannot be null");
@@ -244,13 +254,15 @@ public class IngestionOrchestrator {
         this.lshIngestionService = lshIngestionService; // may be null
         this.documentChunkBuffer = documentChunkBuffer; // may be null
         this.visibilityTracker = visibilityTracker; // may be null
+        this.termFrequencyTracker = termFrequencyTracker; // may be null
         this.documentTimeoutMs = documentTimeoutMs > 0 ? documentTimeoutMs : DEFAULT_DOCUMENT_TIMEOUT_MS;
         this.activeIngestions = ConcurrentHashMap.newKeySet();
         this.shutdown = new AtomicBoolean(false);
 
-        LOGGER.info("IngestionOrchestrator initialized with LSH={}, atomicBatching={}, documentTimeoutMs={}",
+        LOGGER.info("IngestionOrchestrator initialized with LSH={}, atomicBatching={}, termFrequencyTracking={}, documentTimeoutMs={}",
             (lshIngestionService != null ? "enabled" : "disabled"),
             (documentChunkBuffer != null && visibilityTracker != null ? "enabled" : "disabled"),
+            (termFrequencyTracker != null ? "enabled" : "disabled"),
             this.documentTimeoutMs);
     }
 
@@ -350,6 +362,23 @@ public class IngestionOrchestrator {
 
                     // Chunk the content
                     List<TextChunk> chunks = textChunker.chunk(documentId, content);
+
+                    // Track term frequencies for selectivity estimation
+                    // This populates the Count-Min Sketch on segments for query optimization
+                    if (termFrequencyTracker != null && !chunks.isEmpty()) {
+                        for (int i = 0; i < chunks.size(); i++) {
+                            TextChunk chunk = chunks.get(i);
+                            String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
+                            byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
+                            long keyHash = io.excalibur.store.hash.XxHash64.hash(keyBytes);
+                            int segmentIndex = (int) (keyHash & (storageEngine.getSegmentCount() - 1));
+
+                            io.excalibur.store.Segment segment = storageEngine.getSegment((long) segmentIndex);
+                            if (segment != null) {
+                                termFrequencyTracker.trackText(segment, chunk.getText());
+                            }
+                        }
+                    }
 
                     // Check if atomic batching is enabled
                     boolean useAtomicBatching = documentChunkBuffer != null && visibilityTracker != null;

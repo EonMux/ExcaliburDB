@@ -173,18 +173,17 @@ public class MBeanNotificationBroadcaster implements NotificationEmitter {
             }
         };
 
-        listeners.add(new ListenerEntry(info, observer));
+        // Store the entry with references to the original listener/filter/handback
+        listeners.add(new ListenerEntry(info, observer, listener, filter, handback));
     }
 
     @Override
     public void removeNotificationListener(NotificationListener listener)
             throws ListenerNotFoundException {
 
-        boolean removed = listeners.removeIf(entry -> {
-            // For wrapped listeners, we can't reliably identify them
-            // This is a limitation of the adapter pattern
-            return false;
-        });
+        boolean removed = listeners.removeIf(entry ->
+            entry.wrappedListener == listener
+        );
 
         if (!removed) {
             throw new ListenerNotFoundException("Listener not found");
@@ -197,10 +196,11 @@ public class MBeanNotificationBroadcaster implements NotificationEmitter {
             NotificationFilter filter,
             Object handback) throws ListenerNotFoundException {
 
-        boolean removed = listeners.removeIf(entry -> {
-            // For wrapped listeners, we can't reliably identify them
-            return false;
-        });
+        boolean removed = listeners.removeIf(entry ->
+            entry.wrappedListener == listener &&
+            (entry.wrappedFilter == filter || (entry.wrappedFilter != null && entry.wrappedFilter.equals(filter))) &&
+            (entry.wrappedHandback == handback || (entry.wrappedHandback != null && entry.wrappedHandback.equals(handback)))
+        );
 
         if (!removed) {
             throw new ListenerNotFoundException("Listener not found");
@@ -252,14 +252,28 @@ public class MBeanNotificationBroadcaster implements NotificationEmitter {
 
     /**
      * Entry representing a registered listener.
+     * Stores both the observer and, for wrapped standard JMX listeners,
+     * references to the original listener/filter/handback for proper removal.
      */
     private static class ListenerEntry {
         final ObjectNotificationInfo info;
         final MBeanNotificationObserver observer;
+        final NotificationListener wrappedListener;
+        final NotificationFilter wrappedFilter;
+        final Object wrappedHandback;
 
         ListenerEntry(ObjectNotificationInfo info, MBeanNotificationObserver observer) {
+            this(info, observer, null, null, null);
+        }
+
+        ListenerEntry(ObjectNotificationInfo info, MBeanNotificationObserver observer,
+                      NotificationListener wrappedListener, NotificationFilter wrappedFilter,
+                      Object wrappedHandback) {
             this.info = info;
             this.observer = observer;
+            this.wrappedListener = wrappedListener;
+            this.wrappedFilter = wrappedFilter;
+            this.wrappedHandback = wrappedHandback;
         }
     }
 

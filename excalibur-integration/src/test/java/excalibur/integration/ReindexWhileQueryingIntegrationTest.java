@@ -109,7 +109,7 @@ class ReindexWhileQueryingIntegrationTest {
         // Create storage infrastructure
         Path dataDir = tempDir.resolve("data");
         Files.createDirectories(dataDir);
-        storageEngine = new TestStorageEngine(dataDir);
+        storageEngine = new TestStorageEngine(dataDir, arena);
 
         // Create visibility tracker
         visibilityTracker = new TestVisibilityTracker();
@@ -162,8 +162,8 @@ class ReindexWhileQueryingIntegrationTest {
             Path oldGraphPath = tempDir.resolve("old.graph");
             HnswGraph oldGraph = new HnswGraph(oldGraphPath, config, distanceFunction, 10000);
 
-            // Register old segment
-            long oldSegmentId = 1L;
+            // Create and register old segment, using its actual ID
+            long oldSegmentId = storageEngine.createAndRegisterSegment();
             visibilityTracker.registerSegment(oldSegmentId, 0L);
 
             // Ingest initial documents into old segment
@@ -264,8 +264,8 @@ class ReindexWhileQueryingIntegrationTest {
                     Path newGraphPath = tempDir.resolve("new.graph");
                     HnswGraph newGraph = new HnswGraph(newGraphPath, config, distanceFunction, 10000);
 
-                    // Register new segment in BOOTSTRAPPING
-                    long newSegmentId = 2L;
+                    // Create and register new segment, using its actual ID
+                    long newSegmentId = storageEngine.createAndRegisterSegment();
                     visibilityTracker.registerSegment(newSegmentId, visibilityTracker.currentEpoch());
                     storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.BOOTSTRAPPING);
 
@@ -375,8 +375,8 @@ class ReindexWhileQueryingIntegrationTest {
             Path oldGraphPath = tempDir.resolve("old-serve.graph");
             HnswGraph oldGraph = new HnswGraph(oldGraphPath, config, distanceFunction, 10000);
 
-            // Register and activate old segment
-            long oldSegmentId = 1L;
+            // Create and register old segment, using its actual ID
+            long oldSegmentId = storageEngine.createAndRegisterSegment();
             visibilityTracker.registerSegment(oldSegmentId, 0L);
             storageEngine.getTestCatalog().setSegmentState(oldSegmentId, LifecycleState.ACTIVE);
 
@@ -395,8 +395,8 @@ class ReindexWhileQueryingIntegrationTest {
                 distanceFunction
             );
 
-            // Create new segment in BOOTSTRAPPING
-            long newSegmentId = 2L;
+            // Create and register new segment, using its actual ID
+            long newSegmentId = storageEngine.createAndRegisterSegment();
             visibilityTracker.registerSegment(newSegmentId, visibilityTracker.currentEpoch());
             storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.BOOTSTRAPPING);
 
@@ -449,8 +449,8 @@ class ReindexWhileQueryingIntegrationTest {
             Path oldGraphPath = tempDir.resolve("old-rolling.graph");
             HnswGraph oldGraph = new HnswGraph(oldGraphPath, config, distanceFunction, 10000);
 
-            // Register and activate old segment
-            long oldSegmentId = 1L;
+            // Create and register old segment, using its actual ID
+            long oldSegmentId = storageEngine.createAndRegisterSegment();
             visibilityTracker.registerSegment(oldSegmentId, 0L);
             storageEngine.getTestCatalog().setSegmentState(oldSegmentId, LifecycleState.ACTIVE);
 
@@ -477,12 +477,13 @@ class ReindexWhileQueryingIntegrationTest {
                 LifecycleState.ACTIVE
             };
 
-            long newSegmentId = 2L;
+            // Create new segment upfront to get its actual ID
+            long newSegmentId = storageEngine.createAndRegisterSegment();
             int queryCount = 0;
             int availableCount = 0;
 
             for (LifecycleState state : newSegmentStates) {
-                // Create/register new segment if needed
+                // Register new segment with visibility tracker at BOOTSTRAPPING
                 if (state == LifecycleState.BOOTSTRAPPING) {
                     visibilityTracker.registerSegment(newSegmentId, visibilityTracker.currentEpoch());
                 }
@@ -564,8 +565,8 @@ class ReindexWhileQueryingIntegrationTest {
             Path graph1Path = tempDir.resolve("graph1.graph");
             HnswGraph graph1 = new HnswGraph(graph1Path, config, distanceFunction, 10000);
 
-            // Register segment 1
-            long segmentId1 = 1L;
+            // Create and register segment 1, using its actual ID
+            long segmentId1 = storageEngine.createAndRegisterSegment();
             visibilityTracker.registerSegment(segmentId1, 0L);
             storageEngine.getTestCatalog().setSegmentState(segmentId1, LifecycleState.ACTIVE);
 
@@ -641,14 +642,15 @@ class ReindexWhileQueryingIntegrationTest {
             };
 
             // Re-index task
-            AtomicInteger segmentIdCounter = new AtomicInteger(2);
+            AtomicInteger graphCounter = new AtomicInteger(0);
             Runnable reindexTask = () -> {
                 try {
                     startLatch.await();
 
-                    // Create new segment
-                    long newSegmentId = segmentIdCounter.getAndIncrement();
-                    Path newGraphPath = tempDir.resolve("reindex-" + newSegmentId + ".graph");
+                    // Create new segment and get its actual ID
+                    long newSegmentId = storageEngine.createAndRegisterSegment();
+                    int graphNum = graphCounter.getAndIncrement();
+                    Path newGraphPath = tempDir.resolve("reindex-" + graphNum + ".graph");
                     HnswGraph newGraph = new HnswGraph(newGraphPath, config, distanceFunction, 10000);
 
                     // Register and index
@@ -738,7 +740,8 @@ class ReindexWhileQueryingIntegrationTest {
             Path oldGraphPath = tempDir.resolve("old-gap.graph");
             HnswGraph oldGraph = new HnswGraph(oldGraphPath, config, distanceFunction, 10000);
 
-            long oldSegmentId = 1L;
+            // Create and register old segment, using its actual ID
+            long oldSegmentId = storageEngine.createAndRegisterSegment();
             visibilityTracker.registerSegment(oldSegmentId, 0L);
             storageEngine.getTestCatalog().setSegmentState(oldSegmentId, LifecycleState.ACTIVE);
 
@@ -753,7 +756,8 @@ class ReindexWhileQueryingIntegrationTest {
             Path newGraphPath = tempDir.resolve("new-gap.graph");
             HnswGraph newGraph = new HnswGraph(newGraphPath, config, distanceFunction, 10000);
 
-            long newSegmentId = 2L;
+            // Create and register new segment, using its actual ID
+            long newSegmentId = storageEngine.createAndRegisterSegment();
             visibilityTracker.registerSegment(newSegmentId, visibilityTracker.currentEpoch());
             storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.INDEXING);
             visibilityTracker.advanceEpoch();
@@ -888,12 +892,21 @@ class ReindexWhileQueryingIntegrationTest {
 
     /**
      * Minimal StorageEngine for testing.
+     *
+     * <p>Stores real Segment instances mapped by their actual segment IDs.
+     * Segments are registered by their internally-generated IDs.</p>
      */
     private static class TestStorageEngine extends StorageEngine {
         private final TestSegmentCatalog catalog;
+        private final ConcurrentHashMap<Long, Segment> segments = new ConcurrentHashMap<>();
+        private final Arena arena;
+        private final Path dataDir;
+        private final AtomicLong segmentFileCounter = new AtomicLong(0);
 
-        TestStorageEngine(Path dataDir) throws IOException {
+        TestStorageEngine(Path dataDir, Arena arena) throws IOException {
             super(dataDir, Arena.ofShared());
+            this.dataDir = dataDir;
+            this.arena = arena;
             this.catalog = new TestSegmentCatalog();
         }
 
@@ -906,13 +919,48 @@ class ReindexWhileQueryingIntegrationTest {
             return catalog;
         }
 
+        /**
+         * Creates and registers a new Segment, returning its actual ID.
+         *
+         * <p>This method creates a real memory-mapped Segment file and registers it
+         * using the Segment's internally-generated ID. The returned ID should be used
+         * for visibility tracking and catalog registration.</p>
+         *
+         * @return The created Segment's actual ID
+         * @throws IOException if the segment file cannot be created
+         */
+        long createAndRegisterSegment() throws IOException {
+            long fileNum = segmentFileCounter.getAndIncrement();
+            Path segmentPath = dataDir.resolve("segment_" + fileNum + ".dat");
+            Segment segment = new Segment(segmentPath, 1024 * 1024, arena); // 1MB segment
+            long segmentId = segment.segmentId();
+            segments.put(segmentId, segment);
+            return segmentId;
+        }
+
+        /**
+         * Registers an existing Segment by its actual ID.
+         *
+         * @param segment The Segment to register
+         */
+        void registerSegment(Segment segment) {
+            segments.put(segment.segmentId(), segment);
+        }
+
         @Override
         public Segment getSegment(long segmentId) {
-            return null;
+            return segments.get(segmentId);
         }
 
         public void close() {
-            // Cleanup
+            for (Segment segment : segments.values()) {
+                try {
+                    segment.close();
+                } catch (Exception e) {
+                    // Ignore close errors during cleanup
+                }
+            }
+            segments.clear();
         }
     }
 
