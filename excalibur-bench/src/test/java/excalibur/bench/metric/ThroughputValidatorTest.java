@@ -45,12 +45,14 @@ class ThroughputValidatorTest {
         }
 
         @Test
-        @DisplayName("Very large positive throughput should pass validation")
-        void veryLargePositiveThroughput_shouldPass() {
+        @DisplayName("Very large positive throughput should pass basic validation with warning")
+        void veryLargePositiveThroughput_shouldPassWithWarning() {
+            // 1B ops/sec passes basic validation but gets a warning (exceeds 100M physical limit)
             ThroughputValidator.ValidationResult result = ThroughputValidator.validate(1_000_000_000.0);
 
             assertThat(result.valid()).isTrue();
             assertThat(result.throughput()).isEqualTo(1_000_000_000.0);
+            assertThat(result.hasWarnings()).isTrue(); // Exceeds physical maximum
         }
 
         @Test
@@ -114,17 +116,18 @@ class ThroughputValidatorTest {
 
             assertThat(result.valid()).isTrue();
             assertThat(result.hasWarnings()).isTrue();
-            assertThat(result.warnings()).contains("below reasonable minimum");
+            assertThat(result.warnings()).contains("below physical minimum");
         }
 
         @Test
         @DisplayName("Very high throughput should generate warning")
         void veryHighThroughput_shouldWarn() {
-            ThroughputValidator.ValidationResult result = ThroughputValidator.validate(5_000_000_000.0);
+            // 500M exceeds the 100M physical limit
+            ThroughputValidator.ValidationResult result = ThroughputValidator.validate(500_000_000.0);
 
             assertThat(result.valid()).isTrue();
             assertThat(result.hasWarnings()).isTrue();
-            assertThat(result.warnings()).contains("exceeds reasonable maximum");
+            assertThat(result.warnings()).contains("exceeds physical maximum");
         }
 
         @Test
@@ -520,6 +523,140 @@ class ThroughputValidatorTest {
         }
     }
 
+    // ==================== Physical Limits Tests ====================
+
+    @Nested
+    @DisplayName("Physical Limits (1K-100M ops/sec)")
+    class PhysicalLimitsTests {
+
+        @Test
+        @DisplayName("Physical minimum constant should be 1K")
+        void physicalMinConstant() {
+            assertThat(ThroughputValidator.PHYSICAL_MIN_THROUGHPUT).isEqualTo(1_000.0);
+        }
+
+        @Test
+        @DisplayName("Physical maximum constant should be 100M")
+        void physicalMaxConstant() {
+            assertThat(ThroughputValidator.PHYSICAL_MAX_THROUGHPUT).isEqualTo(100_000_000.0);
+        }
+
+        @Test
+        @DisplayName("Throughput within physical limits should pass strict validation")
+        void withinPhysicalLimits_shouldPass() {
+            // 50M ops/sec is within 1K-100M range
+            ThroughputValidator.ValidationResult result =
+                ThroughputValidator.validateWithinPhysicalLimits(50_000_000.0);
+
+            assertThat(result.valid()).isTrue();
+            assertThat(result.hasErrors()).isFalse();
+        }
+
+        @Test
+        @DisplayName("Throughput at physical minimum (1K) should pass")
+        void atPhysicalMin_shouldPass() {
+            ThroughputValidator.ValidationResult result =
+                ThroughputValidator.validateWithinPhysicalLimits(1_000.0);
+
+            assertThat(result.valid()).isTrue();
+        }
+
+        @Test
+        @DisplayName("Throughput at physical maximum (100M) should pass")
+        void atPhysicalMax_shouldPass() {
+            ThroughputValidator.ValidationResult result =
+                ThroughputValidator.validateWithinPhysicalLimits(100_000_000.0);
+
+            assertThat(result.valid()).isTrue();
+        }
+
+        @Test
+        @DisplayName("Throughput below physical minimum should fail strict validation")
+        void belowPhysicalMin_shouldFail() {
+            ThroughputValidator.ValidationResult result =
+                ThroughputValidator.validateWithinPhysicalLimits(500.0);
+
+            assertThat(result.valid()).isFalse();
+            assertThat(result.errors()).contains("below physical minimum");
+        }
+
+        @Test
+        @DisplayName("Throughput above physical maximum should fail strict validation")
+        void abovePhysicalMax_shouldFail() {
+            ThroughputValidator.ValidationResult result =
+                ThroughputValidator.validateWithinPhysicalLimits(500_000_000.0);
+
+            assertThat(result.valid()).isFalse();
+            assertThat(result.errors()).contains("exceeds physical maximum");
+        }
+
+        @Test
+        @DisplayName("isWithinPhysicalLimits should return true for valid range")
+        void isWithinPhysicalLimits_valid() {
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(1_000.0)).isTrue();
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(50_000_000.0)).isTrue();
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(100_000_000.0)).isTrue();
+        }
+
+        @Test
+        @DisplayName("isWithinPhysicalLimits should return false for out-of-range values")
+        void isWithinPhysicalLimits_invalid() {
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(500.0)).isFalse();
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(500_000_000.0)).isFalse();
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(0.0)).isFalse();
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(-1.0)).isFalse();
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(Double.NaN)).isFalse();
+        }
+
+        @Test
+        @DisplayName("clampToPhysicalLimits should clamp values to range")
+        void clampToPhysicalLimits() {
+            // Value within range - unchanged
+            assertThat(ThroughputValidator.clampToPhysicalLimits(50_000_000.0)).isEqualTo(50_000_000.0);
+
+            // Value below min - clamped to min
+            assertThat(ThroughputValidator.clampToPhysicalLimits(500.0)).isEqualTo(1_000.0);
+
+            // Value above max - clamped to max
+            assertThat(ThroughputValidator.clampToPhysicalLimits(500_000_000.0)).isEqualTo(100_000_000.0);
+
+            // Invalid values - clamped to min
+            assertThat(ThroughputValidator.clampToPhysicalLimits(0.0)).isEqualTo(1_000.0);
+            assertThat(ThroughputValidator.clampToPhysicalLimits(-1.0)).isEqualTo(1_000.0);
+            assertThat(ThroughputValidator.clampToPhysicalLimits(Double.NaN)).isEqualTo(1_000.0);
+            assertThat(ThroughputValidator.clampToPhysicalLimits(Double.POSITIVE_INFINITY)).isEqualTo(1_000.0);
+        }
+
+        @ParameterizedTest
+        @ValueSource(doubles = {
+            1_000.0,       // Exactly at min
+            10_000.0,      // 10K
+            1_000_000.0,   // 1M
+            10_000_000.0,  // 10M
+            50_000_000.0,  // 50M
+            100_000_000.0  // Exactly at max
+        })
+        @DisplayName("Values within physical limits (1K-100M) should pass")
+        void valuesWithinPhysicalLimits(double value) {
+            assertThat(ThroughputValidator.isWithinPhysicalLimits(value)).isTrue();
+            assertThat(ThroughputValidator.validateWithinPhysicalLimits(value).valid()).isTrue();
+        }
+
+        @ParameterizedTest
+        @ValueSource(doubles = {
+            1.0,           // Way below min
+            100.0,         // Below min
+            999.999,       // Just below min
+            100_000_001.0, // Just above max
+            1_000_000_000.0, // 1B - way above max
+            Double.MAX_VALUE // Maximum double
+        })
+        @DisplayName("Values outside physical limits should fail strict validation")
+        void valuesOutsidePhysicalLimits(double value) {
+            assertThat(ThroughputValidator.validateWithinPhysicalLimits(value).valid()).isFalse();
+        }
+    }
+
     // ==================== Edge Cases ====================
 
     @Nested
@@ -543,7 +680,7 @@ class ThroughputValidatorTest {
                 ThroughputValidator.validate(Double.MAX_VALUE);
 
             assertThat(result.valid()).isTrue();
-            assertThat(result.hasWarnings()).isTrue(); // Exceeds reasonable maximum
+            assertThat(result.hasWarnings()).isTrue(); // Exceeds physical maximum (100M)
         }
 
         @Test

@@ -221,6 +221,13 @@ public final class BenchmarkResult {
     }
 
     /**
+     * Gets the p0 (minimum) latency metric, if available.
+     */
+    public BenchmarkMetric getP0() {
+        return getMetric("p0");
+    }
+
+    /**
      * Formats the result as a summary string.
      */
     public String formatSummary() {

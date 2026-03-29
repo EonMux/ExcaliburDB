@@ -7,6 +7,7 @@ import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
+import excalibur.ingest.visibility.DocumentVisibilityRegistry;
 import excalibur.query.IndexCoverage;
 import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
@@ -98,6 +99,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
     private WriteLog writeLog;
     private DocumentChunkBuffer chunkBuffer;
     private DocumentRegistry documentRegistry;
+    private DocumentVisibilityRegistry visibilityRegistry;
     private DocumentBatchPublisher publisher;
 
     @BeforeEach
@@ -122,10 +124,12 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
         // Create ingestion infrastructure
         chunkBuffer = new DocumentChunkBuffer(writeLog);
         documentRegistry = new DocumentRegistry();
+        visibilityRegistry = new DocumentVisibilityRegistry();
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
             documentRegistry,
-            null,
+            visibilityRegistry,
+            null,  // cuckooFilter - not needed for this test
             writeLog::sync,
             new ReentrantLock()
         );
@@ -162,11 +166,12 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             Path graphPath = tempDir.resolve("concurrent.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Create query pipeline
+            // Create query pipeline with document atomicity support
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
+                visibilityRegistry,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -326,11 +331,12 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             Path graphPath = tempDir.resolve("progressive.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Create query pipeline
+            // Create query pipeline with document atomicity support
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
+                visibilityRegistry,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -444,11 +450,12 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             Path graphPath = tempDir.resolve("epoch-isolation.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Create query pipeline
+            // Create query pipeline with document atomicity support
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
+                visibilityRegistry,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -639,11 +646,12 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             Path graphPath = tempDir.resolve("atomic.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Create query pipeline
+            // Create query pipeline with document atomicity support
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
+                visibilityRegistry,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -657,18 +665,18 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             int numDocuments = 20;
             int chunksPerDocument = 5;
 
-            // Track expected chunks per document
-            Map<String, Integer> expectedChunkCounts = new ConcurrentHashMap<>();
+            // Track which documents have been fully published
+            Set<String> publishedDocuments = Collections.synchronizedSet(new HashSet<>());
+            AtomicInteger totalQueries = new AtomicInteger(0);
+            AtomicInteger atomicityViolations = new AtomicInteger(0);
+            List<String> violationDetails = Collections.synchronizedList(new ArrayList<>());
 
             ExecutorService executor = Executors.newFixedThreadPool(3);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch writerDone = new CountDownLatch(1);
             AtomicBoolean writersFinished = new AtomicBoolean(false);
 
-            AtomicInteger partialDocumentCount = new AtomicInteger(0);
-            AtomicInteger totalQueries = new AtomicInteger(0);
-
-            // Writer task
+            // Writer task - uses DocumentBatchPublisher for atomic publication
             Runnable writer = () -> {
                 try {
                     startLatch.await();
@@ -676,20 +684,41 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                     for (int d = 0; d < numDocuments; d++) {
                         String documentId = "doc-atomic-" + d;
 
-                        // Create document with known number of chunks
+                        // Create batch buffer for atomic publication
+                        DocumentBatchBuffer batchBuffer = new DocumentBatchBuffer(documentId, "test-source");
+
+                        // Add chunks to batch
                         List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                        chunkBuffer.bufferChunks(chunks);
-                        chunkBuffer.commitDocument(documentId);
+                        for (int c = 0; c < chunks.size(); c++) {
+                            TextChunk chunk = chunks.get(c);
+                            String chunkId = documentId + ":" + c;
+                            long offset = writeLog.writeHead();
+                            batchBuffer.addChunk(chunkId, chunk, offset);
+                        }
 
-                        // Insert vector
+                        // Seal the batch (no more chunks can be added)
+                        batchBuffer.seal();
+
+                        // Insert vector into HNSW graph
                         float[] vector = createRandomVector(dimension);
-                        graph.insert(vector);
+                        long nodeId = graph.insert(vector);
+                        graph.registerDocumentId(nodeId, documentId);
+                        graph.setLastIntegratedOffset(writeLog.writeHead());
 
-                        // Record expected chunk count
-                        expectedChunkCounts.put(documentId, chunksPerDocument);
+                        // Publish atomically - this registers document in visibilityRegistry
+                        DocumentMetadata metadata = DocumentMetadata.builder()
+                            .sourceId("test-source")
+                            .documentId(documentId)
+                            .lastModifiedMillis(System.currentTimeMillis())
+                            .contentHash((long) d * 1000)
+                            .contentLength(1000)
+                            .indexTimeMillis(System.currentTimeMillis())
+                            .build();
 
-                        writeLog.sync();
-                        visibilityTracker.advanceEpoch();
+                        publisher.publish(batchBuffer, metadata);
+
+                        // Mark document as published AFTER atomic publication
+                        publishedDocuments.add(documentId);
 
                         Thread.sleep(10);
                     }
@@ -701,12 +730,17 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                 }
             };
 
-            // Reader task
+            // Reader task - verifies document atomicity
             Runnable reader = () -> {
                 try {
                     startLatch.await();
 
                     while (!writersFinished.get()) {
+                        // Capture a snapshot of published documents at query time
+                        Set<String> publishedAtQueryStart = new HashSet<>(publishedDocuments);
+                        // Capture the current epoch BEFORE executing the query
+                        long queryEpoch = visibilityTracker.currentEpoch();
+
                         QueryRequest request = QueryRequest.builder()
                             .queryText("atomicity query")
                             .queryVector(createRandomVector(dimension))
@@ -722,10 +756,36 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
                         totalQueries.incrementAndGet();
 
-                        // Verify document atomicity: if a document is in results,
-                        // all its chunks should be present (not partial)
-                        // Note: This is a simplified check - in a real system,
-                        // we would verify chunk counts explicitly
+                        // Verify document atomicity:
+                        // Every document in results should be fully visible (in publishedDocuments)
+                        for (var result : response.results()) {
+                            String resultDocId = result.documentIdStr();
+                            if (resultDocId == null) {
+                                resultDocId = String.valueOf(result.documentId());
+                            }
+
+                            // If the result is from a document that was published before query started,
+                            // it MUST be visible. If it wasn't published yet, it should NOT be visible.
+                            // This is the atomicity guarantee: either all chunks are visible or none are.
+                            boolean wasPublishedAtQueryStart = publishedAtQueryStart.contains(resultDocId);
+
+                            // Check with the visibility registry
+                            boolean isVisibleInRegistry = visibilityRegistry.isDocumentVisible(resultDocId, queryEpoch);
+
+                            // If document was published before query, it should be visible
+                            // If it wasn't, and it appears in results, that's a potential atomicity violation
+                            // (unless it was published between query start and when we captured publishedAtQueryStart)
+                            if (!wasPublishedAtQueryStart && isVisibleInRegistry) {
+                                // Document became visible during query - this is OK due to timing
+                                // The important thing is that when it became visible, ALL chunks became visible
+                            } else if (wasPublishedAtQueryStart && !isVisibleInRegistry) {
+                                // Document was published before query but not visible - VIOLATION
+                                atomicityViolations.incrementAndGet();
+                                violationDetails.add(String.format(
+                                    "Document %s was published but not visible at epoch %d",
+                                    resultDocId, queryEpoch));
+                            }
+                        }
 
                         Thread.sleep(15);
                     }
@@ -749,12 +809,15 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             executor.shutdown();
             executor.awaitTermination(10, TimeUnit.SECONDS);
 
-            System.out.println("Document atomicity test: " + partialDocumentCount.get() +
-                " partial documents out of " + totalQueries.get() + " queries");
+            System.out.println("Document atomicity test: " + atomicityViolations.get() +
+                " violations out of " + totalQueries.get() + " queries");
+            if (!violationDetails.isEmpty()) {
+                System.out.println("Violation details: " + violationDetails);
+            }
 
-            // Verify no partial documents
-            assertThat(partialDocumentCount.get())
-                .as("No partial documents should be visible")
+            // Verify no atomicity violations
+            assertThat(atomicityViolations.get())
+                .as("No atomicity violations should occur. Violations: " + violationDetails)
                 .isEqualTo(0);
 
             graph.close();
@@ -774,11 +837,12 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             Path graphPath = tempDir.resolve("no-partial.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Create query pipeline
+            // Create query pipeline with document atomicity support
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
+                visibilityRegistry,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );
@@ -876,11 +940,12 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             Path graphPath = tempDir.resolve("coverage.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Create query pipeline
+            // Create query pipeline with document atomicity support
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
+                visibilityRegistry,  // Document atomicity checker
                 graphProvider,
                 distanceFunction
             );

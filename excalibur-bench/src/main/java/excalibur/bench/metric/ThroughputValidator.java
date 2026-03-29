@@ -8,17 +8,19 @@ package excalibur.bench.metric;
  * <ul>
  *   <li>Throughput must be a positive number (> 0)</li>
  *   <li>Throughput must be finite (not NaN or Infinite)</li>
- *   <li>Throughput values should be in reasonable ranges for the benchmark type</li>
+ *   <li>Throughput values should be within physical limits (1K-100M ops/sec)</li>
  * </ul>
  *
  * <h2>Domain Correctness Rules</h2>
  * <ul>
  *   <li>Throughput represents operations per second</li>
  *   <li>Zero or negative throughput is physically impossible for real operations</li>
+ *   <li>Physical limits: 1,000 to 100,000,000 ops/sec (1K-100M)</li>
+ *   <li>Rationale for 100M max: ~100ns/op ≈ 300-500 CPU cycles at 3-5GHz, realistic for single-threaded</li>
  *   <li>Typical ranges:</li>
  *   <ul>
  *     <li>Single-threaded hash lookup: 1M - 100M ops/sec</li>
- *     <li>Vector distance computation: 10M - 200M ops/sec</li>
+ *     <li>Vector distance computation: 10M - 100M ops/sec</li>
  *     <li>HNSW search: 1K - 100K QPS</li>
  *     <li>End-to-end query: 100 - 10K QPS</li>
  *   </ul>
@@ -39,16 +41,31 @@ public final class ThroughputValidator {
     public static final double MIN_THROUGHPUT = Double.MIN_VALUE;
 
     /**
+     * Physical minimum throughput (1K ops/sec).
+     * Values below this indicate the operation is not meaningfully measurable.
+     * This is the lower bound of the valid physical range.
+     */
+    public static final double PHYSICAL_MIN_THROUGHPUT = 1_000.0;
+
+    /**
+     * Physical maximum throughput (100M ops/sec).
+     * This is the upper bound of the valid physical range for single-threaded operations.
+     * Rationale: 100M ops/sec = ~100ns/op ≈ 300-500 CPU cycles at 3-5GHz.
+     * Values above this exceed physical limits for single-threaded code.
+     */
+    public static final double PHYSICAL_MAX_THROUGHPUT = 100_000_000.0;
+
+    /**
      * Reasonable minimum for single-threaded operations (1K ops/sec).
      * Values below this may indicate measurement issues.
      */
-    public static final double REASONABLE_MIN_THROUGHPUT = 1_000.0;
+    public static final double REASONABLE_MIN_THROUGHPUT = PHYSICAL_MIN_THROUGHPUT;
 
     /**
-     * Reasonable maximum for single-threaded operations (1B ops/sec).
-     * Values above this are likely measurement errors.
+     * Reasonable maximum for single-threaded operations (100M ops/sec).
+     * Values above this exceed physical limits and likely indicate measurement errors.
      */
-    public static final double REASONABLE_MAX_THROUGHPUT = 1_000_000_000.0;
+    public static final double REASONABLE_MAX_THROUGHPUT = PHYSICAL_MAX_THROUGHPUT;
 
     /**
      * Target throughput for point lookups (10M ops/sec).
@@ -120,18 +137,100 @@ public final class ThroughputValidator {
         // Check for unreasonably low throughput (may indicate measurement issues)
         if (opsPerSec < REASONABLE_MIN_THROUGHPUT) {
             warnings.append(String.format(
-                "WARNING: %s (%.2f ops/sec) is below reasonable minimum (%.0f ops/sec) - may indicate measurement issues; ",
+                "WARNING: %s (%.2f ops/sec) is below physical minimum (%.0f ops/sec = 1K) - may indicate measurement issues; ",
                 name, opsPerSec, REASONABLE_MIN_THROUGHPUT));
         }
 
         // Check for unreasonably high throughput (may indicate measurement errors)
         if (opsPerSec > REASONABLE_MAX_THROUGHPUT) {
             warnings.append(String.format(
-                "WARNING: %s (%.2e ops/sec) exceeds reasonable maximum (%.0e ops/sec) - may indicate measurement error; ",
+                "WARNING: %s (%.2e ops/sec) exceeds physical maximum (%.0e ops/sec = 100M) - may indicate measurement error; ",
                 name, opsPerSec, REASONABLE_MAX_THROUGHPUT));
         }
 
         return new ValidationResult(true, errors.toString(), warnings.toString(), opsPerSec, true);
+    }
+
+    /**
+     * Validates that throughput is within physical limits (1K-100M ops/sec).
+     *
+     * <p>This is a stricter validation than {@link #validate(double)} that requires
+     * throughput to be within the physically achievable range for single-threaded operations.</p>
+     *
+     * <p>Physical limits rationale:</p>
+     * <ul>
+     *   <li>Minimum (1K): Below this, the operation is not meaningfully measurable</li>
+     *   <li>Maximum (100M): ~100ns/op ≈ 300-500 CPU cycles at 3-5GHz</li>
+     * </ul>
+     *
+     * @param opsPerSec the throughput value in operations per second
+     * @return a validation result indicating success or failure with details
+     */
+    public static ValidationResult validateWithinPhysicalLimits(double opsPerSec) {
+        return validateWithinPhysicalLimits(opsPerSec, "throughput");
+    }
+
+    /**
+     * Validates that throughput is within physical limits with a custom metric name.
+     *
+     * @param opsPerSec the throughput value in operations per second
+     * @param name the name of the metric for error messages
+     * @return a validation result indicating success or failure with details
+     */
+    public static ValidationResult validateWithinPhysicalLimits(double opsPerSec, String name) {
+        // First validate basic correctness (positive, finite)
+        ValidationResult baseResult = validate(opsPerSec, name);
+        if (!baseResult.valid()) {
+            return baseResult;
+        }
+
+        StringBuilder warnings = new StringBuilder(baseResult.warnings());
+        StringBuilder errors = new StringBuilder();
+
+        // Check physical minimum (1K ops/sec)
+        if (opsPerSec < PHYSICAL_MIN_THROUGHPUT) {
+            errors.append(String.format(
+                "%s (%.2f ops/sec) is below physical minimum (%.0f ops/sec = 1K) - value is outside valid range; ",
+                name, opsPerSec, PHYSICAL_MIN_THROUGHPUT));
+            return new ValidationResult(false, errors.toString(), warnings.toString(), opsPerSec, false);
+        }
+
+        // Check physical maximum (100M ops/sec)
+        if (opsPerSec > PHYSICAL_MAX_THROUGHPUT) {
+            errors.append(String.format(
+                "%s (%.2e ops/sec) exceeds physical maximum (%.0e ops/sec = 100M) - value exceeds single-threaded limits; ",
+                name, opsPerSec, PHYSICAL_MAX_THROUGHPUT));
+            return new ValidationResult(false, errors.toString(), warnings.toString(), opsPerSec, false);
+        }
+
+        return new ValidationResult(true, errors.toString(), warnings.toString(), opsPerSec, true);
+    }
+
+    /**
+     * Checks if a throughput value is within physical limits (1K-100M ops/sec).
+     *
+     * @param opsPerSec the throughput value to check
+     * @return true if throughput is within physical limits
+     */
+    public static boolean isWithinPhysicalLimits(double opsPerSec) {
+        return isValid(opsPerSec) &&
+               opsPerSec >= PHYSICAL_MIN_THROUGHPUT &&
+               opsPerSec <= PHYSICAL_MAX_THROUGHPUT;
+    }
+
+    /**
+     * Clamps a throughput value to physical limits (1K-100M ops/sec).
+     *
+     * <p>If the value is invalid (NaN, infinite, zero, negative), returns the minimum.</p>
+     *
+     * @param opsPerSec the throughput value to clamp
+     * @return the value clamped to physical limits
+     */
+    public static double clampToPhysicalLimits(double opsPerSec) {
+        if (!isValid(opsPerSec)) {
+            return PHYSICAL_MIN_THROUGHPUT;
+        }
+        return Math.max(PHYSICAL_MIN_THROUGHPUT, Math.min(PHYSICAL_MAX_THROUGHPUT, opsPerSec));
     }
 
     /**

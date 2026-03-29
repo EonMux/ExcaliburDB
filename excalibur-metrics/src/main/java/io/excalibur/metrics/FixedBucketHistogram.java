@@ -226,6 +226,16 @@ public final class FixedBucketHistogram {
 
     // Convenience methods for common percentiles (static for Metrics access)
     /**
+     * Gets the p0 (minimum) latency value.
+     * This is the minimum recorded latency, representing the 0th percentile.
+     *
+     * @return the minimum latency in milliseconds
+     */
+    public static long getP0() {
+        return histogram.getMinimum();
+    }
+
+    /**
      * Gets the p50 (median) percentile value.
      */
     public static long getP50() {

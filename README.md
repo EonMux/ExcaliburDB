@@ -6,16 +6,19 @@ A disk-backed vector similarity search engine with LLM-based relevancy scoring. 
 
 ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-copy, memory-mapped file I/O. It handles vector indexes larger than available RAM by keeping data on disk and navigating graphs directly from memory-mapped regions.
 
-Key components:
-- **HNSW graphs** for approximate nearest neighbor search with configurable efConstruction and efSearch
-- **Cuckoo filters** for probabilistic set membership with deletion support
+### Key Features
+
+- **HNSW (Hierarchical Navigable Small World) graphs** for approximate nearest neighbor search with configurable efConstruction and efSearch parameters
+- **Cuckoo filters** for probabilistic set membership testing with deletion support
 - **LSH (Locality-Sensitive Hashing)** for coarse vector pre-filtering
 - **Product quantization** for compressed vector storage
-- **Epoch-based visibility tracking** for consistent query snapshots
+- **Epoch-based visibility tracking** for consistent query snapshots during concurrent ingestion
+- **LLM integration** for semantic relevancy scoring with circuit breaker fallback
+- **Queryability guarantee** - the system remains queryable at all times, including during initial indexing and re-indexing operations
 
 ## Requirements
 
-- Java 21 or later (required for Panama FFM and virtual threads)
+- Java 21 or later (required for Panama FFM API and virtual threads)
 - Gradle 8.11+ (included via wrapper)
 
 ## Building
@@ -24,13 +27,16 @@ Key components:
 # Build all modules
 ./gradlew build
 
-# Build fat JAR
+# Build without running tests
+./gradlew build -x test
+
+# Build fat JAR for deployment
 ./gradlew :excalibur-api:shadowJar
 
 # Run tests
 ./gradlew test
 
-# Run tests with coverage
+# Run tests with coverage reporting
 ./gradlew coverage
 ```
 
@@ -51,9 +57,15 @@ EXCALIBUR_PORT=9090 java --enable-preview --enable-native-access=ALL-UNNAMED -ja
 
 ## Configuration
 
-Configuration is loaded from `excalibur.properties` in the working directory by default. Environment variables can override properties.
+Configuration is loaded from `excalibur.properties` in the working directory by default. Environment variables can override properties using uppercase with underscores:
 
-### Key Configuration Options
+```bash
+export EXCALIBUR_LLM_API_KEY=sk-your-api-key-here
+export EXCALIBUR_LLM_BASE_URL=https://api.openai.com/v1
+export EXCALIBUR_PORT=9090
+```
+
+### Configuration Options
 
 | Property | Default | Description |
 |----------|---------|-------------|
@@ -63,6 +75,7 @@ Configuration is loaded from `excalibur.properties` in the working directory by 
 | `excalibur.query.recall-target` | 0.95 | Target recall for ANN search |
 | `excalibur.query.vector-dimensions` | 1536 | Vector dimensionality |
 | `excalibur.query.include-partial-segments` | true | Include indexing segments in queries |
+| `excalibur.query.llm-timeout-ms` | 60000 | LLM scoring timeout (ms) |
 | `excalibur.shard.segment-load-factor` | 0.7 | Segment load factor for splitting |
 | `excalibur.shard.default-ef-construction` | 128 | HNSW construction candidate list size |
 | `excalibur.shard.default-ef-search` | 64 | HNSW search candidate list size |
@@ -71,18 +84,12 @@ Configuration is loaded from `excalibur.properties` in the working directory by 
 | `excalibur.llm.chat-model` | gpt-4o-mini | Chat model for relevancy scoring |
 | `excalibur.llm.embedding-model` | text-embedding-3-small | Embedding model name |
 | `excalibur.llm.relevancy-threshold` | 0.3 | Minimum relevancy score (0.0-1.0) |
+| `excalibur.llm.timeout-ms` | 60000 | LLM request timeout (ms) |
+| `excalibur.llm.max-retries` | 3 | Maximum retry attempts |
+| `excalibur.llm.failure-threshold` | 5 | Failures before circuit opens |
+| `excalibur.llm.cooldown-period-ms` | 60000 | Circuit breaker cooldown (ms) |
 | `excalibur.health.readiness-threshold` | 0.5 | Readiness coverage threshold |
 | `excalibur.health.healthy-threshold` | 0.9 | Healthy coverage threshold |
-
-### Environment Variable Overrides
-
-Properties can be overridden via environment variables using uppercase with underscores:
-
-```bash
-export EXCALIBUR_LLM_API_KEY=sk-your-api-key-here
-export EXCALIBUR_LLM_BASE_URL=https://api.openai.com/v1
-export EXCALIBUR_PORT=9090
-```
 
 ## HTTP API
 
@@ -99,7 +106,7 @@ ExcaliburDB exposes an HTTP API on port 8080 by default.
 | `POST` | `/v1/reindex` | Force reindex of a source |
 | `GET` | `/v1/ingest/status` | Get ingestion status by source |
 
-### Query Endpoint
+### Query Example
 
 ```bash
 curl -X POST http://localhost:8080/v1/query \
@@ -134,7 +141,7 @@ curl -X POST http://localhost:8080/v1/query \
 }
 ```
 
-### Ingest Endpoint
+### Ingest Example
 
 ```bash
 curl -X POST http://localhost:8080/v1/ingest \
@@ -150,7 +157,7 @@ curl -X POST http://localhost:8080/v1/ingest \
   }'
 ```
 
-### Stats Endpoint
+### Stats Example
 
 ```bash
 curl http://localhost:8080/v1/stats
@@ -173,13 +180,13 @@ curl http://localhost:8080/v1/stats
   "hnsw": {"queueDepth": 50000, "queueDepthLimit": 100000, "vectorsIntegrated": 14000000},
   "cuckoo": {"pendingDeletions": 100, "totalDeletions": 5000},
   "visibility": {"epoch": 42, "registeredSegments": 1024, "visibleSegments": 1024},
-  "coverage": 0.9600
+  "coverage": 0.96
 }
 ```
 
 ## Architecture
 
-ExcaliburDB is organized into modules:
+### Module Structure
 
 | Module | Description |
 |--------|-------------|
@@ -194,6 +201,9 @@ ExcaliburDB is organized into modules:
 | `excalibur-api` | HTTP server and API endpoints |
 | `excalibur-metrics` | JMX metrics and observability |
 | `excalibur-config` | Configuration loading and validation |
+| `excalibur-test` | Test utilities and fixtures |
+| `excalibur-integration` | Integration tests |
+| `excalibur-bench` | JMH benchmarks |
 
 ### Query Pipeline
 
@@ -202,9 +212,11 @@ Queries execute through a 6-stage pipeline:
 1. **Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
 2. **Cuckoo Filter Cascade** - Eliminate segments that cannot contain relevant terms
 3. **LSH Pre-filter** - Coarse vector similarity filtering
-4. **HNSW Vector Search** - Precise ANN search with tail scan
+4. **HNSW Vector Search** - Precise ANN search with tail scan for unindexed entries
 5. **Full Vector Rerank** - Exact distance computation on candidates
 6. **LLM Relevancy Scoring** - Optional semantic relevancy scoring
+
+Each stage checks for cancellation and timeout, allowing queries to return partial results if time-constrained.
 
 ### Storage Model
 
@@ -213,7 +225,16 @@ Data is organized into segments, each backed by memory-mapped files:
 - Hash-based routing provides O(1) segment lookup
 - Append-only write log with CRC32 checksums
 - Background compaction removes tombstones without blocking reads
-- Elastic segment splitting based on load factor thresholds
+- Elastic segment splitting based on load factor thresholds (default 0.7)
+
+### Visibility and Consistency
+
+The system uses epoch-based visibility tracking to ensure:
+
+- Queries see a consistent snapshot of data
+- No torn reads during concurrent ingestion
+- Document atomicity - all chunks of a document become visible together
+- Monotonic epoch advancement
 
 ## Development
 
@@ -247,6 +268,21 @@ excaliburdb/
 ./gradlew :excalibur-bench:jmh --tests "MappedFileBenchmark"
 ```
 
+Available benchmarks:
+- `CuckooFilterBenchmark` - Filter lookup/insert operations
+- `CuckooFilterFPRateBenchmark` - False positive rate measurement
+- `CuckooFilterDeleteBenchmark` - Deletion operations
+- `DistanceBenchmark` - Distance function performance
+- `DistanceVectorApiBenchmark` - SIMD-accelerated distance
+- `EndToEndQueryBenchmark` - Full query pipeline latency
+- `HashBenchmark` - Hash function throughput
+- `HnswRecallBenchmark` - HNSW recall@10 measurement
+- `MappedFileBenchmark` - Memory-mapped I/O throughput
+- `PointLookupBenchmark` - Storage point lookup
+- `SegmentBenchmark` - Segment-level operations
+- `TailScanBenchmark` - Brute-force scan throughput
+- `VectorLayoutBenchmark` - Vector memory layout
+
 ### Test Coverage
 
 The project maintains 80% minimum test coverage. Run coverage reports:
@@ -256,8 +292,24 @@ The project maintains 80% minimum test coverage. Run coverage reports:
 ```
 
 Reports are generated at:
-- `build/reports/jacoco/COVERAGE_SUMMARY.html`
-- `build/reports/jacoco/aggregate/html/index.html`
+- `build/reports/jacoco/COVERAGE_SUMMARY.html` - Summary report
+- `build/reports/jacoco/aggregate/html/index.html` - Detailed aggregate report
+
+To analyze coverage gaps:
+```bash
+./gradlew coverageGaps
+```
+
+### Integration Tests
+
+Integration tests verify the core system requirements:
+
+- `ColdStartIntegrationTest` - Empty index queries, progressive results
+- `ConcurrentQueryDuringIngestionIntegrationTest` - Epoch isolation, document atomicity
+- `ReindexWhileQueryingIntegrationTest` - Zero-downtime reindexing
+- `LLMUnavailabilityIntegrationTest` - Circuit breaker and fallback behavior
+- `DeletionCorrectnessIntegrationTest` - Cuckoo filter deletion correctness
+- `FullPipelineIntegrationTest` - End-to-end ingestion and query
 
 ## License
 

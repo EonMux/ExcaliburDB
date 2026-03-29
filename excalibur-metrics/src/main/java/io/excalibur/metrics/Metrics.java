@@ -118,6 +118,14 @@ public final class Metrics {
     }
 
     /**
+     * Gets the p0 (minimum) query latency.
+     * This is the minimum recorded latency, representing the 0th percentile.
+     */
+    public static long getP0() {
+        return queryLatencyHistogram.getMinimum();
+    }
+
+    /**
      * Gets the p50 query latency.
      */
     public static long getP50() {
