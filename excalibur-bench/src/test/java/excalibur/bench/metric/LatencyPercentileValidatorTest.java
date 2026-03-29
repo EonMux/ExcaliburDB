@@ -65,18 +65,22 @@ class LatencyPercentileValidatorTest {
         }
 
         @Test
-        @DisplayName("Zero latency should be valid")
+        @DisplayName("Zero latency should FAIL validation (latency must be POSITIVE)")
         void testZeroLatency() {
+            // Domain correctness: Zero latency indicates measurement error
+            // Real operations take non-zero time; sub-ms operations need ns precision
             LatencyPercentileValidator.ValidationResult result =
                 LatencyPercentileValidator.validate(0.0, 0.0);
 
-            assertThat(result.valid()).isTrue();
+            assertThat(result.valid()).isFalse();
+            assertThat(result.errors()).contains("p50 must be POSITIVE");
+            assertThat(result.errors()).contains("p99 must be POSITIVE");
         }
     }
 
     @Nested
-    @DisplayName("Non-Negative Constraint")
-    class NonNegativeTests {
+    @DisplayName("Positive Constraint")
+    class PositiveConstraintTests {
 
         @Test
         @DisplayName("Negative p50 should fail validation")
@@ -85,7 +89,7 @@ class LatencyPercentileValidatorTest {
                 LatencyPercentileValidator.validate(-1.0, 10.0);
 
             assertThat(result.valid()).isFalse();
-            assertThat(result.errors()).contains("p50 must be non-negative");
+            assertThat(result.errors()).contains("p50 must be POSITIVE");
         }
 
         @Test
@@ -95,7 +99,7 @@ class LatencyPercentileValidatorTest {
                 LatencyPercentileValidator.validate(5.0, -1.0);
 
             assertThat(result.valid()).isFalse();
-            assertThat(result.errors()).contains("p99 must be non-negative");
+            assertThat(result.errors()).contains("p99 must be POSITIVE");
         }
 
         @Test
@@ -105,8 +109,28 @@ class LatencyPercentileValidatorTest {
                 LatencyPercentileValidator.validate(-5.0, -1.0);
 
             assertThat(result.valid()).isFalse();
-            assertThat(result.errors()).contains("p50 must be non-negative");
-            assertThat(result.errors()).contains("p99 must be non-negative");
+            assertThat(result.errors()).contains("p50 must be POSITIVE");
+            assertThat(result.errors()).contains("p99 must be POSITIVE");
+        }
+
+        @Test
+        @DisplayName("Zero p50 should fail validation (must be strictly positive)")
+        void testZeroP50() {
+            LatencyPercentileValidator.ValidationResult result =
+                LatencyPercentileValidator.validate(0.0, 10.0);
+
+            assertThat(result.valid()).isFalse();
+            assertThat(result.errors()).contains("p50 must be POSITIVE");
+        }
+
+        @Test
+        @DisplayName("Zero p99 should fail validation (must be strictly positive)")
+        void testZeroP99() {
+            LatencyPercentileValidator.ValidationResult result =
+                LatencyPercentileValidator.validate(5.0, 0.0);
+
+            assertThat(result.valid()).isFalse();
+            assertThat(result.errors()).contains("p99 must be POSITIVE");
         }
     }
 

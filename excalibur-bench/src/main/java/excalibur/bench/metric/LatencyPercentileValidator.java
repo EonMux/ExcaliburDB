@@ -7,14 +7,16 @@ package excalibur.bench.metric;
  * required for valid benchmark results:</p>
  * <ul>
  *   <li>p50 &lt; p99 (strict ordering for non-constant distributions)</li>
- *   <li>Both values are non-negative</li>
+ *   <li>Both values are POSITIVE (&gt; 0) - operations take non-zero time</li>
  *   <li>Both values are in milliseconds (not nanoseconds or other units)</li>
  *   <li>Values are within reasonable ranges for query latency</li>
  * </ul>
  *
  * <h2>Domain Correctness Rules</h2>
  * <ul>
- *   <li>Latency values must be non-negative (time cannot be negative)</li>
+ *   <li>Latency values must be POSITIVE (&gt; 0) - real operations take non-zero time</li>
+ *   <li>Zero latency indicates measurement error (sub-ms operations need ns precision)</li>
+ *   <li>Negative latency is physically impossible</li>
  *   <li>p50 must be strictly less than p99 (percentile ordering)</li>
  *   <li>Values in milliseconds should typically be &lt; 60000ms (1 minute)</li>
  *   <li>Values &gt; 1000ms may indicate incorrect unit (nanoseconds not converted)</li>
@@ -80,12 +82,13 @@ public final class LatencyPercentileValidator {
             return new ValidationResult(false, errors.toString(), warnings.toString());
         }
 
-        // Check non-negative
-        if (p50Ms < 0) {
-            errors.append("p50 must be non-negative, got: ").append(p50Ms).append("ms; ");
+        // Check POSITIVE values - latency must be > 0 (operations take non-zero time)
+        // Domain correctness: Zero latency indicates measurement error (sub-ms operations need ns precision)
+        if (p50Ms <= 0) {
+            errors.append("p50 must be POSITIVE (> 0 ms), got: ").append(p50Ms).append("ms; ");
         }
-        if (p99Ms < 0) {
-            errors.append("p99 must be non-negative, got: ").append(p99Ms).append("ms; ");
+        if (p99Ms <= 0) {
+            errors.append("p99 must be POSITIVE (> 0 ms), got: ").append(p99Ms).append("ms; ");
         }
 
         // Check strict ordering: p50 < p99

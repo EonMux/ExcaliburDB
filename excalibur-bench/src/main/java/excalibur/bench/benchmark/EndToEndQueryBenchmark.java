@@ -106,8 +106,8 @@ public class EndToEndQueryBenchmark {
     private float[][] queryVectors;
     private int queryIndex;
 
-    // Latency samples for percentile calculation
-    private List<Long> latencySamples;
+    // Latency samples for percentile calculation (Double for sub-millisecond precision)
+    private List<Double> latencySamples;
 
     @Setup(Level.Trial)
     public void setup() throws IOException {
@@ -301,13 +301,15 @@ public class EndToEndQueryBenchmark {
         QueryResponse response = queryPipeline.executeSync(request, token);
 
         long endTime = System.nanoTime();
-        long latencyMs = TimeUnit.NANOSECONDS.toMillis(endTime - startTime);
+        // Use floating-point division for sub-millisecond precision
+        // Domain correctness: Real latency should be positive, not truncated to 0
+        double latencyMs = (endTime - startTime) / 1_000_000.0;
 
         // Collect sample for percentile calculation
         latencySamples.add(latencyMs);
 
         bh.consume(response);
-        return latencyMs;
+        return (long) latencyMs;
     }
 
     /**
@@ -486,7 +488,7 @@ public class EndToEndQueryBenchmark {
             return 0.0;
         }
 
-        List<Long> sorted = latencySamples.stream()
+        List<Double> sorted = latencySamples.stream()
             .sorted()
             .toList();
 
@@ -608,6 +610,11 @@ public class EndToEndQueryBenchmark {
                 result.put(i, get(i));
             }
             return result;
+        }
+
+        @Override
+        public int size() {
+            return segmentCount;
         }
     }
 

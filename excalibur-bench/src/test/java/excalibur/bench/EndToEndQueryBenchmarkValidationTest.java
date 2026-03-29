@@ -250,9 +250,9 @@ class EndToEndQueryBenchmarkValidationTest {
     @Test
     @DisplayName("p50 and p99 percentiles should be correctly ordered")
     void testPercentilesAreOrdered() {
-        List<Long> latencies = new ArrayList<>();
+        List<Double> latenciesMs = new ArrayList<>();
 
-        // Collect latency samples
+        // Collect latency samples with sub-millisecond precision
         for (int i = 0; i < 100; i++) {
             QueryRequest request = QueryRequest.builder()
                 .queryText("percentile test query")
@@ -269,24 +269,27 @@ class EndToEndQueryBenchmarkValidationTest {
             queryPipeline.executeSync(request, token);
             long endTime = System.nanoTime();
 
-            latencies.add(TimeUnit.NANOSECONDS.toMillis(endTime - startTime));
+            // Convert to milliseconds with sub-ms precision using floating-point division
+            // Domain correctness: This preserves sub-millisecond latency values
+            double latencyMs = (endTime - startTime) / 1_000_000.0;
+            latenciesMs.add(latencyMs);
         }
 
         // Calculate percentiles
-        double p50 = calculatePercentile(latencies, 50);
-        double p99 = calculatePercentile(latencies, 99);
-        double p90 = calculatePercentile(latencies, 90);
-        double p10 = calculatePercentile(latencies, 10);
+        double p50 = calculatePercentileD(latenciesMs, 50);
+        double p99 = calculatePercentileD(latenciesMs, 99);
+        double p90 = calculatePercentileD(latenciesMs, 90);
+        double p10 = calculatePercentileD(latenciesMs, 10);
 
         System.out.println("Percentile latencies:");
-        System.out.printf("  p10: %.2f ms%n", p10);
-        System.out.printf("  p50: %.2f ms%n", p50);
-        System.out.printf("  p90: %.2f ms%n", p90);
-        System.out.printf("  p99: %.2f ms%n", p99);
+        System.out.printf("  p10: %.4f ms%n", p10);
+        System.out.printf("  p50: %.4f ms%n", p50);
+        System.out.printf("  p90: %.4f ms%n", p90);
+        System.out.printf("  p99: %.4f ms%n", p99);
 
         // Use LatencyPercentileValidator for comprehensive validation
         LatencyPercentileValidator.ValidationResult validation =
-            LatencyPercentileValidator.validate(p50, p99, latencies.size());
+            LatencyPercentileValidator.validate(p50, p99, latenciesMs.size());
 
         System.out.println("\n" + LatencyPercentileValidator.formatSummary(p50, p99));
 
@@ -309,14 +312,15 @@ class EndToEndQueryBenchmarkValidationTest {
             .as("p90 should be <= p99")
             .isLessThanOrEqualTo(p99);
 
-        // All percentiles should be non-negative
+        // All percentiles should be POSITIVE (latency > 0 for real operations)
+        // Domain correctness: Real operations take non-zero time
         assertThat(p50)
-            .as("p50 must be non-negative")
-            .isGreaterThanOrEqualTo(0.0);
+            .as("p50 must be POSITIVE (> 0 ms)")
+            .isGreaterThan(0.0);
 
         assertThat(p99)
-            .as("p99 must be non-negative")
-            .isGreaterThanOrEqualTo(0.0);
+            .as("p99 must be POSITIVE (> 0 ms)")
+            .isGreaterThan(0.0);
     }
 
     @Test
@@ -393,7 +397,8 @@ class EndToEndQueryBenchmarkValidationTest {
         int threadCount = 4;
         int queriesPerThread = 10;
         List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
-        List<Long> allLatencies = Collections.synchronizedList(new ArrayList<>());
+        // Use Double for sub-millisecond precision
+        List<Double> allLatenciesMs = Collections.synchronizedList(new ArrayList<>());
 
         Thread[] threads = new Thread[threadCount];
         for (int t = 0; t < threadCount; t++) {
@@ -417,7 +422,9 @@ class EndToEndQueryBenchmarkValidationTest {
                         QueryResponse response = queryPipeline.executeSync(request, token);
                         long endTime = System.nanoTime();
 
-                        allLatencies.add(TimeUnit.NANOSECONDS.toMillis(endTime - startTime));
+                        // Convert to milliseconds with sub-ms precision using floating-point division
+                        double latencyMs = (endTime - startTime) / 1_000_000.0;
+                        allLatenciesMs.add(latencyMs);
 
                         // Validate response
                         assertThat(response.results())
@@ -447,23 +454,23 @@ class EndToEndQueryBenchmarkValidationTest {
             .isEmpty();
 
         // Verify we got latency samples from all threads
-        assertThat(allLatencies)
+        assertThat(allLatenciesMs)
             .as("Should have latency samples from all threads")
             .hasSize(threadCount * queriesPerThread);
 
         // All latencies should be non-negative
-        for (Long latency : allLatencies) {
+        for (Double latency : allLatenciesMs) {
             assertThat(latency)
                 .as("All latencies should be non-negative")
-                .isGreaterThanOrEqualTo(0L);
+                .isGreaterThanOrEqualTo(0.0);
         }
 
-        double p50 = calculatePercentile(allLatencies, 50);
-        double p99 = calculatePercentile(allLatencies, 99);
+        double p50 = calculatePercentileD(allLatenciesMs, 50);
+        double p99 = calculatePercentileD(allLatenciesMs, 99);
 
         // Validate latency percentiles using LatencyPercentileValidator
         LatencyPercentileValidator.ValidationResult validation =
-            LatencyPercentileValidator.validate(p50, p99, allLatencies.size());
+            LatencyPercentileValidator.validate(p50, p99, allLatenciesMs.size());
 
         System.out.println("Concurrent query latency percentiles:");
         System.out.println(LatencyPercentileValidator.formatSummary(p50, p99));
@@ -500,6 +507,24 @@ class EndToEndQueryBenchmarkValidationTest {
         }
 
         List<Long> sorted = new ArrayList<>(values);
+        Collections.sort(sorted);
+
+        int index = (int) Math.ceil(percentile / 100.0 * sorted.size()) - 1;
+        index = Math.max(0, Math.min(index, sorted.size() - 1));
+
+        return sorted.get(index);
+    }
+
+    /**
+     * Calculates a percentile from a list of double values with sub-millisecond precision.
+     * Domain correctness: Preserves sub-millisecond latency values for accurate p50/p99 reporting.
+     */
+    private double calculatePercentileD(List<Double> values, int percentile) {
+        if (values.isEmpty()) {
+            return 0.0;
+        }
+
+        List<Double> sorted = new ArrayList<>(values);
         Collections.sort(sorted);
 
         int index = (int) Math.ceil(percentile / 100.0 * sorted.size()) - 1;
@@ -587,6 +612,11 @@ class EndToEndQueryBenchmarkValidationTest {
                 result.put(i, get(i));
             }
             return result;
+        }
+
+        @Override
+        public int size() {
+            return segmentCount;
         }
     }
 

@@ -988,6 +988,11 @@ class ReindexWhileQueryingIntegrationTest {
             return Collections.unmodifiableMap(segments);
         }
 
+        @Override
+        public int size() {
+            return segments.size();
+        }
+
         public void setSegmentState(long segmentId, LifecycleState state) {
             segments.compute(segmentId, (k, existing) -> {
                 if (existing == null) {

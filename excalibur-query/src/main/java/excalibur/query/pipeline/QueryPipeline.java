@@ -16,6 +16,7 @@ import excalibur.query.executor.ResultAggregator;
 import excalibur.query.executor.SegmentQueryTask;
 import excalibur.query.visibility.DocumentAtomicityFilter;
 import excalibur.query.visibility.QuerySnapshot;
+import excalibur.query.validation.DomainCorrectnessValidator;
 import excalibur.shard.VisibilityTracker;
 import io.excalibur.core.text.TermExtractor;
 import io.excalibur.metrics.Metrics;
@@ -1458,6 +1459,15 @@ public class QueryPipeline {
         );
 
         // DOMAIN CORRECTNESS VALIDATION:
+        // Validate the response meets all domain correctness constraints
+        // This ensures: scores in [0.0, 1.0], coverage in [0.0, 1.0], results sorted, no duplicates
+        DomainCorrectnessValidator.ValidationResult validationResult =
+            DomainCorrectnessValidator.validateResponseWithResult(response);
+        if (!validationResult.isValid()) {
+            LOGGER.warn("Query response failed domain correctness validation: {}",
+                validationResult.summary());
+        }
+
         // Empty results are ONLY acceptable when no documents match the query vector
         // Log diagnostic information when empty results are returned to help identify issues
         if (response.isEmpty()) {

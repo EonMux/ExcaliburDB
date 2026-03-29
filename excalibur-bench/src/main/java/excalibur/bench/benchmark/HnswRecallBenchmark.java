@@ -1,5 +1,6 @@
 package excalibur.bench.benchmark;
 
+import excalibur.bench.metric.RecallValidator;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.distance.L2Distance;
 import io.excalibur.vector.hnsw.HnswConfig;
@@ -239,11 +240,13 @@ public class HnswRecallBenchmark {
      * <p>This ensures domain correctness: recall represents a percentage
      * of correctly retrieved items and must be between 0% and 100%.</p>
      *
+     * <p>Delegates to {@link RecallValidator#clamp(double)} for consistency.</p>
+     *
      * @param recall The raw recall value
      * @return Recall clamped to [0.0, 1.0]
      */
     public static double clampRecall(double recall) {
-        return Math.max(0.0, Math.min(1.0, recall));
+        return RecallValidator.clamp(recall);
     }
 
     /**
@@ -252,12 +255,13 @@ public class HnswRecallBenchmark {
      * <p>Domain correctness: The input recall should be in range [0.0, 1.0].
      * If outside this range, it will be clamped before validation.</p>
      *
+     * <p>Delegates to {@link RecallValidator#meetsTarget(double)} for consistency.</p>
+     *
      * @param measuredRecall The measured recall value
      * @return true if recall meets target (≥0.99)
      */
     public static boolean validateRecall(double measuredRecall) {
-        double clampedRecall = clampRecall(measuredRecall);
-        return clampedRecall >= TARGET_RECALL_10;
+        return RecallValidator.meetsTarget(measuredRecall);
     }
 
     /**

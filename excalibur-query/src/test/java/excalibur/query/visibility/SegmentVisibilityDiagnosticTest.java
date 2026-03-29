@@ -409,6 +409,11 @@ class SegmentVisibilityDiagnosticTest {
         public Map<Long, SegmentCatalog.SegmentMetadata> getAll() {
             return Collections.unmodifiableMap(segments);
         }
+
+        @Override
+        public int size() {
+            return segments.size();
+        }
     }
 
     private static class MockStorageEngine extends StorageEngine {

@@ -354,11 +354,14 @@ public final class CoverageGapAnalyzer {
 
     /**
      * Calculates percentage from covered and missed counts.
+     *
+     * <p>Delegates to {@link CoverageValidator#calculatePercentage(long, long)}
+     * to ensure consistent behavior across all coverage calculations.</p>
+     *
+     * <p>Note: Empty code (total = 0) returns 0.0% coverage as per project convention.</p>
      */
     private static double calculatePercentage(long covered, long missed) {
-        long total = covered + missed;
-        if (total == 0) return 100.0; // No code means fully covered
-        return (covered * 100.0) / total;
+        return CoverageValidator.calculatePercentage(covered, missed);
     }
 
     /**

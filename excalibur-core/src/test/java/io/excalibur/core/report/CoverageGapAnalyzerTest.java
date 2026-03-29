@@ -264,7 +264,8 @@ class CoverageGapAnalyzerTest {
         ModuleGapAnalysis analysis = CoverageGapAnalyzer.analyzeModule(emptyReportPath, "empty-module");
 
         assertThat(analysis.moduleName()).isEqualTo("empty-module");
-        assertThat(analysis.moduleCoverage()).isEqualTo(100.0); // No code = fully covered
+        // Domain correctness: No code to cover means 0% coverage (nothing was covered)
+        assertThat(analysis.moduleCoverage()).isEqualTo(0.0);
         assertThat(analysis.classesBelowThreshold()).isEmpty();
         assertThat(analysis.methodsWithZeroCoverage()).isEmpty();
     }

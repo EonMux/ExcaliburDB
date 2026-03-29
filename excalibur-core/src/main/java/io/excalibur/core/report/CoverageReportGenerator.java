@@ -101,6 +101,18 @@ public final class CoverageReportGenerator {
 
     /**
      * Extracts coverage data for a specific counter type from JaCoCo XML.
+     *
+     * <p>JaCoCo XML contains counter elements at multiple levels (method, class,
+     * package, report). The aggregate coverage is in the LAST counter element
+     * of each type, which appears at the end of the file within the root
+     * {@code <report>} element.</p>
+     *
+     * <p>This method finds all matching counters and returns the last one,
+     * which represents the aggregate coverage for the entire module.</p>
+     *
+     * @param xml the JaCoCo XML content
+     * @param type the counter type (INSTRUCTION, BRANCH, LINE, METHOD, CLASS)
+     * @return the aggregate coverage for the module
      */
     private static Coverage extractCoverage(String xml, String type) {
         // Pattern matches: <counter type="INSTRUCTION" missed="100" covered="500"/>
@@ -110,12 +122,18 @@ public final class CoverageReportGenerator {
         );
         Matcher matcher = pattern.matcher(xml);
 
-        if (matcher.find()) {
-            long missed = Long.parseLong(matcher.group(1));
-            long covered = Long.parseLong(matcher.group(2));
-            return new Coverage(covered, missed);
+        // Find ALL matches and take the LAST one (the aggregate counter)
+        long lastMissed = 0;
+        long lastCovered = 0;
+        boolean found = false;
+
+        while (matcher.find()) {
+            found = true;
+            lastMissed = Long.parseLong(matcher.group(1));
+            lastCovered = Long.parseLong(matcher.group(2));
         }
-        return new Coverage(0, 0);
+
+        return found ? new Coverage(lastCovered, lastMissed) : new Coverage(0, 0);
     }
 
     /**
@@ -916,11 +934,12 @@ public final class CoverageReportGenerator {
 
     /**
      * Calculates percentage from covered and missed counts.
+     *
+     * <p>Delegates to {@link CoverageValidator#calculatePercentage(long, long)}
+     * to ensure consistent behavior across all coverage calculations.</p>
      */
     private static double calculatePercentage(long covered, long missed) {
-        long total = covered + missed;
-        if (total == 0) return 0.0;
-        return (covered * 100.0) / total;
+        return CoverageValidator.calculatePercentage(covered, missed);
     }
 
     /**

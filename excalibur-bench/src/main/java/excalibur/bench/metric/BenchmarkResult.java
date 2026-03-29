@@ -448,7 +448,7 @@ public final class BenchmarkResult {
          *
          * <p>Domain correctness rules:</p>
          * <ul>
-         *   <li>Throughput values (ops/sec) must be positive</li>
+         *   <li>Throughput values (ops/sec) must be positive - validated via ThroughputValidator</li>
          *   <li>Latency percentiles: p50 &lt; p99 (strict ordering), both in milliseconds</li>
          *   <li>Latency values must be non-negative</li>
          * </ul>
@@ -456,30 +456,30 @@ public final class BenchmarkResult {
          * @throws IllegalStateException if domain constraints are violated
          */
         private void validateDomainCorrectness() {
-            // Validate throughput values are positive
+            // Validate throughput values are positive using ThroughputValidator
             boolean isThroughputMode = "thrpt".equalsIgnoreCase(mode) ||
                                        primaryScoreUnit.contains("ops/sec") ||
                                        primaryScoreUnit.contains("op/s");
 
             if (isThroughputMode && higherIsBetter) {
-                if (primaryScore <= 0) {
+                ThroughputValidator.ValidationResult validation =
+                    ThroughputValidator.validate(primaryScore, "throughput");
+                if (!validation.valid()) {
                     throw new IllegalStateException(
-                        "Throughput values must be positive (ops/sec), got: " + primaryScore +
-                        " for benchmark: " + benchmarkName);
-                }
-                if (Double.isNaN(primaryScore) || Double.isInfinite(primaryScore)) {
-                    throw new IllegalStateException(
-                        "Throughput values must be finite positive numbers, got: " + primaryScore +
-                        " for benchmark: " + benchmarkName);
+                        "Throughput validation failed for benchmark '" + benchmarkName +
+                        "': " + validation.errors());
                 }
             }
 
-            // Validate throughput metrics are positive
+            // Validate throughput metrics are positive using ThroughputValidator
             for (BenchmarkMetric metric : metrics) {
                 if ("throughput".equals(metric.name())) {
-                    if (metric.value() <= 0) {
+                    ThroughputValidator.ValidationResult validation =
+                        ThroughputValidator.validate(metric.value(), "throughput metric");
+                    if (!validation.valid()) {
                         throw new IllegalStateException(
-                            "Throughput metric must be positive, got: " + metric.value());
+                            "Throughput metric validation failed for benchmark '" + benchmarkName +
+                            "': " + validation.errors());
                     }
                 }
             }

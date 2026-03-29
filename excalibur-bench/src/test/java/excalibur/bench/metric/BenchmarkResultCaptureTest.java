@@ -512,7 +512,7 @@ class BenchmarkResultCaptureTest {
                 .higherIsBetter(true)
                 .build()
         ).isInstanceOf(IllegalStateException.class)
-         .hasMessageContaining("positive");
+         .hasMessageContaining("POSITIVE");
     }
 
     @Test
@@ -528,7 +528,7 @@ class BenchmarkResultCaptureTest {
                 .addMetric(new BenchmarkMetric("throughput", -5_000_000.0, "ops/sec", 0, 0))  // Negative!
                 .build()
         ).isInstanceOf(IllegalStateException.class)
-         .hasMessageContaining("positive");
+         .hasMessageContaining("POSITIVE");
     }
 
     @Test

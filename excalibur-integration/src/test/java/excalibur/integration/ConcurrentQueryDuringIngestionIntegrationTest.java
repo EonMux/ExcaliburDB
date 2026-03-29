@@ -1125,6 +1125,11 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             return Collections.unmodifiableMap(metadata);
         }
 
+        @Override
+        public int size() {
+            return metadata.size();
+        }
+
         /**
          * Clears all segment metadata.
          */
