@@ -183,6 +183,47 @@ public final class SegmentVarHandle {
     }
 
     /**
+     * Atomically reads up to 8 bytes from a MemorySegment at the specified offset
+     * with volatile (acquire) semantics, even at unaligned offsets.
+     *
+     * <p>This method reads byte-by-byte using volatile semantics and assembles
+     * them into a long value. This works for any alignment and provides atomicity
+     * guarantees for each byte.</p>
+     *
+     * <h3>Use Case</h3>
+     * <p>This is designed for packed data structures where offsets may not be
+     * 8-byte aligned, such as CuckooFilter's packed fingerprint storage.</p>
+     *
+     * @param segment The source memory segment
+     * @param offset  Offset in bytes
+     * @param bytesToRead Number of bytes to read (1-8)
+     * @return The value assembled from bytes (big-endian, left-aligned in result)
+     * @throws NullPointerException if segment is null
+     * @throws IllegalArgumentException if bytesToRead is not in range [1, 8]
+     * @throws IndexOutOfBoundsException if offset is out of bounds
+     */
+    public static long readLongUnaligned(MemorySegment segment, long offset, int bytesToRead) {
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        if (bytesToRead < 1 || bytesToRead > 8) {
+            throw new IllegalArgumentException("bytesToRead must be in range [1, 8], got: " + bytesToRead);
+        }
+        checkBounds(segment, offset, bytesToRead);
+
+        // Read byte-by-byte with volatile semantics and assemble into long
+        long value = 0;
+        for (int i = 0; i < bytesToRead; i++) {
+            MemorySegment byteSlice = segment.asSlice(offset + i, 1);
+            byte b = (byte) BYTE_HANDLE.getVolatile(byteSlice);
+            value = (value << 8) | (b & 0xFF);
+        }
+        // Shift to left-align in 64-bit result (high bits)
+        value <<= (8 - bytesToRead) * 8;
+        return value;
+    }
+
+    /**
      * Atomically writes a long to a MemorySegment at the specified offset
      * with volatile (release) semantics.
      *

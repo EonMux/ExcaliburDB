@@ -136,6 +136,53 @@ public final class LlmScorerFactory {
     }
 
     /**
+     * Creates an LLM scorer from the application's Config with query-specific timeout.
+     *
+     * <p>This factory method allows specifying a query-specific LLM timeout that
+     * overrides the general LLM timeout. This is useful when relevancy scoring
+     * queries need different timeout settings than embedding generation.</p>
+     *
+     * <h3>Domain Correctness</h3>
+     * <ul>
+     *   <li>Uses query-specific timeout from excalibur.query.llm-timeout-ms</li>
+     *   <li>All other settings (baseUrl, apiKey, circuit breaker) from llmConfig</li>
+     *   <li>Timeout must be positive (&gt; 0)</li>
+     * </ul>
+     *
+     * @param llmConfig The LLM configuration from the properties file
+     * @param queryLlmTimeoutMs The query-specific LLM timeout in milliseconds
+     * @return A new LlmScorer instance
+     * @throws NullPointerException if llmConfig is null
+     * @throws IllegalArgumentException if configuration values are invalid
+     */
+    public static LlmScorer fromConfigWithQueryTimeout(Config.Llm llmConfig, int queryLlmTimeoutMs) {
+        Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
+        if (queryLlmTimeoutMs <= 0) {
+            throw new IllegalArgumentException("queryLlmTimeoutMs must be positive: " + queryLlmTimeoutMs);
+        }
+
+        // Create LLMClientConfig from llmConfig but override the timeout
+        LLMClientConfig config = new LLMClientConfig.Builder()
+            .baseUrl(llmConfig.getBaseUrl())
+            .apiKey(llmConfig.getApiKey())
+            .chatModel(llmConfig.getChatModel())
+            .embeddingModel(llmConfig.getEmbeddingModel())
+            .timeout(java.time.Duration.ofMillis(queryLlmTimeoutMs))  // Use query-specific timeout
+            .maxRetries(llmConfig.getMaxRetries())
+            .failureThreshold(llmConfig.getFailureThreshold())
+            .cooldownPeriod(java.time.Duration.ofMillis(llmConfig.getCooldownPeriodMs()))
+            .maxPromptsPerQuery(llmConfig.getMaxPromptsPerQuery())
+            .relevancyThreshold(llmConfig.getRelevancyThreshold())
+            .embeddingDimension(llmConfig.getEmbeddingsDimensions())
+            .maxBatchTokens(llmConfig.getMaxBatchTokens())
+            .retryBaseDelay(java.time.Duration.ofMillis(llmConfig.getRetryBaseDelayMs()))
+            .build();
+
+        LLMHttpClient llmClient = new LLMHttpClient(config);
+        return new LlmRelevancyScorer(llmClient);
+    }
+
+    /**
      * Creates a no-op LLM scorer that passes through results unchanged.
      *
      * <p>This is useful for testing or when LLM scoring is disabled but

@@ -436,18 +436,48 @@ public class HnswIntegrationWorker {
     /**
      * Calculates the total queue depth across all registered segments.
      *
-     * @return Total pending entries
+     * <p>This method counts the actual number of entries pending integration,
+     * not the byte offset difference. Each entry in the write log is counted
+     * as one entry toward the queue depth limit.</p>
+     *
+     * <p><strong>Domain Correctness:</strong> The queue depth limit (default 100,000)
+     * is specified in entries, not bytes. This ensures consistent backpressure
+     * behavior regardless of entry size variations.</p>
+     *
+     * @return Total pending entries (not bytes)
      */
     private long calculateTotalQueueDepth() {
-        long total = 0;
+        long totalEntries = 0;
         for (IndexableSegment indexable : registeredSegments) {
-            long writeLogHead = indexable.segment.getWriteLogHead();
+            WriteLog writeLog = indexable.segment.writeLog();
+            if (writeLog == null) {
+                // Fallback: use byte offset difference if writeLog not available
+                long writeLogHead = indexable.segment.getWriteLogHead();
+                long lastIntegrated = indexable.tracker.getLastIntegratedOffset();
+                if (writeLogHead > lastIntegrated) {
+                    // Estimate ~100 bytes per entry as rough approximation
+                    totalEntries += ((writeLogHead - lastIntegrated) / 100);
+                }
+                continue;
+            }
+
+            long writeLogHead = writeLog.writeOffset();
             long lastIntegrated = indexable.tracker.getLastIntegratedOffset();
+
             if (writeLogHead > lastIntegrated) {
-                total += (writeLogHead - lastIntegrated);
+                // Count actual entries in the tail region by scanning
+                long offset = lastIntegrated;
+                while (offset < writeLogHead) {
+                    int entrySize = writeLog.entrySizeAt(offset);
+                    if (entrySize <= 0) {
+                        break; // Invalid entry or end of log
+                    }
+                    totalEntries++;
+                    offset += entrySize;
+                }
             }
         }
-        return total;
+        return totalEntries;
     }
 
     // ==================== Integration Operations ====================

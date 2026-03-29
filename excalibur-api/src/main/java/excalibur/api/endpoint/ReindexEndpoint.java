@@ -6,6 +6,7 @@ import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceResolver;
 import excalibur.shard.allocator.VolumeManager;
+import io.excalibur.core.logging.StructuredLoggingHelper;
 import io.excalibur.store.SegmentCatalog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -185,56 +186,66 @@ public class ReindexEndpoint implements HttpHandler {
 
         String correlationId = UUID.randomUUID().toString().substring(0, 8);
 
-        try {
-            // Parse request body
-            String requestBody = readRequestBody(exchange);
-            ReindexRequest request = parseRequest(requestBody);
+        // Use MDC for structured logging - context is automatically cleaned up in finally block
+        try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
+                .withCorrelationId(correlationId)
+                .build()) {
 
-            LOGGER.info("[{}] Reindex requested for source: {}", correlationId, request.sourceId);
+            try {
+                // Parse request body
+                String requestBody = readRequestBody(exchange);
+                ReindexRequest request = parseRequest(requestBody);
 
-            // Validate source exists
-            if (!sourceRegistry.isRegistered(request.sourceId)) {
-                sendError(exchange, 404, "Source not found: " + request.sourceId);
-                return;
+                // Set source ID in MDC for per-source logging
+                StructuredLoggingHelper.setSourceId(request.sourceId);
+
+                LOGGER.info("Reindex requested for source");
+
+                // Validate source exists
+                if (!sourceRegistry.isRegistered(request.sourceId)) {
+                    sendError(exchange, 404, "Source not found: " + request.sourceId);
+                    return;
+                }
+
+                // Check if reindex is already in progress
+                ReindexStatus currentStatus = reindexStatusRegistry.getStatus(request.sourceId);
+                if (currentStatus != null && currentStatus.isInProgress()) {
+                    sendError(exchange, 409, "Reindex already in progress for source: " + request.sourceId);
+                    return;
+                }
+
+                // Start reindex (runs in background)
+                reindexStatusRegistry.startReindex(request.sourceId);
+
+                // Launch async reindex task if reindexer is configured
+                if (documentReindexer != null && sourceResolver != null && reindexExecutor != null) {
+                    final String sourceId = request.sourceId;
+                    reindexExecutor.submit(() -> executeReindex(sourceId));
+                    LOGGER.info("Async reindex task submitted for source");
+                } else {
+                    LOGGER.info("Reindex started (stub mode - no actual reindexing)");
+                }
+
+                // Send success response
+                ReindexResponse response = new ReindexResponse(
+                    request.sourceId,
+                    "reindexing",
+                    "Reindex started in background"
+                );
+                sendResponse(exchange, 202, response);
+
+                LOGGER.info("Reindex started for source");
+
+            } catch (IllegalArgumentException e) {
+                LOGGER.warn("Invalid reindex request: {}", e.getMessage());
+                sendError(exchange, 400, "Bad Request: " + e.getMessage());
+
+            } catch (Exception e) {
+                LOGGER.error("Error processing reindex request: {}", e.getMessage(), e);
+                sendError(exchange, 500, "Internal Server Error");
             }
-
-            // Check if reindex is already in progress
-            ReindexStatus currentStatus = reindexStatusRegistry.getStatus(request.sourceId);
-            if (currentStatus != null && currentStatus.isInProgress()) {
-                sendError(exchange, 409, "Reindex already in progress for source: " + request.sourceId);
-                return;
-            }
-
-            // Start reindex (runs in background)
-            reindexStatusRegistry.startReindex(request.sourceId);
-
-            // Launch async reindex task if reindexer is configured
-            if (documentReindexer != null && sourceResolver != null && reindexExecutor != null) {
-                final String sourceId = request.sourceId;
-                reindexExecutor.submit(() -> executeReindex(sourceId));
-                LOGGER.info("[{}] Async reindex task submitted for source: {}", correlationId, request.sourceId);
-            } else {
-                LOGGER.info("[{}] Reindex started (stub mode - no actual reindexing)", correlationId);
-            }
-
-            // Send success response
-            ReindexResponse response = new ReindexResponse(
-                request.sourceId,
-                "reindexing",
-                "Reindex started in background"
-            );
-            sendResponse(exchange, 202, response);
-
-            LOGGER.info("[{}] Reindex started for source: {}", correlationId, request.sourceId);
-
-        } catch (IllegalArgumentException e) {
-            LOGGER.warn("Invalid reindex request: {}", e.getMessage());
-            sendError(exchange, 400, "Bad Request: " + e.getMessage());
-
-        } catch (Exception e) {
-            LOGGER.error("Error processing reindex request: {}", e.getMessage(), e);
-            sendError(exchange, 500, "Internal Server Error");
         }
+        // MDC context is automatically cleared when ctx.close() is called
     }
 
     /**

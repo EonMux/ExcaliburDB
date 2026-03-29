@@ -13,6 +13,7 @@ import excalibur.ingest.lsh.LshIngestionService;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.llm.embedding.EmbeddingClient;
 import excalibur.shard.IndexOrchestrator;
+import io.excalibur.core.logging.StructuredLoggingHelper;
 import io.excalibur.llm.LLMException;
 import io.excalibur.store.StorageEngine;
 import io.excalibur.store.log.WriteLog;
@@ -317,88 +318,108 @@ public class IngestionOrchestrator {
         String sourceId = source.getSourceId();
         IngestionStatus status = statusRegistry.getOrCreate(sourceId);
 
-        long totalIngested = 0;
-        long totalPending = 0;
+        // Use MDC for structured logging - context is automatically cleaned up in finally block
+        try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
+                .withSourceId(sourceId)
+                .build()) {
 
-        try {
-            // Phase 1: Crawling
-            status.update("crawling", 0.0, 0, 0);
-            LOGGER.info("[{}] Phase 1: Starting crawl", sourceId);
+            long totalIngested = 0;
+            long totalPending = 0;
 
-            List<String> documentIds;
-            try (Stream<String> crawlStream = source.crawl()) {
-                documentIds = crawlStream.toList();
-            }
+            try {
+                // Phase 1: Crawling
+                status.update("crawling", 0.0, 0, 0);
+                StructuredLoggingHelper.setStage("crawling");
+                LOGGER.info("Phase 1: Starting crawl");
 
-            totalPending = documentIds.size();
-            LOGGER.info("[{}] Discovered {} documents", sourceId, totalPending);
+                List<String> documentIds;
+                try (Stream<String> crawlStream = source.crawl()) {
+                    documentIds = crawlStream.toList();
+                }
 
-            if (totalPending == 0) {
-                status.update("idle", 1.0, 0, 0);
-                LOGGER.info("[{}] No documents to ingest", sourceId);
-                return;
-            }
+                totalPending = documentIds.size();
+                LOGGER.info("Discovered {} documents", totalPending);
 
-            // Estimate total chunks for progress tracking
-            long estimatedTotalChunks = totalPending * 3; // Assume ~3 chunks per doc
-
-            // Phase 2: Processing documents
-            status.update("embedding", 0.0, 0, totalPending);
-
-            int processedDocs = 0;
-            int processedChunks = 0;
-
-            for (String documentId : documentIds) {
-                if (shutdown.get()) {
-                    LOGGER.info("[{}] Ingestion interrupted by shutdown", sourceId);
-                    status.setError("Ingestion interrupted");
+                if (totalPending == 0) {
+                    status.update("idle", 1.0, 0, 0);
+                    LOGGER.info("No documents to ingest");
                     return;
                 }
 
-                try {
-                    // Fetch document
-                    FetchedDocument doc = source.fetch(documentId);
-                    String content = new String(doc.getContent(), StandardCharsets.UTF_8);
+                // Estimate total chunks for progress tracking
+                long estimatedTotalChunks = totalPending * 3; // Assume ~3 chunks per doc
 
-                    // Chunk the content
-                    List<TextChunk> chunks = textChunker.chunk(documentId, content);
+                // Phase 2: Processing documents
+                StructuredLoggingHelper.setStage("embedding");
+                status.update("embedding", 0.0, 0, totalPending);
 
-                    // Track term frequencies for selectivity estimation
-                    // This populates the Count-Min Sketch on segments for query optimization
-                    if (termFrequencyTracker != null && !chunks.isEmpty()) {
-                        for (int i = 0; i < chunks.size(); i++) {
-                            TextChunk chunk = chunks.get(i);
-                            String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
-                            byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
-                            long keyHash = io.excalibur.store.hash.XxHash64.hash(keyBytes);
-                            int segmentIndex = (int) (keyHash & (storageEngine.getSegmentCount() - 1));
+                int processedDocs = 0;
+                int processedChunks = 0;
 
-                            io.excalibur.store.Segment segment = storageEngine.getSegment((long) segmentIndex);
-                            if (segment != null) {
-                                termFrequencyTracker.trackText(segment, chunk.getText());
-                            }
+                for (String documentId : documentIds) {
+                    if (shutdown.get()) {
+                        LOGGER.info("Ingestion interrupted by shutdown");
+                        status.setError("Ingestion interrupted");
+                        return;
+                    }
+
+                    // Check backpressure BEFORE processing each document (Phase 5 requirement)
+                    // When HNSW integration queue exceeds limit, throttle embedding stage
+                    if (indexOrchestrator.isBackpressured()) {
+                        LOGGER.info("Backpressure detected, waiting for HNSW queue to drain");
+                        boolean released = indexOrchestrator.awaitBackpressureRelease(documentTimeoutMs);
+                        if (!released) {
+                            LOGGER.warn("Backpressure timeout after {}ms, continuing ingestion", documentTimeoutMs);
                         }
                     }
 
-                    // Check if atomic batching is enabled
-                    boolean useAtomicBatching = documentChunkBuffer != null && visibilityTracker != null;
+                    try {
+                        // Set document ID in MDC for per-document logging
+                        StructuredLoggingHelper.setDocumentId(documentId);
 
-                    if (useAtomicBatching) {
-                        // === ATOMIC BATCHING MODE ===
-                        // Buffer all chunks and commit atomically with visibility epoch
+                        // Fetch document
+                        FetchedDocument doc = source.fetch(documentId);
+                        String content = new String(doc.getContent(), StandardCharsets.UTF_8);
 
-                        Map<Integer, float[]> embeddings = new HashMap<>();
-                        boolean allEmbeddingsGenerated = true;
+                        // Chunk the content
+                        List<TextChunk> chunks = textChunker.chunk(documentId, content);
 
-                        // Generate all embeddings first
-                        for (int i = 0; i < chunks.size(); i++) {
-                            TextChunk chunk = chunks.get(i);
-                            try {
-                                float[] embedding = embeddingClient.embed(chunk.getText());
+                        // Track term frequencies for selectivity estimation
+                        // This populates the Count-Min Sketch on segments for query optimization
+                        if (termFrequencyTracker != null && !chunks.isEmpty()) {
+                            for (int i = 0; i < chunks.size(); i++) {
+                                TextChunk chunk = chunks.get(i);
+                                String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
+                                byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
+                                long keyHash = io.excalibur.store.hash.XxHash64.hash(keyBytes);
+                                int segmentIndex = (int) (keyHash & (storageEngine.getSegmentCount() - 1));
+
+                                io.excalibur.store.Segment segment = storageEngine.getSegment((long) segmentIndex);
+                                if (segment != null) {
+                                    termFrequencyTracker.trackText(segment, chunk.getText());
+                                }
+                            }
+                        }
+
+                        // Check if atomic batching is enabled
+                        boolean useAtomicBatching = documentChunkBuffer != null && visibilityTracker != null;
+
+                        if (useAtomicBatching) {
+                            // === ATOMIC BATCHING MODE ===
+                            // Buffer all chunks and commit atomically with visibility epoch
+
+                            Map<Integer, float[]> embeddings = new HashMap<>();
+                            boolean allEmbeddingsGenerated = true;
+
+                            // Generate all embeddings first
+                            for (int i = 0; i < chunks.size(); i++) {
+                                TextChunk chunk = chunks.get(i);
+                                try {
+                                    float[] embedding = embeddingClient.embed(chunk.getText());
                                 embeddings.put(i, embedding);
                             } catch (LLMException e) {
-                                LOGGER.warn("[{}] Failed to embed chunk {} of {}: {}",
-                                    sourceId, i, documentId, e.getMessage());
+                                LOGGER.warn("Failed to embed chunk {} of {}: {}",
+                                    i, documentId, e.getMessage());
                                 allEmbeddingsGenerated = false;
                                 break;
                             }
@@ -430,8 +451,8 @@ public class IngestionOrchestrator {
                             long epoch = visibilityTracker.advanceEpoch();
                             visibilityTracker.registerAtomicDocument(batch, epoch);
 
-                            LOGGER.debug("[{}] Document {} committed atomically with {} chunks at epoch {}",
-                                sourceId, documentId, batch.getChunkCount(), epoch);
+                            LOGGER.debug("Document committed atomically with {} chunks at epoch {}",
+                                batch.getChunkCount(), epoch);
 
                             // Insert into LSH index for each chunk
                             if (lshIngestionService != null) {
@@ -451,8 +472,8 @@ public class IngestionOrchestrator {
                                             lshIngestionService.insertVector(segment, embedding, entryId);
                                         }
                                     } catch (Exception lshError) {
-                                        LOGGER.warn("[{}] Failed to insert vector into LSH index for chunk {}: {}",
-                                            sourceId, i, lshError.getMessage());
+                                        LOGGER.warn("Failed to insert vector into LSH index for chunk {}: {}",
+                                            i, lshError.getMessage());
                                     }
                                 }
                             }
@@ -461,8 +482,7 @@ public class IngestionOrchestrator {
                             processedChunks += chunks.size();
 
                         } catch (IOException e) {
-                            LOGGER.error("[{}] Failed to commit document {} atomically: {}",
-                                sourceId, documentId, e.getMessage());
+                            LOGGER.error("Failed to commit document atomically: {}", e.getMessage());
                             // Abort the document on failure
                             documentChunkBuffer.abortDocument(documentId);
                         }
@@ -505,8 +525,8 @@ public class IngestionOrchestrator {
                                         }
                                     } catch (Exception lshError) {
                                         // Log warning but don't fail ingestion - LSH is for pre-filtering optimization
-                                        LOGGER.warn("[{}] Failed to insert vector into LSH index for chunk {}: {}",
-                                            sourceId, i, lshError.getMessage());
+                                        LOGGER.warn("Failed to insert vector into LSH index for chunk {}: {}",
+                                            i, lshError.getMessage());
                                     }
                                 }
 
@@ -519,8 +539,8 @@ public class IngestionOrchestrator {
                                     totalPending - processedDocs);
 
                             } catch (LLMException e) {
-                                LOGGER.warn("[{}] Failed to embed chunk {} of {}: {}",
-                                    sourceId, i, documentId, e.getMessage());
+                                LOGGER.warn("Failed to embed chunk {} of {}: {}",
+                                    i, documentId, e.getMessage());
                                 // Continue with next chunk
                             }
                         }
@@ -529,13 +549,14 @@ public class IngestionOrchestrator {
                     processedDocs++;
 
                 } catch (DocumentNotFoundException e) {
-                    LOGGER.warn("[{}] Document not found: {}", sourceId, documentId);
+                    LOGGER.warn("Document not found: {}", documentId);
                 } catch (SourceException e) {
-                    LOGGER.warn("[{}] Failed to fetch document {}: {}",
-                        sourceId, documentId, e.getMessage());
+                    LOGGER.warn("Failed to fetch document {}: {}", documentId, e.getMessage());
                 } catch (Exception e) {
-                    LOGGER.warn("[{}] Unexpected error processing document {}: {}",
-                        sourceId, documentId, e.getMessage());
+                    LOGGER.warn("Unexpected error processing document {}: {}", documentId, e.getMessage());
+                } finally {
+                    // Clear document ID from MDC after processing each document
+                    StructuredLoggingHelper.clearDocumentId();
                 }
 
                 // Update progress after each document
@@ -544,27 +565,28 @@ public class IngestionOrchestrator {
             }
 
             // Phase 3: Indexing (wait for HNSW integration)
+            StructuredLoggingHelper.setStage("indexing");
             status.update("indexing", 0.9, totalIngested, 0);
 
             // Wait for backpressure to clear before marking complete
             if (indexOrchestrator.isBackpressured()) {
-                LOGGER.info("[{}] Waiting for HNSW integration queue to drain (timeout={}ms)", sourceId, documentTimeoutMs);
+                LOGGER.info("Waiting for HNSW integration queue to drain (timeout={}ms)", documentTimeoutMs);
                 indexOrchestrator.awaitBackpressureRelease(documentTimeoutMs);
             }
 
             // Complete
+            StructuredLoggingHelper.setStage("idle");
             status.update("idle", 1.0, totalIngested, 0);
-            LOGGER.info("[{}] Ingestion complete: {} chunks from {} documents",
-                sourceId, totalIngested, processedDocs);
+            LOGGER.info("Ingestion complete: {} chunks from {} documents", totalIngested, processedDocs);
 
         } catch (SourceException e) {
             String error = "Crawl failed: " + e.getMessage();
-            LOGGER.error("[{}] {}", sourceId, error, e);
+            LOGGER.error("{}", error, e);
             status.setError(error);
 
         } catch (Exception e) {
             String error = "Ingestion failed: " + e.getMessage();
-            LOGGER.error("[{}] {}", sourceId, error, e);
+            LOGGER.error("{}", error, e);
             status.setError(error);
 
         } finally {
@@ -572,9 +594,11 @@ public class IngestionOrchestrator {
             try {
                 source.close();
             } catch (IOException e) {
-                LOGGER.debug("[{}] Error closing source: {}", sourceId, e.getMessage());
+                LOGGER.debug("Error closing source: {}", e.getMessage());
             }
         }
+        }
+        // MDC context is automatically cleared when ctx.close() is called
     }
 
     /**

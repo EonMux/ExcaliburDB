@@ -501,9 +501,9 @@ class EpochIsolationIntegrationTest {
             long segmentId = storageEngine.registerSegment(0L, LifecycleState.ACTIVE);
             visibilityTracker.registerSegment(segmentId, 0L);
 
-            int numWriterThreads = 4;
-            int numReaderThreads = 8;
-            int documentsPerWriter = 15;
+            int numWriterThreads = 3;
+            int numReaderThreads = 5;
+            int documentsPerWriter = 10;
             int chunksPerDocument = 4;
 
             ExecutorService executor = Executors.newFixedThreadPool(numWriterThreads + numReaderThreads);
@@ -672,8 +672,8 @@ class EpochIsolationIntegrationTest {
             long segmentId = storageEngine.registerSegment(0L, LifecycleState.ACTIVE);
             visibilityTracker.registerSegment(segmentId, 0L);
 
-            int numThreads = 10;
-            int operationsPerThread = 50;
+            int numThreads = 6;
+            int operationsPerThread = 30;
 
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);

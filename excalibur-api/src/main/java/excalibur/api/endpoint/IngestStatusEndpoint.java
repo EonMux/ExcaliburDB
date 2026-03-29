@@ -2,6 +2,7 @@ package excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import io.excalibur.core.logging.StructuredLoggingHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -96,32 +97,38 @@ public class IngestStatusEndpoint implements HttpHandler {
 
         String correlationId = UUID.randomUUID().toString().substring(0, 8);
 
-        try {
-            // Parse query parameters
-            String query = exchange.getRequestURI().getQuery();
-            String sourceId = getQueryParam(query, "source_id");
+        // Use MDC for structured logging - context is automatically cleaned up in finally block
+        try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
+                .withCorrelationId(correlationId)
+                .build()) {
 
-            LOGGER.debug("[{}] Ingest status request for source: {}", correlationId,
-                sourceId != null ? sourceId : "all");
+            try {
+                // Parse query parameters
+                String query = exchange.getRequestURI().getQuery();
+                String sourceId = getQueryParam(query, "source_id");
 
-            if (sourceId != null) {
-                // Get status for specific source
-                IngestionStatus status = statusRegistry.getStatus(sourceId);
-                if (status == null) {
-                    sendError(exchange, 404, "Source not found: " + sourceId);
-                    return;
+                LOGGER.debug("Ingest status request for source: {}", sourceId != null ? sourceId : "all");
+
+                if (sourceId != null) {
+                    // Get status for specific source
+                    IngestionStatus status = statusRegistry.getStatus(sourceId);
+                    if (status == null) {
+                        sendError(exchange, 404, "Source not found: " + sourceId);
+                        return;
+                    }
+                    sendSingleResponse(exchange, status);
+                } else {
+                    // Get status for all sources
+                    Map<String, IngestionStatus> allStatuses = statusRegistry.getAllStatuses();
+                    sendAllResponse(exchange, allStatuses);
                 }
-                sendSingleResponse(exchange, status);
-            } else {
-                // Get status for all sources
-                Map<String, IngestionStatus> allStatuses = statusRegistry.getAllStatuses();
-                sendAllResponse(exchange, allStatuses);
-            }
 
-        } catch (Exception e) {
-            LOGGER.error("Error processing ingest status request: {}", e.getMessage(), e);
-            sendError(exchange, 500, "Internal Server Error");
+            } catch (Exception e) {
+                LOGGER.error("Error processing ingest status request: {}", e.getMessage(), e);
+                sendError(exchange, 500, "Internal Server Error");
+            }
         }
+        // MDC context is automatically cleared when ctx.close() is called
     }
 
     /**

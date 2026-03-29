@@ -411,6 +411,28 @@ class ConfigValidationTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("llm.embeddings-dimensions must be <= 4096");
         }
+
+        @Test
+        @DisplayName("rejects retry-base-delay-ms below minimum")
+        void rejectsRetryBaseDelayBelowMinimum() {
+            baseProps.put("excalibur.llm.retry-base-delay-ms", "9");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.retry-base-delay-ms must be >= 10");
+        }
+
+        @Test
+        @DisplayName("rejects retry-base-delay-ms above maximum")
+        void rejectsRetryBaseDelayAboveMaximum() {
+            baseProps.put("excalibur.llm.retry-base-delay-ms", "30001");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.retry-base-delay-ms must be <= 30000");
+        }
     }
 
     @Nested

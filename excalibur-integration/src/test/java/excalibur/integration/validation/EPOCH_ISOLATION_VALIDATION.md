@@ -2,6 +2,7 @@
 
 **Date**: 2026-03-29
 **Status**: ✓ VERIFIED - NO VIOLATIONS DETECTED
+**Last Test Run**: 2026-03-29T12:00:00Z
 
 ## Executive Summary
 
@@ -41,7 +42,7 @@ All integration tests for epoch isolation and document atomicity pass with zero 
 
 ### 1. Document Atomicity
 - **Verified**: All chunks of a document become visible at the exact same epoch
-- **Test Evidence**: `NoTornReads.allChunksVisibleAtSameEpoch` passed with 3949 chunk visibility checks
+- **Test Evidence**: `DocumentAtomicVisibilityIntegrationTest.testNoTornReadsDuringConcurrentIngestion` passed with 1606 chunk visibility checks, 0 torn reads detected
 - **Implementation**: `DocumentAtomicityFilter` enforces atomic visibility at query time
 
 ### 2. Epoch Monotonicity

@@ -585,15 +585,35 @@ public final class ExcaliburApplication {
         // Use cosine similarity as default distance function
         DistanceFunction distanceFunction = CosineSimilarity.getInstance();
 
+        // Create LLM scorer with query-specific timeout from config
+        // Uses excalibur.query.llm-timeout-ms for relevancy scoring calls
+        QueryPipeline.LlmScorer llmScorer = null;
+        String llmApiKey = config.llm().getApiKey();
+        if (llmApiKey != null && !llmApiKey.isEmpty()) {
+            try {
+                int queryLlmTimeoutMs = config.query().getLlmTimeoutMs();
+                llmScorer = excalibur.query.scorer.LlmScorerFactory.fromConfigWithQueryTimeout(
+                    config.llm(), queryLlmTimeoutMs);
+                LOGGER.info("LLM scorer created with query-specific timeout: {}ms", queryLlmTimeoutMs);
+            } catch (Exception e) {
+                LOGGER.warn("Failed to create LLM scorer: {}. LLM scoring will be disabled.", e.getMessage());
+            }
+        } else {
+            LOGGER.info("LLM API key not configured - LLM scoring disabled");
+        }
+
         QueryPipeline pipeline = new QueryPipeline(
             storageEngine,
             indexOrchestrator.getVisibilityTracker(),
             documentVisibilityChecker,  // Document atomicity filter for query pipeline
             graphProvider,
-            distanceFunction
+            distanceFunction,
+            llmScorer,  // LLM scorer with query-specific timeout
+            QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
+            hierarchicalFilter  // CRITICAL: Pass the hierarchical filter for Stage 1 pruning
         );
 
-        LOGGER.info("Query pipeline initialized with document atomicity enabled");
+        LOGGER.info("Query pipeline initialized with document atomicity and hierarchical Cuckoo filter enabled");
         return pipeline;
     }
 

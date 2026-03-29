@@ -7,6 +7,7 @@ import excalibur.ingest.source.FilesystemSource;
 import excalibur.ingest.source.HttpSource;
 import excalibur.ingest.source.Source;
 import excalibur.shard.worker.SegmentReindexScheduler;
+import io.excalibur.core.logging.StructuredLoggingHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -174,44 +175,53 @@ public class IngestEndpoint implements HttpHandler {
 
         String correlationId = UUID.randomUUID().toString().substring(0, 8);
 
-        try {
-            // Parse request body
-            String requestBody = readRequestBody(exchange);
-            IngestRequest request = parseRequest(requestBody);
+        // Use MDC for structured logging - context is automatically cleaned up in finally block
+        try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
+                .withCorrelationId(correlationId)
+                .build()) {
 
-            LOGGER.info("[{}] Registering ingestion source: type={}, id={}",
-                correlationId, request.sourceType, request.sourceId);
+            try {
+                // Parse request body
+                String requestBody = readRequestBody(exchange);
+                IngestRequest request = parseRequest(requestBody);
 
-            // Validate source ID is not already registered
-            if (sourceRegistry.isRegistered(request.sourceId)) {
-                sendError(exchange, 409, "Source already registered: " + request.sourceId);
-                return;
+                // Set source ID in MDC for per-source logging
+                StructuredLoggingHelper.setSourceId(request.sourceId);
+
+                LOGGER.info("Registering ingestion source: type={}", request.sourceType);
+
+                // Validate source ID is not already registered
+                if (sourceRegistry.isRegistered(request.sourceId)) {
+                    sendError(exchange, 409, "Source already registered: " + request.sourceId);
+                    return;
+                }
+
+                // Create source based on type
+                Source source = createSource(request);
+
+                // Register the source (ingestion runs in background)
+                sourceRegistry.register(source);
+
+                // Send success response
+                IngestResponse response = new IngestResponse(
+                    request.sourceId,
+                    request.sourceType,
+                    "registered"
+                );
+                sendResponse(exchange, 200, response);
+
+                LOGGER.info("Source registered successfully");
+
+            } catch (IllegalArgumentException e) {
+                LOGGER.warn("Invalid ingest request: {}", e.getMessage());
+                sendError(exchange, 400, "Bad Request: " + e.getMessage());
+
+            } catch (Exception e) {
+                LOGGER.error("Error processing ingest request: {}", e.getMessage(), e);
+                sendError(exchange, 500, "Internal Server Error");
             }
-
-            // Create source based on type
-            Source source = createSource(request);
-
-            // Register the source (ingestion runs in background)
-            sourceRegistry.register(source);
-
-            // Send success response
-            IngestResponse response = new IngestResponse(
-                request.sourceId,
-                request.sourceType,
-                "registered"
-            );
-            sendResponse(exchange, 200, response);
-
-            LOGGER.info("[{}] Source registered successfully: {}", correlationId, request.sourceId);
-
-        } catch (IllegalArgumentException e) {
-            LOGGER.warn("Invalid ingest request: {}", e.getMessage());
-            sendError(exchange, 400, "Bad Request: " + e.getMessage());
-
-        } catch (Exception e) {
-            LOGGER.error("Error processing ingest request: {}", e.getMessage(), e);
-            sendError(exchange, 500, "Internal Server Error");
         }
+        // MDC context is automatically cleared when ctx.close() is called
     }
 
     /**

@@ -7,6 +7,7 @@ import excalibur.query.executor.CancellationToken;
 import excalibur.query.executor.QueryRegistry;
 import excalibur.query.pipeline.QueryPipeline;
 import io.excalibur.config.Config;
+import io.excalibur.core.logging.StructuredLoggingHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -160,63 +161,71 @@ public class QueryEndpoint implements HttpHandler {
         String queryId = UUID.randomUUID().toString();
         long startTime = System.nanoTime();
 
-        try {
-            // Parse request body
-            String requestBody = readRequestBody(exchange);
-            QueryRequest request = parseRequest(requestBody, correlationId);
+        // Use MDC for structured logging - context is automatically cleaned up in finally block
+        try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
+                .withCorrelationId(correlationId)
+                .withQueryId(queryId)
+                .build()) {
 
-            LOGGER.debug("[{}] Processing query: queryId={}, topK={}, timeout={}ms",
-                correlationId, queryId, request.topK(), request.timeoutMs());
-
-            // Create cancellation token
-            CancellationToken token = new CancellationToken();
-
-            // Register query with registry for cancellation support
-            if (queryRegistry != null) {
-                queryRegistry.register(queryId, token, correlationId);
-            }
-
-            // Execute query with timeout
-            CompletableFuture<QueryResponse> future = queryPipeline.execute(request, token);
-
-            // Wait for completion
-            QueryResponse response;
             try {
-                response = future.get(request.timeoutMs(), TimeUnit.MILLISECONDS);
-                // Add queryId to response
-                response = response.withQueryId(queryId);
-            } catch (TimeoutException e) {
-                // Cancel the token to propagate cancellation
-                token.cancel("Query timeout");
-                long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-                LOGGER.warn("[{}] Query timed out after {}ms", correlationId, durationMs);
-                response = buildTimeoutResponse(queryId, durationMs);
-            } catch (CancellationException e) {
-                long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-                LOGGER.info("[{}] Query cancelled after {}ms", correlationId, durationMs);
-                response = buildCancelledResponse(queryId, durationMs);
-            } catch (ExecutionException e) {
-                long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-                LOGGER.error("[{}] Query failed: {}", correlationId, e.getCause().getMessage());
-                response = buildErrorResponse(queryId, durationMs, e.getCause().getMessage());
-            } finally {
-                // Unregister query when complete
+                // Parse request body
+                String requestBody = readRequestBody(exchange);
+                QueryRequest request = parseRequest(requestBody, correlationId);
+
+                LOGGER.debug("Processing query: topK={}, timeout={}ms",
+                    request.topK(), request.timeoutMs());
+
+                // Create cancellation token
+                CancellationToken token = new CancellationToken();
+
+                // Register query with registry for cancellation support
                 if (queryRegistry != null) {
-                    queryRegistry.unregister(queryId);
+                    queryRegistry.register(queryId, token, correlationId);
                 }
+
+                // Execute query with timeout
+                CompletableFuture<QueryResponse> future = queryPipeline.execute(request, token);
+
+                // Wait for completion
+                QueryResponse response;
+                try {
+                    response = future.get(request.timeoutMs(), TimeUnit.MILLISECONDS);
+                    // Add queryId to response
+                    response = response.withQueryId(queryId);
+                } catch (TimeoutException e) {
+                    // Cancel the token to propagate cancellation
+                    token.cancel("Query timeout");
+                    long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+                    LOGGER.warn("Query timed out after {}ms", durationMs);
+                    response = buildTimeoutResponse(queryId, durationMs);
+                } catch (CancellationException e) {
+                    long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+                    LOGGER.info("Query cancelled after {}ms", durationMs);
+                    response = buildCancelledResponse(queryId, durationMs);
+                } catch (ExecutionException e) {
+                    long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+                    LOGGER.error("Query failed: {}", e.getCause().getMessage());
+                    response = buildErrorResponse(queryId, durationMs, e.getCause().getMessage());
+                } finally {
+                    // Unregister query when complete
+                    if (queryRegistry != null) {
+                        queryRegistry.unregister(queryId);
+                    }
+                }
+
+                // Send response
+                sendResponse(exchange, 200, response);
+
+            } catch (IllegalArgumentException e) {
+                LOGGER.warn("Invalid request: {}", e.getMessage());
+                sendError(exchange, 400, "Bad Request: " + e.getMessage());
+
+            } catch (Exception e) {
+                LOGGER.error("Internal error: {}", e.getMessage(), e);
+                sendError(exchange, 500, "Internal Server Error");
             }
-
-            // Send response
-            sendResponse(exchange, 200, response);
-
-        } catch (IllegalArgumentException e) {
-            LOGGER.warn("[{}] Invalid request: {}", correlationId, e.getMessage());
-            sendError(exchange, 400, "Bad Request: " + e.getMessage());
-
-        } catch (Exception e) {
-            LOGGER.error("[{}] Internal error: {}", correlationId, e.getMessage(), e);
-            sendError(exchange, 500, "Internal Server Error");
         }
+        // MDC context is automatically cleared when ctx.close() is called
     }
 
     /**
@@ -251,7 +260,11 @@ public class QueryEndpoint implements HttpHandler {
         // Simple JSON parsing (in production, use a proper JSON parser)
         String query = extractString(json, "query");
         float[] vector = extractFloatArray(json, "vector");
-        int topK = extractInt(json, "top_k", 10);
+
+        // Use config default for top_k if config is provided, otherwise fallback to 10
+        int defaultTopK = config != null ? config.query().getDefaultTopK() : 10;
+        int topK = extractInt(json, "top_k", defaultTopK);
+
         float threshold = extractFloat(json, "threshold", 0.0f);
         long timeoutMs = extractLong(json, "timeout_ms", defaultTimeoutMs);
 
@@ -271,6 +284,10 @@ public class QueryEndpoint implements HttpHandler {
 
         // Parse oversampling_factor with default from QueryOptions
         int oversamplingFactor = extractInt(json, "oversampling_factor", QueryOptions.DEFAULT_OVERSAMPLING_FACTOR);
+
+        // Use config default for recall_target if config is provided
+        double defaultRecallTarget = config != null ? config.query().getRecallTarget() : 0.95;
+        double recallTarget = extractDouble(json, "recall_target", defaultRecallTarget);
 
         // Domain correctness validation
         if (vector == null || vector.length == 0) {
@@ -305,10 +322,16 @@ public class QueryEndpoint implements HttpHandler {
             throw new IllegalArgumentException("Field 'oversampling_factor' must be at least 1: " + oversamplingFactor);
         }
 
+        // Validate recallTarget
+        if (Double.isNaN(recallTarget) || recallTarget < 0.0 || recallTarget > 1.0) {
+            throw new IllegalArgumentException("Field 'recall_target' must be in range [0.0, 1.0]: " + recallTarget);
+        }
+
         return QueryRequest.builder()
             .queryText(query)
             .queryVector(vector)
             .topK(topK)
+            .recallTarget(recallTarget)
             .threshold(threshold)
             .timeoutMs(timeoutMs)
             .includePartialSegments(includePartial)
@@ -574,6 +597,26 @@ public class QueryEndpoint implements HttpHandler {
 
         if (end == start) return defaultValue;
         return Float.parseFloat(json.substring(start, end));
+    }
+
+    private double extractDouble(String json, String field, double defaultValue) {
+        String pattern = "\"" + field + "\"";
+        int start = json.indexOf(pattern);
+        if (start < 0) return defaultValue;
+
+        start += pattern.length();
+        while (start < json.length() && (json.charAt(start) == ':' || Character.isWhitespace(json.charAt(start)))) {
+            start++;
+        }
+
+        int end = start;
+        while (end < json.length() && (Character.isDigit(json.charAt(end)) ||
+            json.charAt(end) == '-' || json.charAt(end) == '.' || json.charAt(end) == 'e' || json.charAt(end) == 'E')) {
+            end++;
+        }
+
+        if (end == start) return defaultValue;
+        return Double.parseDouble(json.substring(start, end));
     }
 
     private boolean extractBoolean(String json, String field, boolean defaultValue) {

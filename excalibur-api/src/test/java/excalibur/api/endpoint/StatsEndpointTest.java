@@ -217,6 +217,8 @@ class StatsEndpointTest {
             assertThat(response).contains("\"cuckoo\":");
             assertThat(response).contains("\"pendingDeletions\": 50");
             assertThat(response).contains("\"totalDeletions\": 500");
+            assertThat(response).contains("\"avgFpRate\":");
+            assertThat(response).contains("\"maxFpRate\":");
         }
 
         @Test
@@ -365,12 +367,26 @@ class StatsEndpointTest {
             assertThatCode(() -> new StatsEndpoint.HnswStats(0, 0, 0))
                 .doesNotThrowAnyException();
 
-            // CuckooStats - both fields validated
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(-1, 0))
+            // CuckooStats - all fields validated
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(-1, 0, 0.0, 0.0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, -1))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, -1, 0.0, 0.0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, -0.1, 0.0))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, -0.1))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 1.1, 0.0))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 1.1))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, Double.NaN, 0.0))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, Double.NaN))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0))
+                .doesNotThrowAnyException();
+            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0, 1.0, 1.0))
                 .doesNotThrowAnyException();
 
             // VisibilityStats - all fields validated
@@ -391,7 +407,7 @@ class StatsEndpointTest {
             StatsEndpoint.EntryStats entries = new StatsEndpoint.EntryStats(0);
             StatsEndpoint.VolumeStats volumes = new StatsEndpoint.VolumeStats(0, 0, 0);
             StatsEndpoint.HnswStats hnsw = new StatsEndpoint.HnswStats(0, 0, 0);
-            StatsEndpoint.CuckooStats cuckoo = new StatsEndpoint.CuckooStats(0, 0);
+            StatsEndpoint.CuckooStats cuckoo = new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0);
             StatsEndpoint.VisibilityStats visibility = new StatsEndpoint.VisibilityStats(0, 0, 0);
 
             // Coverage validation

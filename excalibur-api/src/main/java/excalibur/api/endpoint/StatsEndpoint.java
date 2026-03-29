@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpHandler;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.VisibilityTracker;
 import excalibur.shard.allocator.VolumeManager;
+import io.excalibur.metrics.FixedBucketHistogram;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -51,7 +52,9 @@ import java.util.Objects;
  *   },
  *   "cuckoo": {
  *     "pendingDeletions": 100,
- *     "totalDeletions": 5000
+ *     "totalDeletions": 5000,
+ *     "avgFpRate": 0.000500,
+ *     "maxFpRate": 0.001000
  *   },
  *   "visibility": {
  *     "epoch": 42,
@@ -226,7 +229,9 @@ public class StatsEndpoint implements HttpHandler {
 
         CuckooStats cuckoo = new CuckooStats(
             indexOrchestrator.getPendingCuckooDeletions(),
-            indexOrchestrator.getTotalCuckooDeletions()
+            indexOrchestrator.getTotalCuckooDeletions(),
+            FixedBucketHistogram.getInstance().getAverageFpRate(),
+            FixedBucketHistogram.getInstance().getMaxFpRate()
         );
 
         VisibilityTracker.VisibilityStats visStats = visibilityTracker.getStats();
@@ -412,7 +417,9 @@ public class StatsEndpoint implements HttpHandler {
 
         sb.append("\"cuckoo\": {");
         sb.append("\"pendingDeletions\": ").append(stats.cuckoo().pendingDeletions()).append(", ");
-        sb.append("\"totalDeletions\": ").append(stats.cuckoo().totalDeletions());
+        sb.append("\"totalDeletions\": ").append(stats.cuckoo().totalDeletions()).append(", ");
+        sb.append("\"avgFpRate\": ").append(String.format("%.6f", stats.cuckoo().avgFpRate())).append(", ");
+        sb.append("\"maxFpRate\": ").append(String.format("%.6f", stats.cuckoo().maxFpRate()));
         sb.append("}, ");
 
         sb.append("\"visibility\": {");
@@ -546,7 +553,9 @@ public class StatsEndpoint implements HttpHandler {
      */
     public record CuckooStats(
         int pendingDeletions,
-        long totalDeletions
+        long totalDeletions,
+        double avgFpRate,
+        double maxFpRate
     ) {
         public CuckooStats {
             if (pendingDeletions < 0) {
@@ -554,6 +563,12 @@ public class StatsEndpoint implements HttpHandler {
             }
             if (totalDeletions < 0) {
                 throw new IllegalArgumentException("Total deletions must be non-negative: " + totalDeletions);
+            }
+            if (Double.isNaN(avgFpRate) || avgFpRate < 0.0 || avgFpRate > 1.0) {
+                throw new IllegalArgumentException("Average FP rate must be in range [0.0, 1.0]: " + avgFpRate);
+            }
+            if (Double.isNaN(maxFpRate) || maxFpRate < 0.0 || maxFpRate > 1.0) {
+                throw new IllegalArgumentException("Max FP rate must be in range [0.0, 1.0]: " + maxFpRate);
             }
         }
     }

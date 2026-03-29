@@ -2,6 +2,7 @@ package excalibur.api.endpoint;
 
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
+import io.excalibur.core.logging.StructuredLoggingHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,88 +87,100 @@ public class IngestionWorker implements Runnable {
         String sourceId = source.getSourceId();
         IngestStatusEndpoint.IngestionStatus status = statusRegistry.getOrCreate(sourceId);
 
-        LOGGER.info("[{}] Starting stub ingestion worker", sourceId);
+        // Use MDC for structured logging - context is automatically cleaned up in finally block
+        try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
+                .withSourceId(sourceId)
+                .build()) {
 
-        try {
-            // Phase 1: Crawling - discover document count
-            status.update("crawling", 0.0, 0, 0);
-            LOGGER.debug("[{}] Phase 1: Crawling source", sourceId);
+            LOGGER.info("Starting stub ingestion worker");
 
-            if (checkCancelled(status)) return;
-
-            long documentCount = countDocuments();
-
-            if (documentCount == 0) {
-                status.update("idle", 1.0, 0, 0);
-                LOGGER.info("[{}] No documents found, ingestion complete", sourceId);
-                return;
-            }
-
-            LOGGER.info("[{}] Discovered {} documents", sourceId, documentCount);
-
-            if (checkCancelled(status)) return;
-
-            // Phase 2: Embedding simulation
-            // In stub mode, we just simulate progress since we don't have an LLM client
-            status.update("embedding", 0.0, 0, documentCount);
-            LOGGER.debug("[{}] Phase 2: Simulating embedding", sourceId);
-
-            long processedCount = 0;
-            long batchSize = Math.max(1, documentCount / 10); // Update progress every 10%
-
-            for (long i = 0; i < documentCount && !cancelled.get(); i++) {
-                processedCount++;
-
-                // Update progress periodically
-                if (processedCount % batchSize == 0 || processedCount == documentCount) {
-                    double progress = (double) processedCount / documentCount;
-                    status.update("embedding", progress, processedCount, documentCount - processedCount);
-                }
-
-                // Small delay to simulate work (only in stub mode for demonstration)
-                if (documentCount < 1000) {
-                    Thread.sleep(10);
-                }
-            }
-
-            if (checkCancelled(status)) return;
-
-            // Phase 3: Indexing simulation
-            status.update("indexing", 0.9, documentCount, 0);
-            LOGGER.debug("[{}] Phase 3: Simulating indexing", sourceId);
-
-            // Brief pause to show indexing state
-            Thread.sleep(100);
-
-            if (checkCancelled(status)) return;
-
-            // Complete
-            status.update("idle", 1.0, documentCount, 0);
-            LOGGER.info("[{}] Stub ingestion complete: {} documents", sourceId, documentCount);
-
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            status.setError("Ingestion interrupted");
-            LOGGER.info("[{}] Ingestion interrupted", sourceId);
-
-        } catch (SourceException e) {
-            String error = "Source error: " + e.getMessage();
-            status.setError(error);
-            LOGGER.error("[{}] {}", sourceId, error, e);
-
-        } catch (Exception e) {
-            String error = "Ingestion failed: " + e.getMessage();
-            status.setError(error);
-            LOGGER.error("[{}] {}", sourceId, error, e);
-
-        } finally {
-            // Ensure source is closed
             try {
-                source.close();
-            } catch (IOException e) {
-                LOGGER.debug("[{}] Error closing source: {}", sourceId, e.getMessage());
+                // Phase 1: Crawling - discover document count
+                StructuredLoggingHelper.setStage("crawling");
+                status.update("crawling", 0.0, 0, 0);
+                LOGGER.debug("Phase 1: Crawling source");
+
+                if (checkCancelled(status)) return;
+
+                long documentCount = countDocuments();
+
+                if (documentCount == 0) {
+                    StructuredLoggingHelper.setStage("idle");
+                    status.update("idle", 1.0, 0, 0);
+                    LOGGER.info("No documents found, ingestion complete");
+                    return;
+                }
+
+                LOGGER.info("Discovered {} documents", documentCount);
+
+                if (checkCancelled(status)) return;
+
+                // Phase 2: Embedding simulation
+                // In stub mode, we just simulate progress since we don't have an LLM client
+                StructuredLoggingHelper.setStage("embedding");
+                status.update("embedding", 0.0, 0, documentCount);
+                LOGGER.debug("Phase 2: Simulating embedding");
+
+                long processedCount = 0;
+                long batchSize = Math.max(1, documentCount / 10); // Update progress every 10%
+
+                for (long i = 0; i < documentCount && !cancelled.get(); i++) {
+                    processedCount++;
+
+                    // Update progress periodically
+                    if (processedCount % batchSize == 0 || processedCount == documentCount) {
+                        double progress = (double) processedCount / documentCount;
+                        status.update("embedding", progress, processedCount, documentCount - processedCount);
+                    }
+
+                    // Small delay to simulate work (only in stub mode for demonstration)
+                    if (documentCount < 1000) {
+                        Thread.sleep(10);
+                    }
+                }
+
+                if (checkCancelled(status)) return;
+
+                // Phase 3: Indexing simulation
+                StructuredLoggingHelper.setStage("indexing");
+                status.update("indexing", 0.9, documentCount, 0);
+                LOGGER.debug("Phase 3: Simulating indexing");
+
+                // Brief pause to show indexing state
+                Thread.sleep(100);
+
+                if (checkCancelled(status)) return;
+
+                // Complete
+                StructuredLoggingHelper.setStage("idle");
+                status.update("idle", 1.0, documentCount, 0);
+                LOGGER.info("Stub ingestion complete: {} documents", documentCount);
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                status.setError("Ingestion interrupted");
+                LOGGER.info("Ingestion interrupted");
+
+            } catch (SourceException e) {
+                String error = "Source error: " + e.getMessage();
+                status.setError(error);
+                LOGGER.error("{}", error, e);
+
+            } catch (Exception e) {
+                String error = "Ingestion failed: " + e.getMessage();
+                status.setError(error);
+                LOGGER.error("{}", error, e);
+
+            } finally {
+                // Ensure source is closed
+                try {
+                    source.close();
+                } catch (IOException e) {
+                    LOGGER.debug("Error closing source: {}", e.getMessage());
+                }
             }
         }
+        // MDC context is automatically cleared when ctx.close() is called
     }
 
     /**

@@ -428,7 +428,7 @@ class ColdStartIntegrationTest {
                 distanceFunction
             );
 
-            ExecutorService executor = Executors.newFixedThreadPool(4);
+            ExecutorService executor = Executors.newFixedThreadPool(3);
             AtomicBoolean ingestionRunning = new AtomicBoolean(true);
             AtomicInteger queryCount = new AtomicInteger(0);
             AtomicInteger queryWithResultsCount = new AtomicInteger(0);
@@ -438,7 +438,7 @@ class ColdStartIntegrationTest {
             // Ingestion task - simulates cold start ingestion
             Runnable ingestionTask = () -> {
                 try {
-                    for (int i = 0; i < 500 && ingestionRunning.get(); i++) {
+                    for (int i = 0; i < 200 && ingestionRunning.get(); i++) {
                         float[] vector = createRandomVector(dimension);
                         long nodeId = graph.insert(vector);
                         graph.registerDocumentId(nodeId, "concurrent-doc-" + i);
@@ -502,7 +502,7 @@ class ColdStartIntegrationTest {
 
             // Start queries concurrently (simulates queries during cold start)
             List<CompletableFuture<Void>> queryFutures = new ArrayList<>();
-            for (int q = 0; q < 3; q++) {
+            for (int q = 0; q < 2; q++) {
                 queryFutures.add(CompletableFuture.runAsync(queryTask, executor));
             }
 

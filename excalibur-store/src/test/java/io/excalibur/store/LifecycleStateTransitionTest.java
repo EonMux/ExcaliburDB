@@ -100,6 +100,14 @@ class LifecycleStateTransitionTest {
         }
 
         @Test
+        @DisplayName("COMPACTING → TOMBSTONED is valid")
+        void compactingToTombstonedIsValid() {
+            assertDoesNotThrow(() ->
+                LifecycleState.validateTransition(LifecycleState.COMPACTING, LifecycleState.TOMBSTONED)
+            );
+        }
+
+        @Test
         @DisplayName("TOMBSTONED → PURGED is valid")
         void tombstonedToPurgedIsValid() {
             assertDoesNotThrow(() ->

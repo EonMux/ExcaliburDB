@@ -291,6 +291,7 @@ public final class LLMClientConfig {
             .relevancyThreshold(llmConfig.getRelevancyThreshold())
             .embeddingDimension(llmConfig.getEmbeddingsDimensions())
             .maxBatchTokens(llmConfig.getMaxBatchTokens())
+            .retryBaseDelay(Duration.ofMillis(llmConfig.getRetryBaseDelayMs()))
             .build();
     }
 

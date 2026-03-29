@@ -29,9 +29,15 @@ subprojects {
     }
 
     dependencies {
-        // Runtime dependencies
-        runtimeOnly("org.slf4j:slf4j-simple:2.0.16")
+        // SLF4J API for logging
+        implementation("org.slf4j:slf4j-api:2.0.16")
+
+        // Logback for structured logging (production)
+        // Note: slf4j-simple is removed to avoid binding conflict with logback-classic
         runtimeOnly("ch.qos.logback:logback-classic:1.5.12")
+
+        // Logstash encoder for JSON structured logging
+        runtimeOnly("net.logstash.logback:logstash-logback-encoder:8.0")
 
         // Test dependencies
         testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
@@ -193,10 +199,10 @@ tasks.register<JavaExec>("generateCoverageSummary") {
     dependsOn(":excalibur-core:classes")
 }
 
-// Combined coverage task that runs everything
+// Combined coverage task that runs everything and enforces 80% threshold
 tasks.register("coverage") {
     group = "verification"
-    description = "Runs all tests and generates complete coverage reports (HTML + XML)"
+    description = "Runs all tests, generates coverage reports, and enforces 80% minimum threshold"
 
     val targetProjects = listOf(
         "excalibur-core",
@@ -208,6 +214,8 @@ tasks.register("coverage") {
     targetProjects.forEach { projectName ->
         dependsOn(":${projectName}:test")
         dependsOn(":${projectName}:jacocoTestReport")
+        // Enforce 80% minimum coverage threshold
+        dependsOn(":${projectName}:jacocoTestCoverageVerification")
     }
 
     dependsOn("jacocoAggregateReport")

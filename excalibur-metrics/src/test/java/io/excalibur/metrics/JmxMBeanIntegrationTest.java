@@ -50,7 +50,8 @@ class JmxMBeanIntegrationTest {
             "io.excalibur:type=IngestionQueue",
             "io.excalibur:type=VisibilityEpoch",
             "io.excalibur:type=CuckooFpRate",
-            "io.excalibur:type=HnswQueueDepth"
+            "io.excalibur:type=HnswQueueDepth",
+            "io.excalibur:type=IngestionThroughput"
         };
 
         for (String name : mbeanNames) {
@@ -203,8 +204,10 @@ class JmxMBeanIntegrationTest {
             "CuckooFpRate MBean should be discoverable");
         assertTrue(mbeans.contains(new ObjectName("io.excalibur:type=HnswQueueDepth")),
             "HnswQueueDepth MBean should be discoverable");
+        assertTrue(mbeans.contains(new ObjectName("io.excalibur:type=IngestionThroughput")),
+            "IngestionThroughput MBean should be discoverable");
 
-        assertEquals(6, mbeans.size(), "Exactly 6 ExcaliburDB MBeans should be registered");
+        assertEquals(7, mbeans.size(), "Exactly 7 ExcaliburDB MBeans should be registered");
     }
 
     @Test
@@ -299,6 +302,52 @@ class JmxMBeanIntegrationTest {
         assertNotNull(ready, "ready attribute should not be null");
         assertTrue(ready instanceof Boolean, "ready should be Boolean");
         assertTrue((Boolean) ready, "ready should be true when health >= 0.5");
+    }
+
+    @Test
+    @DisplayName("IngestionThroughput MBean should be registered and visible")
+    void ingestionThroughputMBeanShouldBeRegistered() throws Exception {
+        ObjectName objectName = new ObjectName("io.excalibur:type=IngestionThroughput");
+
+        assertTrue(mbeanServer.isRegistered(objectName),
+            "IngestionThroughput MBean should be registered in JMX");
+
+        MBeanInfo info = mbeanServer.getMBeanInfo(objectName);
+        assertNotNull(info, "MBeanInfo should not be null");
+        assertEquals("Ingestion Throughput MBean", info.getDescription(),
+            "MBean description should match");
+
+        assertAttributeExists(info, "entriesIngested");
+        assertAttributeExists(info, "queriesExecuted");
+        assertAttributeExists(info, "ingestionRate");
+        assertAttributeExists(info, "peakIngestionRate");
+    }
+
+    @Test
+    @DisplayName("Ingestion throughput should be readable via JMX")
+    void ingestionThroughputShouldBeReadable() throws Exception {
+        ObjectName throughputName = new ObjectName("io.excalibur:type=IngestionThroughput");
+
+        // Record some ingestion entries
+        Metrics.recordIngestEntry();
+        Metrics.recordIngestEntry();
+        Metrics.recordIngestEntry();
+
+        // Read entriesIngested via JMX
+        Object entriesIngested = mbeanServer.getAttribute(throughputName, "entriesIngested");
+        assertNotNull(entriesIngested, "entriesIngested attribute should not be null");
+        assertTrue(entriesIngested instanceof Long, "entriesIngested should be Long");
+        assertTrue((Long) entriesIngested >= 3, "entriesIngested should be at least 3");
+
+        // Read ingestionRate via JMX
+        Object ingestionRate = mbeanServer.getAttribute(throughputName, "ingestionRate");
+        assertNotNull(ingestionRate, "ingestionRate attribute should not be null");
+        assertTrue(ingestionRate instanceof Double, "ingestionRate should be Double");
+
+        // Read peakIngestionRate via JMX
+        Object peakRate = mbeanServer.getAttribute(throughputName, "peakIngestionRate");
+        assertNotNull(peakRate, "peakIngestionRate attribute should not be null");
+        assertTrue(peakRate instanceof Double, "peakIngestionRate should be Double");
     }
 
     // Helper method to assert attribute exists

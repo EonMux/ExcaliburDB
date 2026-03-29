@@ -17,6 +17,12 @@ dependencies {
     // SLF4J API for logging
     implementation("org.slf4j:slf4j-api:2.0.16")
 
+    // Logback for structured logging
+    runtimeOnly("ch.qos.logback:logback-classic:1.5.12")
+
+    // Logstash encoder for JSON structured logging
+    runtimeOnly("net.logstash.logback:logstash-logback-encoder:8.0")
+
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")

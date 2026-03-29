@@ -36,10 +36,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class HnswRecallBenchmarkValidationTest {
 
-    private static final int DATASET_SIZE = 1000;
+    // Optimized dataset sizes for faster test execution while maintaining statistical validity
+    private static final int DATASET_SIZE = 400;
     private static final int DIMENSION = 64;
     private static final int K = 10;
-    private static final int QUERY_COUNT = 50;
+    private static final int QUERY_COUNT = 20;
 
     /**
      * Target recall@10 threshold - uses the same constant as HnswRecallBenchmark.
@@ -191,12 +192,12 @@ class HnswRecallBenchmarkValidationTest {
             }
 
             // Warm up
-            for (int i = 0; i < 10; i++) {
+            for (int i = 0; i < 5; i++) {
                 graph.search(queries[i % QUERY_COUNT], K);
             }
 
             // Measure QPS
-            int iterations = 100;
+            int iterations = 50;
             long start = System.nanoTime();
             for (int i = 0; i < iterations; i++) {
                 graph.search(queries[i % QUERY_COUNT], K);

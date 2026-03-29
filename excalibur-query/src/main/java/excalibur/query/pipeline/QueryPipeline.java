@@ -18,6 +18,7 @@ import excalibur.query.visibility.DocumentAtomicityFilter;
 import excalibur.query.visibility.QuerySnapshot;
 import excalibur.query.validation.DomainCorrectnessValidator;
 import excalibur.shard.VisibilityTracker;
+import io.excalibur.core.logging.StructuredLoggingHelper;
 import io.excalibur.core.text.TermExtractor;
 import io.excalibur.metrics.Metrics;
 import io.excalibur.store.LifecycleState;
@@ -388,7 +389,10 @@ public class QueryPipeline {
         long startTime = System.nanoTime();
         String correlationId = request.correlationId();
 
-        LOGGER.debug("Starting query pipeline: {}", correlationId);
+        // Set correlation ID in MDC for structured logging
+        StructuredLoggingHelper.setCorrelationId(correlationId);
+
+        LOGGER.debug("Starting query pipeline");
 
         // Create the pipeline execution future
         CompletableFuture<PipelineContext> pipelineFuture = CompletableFuture.supplyAsync(() -> {
@@ -428,11 +432,16 @@ public class QueryPipeline {
             // This enables monitoring of p50/p90/p95/p99 latencies
             Metrics.recordQueryLatency(durationMs);
 
-            if (error != null) {
-                return handlePipelineError(error, request, durationMs, token);
-            }
+            try {
+                if (error != null) {
+                    return handlePipelineError(error, request, durationMs, token);
+                }
 
-            return buildResponse(context, durationMs);
+                return buildResponse(context, durationMs);
+            } finally {
+                // Clear MDC context after pipeline completes
+                StructuredLoggingHelper.clearCorrelationId();
+            }
         });
     }
 
@@ -1362,11 +1371,11 @@ public class QueryPipeline {
             (error.getCause() instanceof CancellationException);
 
         if (timedOut) {
-            LOGGER.warn("Query timed out after {}ms: {}", durationMs, request.correlationId());
+            LOGGER.warn("Query timed out after {}ms", durationMs);
             // Cancel the token to propagate to any running stages
             token.cancel("Query timeout after " + durationMs + "ms");
         } else if (cancelled) {
-            LOGGER.info("Query cancelled: {}", request.correlationId());
+            LOGGER.info("Query cancelled");
         } else {
             LOGGER.error("Query failed: {}", error.getMessage(), error);
         }

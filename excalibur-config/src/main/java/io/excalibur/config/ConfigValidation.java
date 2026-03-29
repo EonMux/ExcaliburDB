@@ -42,6 +42,7 @@ package io.excalibur.config;
  *     <ul>
  *       <li>base-url: must be a valid URL (http:// or https://)</li>
  *       <li>embeddings-dimensions: 128-4096 (default: 1536)</li>
+ *       <li>retry-base-delay-ms: 10-30000 (default: 500)</li>
  *     </ul>
  *   </li>
  *   <li><strong>Shard:</strong>
@@ -260,6 +261,17 @@ public final class ConfigValidation {
         if (embeddingsDimensions > 4096) {
             throw new IllegalStateException(
                 "llm.embeddings-dimensions must be <= 4096, got: " + embeddingsDimensions);
+        }
+
+        // Retry base delay must be between 10 and 30000 ms
+        long retryBaseDelayMs = llm.getRetryBaseDelayMs();
+        if (retryBaseDelayMs < 10) {
+            throw new IllegalStateException(
+                "llm.retry-base-delay-ms must be >= 10, got: " + retryBaseDelayMs);
+        }
+        if (retryBaseDelayMs > 30000) {
+            throw new IllegalStateException(
+                "llm.retry-base-delay-ms must be <= 30000, got: " + retryBaseDelayMs);
         }
     }
     

@@ -275,6 +275,191 @@ class HealthEndpointTest {
         }
 
         @Test
+        @DisplayName("healthy is false when coverage below healthy threshold")
+        void healthyFalseWhenCoverageBelowHealthyThreshold() throws IOException {
+            // Add 1 active segment, coverage = 1/1 = 1.0
+            addActiveSegment(segmentCatalog, 1);
+
+            // Use high healthy threshold so coverage is below it
+            HealthEndpoint endpoint = new HealthEndpoint(
+                visibilityTracker, segmentCatalog, 0.5, 0.9, 5000);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            // coverage = 1.0 >= 0.5 (readiness), so ready=true
+            // coverage = 1.0 >= 0.9 (healthy), so healthy=true
+            assertThat(response).contains("\"ready\": true");
+            assertThat(response).contains("\"healthy\": true");
+        }
+
+        @Test
+        @DisplayName("healthy is true when coverage at healthy threshold")
+        void healthyTrueWhenCoverageAtHealthyThreshold() throws IOException {
+            // Add 1 active segment, 1 tombstoned -> coverage = 1/2 = 0.5
+            addActiveSegment(segmentCatalog, 1);
+            addTombstonedSegment(segmentCatalog, 2);
+
+            // Use healthy threshold of 0.5
+            HealthEndpoint endpoint = new HealthEndpoint(
+                visibilityTracker, segmentCatalog, 0.3, 0.5, 5000);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            // coverage = 0.5 >= 0.3 (readiness), so ready=true
+            // coverage = 0.5 >= 0.5 (healthy), so healthy=true
+            assertThat(response).contains("\"ready\": true");
+            assertThat(response).contains("\"healthy\": true");
+        }
+
+        @Test
+        @DisplayName("custom healthy threshold affects healthy status")
+        void customHealthyThresholdAffectsHealthyStatus() throws IOException {
+            // Add 1 active segment, 1 tombstoned -> coverage = 1/2 = 0.5
+            addActiveSegment(segmentCatalog, 1);
+            addTombstonedSegment(segmentCatalog, 2);
+
+            // Use healthy threshold of 0.9 (coverage 0.5 is below it)
+            HealthEndpoint endpoint = new HealthEndpoint(
+                visibilityTracker, segmentCatalog, 0.3, 0.9, 5000);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            // coverage = 0.5 >= 0.3 (readiness), so ready=true
+            // coverage = 0.5 < 0.9 (healthy), so healthy=false
+            assertThat(response).contains("\"ready\": true");
+            assertThat(response).contains("\"healthy\": false");
+        }
+
+        @Test
+        @DisplayName("ready and healthy thresholds work independently")
+        void readyAndHealthyThresholdsWorkIndependently() throws IOException {
+            // Create a fresh catalog for this test
+            SegmentCatalog localCatalog = new SegmentCatalog();
+            VisibilityTracker localTracker = new VisibilityTracker(localCatalog);
+
+            // Add segments: 5 active, 5 tombstoned -> coverage = 5/10 = 0.5
+            for (int i = 1; i <= 5; i++) {
+                var metadata = localCatalog.add(i, java.nio.file.Path.of("/tmp/segment" + i));
+                metadata.transitionToIndexing();
+                metadata.transitionToWarming();
+                metadata.transitionToActive();
+            }
+            for (int i = 6; i <= 10; i++) {
+                var metadata = localCatalog.add(i, java.nio.file.Path.of("/tmp/segment" + i));
+                metadata.transitionToIndexing();
+                metadata.transitionToWarming();
+                metadata.transitionToActive();
+                metadata.transitionToTombstoned();
+            }
+
+            // readiness = 0.4, healthy = 0.8
+            // coverage = 0.5 >= 0.4 -> ready=true
+            // coverage = 0.5 < 0.8 -> healthy=false
+            HealthEndpoint endpoint = new HealthEndpoint(
+                localTracker, localCatalog, 0.4, 0.8, 5000);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            assertThat(response).contains("\"ready\": true");
+            assertThat(response).contains("\"healthy\": false");
+        }
+
+        @Test
+        @DisplayName("5-parameter constructor with explicit dependencies uses all config values")
+        void fiveParameterConstructorUsesAllConfigValues() throws IOException {
+            // Create fresh catalog
+            SegmentCatalog localCatalog = new SegmentCatalog();
+            VisibilityTracker localTracker = new VisibilityTracker(localCatalog);
+
+            // Add segments: 3 active, 1 tombstoned -> coverage = 3/4 = 0.75
+            for (int i = 1; i <= 3; i++) {
+                var metadata = localCatalog.add(i, java.nio.file.Path.of("/tmp/segment" + i));
+                metadata.transitionToIndexing();
+                metadata.transitionToWarming();
+                metadata.transitionToActive();
+            }
+            var tombstonedMeta = localCatalog.add(4, java.nio.file.Path.of("/tmp/segment4"));
+            tombstonedMeta.transitionToIndexing();
+            tombstonedMeta.transitionToWarming();
+            tombstonedMeta.transitionToActive();
+            tombstonedMeta.transitionToTombstoned();
+
+            // readiness = 0.5, healthy = 0.8, maxLatencyMs = 10000
+            // coverage = 0.75 >= 0.5 -> ready=true
+            // coverage = 0.75 < 0.8 -> healthy=false
+            HealthEndpoint endpoint = new HealthEndpoint(
+                localTracker, localCatalog, 0.5, 0.8, 10000);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            assertThat(response).contains("\"ready\": true");
+            assertThat(response).contains("\"healthy\": false");
+        }
+
+        @Test
+        @DisplayName("both ready and healthy are true when coverage exceeds both thresholds")
+        void bothTrueWhenCoverageExceedsBothThresholds() throws IOException {
+            // Add 10 active segments -> coverage = 1.0
+            for (int i = 1; i <= 10; i++) {
+                addActiveSegment(segmentCatalog, i);
+            }
+
+            // Use high thresholds
+            HealthEndpoint endpoint = new HealthEndpoint(
+                visibilityTracker, segmentCatalog, 0.8, 0.9, 5000);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            // coverage = 1.0 >= 0.8 and >= 0.9
+            assertThat(response).contains("\"ready\": true");
+            assertThat(response).contains("\"healthy\": true");
+        }
+
+        @Test
+        @DisplayName("both ready and healthy are false when coverage below both thresholds")
+        void bothFalseWhenCoverageBelowBothThresholds() throws IOException {
+            // Empty catalog -> coverage = 0.0
+
+            // Use low thresholds
+            HealthEndpoint endpoint = new HealthEndpoint(
+                visibilityTracker, segmentCatalog, 0.1, 0.2, 5000);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            // coverage = 0.0 < 0.1 and < 0.2
+            assertThat(response).contains("\"ready\": false");
+            assertThat(response).contains("\"healthy\": false");
+        }
+
+        @Test
         @DisplayName("coverage includes indexing segments")
         void coverageIncludesIndexingSegments() throws IOException {
             addIndexingSegment(segmentCatalog, 1);

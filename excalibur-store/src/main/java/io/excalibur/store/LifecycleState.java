@@ -23,6 +23,7 @@ package io.excalibur.store;
  *   <li>ACTIVE → COMPACTING (compaction initiated)</li>
  *   <li>COMPACTING → ACTIVE (compaction complete)</li>
  *   <li>ACTIVE → TOMBSTONED (segment marked for deletion)</li>
+ *   <li>COMPACTING → TOMBSTONED (segment deleted during compaction)</li>
  *   <li>TOMBSTONED → PURGED (segment fully removed)</li>
  * </ul>
  *
@@ -154,7 +155,8 @@ public enum LifecycleState {
                 }
                 break;
             case COMPACTING:
-                if (nextState != ACTIVE) {
+                // Can go to ACTIVE (compaction complete) or TOMBSTONED (segment deleted during compaction)
+                if (nextState != ACTIVE && nextState != TOMBSTONED) {
                     throw new IllegalStateException(
                         "Invalid transition from COMPACTING to " + nextState);
                 }

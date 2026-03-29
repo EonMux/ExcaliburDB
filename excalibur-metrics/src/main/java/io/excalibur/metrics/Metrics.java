@@ -39,6 +39,7 @@ public final class Metrics {
     private static final VisibilityEpochMBean visibilityEpochMBeanInstance = new VisibilityEpochMBean();
     private static final CuckooFpRateMBean cuckooFpRateMBeanInstance = new CuckooFpRateMBean();
     private static final HnswQueueDepthMBean hnswQueueDepthMBeanInstance = new HnswQueueDepthMBean();
+    private static final IngestionThroughputMBean ingestionThroughputMBeanInstance = new IngestionThroughputMBean();
 
     /**
      * Gets the QueryLatency MBean instance.
@@ -92,6 +93,15 @@ public final class Metrics {
      */
     public static HnswQueueDepthMBean getHnswQueueDepthMBean() {
         return hnswQueueDepthMBeanInstance;
+    }
+
+    /**
+     * Gets the IngestionThroughput MBean instance.
+     *
+     * @return The IngestionThroughput MBean
+     */
+    public static IngestionThroughputMBean getIngestionThroughputMBean() {
+        return ingestionThroughputMBeanInstance;
     }
 
     // ============================================
@@ -180,6 +190,12 @@ public final class Metrics {
     private static final AtomicLong entriesIngested = new AtomicLong(0);
     private static final AtomicLong queriesExecuted = new AtomicLong(0);
 
+    // Ingestion rate tracking
+    private static final AtomicLong ingestionStartTimestamp = new AtomicLong(System.currentTimeMillis());
+    private static volatile long lastRateCalculationTimestamp = System.currentTimeMillis();
+    private static volatile double currentIngestionRate = 0.0;
+    private static volatile double peakIngestionRate = 0.0;
+
     /**
      * Gets the total number of entries ingested.
      */
@@ -192,6 +208,12 @@ public final class Metrics {
      */
     public static void recordIngestEntry() {
         entriesIngested.incrementAndGet();
+        // Emit notification for ingestion throughput tracking
+        ingestionThroughputMBeanInstance.getBroadcaster().sendNotification(
+            MBeanNotificationBroadcaster.NotificationTypes.INGESTION_THROUGHPUT,
+            "Entry ingested: total=" + entriesIngested.get(),
+            entriesIngested.get()
+        );
     }
 
     /**
@@ -206,6 +228,46 @@ public final class Metrics {
      */
     public static void recordQueryExecution() {
         queriesExecuted.incrementAndGet();
+    }
+
+    /**
+     * Gets the current ingestion rate (entries per second).
+     *
+     * <p>Domain: Returns a value in range [0, Long.MAX_VALUE]. Typical values
+     * for production systems: 100-10000 entries/second.</p>
+     *
+     * @return Current ingestion rate in entries per second
+     */
+    public static double getIngestionRate() {
+        return currentIngestionRate;
+    }
+
+    /**
+     * Gets the peak ingestion rate (entries per second) since startup.
+     *
+     * @return Peak ingestion rate in entries per second
+     */
+    public static double getPeakIngestionRate() {
+        return peakIngestionRate;
+    }
+
+    /**
+     * Updates the ingestion rate calculation.
+     * Should be called periodically to track throughput over time.
+     *
+     * <p>Domain correctness: Rate is calculated as entries/second based on
+     * time elapsed since last calculation. Values are non-negative.</p>
+     */
+    public static void updateIngestionRate() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - lastRateCalculationTimestamp;
+        if (elapsed > 0) {
+            currentIngestionRate = (entriesIngested.get() * 1000.0) / (now - ingestionStartTimestamp.get());
+            if (currentIngestionRate > peakIngestionRate) {
+                peakIngestionRate = currentIngestionRate;
+            }
+            lastRateCalculationTimestamp = now;
+        }
     }
 
     // ============================================
@@ -664,6 +726,16 @@ public final class Metrics {
     }
 
     /**
+     * Registers the ingestion throughput MBean.
+     *
+     * @param registry Metrics registry
+     * @throws Exception if registration fails
+     */
+    private static void registerIngestionThroughputMBean(MetricsRegistry registry) throws Exception {
+        registry.registerMBean(ingestionThroughputMBeanInstance, "io.excalibur:type=IngestionThroughput");
+    }
+
+    /**
      * Registers all metrics MBeans.
      *
      * @param registry Metrics registry instance
@@ -676,6 +748,7 @@ public final class Metrics {
         registerVisibilityEpochMBean(registry);
         registerCuckooFpRateMBean(registry);
         registerHnswQueueDepthMBean(registry);
+        registerIngestionThroughputMBean(registry);
     }
 
     // ============================================
@@ -1573,6 +1646,138 @@ public final class Metrics {
                 broadcaster.getNotificationInfo() // notifications
             );
         }
+
+        @Override
+        public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {
+            broadcaster.addNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener);
+        }
+
+        @Override
+        public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException {
+            broadcaster.removeNotificationListener(listener, filter, handback);
+        }
+
+        @Override
+        public MBeanNotificationInfo[] getNotificationInfo() {
+            return broadcaster.getNotificationInfo();
+        }
+    }
+
+    /**
+     * JMX MBean for ingestion throughput statistics.
+     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
+     *
+     * <p>Provides metrics for tracking ingestion throughput including:
+     * <ul>
+     *   <li>Total entries ingested</li>
+     *   <li>Total queries executed</li>
+     *   <li>Current ingestion rate (entries/second)</li>
+     *   <li>Peak ingestion rate</li>
+     * </ul>
+     * </p>
+     */
+    public static class IngestionThroughputMBean implements DynamicMBean, NotificationEmitter {
+
+        private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
+            "IngestionThroughput",
+            new String[]{ MBeanNotificationBroadcaster.NotificationTypes.INGESTION_THROUGHPUT }
+        );
+
+        private static final MBeanAttributeInfo[] ATTRIBUTES = {
+            new MBeanAttributeInfo("entriesIngested", "long", "Total entries ingested", true, false, false),
+            new MBeanAttributeInfo("queriesExecuted", "long", "Total queries executed", true, false, false),
+            new MBeanAttributeInfo("ingestionRate", "double", "Current ingestion rate (entries/sec)", true, false, false),
+            new MBeanAttributeInfo("peakIngestionRate", "double", "Peak ingestion rate (entries/sec)", true, false, false)
+        };
+
+        /**
+         * Gets the notification broadcaster for this MBean.
+         *
+         * @return The notification broadcaster
+         */
+        public MBeanNotificationBroadcaster getBroadcaster() {
+            return broadcaster;
+        }
+
+        /**
+         * Gets all available attribute names.
+         *
+         * @return Set of attribute names
+         */
+        public Set<String> getAttributes() {
+            return Set.of("entriesIngested", "queriesExecuted", "ingestionRate", "peakIngestionRate");
+        }
+
+        // ============================================
+        // DynamicMBean interface implementation
+        // ============================================
+
+        @Override
+        public Object getAttribute(String attribute) throws AttributeNotFoundException, MBeanException, ReflectionException {
+            switch (attribute) {
+                case "entriesIngested":
+                    return Metrics.getEntriesIngested();
+                case "queriesExecuted":
+                    return Metrics.getQueriesExecuted();
+                case "ingestionRate":
+                    // Update rate before reading
+                    Metrics.updateIngestionRate();
+                    return Metrics.getIngestionRate();
+                case "peakIngestionRate":
+                    return Metrics.getPeakIngestionRate();
+                default:
+                    throw new AttributeNotFoundException("Unknown attribute: " + attribute);
+            }
+        }
+
+        @Override
+        public void setAttribute(Attribute attribute) throws AttributeNotFoundException, InvalidAttributeValueException, MBeanException, ReflectionException {
+            throw new AttributeNotFoundException("Read-only attribute: " + attribute.getName());
+        }
+
+        @Override
+        public AttributeList getAttributes(String[] attributes) {
+            AttributeList list = new AttributeList();
+            for (String attr : attributes) {
+                try {
+                    list.add(new Attribute(attr, getAttribute(attr)));
+                } catch (Exception ignored) {
+                    // Skip attributes that fail
+                }
+            }
+            return list;
+        }
+
+        @Override
+        public AttributeList setAttributes(AttributeList attributes) {
+            return new AttributeList(); // All read-only
+        }
+
+        @Override
+        public Object invoke(String actionName, Object[] params, String[] signature) throws MBeanException, ReflectionException {
+            throw new ReflectionException(new NoSuchMethodException("No operation: " + actionName));
+        }
+
+        @Override
+        public MBeanInfo getMBeanInfo() {
+            return new MBeanInfo(
+                this.getClass().getName(),
+                "Ingestion Throughput MBean",
+                ATTRIBUTES,
+                null, // constructors
+                null, // operations
+                broadcaster.getNotificationInfo() // notifications
+            );
+        }
+
+        // ============================================
+        // NotificationEmitter interface implementation
+        // ============================================
 
         @Override
         public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {

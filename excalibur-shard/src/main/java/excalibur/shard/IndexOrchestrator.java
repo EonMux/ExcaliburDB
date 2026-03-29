@@ -434,6 +434,8 @@ public class IndexOrchestrator implements AutoCloseable {
     @Override
     public void close() {
         stop();
+        // Close the epoch tick scheduler to shut down its executor
+        epochTickScheduler.close();
     }
 
     /**

@@ -293,5 +293,7 @@ public class MBeanNotificationBroadcaster implements NotificationEmitter {
         public static final String CUCKOO_FP_RATE = "excalibur.cuckoo.fprate";
         /** HNSW queue depth changed */
         public static final String HNSW_QUEUE_DEPTH = "excalibur.hnsw.queue";
+        /** Ingestion throughput updated */
+        public static final String INGESTION_THROUGHPUT = "excalibur.ingest.throughput";
     }
 }

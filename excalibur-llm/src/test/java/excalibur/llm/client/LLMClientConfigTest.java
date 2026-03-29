@@ -538,5 +538,24 @@ class LLMClientConfigTest {
             LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
             assertEquals(25, clientConfig.getMaxPromptsPerQuery());
         }
+
+        @Test
+        @DisplayName("Config.Llm retryBaseDelayMs maps to LLMClientConfig")
+        void retryBaseDelayMsMapsCorrectly() {
+            // Create a Config.Llm with custom retry-base-delay-ms
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.llm.base-url", "https://api.test.com/v1");
+            props.put("excalibur.llm.retry-base-delay-ms", "1000");
+
+            Config config = new Config(props);
+            Config.Llm llmConfig = config.llm();
+
+            // Verify Config.Llm has the correct value
+            assertEquals(1000, llmConfig.getRetryBaseDelayMs());
+
+            // Verify LLMClientConfig.fromConfig() maps it correctly
+            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
+            assertEquals(Duration.ofMillis(1000), clientConfig.getRetryBaseDelay());
+        }
     }
 }

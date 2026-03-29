@@ -176,14 +176,6 @@ class LifecycleStateInvalidTransitionTest {
         }
 
         @Test
-        @DisplayName("COMPACTING → TOMBSTONED is invalid")
-        void compactingToTombstonedIsInvalid() {
-            assertThrows(IllegalStateException.class, () ->
-                LifecycleState.validateTransition(LifecycleState.COMPACTING, LifecycleState.TOMBSTONED)
-            );
-        }
-
-        @Test
         @DisplayName("COMPACTING → PURGED is invalid")
         void compactingToPurgedIsInvalid() {
             assertThrows(IllegalStateException.class, () ->

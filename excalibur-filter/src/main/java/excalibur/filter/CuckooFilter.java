@@ -1,12 +1,11 @@
 package excalibur.filter;
 
 import io.excalibur.core.hash.XxHash64;
+import io.excalibur.core.util.SegmentVarHandle;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -130,17 +129,11 @@ public class CuckooFilter {
     private static final int FINGERPRINTS_PER_BUCKET = 4;
     private static final int DEFAULT_MAX_DISPLACEMENTS = 500;
 
-    // ==================== VarHandle for Lock-Free Atomic Reads ====================
-    //
-    // These VarHandles provide atomic reads for thread-safe access without locks.
-    // Buckets are read atomically as 8-byte longs, ensuring no torn reads.
-
-    /**
-     * VarHandle for atomic long reads (8 bytes).
-     * Used to read entire buckets atomically for lock-free contains operations.
-     */
-    private static final VarHandle LONG_HANDLE = MethodHandles
-        .memorySegmentViewVarHandle(ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN));
+    // Cache-line alignment: x86/x64 cache line is 64 bytes
+    // Using 8-byte aligned buckets ensures no bucket crosses a cache line boundary
+    // 8 buckets fit per cache line (64 / 8 = 8)
+    private static final int CACHE_LINE_SIZE = 64;
+    private static final int ALIGNED_BYTES_PER_BUCKET = 8;
 
     // Configuration
     private final int fingerprintBits;
@@ -196,11 +189,12 @@ public class CuckooFilter {
             numBuckets = 4;
         }
 
-        // Calculate bytes per bucket: (4 * fingerprintBits + 7) / 8
-        // For 12 bits: 6 bytes, for 13 bits: 7 bytes
-        int bytesPerBucket = (FINGERPRINTS_PER_BUCKET * fingerprintBits + 7) / 8;
+        // Cache-line aligned bucket storage: 8 bytes per bucket
+        // This ensures buckets never cross 64-byte cache line boundaries
+        // 8 buckets per cache line = optimal cache utilization
+        int bytesPerBucket = ALIGNED_BYTES_PER_BUCKET;
 
-        // Total size: header + buckets (packed fingerprint storage)
+        // Total size: header + buckets (cache-line aligned storage)
         long totalSize = HEADER_SIZE + numBuckets * bytesPerBucket;
 
         // Allocate memory segment
@@ -739,22 +733,21 @@ public class CuckooFilter {
      * Checks if a fingerprint exists in a bucket using lock-free atomic reads.
      *
      * <h3>Lock-Free Implementation</h3>
-     * <p>This method reads the entire bucket atomically. For packed storage where
-     * buckets are smaller than 8 bytes (6 or 7 bytes), we read the bucket using
-     * MemorySegment's native atomicity guarantees where available.</p>
+     * <p>This method reads the entire bucket atomically using VarHandle-based
+     * volatile reads via {@link SegmentVarHandle#readLong(MemorySegment, long)}.
+     * This provides acquire semantics for thread-safe concurrent access.</p>
      *
      * <h3>Atomicity Strategy</h3>
-     * <p>Since packed storage uses 6 or 7-byte buckets, offsets may not be 8-byte aligned,
-     * preventing direct VarHandle usage. Instead, we use MemorySegment.get() with
-     * JAVA_LONG_UNALIGNED which provides atomic reads on most platforms for up to 8 bytes.
-     * On x86/x64, aligned and naturally-sized reads are atomic.</p>
+     * <p>Since packed storage uses 6 or 7-byte buckets, offsets may not be 8-byte aligned.
+     * We use {@link SegmentVarHandle} which provides volatile (acquire) semantics for
+     * MemorySegment access, ensuring no torn reads in concurrent scenarios.</p>
      *
      * @param bucketIndex  The bucket index
      * @param fingerprint The fingerprint to find
      * @return true if found, false otherwise
      */
     private boolean containsFingerprint(long bucketIndex, int fingerprint) {
-        // Read the entire bucket atomically
+        // Read the entire bucket atomically using VarHandle-based volatile read
         // For packed storage, we read up to 8 bytes starting at bucket offset
         long bucketOffset = getBucketOffset(bucketIndex);
 
@@ -762,24 +755,19 @@ public class CuckooFilter {
         long remainingBytes = segment.byteSize() - bucketOffset;
         int bytesToRead = (int) Math.min(8, remainingBytes);
 
-        // Read bytes using MemorySegment's atomic read capability
-        // JAVA_LONG_UNALIGNED allows reading 8 bytes at any offset
+        // Read bytes using VarHandle-based atomic volatile read
         long bucketValue;
         if (bytesToRead >= 8) {
-            // Use unaligned long read for atomic access
-            // MemorySegment.get with JAVA_LONG_UNALIGNED provides atomicity on aligned reads
-            // and reasonable behavior on unaligned reads
-            bucketValue = segment.get(ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN), bucketOffset);
-        } else {
+            // Use SegmentVarHandle for atomic unaligned volatile read with acquire semantics
+            // This ensures thread-safe concurrent access without locks, even for unaligned offsets
+            bucketValue = SegmentVarHandle.readLongUnaligned(segment, bucketOffset, 8);
+        } else if (bytesToRead > 0) {
             // Partial read (last bucket near end of segment) - read available bytes
-            // Pack bytes into long (big-endian order to match storage format)
-            bucketValue = 0;
-            for (int i = 0; i < bytesToRead; i++) {
-                byte b = segment.get(ValueLayout.JAVA_BYTE, bucketOffset + i);
-                bucketValue = (bucketValue << 8) | (b & 0xFF);
-            }
-            // Shift to position at high bits (as if we read 8 bytes)
-            bucketValue <<= (8 - bytesToRead) * 8;
+            // Use unaligned read for volatile semantics
+            bucketValue = SegmentVarHandle.readLongUnaligned(segment, bucketOffset, bytesToRead);
+        } else {
+            // Edge case: no bytes to read
+            return false;
         }
 
         // Extract and compare each fingerprint from the atomic read

@@ -121,6 +121,21 @@ class FixedBucketHistogramTest {
     }
 
     @Test
+    @DisplayName("FP rate boundary values do not throw ArrayIndexOutOfBoundsException")
+    void testFpRateBoundaryValues() {
+        // These should not throw ArrayIndexOutOfBoundsException
+        assertDoesNotThrow(() -> histogram.recordFpRate(0.0));
+        assertDoesNotThrow(() -> histogram.recordFpRate(1.0));
+        assertDoesNotThrow(() -> histogram.recordFpRate(0.9999));
+        assertDoesNotThrow(() -> histogram.recordFpRate(-0.1));  // Should be clamped to 0.0
+        assertDoesNotThrow(() -> histogram.recordFpRate(1.1));   // Should be clamped to 1.0
+
+        assertEquals(5, histogram.getFpRateCount());
+        assertTrue(histogram.getMaxFpRate() >= 0.0 && histogram.getMaxFpRate() <= 1.0,
+            "Max FP rate should be in valid range");
+    }
+
+    @Test
     @DisplayName("Synchronized access is thread-safe")
     void testThreadSafety() throws InterruptedException {
         Thread[] threads = new Thread[10];

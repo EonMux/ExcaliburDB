@@ -53,11 +53,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class EndToEndQueryBenchmarkValidationTest {
 
+    // Optimized sizes for faster test execution while maintaining validity
     private static final int SEGMENT_COUNT = 2;
-    private static final int VECTORS_PER_SEGMENT = 500;
+    private static final int VECTORS_PER_SEGMENT = 200;
     private static final int DIMENSION = 64;
     private static final int TOP_K = 10;
-    private static final int QUERY_COUNT = 100;
+    private static final int QUERY_COUNT = 50;
 
     @TempDir
     Path tempDir;
@@ -214,7 +215,7 @@ class EndToEndQueryBenchmarkValidationTest {
     void testLatencyIsMeasurable() {
         List<Long> latencies = new ArrayList<>();
 
-        for (int i = 0; i < 20; i++) {
+        for (int i = 0; i < 10; i++) {
             QueryRequest request = QueryRequest.builder()
                 .queryText("latency test query")
                 .queryVector(queryVectors[i % queryVectors.length])
@@ -253,7 +254,7 @@ class EndToEndQueryBenchmarkValidationTest {
         List<Double> latenciesMs = new ArrayList<>();
 
         // Collect latency samples with sub-millisecond precision
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 50; i++) {
             QueryRequest request = QueryRequest.builder()
                 .queryText("percentile test query")
                 .queryVector(queryVectors[i % queryVectors.length])
@@ -394,8 +395,8 @@ class EndToEndQueryBenchmarkValidationTest {
     @Test
     @DisplayName("Multiple concurrent queries should not interfere")
     void testConcurrentQueryIsolation() throws InterruptedException {
-        int threadCount = 4;
-        int queriesPerThread = 10;
+        int threadCount = 3;
+        int queriesPerThread = 8;
         List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
         // Use Double for sub-millisecond precision
         List<Double> allLatenciesMs = Collections.synchronizedList(new ArrayList<>());

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.util.Set;
 
@@ -48,7 +49,9 @@ class LshHashTableTest {
 
             assertThat(hashTable.numBits()).isEqualTo(NUM_BITS);
             assertThat(hashTable.dimensions()).isEqualTo(DIMENSIONS);
-            assertThat(hashTable.hashFunction()).isEqualTo(hashFunction);
+            // Compare properties since the constructor creates a new hash function internally
+            assertThat(hashTable.hashFunction().numBits()).isEqualTo(hashFunction.numBits());
+            assertThat(hashTable.hashFunction().dimensions()).isEqualTo(hashFunction.dimensions());
         }
     }
 
@@ -58,7 +61,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should insert single entry")
-        void shouldInsertSingleEntry() {
+        void shouldInsertSingleEntry() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -68,7 +71,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should insert multiple entries")
-        void shouldInsertMultipleEntries() {
+        void shouldInsertMultipleEntries() throws IOException {
             for (int i = 0; i < 100; i++) {
                 float[] vector = createRandomVector(DIMENSIONS, i);
                 table.insert(vector, i);
@@ -111,7 +114,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should find inserted entry")
-        void shouldFindInsertedEntry() {
+        void shouldFindInsertedEntry() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -122,7 +125,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should find entry with multi-probe")
-        void shouldFindWithMultiProbe() {
+        void shouldFindWithMultiProbe() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -156,7 +159,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should query exact hash")
-        void shouldQueryExact() {
+        void shouldQueryExact() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -167,7 +170,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should return empty for empty bucket")
-        void shouldReturnEmptyForEmptyBucket() {
+        void shouldReturnEmptyForEmptyBucket() throws IOException {
             float[] vector1 = createRandomVector(DIMENSIONS, 1);
             float[] vector2 = createRandomVector(DIMENSIONS, 2);
 
@@ -204,7 +207,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should delete entry")
-        void shouldDeleteEntry() {
+        void shouldDeleteEntry() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -224,7 +227,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should delete from specific bucket")
-        void shouldDeleteFromSpecificBucket() {
+        void shouldDeleteFromSpecificBucket() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -237,7 +240,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should return false for wrong bucket")
-        void shouldReturnFalseForWrongBucket() {
+        void shouldReturnFalseForWrongBucket() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -249,7 +252,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should remove empty bucket after deletion")
-        void shouldRemoveEmptyBucket() {
+        void shouldRemoveEmptyBucket() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -267,7 +270,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should check contains for existing entry")
-        void shouldCheckContainsExisting() {
+        void shouldCheckContainsExisting() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -279,7 +282,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should check contains for non-existent entry")
-        void shouldCheckContainsNonExistent() {
+        void shouldCheckContainsNonExistent() throws IOException {
             float[] vector = createRandomVector(DIMENSIONS, 1);
             table.insert(vector, 1L);
 
@@ -304,7 +307,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should clear all entries")
-        void shouldClearAllEntries() {
+        void shouldClearAllEntries() throws IOException {
             for (int i = 0; i < 50; i++) {
                 float[] vector = createRandomVector(DIMENSIONS, i);
                 table.insert(vector, i);
@@ -325,7 +328,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should serialize to bytes")
-        void shouldSerializeToBytes() {
+        void shouldSerializeToBytes() throws IOException {
             for (int i = 0; i < 10; i++) {
                 float[] vector = createRandomVector(DIMENSIONS, i);
                 table.insert(vector, i);
@@ -339,7 +342,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should serialize to MemorySegment")
-        void shouldSerializeToMemorySegment() {
+        void shouldSerializeToMemorySegment() throws IOException {
             for (int i = 0; i < 10; i++) {
                 float[] vector = createRandomVector(DIMENSIONS, i);
                 table.insert(vector, i);
@@ -355,7 +358,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should deserialize from MemorySegment")
-        void shouldDeserializeFromMemorySegment() {
+        void shouldDeserializeFromMemorySegment() throws IOException {
             // Insert entries
             for (int i = 0; i < 10; i++) {
                 float[] vector = createRandomVector(DIMENSIONS, i);
@@ -398,7 +401,7 @@ class LshHashTableTest {
         @DisplayName("Should reject invalid magic number")
         void shouldRejectInvalidMagicNumber() {
             try (Arena arena = Arena.ofConfined()) {
-                var segment = arena.allocate(32);
+                var segment = arena.allocate(64);
                 // Write wrong magic number
                 segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, 0, 0xDEADBEEF);
 
@@ -412,7 +415,7 @@ class LshHashTableTest {
         @DisplayName("Should reject unsupported version")
         void shouldRejectUnsupportedVersion() {
             try (Arena arena = Arena.ofConfined()) {
-                var segment = arena.allocate(32);
+                var segment = arena.allocate(64);
                 // Write magic and wrong version
                 segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, 0, 0x4C534854); // MAGIC
                 segment.set(java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED, 4, 999); // Wrong version
@@ -441,7 +444,7 @@ class LshHashTableTest {
 
         @Test
         @DisplayName("Should show counts after insertions")
-        void shouldShowCountsAfterInsertions() {
+        void shouldShowCountsAfterInsertions() throws IOException {
             for (int i = 0; i < 10; i++) {
                 float[] vector = createRandomVector(DIMENSIONS, i);
                 table.insert(vector, i);

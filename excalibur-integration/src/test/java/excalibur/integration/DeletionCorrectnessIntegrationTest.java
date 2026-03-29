@@ -8,13 +8,21 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.RepeatedTest;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -509,6 +517,488 @@ class DeletionCorrectnessIntegrationTest {
             assertThat(fpRate)
                 .as("False positive rate should be ≤1%")
                 .isLessThan(0.01);
+        }
+    }
+
+    @Nested
+    @DisplayName("Concurrent Deletion Safety")
+    class ConcurrentDeletionSafety {
+
+        /**
+         * Test: Concurrent deletes from multiple threads are safe.
+         *
+         * <p>Domain correctness: No data corruption or race conditions when
+         * multiple threads delete entries concurrently.</p>
+         */
+        @Test
+        @DisplayName("concurrent deletes from multiple threads are safe")
+        void concurrentDeletesFromMultipleThreadsAreSafe() throws Exception {
+            CuckooFilter filter = CuckooFilter.create(10000);
+
+            // Insert keys
+            Set<String> allKeys = ConcurrentHashMap.newKeySet();
+            for (int i = 0; i < 2000; i++) {
+                String key = "concurrent-key-" + i;
+                filter.insert(key.getBytes(StandardCharsets.UTF_8));
+                allKeys.add(key);
+            }
+
+            // Verify all inserted
+            assertThat(filter.count()).isEqualTo(2000);
+
+            // Partition keys for concurrent deletion
+            List<String> keyList = new ArrayList<>(allKeys);
+            Collections.shuffle(keyList, random);
+
+            int numThreads = 4;
+            List<List<String>> partitions = new ArrayList<>();
+            for (int i = 0; i < numThreads; i++) {
+                partitions.add(new ArrayList<>());
+            }
+            for (int i = 0; i < keyList.size(); i++) {
+                partitions.get(i % numThreads).add(keyList.get(i));
+            }
+
+            // Concurrent deletion
+            CountDownLatch startLatch = new CountDownLatch(1);
+            CountDownLatch doneLatch = new CountDownLatch(numThreads);
+            AtomicInteger totalDeleted = new AtomicInteger(0);
+
+            try (ExecutorService executor = Executors.newFixedThreadPool(numThreads)) {
+                for (int t = 0; t < numThreads; t++) {
+                    final List<String> partition = partitions.get(t);
+                    executor.submit(() -> {
+                        try {
+                            startLatch.await();
+                            for (String key : partition) {
+                                if (filter.delete(key.getBytes(StandardCharsets.UTF_8))) {
+                                    totalDeleted.incrementAndGet();
+                                }
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        } finally {
+                            doneLatch.countDown();
+                        }
+                    });
+                }
+
+                startLatch.countDown();
+                boolean finished = doneLatch.await(30, TimeUnit.SECONDS);
+                assertThat(finished).as("Concurrent deletions should complete in time").isTrue();
+            }
+
+            // Verify all deletions succeeded
+            assertThat(totalDeleted.get()).isEqualTo(2000);
+            assertThat(filter.count()).isEqualTo(0);
+
+            // Verify no false positives after deletion
+            int falsePositives = 0;
+            for (String key : allKeys) {
+                if (filter.contains(key.getBytes(StandardCharsets.UTF_8))) {
+                    falsePositives++;
+                }
+            }
+            assertThat(falsePositives)
+                .as("No false positives after concurrent deletion")
+                .isEqualTo(0);
+
+            System.out.println("Concurrent deletion: " + totalDeleted.get() +
+                " deleted by " + numThreads + " threads, " + falsePositives + " false positives");
+        }
+
+        /**
+         * Test: Concurrent insert and delete operations are safe.
+         */
+        @Test
+        @DisplayName("concurrent insert and delete operations are safe")
+        void concurrentInsertAndDeleteOperationsAreSafe() throws Exception {
+            CuckooFilter filter = CuckooFilter.create(10000);
+
+            int numOperations = 1000;
+            CountDownLatch startLatch = new CountDownLatch(1);
+            CountDownLatch doneLatch = new CountDownLatch(2);
+            AtomicInteger insertCount = new AtomicInteger(0);
+            AtomicInteger deleteCount = new AtomicInteger(0);
+            Set<String> insertedKeys = ConcurrentHashMap.newKeySet();
+
+            try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+                // Insert thread
+                executor.submit(() -> {
+                    try {
+                        startLatch.await();
+                        for (int i = 0; i < numOperations; i++) {
+                            String key = "mixed-key-" + i;
+                            if (filter.insert(key.getBytes(StandardCharsets.UTF_8))) {
+                                insertedKeys.add(key);
+                                insertCount.incrementAndGet();
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                });
+
+                // Delete thread (deletes odd keys that may or may not exist)
+                executor.submit(() -> {
+                    try {
+                        startLatch.await();
+                        for (int i = 0; i < numOperations; i += 2) {
+                            String key = "mixed-key-" + i;
+                            if (filter.delete(key.getBytes(StandardCharsets.UTF_8))) {
+                                deleteCount.incrementAndGet();
+                                insertedKeys.remove(key);
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                });
+
+                startLatch.countDown();
+                boolean finished = doneLatch.await(30, TimeUnit.SECONDS);
+                assertThat(finished).as("Concurrent operations should complete in time").isTrue();
+            }
+
+            // Verify consistency: filter count should match inserted keys still present
+            long filterCount = filter.count();
+            int expectedCount = insertedKeys.size();
+
+            System.out.println("Mixed operations: " + insertCount.get() + " inserts, " +
+                deleteCount.get() + " deletes, filter count=" + filterCount +
+                ", expected=" + expectedCount);
+
+            // All keys still in insertedKeys should be present
+            int missingCount = 0;
+            for (String key : insertedKeys) {
+                if (!filter.contains(key.getBytes(StandardCharsets.UTF_8))) {
+                    missingCount++;
+                }
+            }
+            assertThat(missingCount).as("All remaining keys should be present").isEqualTo(0);
+        }
+    }
+
+    @Nested
+    @DisplayName("Domain Correctness Verification")
+    class DomainCorrectnessVerification {
+
+        /**
+         * Test: Deleted entries have exactly zero false positives at normal load factors.
+         *
+         * <p>Domain correctness: This is a critical requirement for Cuckoo filters.
+         * After delete(key), contains(key) MUST return false. This is guaranteed
+         * by the Cuckoo filter design when load factor is reasonable (&lt;95%).</p>
+         */
+        @Test
+        @DisplayName("deleted entries have zero false positives at normal load factor")
+        void deletedEntriesHaveZeroFalsePositivesAtNormalLoadFactor() {
+            CuckooFilter filter = CuckooFilter.create(DEFAULT_CAPACITY);
+
+            // Insert at moderate load factor (~50%)
+            Set<String> keys = new HashSet<>();
+            for (int i = 0; i < 5000; i++) {
+                String key = "domain-key-" + i;
+                assertThat(filter.insert(key.getBytes(StandardCharsets.UTF_8)))
+                    .as("Insert should succeed at moderate load factor")
+                    .isTrue();
+                keys.add(key);
+            }
+
+            double loadFactor = filter.loadFactor();
+            System.out.println("Load factor before deletion: " +
+                String.format("%.2f%%", loadFactor * 100));
+
+            assertThat(loadFactor)
+                .as("Load factor should be reasonable for this test")
+                .isLessThan(0.7);
+
+            // Delete all keys
+            for (String key : keys) {
+                boolean deleted = filter.delete(key.getBytes(StandardCharsets.UTF_8));
+                assertThat(deleted)
+                    .as("Delete should succeed for key: " + key)
+                    .isTrue();
+            }
+
+            // CRITICAL: Verify zero false positives
+            int falsePositives = 0;
+            for (String key : keys) {
+                if (filter.contains(key.getBytes(StandardCharsets.UTF_8))) {
+                    falsePositives++;
+                }
+            }
+
+            assertThat(falsePositives)
+                .as("CRITICAL: Deleted keys must have ZERO false positives at normal load factor")
+                .isEqualTo(0);
+
+            System.out.println("Domain correctness verified: 0 false positives for " +
+                keys.size() + " deleted keys at " +
+                String.format("%.2f%%", loadFactor * 100) + " load factor");
+        }
+
+        /**
+         * Test: Hierarchical deletion removes entries from ALL levels.
+         *
+         * <p>Domain correctness: When deleting from a hierarchical filter,
+         * the entry must be removed from segment, cluster, AND corpus levels.</p>
+         */
+        @Test
+        @DisplayName("hierarchical deletion removes from all levels")
+        void hierarchicalDeletionRemovesFromAllLevels() {
+            HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(10000);
+
+            // Create hierarchy: corpus -> clusters -> segments
+            hcf.registerSegment("seg-A1", "cluster-A");
+            hcf.registerSegment("seg-A2", "cluster-A");
+            hcf.registerSegment("seg-B1", "cluster-B");
+
+            // Insert keys into different segments
+            String key1 = "hierarchy-test-key-1";
+            String key2 = "hierarchy-test-key-2";
+            String key3 = "hierarchy-test-key-3";
+
+            assertThat(hcf.insertKey(key1, "seg-A1")).isTrue();
+            assertThat(hcf.insertKey(key2, "seg-A2")).isTrue();
+            assertThat(hcf.insertKey(key3, "seg-B1")).isTrue();
+
+            // Verify presence at all levels before deletion
+            CuckooFilter corpusFilter = hcf.getCorpusFilter();
+            CuckooFilter clusterA = hcf.getClusterFilter("cluster-A");
+            CuckooFilter clusterB = hcf.getClusterFilter("cluster-B");
+            CuckooFilter segA1 = hcf.getSegmentFilter("seg-A1");
+
+            assertThat(corpusFilter.contains(HierarchicalCuckooFilter.toBytes(key1))).isTrue();
+            assertThat(clusterA.contains(HierarchicalCuckooFilter.toBytes(key1))).isTrue();
+            assertThat(segA1.contains(HierarchicalCuckooFilter.toBytes(key1))).isTrue();
+
+            // Delete key1 from hierarchy
+            boolean deleted = hcf.deleteKey(key1, "seg-A1");
+            assertThat(deleted).isTrue();
+
+            // CRITICAL: Verify key1 is gone from ALL levels
+            assertThat(segA1.contains(HierarchicalCuckooFilter.toBytes(key1)))
+                .as("Key must be removed from segment level")
+                .isFalse();
+            assertThat(clusterA.contains(HierarchicalCuckooFilter.toBytes(key1)))
+                .as("Key must be removed from cluster level")
+                .isFalse();
+            assertThat(corpusFilter.contains(HierarchicalCuckooFilter.toBytes(key1)))
+                .as("Key must be removed from corpus level")
+                .isFalse();
+
+            // Verify other keys are still present
+            assertThat(hcf.mightContainKey(key2)).isTrue();
+            assertThat(hcf.mightContainKey(key3)).isTrue();
+
+            System.out.println("Hierarchical deletion verified: key removed from all levels");
+        }
+
+        /**
+         * Test: Delete operation is idempotent.
+         */
+        @Test
+        @DisplayName("delete operation is idempotent")
+        void deleteOperationIsIdempotent() {
+            CuckooFilter filter = CuckooFilter.create(DEFAULT_CAPACITY);
+
+            String key = "idempotent-key";
+            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+
+            // Insert
+            assertThat(filter.insert(keyBytes)).isTrue();
+            assertThat(filter.contains(keyBytes)).isTrue();
+
+            // First delete - should succeed
+            assertThat(filter.delete(keyBytes)).isTrue();
+            assertThat(filter.contains(keyBytes)).isFalse();
+
+            // Second delete - should fail (already deleted)
+            assertThat(filter.delete(keyBytes)).isFalse();
+            assertThat(filter.contains(keyBytes)).isFalse();
+
+            // Third delete - should still fail
+            assertThat(filter.delete(keyBytes)).isFalse();
+
+            System.out.println("Delete idempotency verified");
+        }
+    }
+
+    @Nested
+    @DisplayName("End-to-End System Integration")
+    class EndToEndSystemIntegration {
+
+        /**
+         * Test: Full lifecycle - insert, query, delete, verify.
+         *
+         * <p>Domain correctness: Simulates real user workflow with a complete
+         * lifecycle of entries in the system.</p>
+         */
+        @Test
+        @DisplayName("full lifecycle insert query delete verify")
+        void fullLifecycleInsertQueryDeleteVerify() {
+            // Create a hierarchical filter simulating a multi-segment index
+            HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(50000);
+
+            // Register segments for different document types
+            for (int seg = 0; seg < 10; seg++) {
+                String cluster = (seg < 5) ? "cluster-alpha" : "cluster-beta";
+                hcf.registerSegment("documents-" + seg, cluster);
+            }
+
+            // Insert documents (simulating ingestion)
+            Set<String> allKeys = new HashSet<>();
+            for (int seg = 0; seg < 10; seg++) {
+                String segmentId = "documents-" + seg;
+                for (int doc = 0; doc < 100; doc++) {
+                    String key = "doc-" + seg + "-" + doc + "-" + System.nanoTime();
+                    boolean inserted = hcf.insertKey(key, segmentId);
+                    if (inserted) {
+                        allKeys.add(key);
+                    }
+                }
+            }
+
+            System.out.println("Inserted " + allKeys.size() + " documents across 10 segments");
+
+            // Query phase - verify all inserted documents are findable
+            int foundCount = 0;
+            for (String key : allKeys) {
+                if (hcf.mightContainKey(key)) {
+                    foundCount++;
+                }
+            }
+            assertThat(foundCount).isEqualTo(allKeys.size());
+
+            // Simulate document deletion (e.g., user deleted documents)
+            Set<String> keysToDelete = new HashSet<>();
+            int deleteCount = 0;
+            for (String key : allKeys) {
+                if (deleteCount >= allKeys.size() / 2) break;
+                keysToDelete.add(key);
+                deleteCount++;
+            }
+
+            // Delete documents - must determine segment for each key
+            // For this test, we search segments to find the right one
+            int successfullyDeleted = 0;
+            for (String key : keysToDelete) {
+                byte[] keyBytes = HierarchicalCuckooFilter.toBytes(key);
+                List<String> candidates = hcf.findCandidateSegments(keyBytes);
+                for (String segId : candidates) {
+                    if (hcf.deleteFromHierarchy(keyBytes, segId)) {
+                        successfullyDeleted++;
+                        break;
+                    }
+                }
+            }
+
+            System.out.println("Deleted " + successfullyDeleted + " documents");
+
+            // Verify deleted documents are NOT found (no false positives)
+            int falsePositives = 0;
+            for (String key : keysToDelete) {
+                if (hcf.mightContainKey(key)) {
+                    falsePositives++;
+                }
+            }
+            assertThat(falsePositives)
+                .as("CRITICAL: Deleted documents must not appear in queries")
+                .isEqualTo(0);
+
+            // Verify remaining documents are still findable
+            Set<String> remainingKeys = new HashSet<>(allKeys);
+            remainingKeys.removeAll(keysToDelete);
+            int remainingFound = 0;
+            for (String key : remainingKeys) {
+                if (hcf.mightContainKey(key)) {
+                    remainingFound++;
+                }
+            }
+            assertThat(remainingFound).isEqualTo(remainingKeys.size());
+
+            System.out.println("End-to-end verification: " + falsePositives +
+                " false positives, " + remainingFound + "/" + remainingKeys.size() +
+                " remaining documents found");
+        }
+
+        /**
+         * Test: Stress test with many operations.
+         */
+        @Test
+        @DisplayName("stress test with many operations")
+        void stressTestWithManyOperations() {
+            CuckooFilter filter = CuckooFilter.create(50000);
+
+            Set<String> activeKeys = new HashSet<>();
+            Random rng = new Random(12345);
+
+            // Perform many insert/delete cycles
+            int totalInserts = 0;
+            int totalDeletes = 0;
+            int failedInserts = 0;
+
+            for (int round = 0; round < 100; round++) {
+                // Insert batch
+                for (int i = 0; i < 100; i++) {
+                    String key = "stress-" + round + "-" + i;
+                    if (filter.insert(key.getBytes(StandardCharsets.UTF_8))) {
+                        activeKeys.add(key);
+                        totalInserts++;
+                    } else {
+                        failedInserts++;
+                    }
+                }
+
+                // Delete random subset
+                List<String> keyList = new ArrayList<>(activeKeys);
+                Collections.shuffle(keyList, rng);
+                int toDelete = Math.min(50, keyList.size());
+                for (int i = 0; i < toDelete; i++) {
+                    String key = keyList.get(i);
+                    if (filter.delete(key.getBytes(StandardCharsets.UTF_8))) {
+                        activeKeys.remove(key);
+                        totalDeletes++;
+                    }
+                }
+            }
+
+            System.out.println("Stress test: " + totalInserts + " inserts, " +
+                totalDeletes + " deletes, " + failedInserts + " failed inserts, " +
+                activeKeys.size() + " active keys");
+
+            // Verify all active keys are present
+            int missingCount = 0;
+            for (String key : activeKeys) {
+                if (!filter.contains(key.getBytes(StandardCharsets.UTF_8))) {
+                    missingCount++;
+                }
+            }
+            assertThat(missingCount).as("All active keys should be present").isEqualTo(0);
+
+            // Delete all remaining and verify zero false positives
+            Set<String> toVerify = new HashSet<>(activeKeys);
+            for (String key : toVerify) {
+                filter.delete(key.getBytes(StandardCharsets.UTF_8));
+                activeKeys.remove(key);
+            }
+
+            int falsePositives = 0;
+            for (String key : toVerify) {
+                if (filter.contains(key.getBytes(StandardCharsets.UTF_8))) {
+                    falsePositives++;
+                }
+            }
+            assertThat(falsePositives)
+                .as("No false positives after stress test deletion")
+                .isEqualTo(0);
+
+            System.out.println("Stress test passed: " + falsePositives + " false positives");
         }
     }
 }

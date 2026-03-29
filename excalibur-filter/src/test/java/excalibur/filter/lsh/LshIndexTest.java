@@ -4,6 +4,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.Set;
@@ -44,7 +45,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should insert and query vectors")
-    void testInsertAndQuery() {
+    void testInsertAndQuery() throws IOException {
         float[] vector1 = createRandomVector(DIMENSIONS, 1);
         float[] vector2 = createRandomVector(DIMENSIONS, 2);
         float[] similarVector = createSimilarVector(vector1, 0.01f);
@@ -69,7 +70,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should delete entries")
-    void testDelete() {
+    void testDelete() throws IOException {
         float[] vector = createRandomVector(DIMENSIONS, 1);
         index.insert(vector, 1L);
         assertThat(index.entryCount()).isEqualTo(1L);
@@ -84,7 +85,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should handle multiple insertions of same entry")
-    void testDuplicateInsert() {
+    void testDuplicateInsert() throws IOException {
         float[] vector = createRandomVector(DIMENSIONS, 1);
 
         index.insert(vector, 1L);
@@ -130,7 +131,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should handle concurrent insertions")
-    void testConcurrentInsert() throws InterruptedException {
+    void testConcurrentInsert() throws InterruptedException, IOException {
         int numThreads = 4;
         int insertsPerThread = 100;
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
@@ -163,7 +164,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should handle concurrent queries")
-    void testConcurrentQuery() throws InterruptedException {
+    void testConcurrentQuery() throws InterruptedException, IOException {
         // Insert some vectors first
         for (int i = 0; i < 100; i++) {
             float[] vector = createRandomVector(DIMENSIONS, i);
@@ -199,7 +200,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should clear index")
-    void testClear() {
+    void testClear() throws IOException {
         for (int i = 0; i < 10; i++) {
             float[] vector = createRandomVector(DIMENSIONS, i);
             index.insert(vector, i);
@@ -214,7 +215,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should find similar vectors with high probability")
-    void testFindSimilarVectors() {
+    void testFindSimilarVectors() throws IOException {
         // Create base vector
         float[] base = createRandomVector(DIMENSIONS, 1);
         index.insert(base, 1L);
@@ -260,7 +261,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should estimate memory usage")
-    void testEstimatedMemoryUsage() {
+    void testEstimatedMemoryUsage() throws IOException {
         long initialMemory = index.estimatedMemoryUsage();
 
         for (int i = 0; i < 100; i++) {
@@ -274,7 +275,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should check might contain")
-    void testMightContain() {
+    void testMightContain() throws IOException {
         float[] vector = createRandomVector(DIMENSIONS, 1);
         index.insert(vector, 1L);
 
@@ -291,7 +292,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should serialize and deserialize index")
-    void testSerializationRoundTrip() {
+    void testSerializationRoundTrip() throws IOException {
         // Insert several entries
         for (int i = 0; i < 10; i++) {
             float[] vector = createRandomVector(DIMENSIONS, i);
@@ -323,7 +324,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should restore queryability after deserialization")
-    void testQueryAfterDeserialization() {
+    void testQueryAfterDeserialization() throws IOException {
         // Insert entries with known vectors
         float[] vector1 = createRandomVector(DIMENSIONS, 1);
         float[] vector2 = createRandomVector(DIMENSIONS, 2);
@@ -354,7 +355,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should handle serialization of empty index")
-    void testSerializeEmptyIndex() {
+    void testSerializeEmptyIndex() throws IOException {
         // Don't insert anything - index is empty
 
         try (Arena arena = Arena.ofConfined()) {
@@ -402,7 +403,7 @@ class LshIndexTest {
 
     @Test
     @DisplayName("Should preserve deleted state after deserialization")
-    void testDeleteAfterDeserialization() {
+    void testDeleteAfterDeserialization() throws IOException {
         // Insert entries
         for (int i = 0; i < 5; i++) {
             float[] vector = createRandomVector(DIMENSIONS, i);

@@ -84,7 +84,8 @@ public final class FixedBucketHistogram {
      */
     public void recordFpRate(double fpRate) {
         double normalizedRate = Math.max(0.0, Math.min(1.0, fpRate));
-        int bucketIndex = (int) (normalizedRate * NUM_FP_RATES);
+        // Clamp index to prevent ArrayIndexOutOfBoundsException when normalizedRate == 1.0
+        int bucketIndex = Math.min((int) (normalizedRate * NUM_FP_RATES), NUM_FP_RATES - 1);
         synchronized (this) {
             fpRateBuckets[bucketIndex]++;
             fpRateEntries++;

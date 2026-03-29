@@ -13,9 +13,11 @@ dependencies {
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.mockito:mockito-core:5.14.2")
 
     // All phases dependencies
     implementation(project(":excalibur-core"))
+    implementation(project(":excalibur-config"))
     implementation(project(":excalibur-store"))
     implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-vector"))

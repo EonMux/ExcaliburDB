@@ -520,6 +520,7 @@ public final class Config {
      *   <li><code>excalibur.llm.max-prompts-per-query</code> - Max prompts for relevancy scoring (default: 10)</li>
      *   <li><code>excalibur.llm.relevancy-threshold</code> - Minimum relevancy score (default: 0.3)</li>
      *   <li><code>excalibur.llm.max-batch-tokens</code> - Max tokens per batch (default: 4000)</li>
+     *   <li><code>excalibur.llm.retry-base-delay-ms</code> - Base delay for exponential backoff (default: 500)</li>
      * </ul>
      */
     public static final class Llm {
@@ -563,6 +564,9 @@ public final class Config {
         // Default max batch tokens
         public static final int DEFAULT_MAX_BATCH_TOKENS = 4000;
 
+        // Default retry base delay in milliseconds
+        public static final long DEFAULT_RETRY_BASE_DELAY_MS = 500L;
+
         // Minimum and maximum values for validation
         public static final int MIN_EMBEDDINGS_DIMENSIONS = 128;
         public static final int MAX_EMBEDDINGS_DIMENSIONS = 4096;
@@ -580,6 +584,8 @@ public final class Config {
         public static final double MAX_RELEVANCY_THRESHOLD = 1.0;
         public static final int MIN_MAX_BATCH_TOKENS = 100;
         public static final int MAX_MAX_BATCH_TOKENS = 100000;
+        public static final long MIN_RETRY_BASE_DELAY_MS = 10L;
+        public static final long MAX_RETRY_BASE_DELAY_MS = 30000L;
 
         // All fields final for immutability
         private final String baseUrl;
@@ -595,6 +601,7 @@ public final class Config {
         private final int maxPromptsPerQuery;
         private final double relevancyThreshold;
         private final int maxBatchTokens;
+        private final long retryBaseDelayMs;
 
         /**
          * Creates an Llm config from properties.
@@ -615,6 +622,7 @@ public final class Config {
             this.maxPromptsPerQuery = parseInt(props, "excalibur.llm.max-prompts-per-query", DEFAULT_MAX_PROMPTS_PER_QUERY);
             this.relevancyThreshold = parseDouble(props, "excalibur.llm.relevancy-threshold", DEFAULT_RELEVANCY_THRESHOLD);
             this.maxBatchTokens = parseInt(props, "excalibur.llm.max-batch-tokens", DEFAULT_MAX_BATCH_TOKENS);
+            this.retryBaseDelayMs = parseLong(props, "excalibur.llm.retry-base-delay-ms", DEFAULT_RETRY_BASE_DELAY_MS);
         }
 
         /**
@@ -713,6 +721,17 @@ public final class Config {
             return maxBatchTokens;
         }
 
+        /**
+         * Gets the base delay for exponential backoff retries in milliseconds.
+         * This is the initial delay before the first retry, which doubles with each
+         * subsequent retry attempt.
+         *
+         * @return Retry base delay in milliseconds
+         */
+        public long getRetryBaseDelayMs() {
+            return retryBaseDelayMs;
+        }
+
         @Override
         public String toString() {
             return "Llm{baseUrl='" + baseUrl + "', apiKey='***', chatModel='" + chatModel +
@@ -720,7 +739,7 @@ public final class Config {
                    ", timeoutMs=" + timeoutMs + ", maxRetries=" + maxRetries +
                    ", failureThreshold=" + failureThreshold + ", cooldownPeriodMs=" + cooldownPeriodMs +
                    ", maxPromptsPerQuery=" + maxPromptsPerQuery + ", relevancyThreshold=" + relevancyThreshold +
-                   ", maxBatchTokens=" + maxBatchTokens + '}';
+                   ", maxBatchTokens=" + maxBatchTokens + ", retryBaseDelayMs=" + retryBaseDelayMs + '}';
         }
     }
 

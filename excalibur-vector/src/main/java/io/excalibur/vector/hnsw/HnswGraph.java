@@ -136,6 +136,7 @@ public class HnswGraph implements AutoCloseable {
     private static final long OFFSET_CONFIG_MAX_CONN_0 = 48;
     private static final long OFFSET_CONFIG_EF_CONSTRUCTION = 52;
     private static final long OFFSET_CONFIG_ML = 56;
+    private static final long OFFSET_CONFIG_EF_SEARCH = 64;
 
     // Configuration
     private HnswConfig config;
@@ -293,9 +294,10 @@ public class HnswGraph implements AutoCloseable {
             int maxConn = mappedFile.readInt(OFFSET_CONFIG_MAX_CONN);
             int maxConn0 = mappedFile.readInt(OFFSET_CONFIG_MAX_CONN_0);
             int efConstruction = mappedFile.readInt(OFFSET_CONFIG_EF_CONSTRUCTION);
+            int efSearch = mappedFile.readInt(OFFSET_CONFIG_EF_SEARCH);
             double mL = Double.longBitsToDouble(mappedFile.readLong(OFFSET_CONFIG_ML));
 
-            HnswConfig config = new HnswConfig(maxConn, maxConn0, efConstruction, 100, mL, dimension);
+            HnswConfig config = new HnswConfig(maxConn, maxConn0, efConstruction, efSearch, mL, dimension);
 
             // Calculate capacity based on existing node count
             long maxNodes = Math.max(nodeCount * 2, 1000);
@@ -454,9 +456,10 @@ public class HnswGraph implements AutoCloseable {
             int maxConn0 = segment.getInt(OFFSET_CONFIG_MAX_CONN_0);
             int efConstruction = segment.getInt(OFFSET_CONFIG_EF_CONSTRUCTION);
             double mL = Double.longBitsToDouble(segment.getLong(OFFSET_CONFIG_ML));
+            int efSearch = segment.getInt(OFFSET_CONFIG_EF_SEARCH);
 
             return new HeaderInfo(version, dimension, nodeCount, entryPoint, maxLevel,
-                lastIntegrated, maxConn, maxConn0, efConstruction, mL);
+                lastIntegrated, maxConn, maxConn0, efConstruction, efSearch, mL);
         } catch (Exception e) {
             LOGGER.debug("Failed to read header info from segment: {}", e.getMessage());
             return null;
@@ -468,7 +471,7 @@ public class HnswGraph implements AutoCloseable {
      *
      * @since 1.1
      */
-    public record HeaderInfo(
+   public record HeaderInfo(
         int version,
         int dimension,
         long nodeCount,
@@ -478,6 +481,7 @@ public class HnswGraph implements AutoCloseable {
         int maxConnections,
         int maxConnectionsLayer0,
         int efConstruction,
+        int efSearch,
         double mL
     ) {
         /**
@@ -487,7 +491,7 @@ public class HnswGraph implements AutoCloseable {
          */
         public HnswConfig toConfig() {
             return new HnswConfig(maxConnections, maxConnectionsLayer0,
-                efConstruction, 100, mL, dimension);
+                efConstruction, efSearch, mL, dimension);
         }
     }
 
@@ -520,6 +524,7 @@ public class HnswGraph implements AutoCloseable {
             mappedFile.writeInt(OFFSET_CONFIG_MAX_CONN, config.maxConnections());
             mappedFile.writeInt(OFFSET_CONFIG_MAX_CONN_0, config.maxConnectionsLayer0());
             mappedFile.writeInt(OFFSET_CONFIG_EF_CONSTRUCTION, config.efConstruction());
+            mappedFile.writeInt(OFFSET_CONFIG_EF_SEARCH, config.efSearch());
             mappedFile.writeLong(OFFSET_CONFIG_ML, Double.doubleToLongBits(config.mL()));
 
             this.dataWriteOffset = 0;
