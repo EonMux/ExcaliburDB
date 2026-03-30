@@ -75,8 +75,7 @@ public final class EmbeddingClient {
     private static final int MIN_EMBEDDING_DIMENSION = 1;
     private static final int MAX_EMBEDDING_DIMENSION = 4096;
 
-    // Retry configuration
-    private static final long RETRY_BASE_DELAY_MS = 100L;
+    // Retry configuration (base delay is configurable via LLMClientConfig.getRetryBaseDelay())
     private static final long RETRY_MAX_DELAY_MS = 30_000L;
     private static final double RETRY_BACKOFF_MULTIPLIER = 2.0;
     private static final double RETRY_JITTER_FACTOR = 0.25;
@@ -769,7 +768,8 @@ public final class EmbeddingClient {
         long cappedDelay = Math.min((long) exponentialDelay, RETRY_MAX_DELAY_MS);
         double jitter = 1.0 + (RANDOM.nextDouble() * 2 - 1) * RETRY_JITTER_FACTOR;
         long delayWithJitter = (long) (cappedDelay * jitter);
-        return Math.max(delayWithJitter, RETRY_BASE_DELAY_MS);
+        // Ensure minimum delay (at least configured base delay after jitter)
+        return Math.max(delayWithJitter, baseDelayMs);
     }
 
     private String truncate(String s, int maxLength) {

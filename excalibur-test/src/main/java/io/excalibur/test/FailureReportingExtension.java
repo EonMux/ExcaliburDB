@@ -74,6 +74,22 @@ public final class FailureReportingExtension
     private static final AtomicInteger totalTests = new AtomicInteger(0);
     private static final AtomicInteger totalFailures = new AtomicInteger(0);
 
+    /**
+     * Default constructor required for ServiceLoader auto-detection.
+     *
+     * <p>Creates an extension with default settings:
+     * <ul>
+     *   <li>Console reporting enabled</li>
+     *   <li>JSON reporting disabled</li>
+     *   <li>No report directory</li>
+     * </ul>
+     */
+    public FailureReportingExtension() {
+        this.reportDirectory = null;
+        this.writeJsonReport = false;
+        this.consoleReport = true;
+    }
+
     private FailureReportingExtension(Builder builder) {
         this.reportDirectory = builder.reportDirectory;
         this.writeJsonReport = builder.writeJsonReport;

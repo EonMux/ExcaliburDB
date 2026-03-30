@@ -159,6 +159,13 @@ public class ResultAggregator {
                     continue;
                 }
 
+                // Skip items with NaN scores - they cannot be properly ranked
+                if (Float.isNaN(normalizedScore)) {
+                    LOGGER.debug("Skipping result with NaN score: nodeId={}, documentId={}",
+                        hnswResult.nodeId(), hnswResult.documentId());
+                    continue;
+                }
+
                 String documentIdStr = hnswResult.documentId();
                 long nodeId = hnswResult.nodeId();
 

@@ -25,6 +25,7 @@ import io.excalibur.config.ConfigValidation;
 import io.excalibur.core.memory.MemorySegmentFactory;
 import io.excalibur.metrics.Metrics;
 import io.excalibur.metrics.MetricsRegistry;
+import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import io.excalibur.vector.distance.CosineSimilarity;
@@ -574,11 +575,13 @@ public final class ExcaliburApplication {
     private QueryPipeline createQueryPipeline() {
         LOGGER.info("Initializing query pipeline...");
 
-        // Create graph provider that returns graphs from storage
-        // In a full implementation, this would look up graphs from a registry
+        // Create graph provider that returns graphs from segments in storage
+        // Each segment has an associated HNSW graph that is built incrementally during ingestion
         QueryPipeline.HnswGraphProvider graphProvider = segmentId -> {
-            // For now, return null (no pre-built graphs)
-            // Graphs are built incrementally during ingestion
+            Segment segment = storageEngine.getSegment(segmentId);
+            if (segment != null) {
+                return segment.getHnswGraph();
+            }
             return null;
         };
 

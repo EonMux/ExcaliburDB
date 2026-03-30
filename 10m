@@ -1,0 +1,45 @@
+Initialized native services in: /home/aeslampanah/.gradle/native
+Initialized jansi services in: /home/aeslampanah/.gradle/native
+Received JVM installation metadata from '/usr/lib/jvm/java-21-openjdk': {JAVA_HOME=/usr/lib/jvm/java-21-openjdk, JAVA_VERSION=21.0.10, JAVA_VENDOR=Arch Linux, RUNTIME_NAME=OpenJDK Runtime Environment, RUNTIME_VERSION=21.0.10+7, VM_NAME=OpenJDK 64-Bit Server VM, VM_VERSION=21.0.10+7, VM_VENDOR=Arch Linux, OS_ARCH=amd64}
+The client will now receive all logging from the daemon (pid: 1233722). The daemon log file: /home/aeslampanah/.gradle/daemon/8.5/daemon-1233722.out.log
+Starting 20th build in daemon [uptime: 48 mins 19.938 secs, performance: 100%, GC rate: 0.00/s, heap usage: 0% of 6 GiB]
+Using 8 worker leases.
+Configuration on demand is an incubating feature.
+Now considering [/home/aeslampanah/Desktop/Projects/ExcaliburDB] as hierarchies to watch
+Closing daemon's stdin at end of input.
+The daemon will no longer process any standard input.
+Watching the file system is configured to be enabled
+File system watching is active
+Starting Build
+Settings evaluated using settings file '/home/aeslampanah/Desktop/Projects/ExcaliburDB/settings.gradle.kts'.
+Using local directory build cache for the root build (location = /home/aeslampanah/.gradle/caches/build-cache-1, removeUnusedEntriesAfter = 7 days).
+Projects loaded. Root project using build file '/home/aeslampanah/Desktop/Projects/ExcaliburDB/build.gradle.kts'.
+Included projects: [root project 'excaliburdb', project ':excalibur-api', project ':excalibur-bench', project ':excalibur-config', project ':excalibur-core', project ':excalibur-filter', project ':excalibur-ingest', project ':excalibur-integration', project ':excalibur-llm', project ':excalibur-metrics', project ':excalibur-query', project ':excalibur-shard', project ':excalibur-store', project ':excalibur-test', project ':excalibur-vector']
+Task path ':excalibur-integration:test' matched project ':excalibur-integration'
+
+> Configure project :
+Evaluating root project 'excaliburdb' using build file '/home/aeslampanah/Desktop/Projects/ExcaliburDB/build.gradle.kts'.
+Build cache key for Kotlin DSL accessors for root project 'excaliburdb' is ad6b90dfe5e12282250a45ef9778cee3
+Skipping Kotlin DSL accessors for root project 'excaliburdb' as it is up-to-date.
+
+> Configure project :excalibur-integration
+Evaluating project ':excalibur-integration' using build file '/home/aeslampanah/Desktop/Projects/ExcaliburDB/excalibur-integration/build.gradle.kts'.
+Build cache key for Kotlin DSL accessors for project ':excalibur-integration' is c0a7757a99562e0e14275e728185317c
+Skipping Kotlin DSL accessors for project ':excalibur-integration' as it is up-to-date.
+Task name matched 'test'
+
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Task '2' not found in root project 'excaliburdb' and its subprojects.
+
+* Try:
+> Run gradlew tasks to get a list of available tasks.
+> For more on name expansion, please refer to https://docs.gradle.org/8.5/userguide/command_line_interface.html#sec:name_abbreviation in the Gradle documentation.
+> Run with --stacktrace option to get the stack trace.
+> Run with --debug option to get more log output.
+> Run with --scan to get full insights.
+> Get more help at https://help.gradle.org.
+
+BUILD FAILED in 345ms

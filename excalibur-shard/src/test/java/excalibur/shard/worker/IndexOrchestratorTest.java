@@ -1173,4 +1173,82 @@ class IndexOrchestratorTest {
         arena.close();
         catalog.close();
     }
+
+    @Test
+    @DisplayName("HierarchicalCuckooFilter setHierarchicalCuckooFilter registers existing segments")
+    void hierarchicalCuckooFilterRegistrationTest() throws IOException {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data19");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        // Verify initial state
+        assertNull(orchestrator.getHierarchicalCuckooFilter(),
+            "Filter should be null initially");
+
+        // Create hierarchical filter
+        HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(
+            100_000L,  // corpus capacity
+            13,        // fingerprint bits
+            10_000,    // cluster capacity
+            1_000      // segment capacity
+        );
+
+        // Set the filter
+        orchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
+
+        // Verify filter is set
+        assertSame(hierarchicalFilter, orchestrator.getHierarchicalCuckooFilter(),
+            "Filter should be set");
+
+        // The setHierarchicalCuckooFilter should register any existing segments
+        // In this case there are no segments, so the filter should be empty
+        assertEquals(0, hierarchicalFilter.getSegmentCount(),
+            "Filter should have no segments since none were registered");
+
+        // Create a hierarchical filter and pre-register some segments in it
+        HierarchicalCuckooFilter filter2 = new HierarchicalCuckooFilter(
+            100_000L, 13, 10_000, 1_000
+        );
+
+        // Pre-register some segment IDs in the filter
+        filter2.registerSegment("100", "default");
+        filter2.registerSegment("200", "default");
+        filter2.registerSegment("300", "default");
+
+        assertEquals(3, filter2.getSegmentCount(),
+            "Filter should have 3 segments pre-registered");
+
+        // Verify we can insert for these pre-registered segments
+        byte[] testKey1 = "test-key-100".getBytes();
+        byte[] testKey2 = "test-key-200".getBytes();
+
+        assertTrue(filter2.insert(testKey1, "100"),
+            "Should be able to insert for segment 100");
+        assertTrue(filter2.insert(testKey2, "200"),
+            "Should be able to insert for segment 200");
+
+        // Verify the keys are in the filter
+        assertTrue(filter2.mightContain(testKey1),
+            "Key 1 should be in corpus filter");
+        assertTrue(filter2.mightContain(testKey2),
+            "Key 2 should be in corpus filter");
+
+        // Verify findCandidateSegments works
+        java.util.List<String> candidates1 = filter2.findCandidateSegments(testKey1);
+        assertTrue(candidates1.contains("100"),
+            "Segment 100 should be a candidate for key 1");
+
+        java.util.List<String> candidates2 = filter2.findCandidateSegments(testKey2);
+        assertTrue(candidates2.contains("200"),
+            "Segment 200 should be a candidate for key 2");
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
 }

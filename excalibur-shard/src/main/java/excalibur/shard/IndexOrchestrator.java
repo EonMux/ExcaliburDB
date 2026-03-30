@@ -3,6 +3,7 @@ package excalibur.shard;
 import excalibur.filter.CuckooFilter;
 import excalibur.filter.HierarchicalCuckooFilter;
 import excalibur.shard.allocator.VolumeManager;
+import excalibur.shard.visibility.EpochIsolationValidator;
 import excalibur.shard.worker.CuckooMaintenanceWorker;
 import excalibur.shard.worker.CuckooMetricsWorker;
 import excalibur.shard.worker.HnswCompactionWorker;
@@ -159,6 +160,13 @@ public class IndexOrchestrator implements AutoCloseable {
     private final VisibilityTracker visibilityTracker;
 
     /**
+     * Epoch isolation validator for preventing torn reads at the node level.
+     * Tracks when individual HNSW nodes become visible and filters query results
+     * to only include nodes visible at the query's captured epoch.
+     */
+    private final EpochIsolationValidator epochIsolationValidator;
+
+    /**
      * Epoch tick scheduler for periodic epoch advancement.
      * Ensures writes become visible within one tick of fsync.
      */
@@ -169,6 +177,13 @@ public class IndexOrchestrator implements AutoCloseable {
      * May be null if reindexing is handled externally or in stub mode.
      */
     private volatile ReindexOperationHandler reindexOperationHandler;
+
+    /**
+     * Hierarchical Cuckoo filter for corpus → cluster → segment membership testing.
+     * Used to register segments in the hierarchy and enable efficient query pruning.
+     * May be null if not configured.
+     */
+    private volatile HierarchicalCuckooFilter hierarchicalFilter;
 
     private final Map<Long, SegmentIndexInfo> segmentIndexInfo;
 
@@ -263,12 +278,18 @@ public class IndexOrchestrator implements AutoCloseable {
         // Create visibility tracker for coordinating epochs across segments
         this.visibilityTracker = new VisibilityTracker(catalog);
 
+        // Create epoch isolation validator for node-level epoch tracking
+        this.epochIsolationValidator = new EpochIsolationValidator();
+
         // Create epoch tick scheduler for periodic epoch advancement
         this.epochTickScheduler = new EpochTickScheduler(visibilityTracker, epochTickIntervalMs);
 
         // Create workers with listeners
+        // Pass epoch isolation validator and visibility tracker to HNSW worker for node-level epoch tracking
         this.hnswWorker = new HnswIntegrationWorker(catalog,
             (segment, count) -> onVectorsIntegrated(segment, count),
+            epochIsolationValidator,
+            visibilityTracker,
             100, hnswQueueDepthLimit, 100);
 
         this.cuckooWorker = new CuckooMaintenanceWorker(catalog, storageEngine,
@@ -459,6 +480,7 @@ public class IndexOrchestrator implements AutoCloseable {
      *   <li>Cuckoo metrics (for FP rate monitoring, if it has a filter)</li>
      *   <li>Compaction worker (for tombstone cleanup)</li>
      *   <li>Warming phase worker (for PQ training during WARMING state)</li>
+     *   <li>Hierarchical Cuckoo filter (for corpus → cluster → segment membership)</li>
      * </ul>
      *
      * @param segmentId The segment ID
@@ -498,6 +520,16 @@ public class IndexOrchestrator implements AutoCloseable {
         // Register with compaction worker for background tombstone cleanup
         compactionWorker.registerSegment(segment);
 
+        // Register with hierarchical Cuckoo filter for corpus → cluster → segment membership
+        // This enables efficient query pruning via Stage 1 Cuckoo filter cascade
+        if (hierarchicalFilter != null) {
+            String segmentIdStr = String.valueOf(segmentId);
+            // Use "default" cluster for segments without explicit cluster assignment
+            // This allows the hierarchy to function with a single default cluster
+            hierarchicalFilter.registerSegment(segmentIdStr, "default");
+            LOGGER.debug("Registered segment {} in hierarchical Cuckoo filter with cluster 'default'", segmentId);
+        }
+
         LOGGER.debug("Registered segment {} with index orchestrator", segmentId);
     }
 
@@ -523,6 +555,14 @@ public class IndexOrchestrator implements AutoCloseable {
             cuckooWorker.unregisterFilter(segmentId);
             cuckooMetricsWorker.unregisterFilter(segmentId);
             compactionWorker.unregisterSegment(info.segment);
+
+            // Unregister from hierarchical Cuckoo filter
+            if (hierarchicalFilter != null) {
+                String segmentIdStr = String.valueOf(segmentId);
+                hierarchicalFilter.unregisterSegment(segmentIdStr);
+                LOGGER.debug("Unregistered segment {} from hierarchical Cuckoo filter", segmentId);
+            }
+
             LOGGER.debug("Unregistered segment {} from index orchestrator", segmentId);
         }
     }
@@ -728,6 +768,19 @@ public class IndexOrchestrator implements AutoCloseable {
      */
     public VisibilityTracker getVisibilityTracker() {
         return visibilityTracker;
+    }
+
+    /**
+     * Returns the epoch isolation validator for node-level epoch filtering.
+     *
+     * <p>This validator is used by the query pipeline to filter HNSW search results
+     * to only include nodes that were visible at the query's captured epoch,
+     * preventing "torn reads" where a query might see partially visible data.</p>
+     *
+     * @return The epoch isolation validator
+     */
+    public EpochIsolationValidator getEpochIsolationValidator() {
+        return epochIsolationValidator;
     }
 
     /**
@@ -1025,12 +1078,54 @@ public class IndexOrchestrator implements AutoCloseable {
      * the hierarchy: segment → cluster → corpus. This ensures no stale false
      * positives from tombstoned entries.</p>
      *
+     * <p>The filter is also stored locally to enable segment registration
+     * in the hierarchy via {@link #registerSegment}.</p>
+     *
+     * <p><strong>CRITICAL:</strong> This method also registers all existing segments
+     * with the new filter. This ensures that segments registered before the filter
+     * was configured are properly included in the hierarchical filter cascade for
+     * Stage 1 query pruning.</p>
+     *
      * @param filter The hierarchical Cuckoo filter (may be null)
      */
     public void setHierarchicalCuckooFilter(HierarchicalCuckooFilter filter) {
+        this.hierarchicalFilter = filter;
         this.cuckooWorker.setHierarchicalFilter(filter);
+
+        // Register all existing segments with the new hierarchical filter
+        // This is CRITICAL for Stage 1 Cuckoo filter cascade to function correctly
+        if (filter != null) {
+            int registeredCount = 0;
+            for (Map.Entry<Long, SegmentIndexInfo> entry : segmentIndexInfo.entrySet()) {
+                long segmentId = entry.getKey();
+                String segmentIdStr = String.valueOf(segmentId);
+                // Use "default" cluster for segments without explicit cluster assignment
+                // This allows the hierarchy to function with a single default cluster
+                filter.registerSegment(segmentIdStr, "default");
+                registeredCount++;
+            }
+            if (registeredCount > 0) {
+                LOGGER.info("Registered {} existing segments with hierarchical Cuckoo filter", registeredCount);
+            }
+        }
+
         LOGGER.info("Hierarchical Cuckoo filter {} for IndexOrchestrator",
             filter != null ? "configured" : "cleared");
+    }
+
+    /**
+     * Returns the hierarchical Cuckoo filter for corpus → cluster → segment membership.
+     *
+     * <p>The hierarchical filter is used for:</p>
+     * <ul>
+     *   <li>Efficient query pruning via Stage 1 Cuckoo filter cascade</li>
+     *   <li>Proper deletion propagation when segments are tombstoned</li>
+     * </ul>
+     *
+     * @return The hierarchical Cuckoo filter, or null if not configured
+     */
+    public HierarchicalCuckooFilter getHierarchicalCuckooFilter() {
+        return hierarchicalFilter;
     }
 
     /**

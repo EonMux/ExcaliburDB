@@ -16,6 +16,7 @@ import excalibur.query.executor.ResultAggregator;
 import excalibur.query.executor.SegmentQueryTask;
 import excalibur.query.visibility.DocumentAtomicityFilter;
 import excalibur.query.visibility.QuerySnapshot;
+import excalibur.shard.visibility.EpochIsolationValidator;
 import excalibur.query.validation.DomainCorrectnessValidator;
 import excalibur.shard.VisibilityTracker;
 import io.excalibur.core.logging.StructuredLoggingHelper;
@@ -102,6 +103,13 @@ public class QueryPipeline {
     private final LlmScorer llmScorer;
     private final double coverageThreshold;
     private final HierarchicalCuckooFilter hierarchicalFilter;
+
+    /**
+     * Epoch isolation validator for filtering HNSW results to only include
+     * nodes visible at the query's captured epoch.
+     * May be null if epoch isolation is not configured.
+     */
+    private final EpochIsolationValidator epochIsolationValidator;
 
     // Lazily initialized dispatcher for parallel query execution
     private volatile ParallelQueryDispatcher dispatcher;
@@ -208,6 +216,37 @@ public class QueryPipeline {
             double coverageThreshold,
             HierarchicalCuckooFilter hierarchicalFilter) {
 
+        this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction,
+             llmScorer, coverageThreshold, hierarchicalFilter, null);
+    }
+
+    /**
+     * Creates a new QueryPipeline with all options including epoch isolation.
+     *
+     * <p>This is the full constructor that accepts all configurable parameters including
+     * the epoch isolation validator for preventing torn reads at the node level.</p>
+     *
+     * @param storageEngine The storage engine
+     * @param visibilityTracker The visibility tracker
+     * @param visibilityChecker The visibility checker for document atomicity (may be null)
+     * @param graphProvider Provider for HNSW graphs
+     * @param distanceFunction The distance function
+     * @param llmScorer Optional LLM scorer for Stage 5
+     * @param coverageThreshold Threshold for degraded state
+     * @param hierarchicalFilter Optional hierarchical Cuckoo filter for Stage 1 pruning
+     * @param epochIsolationValidator Optional validator for node-level epoch filtering
+     */
+    public QueryPipeline(
+            StorageEngine storageEngine,
+            VisibilityTracker visibilityTracker,
+            DocumentVisibilityChecker visibilityChecker,
+            HnswGraphProvider graphProvider,
+            DistanceFunction distanceFunction,
+            LlmScorer llmScorer,
+            double coverageThreshold,
+            HierarchicalCuckooFilter hierarchicalFilter,
+            EpochIsolationValidator epochIsolationValidator) {
+
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
         this.visibilityChecker = visibilityChecker;
@@ -216,6 +255,7 @@ public class QueryPipeline {
         this.llmScorer = llmScorer;
         this.coverageThreshold = coverageThreshold;
         this.hierarchicalFilter = hierarchicalFilter;
+        this.epochIsolationValidator = epochIsolationValidator;
         // Dispatcher is lazily initialized on first use
     }
 
@@ -234,6 +274,7 @@ public class QueryPipeline {
             LlmScorer llmScorer,
             double coverageThreshold,
             HierarchicalCuckooFilter hierarchicalFilter,
+            EpochIsolationValidator epochIsolationValidator,
             ParallelQueryDispatcher dispatcher) {
 
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
@@ -244,6 +285,7 @@ public class QueryPipeline {
         this.llmScorer = llmScorer;
         this.coverageThreshold = coverageThreshold;
         this.hierarchicalFilter = hierarchicalFilter;
+        this.epochIsolationValidator = epochIsolationValidator;
         this.dispatcher = dispatcher;
     }
 
@@ -298,6 +340,7 @@ public class QueryPipeline {
             llmScorer,
             this.coverageThreshold,
             this.hierarchicalFilter,
+            this.epochIsolationValidator,
             this.dispatcher
         );
     }
@@ -328,6 +371,7 @@ public class QueryPipeline {
             this.llmScorer,
             this.coverageThreshold,
             this.hierarchicalFilter,
+            this.epochIsolationValidator,
             this.dispatcher
         );
     }
@@ -909,6 +953,41 @@ public class QueryPipeline {
 
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = dispatchResult.segmentResults();
         long totalTailScanEntries = dispatchResult.coverage().tailScanEntries();
+
+        // Apply epoch isolation filtering to HNSW results to prevent torn reads
+        // Filter out nodes that were inserted after the query's captured epoch
+        if (epochIsolationValidator != null) {
+            long queryEpoch = context.epoch;
+            int totalFiltered = 0;
+            List<SegmentQueryTask.SegmentQueryResult> filteredResults = new ArrayList<>(segmentResults.size());
+
+            for (SegmentQueryTask.SegmentQueryResult sr : segmentResults) {
+                if (sr != null && sr.results() != null) {
+                    List<HnswSearchResult> filtered = epochIsolationValidator.filterResults(
+                        sr.results(), queryEpoch);
+                    totalFiltered += sr.results().size() - filtered.size();
+
+                    // Create new result with filtered list
+                    filteredResults.add(new SegmentQueryTask.SegmentQueryResult(
+                        sr.segmentId(),
+                        filtered,
+                        sr.tailScanEntries(),
+                        sr.durationMs(),
+                        sr.success(),
+                        sr.errorMessage()
+                    ));
+                } else {
+                    filteredResults.add(sr);
+                }
+            }
+
+            if (totalFiltered > 0) {
+                LOGGER.debug("Stage 3: Epoch isolation filtered out {} results not visible at epoch {}",
+                    totalFiltered, queryEpoch);
+            }
+
+            segmentResults = filteredResults;
+        }
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 

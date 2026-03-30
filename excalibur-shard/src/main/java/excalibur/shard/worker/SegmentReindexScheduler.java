@@ -89,7 +89,7 @@ public class SegmentReindexScheduler {
     private final SegmentCatalog catalog;
     private final ReindexListener listener;
     private final Map<Long, SourceSchedule> sourceSchedules;
-    private final ScheduledExecutorService scheduler;
+    private volatile ScheduledExecutorService scheduler;
 
     private final AtomicBoolean running;
     private final AtomicBoolean stopped;
@@ -195,6 +195,14 @@ public class SegmentReindexScheduler {
     public boolean start() {
         if (running.compareAndSet(false, true)) {
             stopped.set(false);
+
+            // CRITICAL FIX: Create new scheduler if the previous one was terminated
+            // Must check both isShutdown() and isTerminated() to handle race conditions
+            // where shutdown() was called but termination is still in progress
+            if (scheduler == null || scheduler.isShutdown() || scheduler.isTerminated()) {
+                this.scheduler = Executors.newSingleThreadScheduledExecutor(
+                    Thread.ofVirtual().name("excalibur-reindex-scheduler").factory());
+            }
 
             scheduler.scheduleAtFixedRate(
                 this::performSchedulerCheck,

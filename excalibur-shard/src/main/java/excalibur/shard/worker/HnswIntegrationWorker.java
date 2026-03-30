@@ -1,5 +1,7 @@
 package excalibur.shard.worker;
 
+import excalibur.shard.visibility.EpochIsolationValidator;
+import excalibur.shard.VisibilityTracker;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
@@ -124,6 +126,18 @@ public class HnswIntegrationWorker {
     private final IntegrationListener listener;
     private final CopyOnWriteArrayList<IndexableSegment> registeredSegments;
 
+    /**
+     * Epoch isolation validator for tracking node visibility.
+     * May be null if epoch isolation is not configured.
+     */
+    private final EpochIsolationValidator epochIsolationValidator;
+
+    /**
+     * Visibility tracker for getting current epoch.
+     * May be null if epoch isolation is not configured.
+     */
+    private final VisibilityTracker visibilityTracker;
+
     private final AtomicBoolean running;
     private final AtomicBoolean stopped;
     private final AtomicBoolean backpressured;
@@ -149,8 +163,24 @@ public class HnswIntegrationWorker {
      * @throws NullPointerException if catalog or listener is null
      */
     public HnswIntegrationWorker(SegmentCatalog catalog, IntegrationListener listener) {
-        this(catalog, listener, DEFAULT_INTEGRATION_INTERVAL_MS,
+        this(catalog, listener, null, null, DEFAULT_INTEGRATION_INTERVAL_MS,
              DEFAULT_QUEUE_DEPTH_LIMIT, DEFAULT_BATCH_SIZE);
+    }
+
+    /**
+     * Creates a new HnswIntegrationWorker with default configuration and epoch isolation.
+     *
+     * @param catalog                  The segment catalog for metadata access
+     * @param listener                 Callback for integration events
+     * @param epochIsolationValidator  Validator for tracking node visibility (may be null)
+     * @param visibilityTracker        Tracker for getting current epoch (may be null)
+     * @throws NullPointerException    if catalog or listener is null
+     */
+    public HnswIntegrationWorker(SegmentCatalog catalog, IntegrationListener listener,
+                                  EpochIsolationValidator epochIsolationValidator,
+                                  VisibilityTracker visibilityTracker) {
+        this(catalog, listener, epochIsolationValidator, visibilityTracker,
+             DEFAULT_INTEGRATION_INTERVAL_MS, DEFAULT_QUEUE_DEPTH_LIMIT, DEFAULT_BATCH_SIZE);
     }
 
     /**
@@ -166,6 +196,26 @@ public class HnswIntegrationWorker {
      */
     public HnswIntegrationWorker(SegmentCatalog catalog, IntegrationListener listener,
                                   long integrationIntervalMs, int queueDepthLimit, int batchSize) {
+        this(catalog, listener, null, null, integrationIntervalMs, queueDepthLimit, batchSize);
+    }
+
+    /**
+     * Creates a new HnswIntegrationWorker with full configuration including epoch isolation.
+     *
+     * @param catalog                  The segment catalog
+     * @param listener                 Callback for integration events
+     * @param epochIsolationValidator  Validator for tracking node visibility (may be null)
+     * @param visibilityTracker        Tracker for getting current epoch (may be null)
+     * @param integrationIntervalMs    Interval between integration cycles
+     * @param queueDepthLimit          Maximum pending entries before backpressure
+     * @param batchSize                Number of entries to integrate per cycle
+     * @throws NullPointerException    if catalog or listener is null
+     * @throws IllegalArgumentException if configuration values are invalid
+     */
+    public HnswIntegrationWorker(SegmentCatalog catalog, IntegrationListener listener,
+                                  EpochIsolationValidator epochIsolationValidator,
+                                  VisibilityTracker visibilityTracker,
+                                  long integrationIntervalMs, int queueDepthLimit, int batchSize) {
         if (catalog == null) {
             throw new NullPointerException("Catalog cannot be null");
         }
@@ -179,6 +229,8 @@ public class HnswIntegrationWorker {
 
         this.catalog = catalog;
         this.listener = listener;
+        this.epochIsolationValidator = epochIsolationValidator;
+        this.visibilityTracker = visibilityTracker;
         this.registeredSegments = new CopyOnWriteArrayList<>();
 
         this.running = new AtomicBoolean(false);
@@ -194,8 +246,13 @@ public class HnswIntegrationWorker {
         this.queueDepthLimit = queueDepthLimit;
         this.batchSize = batchSize;
 
-        LOGGER.info("HnswIntegrationWorker created with interval={}ms, queueDepthLimit={}, batchSize={}",
-            integrationIntervalMs, queueDepthLimit, batchSize);
+        if (epochIsolationValidator != null && visibilityTracker != null) {
+            LOGGER.info("HnswIntegrationWorker created with epoch isolation enabled, interval={}ms, queueDepthLimit={}, batchSize={}",
+                integrationIntervalMs, queueDepthLimit, batchSize);
+        } else {
+            LOGGER.info("HnswIntegrationWorker created without epoch isolation, interval={}ms, queueDepthLimit={}, batchSize={}",
+                integrationIntervalMs, queueDepthLimit, batchSize);
+        }
     }
 
     // ==================== Configuration Validation ====================
@@ -568,6 +625,15 @@ public class HnswIntegrationWorker {
                         graph.registerDocumentId(result.nodeId(), documentId);
                         LOGGER.trace("Registered nodeId={} -> documentId={}",
                             result.nodeId(), documentId);
+                    }
+
+                    // Register node with epoch isolation validator for torn-read prevention
+                    // This ensures queries only see nodes visible at their captured epoch
+                    if (epochIsolationValidator != null && visibilityTracker != null) {
+                        long currentEpoch = visibilityTracker.currentEpoch();
+                        epochIsolationValidator.registerNode(result.nodeId(), currentEpoch);
+                        LOGGER.trace("Registered nodeId={} with visibility epoch {}",
+                            result.nodeId(), currentEpoch);
                     }
                 } else {
                     LOGGER.debug("Vector integration failed at offset {} (nodeId={})",

@@ -184,6 +184,13 @@ public class EpochTickScheduler implements AutoCloseable {
 
             if (tickTask != null) {
                 tickTask.cancel(false);
+                try {
+                    // Wait for the task to fully terminate (with timeout)
+                    tickTask.get(100, TimeUnit.MILLISECONDS);
+                } catch (Exception e) {
+                    // Ignore interruptions and exceptions during shutdown
+                    LOGGER.debug("Interrupted while waiting for tick task to complete", e);
+                }
                 tickTask = null;
             }
 

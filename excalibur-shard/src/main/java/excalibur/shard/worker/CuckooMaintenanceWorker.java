@@ -136,7 +136,7 @@ public class CuckooMaintenanceWorker {
     private volatile int maxDeletionsPerCycle;
     private volatile double fpRateThreshold;
 
-    private final ScheduledExecutorService scheduler;
+    private volatile ScheduledExecutorService scheduler;
 
     // ==================== Constructors ====================
 
@@ -276,6 +276,14 @@ public class CuckooMaintenanceWorker {
     public boolean start() {
         if (running.compareAndSet(false, true)) {
             stopped.set(false);
+
+            // CRITICAL FIX: Create new scheduler if the previous one was terminated
+            // Must check both isShutdown() and isTerminated() to handle race conditions
+            // where shutdown() was called but termination is still in progress
+            if (scheduler.isShutdown() || scheduler.isTerminated()) {
+                this.scheduler = Executors.newSingleThreadScheduledExecutor(
+                    Thread.ofVirtual().name("excalibur-cuckoo-maintenance-scheduler").factory());
+            }
 
             scheduler.scheduleAtFixedRate(
                 this::performMaintenanceCycle,

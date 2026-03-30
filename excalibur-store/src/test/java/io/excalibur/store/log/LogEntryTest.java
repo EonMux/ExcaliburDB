@@ -512,5 +512,76 @@ class LogEntryTest {
             LogEntry entry = new LogEntry((byte) 99, 1L, TEST_VALUE, 0L);
             assertThat(entry.toString()).contains("UNKNOWN");
         }
+
+        @Test
+        @DisplayName("Should format with indent")
+        void shouldFormatWithIndent() {
+            LogEntry entry = new LogEntry(LogEntry.TYPE_PUT, 1L, TEST_VALUE, 100L);
+            String formatted = entry.toString(2);
+
+            assertThat(formatted).contains("PUT");
+            assertThat(formatted).contains("1");
+            assertThat(formatted).contains("100");
+        }
+
+        @Test
+        @DisplayName("Should format DELETE entry with indent")
+        void shouldFormatDeleteWithIndent() {
+            LogEntry entry = new LogEntry(LogEntry.TYPE_DELETE, 1L, TEST_KEY, 100L);
+            String formatted = entry.toString(4);
+
+            assertThat(formatted).contains("DELETE");
+            assertThat(formatted).contains("1");
+        }
+
+        @Test
+        @DisplayName("Should format BARRIER entry with indent")
+        void shouldFormatBarrierWithIndent() {
+            LogEntry entry = new LogEntry(LogEntry.TYPE_BARRIER, 1L, EMPTY_PAYLOAD, 100L);
+            String formatted = entry.toString(1);
+
+            assertThat(formatted).contains("BARRIER");
+            assertThat(formatted).contains("1");
+        }
+
+        @Test
+        @DisplayName("Should format unknown type with indent")
+        void shouldFormatUnknownTypeWithIndent() {
+            LogEntry entry = new LogEntry((byte) 99, 1L, TEST_VALUE, 0L);
+            String formatted = entry.toString(0);
+
+            assertThat(formatted).contains("UNKNOWN");
+        }
+
+        @Test
+        @DisplayName("Should format null payload with indent")
+        void shouldFormatNullPayloadWithIndent() {
+            LogEntry entry = new LogEntry(LogEntry.TYPE_BARRIER, 1L, null, 0L, 0L);
+            String formatted = entry.toString(2);
+
+            assertThat(formatted).contains("BARRIER");
+        }
+    }
+
+    @Nested
+    @DisplayName("Payload Factory")
+    class PayloadFactoryTests {
+
+        @Test
+        @DisplayName("Created payload should be parseable as PutEntry")
+        void createdPayloadShouldBeParseable() {
+            // Manually construct payload (payload method is private)
+            byte[] payload = new byte[1 + TEST_KEY.length + TEST_VALUE.length];
+            payload[0] = (byte) TEST_KEY.length;
+            System.arraycopy(TEST_KEY, 0, payload, 1, TEST_KEY.length);
+            System.arraycopy(TEST_VALUE, 0, payload, 1 + TEST_KEY.length, TEST_VALUE.length);
+
+            LogEntry entry = new LogEntry(LogEntry.TYPE_PUT, 1L, payload, 0L);
+            LogEntry.PutEntry putEntry = entry.asPutEntry();
+
+            assertThat(putEntry).isNotNull();
+            assertThat(putEntry.getKey()).isEqualTo(TEST_KEY);
+            assertThat(putEntry.getValue()).isEqualTo(TEST_VALUE);
+        }
     }
 }

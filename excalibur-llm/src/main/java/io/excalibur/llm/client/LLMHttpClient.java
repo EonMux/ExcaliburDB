@@ -106,12 +106,8 @@ public class LLMHttpClient {
 
     // ==================== Retry with Exponential Backoff Configuration ====================
 
-    /**
-     * Base delay for first retry attempt (100ms).
-     * Domain correctness: 100ms is a reasonable minimum that avoids hammering
-     * a recovering service while keeping latency low.
-     */
-    private static final long RETRY_BASE_DELAY_MS = 100L;
+    // Note: Base delay is now configurable via config.getRetryBaseDelay()
+    // Minimum allowed: 10ms (enforced by ConfigValidation)
 
     /**
      * Maximum delay between retries (30 seconds).
@@ -798,14 +794,14 @@ public class LLMHttpClient {
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>Base delay: 100ms (RETRY_BASE_DELAY_MS)</li>
+     *   <li>Base delay: configurable via excalibur.llm.retry-base-delay-ms (default 100ms, min 10ms)</li>
      *   <li>Multiplier: 2x per attempt (RETRY_BACKOFF_MULTIPLIER)</li>
      *   <li>Max delay: 30 seconds (RETRY_MAX_DELAY_MS)</li>
      *   <li>Jitter: ±25% (RETRY_JITTER_FACTOR)</li>
      *   <li>Result is always positive and &lt;= max delay</li>
      * </ul>
      *
-     * <h3>Example Delays</h3>
+     * <h3>Example Delays (with default 100ms base)</h3>
      * <ul>
      *   <li>Attempt 0: ~100ms (75-125ms with jitter)</li>
      *   <li>Attempt 1: ~200ms (150-250ms with jitter)</li>
@@ -833,8 +829,8 @@ public class LLMHttpClient {
         double jitter = 1.0 + (RANDOM.nextDouble() * 2 - 1) * RETRY_JITTER_FACTOR;
         long delayWithJitter = (long) (cappedDelay * jitter);
 
-        // Ensure minimum delay (at least base delay after jitter)
-        return Math.max(delayWithJitter, RETRY_BASE_DELAY_MS);
+        // Ensure minimum delay (at least configured base delay after jitter)
+        return Math.max(delayWithJitter, baseDelayMs);
     }
 
     /**

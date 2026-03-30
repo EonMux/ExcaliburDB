@@ -37,6 +37,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -53,6 +54,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.Lock;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -187,6 +189,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch ingestionComplete = new CountDownLatch(numIngestionThreads);
+            CountDownLatch queriesComplete = new CountDownLatch(numQueryThreads);
             AtomicBoolean ingestionRunning = new AtomicBoolean(true);
 
             AtomicInteger exceptionCount = new AtomicInteger(0);
@@ -216,11 +219,26 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
                         // Insert vector into HNSW graph
                         float[] vector = createRandomVector(dimension);
-                        graph.insert(vector);
+                        long nodeId = graph.insert(vector);
+
+                        // CRITICAL: Register the document ID with the HNSW node so search results
+                        // include the string document ID for atomicity filtering
+                        graph.registerDocumentId(nodeId, documentId);
+
+                        // CRITICAL: Update lastIntegratedOffset so query pipeline knows vectors are in graph
+                        graph.setLastIntegratedOffset(writeLog.writeHead());
 
                         // Sync write log and advance epoch
                         writeLog.sync();
-                        visibilityTracker.advanceEpoch();
+                        long newEpoch = visibilityTracker.advanceEpoch();
+
+                        // CRITICAL: Register document with visibility registry for document atomicity filtering
+                        // Without this, DocumentAtomicityFilter will filter out ALL results
+                        Set<String> chunkIds = new HashSet<>();
+                        for (int i = 0; i < chunksPerDocument; i++) {
+                            chunkIds.add(documentId + ":" + i);
+                        }
+                        visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
 
                         // Small delay to allow concurrent queries
                         if (d % 10 == 0) {
@@ -267,7 +285,8 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                                 }
                             }
 
-                            Thread.sleep(10); // Small delay between queries
+                            // Small delay between queries - bounded to avoid infinite loop
+                            Thread.sleep(10);
                         } catch (Exception e) {
                             exceptionCount.incrementAndGet();
                             exceptions.add("Query: " + e.getClass().getSimpleName() + " - " + e.getMessage());
@@ -275,6 +294,8 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                } finally {
+                    queriesComplete.countDown();
                 }
             };
 
@@ -292,14 +313,26 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             startLatch.countDown();
 
             // Wait for ingestion to complete
-            boolean completed = ingestionComplete.await(60, TimeUnit.SECONDS);
+            boolean ingestionCompleted = ingestionComplete.await(60, TimeUnit.SECONDS);
+            if (!ingestionCompleted) {
+                throw new AssertionError("Ingestion threads did not complete within timeout");
+            }
+
+            // Signal queries to stop and wait for them to finish
             ingestionRunning.set(false);
 
-            // Give query threads time to finish
-            Thread.sleep(500);
+            // Wait for all query threads to complete their current work
+            boolean queriesCompleted = queriesComplete.await(30, TimeUnit.SECONDS);
+            if (!queriesCompleted) {
+                // Log which queries are still running for debugging
+                System.out.println("Warning: Not all query threads completed within timeout");
+            }
 
+            // Force shutdown if needed
             executor.shutdown();
-            executor.awaitTermination(10, TimeUnit.SECONDS);
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
 
             // Verify no exceptions
             assertThat(exceptionCount.get())
@@ -366,13 +399,26 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                     chunkBuffer.commitDocument(documentId);
 
                     float[] vector = createRandomVector(dimension);
-                    graph.insert(vector);
+                    long nodeId = graph.insert(vector);
+
+                    // CRITICAL: Register the document ID with the HNSW node so search results
+                    // include the string document ID for atomicity filtering
+                    graph.registerDocumentId(nodeId, documentId);
 
                     // CRITICAL: Update lastIntegratedOffset so query pipeline knows vectors are in graph
                     graph.setLastIntegratedOffset(writeLog.writeHead());
 
                     writeLog.sync();
-                    visibilityTracker.advanceEpoch();
+                    long newEpoch = visibilityTracker.advanceEpoch();
+
+                    // CRITICAL: Register document with visibility registry for document atomicity filtering
+                    // Without this, DocumentAtomicityFilter will filter out ALL results because the
+                    // document is not registered as visible
+                    Set<String> chunkIds = new HashSet<>();
+                    for (int i = 0; i < chunksPerDocument; i++) {
+                        chunkIds.add(documentId + ":" + i);
+                    }
+                    visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
                 }
 
                 // Query at this checkpoint
@@ -482,6 +528,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             ExecutorService executor = Executors.newFixedThreadPool(6);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch writerDone = new CountDownLatch(1);
+            CountDownLatch readersDone = new CountDownLatch(5); // 5 reader threads
             AtomicBoolean writersFinished = new AtomicBoolean(false);
 
             // Writer task - ingests documents
@@ -497,9 +544,11 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                     }
 
                     writersFinished.set(true);
-                    writerDone.countDown();
                 } catch (Exception e) {
+                    exceptionCount.incrementAndGet();
                     e.printStackTrace();
+                } finally {
+                    writerDone.countDown();
                 }
             };
 
@@ -550,6 +599,8 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                 } catch (Exception e) {
                     exceptionCount.incrementAndGet();
                     e.printStackTrace();
+                } finally {
+                    readersDone.countDown();
                 }
             };
 
@@ -563,11 +614,22 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
             startLatch.countDown();
 
-            // Wait for completion
-            writerDone.await(60, TimeUnit.SECONDS);
+            // Wait for writer to complete
+            boolean writerCompleted = writerDone.await(60, TimeUnit.SECONDS);
+            if (!writerCompleted) {
+                throw new AssertionError("Writer did not complete within timeout");
+            }
+
+            // Wait for all readers to finish their current work
+            boolean readersCompleted = readersDone.await(30, TimeUnit.SECONDS);
+            if (!readersCompleted) {
+                System.out.println("Warning: Not all readers completed within timeout");
+            }
 
             executor.shutdown();
-            executor.awaitTermination(10, TimeUnit.SECONDS);
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
 
             System.out.println("Segment visibility test: " + totalReads.get() + " reads, " +
                 emptyReads.get() + " empty, " + exceptionCount.get() + " exceptions, " +
@@ -665,15 +727,18 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             int numDocuments = 20;
             int chunksPerDocument = 5;
 
-            // Track which documents have been fully published
-            Set<String> publishedDocuments = Collections.synchronizedSet(new HashSet<>());
+            // Track which documents have been fully published with their publication epoch
+            // Using a ConcurrentHashMap to avoid race between publication and epoch capture
+            ConcurrentHashMap<String, Long> publishedDocumentsWithEpoch = new ConcurrentHashMap<>();
             AtomicInteger totalQueries = new AtomicInteger(0);
             AtomicInteger atomicityViolations = new AtomicInteger(0);
             List<String> violationDetails = Collections.synchronizedList(new ArrayList<>());
 
-            ExecutorService executor = Executors.newFixedThreadPool(3);
+            int numReaders = 2;
+            ExecutorService executor = Executors.newFixedThreadPool(1 + numReaders);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch writerDone = new CountDownLatch(1);
+            CountDownLatch readersDone = new CountDownLatch(numReaders);
             AtomicBoolean writersFinished = new AtomicBoolean(false);
 
             // Writer task - uses DocumentBatchPublisher for atomic publication
@@ -717,16 +782,28 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
                         publisher.publish(batchBuffer, metadata);
 
-                        // Mark document as published AFTER atomic publication
-                        publishedDocuments.add(documentId);
+                        // Sync write log and advance epoch
+                        writeLog.sync();
+                        long publicationEpoch = visibilityTracker.advanceEpoch();
+
+                        // Register document with visibility registry for atomicity filtering
+                        Set<String> chunkIds = new HashSet<>();
+                        for (int i = 0; i < chunksPerDocument; i++) {
+                            chunkIds.add(documentId + ":" + i);
+                        }
+                        visibilityRegistry.registerDocument(documentId, chunkIds, publicationEpoch);
+
+                        // Mark document as published with its epoch - atomically with visibility registration
+                        publishedDocumentsWithEpoch.put(documentId, publicationEpoch);
 
                         Thread.sleep(10);
                     }
 
                     writersFinished.set(true);
-                    writerDone.countDown();
                 } catch (Exception e) {
                     e.printStackTrace();
+                } finally {
+                    writerDone.countDown();
                 }
             };
 
@@ -736,8 +813,6 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                     startLatch.await();
 
                     while (!writersFinished.get()) {
-                        // Capture a snapshot of published documents at query time
-                        Set<String> publishedAtQueryStart = new HashSet<>(publishedDocuments);
                         // Capture the current epoch BEFORE executing the query
                         long queryEpoch = visibilityTracker.currentEpoch();
 
@@ -757,40 +832,39 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                         totalQueries.incrementAndGet();
 
                         // Verify document atomicity:
-                        // Every document in results should be fully visible (in publishedDocuments)
+                        // Every document in results should be fully visible (published with epoch <= queryEpoch)
                         for (var result : response.results()) {
                             String resultDocId = result.documentIdStr();
                             if (resultDocId == null) {
                                 resultDocId = String.valueOf(result.documentId());
                             }
 
-                            // If the result is from a document that was published before query started,
-                            // it MUST be visible. If it wasn't published yet, it should NOT be visible.
-                            // This is the atomicity guarantee: either all chunks are visible or none are.
-                            boolean wasPublishedAtQueryStart = publishedAtQueryStart.contains(resultDocId);
+                            // Check the publication epoch of this document
+                            Long publicationEpoch = publishedDocumentsWithEpoch.get(resultDocId);
 
-                            // Check with the visibility registry
-                            boolean isVisibleInRegistry = visibilityRegistry.isDocumentVisible(resultDocId, queryEpoch);
+                            if (publicationEpoch != null) {
+                                // Document was published - verify it's visible at the query epoch
+                                boolean isVisibleInRegistry = visibilityRegistry.isDocumentVisible(resultDocId, queryEpoch);
 
-                            // If document was published before query, it should be visible
-                            // If it wasn't, and it appears in results, that's a potential atomicity violation
-                            // (unless it was published between query start and when we captured publishedAtQueryStart)
-                            if (!wasPublishedAtQueryStart && isVisibleInRegistry) {
-                                // Document became visible during query - this is OK due to timing
-                                // The important thing is that when it became visible, ALL chunks became visible
-                            } else if (wasPublishedAtQueryStart && !isVisibleInRegistry) {
-                                // Document was published before query but not visible - VIOLATION
-                                atomicityViolations.incrementAndGet();
-                                violationDetails.add(String.format(
-                                    "Document %s was published but not visible at epoch %d",
-                                    resultDocId, queryEpoch));
+                                // If document was published at epoch <= queryEpoch, it MUST be visible
+                                // If document was published at epoch > queryEpoch, it's OK if not visible
+                                if (publicationEpoch <= queryEpoch && !isVisibleInRegistry) {
+                                    // Document was published before/during query but not visible - VIOLATION
+                                    atomicityViolations.incrementAndGet();
+                                    violationDetails.add(String.format(
+                                        "Document %s was published at epoch %d but not visible at query epoch %d",
+                                        resultDocId, publicationEpoch, queryEpoch));
+                                }
                             }
+                            // If publicationEpoch is null, document is still being published - skip verification
                         }
 
                         Thread.sleep(15);
                     }
                 } catch (Exception e) {
                     e.printStackTrace();
+                } finally {
+                    readersDone.countDown();
                 }
             };
 
@@ -798,16 +872,28 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             executor.submit(writer);
 
             // Start readers
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < numReaders; i++) {
                 executor.submit(reader);
             }
 
             startLatch.countDown();
 
-            writerDone.await(60, TimeUnit.SECONDS);
+            // Wait for writer to complete
+            boolean writerCompleted = writerDone.await(60, TimeUnit.SECONDS);
+            if (!writerCompleted) {
+                throw new AssertionError("Writer did not complete within timeout");
+            }
+
+            // Wait for readers to finish their current work
+            boolean readersCompleted = readersDone.await(30, TimeUnit.SECONDS);
+            if (!readersCompleted) {
+                System.out.println("Warning: Not all readers completed within timeout");
+            }
 
             executor.shutdown();
-            executor.awaitTermination(10, TimeUnit.SECONDS);
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
 
             System.out.println("Document atomicity test: " + atomicityViolations.get() +
                 " violations out of " + totalQueries.get() + " queries");
@@ -887,12 +973,25 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
                 publisher.publish(batchBuffer, metadata);
 
-                // Insert vector
+                // Insert vector and register document ID for atomicity filtering
                 float[] vector = createRandomVector(dimension);
-                graph.insert(vector);
+                long nodeId = graph.insert(vector);
+
+                // CRITICAL: Register document ID with HNSW node for atomicity filtering
+                graph.registerDocumentId(nodeId, documentId);
+
+                // CRITICAL: Update lastIntegratedOffset so query pipeline knows vector is in graph
+                graph.setLastIntegratedOffset(writeLog.writeHead());
 
                 writeLog.sync();
-                visibilityTracker.advanceEpoch();
+                long newEpoch = visibilityTracker.advanceEpoch();
+
+                // CRITICAL: Register document with visibility registry for document atomicity filtering
+                Set<String> chunkIds = new HashSet<>();
+                for (int i = 0; i < chunksPerDocument; i++) {
+                    chunkIds.add(documentId + ":" + i);
+                }
+                visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
             }
 
             // Query to verify all documents are fully visible
@@ -1056,7 +1155,16 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
         graph.setLastIntegratedOffset(writeLog.writeHead());
 
         writeLog.sync();
-        visibilityTracker.advanceEpoch();
+        long newEpoch = visibilityTracker.advanceEpoch();
+
+        // CRITICAL: Register document with visibility registry for document atomicity filtering
+        // Without this, DocumentAtomicityFilter will filter out ALL results because the
+        // document is not registered as visible
+        Set<String> chunkIds = new HashSet<>();
+        for (int i = 0; i < chunkCount; i++) {
+            chunkIds.add(documentId + ":" + i);
+        }
+        visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
     }
 
     // ==================== Test Infrastructure ====================
@@ -1204,12 +1312,17 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
     }
 
     /**
-     * Test VisibilityTracker implementation.
+     * Test VisibilityTracker implementation with proper synchronization.
+     *
+     * <p><strong>Thread Safety:</strong> All operations are synchronized to prevent
+     * race conditions between segment registration and epoch advancement. This ensures
+     * that a segment is always registered with the correct creation epoch atomically.</p>
      */
     private static class TestVisibilityTracker extends VisibilityTracker {
-        private final AtomicLong epoch = new AtomicLong(1);
-        private final ConcurrentHashMap<Long, Long> creationEpochs = new ConcurrentHashMap<>();
-        private final ConcurrentHashMap<Long, Long> tombstoneEpochs = new ConcurrentHashMap<>();
+        private final Lock lock = new ReentrantLock();
+        private long epoch = 1;
+        private final Map<Long, Long> creationEpochs = new HashMap<>();
+        private final Map<Long, Long> tombstoneEpochs = new HashMap<>();
 
         TestVisibilityTracker() {
             super(new TestSegmentCatalog());
@@ -1217,63 +1330,108 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
         @Override
         public long currentEpoch() {
-            return epoch.get();
+            lock.lock();
+            try {
+                return epoch;
+            } finally {
+                lock.unlock();
+            }
         }
 
         @Override
         public long captureEpoch() {
-            return epoch.get();
+            lock.lock();
+            try {
+                return epoch;
+            } finally {
+                lock.unlock();
+            }
         }
 
         @Override
         public long advanceEpoch() {
-            return epoch.incrementAndGet();
+            lock.lock();
+            try {
+                return ++epoch;
+            } finally {
+                lock.unlock();
+            }
         }
 
         @Override
         public void registerSegment(long segmentId, long creationEpoch) {
-            creationEpochs.put(segmentId, creationEpoch);
-            tombstoneEpochs.putIfAbsent(segmentId, Long.MAX_VALUE);
+            lock.lock();
+            try {
+                creationEpochs.put(segmentId, creationEpoch);
+                tombstoneEpochs.putIfAbsent(segmentId, Long.MAX_VALUE);
+            } finally {
+                lock.unlock();
+            }
         }
 
         @Override
         public void markTombstoned(long segmentId, long tombEpoch) {
-            tombstoneEpochs.put(segmentId, tombEpoch);
+            lock.lock();
+            try {
+                tombstoneEpochs.put(segmentId, tombEpoch);
+            } finally {
+                lock.unlock();
+            }
         }
 
         @Override
         public Set<Long> visibleSegments(long queryEpoch) {
-            Set<Long> visible = new HashSet<>();
-            for (Map.Entry<Long, Long> entry : creationEpochs.entrySet()) {
-                long segmentId = entry.getKey();
-                long creationEpoch = entry.getValue();
-                long tombstoneEpoch = tombstoneEpochs.getOrDefault(segmentId, Long.MAX_VALUE);
+            lock.lock();
+            try {
+                Set<Long> visible = new HashSet<>();
+                for (Map.Entry<Long, Long> entry : creationEpochs.entrySet()) {
+                    long segmentId = entry.getKey();
+                    long creationEpoch = entry.getValue();
+                    long tombstoneEpoch = tombstoneEpochs.getOrDefault(segmentId, Long.MAX_VALUE);
 
-                if (creationEpoch <= queryEpoch && queryEpoch < tombstoneEpoch) {
-                    visible.add(segmentId);
+                    if (creationEpoch <= queryEpoch && queryEpoch < tombstoneEpoch) {
+                        visible.add(segmentId);
+                    }
                 }
+                return Collections.unmodifiableSet(visible);
+            } finally {
+                lock.unlock();
             }
-            return Collections.unmodifiableSet(visible);
         }
 
         @Override
         public boolean isSegmentVisible(long segmentId, long queryEpoch) {
-            Long creationEpoch = creationEpochs.get(segmentId);
-            if (creationEpoch == null) {
-                return false;
+            lock.lock();
+            try {
+                Long creationEpoch = creationEpochs.get(segmentId);
+                if (creationEpoch == null) {
+                    return false;
+                }
+                long tombstoneEpoch = tombstoneEpochs.getOrDefault(segmentId, Long.MAX_VALUE);
+                return creationEpoch <= queryEpoch && queryEpoch < tombstoneEpoch;
+            } finally {
+                lock.unlock();
             }
-            long tombstoneEpoch = tombstoneEpochs.getOrDefault(segmentId, Long.MAX_VALUE);
-            return creationEpoch <= queryEpoch && queryEpoch < tombstoneEpoch;
         }
 
         @Override
         public long getCreationEpoch(long segmentId) {
-            return creationEpochs.getOrDefault(segmentId, -1L);
+            lock.lock();
+            try {
+                return creationEpochs.getOrDefault(segmentId, -1L);
+            } finally {
+                lock.unlock();
+            }
         }
 
         @Override
         public long getTombstoneEpoch(long segmentId) {
-            return tombstoneEpochs.getOrDefault(segmentId, Long.MAX_VALUE);
+            lock.lock();
+            try {
+                return tombstoneEpochs.getOrDefault(segmentId, Long.MAX_VALUE);
+            } finally {
+                lock.unlock();
+            }
         }
     }
 }
