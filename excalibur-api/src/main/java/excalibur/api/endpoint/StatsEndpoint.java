@@ -2,6 +2,8 @@ package excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import excalibur.api.protocol.JsonText;
+import excalibur.api.protocol.ResponseBody;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.VisibilityTracker;
 import excalibur.shard.allocator.VolumeManager;
@@ -12,7 +14,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -358,26 +359,18 @@ public class StatsEndpoint implements HttpHandler {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(200, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, 200, bytes);
     }
 
     /**
      * Sends an error response.
      */
     private void sendError(HttpExchange exchange, int statusCode, String message) throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", escapeJson(message));
+        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, statusCode, bytes);
     }
 
     /**
@@ -418,8 +411,8 @@ public class StatsEndpoint implements HttpHandler {
         sb.append("\"cuckoo\": {");
         sb.append("\"pendingDeletions\": ").append(stats.cuckoo().pendingDeletions()).append(", ");
         sb.append("\"totalDeletions\": ").append(stats.cuckoo().totalDeletions()).append(", ");
-        sb.append("\"avgFpRate\": ").append(String.format("%.6f", stats.cuckoo().avgFpRate())).append(", ");
-        sb.append("\"maxFpRate\": ").append(String.format("%.6f", stats.cuckoo().maxFpRate()));
+        sb.append("\"avgFpRate\": ").append(JsonText.number(stats.cuckoo().avgFpRate(), 6)).append(", ");
+        sb.append("\"maxFpRate\": ").append(JsonText.number(stats.cuckoo().maxFpRate(), 6));
         sb.append("}, ");
 
         sb.append("\"visibility\": {");
@@ -428,23 +421,12 @@ public class StatsEndpoint implements HttpHandler {
         sb.append("\"visibleSegments\": ").append(stats.visibility().visibleSegments());
         sb.append("}, ");
 
-        sb.append("\"coverage\": ").append(String.format("%.4f", stats.coverage()));
+        sb.append("\"coverage\": ").append(JsonText.number(stats.coverage(), 4));
 
         sb.append("}");
         return sb.toString();
     }
 
-    /**
-     * Escapes special characters for JSON strings.
-     */
-    private String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t");
-    }
 
     /**
      * Immutable record representing complete system statistics.

@@ -18,18 +18,27 @@ public class MBeanNotificationBroadcaster implements NotificationEmitter {
 
     private final CopyOnWriteArrayList<ListenerEntry> listeners;
     private final AtomicLong sequenceNumber;
+    private final Object source;
     private final String mbeanType;
     private final MBeanNotificationInfo[] notificationInfos;
 
     /**
-     * Creates a new broadcaster for the specified MBean type.
+     * Creates a new broadcaster for the specified MBean.
      *
-     * @param mbeanType The type of MBean (used for notification type prefix)
+     * <p>The owning MBean is used as the notification source so that the
+     * MBeanServer substitutes the MBean's registered ObjectName before
+     * delivering to listeners registered through
+     * {@code MBeanServer.addNotificationListener(ObjectName, ...)}. That
+     * substitution only happens when the source is the MBean instance itself.</p>
+     *
+     * @param source The MBean emitting the notifications (used as notification source)
+     * @param mbeanType The type of MBean (used for notification descriptions)
      * @param notificationTypes Array of notification types this MBean can emit
      */
-    public MBeanNotificationBroadcaster(String mbeanType, String[] notificationTypes) {
+    public MBeanNotificationBroadcaster(Object source, String mbeanType, String[] notificationTypes) {
         this.listeners = new CopyOnWriteArrayList<>();
         this.sequenceNumber = new AtomicLong(0);
+        this.source = source;
         this.mbeanType = mbeanType;
         this.notificationInfos = new MBeanNotificationInfo[]{
             new MBeanNotificationInfo(
@@ -87,7 +96,7 @@ public class MBeanNotificationBroadcaster implements NotificationEmitter {
         long seq = sequenceNumber.incrementAndGet();
         Notification notification = new Notification(
             type,
-            mbeanType,
+            source,
             seq,
             System.currentTimeMillis(),
             message

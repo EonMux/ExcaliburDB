@@ -298,8 +298,10 @@ class StorageEngineSplitHandlingTest {
                     int newIndex = initialCount + 10;
                     engine.preAllocateSegment(newIndex);
 
-                    // Segment count should increase by 1
-                    assertThat(engine.getSegmentCount()).isEqualTo(initialCount + 1);
+                    // Physical segment count (in the map) should increase by 1.
+                    // Note: getSegmentCount() returns the routing count (power-of-2),
+                    // which doesn't change when adding segments at arbitrary indices.
+                    assertThat(engine.getSegments().size()).isEqualTo(initialCount + 1);
 
                     // The new segment should be accessible
                     assertThat(engine.getSegment(newIndex)).isNotNull();

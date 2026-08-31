@@ -267,26 +267,85 @@ public class HierarchicalCuckooFilter {
                 throw new IllegalStateException("Filter missing for segment: " + segmentId);
             }
 
-            boolean segmentOk = segmentFilter.insert(item);
-            if (!segmentOk) {
+            // Set semantics at every level: one entry per item per filter, not one per
+            // insertion. A cuckoo filter stores a fingerprint in one of two buckets, each
+            // holding a fixed handful of entries, so the same item inserted repeatedly
+            // exhausts them and then fails for good - and deletion removes one slot per
+            // call, so it can never undo a count of insertions nobody recorded. The delete
+            // path removes each of a segment's distinct terms once, which is exactly what
+            // this records.
+            //
+            // Safe against a concurrent delete because deletes take the write lock of the
+            // same hierarchyLock this insert holds for reading: without that, an insert
+            // could find an entry present, skip its own, and have the delete remove it a
+            // moment later -- leaving a level denying an item a level below it holds, which
+            // is the false negative this whole arrangement exists to prevent.
+            LevelInsert segmentResult = insertIfAbsent(segmentFilter, item);
+            if (segmentResult == LevelInsert.FULL) {
                 return false;
             }
 
-            boolean clusterOk = clusterFilter.insert(item);
-            boolean corpusOk = corpusFilter.insert(item);
-
-            if (!clusterOk || !corpusOk) {
-                segmentFilter.delete(item);
-                if (clusterOk) {
-                    clusterFilter.delete(item);
-                }
+            // Roll back only the levels this call actually added to. Deleting an entry an
+            // earlier insertion put there would strip the item from a segment that still
+            // holds it.
+            LevelInsert clusterResult = insertIfAbsent(clusterFilter, item);
+            if (clusterResult == LevelInsert.FULL) {
+                rollBack(segmentFilter, item, segmentResult);
                 return false;
             }
 
-            totalEntries.incrementAndGet();
+            LevelInsert corpusResult = insertIfAbsent(corpusFilter, item);
+            if (corpusResult == LevelInsert.FULL) {
+                rollBack(segmentFilter, item, segmentResult);
+                rollBack(clusterFilter, item, clusterResult);
+                return false;
+            }
+
+            if (segmentResult == LevelInsert.ADDED) {
+                totalEntries.incrementAndGet();
+            }
             return true;
         } finally {
             hierarchyLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * What one level's insertion did.
+     */
+    private enum LevelInsert {
+        /** The level did not hold the item and now does. */
+        ADDED,
+        /** The level already reported the item; nothing was written. */
+        PRESENT,
+        /** The level does not hold the item and had no room for it. */
+        FULL
+    }
+
+    /**
+     * Records an item in one level unless that level already reports it.
+     *
+     * @param filter The level's filter
+     * @param item The item
+     * @return What the level did
+     */
+    private static LevelInsert insertIfAbsent(CuckooFilter filter, byte[] item) {
+        if (filter.contains(item)) {
+            return LevelInsert.PRESENT;
+        }
+        return filter.insert(item) ? LevelInsert.ADDED : LevelInsert.FULL;
+    }
+
+    /**
+     * Undoes one level's insertion, and only if this call made it.
+     *
+     * @param filter The level's filter
+     * @param item The item
+     * @param result What that level did
+     */
+    private static void rollBack(CuckooFilter filter, byte[] item, LevelInsert result) {
+        if (result == LevelInsert.ADDED) {
+            filter.delete(item);
         }
     }
 
@@ -405,45 +464,95 @@ public class HierarchicalCuckooFilter {
      * <p>This ensures queries issued after deletion will not consider the entry
      * as a candidate, preventing stale false positives.</p>
      *
+     * <p>The cluster and corpus levels are only touched when the segment filter actually
+     * held the item. A Cuckoo delete removes the first slot whose fingerprint matches, so
+     * deleting an item that was never inserted evicts some other item that happens to share
+     * a fingerprint - and at the corpus level that other item can belong to any segment.
+     * A miss at the leaf proves the item was never inserted for this segment.</p>
+     *
      * @param item The item to delete
      * @param segmentId The segment ID where the item was stored
-     * @return true if the item was found and deleted from at least one level
+     * @return true if the item was found in the segment filter and removed
      * @throws NullPointerException if item or segmentId is null
      */
     public boolean deleteFromHierarchy(byte[] item, String segmentId) {
         Objects.requireNonNull(item, "item must not be null");
         Objects.requireNonNull(segmentId, "segmentId must not be null");
 
-        boolean deleted = false;
-
-        hierarchyLock.readLock().lock();
+        hierarchyLock.writeLock().lock();
         try {
-            String clusterId = segmentToCluster.get(segmentId);
-            
             CuckooFilter segmentFilter = segmentFilters.get(segmentId);
-            if (segmentFilter != null && segmentFilter.delete(item)) {
-                deleted = true;
+            if (segmentFilter == null || !segmentFilter.delete(item)) {
+                return false;
             }
 
-            if (clusterId != null) {
-                CuckooFilter clusterFilter = clusterFilters.get(clusterId);
-                if (clusterFilter != null && clusterFilter.delete(item)) {
-                    deleted = true;
-                }
-            }
-
-            if (corpusFilter.delete(item)) {
-                deleted = true;
-            }
-
-            if (deleted) {
-                totalEntries.decrementAndGet();
-            }
+            propagateDelete(item, segmentToCluster.get(segmentId), segmentId);
+            totalEntries.decrementAndGet();
+            return true;
         } finally {
-            hierarchyLock.readLock().unlock();
+            hierarchyLock.writeLock().unlock();
         }
+    }
 
-        return deleted;
+    /**
+     * Removes an item from the cluster and corpus filters, if no one else still needs it there.
+     *
+     * <p>Those levels hold each item once however many segments contain it, so removing one
+     * segment's copy must not remove the shared entry while another segment still has the item
+     * - that would make the shared filter answer "absent" for something present, and the query
+     * path prunes on exactly that answer.
+     *
+     * <p>The checks are deliberately conservative. {@code mightContain} can be a false positive,
+     * so the entry is sometimes kept when it could have gone; the cost of that is a candidate
+     * that turns out to hold nothing, which is what a probabilistic filter is for. The cost of
+     * the opposite mistake is a document that can no longer be found.
+     *
+     * <p>The caller must hold {@code hierarchyLock}.
+     *
+     * @param item        The item to remove
+     * @param clusterId   Cluster owning the segment, or null when unknown
+     * @param fromSegment The segment it was just removed from, which is not consulted
+     */
+    private void propagateDelete(byte[] item, String clusterId, String fromSegment) {
+        if (clusterId == null) {
+            return;
+        }
+        CuckooFilter clusterFilter = clusterFilters.get(clusterId);
+        if (clusterFilter == null || stillInCluster(item, clusterId, fromSegment)) {
+            return;
+        }
+        clusterFilter.delete(item);
+
+        // Only once no cluster claims it. Scanning cluster filters rather than every segment
+        // keeps this proportional to the number of clusters, and a delete is far rarer than a
+        // lookup.
+        for (CuckooFilter other : clusterFilters.values()) {
+            if (other != clusterFilter && other.contains(item)) {
+                return;
+            }
+        }
+        corpusFilter.delete(item);
+    }
+
+    /**
+     * Whether any segment of a cluster other than {@code excluded} still holds the item.
+     *
+     * @param item      The item
+     * @param clusterId The cluster
+     * @param excluded  The segment it was just removed from
+     * @return true when the cluster's entry is still needed
+     */
+    private boolean stillInCluster(byte[] item, String clusterId, String excluded) {
+        for (Map.Entry<String, String> entry : segmentToCluster.entrySet()) {
+            if (!clusterId.equals(entry.getValue()) || entry.getKey().equals(excluded)) {
+                continue;
+            }
+            CuckooFilter sibling = segmentFilters.get(entry.getKey());
+            if (sibling != null && sibling.contains(item)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -462,28 +571,22 @@ public class HierarchicalCuckooFilter {
 
         boolean deleted = false;
 
-        hierarchyLock.readLock().lock();
+        hierarchyLock.writeLock().lock();
         try {
             for (Map.Entry<String, CuckooFilter> segmentEntry : segmentFilters.entrySet()) {
                 if (segmentEntry.getValue().delete(item)) {
                     deleted = true;
-                    String segmentId = segmentEntry.getKey();
-                    String clusterId = segmentToCluster.get(segmentId);
-                    if (clusterId != null) {
-                        CuckooFilter clusterFilter = clusterFilters.get(clusterId);
-                        if (clusterFilter != null) {
-                            clusterFilter.delete(item);
-                        }
-                    }
+                    propagateDelete(item, segmentToCluster.get(segmentEntry.getKey()),
+                        segmentEntry.getKey());
                     break;
                 }
             }
 
-            if (deleted && corpusFilter.delete(item)) {
+            if (deleted) {
                 totalEntries.decrementAndGet();
             }
         } finally {
-            hierarchyLock.readLock().unlock();
+            hierarchyLock.writeLock().unlock();
         }
 
         return deleted;
@@ -494,6 +597,11 @@ public class HierarchicalCuckooFilter {
      *
      * <p>This is more efficient than calling {@link #deleteFromHierarchy(byte[], String)}
      * multiple times when deleting many items from the same segment.</p>
+     *
+     * <p>As in {@link #deleteFromHierarchy(byte[], String)}, an item is removed from the
+     * cluster and corpus filters only when the segment filter held it. Deleting an item that
+     * was never inserted would evict a fingerprint-colliding item belonging to another
+     * segment from the shared corpus filter, which the query path then hard-prunes.</p>
      *
      * @param items The items to delete
      * @param segmentId The segment ID
@@ -506,34 +614,26 @@ public class HierarchicalCuckooFilter {
 
         int deletedCount = 0;
 
-        hierarchyLock.readLock().lock();
+        hierarchyLock.writeLock().lock();
         try {
             String clusterId = segmentToCluster.get(segmentId);
             CuckooFilter segmentFilter = segmentFilters.get(segmentId);
-            CuckooFilter clusterFilter = clusterId != null ? clusterFilters.get(clusterId) : null;
+
+            if (segmentFilter == null) {
+                return 0;
+            }
 
             for (byte[] item : items) {
-                boolean deleted = false;
-
-                if (segmentFilter != null && segmentFilter.delete(item)) {
-                    deleted = true;
+                if (!segmentFilter.delete(item)) {
+                    continue;
                 }
 
-                if (clusterFilter != null && clusterFilter.delete(item)) {
-                    deleted = true;
-                }
-
-                if (corpusFilter.delete(item)) {
-                    deleted = true;
-                }
-
-                if (deleted) {
-                    deletedCount++;
-                    totalEntries.decrementAndGet();
-                }
+                propagateDelete(item, clusterId, segmentId);
+                deletedCount++;
+                totalEntries.decrementAndGet();
             }
         } finally {
-            hierarchyLock.readLock().unlock();
+            hierarchyLock.writeLock().unlock();
         }
 
         return deletedCount;

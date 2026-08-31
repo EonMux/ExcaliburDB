@@ -527,4 +527,54 @@ public final class DistanceValidator {
         // Then normalize to [0, 1]
         return normalizeToScore(clamped, distanceFunction);
     }
+
+    /**
+     * Normalizes a monotone dissimilarity to a score in [0.0, 1.0].
+     *
+     * <p>Use this overload for values produced by
+     * {@link DistanceFunction#distance(float[], float[])} - such as
+     * {@code HnswSearchResult.distance()} - where smaller always means closer.
+     * The value is first converted back to the metric's natural
+     * {@link DistanceFunction#compute} scale using
+     * {@link DistanceFunction.Ordering#fromDistance(float)}, then normalized by
+     * {@link #normalizeToScore(float, DistanceFunction)}.</p>
+     *
+     * <p>Passing an ordered distance to {@link #normalizeToScore} directly would
+     * invert the ranking for similarity metrics (cosine, inner product).</p>
+     *
+     * @param orderedDistance The dissimilarity value (smaller is closer)
+     * @param distanceFunction The distance function that produced the value
+     * @return The normalized score in [0.0, 1.0], or NaN if input is NaN
+     * @throws NullPointerException if distanceFunction is null
+     * @since 1.3
+     */
+    public static float normalizeOrderedDistanceToScore(float orderedDistance,
+                                                        DistanceFunction distanceFunction) {
+        if (distanceFunction == null) {
+            throw new NullPointerException("DistanceFunction cannot be null");
+        }
+        return normalizeToScore(
+            distanceFunction.ordering().fromDistance(orderedDistance), distanceFunction);
+    }
+
+    /**
+     * Validates, clamps, and normalizes a monotone dissimilarity to a score in [0.0, 1.0].
+     *
+     * <p>This is the {@link DistanceFunction#distance(float[], float[])} counterpart of
+     * {@link #validateClampAndNormalize(float, DistanceFunction)}.</p>
+     *
+     * @param orderedDistance The dissimilarity value (smaller is closer)
+     * @param distanceFunction The distance function that produced the value
+     * @return The normalized score in [0.0, 1.0], or NaN if input is NaN
+     * @throws NullPointerException if distanceFunction is null
+     * @since 1.3
+     */
+    public static float validateClampAndNormalizeOrderedDistance(float orderedDistance,
+                                                                 DistanceFunction distanceFunction) {
+        if (distanceFunction == null) {
+            throw new NullPointerException("DistanceFunction cannot be null");
+        }
+        return validateClampAndNormalize(
+            distanceFunction.ordering().fromDistance(orderedDistance), distanceFunction);
+    }
 }

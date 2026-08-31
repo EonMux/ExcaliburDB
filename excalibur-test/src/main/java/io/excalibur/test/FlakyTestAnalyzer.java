@@ -20,7 +20,6 @@ package io.excalibur.test;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
@@ -29,14 +28,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -68,13 +63,14 @@ import java.util.stream.Collectors;
  * </pre>
  *
  * <h2>Flakiness Score</h2>
- * <p>The flakiness score ranges from 0.0 to 1.0:</p>
+ * <p>The flakiness score is {@code 2 * min(passRate, 1 - passRate)} over the runs that
+ * actually executed the test, so it ranges from 0.0 to 1.0:</p>
  * <ul>
  *   <li>0.0 - Test passes or fails consistently (not flaky)</li>
- *   <li>0.5 - Test passes 50% of the time (highly flaky)</li>
- *   <li>1.0 - Test passes or fails consistently (not flaky)</li>
+ *   <li>0.5 - Test passes 25% (or 75%) of the time</li>
+ *   <li>1.0 - Test passes 50% of the time (maximally flaky)</li>
  * </ul>
- * <p>Tests with flakiness scores between 0.1 and 0.9 are considered potentially flaky.</p>
+ * <p>Tests scoring above 0.1 that both passed and failed are reported as flaky.</p>
  *
  * @author ExcaliburDB
  * @since 10.0
@@ -96,11 +92,11 @@ public final class FlakyTestAnalyzer {
     /** Flakiness threshold - tests with scores above this are considered flaky */
     private static final double FLAKINESS_THRESHOLD = 0.1;
 
-    // Patterns for parsing Gradle test output
-    private static final Pattern TEST_PASS_PATTERN = Pattern.compile("^(\\S+)\\s+PASSED$");
-    private static final Pattern TEST_FAIL_PATTERN = Pattern.compile("^(\\S+)\\s+FAILED$");
-    private static final Pattern TEST_SKIP_PATTERN = Pattern.compile("^(\\S+)\\s+SKIPPED$");
-    private static final Pattern CLASS_HEADER = Pattern.compile("^([\\w.]+)\\s*>$");
+    /** Location of the JUnit XML reports Gradle writes, relative to the module directory */
+    private static final String TEST_RESULTS_PATH = "build/test-results/test";
+
+    /** Number of trailing Gradle output lines quoted when a run produces no reports */
+    private static final int OUTPUT_TAIL_LINES = 20;
 
     private String moduleName = DEFAULT_MODULE;
     private int runCount = DEFAULT_RUN_COUNT;
@@ -221,15 +217,26 @@ public final class FlakyTestAnalyzer {
 
             int passCount = (int) results.stream().filter(TestRunResult::passed).count();
             int failCount = (int) results.stream().filter(TestRunResult::failed).count();
-            int totalRuns = results.size();
+            // Only runs that actually executed the test carry a verdict. Counting SKIPPED
+            // runs here would both distort the pass rate and break the FlakyTestResult
+            // invariant passCount + failCount == totalRuns.
+            int executedRuns = passCount + failCount;
 
-            // Calculate flakiness score (0 = consistent, 0.5 = maximally flaky)
-            double passRate = (double) passCount / totalRuns;
+            if (executedRuns == 0) {
+                // Skipped in every run - there is no evidence either way
+                if (verbose) {
+                    System.out.println("Test: " + testName + " | skipped in all " + results.size() + " runs");
+                }
+                continue;
+            }
+
+            // Calculate flakiness score (0 = consistent, 1.0 = maximally flaky)
+            double passRate = (double) passCount / executedRuns;
             double flakinessScore = calculateFlakinessScore(passRate);
 
             if (verbose) {
                 System.out.println("Test: " + testName +
-                    " | Passes: " + passCount + "/" + totalRuns +
+                    " | Passes: " + passCount + "/" + executedRuns +
                     " | Flakiness: " + String.format("%.2f", flakinessScore));
             }
 
@@ -239,12 +246,12 @@ public final class FlakyTestAnalyzer {
                     testName,
                     passCount,
                     failCount,
-                    totalRuns,
+                    executedRuns,
                     flakinessScore,
                     passRate,
                     extractFailurePatterns(results)
                 ));
-            } else if (failCount == totalRuns) {
+            } else if (failCount == executedRuns) {
                 // Consistently failing
                 String errorMessage = results.stream()
                     .filter(TestRunResult::failed)
@@ -252,8 +259,8 @@ public final class FlakyTestAnalyzer {
                     .filter(Objects::nonNull)
                     .findFirst()
                     .orElse("Unknown error");
-                consistentFailures.add(new ConsistentFailure(testName, totalRuns, errorMessage));
-            } else if (passCount == totalRuns) {
+                consistentFailures.add(new ConsistentFailure(testName, executedRuns, errorMessage));
+            } else if (passCount == executedRuns) {
                 // Consistently passing
                 alwaysPassing.add(testName);
             }
@@ -326,65 +333,43 @@ public final class FlakyTestAnalyzer {
 
     /**
      * Run tests once and collect results.
+     *
+     * <p>Results are read from the JUnit XML reports Gradle writes for the module rather
+     * than scraped from console output: the reports are structured, carry the real failure
+     * message for every failed test, and cannot be confused with a test's own stdout.</p>
+     *
+     * @param runNumber The 1-based run number
+     * @return The summary of this run
+     * @throws IOException if Gradle produced no test reports for this run
      */
     private RunSummary runTests(int runNumber) throws IOException, InterruptedException {
         Instant start = Instant.now();
+        Path resultsDirectory = testResultsDirectory();
 
         ProcessBuilder pb = new ProcessBuilder(
             gradlePath,
             ":" + moduleName + ":test",
             "--console=plain",
-            "--no-daemon"
+            "--no-daemon",
+            // Without this the test task is UP-TO-DATE from run 2 onwards and no test
+            // would actually be executed again, which is the whole point of the analysis.
+            "--rerun"
         );
         pb.directory(workingDirectory.toFile());
         pb.redirectErrorStream(true);
 
         Process process = pb.start();
-
-        List<TestRunResult> results = new ArrayList<>();
-        String currentClass = null;
-
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                line = line.trim();
-
-                if (verbose) {
-                    System.out.println("  " + line);
-                }
-
-                // Track class context
-                Matcher classMatcher = CLASS_HEADER.matcher(line);
-                if (classMatcher.matches()) {
-                    currentClass = classMatcher.group(1);
-                    continue;
-                }
-
-                // Parse test results
-                Matcher passMatcher = TEST_PASS_PATTERN.matcher(line);
-                if (passMatcher.matches()) {
-                    String testName = formatTestName(currentClass, passMatcher.group(1));
-                    results.add(new TestRunResult(testName, TestStatus.PASSED, null, runNumber));
-                    continue;
-                }
-
-                Matcher failMatcher = TEST_FAIL_PATTERN.matcher(line);
-                if (failMatcher.matches()) {
-                    String testName = formatTestName(currentClass, failMatcher.group(1));
-                    results.add(new TestRunResult(testName, TestStatus.FAILED, "Test failed", runNumber));
-                    continue;
-                }
-
-                Matcher skipMatcher = TEST_SKIP_PATTERN.matcher(line);
-                if (skipMatcher.matches()) {
-                    String testName = formatTestName(currentClass, skipMatcher.group(1));
-                    results.add(new TestRunResult(testName, TestStatus.SKIPPED, null, runNumber));
-                }
-            }
-        }
-
+        List<String> output = drainOutput(process);
         int exitCode = process.waitFor();
         Instant end = Instant.now();
+
+        List<TestRunResult> results = JUnitReportReader.readReports(resultsDirectory, start, runNumber);
+        if (results.isEmpty()) {
+            throw new IOException(
+                "Run " + runNumber + " produced no test reports in " + resultsDirectory
+                    + " (gradle exit code " + exitCode + "). Last output:\n"
+                    + String.join("\n", tail(output, OUTPUT_TAIL_LINES)));
+        }
 
         int passed = (int) results.stream().filter(TestRunResult::passed).count();
         int failed = (int) results.stream().filter(TestRunResult::failed).count();
@@ -394,13 +379,32 @@ public final class FlakyTestAnalyzer {
     }
 
     /**
-     * Format test name with class context.
+     * Resolve the directory Gradle writes JUnit XML reports to for the analyzed module.
      */
-    private String formatTestName(String className, String methodName) {
-        if (className == null) {
-            return methodName;
+    private Path testResultsDirectory() {
+        String relativePath = moduleName.replace(':', '/');
+        return workingDirectory.resolve(relativePath).resolve(TEST_RESULTS_PATH).normalize();
+    }
+
+    /**
+     * Consume the process output so the child never blocks on a full pipe.
+     */
+    private List<String> drainOutput(Process process) throws IOException {
+        List<String> output = new ArrayList<>();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (verbose) {
+                    System.out.println("  " + line);
+                }
+                output.add(line);
+            }
         }
-        return className + "." + methodName;
+        return output;
+    }
+
+    private static List<String> tail(List<String> lines, int count) {
+        return lines.subList(Math.max(0, lines.size() - count), lines.size());
     }
 
     // ==================== Supporting Types ====================
@@ -490,7 +494,7 @@ public final class FlakyTestAnalyzer {
      * @param testName Full test name
      * @param passCount Number of times the test passed
      * @param failCount Number of times the test failed
-     * @param totalRuns Total number of runs
+     * @param totalRuns Number of runs that executed the test (passCount + failCount)
      * @param flakinessScore Flakiness score (0.0 to 1.0, higher = more flaky)
      * @param passRate Pass rate (0.0 to 1.0)
      * @param failurePatterns Common failure patterns observed
@@ -676,23 +680,24 @@ public final class FlakyTestAnalyzer {
         }
 
         /**
-         * Get overall pass rate across all runs.
+         * Get overall pass rate across all runs, over the tests that actually executed.
          */
         public double getOverallPassRate() {
             int totalPasses = 0;
-            int totalRuns = 0;
+            int totalExecuted = 0;
 
             for (RunSummary summary : runSummaries) {
                 totalPasses += summary.passed();
-                totalRuns += summary.total();
+                // Skipped tests were never executed and carry no verdict
+                totalExecuted += summary.passed() + summary.failed();
             }
 
             // Domain correctness: handle division by zero
-            if (totalRuns == 0) {
+            if (totalExecuted == 0) {
                 return 0.0;
             }
 
-            return (double) totalPasses / totalRuns;
+            return (double) totalPasses / totalExecuted;
         }
 
         /**

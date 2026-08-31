@@ -14,6 +14,7 @@ import excalibur.query.executor.CancellationToken;
 import excalibur.query.executor.ParallelQueryDispatcher;
 import excalibur.query.executor.ResultAggregator;
 import excalibur.query.executor.SegmentQueryTask;
+import excalibur.query.payload.ResultPayloadResolver;
 import excalibur.query.visibility.DocumentAtomicityFilter;
 import excalibur.query.visibility.QuerySnapshot;
 import excalibur.shard.visibility.EpochIsolationValidator;
@@ -33,10 +34,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -45,8 +45,13 @@ import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 /**
@@ -95,6 +100,51 @@ public class QueryPipeline {
      */
     public static final float DEFAULT_LLM_THRESHOLD = 0.3f;
 
+    /**
+     * Multiplier applied to topK when collecting Stage 4 rerank candidates.
+     */
+    private static final int RERANK_CANDIDATE_MULTIPLIER = 2;
+
+    /**
+     * Minimum interval between two runs of the empty-result diagnostics.
+     */
+    private static final long EMPTY_RESULT_DIAGNOSTIC_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
+
+    /**
+     * Minimum fraction of a segment's entries an LSH index must cover before its verdict
+     * is treated as authoritative.
+     *
+     * <p>An index that has seen far fewer entries than the segment holds - because it is
+     * still being populated, or was built after the segment - cannot rule a segment out:
+     * an empty candidate set from such an index means "no information", not "no matches".</p>
+     */
+    private static final double LSH_AUTHORITATIVE_COVERAGE = 0.5;
+
+    /**
+     * Epoch handed to the document atomicity filter, meaning "no epoch bound".
+     *
+     * <p>The pipeline's own epoch ({@code PipelineContext.epoch}) comes from the shard's
+     * {@link VisibilityTracker}, which counts segment lifecycle transitions and periodic
+     * ticks. Document commit epochs come from the ingest-side visibility tracker, a
+     * separate counter advanced once per published document. The two numbers have no
+     * defined ordering relationship, so comparing a document's commit epoch against the
+     * shard epoch decides visibility on whichever counter happens to be running faster -
+     * dropping committed documents when ingest is ahead, and asserting nothing when the
+     * shard tick is.</p>
+     *
+     * <p>Rather than perform a comparison across two unrelated domains, the filter is
+     * applied without an epoch bound, which reduces it to exactly the guarantee it exists
+     * to provide: a result is dropped only when its document is registered as not yet
+     * complete. Epoch-based snapshot isolation is still enforced, in its own domain, by
+     * the shard {@code EpochIsolationValidator} in Stage 3.</p>
+     *
+     * <p>Restoring an epoch bound here requires the query epoch to be drawn from the same
+     * counter that stamps document commits - i.e. an accessor for the current commit epoch
+     * on {@code DocumentVisibilityChecker}, captured in Stage 0 alongside the segment
+     * epoch.</p>
+     */
+    private static final long DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED = Long.MAX_VALUE;
+
     private final StorageEngine storageEngine;
     private final VisibilityTracker visibilityTracker;
     private final DocumentVisibilityChecker visibilityChecker;
@@ -111,8 +161,30 @@ public class QueryPipeline {
      */
     private final EpochIsolationValidator epochIsolationValidator;
 
+    /**
+     * Resolves the stored chunk text of the results Stage 5 is about to score.
+     *
+     * <p>A search result identifies a node, not a document body, so without this the
+     * relevancy scorer receives one empty string per candidate.</p>
+     */
+    private final ResultPayloadResolver payloadResolver;
+
     // Lazily initialized dispatcher for parallel query execution
     private volatile ParallelQueryDispatcher dispatcher;
+
+    // Lazily initialized executor that runs the (blocking) pipeline stages. The pipeline
+    // must not run on ForkJoinPool.commonPool: its stages block on segment I/O and on the
+    // dispatcher, which starves every other commonPool user, and a commonPool task cannot
+    // be interrupted when the query times out.
+    private volatile ExecutorService pipelineExecutor;
+
+    /**
+     * Timestamp (nanoTime) after which empty-result diagnostics may run again.
+     *
+     * <p>The diagnostics walk whole graphs, so they are rate limited: a query storm that
+     * legitimately returns nothing must not turn every response into a full graph scan.</p>
+     */
+    private final AtomicLong nextEmptyResultDiagnosticNanos = new AtomicLong(Long.MIN_VALUE);
 
     /**
      * Creates a new QueryPipeline.
@@ -247,16 +319,9 @@ public class QueryPipeline {
             HierarchicalCuckooFilter hierarchicalFilter,
             EpochIsolationValidator epochIsolationValidator) {
 
-        this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
-        this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
-        this.visibilityChecker = visibilityChecker;
-        this.graphProvider = Objects.requireNonNull(graphProvider, "GraphProvider cannot be null");
-        this.distanceFunction = Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
-        this.llmScorer = llmScorer;
-        this.coverageThreshold = coverageThreshold;
-        this.hierarchicalFilter = hierarchicalFilter;
-        this.epochIsolationValidator = epochIsolationValidator;
-        // Dispatcher is lazily initialized on first use
+        // Dispatcher and pipeline executor are lazily initialized on first use
+        this(storageEngine, visibilityTracker, visibilityChecker, graphProvider, distanceFunction,
+            llmScorer, coverageThreshold, hierarchicalFilter, epochIsolationValidator, null, null);
     }
 
     /**
@@ -275,7 +340,8 @@ public class QueryPipeline {
             double coverageThreshold,
             HierarchicalCuckooFilter hierarchicalFilter,
             EpochIsolationValidator epochIsolationValidator,
-            ParallelQueryDispatcher dispatcher) {
+            ParallelQueryDispatcher dispatcher,
+            ExecutorService pipelineExecutor) {
 
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
@@ -286,7 +352,9 @@ public class QueryPipeline {
         this.coverageThreshold = coverageThreshold;
         this.hierarchicalFilter = hierarchicalFilter;
         this.epochIsolationValidator = epochIsolationValidator;
+        this.payloadResolver = new ResultPayloadResolver(this.storageEngine);
         this.dispatcher = dispatcher;
+        this.pipelineExecutor = pipelineExecutor;
     }
 
     /**
@@ -310,6 +378,31 @@ public class QueryPipeline {
             }
         }
         return dispatcher;
+    }
+
+    /**
+     * Returns the executor that runs pipeline stages, initializing it lazily.
+     *
+     * <p>A virtual-thread-per-task executor matches the rest of the server: the stages
+     * are dominated by blocking waits, and a virtual thread parked on one costs nothing.
+     * Crucially it also lets a timed-out query interrupt the thread actually running the
+     * pipeline, which {@link CompletableFuture#supplyAsync(java.util.function.Supplier)}
+     * on the common pool cannot do.</p>
+     *
+     * @return The pipeline executor
+     */
+    private ExecutorService getPipelineExecutor() {
+        ExecutorService local = pipelineExecutor;
+        if (local == null) {
+            synchronized (this) {
+                local = pipelineExecutor;
+                if (local == null) {
+                    local = Executors.newVirtualThreadPerTaskExecutor();
+                    pipelineExecutor = local;
+                }
+            }
+        }
+        return local;
     }
 
     // ==================== Configuration Methods ====================
@@ -341,7 +434,8 @@ public class QueryPipeline {
             this.coverageThreshold,
             this.hierarchicalFilter,
             this.epochIsolationValidator,
-            this.dispatcher
+            this.dispatcher,
+            this.pipelineExecutor
         );
     }
 
@@ -372,7 +466,8 @@ public class QueryPipeline {
             this.coverageThreshold,
             this.hierarchicalFilter,
             this.epochIsolationValidator,
-            this.dispatcher
+            this.dispatcher,
+            this.pipelineExecutor
         );
     }
 
@@ -407,8 +502,12 @@ public class QueryPipeline {
     public void shutdown() {
         if (dispatcher != null) {
             dispatcher.shutdown();
-            LOGGER.debug("QueryPipeline shutdown complete");
         }
+        ExecutorService executor = pipelineExecutor;
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+        LOGGER.debug("QueryPipeline shutdown complete");
     }
 
     // ==================== Main Execution Method ====================
@@ -438,30 +537,21 @@ public class QueryPipeline {
 
         LOGGER.debug("Starting query pipeline");
 
-        // Create the pipeline execution future
-        CompletableFuture<PipelineContext> pipelineFuture = CompletableFuture.supplyAsync(() -> {
-            // Stage 0: Epoch Snapshot
-            PipelineContext context = stage0_EpochSnapshot(request, token);
+        // Holds the latest completed stage's context so that if the pipeline is
+        // interrupted by a timeout or cancellation, handlePipelineError can return
+        // any partial results that were already computed (the pipeline contract is
+        // "partial results on timeout", not "empty results on timeout").
+        AtomicReference<PipelineContext> partialContext = new AtomicReference<>();
 
-            // Stage 0b: Selectivity Estimation and Segment Prioritization
-            context = stage0b_SelectivityEstimation(context, token);
-
-            // Stage 1: Cuckoo Filter Cascade
-            context = stage1_CuckooFilterCascade(context, token);
-
-            // Stage 2: LSH Pre-filter
-            context = stage2_LshPreFilter(context, token);
-
-            // Stage 3: HNSW Vector Search with Tail Scan
-            context = stage3_HnswVectorSearch(context, token);
-
-            // Stage 4: Full Vector Rerank
-            context = stage4_FullVectorRerank(context, token);
-
-            // Stage 5: LLM Relevancy Scoring (optional)
-            context = stage5_LlmScoring(context, token);
-
-            return context;
+        // Run the pipeline on the pipeline executor, keeping the underlying task handle so
+        // a timeout can actually interrupt the work instead of just abandoning it.
+        CompletableFuture<PipelineContext> pipelineFuture = new CompletableFuture<>();
+        Future<?> pipelineTask = getPipelineExecutor().submit(() -> {
+            try {
+                pipelineFuture.complete(runStages(request, token, partialContext));
+            } catch (Throwable t) {
+                pipelineFuture.completeExceptionally(t);
+            }
         });
 
         // Apply timeout
@@ -475,10 +565,18 @@ public class QueryPipeline {
             // Record query latency for JMX observability
             // This enables monitoring of p50/p90/p95/p99 latencies
             Metrics.recordQueryLatency(durationMs);
+            // And the count the IngestionThroughput MBean reports, which had no writer outside
+            // the tests: the MBean was registered and advertised four attributes that were zero
+            // on a server that had served millions of queries.
+            Metrics.recordQueryExecution();
 
             try {
                 if (error != null) {
-                    return handlePipelineError(error, request, durationMs, token);
+                    // Stop the abandoned pipeline: cancelling with an interrupt unblocks
+                    // the stage that is running and stops the segment searches and tail
+                    // scans it dispatched, which all check the interrupt flag.
+                    pipelineTask.cancel(true);
+                    return handlePipelineError(error, request, durationMs, token, partialContext.get());
                 }
 
                 return buildResponse(context, durationMs);
@@ -487,6 +585,51 @@ public class QueryPipeline {
                 StructuredLoggingHelper.clearCorrelationId();
             }
         });
+    }
+
+    /**
+     * Runs every pipeline stage in order, publishing each stage's context so that a
+     * timeout or cancellation can still return the results computed so far.
+     *
+     * @param request The query request
+     * @param token The cancellation token
+     * @param partialContext Holder updated after each completed stage
+     * @return The final pipeline context
+     */
+    private PipelineContext runStages(
+            QueryRequest request,
+            CancellationToken token,
+            AtomicReference<PipelineContext> partialContext) {
+
+        // Stage 0: Epoch Snapshot
+        PipelineContext context = stage0_EpochSnapshot(request, token);
+        partialContext.set(context);
+
+        // Stage 0b: Selectivity Estimation and Segment Prioritization
+        context = stage0b_SelectivityEstimation(context, token);
+        partialContext.set(context);
+
+        // Stage 1: Cuckoo Filter Cascade
+        context = stage1_CuckooFilterCascade(context, token);
+        partialContext.set(context);
+
+        // Stage 2: LSH Pre-filter
+        context = stage2_LshPreFilter(context, token);
+        partialContext.set(context);
+
+        // Stage 3: HNSW Vector Search with Tail Scan
+        context = stage3_HnswVectorSearch(context, token);
+        partialContext.set(context);
+
+        // Stage 4: Full Vector Rerank
+        context = stage4_FullVectorRerank(context, token);
+        partialContext.set(context);
+
+        // Stage 5: LLM Relevancy Scoring (optional)
+        context = stage5_LlmScoring(context, token);
+        partialContext.set(context);
+
+        return context;
     }
 
     /**
@@ -660,7 +803,7 @@ public class QueryPipeline {
             char c = queryText.charAt(i);
             if (Character.isWhitespace(c)) {
                 if (currentTerm.length() > 0) {
-                    terms.add(currentTerm.toString().toLowerCase());
+                    terms.add(currentTerm.toString().toLowerCase(Locale.ROOT));
                     currentTerm.setLength(0);
                 }
             } else {
@@ -670,7 +813,7 @@ public class QueryPipeline {
 
         // Add final term if any
         if (currentTerm.length() > 0) {
-            terms.add(currentTerm.toString().toLowerCase());
+            terms.add(currentTerm.toString().toLowerCase(Locale.ROOT));
         }
 
         return terms;
@@ -795,23 +938,58 @@ public class QueryPipeline {
             }
         }
 
-        // If no terms matched any segments, return empty candidates
-        if (candidateSegmentIds.isEmpty()) {
-            LOGGER.debug("Stage 1: No segments matched any of {} query terms", queryTerms.size());
-            return context.withCandidates(Collections.emptyList());
-        }
-
-        // Filter candidates to only those that matched at least one term
-        // Use String.valueOf(segmentId) to match the format used during ingestion
+        // A segment is excluded only on the word of a filter that actually holds its terms.
+        // The filter is built in memory as documents are published and is not reloaded at
+        // startup, so on a fresh process it holds nothing at all -- and reading that silence as
+        // "this term is in no segment" makes every query with a text term return zero results
+        // until the corpus has been re-ingested. Nothing errors; the database simply answers
+        // that it knows nothing. This is the same rule stage 2 already applies to an LSH index
+        // that does not cover its segment: an index with no entries has no verdict to give.
         List<SegmentCandidate> passed = context.candidates.stream()
-            .filter(c -> candidateSegmentIds.contains(String.valueOf(c.segmentId())))
+            .filter(c -> survivesTermFilter(hierarchicalFilter, c.segmentId(), candidateSegmentIds))
             .collect(Collectors.toList());
 
-        LOGGER.debug("Stage 1: {} of {} segments passed Cuckoo filter cascade " +
-            "({} terms matched, {} unique segment IDs from filter)",
+        LOGGER.debug("Stage 1: {} of {} segments passed Cuckoo filter cascade "
+            + "({} terms matched, {} unique segment IDs from filter)",
             passed.size(), context.candidates.size(), termsWithMatches, candidateSegmentIds.size());
 
         return context.withCandidates(passed);
+    }
+
+    /**
+     * Whether the hierarchical filter holds any terms for a segment.
+     *
+     * <p>Only a segment the filter has actually been populated for can be excluded by it. A
+     * segment with no registered filter, or with one holding nothing, is a segment the filter
+     * has no opinion about — which is not the same as one it has looked at and rejected.
+     *
+     * @param segmentId The segment's id
+     * @return true when the filter's silence about this segment is meaningful
+     */
+    static boolean filterCovers(HierarchicalCuckooFilter filter, long segmentId) {
+        if (filter == null) {
+            return false;
+        }
+        excalibur.filter.CuckooFilter segmentFilter =
+            filter.getSegmentFilter(String.valueOf(segmentId));
+        return segmentFilter != null && segmentFilter.count() > 0;
+    }
+
+    /**
+     * Whether a segment survives the term filter.
+     *
+     * <p>It does when a query term was found in it, or when the filter holds nothing for it and
+     * so has nothing to say. Only the second half is subtle, and it is the half that was
+     * missing: see {@link #filterCovers}.
+     *
+     * @param filter    The hierarchical filter, which may be null
+     * @param segmentId The candidate segment
+     * @param matched   Segment ids the query's terms were found in
+     * @return true when the segment should be searched
+     */
+    static boolean survivesTermFilter(HierarchicalCuckooFilter filter, long segmentId,
+                                      Set<String> matched) {
+        return matched.contains(String.valueOf(segmentId)) || !filterCovers(filter, segmentId);
     }
 
     /**
@@ -825,14 +1003,18 @@ public class QueryPipeline {
      *   <li>For each segment candidate, query its LSH index with the query vector</li>
      *   <li>If the LSH index returns candidates, attach them to the segment candidate</li>
      *   <li>If no LSH index is available, pass the segment through unchanged</li>
-     *   <li>If LSH returns no candidates, the segment is excluded from further processing</li>
+     *   <li>If the index covers the segment and returns no candidates, the segment is
+     *       excluded from further processing</li>
+     *   <li>If the index is empty or covers only a small fraction of the segment's
+     *       entries, its verdict carries no information and the segment passes through</li>
      * </ol>
      *
      * <h3>Domain Correctness</h3>
      * <ul>
      *   <li>LSH candidates are entry IDs (long values) that potentially match the query vector</li>
-     *   <li>Semantically correct: segments with no LSH candidates are filtered out</li>
-     *   <li>Segments without LSH index pass through to ensure no data loss</li>
+     *   <li>A segment is only excluded on the word of an index that actually covers it -
+     *       an empty or barely-populated index means "unknown", not "no matches"</li>
+     *   <li>Segments without an LSH index pass through to ensure no data loss</li>
      * </ul>
      */
     private PipelineContext stage2_LshPreFilter(PipelineContext context, CancellationToken token) {
@@ -852,26 +1034,35 @@ public class QueryPipeline {
             token.checkCancelled("Stage 2 cancelled during LSH query");
 
             LshIndex lsh = candidate.lshIndex();
-            if (lsh != null) {
-                segmentsWithLsh++;
-                try {
-                    Set<Long> lshCandidates = lsh.query(queryVector);
-                    if (!lshCandidates.isEmpty()) {
-                        totalLshCandidates += lshCandidates.size();
-                        passed.add(candidate.withLshCandidates(lshCandidates));
-                    } else {
-                        // Segment has no LSH candidates - filter it out
-                        segmentsFiltered++;
-                        LOGGER.trace("Segment {} filtered out by LSH (no candidates)", candidate.segmentId());
-                    }
-                } catch (Exception e) {
-                    // On LSH error, pass the segment through to ensure no data loss
-                    LOGGER.warn("LSH query failed for segment {}: {}. Passing through.",
-                        candidate.segmentId(), e.getMessage());
+            if (lsh == null) {
+                // No LSH index - pass through to ensure no data loss
+                passed.add(candidate);
+                continue;
+            }
+
+            segmentsWithLsh++;
+            try {
+                Set<Long> lshCandidates = lsh.query(queryVector);
+                if (!lshCandidates.isEmpty()) {
+                    totalLshCandidates += lshCandidates.size();
+                    passed.add(candidate.withLshCandidates(lshCandidates));
+                } else if (isLshAuthoritative(candidate, lsh)) {
+                    // The index covers this segment and found nothing: a real exclusion
+                    segmentsFiltered++;
+                    LOGGER.trace("Segment {} filtered out by LSH (no candidates)", candidate.segmentId());
+                } else {
+                    // The index has seen little or none of this segment, so an empty
+                    // candidate set says nothing about it. Treat it exactly like a
+                    // missing index and pass the segment through.
+                    LOGGER.debug("Segment {} LSH index covers {} of {} entries; " +
+                        "empty result is not authoritative, passing through",
+                        candidate.segmentId(), lsh.entryCount(), segmentEntryCount(candidate));
                     passed.add(candidate);
                 }
-            } else {
-                // No LSH index - pass through to ensure no data loss
+            } catch (Exception e) {
+                // On LSH error, pass the segment through to ensure no data loss
+                LOGGER.warn("LSH query failed for segment {}: {}. Passing through.",
+                    candidate.segmentId(), e.getMessage());
                 passed.add(candidate);
             }
         }
@@ -880,6 +1071,51 @@ public class QueryPipeline {
             passed.size(), segmentsWithLsh, segmentsFiltered, totalLshCandidates);
 
         return context.withCandidates(passed);
+    }
+
+    /**
+     * Decides whether an empty LSH result may be used to exclude a segment.
+     *
+     * <p>An LSH index only speaks for the entries it has actually indexed. One that is
+     * empty, or that holds far fewer entries than the segment does, has no basis for
+     * ruling the segment out; treating its empty answer as authoritative would silently
+     * drop every match the segment holds.</p>
+     *
+     * @param candidate The segment candidate
+     * @param lsh The segment's LSH index
+     * @return true if the index covers enough of the segment for an empty result to mean
+     *         "no matches" rather than "unknown"
+     */
+    private boolean isLshAuthoritative(SegmentCandidate candidate, LshIndex lsh) {
+        long indexed = lsh.entryCount();
+        if (indexed <= 0) {
+            return false;
+        }
+
+        long segmentEntries = segmentEntryCount(candidate);
+        if (segmentEntries <= 0) {
+            // Entry count unavailable: a populated index is the best evidence we have
+            return true;
+        }
+
+        return indexed >= segmentEntries * LSH_AUTHORITATIVE_COVERAGE;
+    }
+
+    /**
+     * Returns the number of entries a candidate's segment holds, or -1 if unknown.
+     */
+    private long segmentEntryCount(SegmentCandidate candidate) {
+        Segment segment = candidate.segment();
+        if (segment == null) {
+            return -1;
+        }
+        try {
+            return segment.entryCount();
+        } catch (Exception e) {
+            LOGGER.trace("Could not read entry count for segment {}: {}",
+                candidate.segmentId(), e.getMessage());
+            return -1;
+        }
     }
 
     /**
@@ -908,7 +1144,7 @@ public class QueryPipeline {
 
         if (context.candidates.isEmpty()) {
             LOGGER.debug("Stage 3: No candidates to search");
-            return context.withSegmentResults(List.of(), 0);
+            return context.withSegmentResults(List.of(), 0, 0);
         }
 
         float[] queryVector = context.request.queryVectorUnsafe();
@@ -953,6 +1189,7 @@ public class QueryPipeline {
 
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = dispatchResult.segmentResults();
         long totalTailScanEntries = dispatchResult.coverage().tailScanEntries();
+        int segmentsTimedOut = dispatchResult.coverage().segmentsTimedOut();
 
         // Apply epoch isolation filtering to HNSW results to prevent torn reads
         // Filter out nodes that were inserted after the query's captured epoch
@@ -963,18 +1200,25 @@ public class QueryPipeline {
 
             for (SegmentQueryTask.SegmentQueryResult sr : segmentResults) {
                 if (sr != null && sr.results() != null) {
+                    // Scope the lookup by segment. Node IDs are only unique within one
+                    // segment's graph, and the integration worker registers them per
+                    // segment; the segment-less overload looks them up in an unrelated,
+                    // never-populated scope, where every node resolves to "always
+                    // visible" and the isolation guarantee silently disappears.
                     List<HnswSearchResult> filtered = epochIsolationValidator.filterResults(
-                        sr.results(), queryEpoch);
+                        sr.segmentId(), sr.results(), queryEpoch);
                     totalFiltered += sr.results().size() - filtered.size();
 
-                    // Create new result with filtered list
+                    // Create new result with filtered list, keeping the tail-scan chunk
+                    // text so the surviving results still carry their payloads
                     filteredResults.add(new SegmentQueryTask.SegmentQueryResult(
                         sr.segmentId(),
                         filtered,
                         sr.tailScanEntries(),
                         sr.durationMs(),
                         sr.success(),
-                        sr.errorMessage()
+                        sr.errorMessage(),
+                        sr.payloads()
                     ));
                 } else {
                     filteredResults.add(sr);
@@ -994,279 +1238,7 @@ public class QueryPipeline {
         LOGGER.debug("Stage 3: Search completed - {} segments, {} tail scan entries, {}ms",
             segmentResults.size(), totalTailScanEntries, durationMs);
 
-        return context.withSegmentResults(segmentResults, totalTailScanEntries);
-    }
-
-    /**
-     * Searches a single segment and returns the result.
-     *
-     * <p>This method is used for both sequential and parallel execution in Stage 3.
-     * It handles tail scan requirement determination and result collection.</p>
-     *
-     * @param queryVector The query vector
-     * @param candidate The segment candidate to search
-     * @param searchK The number of results to retrieve (with oversampling)
-     * @return Segment query result with search results and tail scan metadata
-     */
-    private SegmentQueryTask.SegmentQueryResult searchSingleSegment(
-            float[] queryVector,
-            SegmentCandidate candidate,
-            int searchK) {
-
-        long segmentStartTime = System.nanoTime();
-
-        try {
-            // Determine tail scan requirement
-            TailScanRequirement requirement = TailScanRequirement.noTailScan(candidate.segmentId());
-            if (candidate.segment() != null && candidate.graph() != null) {
-                long lastIntegratedOffset = candidate.graph().getLastIntegratedOffset();
-                long writeLogHead = candidate.segment().getWriteLogHead();
-                if (lastIntegratedOffset < writeLogHead) {
-                    requirement = TailScanRequirement.compare(
-                        candidate.segmentId(), lastIntegratedOffset, writeLogHead);
-                }
-            }
-
-            // Search the segment using the existing searchSegment method
-            List<HnswSearchResult> results = searchSegment(
-                queryVector, candidate, searchK, requirement);
-
-            // Count tail scan entries
-            long tailScanEntries = requirement.isTailScanNeeded() ? requirement.estimatedEntryCount() : 0;
-
-            long segmentDurationMs = (System.nanoTime() - segmentStartTime) / 1_000_000;
-
-            return new SegmentQueryTask.SegmentQueryResult(
-                candidate.segmentId(),
-                results,
-                tailScanEntries,
-                segmentDurationMs,
-                true,
-                null
-            );
-
-        } catch (Exception e) {
-            LOGGER.warn("Segment {} search failed: {}", candidate.segmentId(), e.getMessage());
-            return new SegmentQueryTask.SegmentQueryResult(
-                candidate.segmentId(),
-                List.of(),
-                0,
-                (System.nanoTime() - segmentStartTime) / 1_000_000,
-                false,
-                e.getMessage()
-            );
-        }
-    }
-
-    /**
-     * Searches a single segment using HNSW and optional tail scan.
-     *
-     * <p>Uses the pre-computed TailScanRequirement to determine if tail scan
-     * is needed. If tail scan is required, performs brute-force scan over
-     * un-integrated write log entries and merges results with HNSW results.</p>
-     *
-     * <h3>LSH Pre-Filtering Integration</h3>
-     * <p>If the segment candidate has LSH pre-filtered candidates attached,
-     * the HNSW search is constrained to only consider those node IDs. This
-     * provides 10x-100x top_k candidate reduction for improved performance.</p>
-     *
-     * <h3>Merge Strategy</h3>
-     * <ol>
-     *   <li>Perform HNSW graph search for k results (filtered by LSH candidates if available)</li>
-     *   <li>If tail scan needed: perform brute-force scan of un-integrated entries</li>
-     *   <li>Merge both result sets, sorting by distance</li>
-     *   <li>Deduplicate by node ID and return top-k</li>
-     * </ol>
-     *
-     * <h3>Domain Correctness</h3>
-     * <ul>
-     *   <li>Results are sorted by distance (closest first)</li>
-     *   <li>No duplicate node IDs in output</li>
-     *   <li>Distance values are valid: cosine ∈ [-1,1], L2 ∈ [0,∞)</li>
-     *   <li>Exactly k results (or fewer if insufficient candidates)</li>
-     * </ul>
-     *
-     * @param queryVector The query vector
-     * @param candidate The candidate segment to search
-     * @param k The number of results to return
-     * @param requirement The pre-computed tail scan requirement
-     * @return List of merged search results (HNSW + tail scan if needed), sorted by distance
-     */
-    private List<HnswSearchResult> searchSegment(
-            float[] queryVector,
-            SegmentCandidate candidate,
-            int k,
-            TailScanRequirement requirement) {
-
-        // Step 1: Perform HNSW graph search
-        // Use LSH pre-filtered candidates if available for 10x-100x top_k reduction
-        List<HnswSearchResult> hnswResults;
-        Set<Long> lshCandidates = candidate.lshCandidates();
-
-        if (lshCandidates != null && !lshCandidates.isEmpty()) {
-            // LSH pre-filtering: search only within the candidate set
-            hnswResults = candidate.graph().search(queryVector, k, lshCandidates);
-            LOGGER.trace("Segment {}: HNSW search with {} LSH candidates returned {} results",
-                candidate.segmentId(), lshCandidates.size(), hnswResults.size());
-        } else {
-            // No LSH filtering: full graph search
-            hnswResults = candidate.graph().search(queryVector, k);
-            LOGGER.trace("Segment {}: HNSW search returned {} results",
-                candidate.segmentId(), hnswResults.size());
-        }
-
-        // Step 2: Check if tail scan is needed based on pre-computed requirement
-        if (!requirement.isTailScanNeeded()) {
-            // No tail scan needed - return HNSW results only
-            return hnswResults;
-        }
-
-        // Step 3: Perform tail scan over un-integrated write log entries
-        List<HnswSearchResult> tailResults = performTailScan(
-            queryVector,
-            candidate,
-            requirement,
-            k
-        );
-
-        LOGGER.trace("Segment {}: Tail scan returned {} results",
-            candidate.segmentId(), tailResults.size());
-
-        // Step 4: Merge HNSW and tail scan results
-        return mergeHnswAndTailResults(hnswResults, tailResults, k);
-    }
-
-    /**
-     * Performs a brute-force tail scan over un-integrated write log entries.
-     *
-     * <p>The tail scan computes exact distances on full-precision vectors
-     * from the write log that haven't been integrated into the HNSW graph yet.</p>
-     *
-     * @param queryVector The query vector
-     * @param candidate The candidate segment
-     * @param requirement The tail scan requirement with offset information
-     * @param k Maximum number of results to return from tail scan
-     * @return List of results from tail scan, sorted by distance
-     */
-    private List<HnswSearchResult> performTailScan(
-            float[] queryVector,
-            SegmentCandidate candidate,
-            TailScanRequirement requirement,
-            int k) {
-
-        Segment segment = candidate.segment();
-        if (segment == null || segment.writeLog() == null) {
-            LOGGER.trace("Segment {}: No write log available for tail scan", candidate.segmentId());
-            return Collections.emptyList();
-        }
-
-        try {
-            // Create tail scanner and perform scan
-            excalibur.query.executor.TailScanner tailScanner =
-                new excalibur.query.executor.TailScanner();
-
-            // Scan range: [lastIntegratedOffset, writeLogHead)
-            long startOffset = requirement.tailScanStartOffset();
-            long endOffset = requirement.tailScanEndOffset();
-
-            // Note: Tail scan metrics are recorded internally by TailScanner.performTailScan()
-            // after the scan completes, providing accurate entriesScanned and vectorEntriesFound counts
-
-            List<HnswSearchResult> results = tailScanner.performTailScan(
-                queryVector,
-                segment.writeLog(),
-                startOffset,
-                endOffset,
-                k,
-                distanceFunction
-            );
-
-            LOGGER.debug("Segment {}: Tail scan completed, {} results from offset range [{}, {})",
-                candidate.segmentId(), results.size(), startOffset, endOffset);
-
-            return results;
-
-        } catch (Exception e) {
-            LOGGER.warn("Segment {}: Tail scan failed: {}",
-                candidate.segmentId(), e.getMessage());
-            return Collections.emptyList();
-        }
-    }
-
-    /**
-     * Merges HNSW search results with tail scan results.
-     *
-     * <p>This method combines results from both sources, removes duplicates,
-     * and returns the top-k results sorted by distance (closest first).</p>
-     *
-     * <h3>Domain Correctness</h3>
-     * <ul>
-     *   <li>Results are sorted by distance (ascending)</li>
-     *   <li>No duplicate node IDs in output</li>
-     *   <li>Exactly k results (or fewer if insufficient candidates)</li>
-     *   <li>Distances are from exact computation (full precision)</li>
-     * </ul>
-     *
-     * @param hnswResults Results from HNSW graph search
-     * @param tailResults Results from tail scan
-     * @param k Maximum number of results to return
-     * @return Merged and deduplicated results, sorted by distance
-     */
-    private List<HnswSearchResult> mergeHnswAndTailResults(
-            List<HnswSearchResult> hnswResults,
-            List<HnswSearchResult> tailResults,
-            int k) {
-
-        // Early return for k <= 0
-        if (k <= 0) {
-            return Collections.emptyList();
-        }
-
-        // Early returns for edge cases
-        if (tailResults.isEmpty()) {
-            return limitResults(hnswResults, k);
-        }
-        if (hnswResults.isEmpty()) {
-            return limitResults(tailResults, k);
-        }
-
-        // Combine both result lists
-        List<HnswSearchResult> combined = new ArrayList<>(
-            hnswResults.size() + tailResults.size());
-        combined.addAll(hnswResults);
-        combined.addAll(tailResults);
-
-        // Sort by distance (ascending - closest first)
-        combined.sort(Comparator.comparingDouble(HnswSearchResult::distance));
-
-        // Deduplicate by node ID and take top-k
-        Set<Long> seenNodeIds = new HashSet<>();
-        List<HnswSearchResult> merged = new ArrayList<>(k);
-
-        for (HnswSearchResult result : combined) {
-            if (seenNodeIds.add(result.nodeId())) {
-                merged.add(result);
-                if (merged.size() >= k) {
-                    break;
-                }
-            }
-        }
-
-        return merged;
-    }
-
-    /**
-     * Limits results to the specified count.
-     *
-     * @param results The results to limit
-     * @param limit Maximum number of results
-     * @return Limited results (new list)
-     */
-    private List<HnswSearchResult> limitResults(List<HnswSearchResult> results, int limit) {
-        if (results.size() <= limit) {
-            return new ArrayList<>(results);
-        }
-        return new ArrayList<>(results.subList(0, limit));
+        return context.withSegmentResults(segmentResults, totalTailScanEntries, segmentsTimedOut);
     }
 
     /**
@@ -1303,9 +1275,11 @@ public class QueryPipeline {
         LOGGER.trace("Stage 4: Running full vector rerank");
 
         // Step 1: Aggregate results from Stage 3 to get candidates
-        // Use topK * 2 to get more candidates for reranking, then limit after exact distance computation
+        // Oversample so reranking and filtering have spare candidates to work with.
+        // topK is client-supplied, so widen before multiplying and saturate instead of
+        // wrapping to a negative candidate count.
         ResultAggregator aggregator = new ResultAggregator(
-            context.request.topK() * 2,
+            rerankCandidateCount(context.request.topK()),
             context.request.threshold(),
             coverageThreshold
         );
@@ -1356,24 +1330,24 @@ public class QueryPipeline {
             rerankedResults.addAll(segmentReranked);
         }
 
-        // Step 4: Final sort by normalized score descending (highest/best first) and limit to top-k
-        // Normalized scores are in [0.0, 1.0] where higher is better (more similar)
+        // Step 4: Sort by normalized score descending (highest/best first).
+        // Normalized scores are in [0.0, 1.0] where higher is better (more similar).
         rerankedResults = ResultAggregator.sortByRelevanceDescending(rerankedResults);
-        if (rerankedResults.size() > context.request.topK()) {
-            rerankedResults = new ArrayList<>(rerankedResults.subList(0, context.request.topK()));
-        }
 
         int beforeAtomicityFilter = rerankedResults.size();
 
-        // Step 5: Apply document atomicity filter to exclude partial documents
-        if (visibilityChecker != null) {
-            DocumentAtomicityFilter atomicityFilter = new DocumentAtomicityFilter(visibilityChecker);
-            rerankedResults = atomicityFilter.filterPartialDocuments(rerankedResults, context.epoch);
+        // Step 5: Apply the document atomicity filter to the FULL candidate list, before
+        // truncating. Filtering after truncation would return fewer than topK results
+        // whenever a partial document happened to rank inside the first topK, even though
+        // enough valid candidates were available.
+        rerankedResults = applyAtomicityFilter(rerankedResults, context.epoch);
 
-            if (rerankedResults.size() < beforeAtomicityFilter) {
-                LOGGER.debug("Stage 4: Document atomicity filter removed {} partial document results",
-                    beforeAtomicityFilter - rerankedResults.size());
-            }
+        // Step 6: Truncate to topK once the result set is final. When Stage 5 is going to
+        // run, leave the oversampled list intact: its threshold filter would otherwise be
+        // applied to an already-truncated list and return fewer than topK results even
+        // though enough candidates passed the threshold.
+        if (!llmScoringWillRun(context.request)) {
+            rerankedResults = truncate(rerankedResults, context.request.topK());
         }
 
         LOGGER.debug("Stage 4: Reranked {} candidates to {} results (atomicity filtered from {})",
@@ -1383,11 +1357,103 @@ public class QueryPipeline {
     }
 
     /**
+     * Returns the number of candidates Stage 4 collects for reranking.
+     *
+     * @param topK The requested result count (client-controlled)
+     * @return {@code topK * RERANK_CANDIDATE_MULTIPLIER}, saturated at {@link Integer#MAX_VALUE}
+     */
+    private static int rerankCandidateCount(int topK) {
+        long widened = (long) topK * RERANK_CANDIDATE_MULTIPLIER;
+        return widened > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) widened;
+    }
+
+    /**
+     * Applies the document atomicity filter, if it can say anything useful.
+     *
+     * <p>The filter excludes results belonging to documents that are not yet fully
+     * visible. It can only do that for documents the visibility checker knows about; when
+     * the checker holds no registrations at all - which is the case whenever ingestion
+     * runs its per-chunk path rather than atomic document batching - it has nothing to
+     * compare against, and running it would express "unknown" as "not visible" for every
+     * result in the response.</p>
+     *
+     * <h3>Which epoch bounds it</h3>
+     * <p>The query's own captured epoch, when the checker publishes on the same clock the
+     * query captured from - which {@link DocumentVisibilityChecker#sharesNodeEpochClock()}
+     * reports. That is a real snapshot bound: a document committed after this query started is
+     * excluded from it, so a long-running query does not pick up writes partway through.</p>
+     *
+     * <p>Otherwise {@link #DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED}, and the filter degrades to a
+     * completeness check. Bounding by a foreign counter is worse than not bounding: the two
+     * numbers are unrelated, so the comparison excludes or admits documents arbitrarily, and it
+     * does so while looking exactly like a snapshot.</p>
+     *
+     * @param results The reranked results
+     * @param queryEpoch The epoch this query captured in stage 0
+     * @return The results that survive the filter, or the input unchanged when the filter
+     *         is not configured or holds no document registrations
+     */
+    /**
+     * The epoch to bound the atomicity filter by.
+     *
+     * <p>The query's own captured epoch when the checker publishes on the clock that epoch came
+     * from, and {@link #DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED} otherwise. A rule rather than an
+     * inline condition because getting it wrong is silent in both directions: bounding by a
+     * foreign counter excludes documents arbitrarily, and never bounding gives up snapshot
+     * isolation without saying so.
+     *
+     * @param checker    The visibility checker the filter will consult
+     * @param queryEpoch The epoch captured in stage 0
+     * @return The bound to filter with
+     */
+    static long atomicityBoundFor(DocumentVisibilityChecker checker, long queryEpoch) {
+        if (checker == null || !checker.sharesNodeEpochClock()) {
+            return DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
+        }
+        // A negative epoch is not a snapshot anyone captured; the filter rejects it outright,
+        // so falling back keeps a malformed context from failing the whole query.
+        return queryEpoch >= 0 ? queryEpoch : DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
+    }
+
+    private List<QueryResultItem> applyAtomicityFilter(List<QueryResultItem> results,
+                                                       long queryEpoch) {
+        if (visibilityChecker == null) {
+            return results;
+        }
+
+        int registeredDocuments = visibilityChecker.getDocumentCount();
+        if (registeredDocuments == 0) {
+            LOGGER.trace("Stage 4: Skipping document atomicity filter - no documents registered");
+            return results;
+        }
+
+        long bound = atomicityBoundFor(visibilityChecker, queryEpoch);
+        boolean bounded = bound != DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
+
+        DocumentAtomicityFilter atomicityFilter = new DocumentAtomicityFilter(visibilityChecker);
+        List<QueryResultItem> filtered = atomicityFilter.filterPartialDocuments(results, bound);
+
+        if (filtered.size() < results.size()) {
+            LOGGER.debug("Stage 4: Document atomicity filter removed {} partial document results "
+                + "({} documents registered, bound={})", results.size() - filtered.size(),
+                registeredDocuments, bounded ? String.valueOf(bound) : "unbounded");
+        }
+
+        return filtered;
+    }
+
+    /**
      * Stage 5: LLM Relevancy Scoring.
      *
      * <p>Sends top-k candidates + original query text to LLM for relevancy
      * scoring. Discards results below threshold. Falls back to vector-only
      * ranking if LLM is unavailable.</p>
+     *
+     * <h3>Candidate Text</h3>
+     * <p>Stage 4 hands over results that identify nodes, not document bodies. This stage
+     * resolves each surviving result's stored chunk text through
+     * {@link ResultPayloadResolver} before scoring; a write-log tail hit already carries
+     * its text from the scan and is left alone.</p>
      *
      * <h3>Sorting After LLM Scoring</h3>
      * <p>After LLM scoring, results are sorted by relevance score in descending
@@ -1397,24 +1463,26 @@ public class QueryPipeline {
     private PipelineContext stage5_LlmScoring(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 5 cancelled before LLM scoring");
 
-        // Skip if LLM scoring disabled or no scorer
-        if (!context.request.enableLlmScoring() || llmScorer == null) {
-            LOGGER.trace("Stage 5: Skipping LLM scoring (disabled or no scorer)");
-            return context.withLlmScored(false);
-        }
-
-        // Skip if no query text
-        if (context.request.queryText() == null || context.request.queryText().isEmpty()) {
-            LOGGER.trace("Stage 5: Skipping LLM scoring (no query text)");
+        if (!llmScoringWillRun(context.request)) {
+            LOGGER.trace("Stage 5: Skipping LLM scoring (disabled, no scorer, or no query text)");
+            // Stage 4 already truncated to topK in this case
             return context.withLlmScored(false);
         }
 
         LOGGER.trace("Stage 5: Running LLM relevancy scoring");
 
+        int topK = context.request.topK();
+
+        // Relevancy scoring compares the query against candidate TEXT, and a search result
+        // identifies a node rather than a document body. Resolve the stored chunk text now
+        // - after selection has narrowed the candidate set, because each resolution is a
+        // storage read - so the scorer has something real to rank.
+        List<QueryResultItem> candidates = payloadResolver.attachPayloads(context.mergedResults);
+
         try {
             List<QueryResultItem> scoredResults = llmScorer.scoreResults(
                 context.request.queryText(),
-                context.mergedResults,
+                candidates,
                 context.request.llmThreshold()
             );
 
@@ -1423,26 +1491,72 @@ public class QueryPipeline {
             scoredResults = ResultAggregator.sortByRelevanceDescending(scoredResults);
 
             LOGGER.debug("Stage 5: LLM scored {} results, {} after threshold filtering",
-                context.mergedResults.size(), scoredResults.size());
+                candidates.size(), scoredResults.size());
 
-            return context.withMergedResults(scoredResults).withLlmScored(true);
+            // Truncate only now, so the threshold filter chose from the full candidate set
+            return context.withMergedResults(truncate(scoredResults, topK)).withLlmScored(true);
 
         } catch (Exception e) {
             LOGGER.warn("LLM scoring failed, using vector-only ranking: {}", e.getMessage());
-            return context.withLlmScored(false).withLlmFallback(true);
+            // Stage 4 deliberately left the list oversampled for this stage; fall back to
+            // the vector ranking, truncated to the requested size.
+            return context
+                .withMergedResults(truncate(candidates, topK))
+                .withLlmScored(false)
+                .withLlmFallback(true);
         }
+    }
+
+    /**
+     * Returns whether Stage 5 will actually score this request.
+     *
+     * <p>Stage 4 consults this to decide whether it may truncate to topK or must leave
+     * spare candidates for Stage 5's threshold filter, so the two must agree exactly.</p>
+     *
+     * @param request The query request
+     * @return true if LLM relevancy scoring will run
+     */
+    private boolean llmScoringWillRun(QueryRequest request) {
+        return request.enableLlmScoring()
+            && llmScorer != null
+            && request.queryText() != null
+            && !request.queryText().isEmpty();
+    }
+
+    /**
+     * Returns at most {@code limit} results, without copying when none are dropped.
+     */
+    private static List<QueryResultItem> truncate(List<QueryResultItem> results, int limit) {
+        if (results.size() <= limit) {
+            return results;
+        }
+        return new ArrayList<>(results.subList(0, limit));
     }
 
     // ==================== Error Handling ====================
 
     /**
      * Handles pipeline errors and creates appropriate response.
+     *
+     * <p>When the pipeline is interrupted by a timeout or cancellation, any results
+     * that were already computed by earlier stages are returned as best-effort partial
+     * results. Hard failures - and interruptions that happened before any stage completed -
+     * produce an empty result set: a stage that threw did not produce an answer, and
+     * whatever earlier stages left behind is not one either.</p>
+     *
+     * @param error         The error that terminated the pipeline
+     * @param request       The original query request
+     * @param durationMs    Elapsed time before the error was observed
+     * @param token         Cancellation token (cancelled here to propagate to running stages)
+     * @param partialContext The most recently completed stage's context, or {@code null}
+     *                      if no stage completed before the error
      */
     private QueryResponse handlePipelineError(
             Throwable error,
             QueryRequest request,
             long durationMs,
-            CancellationToken token) {
+            CancellationToken token,
+            PipelineContext partialContext) {
 
         boolean timedOut = error instanceof TimeoutException ||
             (error.getCause() instanceof TimeoutException);
@@ -1459,14 +1573,27 @@ public class QueryPipeline {
             LOGGER.error("Query failed: {}", error.getMessage(), error);
         }
 
+        // Return partial results only for an interruption, which is what the contract
+        // promises. A hard failure means a stage did not do its job, so whatever earlier
+        // stages happened to accumulate is not an answer to the query - returning it would
+        // present an arbitrary prefix of the pipeline as a successful (if degraded) result.
+        boolean interrupted = timedOut || cancelled;
+        List<QueryResultItem> partialResults = (interrupted && partialContext != null)
+            ? partialContext.mergedResults
+            : Collections.emptyList();
+        long partialTailScanEntries = (interrupted && partialContext != null)
+            ? partialContext.totalTailScanEntries
+            : 0L;
+
         // Build degraded response
         IndexCoverage coverage = IndexCoverage.builder()
             .degraded(true)
+            .tailScanEntries(partialTailScanEntries)
             .computeCoverage()
             .build();
 
         return new QueryResponse(
-            Collections.emptyList(),
+            partialResults,
             coverage,
             durationMs,
             false,
@@ -1532,7 +1659,7 @@ public class QueryPipeline {
             .tailScanEntries(context.totalTailScanEntries)
             .segmentsSearched(segmentsSearched)
             .segmentsWithErrors(segmentsWithErrors)
-            .segmentsTimedOut(0)
+            .segmentsTimedOut(context.segmentsTimedOut)
             .computeCoverage()
             .computeDegraded(coverageThreshold)
             .degraded(context.llmFallback || baseDegradedFromCompute)
@@ -1604,11 +1731,21 @@ public class QueryPipeline {
      * <p>This method enforces the domain correctness constraint that empty results
      * should only be returned when no documents match the query vector.</p>
      *
+     * <p>The diagnostics scan graphs, so they are rate limited to at most one run per
+     * {@link #EMPTY_RESULT_DIAGNOSTIC_INTERVAL_NANOS}. Without that bound a workload
+     * whose queries legitimately match nothing would attach a full graph walk to every
+     * response, on the response thread and outside the query's own timeout.</p>
+     *
      * @param context The pipeline context
      * @param coverage The computed index coverage
      * @param response The query response (for validation)
      */
     private void validateAndLogEmptyResults(PipelineContext context, IndexCoverage coverage, QueryResponse response) {
+        if (!acquireEmptyResultDiagnosticSlot()) {
+            LOGGER.debug("Query returned empty results; diagnostics rate limited");
+            return;
+        }
+
         // Use EmptyResultValidator to diagnose the cause of empty results
         // Adapt the HnswGraphProvider interface using a lambda
         excalibur.query.visibility.EmptyResultValidator.ValidationResult validationResult =
@@ -1623,37 +1760,87 @@ public class QueryPipeline {
 
         if (validationResult.isLegitimate()) {
             LOGGER.debug("Query returned empty results (legitimate): {}", validationResult.oneLineSummary());
-        } else {
-            // Log at WARN level for unexpected empty results to help diagnose issues
-            LOGGER.warn("Query returned empty results unexpectedly - potential bug detected%n{}",
-                validationResult.diagnosticSummary());
+            return;
+        }
 
-            // Also run HNSW graph diagnostic for segments with vectors but empty results
-            for (SegmentQueryTask.SegmentQueryResult segmentResult : context.segmentResults) {
-                if (segmentResult.success() && segmentResult.results().isEmpty()) {
-                    HnswGraph graph = graphProvider.getGraph(segmentResult.segmentId());
-                    if (graph != null && graph.activeNodeCount() > 0) {
-                        // Segment has vectors but search returned empty - diagnose the graph
-                        LOGGER.warn("Segment {} has {} active nodes but search returned empty - running HNSW diagnostic",
-                            segmentResult.segmentId(), graph.activeNodeCount());
+        // Log at WARN level for unexpected empty results to help diagnose issues
+        LOGGER.warn("Query returned empty results unexpectedly - potential bug detected%n{}",
+            validationResult.diagnosticSummary());
 
-                        try {
-                            excalibur.query.visibility.HnswGraphDiagnostic.GraphDiagnosticResult graphDiagnostic =
-                                excalibur.query.visibility.HnswGraphDiagnostic.runFullDiagnostic(
-                                    graph, null, 0);
+        scheduleGraphDiagnostics(context);
+    }
 
-                            LOGGER.warn("HNSW diagnostic for segment {}: {}", segmentResult.segmentId(),
-                                graphDiagnostic.summary());
+    /**
+     * Reserves the next diagnostic slot, returning false when one ran too recently.
+     */
+    private boolean acquireEmptyResultDiagnosticSlot() {
+        long now = System.nanoTime();
+        long next = nextEmptyResultDiagnosticNanos.get();
+        if (next != Long.MIN_VALUE && now - next < 0) {
+            return false;
+        }
+        return nextEmptyResultDiagnosticNanos.compareAndSet(
+            next, now + EMPTY_RESULT_DIAGNOSTIC_INTERVAL_NANOS);
+    }
 
-                            for (excalibur.query.visibility.HnswGraphDiagnostic.GraphDiagnosticIssue issue : graphDiagnostic.issues()) {
-                                LOGGER.warn("  Issue: {}", issue);
-                            }
-                        } catch (Exception e) {
-                            LOGGER.warn("Failed to run HNSW diagnostic for segment {}: {}",
-                                segmentResult.segmentId(), e.getMessage());
-                        }
-                    }
+    /**
+     * Runs the HNSW graph diagnostic off the query path.
+     *
+     * <p>{@code runFullDiagnostic} walks the whole graph and verifies its invariants,
+     * which is unbounded relative to graph size. It must never run on the thread that is
+     * completing a query response, so it is handed to the pipeline executor and its result
+     * is logged whenever it finishes.</p>
+     *
+     * @param context The pipeline context whose segment results triggered the diagnostic
+     */
+    private void scheduleGraphDiagnostics(PipelineContext context) {
+        List<Long> segmentsToDiagnose = new ArrayList<>();
+        for (SegmentQueryTask.SegmentQueryResult segmentResult : context.segmentResults) {
+            if (segmentResult.success() && segmentResult.results().isEmpty()) {
+                segmentsToDiagnose.add(segmentResult.segmentId());
+            }
+        }
+
+        if (segmentsToDiagnose.isEmpty()) {
+            return;
+        }
+
+        try {
+            getPipelineExecutor().execute(() -> runGraphDiagnostics(segmentsToDiagnose));
+        } catch (RuntimeException e) {
+            // Executor shut down mid-flight; diagnostics are best-effort
+            LOGGER.debug("Could not schedule HNSW diagnostics: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Runs the HNSW graph diagnostic for each segment that returned nothing despite
+     * holding active nodes, logging what it finds.
+     *
+     * @param segmentIds The segments to diagnose
+     */
+    private void runGraphDiagnostics(List<Long> segmentIds) {
+        for (long segmentId : segmentIds) {
+            HnswGraph graph = graphProvider.getGraph(segmentId);
+            if (graph == null || graph.activeNodeCount() <= 0) {
+                continue;
+            }
+
+            LOGGER.warn("Segment {} has {} active nodes but search returned empty - running HNSW diagnostic",
+                segmentId, graph.activeNodeCount());
+
+            try {
+                excalibur.query.visibility.HnswGraphDiagnostic.GraphDiagnosticResult graphDiagnostic =
+                    excalibur.query.visibility.HnswGraphDiagnostic.runFullDiagnostic(graph, 0);
+
+                LOGGER.warn("HNSW diagnostic for segment {}: {}", segmentId, graphDiagnostic.summary());
+
+                for (excalibur.query.visibility.HnswGraphDiagnostic.GraphDiagnosticIssue issue
+                        : graphDiagnostic.issues()) {
+                    LOGGER.warn("  Issue: {}", issue);
                 }
+            } catch (Exception e) {
+                LOGGER.warn("Failed to run HNSW diagnostic for segment {}: {}", segmentId, e.getMessage());
             }
         }
     }
@@ -1703,6 +1890,7 @@ public class QueryPipeline {
         final List<SegmentQueryTask.SegmentQueryResult> segmentResults;
         final List<QueryResultItem> mergedResults;
         final long totalTailScanEntries;
+        final int segmentsTimedOut;
         final boolean llmScored;
         final boolean llmFallback;
 
@@ -1714,6 +1902,7 @@ public class QueryPipeline {
                 List<SegmentQueryTask.SegmentQueryResult> segmentResults,
                 List<QueryResultItem> mergedResults,
                 long totalTailScanEntries,
+                int segmentsTimedOut,
                 boolean llmScored,
                 boolean llmFallback) {
             this.request = request;
@@ -1723,38 +1912,40 @@ public class QueryPipeline {
             this.segmentResults = segmentResults;
             this.mergedResults = mergedResults;
             this.totalTailScanEntries = totalTailScanEntries;
+            this.segmentsTimedOut = segmentsTimedOut;
             this.llmScored = llmScored;
             this.llmFallback = llmFallback;
         }
 
         PipelineContext(QueryRequest request, CancellationToken token, long epoch, List<SegmentCandidate> candidates) {
             this(request, token, epoch, candidates, Collections.emptyList(),
-                Collections.emptyList(), 0, false, false);
+                Collections.emptyList(), 0, 0, false, false);
         }
 
         PipelineContext withCandidates(List<SegmentCandidate> candidates) {
             return new PipelineContext(request, token, epoch, candidates,
-                segmentResults, mergedResults, totalTailScanEntries, llmScored, llmFallback);
+                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut, llmScored, llmFallback);
         }
 
-        PipelineContext withSegmentResults(List<SegmentQueryTask.SegmentQueryResult> results, long tailScanEntries) {
+        PipelineContext withSegmentResults(
+                List<SegmentQueryTask.SegmentQueryResult> results, long tailScanEntries, int timedOut) {
             return new PipelineContext(request, token, epoch, candidates,
-                results, mergedResults, tailScanEntries, llmScored, llmFallback);
+                results, mergedResults, tailScanEntries, timedOut, llmScored, llmFallback);
         }
 
         PipelineContext withMergedResults(List<QueryResultItem> results) {
             return new PipelineContext(request, token, epoch, candidates,
-                segmentResults, results, totalTailScanEntries, llmScored, llmFallback);
+                segmentResults, results, totalTailScanEntries, segmentsTimedOut, llmScored, llmFallback);
         }
 
         PipelineContext withLlmScored(boolean scored) {
             return new PipelineContext(request, token, epoch, candidates,
-                segmentResults, mergedResults, totalTailScanEntries, scored, llmFallback);
+                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut, scored, llmFallback);
         }
 
         PipelineContext withLlmFallback(boolean fallback) {
             return new PipelineContext(request, token, epoch, candidates,
-                segmentResults, mergedResults, totalTailScanEntries, llmScored, fallback);
+                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut, llmScored, fallback);
         }
     }
 }

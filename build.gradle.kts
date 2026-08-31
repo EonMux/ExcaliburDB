@@ -24,6 +24,21 @@ subprojects {
     apply(plugin = "java-library")
     apply(plugin = "jacoco")
 
+    // Declared once here rather than per module. Ten modules had drifted to "com.excaliburdb",
+    // which matches no package in the source, so the same build published two different
+    // coordinate namespaces depending on which module you asked for.
+    group = rootProject.group
+    version = rootProject.version
+
+    // Paired with the --enable-preview below. Without a pinned toolchain, --enable-preview is
+    // compiled against whatever JDK happens to be on the machine, and preview APIs are not
+    // stable across releases -- java.lang.foreign in particular changed between 21 and 22.
+    extensions.configure<JavaPluginExtension> {
+        toolchain {
+            languageVersion.set(JavaLanguageVersion.of(21))
+        }
+    }
+
     repositories {
         mavenCentral()
     }
@@ -43,6 +58,12 @@ subprojects {
         testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
         testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.3")
         testImplementation("org.assertj:assertj-core:3.26.3")
+
+        // Declared once. Six modules pinned Mockito individually and two of them had drifted to a
+        // different version, so the same mock could behave differently depending on which module's
+        // tests you were reading.
+        testImplementation("org.mockito:mockito-core:5.15.2")
+        testImplementation("org.mockito:mockito-junit-jupiter:5.15.2")
     }
 
     // Configure Java compilation for performance
@@ -112,6 +133,13 @@ subprojects {
     tasks.jacocoTestReport {
         dependsOn(tasks.test)
 
+        // Same exclusion as the aggregate: JMH's generated harness classes are machine-written
+        // and never unit-tested by design, so counting them measures code generation.
+        classDirectories.setFrom(
+            fileTree(layout.buildDirectory.dir("classes/java/main")) {
+                exclude("**/jmh_generated/**", "**/generated/**")
+            })
+
         reports {
             xml.required.set(true)
             html.required.set(true)
@@ -119,15 +147,47 @@ subprojects {
         }
     }
 
-    // JaCoCo coverage verification (80% minimum per project constraint)
+    // Coverage floors, enforced as part of `check`.
+    //
+    // The project target is 80%, and nine modules meet it. The eight below are held at their
+    // measured level instead, so this is a ratchet rather than a lowered bar: coverage cannot
+    // slide backwards, and each floor is a visible debt to be raised towards 0.80 rather than a
+    // number chosen to make the build pass. Previously this rule declared 80% and was wired into
+    // nothing, so it never ran and the figure was aspirational.
+    //
+    // Measured with generated code excluded; JMH's harness classes are machine-written and
+    // counting them measures code generation rather than testing.
+    val coverageFloors = mapOf(
+        "excalibur-vector" to "0.79",
+        "excalibur-metrics" to "0.74",
+        "excalibur-api" to "0.66",
+        "excalibur-test" to "0.64",
+        "excalibur-ingest" to "0.62",
+        "excalibur-shard" to "0.60",
+        "excalibur-query" to "0.59",
+        "excalibur-bench" to "0.33"
+    )
+
     tasks.jacocoTestCoverageVerification {
+        dependsOn(tasks.test)
+
+        classDirectories.setFrom(
+            fileTree(layout.buildDirectory.dir("classes/java/main")) {
+                exclude("**/jmh_generated/**", "**/generated/**")
+            })
+
         violationRules {
             rule {
                 limit {
-                    minimum = "0.80".toBigDecimal()
+                    minimum = (coverageFloors[project.name] ?: "0.80").toBigDecimal()
                 }
             }
         }
+    }
+
+    // Wired into the standard lifecycle, so `./gradlew build` actually enforces it.
+    tasks.named("check") {
+        dependsOn(tasks.jacocoTestCoverageVerification)
     }
 }
 
@@ -136,46 +196,41 @@ tasks.register<JacocoReport>("jacocoAggregateReport") {
     group = "verification"
     description = "Generates aggregate code coverage report for all subprojects"
 
-    val targetProjects = listOf(
-        "excalibur-core",
-        "excalibur-store",
-        "excalibur-filter",
-        "excalibur-vector"
-    )
+    // Every module, derived from the build rather than listed. The previous hard-coded list of
+    // four went stale the moment a module was added, and a coverage report that silently omits
+    // most of the codebase is worse than none: it reports a number people trust.
+    val covered = subprojects
 
-    // Collect execution data from all target projects
-    val executionFiles = files().apply {
-        targetProjects.forEach { projectName ->
-            val execFile = file("${projectName}/build/jacoco/test.exec")
-            if (execFile.exists()) {
-                from(execFile)
-            }
-        }
-    }
-    executionData(executionFiles)
+    dependsOn(covered.map { it.tasks.named("test") })
 
-    // Collect source directories from all target projects
-    targetProjects.forEach { projectName ->
-        val sourceDir = file("${projectName}/src/main/java")
-        if (sourceDir.exists()) {
-            sourceDirectories.from(sourceDir)
+    // Resolved lazily. The previous version called File.exists() while configuring, before any
+    // test had run, so on a clean build every path was skipped and the report came out empty --
+    // and empty renders as a valid report, not as an error.
+    executionData.from(covered.map { project ->
+        project.layout.buildDirectory.file("jacoco/test.exec")
+    })
+    sourceDirectories.from(covered.map { project ->
+        project.layout.projectDirectory.dir("src/main/java")
+    })
+    // JMH writes a generated harness class per benchmark method. It is machine-written, it is
+    // never unit-tested by design, and in this repo it is 58% of all bytecode -- including it
+    // drags the aggregate from the high seventies to 35% and makes the number describe code
+    // generation rather than the project.
+    classDirectories.from(covered.map { project ->
+        project.fileTree(project.layout.buildDirectory.dir("classes/java/main")) {
+            exclude("**/jmh_generated/**", "**/generated/**")
         }
-        val classDir = file("${projectName}/build/classes/java/main")
-        if (classDir.exists()) {
-            classDirectories.from(classDir)
-        }
-    }
+    })
 
     reports {
         xml.required.set(true)
         html.required.set(true)
         csv.required.set(false)
-        html.outputLocation.set(file("${rootProject.buildDir}/reports/jacoco/aggregate/html"))
-        xml.outputLocation.set(file("${rootProject.buildDir}/reports/jacoco/aggregate/coverage.xml"))
+        html.outputLocation.set(
+            rootProject.layout.buildDirectory.dir("reports/jacoco/aggregate/html"))
+        xml.outputLocation.set(
+            rootProject.layout.buildDirectory.file("reports/jacoco/aggregate/coverage.xml"))
     }
-
-    // Ensure tests run before generating aggregate report
-    dependsOn(targetProjects.map { ":${it}:test" })
 }
 
 // Task to generate the custom HTML summary report
@@ -192,7 +247,7 @@ tasks.register<JavaExec>("generateCoverageSummary") {
 
     args(
         rootProject.projectDir.absolutePath,
-        "${rootProject.buildDir}/reports/jacoco/COVERAGE_SUMMARY.html"
+        rootProject.layout.buildDirectory.file("reports/jacoco/COVERAGE_SUMMARY.html").get().asFile.absolutePath
     )
 
     // Run after core module is compiled
@@ -226,9 +281,9 @@ tasks.register("coverage") {
         println("  Coverage Report Generation Complete!")
         println("=".repeat(60))
         println("\nReport locations:")
-        println("  Summary:    ${rootProject.buildDir}/reports/jacoco/COVERAGE_SUMMARY.html")
-        println("  Aggregate:  ${rootProject.buildDir}/reports/jacoco/aggregate/html/index.html")
-        println("  XML:        ${rootProject.buildDir}/reports/jacoco/aggregate/coverage.xml")
+        println("  Summary:    ${rootProject.layout.buildDirectory.get()}/reports/jacoco/COVERAGE_SUMMARY.html")
+        println("  Aggregate:  ${rootProject.layout.buildDirectory.get()}/reports/jacoco/aggregate/html/index.html")
+        println("  XML:        ${rootProject.layout.buildDirectory.get()}/reports/jacoco/aggregate/coverage.xml")
         println("")
 
         targetProjects.forEach { projectName ->

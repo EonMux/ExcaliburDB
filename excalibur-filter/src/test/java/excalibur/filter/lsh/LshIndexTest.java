@@ -3,10 +3,12 @@ package excalibur.filter.lsh;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.nio.file.Path;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -430,6 +432,42 @@ class LshIndexTest {
     }
 
     // Helper methods
+
+    @Test
+    @DisplayName("Should survive a restart when opened over a directory")
+    void testPersistentIndexSurvivesRestart(@TempDir Path directory) throws IOException {
+        float[][] vectors = new float[20][];
+        for (int i = 0; i < vectors.length; i++) {
+            vectors[i] = createRandomVector(DIMENSIONS, i);
+        }
+
+        try (LshIndex persistent = LshIndex.open(config, directory)) {
+            for (int i = 0; i < vectors.length; i++) {
+                persistent.insert(vectors[i], i);
+            }
+            persistent.flush();
+        }
+
+        try (LshIndex reopened = LshIndex.open(config, directory)) {
+            assertThat(reopened.numTables()).isEqualTo(config.numHashTables());
+            for (int i = 0; i < vectors.length; i++) {
+                assertThat(reopened.query(vectors[i]))
+                    .as("entry %d must survive a restart", i)
+                    .contains((long) i);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Should be idempotent on close")
+    void testCloseIsIdempotent() {
+        LshIndex closeable = new LshIndex(config);
+
+        closeable.close();
+        closeable.close();
+
+        assertThat(closeable.isClosed()).isTrue();
+    }
 
     private float[] createRandomVector(int dimensions, int seed) {
         float[] vector = new float[dimensions];

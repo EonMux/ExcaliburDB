@@ -94,6 +94,13 @@ public final class ThroughputValidator {
     private static final double EPSILON = 1e-9;
 
     /**
+     * Gap below target, as a percentage, that is annotated as a near miss.
+     *
+     * <p>This affects the wording of the report only. A near miss still fails.</p>
+     */
+    private static final double NEAR_MISS_GAP_PERCENT = 10.0;
+
+    /**
      * Validates a throughput value for domain correctness (must be positive and finite).
      *
      * @param opsPerSec the throughput value in operations per second
@@ -250,23 +257,23 @@ public final class ThroughputValidator {
         StringBuilder warnings = new StringBuilder(baseResult.warnings());
         StringBuilder errors = new StringBuilder();
 
-        // Check target compliance
+        // Check target compliance. A shortfall is a shortfall: a value below the target
+        // is never promoted to a pass, however small the gap. Tolerance, if wanted, must
+        // be encoded in the target itself so the effective threshold stays visible.
         boolean meetsTarget = opsPerSec >= target - EPSILON;
 
         if (!meetsTarget) {
             double gap = target - opsPerSec;
             double gapPercent = (gap / target) * 100;
 
-            if (gapPercent <= 10.0) {
-                // Within 10% of target - warning only
+            errors.append(String.format(
+                "%s (%.2e ops/sec) is below target (%.2e ops/sec, %.1f%% gap); ",
+                "throughput", opsPerSec, target, gapPercent));
+
+            if (gapPercent <= NEAR_MISS_GAP_PERCENT) {
                 warnings.append(String.format(
-                    "%s (%.2e ops/sec) is close to but below target (%.2e ops/sec, %.1f%% gap); ",
-                    "throughput", opsPerSec, target, gapPercent));
-                meetsTarget = true; // Accept as meeting target within tolerance
-            } else {
-                errors.append(String.format(
-                    "%s (%.2e ops/sec) is below target (%.2e ops/sec, %.1f%% gap); ",
-                    "throughput", opsPerSec, target, gapPercent));
+                    "%s is within %.0f%% of target - a small regression, not a pass; ",
+                    "throughput", NEAR_MISS_GAP_PERCENT));
             }
         }
 

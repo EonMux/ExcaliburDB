@@ -1,15 +1,17 @@
 package excalibur.api;
 
+import excalibur.api.bootstrap.CoreComponents;
+import excalibur.api.bootstrap.GraphRagFactory;
+import excalibur.api.bootstrap.ReindexerFactory;
+import excalibur.api.bootstrap.ShutdownSequence;
+import excalibur.api.security.ApiSecurityConfig;
 import excalibur.api.server.ExcaliburDBServer;
 import excalibur.filter.HierarchicalCuckooFilter;
 import excalibur.ingest.lsh.LshIngestionService;
-import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
-import excalibur.ingest.pipeline.OffsetAwareStorageWriter;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.registry.DocumentRegistry;
-import excalibur.ingest.registry.UpsertHandler;
 import excalibur.ingest.visibility.DocumentVisibilityChecker;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
@@ -22,17 +24,13 @@ import excalibur.shard.allocator.VolumeManager;
 import io.excalibur.config.Config;
 import io.excalibur.config.ConfigLoader;
 import io.excalibur.config.ConfigValidation;
-import io.excalibur.core.memory.MemorySegmentFactory;
 import io.excalibur.metrics.Metrics;
 import io.excalibur.metrics.MetricsRegistry;
 import io.excalibur.store.Segment;
-import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfigFactory;
-import io.excalibur.vector.hnsw.HnswGraph;
-import io.excalibur.vector.hnsw.TailOffsetTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,8 +39,6 @@ import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Main entry point for ExcaliburDB server.
@@ -104,11 +100,29 @@ public final class ExcaliburApplication {
     private final Arena arena;
     private final StorageEngine storageEngine;
     private final IndexOrchestrator indexOrchestrator;
+    /**
+     * The graph-RAG stack, or null where no graph store is on disk.
+     *
+     * <p>Optional: a deployment doing only vector search has no graph, and the
+     * {@code /v1/graph/query} route is simply not registered. Held here rather than
+     * only inside the server because its mappings and Lucene readers have to be
+     * released on shutdown.
+     */
+    private final GraphRagFactory.GraphRag graphRag;
+
+    /** Every namespace's graph: what it has staged, what it serves, and what it owes. */
+    private final excalibur.api.bootstrap.GraphTenants graphTenants;
     private final VolumeManager volumeManager;
     private final QueryPipeline queryPipeline;
     private final ExcaliburDBServer server;
     private final int port;
     private final HnswConfigFactory hnswConfigFactory;
+
+    /**
+     * Security policy for the HTTP surface, resolved once from the properties file and
+     * the environment and validated before anything binds.
+     */
+    private final ApiSecurityConfig apiSecurity;
 
     /**
      * Hierarchical Cuckoo filter for corpus → cluster → segment membership testing.
@@ -204,58 +218,61 @@ public final class ExcaliburApplication {
         LOGGER.info("HNSW config factory initialized: efConstruction={}, efSearch={}",
             hnswConfigFactory.getEfConstruction(), hnswConfigFactory.getEfSearch());
 
-        // Initialize document visibility tracker for atomic document visibility
-        // This ensures queries never see partially-ingested documents
-        this.documentVisibilityTracker = new DocumentVisibilityTracker(new DocumentRegistry());
-        this.documentVisibilityChecker = new DocumentVisibilityTrackerAdapter(documentVisibilityTracker);
-        LOGGER.info("Document visibility tracker initialized for document atomicity");
-
         // Determine server port from config or use default
         this.port = determinePort();
 
-        // Check Panama FFM availability and create Arena only if available
-        boolean panamaAvailable = MemorySegmentFactory.isPanamaAvailable();
-        this.arena = panamaAvailable ? Arena.ofShared() : null;
-
-        LOGGER.info("Using {} memory implementation",
-            panamaAvailable ? "Panama FFM" : "ByteBuffer fallback");
+        // Resolve and validate the API security policy before any component starts.
+        // A non-loopback bind without a token fails here rather than after the socket
+        // is already accepting requests.
+        // Read straight off Config, which already merged the file with the EXCALIBUR_* environment.
+        // Re-reading the file here would be a second parser that can disagree with that one about
+        // precedence -- and the setting it most affects is the auth token.
+        this.apiSecurity = ApiSecurityConfig.fromProperties(config.getEffectiveProperties());
+        this.apiSecurity.requireSafeToServe();
+        LOGGER.info("API security policy: {}", apiSecurity);
 
         // Initialize data directory
         Path dataDir = initializeDataDirectory();
 
-        // Initialize storage engine (uses fallback constructor if Arena is null)
-        this.storageEngine = createStorageEngine(dataDir);
+        // Build the storage stack: arena, storage engine with its HNSW initializer
+        // installed before start(), volume manager, index orchestrator and the
+        // hierarchical Cuckoo filter.
+        CoreComponents core = CoreComponents.create(config, dataDir, hnswConfigFactory);
+        this.arena = core.arena();
+        this.storageEngine = core.storageEngine();
+        this.volumeManager = core.volumeManager();
+        this.indexOrchestrator = core.indexOrchestrator();
+        this.hierarchicalFilter = core.hierarchicalFilter();
 
-        // Initialize volume manager
-        this.volumeManager = createVolumeManager();
-
-        // Initialize index orchestrator
-        this.indexOrchestrator = createIndexOrchestrator();
-
-        // Initialize hierarchical Cuckoo filter and wire it to the maintenance worker
-        this.hierarchicalFilter = createHierarchicalCuckooFilter();
-        indexOrchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
-
-        // Wire compaction callback from lifecycle manager to compaction worker
-        wireCompactionCallback();
-
-        // Configure HNSW initializer for creating HNSW graphs on new segments
-        configureHnswInitializer();
-
-        // Register existing segments with IndexOrchestrator for HNSW integration
-        registerExistingSegmentsWithOrchestrator();
-
-        // Start the segment lifecycle manager for background compaction
-        storageEngine.startLifecycleManager();
+        // Document visibility, on the node's own epoch clock. Built here rather than earlier
+        // because it needs the index orchestrator's visibility tracker: publishing a document
+        // on the same counter the query pipeline captures from is what lets the atomicity
+        // filter bound by the query's snapshot instead of only checking completeness.
+        this.documentVisibilityTracker = new DocumentVisibilityTracker(
+            new DocumentRegistry(), indexOrchestrator.getVisibilityTracker());
+        this.documentVisibilityChecker =
+            new DocumentVisibilityTrackerAdapter(documentVisibilityTracker);
+        LOGGER.info("Document visibility tracker initialized on the node epoch clock");
 
         // Initialize query pipeline
         this.queryPipeline = createQueryPipeline();
 
-        // Configure document reindexer for actual reindex operations
-        configureReindexer();
+        // Open the graph-RAG stack, if one was built into the data directory. A graph that is
+        // present but unreadable fails the start: the alternative is a node that silently
+        // answers 404 on a documented endpoint.
+        this.graphRag = openGraphRag(dataDir);
+
+        // The build side of the graph, per namespace. A node that never sees the namespace
+        // header runs with exactly one, called shared, which is the single-tenant arrangement.
+        this.graphTenants = openGraphTenants(dataDir);
 
         // Create HTTP server
         this.server = createServer();
+
+        // Configure the document reindexer. This runs after the server field is
+        // assigned: it wires the reindexer into the server, and doing it earlier
+        // dereferences a field that is still null.
+        configureReindexer();
 
         LOGGER.info("ExcaliburApplication initialized successfully");
     }
@@ -337,235 +354,6 @@ public final class ExcaliburApplication {
         return dataDir;
     }
 
-    /**
-     * Creates the storage engine.
-     *
-     * @param dataDir Data directory path
-     * @return Initialized storage engine
-     */
-    private StorageEngine createStorageEngine(Path dataDir) {
-        LOGGER.info("Initializing storage engine...");
-
-        // Use fallback constructor when Arena is null (ByteBuffer-based implementation)
-        // Use Arena constructor when Panama FFM is available
-        StorageEngine engine = (arena != null)
-            ? new StorageEngine(dataDir, arena)
-            : new StorageEngine(dataDir);
-        engine.start();
-
-        LOGGER.info("Storage engine initialized with {} segments", engine.getSegmentCount());
-        return engine;
-    }
-
-    /**
-     * Creates the volume manager.
-     *
-     * @return Initialized volume manager
-     */
-    private VolumeManager createVolumeManager() {
-        LOGGER.info("Initializing volume manager...");
-
-        SegmentCatalog catalog = storageEngine.getCatalog();
-        VolumeManager vm = new VolumeManager(catalog);
-
-        // Register default volume (data directory)
-        Path dataDir = storageEngine.dataDir();
-        vm.registerVolume(dataDir);
-
-        LOGGER.info("Volume manager initialized with {} volume(s)", vm.getVolumeCount());
-        return vm;
-    }
-
-    /**
-     * Creates the index orchestrator.
-     *
-     * @return Initialized index orchestrator
-     */
-    private IndexOrchestrator createIndexOrchestrator() {
-        LOGGER.info("Initializing index orchestrator...");
-
-        SegmentCatalog catalog = storageEngine.getCatalog();
-
-        IndexOrchestrator orchestrator = new IndexOrchestrator(
-            catalog,
-            storageEngine,
-            volumeManager,
-            (int) config.ingest().getHnswQueueDepthLimit(),
-            IndexOrchestrator.DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,
-            IndexOrchestrator.DEFAULT_REINDEX_CHECK_INTERVAL_MS,
-            config.visibility().getEpochTickMs()
-        );
-
-        LOGGER.info("Index orchestrator initialized");
-        return orchestrator;
-    }
-
-    /**
-     * Creates the hierarchical Cuckoo filter for corpus → cluster → segment membership.
-     *
-     * <p>The hierarchical filter enables efficient segment pruning during queries
-     * and proper deletion propagation through all filter levels when documents
-     * are tombstoned.</p>
-     *
-     * <h3>Domain Constraints</h3>
-     * <ul>
-     *   <li>Corpus capacity: 10 million entries (configurable via excalibur.filter.corpus-capacity)</li>
-     *   <li>Fingerprint bits: 13 (provides ~0.1% false positive rate)</li>
-     *   <li>Cluster capacity: 100,000 entries per cluster</li>
-     *   <li>Segment capacity: 10,000 entries per segment</li>
-     * </ul>
-     *
-     * @return Initialized hierarchical Cuckoo filter
-     */
-    private HierarchicalCuckooFilter createHierarchicalCuckooFilter() {
-        LOGGER.info("Initializing hierarchical Cuckoo filter...");
-
-        // Use configurable corpus capacity or default to 10 million entries
-        // This should be sized based on expected corpus size for optimal false positive rate
-        long corpusCapacity = getLongProperty("excalibur.filter.corpus-capacity", 10_000_000L);
-
-        // Default parameters tuned for ~0.1% false positive rate
-        int fingerprintBits = 13;
-        int clusterCapacity = 100_000;
-        int segmentCapacity = 10_000;
-
-        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(
-            corpusCapacity,
-            fingerprintBits,
-            clusterCapacity,
-            segmentCapacity
-        );
-
-        LOGGER.info("Hierarchical Cuckoo filter initialized: corpusCapacity={}, fingerprintBits={}, clusterCapacity={}, segmentCapacity={}",
-            corpusCapacity, fingerprintBits, clusterCapacity, segmentCapacity);
-
-        return filter;
-    }
-
-    /**
-     * Gets a long property from system properties or returns the default.
-     *
-     * @param key The property key
-     * @param defaultValue The default value if property is not set
-     * @return The property value or default
-     */
-    private long getLongProperty(String key, long defaultValue) {
-        String value = System.getProperty(key);
-        if (value != null && !value.isEmpty()) {
-            try {
-                return Long.parseLong(value.trim());
-            } catch (NumberFormatException e) {
-                LOGGER.warn("Invalid value for property {}: '{}', using default: {}", key, value, defaultValue);
-            }
-        }
-        return defaultValue;
-    }
-
-    /**
-     * Wires the compaction callback from the lifecycle manager to the compaction worker.
-     *
-     * <p>This sets up the connection between the SegmentLifecycleManager (which detects
-     * when segments need compaction) and the CompactionWorker (which performs the
-     * actual compaction).</p>
-     */
-    private void wireCompactionCallback() {
-        LOGGER.info("Wiring compaction callback...");
-
-        // Get the lifecycle manager from the storage engine
-        var lifecycleManager = storageEngine.getLifecycleManager();
-
-        // Set up the compaction callback
-        // When the lifecycle manager detects a segment needs compaction,
-        // it will call the compaction worker to perform the actual compaction
-        lifecycleManager.setCompactionCallback(segmentId -> {
-            // Get the segment from the storage engine
-            var segment = storageEngine.getSegment(segmentId);
-            if (segment == null) {
-                LOGGER.warn("Compaction callback received for unknown segment: {}", segmentId);
-                return false;
-            }
-
-            // Request compaction from the compaction worker
-            indexOrchestrator.getCompactionWorker().requestCompaction(segment);
-            LOGGER.debug("Compaction requested for segment {} via lifecycle callback", segmentId);
-            return true;
-        });
-
-        LOGGER.info("Compaction callback wired successfully");
-    }
-
-    /**
-     * Configures the HNSW initializer for the storage engine.
-     *
-     * <p>This sets up HNSW graph creation for new segments using the
-     * configuration from Config.Shard (efConstruction, efSearch).</p>
-     */
-    private void configureHnswInitializer() {
-        LOGGER.info("Configuring HNSW initializer...");
-
-        // Get vector dimensions from config (default to 1536 for OpenAI embeddings)
-        int dimension = config.query().getVectorDimensions();
-        if (dimension <= 0) {
-            dimension = io.excalibur.store.HnswInitializer.DEFAULT_VECTOR_DIMENSION;
-        }
-
-        // Create HNSW initializer with configuration from Config.Shard
-        io.excalibur.store.HnswInitializer initializer =
-            new io.excalibur.store.HnswInitializer(
-                hnswConfigFactory,
-                CosineSimilarity.getInstance(),
-                dimension,
-                io.excalibur.store.HnswInitializer.DEFAULT_MAX_NODES,
-                arena  // May be null for ByteBuffer fallback
-            );
-
-        // Configure storage engine to use the initializer
-        storageEngine.setHnswInitializer(initializer);
-
-        LOGGER.info("HNSW initializer configured: dimension={}, maxNodes={}",
-            initializer.getDimension(), initializer.getMaxNodes());
-    }
-
-    /**
-     * Registers existing segments with the IndexOrchestrator for HNSW integration.
-     *
-     * <p>This method iterates through all existing segments in the storage engine
-     * and registers those with HNSW graphs with the IndexOrchestrator. This enables
-     * the HnswIntegrationWorker to integrate vectors from the write log.</p>
-     *
-     * <p>Segments without HNSW graphs (created before HNSW was enabled) are skipped.</p>
-     */
-    private void registerExistingSegmentsWithOrchestrator() {
-        LOGGER.info("Registering existing segments with IndexOrchestrator...");
-
-        int registeredCount = 0;
-        long segmentCount = storageEngine.getSegmentCount();
-
-        for (long segmentId = 0; segmentId < segmentCount; segmentId++) {
-            io.excalibur.store.Segment segment = storageEngine.getSegment(segmentId);
-            if (segment == null) {
-                continue;
-            }
-
-            HnswGraph graph = segment.getHnswGraph();
-            io.excalibur.vector.hnsw.TailOffsetTracker tracker = segment.getTailOffsetTracker();
-
-            if (graph != null && tracker != null) {
-                indexOrchestrator.registerSegment(
-                    segmentId,
-                    segment,
-                    graph,
-                    null, // CuckooFilter - handled separately
-                    tracker
-                );
-                registeredCount++;
-                LOGGER.debug("Registered segment {} with IndexOrchestrator", segmentId);
-            }
-        }
-
-        LOGGER.info("Registered {} segments with IndexOrchestrator for HNSW integration",
-            registeredCount);
-    }
 
     /**
      * Creates the query pipeline.
@@ -613,29 +401,38 @@ public final class ExcaliburApplication {
             distanceFunction,
             llmScorer,  // LLM scorer with query-specific timeout
             QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
-            hierarchicalFilter  // CRITICAL: Pass the hierarchical filter for Stage 1 pruning
+            hierarchicalFilter,  // CRITICAL: Pass the hierarchical filter for Stage 1 pruning
+            // Node-level epoch filtering. Omitting it leaves the pipeline unable to exclude graph
+            // nodes written after the query's snapshot epoch, so a long-running query can return
+            // vectors that did not exist when it started. The orchestrator maintains the
+            // segment-scoped records this reads, and they were inert while nothing consumed them.
+            indexOrchestrator.getEpochIsolationValidator()
         );
 
-        LOGGER.info("Query pipeline initialized with document atomicity and hierarchical Cuckoo filter enabled");
+        LOGGER.info("Query pipeline initialized with document atomicity, hierarchical Cuckoo "
+            + "filter and node-level epoch isolation enabled");
         return pipeline;
     }
 
     /**
      * Configures the document reindexer for actual reindex operations.
      *
-     * <p>Creates and wires DocumentReindexer with all required dependencies:
-     * TextChunker, LLMHttpClient, UpsertHandler, DocumentRegistry, and
-     * storage writers. Enables zero-downtime rolling replacement when
-     * VolumeManager and SegmentCatalog are available.</p>
+     * <p>Wiring order matters: this must run after {@code server} is assigned, because
+     * it hands the reindexer to the server. Running it from the middle of the
+     * constructor dereferences a field that is still null, and swallowing the
+     * resulting NullPointerException leaves reindexing permanently disabled with only
+     * a warning to show for it.</p>
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>TextChunker uses default 512 tokens / 64 overlap</li>
-     *   <li>LLMHttpClient configured from config.llm() settings</li>
-     *   <li>OffsetAwareStorageWriter writes to segments and returns write log offsets</li>
-     *   <li>DocumentBatchPublisher ensures atomic document visibility</li>
-     *   <li>Rolling replacement enabled when segment catalog and lifecycle manager are available</li>
+     *   <li>Chunks are written through the storage engine's hash routing, so a
+     *       reindexed chunk stays reachable by key</li>
+     *   <li>Superseded chunks are tombstoned through the same routed delete</li>
+     *   <li>Rolling replacement is enabled when a volume manager and a segment catalog
+     *       are available</li>
      * </ul>
+     *
+     * @throws IllegalStateException if the reindexer cannot be constructed
      */
     private void configureReindexer() {
         LOGGER.info("Configuring document reindexer...");
@@ -643,130 +440,22 @@ public final class ExcaliburApplication {
         // Check if LLM API key is configured - required for generating embeddings during reindex
         String llmApiKey = config.llm().getApiKey();
         if (llmApiKey == null || llmApiKey.isEmpty()) {
-            LOGGER.warn("LLM API key not configured - reindexer will run in stub mode. " +
+            LOGGER.warn("LLM API key not configured - POST /v1/reindex will answer 503. " +
                 "Set excalibur.llm.api-key in config or EXCALIBUR_LLM_API_KEY environment variable.");
             return;
         }
 
-        try {
-            // Create text chunker (512 tokens / 64 overlap)
-            TextChunker chunker = new TextChunker();
-            LOGGER.debug("TextChunker created for reindexer");
+        DocumentReindexer reindexer = ReindexerFactory.create(
+            config,
+            storageEngine,
+            volumeManager,
+            indexOrchestrator,
+            hierarchicalFilter,
+            documentVisibilityTracker.getRegistry()
+        );
 
-            // Create LLM client for embeddings
-            LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
-            LLMHttpClient llmClient = new LLMHttpClient(llmClientConfig);
-            LOGGER.debug("LLMHttpClient created for reindexer: baseUrl={}, embeddingModel={}",
-                config.llm().getBaseUrl(), config.llm().getEmbeddingModel());
-
-            // Create document registry from visibility tracker
-            DocumentRegistry registry = documentVisibilityTracker.getRegistry();
-
-            // Create upsert handler with hierarchical filter for tombstoning old chunks
-            UpsertHandler upsertHandler = new UpsertHandler(
-                registry,
-                hierarchicalFilter,
-                (UpsertHandler.StorageAdapter) key -> {
-                    // Delegate to storage engine for tombstone operations
-                    // Note: This is a simplified adapter; full implementation would
-                    // route to the correct segment based on the key
-                    return false; // Tombstone via storage engine not directly supported
-                }
-            );
-            LOGGER.debug("UpsertHandler created with hierarchical filter support");
-
-            // Create offset-aware storage writer that writes to segments
-            OffsetAwareStorageWriter offsetWriter = (chunkId, content, embedding) -> {
-                // Write to first available segment
-                // Full implementation would use volume manager for distribution
-                var segment = storageEngine.getSegment(0L);
-                if (segment == null) {
-                    LOGGER.warn("No segment available for writing chunk: {}", chunkId);
-                    return -1L;
-                }
-                try {
-                    // Build the value: content + embedding for storage
-                    // Format: [4-byte content length][content bytes][embedding floats]
-                    byte[] contentBytes = content.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                    byte[] embeddingBytes = new byte[embedding.length * Float.BYTES];
-                    java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(embeddingBytes)
-                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                    for (float f : embedding) {
-                        buffer.putFloat(f);
-                    }
-
-                    // Build the value: content length (4 bytes) + content + embedding
-                    byte[] value = new byte[4 + contentBytes.length + embeddingBytes.length];
-                    java.nio.ByteBuffer valueBuffer = java.nio.ByteBuffer.wrap(value)
-                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                    valueBuffer.putInt(contentBytes.length);
-                    valueBuffer.put(contentBytes);
-                    valueBuffer.put(embeddingBytes);
-
-                    // Write to segment and get write log offset
-                    long offsetBefore = segment.writeLog() != null ? segment.writeLog().writeOffset() : 0L;
-                    segment.put(chunkId.getBytes(java.nio.charset.StandardCharsets.UTF_8), value);
-                    long offsetAfter = segment.writeLog() != null ? segment.writeLog().writeOffset() : offsetBefore + 1;
-
-                    return offsetAfter;
-                } catch (Exception e) {
-                    LOGGER.warn("Failed to write chunk {}: {}", chunkId, e.getMessage());
-                    return -1L;
-                }
-            };
-            LOGGER.debug("OffsetAwareStorageWriter created for segment writes");
-
-            // Create batch publisher for atomic document visibility
-            DocumentBatchPublisher batchPublisher = new DocumentBatchPublisher(
-                indexOrchestrator.getVisibilityTracker(),
-                registry,
-                hierarchicalFilter,
-                "0", // Default segment ID - will be overridden by withTargetSegment during rolling replacement
-                () -> { /* Write log sync */ },
-                null // No publication lock needed for single-threaded reindex
-            );
-            LOGGER.debug("DocumentBatchPublisher created for atomic publication");
-
-            // Check if rolling replacement is available
-            boolean hasRollingReplacement = volumeManager != null && storageEngine.getCatalog() != null;
-
-            DocumentReindexer reindexer;
-            if (hasRollingReplacement) {
-                // Full rolling replacement support
-                reindexer = new DocumentReindexer(
-                    chunker,
-                    llmClient,
-                    upsertHandler,
-                    registry,
-                    offsetWriter,
-                    batchPublisher,
-                    storageEngine.getCatalog(),
-                    storageEngine.getLifecycleManager(),
-                    indexOrchestrator.getVisibilityTracker()
-                );
-                LOGGER.info("DocumentReindexer configured with rolling replacement support");
-            } else {
-                // Basic reindexing without rolling replacement
-                reindexer = new DocumentReindexer(
-                    chunker,
-                    llmClient,
-                    upsertHandler,
-                    registry,
-                    offsetWriter,
-                    batchPublisher
-                );
-                LOGGER.info("DocumentReindexer configured with atomic publication (no rolling replacement)");
-            }
-
-            // Wire reindexer to server
-            server.withReindexer(reindexer);
-
-            LOGGER.info("Document reindexer configured successfully");
-
-        } catch (Exception e) {
-            LOGGER.warn("Failed to configure document reindexer: {}. Reindex will operate in stub mode.", e.getMessage());
-            // Continue without reindexer - endpoint will operate in stub mode
-        }
+        server.withReindexer(reindexer);
+        LOGGER.info("Document reindexer configured successfully");
     }
 
     /**
@@ -790,12 +479,70 @@ public final class ExcaliburApplication {
             queryPipeline
         );
 
+        // One resolution of the security policy for the whole process
+        srv.withSecurity(apiSecurity);
+
         // Wire the ingestion pipeline with LSH support
         // This enables /v1/ingest to trigger full document processing: chunking, embedding, storage
         configureIngestionPipeline(srv);
 
+        // Both graph routes, whether or not a graph exists yet: a node that has ingested and not
+        // built needs the build route, and one that builds later must start answering without a
+        // restart.
+        srv.withGraphSupport(graphTenants);
+        LOGGER.info("Graph-RAG endpoints registered: /v1/graph/query, /v1/graph/build, "
+            + "/v1/graph/erasure ({} namespace(s) open)", graphTenants.openCount());
+
         LOGGER.info("HTTP server created");
         return srv;
+    }
+
+    /**
+     * Opens every namespace's graph, bounded by what this process may map.
+     *
+     * <p>Rooted at the configured graph path's parent, one subdirectory per namespace, with the
+     * shared namespace being the one a node that never sees the header uses. The mapping budget is
+     * detected once and governs how many graphs stay open at a time: a served store is thirteen
+     * mappings, and a node with a graph per tenant will otherwise exhaust the process's supply at
+     * whatever unrelated allocation happens to come next.</p>
+     *
+     * @param dataDir The data directory
+     * @return The tenant registry
+     */
+    private excalibur.api.bootstrap.GraphTenants openGraphTenants(Path dataDir) {
+        Path root = GraphRagFactory.directoryFor(config, dataDir).getParent();
+        if (root == null) {
+            root = dataDir;
+        }
+        try {
+            return new excalibur.api.bootstrap.GraphTenants(
+                root, config,
+                io.excalibur.tenancy.MappingBudget.detect(),
+                config.graph().getMaxOpenNamespaces());
+        } catch (IOException e) {
+            throw new IllegalStateException("Graph tenants under " + root
+                + " could not be opened: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Opens the graph-RAG stack, or returns null when the node has no graph.
+     *
+     * <p>An unreadable graph is a startup failure rather than a silently absent endpoint. The
+     * two look identical from a client - both answer 404 - and only one of them is what the
+     * operator configured.
+     *
+     * @param dataDir The data directory the graph lives under by default
+     * @return The opened stack, or null
+     */
+    private GraphRagFactory.GraphRag openGraphRag(Path dataDir) {
+        try {
+            return GraphRagFactory.open(config, dataDir);
+        } catch (IOException e) {
+            throw new IllegalStateException("Graph store at "
+                + GraphRagFactory.directoryFor(config, dataDir)
+                + " could not be opened: " + e.getMessage(), e);
+        }
     }
 
     /**
@@ -856,10 +603,50 @@ public final class ExcaliburApplication {
             server.withIngestionPipeline(textChunker, embeddingClient, lshIngestionService, documentVisibilityTracker);
             LOGGER.info("Ingestion pipeline configured with LSH support and document atomicity");
 
+            configureGraphIngest(server, llmClientConfig);
+
         } catch (Exception e) {
             LOGGER.warn("Failed to configure ingestion pipeline: {}. Ingestion will operate in stub mode.", e.getMessage());
             // Continue without ingestion pipeline - endpoint will operate in stub mode
         }
+    }
+
+    /**
+     * Points ingestion at the graph, so published documents become facts.
+     *
+     * <p>The lexical half is always wired: an entity's text is what the BM25 signal ranks it by,
+     * and it costs one staged record per mention. Extraction is wired only when it is asked for -
+     * it is a chat-model call per document, which is the most expensive thing ingestion can do,
+     * and a node doing vector search should not start paying for a graph nobody asked for.</p>
+     *
+     * @param server          The server holding the ingestion orchestrator
+     * @param llmClientConfig The LLM configuration, for the extractor's client
+     */
+    private void configureGraphIngest(ExcaliburDBServer server, LLMClientConfig llmClientConfig) {
+        excalibur.ingest.pipeline.IngestionOrchestrator orchestrator =
+            server.getIngestionOrchestrator();
+        if (orchestrator == null) {
+            LOGGER.warn("No ingestion orchestrator; documents will not reach the graph");
+            return;
+        }
+
+        boolean extractionEnabled = config.graph().isExtractionEnabled();
+        excalibur.ingest.graph.RelationExtractor extractor =
+            excalibur.ingest.graph.RelationExtractor.none();
+        if (extractionEnabled) {
+            extractor = new excalibur.ingest.graph.LlmRelationExtractor(
+                new io.excalibur.llm.client.LLMHttpClient(llmClientConfig),
+                config.graph().getExtractorVersion());
+        }
+
+        // Ingestion is not namespace-aware: a source belongs to whichever namespace registered
+        // it, and today that is the shared one. Staging is therefore taken from the shared tenant,
+        // held for the life of the process rather than borrowed per document - it is two small
+        // append-only files, not the thirteen mappings the budget exists to bound.
+        orchestrator.setGraphSink(new excalibur.ingest.graph.StagingGraphIngestSink(
+            graphTenants.shared().staging(), extractor));
+        LOGGER.info("Graph ingest wired: extraction {} (extractor version {})",
+            extractionEnabled ? "enabled" : "disabled", config.graph().getExtractorVersion());
     }
 
     /**
@@ -909,30 +696,20 @@ public final class ExcaliburApplication {
         LOGGER.info("Shutting down ExcaliburDB...");
         LOGGER.info("========================================");
 
-        try {
-            // Stop HTTP server first (stops accepting new requests)
-            LOGGER.info("Stopping HTTP server...");
-            server.stop(SHUTDOWN_TIMEOUT_SECONDS);
+        // Ordering is a correctness property, not tidiness. Query and reindex threads
+        // read and write memory-mapped segments through the shared Arena; closing that
+        // arena while a mapping is still live crashes the JVM instead of throwing. So:
+        // stop accepting, drain everything in flight, close storage, close the arena.
+        new ShutdownSequence()
+            .add("stop HTTP server and drain in-flight requests",
+                () -> server.stop(SHUTDOWN_TIMEOUT_SECONDS))
+            .add("stop index orchestrator", indexOrchestrator::close)
+            .addIfPresent("close graph tenants", graphTenants, graphTenants::close)
+            .add("close storage engine", storageEngine::close)
+            .addIfPresent("release memory-mapped segments", arena, arena::close)
+            .run();
 
-            // Close index orchestrator (stops background workers)
-            LOGGER.info("Stopping index orchestrator...");
-            indexOrchestrator.close();
-
-            // Close storage engine
-            LOGGER.info("Closing storage engine...");
-            storageEngine.close();
-
-            // Close arena only if using Panama FFM (releases all memory-mapped segments)
-            if (arena != null) {
-                LOGGER.info("Releasing memory-mapped segments...");
-                arena.close();
-            }
-
-            LOGGER.info("ExcaliburDB shutdown complete");
-
-        } catch (Exception e) {
-            LOGGER.error("Error during shutdown: {}", e.getMessage(), e);
-        }
+        LOGGER.info("ExcaliburDB shutdown complete");
     }
 
     /**

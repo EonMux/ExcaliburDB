@@ -84,6 +84,14 @@ public class SegmentReindexScheduler {
      */
     public static final long MIN_CHECK_INTERVAL_MS = 10_000; // 10 seconds
 
+    /**
+     * Consecutive-failure count at which the backoff stops doubling.
+     *
+     * <p>Caps the retry delay at {@code reindexInterval * 2^6}, so a source that keeps
+     * failing is retried rarely rather than on every check.</p>
+     */
+    public static final int MAX_BACKOFF_EXPONENT = 6;
+
     // ==================== Instance Fields ====================
 
     private final SegmentCatalog catalog;
@@ -350,6 +358,7 @@ public class SegmentReindexScheduler {
             if (triggered) {
                 totalReindexesTriggered.incrementAndGet();
                 schedule.lastReindexTime = Instant.now();
+                schedule.consecutiveFailures = 0;
                 LOGGER.info("Triggered immediate re-index for source {}", sourceId);
             }
             return triggered;
@@ -369,6 +378,7 @@ public class SegmentReindexScheduler {
         SourceSchedule schedule = sourceSchedules.get(sourceId);
         if (schedule != null) {
             schedule.lastReindexTime = Instant.now();
+            schedule.consecutiveFailures = 0;
             schedule.reindexInProgress = false;
             totalReindexesCompleted.incrementAndGet();
             LOGGER.info("Re-index completed for source {}", sourceId);
@@ -378,15 +388,28 @@ public class SegmentReindexScheduler {
     /**
      * Marks a re-index as failed for a source.
      *
+     * <p>The attempt still counts as an attempt: {@code lastReindexTime} advances so the
+     * source is not re-crawled on the very next check, and the consecutive-failure count
+     * drives an exponential backoff capped at
+     * {@code reindexInterval * 2^}{@link #MAX_BACKOFF_EXPONENT}. Without this a source
+     * whose origin or embedding endpoint is down would be crawled end to end every check
+     * interval, on the scheduler's single thread, starving every other source.</p>
+     *
      * @param sourceId The source ID
      * @param error    The error message
      */
     public void markReindexFailed(long sourceId, String error) {
         SourceSchedule schedule = sourceSchedules.get(sourceId);
         if (schedule != null) {
+            schedule.lastReindexTime = Instant.now();
+            if (schedule.consecutiveFailures < Integer.MAX_VALUE) {
+                schedule.consecutiveFailures++;
+            }
             schedule.reindexInProgress = false;
             totalReindexesFailed.incrementAndGet();
-            LOGGER.error("Re-index failed for source {}: {}", sourceId, error);
+            LOGGER.error("Re-index failed for source {} (consecutive failures: {}, next attempt in "
+                + "{}ms): {}", sourceId, schedule.consecutiveFailures,
+                schedule.currentIntervalMs(), error);
         }
     }
 
@@ -413,9 +436,9 @@ public class SegmentReindexScheduler {
                     continue;
                 }
 
-                // Check if re-index is needed based on interval
+                // Check if re-index is needed based on interval (backed off after failures)
                 Duration timeSinceLastReindex = Duration.between(schedule.lastReindexTime, now);
-                if (timeSinceLastReindex.toMillis() >= schedule.reindexIntervalMs) {
+                if (timeSinceLastReindex.toMillis() >= schedule.currentIntervalMs()) {
                     try {
                         // Mark as in progress BEFORE calling listener to prevent re-entry
                         schedule.reindexInProgress = true;
@@ -541,7 +564,7 @@ public class SegmentReindexScheduler {
         if (schedule == null) {
             return null;
         }
-        return schedule.lastReindexTime.plusMillis(schedule.reindexIntervalMs);
+        return schedule.lastReindexTime.plusMillis(schedule.currentIntervalMs());
     }
 
     // ==================== Configuration Getters/Setters ====================
@@ -647,12 +670,28 @@ public class SegmentReindexScheduler {
         volatile long reindexIntervalMs;
         volatile Instant lastReindexTime;
         volatile boolean reindexInProgress;
+        volatile int consecutiveFailures;
 
         SourceSchedule(long sourceId, long reindexIntervalMs) {
             this.sourceId = sourceId;
             this.reindexIntervalMs = reindexIntervalMs;
-            this.lastReindexTime = Instant.EPOCH;
+            // Registration counts as the moment the source was last indexed: the caller
+            // ingests it immediately afterwards. Starting from the epoch would make the
+            // very first check re-crawl a source that is still being ingested.
+            this.lastReindexTime = Instant.now();
             this.reindexInProgress = false;
+            this.consecutiveFailures = 0;
+        }
+
+        /**
+         * Returns the interval currently in force, doubled once per consecutive failure
+         * and capped at {@code reindexIntervalMs * 2^MAX_BACKOFF_EXPONENT}.
+         *
+         * @return Effective interval in milliseconds
+         */
+        long currentIntervalMs() {
+            int exponent = Math.min(consecutiveFailures, MAX_BACKOFF_EXPONENT);
+            return reindexIntervalMs << exponent;
         }
     }
 

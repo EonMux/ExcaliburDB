@@ -78,9 +78,12 @@ class HnswGraphErrorHandlingTest {
                 raf.writeLong(0xDEADBEEFCAFEBABEL); // Invalid magic
             }
 
-            // Try to open - should fail with IllegalStateException (from MappedFile close in catch block)
+            // The header check must surface as IOException. It previously surfaced as
+            // IllegalStateException("Already closed") because the cleanup path closed
+            // the arena twice, masking the real failure.
             assertThatThrownBy(() -> HnswGraph.open(graphPath, L2Distance.getInstance()))
-                .isInstanceOf(IllegalStateException.class);
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("bad magic number");
         }
 
         @Test
@@ -98,9 +101,9 @@ class HnswGraphErrorHandlingTest {
                 raf.writeInt(99999); // Invalid version
             }
 
-            // Try to open - should fail with IllegalStateException (from MappedFile close in catch block)
             assertThatThrownBy(() -> HnswGraph.open(graphPath, L2Distance.getInstance()))
-                .isInstanceOf(IllegalStateException.class);
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("Unsupported HNSW version");
         }
     }
 
@@ -114,9 +117,10 @@ class HnswGraphErrorHandlingTest {
             // Create an empty file
             Files.write(graphPath, new byte[0]);
 
-            // Should throw IllegalStateException due to MappedFile behavior
+            // An unreadable header is an open failure, reported as IOException rather
+            // than leaking the cleanup path's IllegalStateException.
             assertThatThrownBy(() -> HnswGraph.open(graphPath, L2Distance.getInstance()))
-                .isInstanceOf(IllegalStateException.class);
+                .isInstanceOf(IOException.class);
         }
 
         @Test

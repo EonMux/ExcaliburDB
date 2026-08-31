@@ -38,6 +38,7 @@ public final class LLMClientConfig {
     private final int embeddingDimension;
     private final int maxBatchTokens;
     private final Duration retryBaseDelay;
+    private final long maxResponseBytes;
 
     private LLMClientConfig(Builder builder) {
         this.baseUrl = validateBaseUrl(builder.baseUrl);
@@ -46,6 +47,7 @@ public final class LLMClientConfig {
         this.embeddingModel = validateModel(builder.embeddingModel, "text-embedding-3-small");
         this.timeout = validateTimeout(builder.timeout);
         this.maxRetries = validateRetryCount(builder.maxRetries);
+        this.maxResponseBytes = validateMaxResponseBytes(builder.maxResponseBytes);
         this.failureThreshold = validateFailureThreshold(builder.failureThreshold);
         this.cooldownPeriod = validateCooldownPeriod(builder.cooldownPeriod);
         this.maxPromptsPerQuery = validateMaxPromptsPerQuery(builder.maxPromptsPerQuery);
@@ -78,6 +80,21 @@ public final class LLMClientConfig {
 
     public int getMaxRetries() {
         return maxRetries;
+    }
+
+    /**
+     * The largest response body this client will read.
+     *
+     * <p>The request timeout does not bound a body that keeps arriving: a steady stream never
+     * trips it, and reading the whole thing into a String first means the process runs out of
+     * heap rather than reporting a bad response. The endpoint is operator-configured, but a
+     * proxy in front of it, or an inference server that misbehaves, is exactly what a timeout
+     * does not cover.</p>
+     *
+     * @return The cap in bytes
+     */
+    public long getMaxResponseBytes() {
+        return maxResponseBytes;
     }
 
     public int getFailureThreshold() {
@@ -149,6 +166,14 @@ public final class LLMClientConfig {
                 "HTTP timeout must be positive (> 0), got: " + timeout.toMillis() + "ms");
         }
         return timeout;
+    }
+
+    private static long validateMaxResponseBytes(long maxResponseBytes) {
+        if (maxResponseBytes <= 0) {
+            throw new IllegalArgumentException(
+                "maxResponseBytes must be positive, got: " + maxResponseBytes);
+        }
+        return maxResponseBytes;
     }
 
     private static int validateRetryCount(int count) {
@@ -314,6 +339,8 @@ public final class LLMClientConfig {
         private String embeddingModel = "text-embedding-3-small";
         private Duration timeout = Duration.ofSeconds(30);
         private int maxRetries = 3;
+        /** 32 MiB: far above any completion or embedding reply, far below a heap. */
+        private long maxResponseBytes = 32L * 1024 * 1024;
         private int failureThreshold = 5;
         private Duration cooldownPeriod = Duration.ofMillis(60000);
         private int maxPromptsPerQuery = 10;
@@ -349,6 +376,17 @@ public final class LLMClientConfig {
 
         public Builder maxRetries(int maxRetries) {
             this.maxRetries = maxRetries;
+            return this;
+        }
+
+        /**
+         * Sets the largest response body the client will read.
+         *
+         * @param maxResponseBytes The cap in bytes; must be positive
+         * @return this builder
+         */
+        public Builder maxResponseBytes(long maxResponseBytes) {
+            this.maxResponseBytes = maxResponseBytes;
             return this;
         }
 

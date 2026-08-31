@@ -23,7 +23,14 @@ import java.util.Map;
  *   <li>Property key: <code>excalibur.visibility.epoch-tick-ms</code></li>
  *   <li>Environment variable: <code>EXCALIBUR_VISIBILITY_EPOCH_TICK_MS</code></li>
  * </ul>
- * The key transformation replaces <code>-</code> with <code>_</code> and converts to uppercase.</p>
+ * The key transformation replaces <code>-</code> with <code>_</code> and converts to uppercase.
+ * The merge itself is performed by the {@link Config} constructor, so a Config built
+ * without this loader resolves overrides the same way.</p>
+ *
+ * <h2>File Format</h2>
+ * <p>One <code>key=value</code> pair per line. A line whose first non-blank character is
+ * <code>#</code> or <code>;</code> is a comment. Inline trailing comments are not
+ * supported: everything after the first <code>=</code> is part of the value.</p>
  *
  * <h2>Loading Strategy</h2>
  * <p>Configuration files are loaded in the following order:
@@ -49,6 +56,8 @@ public final class ConfigLoader {
      * @return Loaded configuration object
      * @throws IOException if the file cannot be read from filesystem or classpath
      * @throws IllegalStateException if the file format is invalid
+     * @throws IllegalArgumentException if a property value cannot be parsed or violates
+     *         a domain constraint
      */
     public static Config load(String configPath, Map<String, String> envOverrides) throws IOException {
         if (configPath == null || configPath.isEmpty()) {
@@ -76,7 +85,9 @@ public final class ConfigLoader {
 
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
             String line;
+            int lineNumber = 0;
             while ((line = reader.readLine()) != null) {
+                lineNumber++;
                 line = line.trim();
 
                 // Skip empty lines and comments
@@ -84,10 +95,13 @@ public final class ConfigLoader {
                     continue;
                 }
 
-                // Parse key=value pairs
+                // Parse key=value pairs. The offending line is reported by position
+                // only: this file is the documented home of excalibur.llm.api-key, and
+                // this exception reaches the startup log with its full stack trace.
                 int equalsIndex = line.indexOf('=');
                 if (equalsIndex <= 0) {
-                    throw new IllegalStateException("Invalid property format: " + line);
+                    throw new IllegalStateException("Invalid property format at " + configPath +
+                        ":" + lineNumber + " (expected key=value)");
                 }
 
                 String key = line.substring(0, equalsIndex).trim();
@@ -95,8 +109,8 @@ public final class ConfigLoader {
 
                 // Remove surrounding quotes from value
                 if (value.length() >= 2 &&
-                    (value.startsWith("\"") && value.endsWith("\"")) ||
-                    (value.startsWith("'") && value.endsWith("'"))) {
+                    ((value.startsWith("\"") && value.endsWith("\"")) ||
+                     (value.startsWith("'") && value.endsWith("'")))) {
                     value = value.substring(1, value.length() - 1);
                 }
 
@@ -104,63 +118,8 @@ public final class ConfigLoader {
             }
         }
 
-        // Apply environment variable overrides
-        Map<String, String> effectiveProperties = applyEnvOverrides(properties, envOverrides);
-
-        // Create immutable config instance with the effective properties
-        return new Config(configPath, envOverrides, effectiveProperties);
-    }
-
-    /**
-     * Applies environment variable overrides to configuration overrides.
-     *
-     * <p>Environment variables can set values even for keys not in the properties file.</p>
-     *
-     * @param baseOverrides Base overrides (from properties file)
-     * @param envOverrides Additional environment variable overrides
-     * @return Merged overrides with env vars taking precedence
-     */
-    private static Map<String, String> applyEnvOverrides(Map<String, String> baseOverrides,
-                                                          Map<String, String> envOverrides) {
-        Map<String, String> result = new HashMap<>(baseOverrides);
-
-        if (envOverrides != null) {
-            for (Map.Entry<String, String> entry : envOverrides.entrySet()) {
-                String propKey = transformEnvKey(entry.getKey());
-                // Always apply override, even for keys not in properties file
-                result.put(propKey, entry.getValue());
-            }
-        }
-
-        return result;
-    }
-
-    /**
-     * Transforms environment variable name to property key format.
-     *
-     * <p>E.g., <code>EXCALIBUR_VISIBILITY_EPOCH_TICK_MS</code> -> <code>excalibur.visibility.epoch-tick-ms</code></p>
-     * <p>The property key format is: excalibur.&lt;section&gt;.&lt;value-name&gt;</p>
-     * <p>where section is a single word and value-name uses hyphens.</p>
-     *
-     * @param envKey Environment variable key
-     * @return Property key format
-     */
-    private static String transformEnvKey(String envKey) {
-        // EXCALIBUR_VISIBILITY_EPOCH_TICK_MS -> excalibur.visibility.epoch-tick-ms
-        if (envKey.startsWith("EXCALIBUR_")) {
-            envKey = envKey.substring(10);  // "EXCALIBUR_" is 10 characters
-        }
-
-        // Split into section and value name
-        // VISIBILITY_EPOCH_TICK_MS -> section=VISIBILITY, value=EPOCH_TICK_MS
-        int firstUnderscore = envKey.indexOf('_');
-        if (firstUnderscore > 0) {
-            String section = envKey.substring(0, firstUnderscore).toLowerCase();
-            String valueName = envKey.substring(firstUnderscore + 1).replace("_", "-").toLowerCase();
-            return "excalibur." + section + "." + valueName;
-        }
-
-        // Fallback for keys without underscores after prefix
-        return "excalibur." + envKey.toLowerCase();
+        // The Config constructor overlays the environment onto the file properties,
+        // so every construction path resolves overrides identically.
+        return new Config(configPath, envOverrides, properties);
     }
 }

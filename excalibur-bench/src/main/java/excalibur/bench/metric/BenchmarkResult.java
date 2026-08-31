@@ -33,12 +33,11 @@ public final class BenchmarkResult {
     private final double primaryScore;
     private final double primaryScoreError;
     private final String primaryScoreUnit;
-    private final double targetValue;
-    private final boolean hasTarget;
     private final boolean higherIsBetter;
     private final long durationMs;
     private final int iterations;
     private final int forks;
+    private final List<TargetEvaluation> targetEvaluations;
 
     private BenchmarkResult(Builder builder) {
         this.benchmarkName = Objects.requireNonNull(builder.benchmarkName, "benchmarkName required");
@@ -49,12 +48,123 @@ public final class BenchmarkResult {
         this.primaryScore = builder.primaryScore;
         this.primaryScoreError = builder.primaryScoreError;
         this.primaryScoreUnit = builder.primaryScoreUnit;
-        this.targetValue = builder.targetValue;
-        this.hasTarget = builder.hasTarget;
         this.higherIsBetter = builder.higherIsBetter;
         this.durationMs = builder.durationMs;
         this.iterations = builder.iterations;
         this.forks = builder.forks;
+        this.targetEvaluations = evaluateTargets(builder.targets);
+    }
+
+    /**
+     * Outcome of comparing one measurement against one registered target.
+     */
+    public enum TargetStatus {
+        /** The measurement satisfies the threshold. */
+        MET,
+        /** The measurement was compared and falls short of the threshold. */
+        MISSED,
+        /**
+         * The comparison could not be made - the metric was absent, a required JMH
+         * parameter was missing, or the measured unit is incompatible with the target
+         * unit. This is a reporting defect and must never be read as a pass.
+         */
+        NOT_EVALUABLE
+    }
+
+    /**
+     * The result of evaluating a single target against this benchmark.
+     *
+     * @param target the target that was evaluated
+     * @param status the outcome
+     * @param comparedValue the measurement converted into the target's unit, or NaN
+     *        when the comparison could not be made
+     * @param detail a human-readable explanation, empty when the comparison succeeded
+     */
+    public record TargetEvaluation(
+        BenchmarkTargetRegistry.TargetConfig target,
+        TargetStatus status,
+        double comparedValue,
+        String detail
+    ) {
+        /**
+         * Formats this evaluation for display.
+         *
+         * @return a one-line summary of the comparison
+         */
+        public String format() {
+            if (status == TargetStatus.NOT_EVALUABLE) {
+                return String.format("%s target %s NOT EVALUATED - %s",
+                    target.metric(), target.formatTarget(), detail);
+            }
+            return String.format("%s %.4f %s vs target %s %s",
+                target.metric(), comparedValue, target.unit(), target.formatTarget(),
+                status == TargetStatus.MET ? "PASS \u2713" : "FAIL \u2717");
+        }
+    }
+
+    private List<TargetEvaluation> evaluateTargets(List<BenchmarkTargetRegistry.TargetConfig> targets) {
+        List<TargetEvaluation> evaluations = new ArrayList<>(targets.size());
+        for (BenchmarkTargetRegistry.TargetConfig target : targets) {
+            evaluations.add(evaluateTarget(target));
+        }
+        return Collections.unmodifiableList(evaluations);
+    }
+
+    private TargetEvaluation evaluateTarget(BenchmarkTargetRegistry.TargetConfig target) {
+        double value;
+        String unit;
+        if (BenchmarkTargetRegistry.PRIMARY_METRIC.equals(target.metric())) {
+            value = primaryScore;
+            unit = primaryScoreUnit;
+        } else {
+            BenchmarkMetric metric = getMetric(target.metric());
+            if (metric == null) {
+                return notEvaluable(target, "metric '" + target.metric() + "' was not captured");
+            }
+            value = metric.value();
+            unit = metric.unit();
+        }
+
+        if (target.scaleByParameter() != null) {
+            String raw = parameters.get(target.scaleByParameter());
+            Double scale = parseScale(raw);
+            if (scale == null) {
+                return notEvaluable(target,
+                    "JMH parameter '" + target.scaleByParameter() + "' is missing or not numeric");
+            }
+            if (MetricUnits.dimensionOf(unit) != MetricUnits.Dimension.THROUGHPUT) {
+                return notEvaluable(target,
+                    "scaling requires a throughput measurement but unit was '" + unit + "'");
+            }
+            value = MetricUnits.convert(value, unit, MetricUnits.OPS_PER_SEC) * scale;
+            unit = MetricUnits.BYTES_PER_SEC;
+        }
+
+        if (!MetricUnits.isCompatible(unit, target.unit())) {
+            return notEvaluable(target,
+                "measured unit '" + unit + "' is incompatible with target unit '" + target.unit() + "'");
+        }
+
+        double converted = MetricUnits.convert(value, unit, target.unit());
+        return new TargetEvaluation(target,
+            target.isMet(converted) ? TargetStatus.MET : TargetStatus.MISSED,
+            converted, "");
+    }
+
+    private static TargetEvaluation notEvaluable(
+            BenchmarkTargetRegistry.TargetConfig target, String detail) {
+        return new TargetEvaluation(target, TargetStatus.NOT_EVALUABLE, Double.NaN, detail);
+    }
+
+    private static Double parseScale(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return Double.parseDouble(raw.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**
@@ -144,38 +254,63 @@ public final class BenchmarkResult {
     }
 
     /**
-     * Gets the target value for this benchmark, if defined.
+     * Gets the primary-score target value for this benchmark, if defined.
+     *
+     * @return the first registered target's threshold, or 0.0 when none is defined
      */
     public double targetValue() {
-        return targetValue;
+        return targetEvaluations.isEmpty() ? 0.0 : targetEvaluations.get(0).target().targetValue();
     }
 
     /**
-     * Checks if a target value is defined for this benchmark.
+     * Checks if at least one target is defined for this benchmark.
+     *
+     * @return true if any target applies
      */
     public boolean hasTarget() {
-        return hasTarget;
+        return !targetEvaluations.isEmpty();
+    }
+
+    /**
+     * Gets every target evaluated against this result.
+     *
+     * @return an immutable list of evaluations, possibly empty
+     */
+    public List<TargetEvaluation> targetEvaluations() {
+        return targetEvaluations;
+    }
+
+    /**
+     * Checks if any registered target could not be compared against a measurement.
+     *
+     * <p>An unevaluated target means the report has no evidence either way. Callers
+     * must treat it as a failure of the reporting pipeline, not as a pass.</p>
+     *
+     * @return true if at least one target is {@link TargetStatus#NOT_EVALUABLE}
+     */
+    public boolean hasUnevaluatedTarget() {
+        return targetEvaluations.stream().anyMatch(e -> e.status() == TargetStatus.NOT_EVALUABLE);
     }
 
     /**
      * Checks if higher values are better for this benchmark.
+     *
+     * @return true when the primary score is a throughput or transfer rate
      */
     public boolean higherIsBetter() {
         return higherIsBetter;
     }
 
     /**
-     * Checks if this benchmark meets its target (if defined).
+     * Checks if every defined target was compared and met.
+     *
+     * <p>Returns true when no target is defined (nothing to fail) and false when any
+     * target was missed or could not be evaluated.</p>
+     *
+     * @return true if all targets were evaluated and satisfied
      */
     public boolean meetsTarget() {
-        if (!hasTarget) {
-            return true; // No target defined
-        }
-        if (higherIsBetter) {
-            return primaryScore >= targetValue;
-        } else {
-            return primaryScore <= targetValue;
-        }
+        return targetEvaluations.stream().allMatch(e -> e.status() == TargetStatus.MET);
     }
 
     /**
@@ -254,23 +389,8 @@ public final class BenchmarkResult {
             sb.append(" ± ").append(String.format("%.2f", primaryScoreError));
         }
 
-        if (hasTarget) {
-            sb.append(" (target: ");
-            if (higherIsBetter) {
-                sb.append("≥");
-            } else {
-                sb.append("≤");
-            }
-            sb.append(String.format("%.2f", targetValue));
-            sb.append(" ");
-            sb.append(primaryScoreUnit);
-
-            if (meetsTarget()) {
-                sb.append(" ✓");
-            } else {
-                sb.append(" ✗");
-            }
-            sb.append(")");
+        for (TargetEvaluation evaluation : targetEvaluations) {
+            sb.append(" (").append(evaluation.format()).append(")");
         }
 
         return sb.toString();
@@ -292,11 +412,34 @@ public final class BenchmarkResult {
         sb.append("      \"value\": ").append(primaryScore).append(",\n");
         sb.append("      \"error\": ").append(primaryScoreError).append(",\n");
         sb.append("      \"unit\": \"").append(escapeJson(primaryScoreUnit)).append("\"");
-        if (hasTarget) {
-            sb.append(",\n      \"target\": ").append(targetValue);
+        if (hasTarget()) {
+            sb.append(",\n      \"target\": ").append(targetValue());
             sb.append(",\n      \"meetsTarget\": ").append(meetsTarget());
         }
         sb.append("\n    },\n");
+
+        // Target evaluations
+        if (!targetEvaluations.isEmpty()) {
+            sb.append("    \"targets\": [\n");
+            for (int i = 0; i < targetEvaluations.size(); i++) {
+                TargetEvaluation evaluation = targetEvaluations.get(i);
+                sb.append("      {\n");
+                sb.append("        \"metric\": \"").append(escapeJson(evaluation.target().metric())).append("\",\n");
+                sb.append("        \"target\": ").append(evaluation.target().targetValue()).append(",\n");
+                sb.append("        \"unit\": \"").append(escapeJson(evaluation.target().unit())).append("\",\n");
+                sb.append("        \"higherIsBetter\": ").append(evaluation.target().higherIsBetter()).append(",\n");
+                sb.append("        \"status\": \"").append(evaluation.status()).append("\",\n");
+                sb.append("        \"measured\": ").append(
+                    Double.isNaN(evaluation.comparedValue()) ? "null" : evaluation.comparedValue()).append(",\n");
+                sb.append("        \"detail\": \"").append(escapeJson(evaluation.detail())).append("\"\n");
+                sb.append("      }");
+                if (i < targetEvaluations.size() - 1) {
+                    sb.append(",");
+                }
+                sb.append("\n");
+            }
+            sb.append("    ],\n");
+        }
 
         // Parameters
         if (!parameters.isEmpty()) {
@@ -357,8 +500,8 @@ public final class BenchmarkResult {
         private double primaryScore;
         private double primaryScoreError;
         private String primaryScoreUnit = "ops/sec";
-        private double targetValue;
-        private boolean hasTarget;
+        private final List<BenchmarkTargetRegistry.TargetConfig> targets = new ArrayList<>();
+        private Double explicitTarget;
         private boolean higherIsBetter = true;
         private long durationMs;
         private int iterations;
@@ -414,14 +557,40 @@ public final class BenchmarkResult {
             return this;
         }
 
+        /**
+         * Sets a target on the primary score, expressed in this result's own unit.
+         *
+         * <p>The unit and direction are resolved at {@link #build()} time from
+         * {@link #primaryScoreUnit(String)} and {@link #higherIsBetter(boolean)},
+         * so the call order does not matter.</p>
+         *
+         * @param target the threshold in {@link #primaryScoreUnit(String)} units
+         * @return this builder
+         */
         public Builder target(double target) {
-            this.targetValue = target;
-            this.hasTarget = true;
+            this.explicitTarget = target;
             return this;
         }
 
+        /**
+         * Adds a registered target to evaluate against this result.
+         *
+         * @param target the target configuration
+         * @return this builder
+         */
+        public Builder addTarget(BenchmarkTargetRegistry.TargetConfig target) {
+            this.targets.add(target);
+            return this;
+        }
+
+        /**
+         * Removes all targets from this builder.
+         *
+         * @return this builder
+         */
         public Builder noTarget() {
-            this.hasTarget = false;
+            this.targets.clear();
+            this.explicitTarget = null;
             return this;
         }
 
@@ -447,6 +616,12 @@ public final class BenchmarkResult {
 
         public BenchmarkResult build() {
             validateDomainCorrectness();
+            if (explicitTarget != null) {
+                targets.add(0, new BenchmarkTargetRegistry.TargetConfig(
+                    ".*", BenchmarkTargetRegistry.PRIMARY_METRIC, explicitTarget,
+                    higherIsBetter, primaryScoreUnit, null, "explicit target"));
+                explicitTarget = null;
+            }
             return new BenchmarkResult(this);
         }
 

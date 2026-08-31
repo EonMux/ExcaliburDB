@@ -4,17 +4,8 @@ plugins {
     `maven-publish`
 }
 
-group = "io.excalibur"
-version = "1.0.0-SNAPSHOT"
 
 // Java 21 configuration
-java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
-    }
-}
 
 repositories {
     mavenCentral()
@@ -30,28 +21,13 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.junit.jupiter:junit-jupiter-params:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
-    testImplementation("org.mockito:mockito-core:5.15.2")
-    testImplementation("org.mockito:mockito-junit-jupiter:5.15.2")
     
     // JMH benchmarks
     testImplementation("org.openjdk.jmh:jmh-core:1.37")
     testRuntimeOnly("org.openjdk.jmh:jmh-generator-annprocess:1.37")
 }
 
-// Enable Panama FFM preview features
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
-    }
-}
-
-// Enable preview features for ExcaliburDB
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
-    }
-}
-
+// Enable Panama FFM preview features (the toolchain itself is declared once, above)
 tasks.withType<JavaCompile> {
     options.encoding = "UTF-8"
     options.release.set(21)

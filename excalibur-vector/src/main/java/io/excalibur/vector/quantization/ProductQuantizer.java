@@ -465,9 +465,23 @@ public final class ProductQuantizer {
      * @throws IllegalStateException if not trained
      */
     public PQDistanceTable createDistanceTable(float[] query) {
+        return createDistanceTable(query, null);
+    }
+
+    /**
+     * Creates a precomputed distance table for a specific metric.
+     *
+     * @param query  The query vector
+     * @param distFn The metric the caller ranks with; null means squared L2
+     * @return Precomputed distance table
+     * @throws IllegalArgumentException if query is invalid
+     * @throws IllegalStateException if not trained
+     */
+    public PQDistanceTable createDistanceTable(
+            float[] query, io.excalibur.vector.distance.DistanceFunction distFn) {
         ensureTrained();
         validateVector(query);
-        return new PQDistanceTable(query, this);
+        return new PQDistanceTable(query, this, distFn);
     }
 
     /**

@@ -122,6 +122,36 @@ class QueryResultConversionTest {
     }
 
     @Test
+    @DisplayName("fromQueryResponse falls back to the numeric ID when the string ID is blank")
+    void fromQueryResponse_withBlankStringDocumentId_fallsBackToNumericId() {
+        // Arrange: a blank string ID is not a usable identity
+        excalibur.query.QueryResultItem queryItem = new excalibur.query.QueryResultItem(
+            777L,   // numeric document ID
+            "  ",   // blank string document ID
+            0.5f,
+            null,
+            1L,
+            7L
+        );
+
+        excalibur.query.IndexCoverage queryCoverage = excalibur.query.IndexCoverage.builder()
+            .totalSegments(1)
+            .activeSegments(1)
+            .estimatedCorpusCoverage(1.0)
+            .degraded(false)
+            .build();
+
+        excalibur.query.QueryResponse response = new excalibur.query.QueryResponse(
+            List.of(queryItem), queryCoverage, 10L);
+
+        // Act
+        QueryResult testResult = QueryResult.fromQueryResponse(response, "blank-id-query");
+
+        // Assert
+        assertThat(testResult.getTopK().get(0).getDocumentId()).isEqualTo("777");
+    }
+
+    @Test
     @DisplayName("fromQueryResponse handles empty results")
     void fromQueryResponse_withEmptyResults_returnsEmptyTopK() {
         // Arrange

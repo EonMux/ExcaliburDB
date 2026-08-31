@@ -100,9 +100,24 @@ public class LLMHttpClient {
     /** Minimum embedding dimension */
     private static final int MIN_EMBEDDING_DIMENSION = 1;
 
-    /** Pattern to extract individual score objects from JSON array */
-    private static final Pattern SCORE_OBJECT_PATTERN = Pattern.compile(
-            "\\{\\s*\"index\"\\s*:\\s*(\\d+)\\s*,\\s*\"score\"\\s*:\\s*([0-9.eE+-]+)\\s*\\}");
+    /**
+     * Pattern to extract individual score objects from a JSON array.
+     *
+     * <p>One object at a time, with its fields read separately, because a model's key order and
+     * extra keys are not something to depend on. A single pattern that required
+     * {@code {"index": N, "score": X}} in that order and nothing else matched nothing at all for
+     * a reply that transposed the two fields or added a "reason" - and a reply that parsed to no
+     * scores used to be indistinguishable from one that scored nothing highly.</p>
+     */
+    private static final Pattern SCORE_OBJECT_PATTERN = Pattern.compile("\\{[^{}]*\\}");
+
+    /** The {@code index} field of a score object. */
+    private static final Pattern SCORE_INDEX_FIELD = Pattern.compile(
+            "\"index\"\\s*:\\s*(-?\\d+)");
+
+    /** The {@code score} field of a score object. */
+    private static final Pattern SCORE_VALUE_FIELD = Pattern.compile(
+            "\"score\"\\s*:\\s*(-?[0-9]*\\.?[0-9]+(?:[eE][+-]?[0-9]+)?)");
 
     // ==================== Retry with Exponential Backoff Configuration ====================
 
@@ -407,6 +422,77 @@ public class LLMHttpClient {
     }
 
     /**
+     * Asks the chat model a question and returns what it said.
+     *
+     * <p>The general form of the call {@link #scoreRelevancy} makes for one specific purpose.
+     * Relevancy scoring was the only reason to talk to the chat model when this client was
+     * written, so the endpoint, the retry loop, the bounded body read and the status handling all
+     * existed with no way to reach them for anything else - and a second caller would have had to
+     * duplicate every one of them.</p>
+     *
+     * <p>Temperature is fixed at zero. Every use of this in the system is an extraction or a
+     * judgement whose value depends on being reproducible: the same document must yield the same
+     * facts on a re-ingest, or the graph changes shape for no reason anyone can point at.</p>
+     *
+     * @param instruction   What the model is being asked to do, sent as the system message
+     * @param input         The text to act on, sent as the user message
+     * @param correlationId Correlation id for tracing, or null
+     * @return The assistant's reply, never null
+     * @throws IllegalArgumentException if instruction or input is null or blank
+     * @throws LLMException if the call fails or the reply cannot be read
+     */
+    public String complete(String instruction, String input, String correlationId) {
+        if (instruction == null || instruction.isBlank()) {
+            throw new IllegalArgumentException("instruction must not be null or blank");
+        }
+        if (input == null || input.isBlank()) {
+            throw new IllegalArgumentException("input must not be null or blank");
+        }
+
+        String requestBody = "{\"model\":\"" + JsonWriter.escapeString(config.getChatModel())
+            + "\",\"messages\":["
+            + "{\"role\":\"system\",\"content\":\"" + JsonWriter.escapeString(instruction) + "\"},"
+            + "{\"role\":\"user\",\"content\":\"" + JsonWriter.escapeString(input) + "\"}"
+            + "],\"temperature\":0.0}";
+
+        HttpResponse<String> response = executeRequest(
+            config.getBaseUrl() + CHAT_COMPLETIONS_PATH, requestBody, correlationId);
+        validateHttpStatus(response.statusCode());
+        return extractMessageContent(response.body());
+    }
+
+    /**
+     * Asks the chat model a question, refusing to call it while the circuit breaker is open.
+     *
+     * <p>The breaker is the same one relevancy scoring uses, because it is the same endpoint: a
+     * model that is failing is failing for both, and letting one caller keep hammering it would
+     * hold the breaker open for the other.</p>
+     *
+     * @param instruction   What the model is being asked to do
+     * @param input         The text to act on
+     * @param correlationId Correlation id for tracing, or null
+     * @return The assistant's reply
+     * @throws LLMException if the breaker is open, or the call fails
+     */
+    public String completeWithCircuitBreaker(String instruction, String input,
+                                             String correlationId) {
+        if (!circuitBreaker.allowRequest()) {
+            throw new LLMException(
+                "Circuit breaker is open for " + circuitBreaker.getName()
+                    + "; not calling the chat model",
+                ErrorType.CIRCUIT_OPEN);
+        }
+        try {
+            String reply = complete(instruction, input, correlationId);
+            circuitBreaker.recordSuccess();
+            return reply;
+        } catch (LLMException e) {
+            circuitBreaker.recordFailure();
+            throw e;
+        }
+    }
+
+    /**
      * Returns the configuration used by this client.
      *
      * @return Client configuration (never null)
@@ -669,7 +755,12 @@ public class LLMHttpClient {
                     logRequest(url, request, requestBody, correlationId);
                 }
 
-                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                // Bounded, because the timeout is not: a peer that keeps sending slowly never
+                // trips it, and an unbounded read ends in an OutOfMemoryError rather than in a
+                // bad-response error the caller can act on.
+                HttpResponse<String> response = httpClient.send(request,
+                    excalibur.llm.client.BoundedBody.ofString(
+                        config.getMaxResponseBytes(), StandardCharsets.UTF_8));
 
                 // DEBUG: Log response details for tracing
                 if (LOG.isDebugEnabled()) {
@@ -1368,7 +1459,8 @@ public class LLMHttpClient {
      * <p>Domain Correctness:</p>
      * <ul>
      *   <li>Scores are clamped to [0.0, 1.0] by {@link RelevancyScore} constructor</li>
-     *   <li>Indices out of bounds are clamped to valid range</li>
+     *   <li>Out-of-range indices are DISCARDED, not clamped: clamping index 999 to the last
+     *       candidate would attribute the model's score to a document it never scored</li>
      *   <li>Candidate text is associated with each score</li>
      * </ul>
      *
@@ -1392,30 +1484,55 @@ public class LLMHttpClient {
             return scores;
         }
 
-        // Use regex to find all score objects - more robust than manual parsing
-        // Pattern matches: {"index": 0, "score": 0.85} or {"index":0,"score":0.85}
+        // One object at a time, reading each field on its own, so key order and any extra keys
+        // the model added do not decide whether the reply is understood at all.
+        boolean anyObjectRead = false;
         Matcher matcher = SCORE_OBJECT_PATTERN.matcher(content);
         while (matcher.find()) {
-            try {
-                int index = Integer.parseInt(matcher.group(1));
-                double score = Double.parseDouble(matcher.group(2));
+            String object = matcher.group();
+            Matcher indexField = SCORE_INDEX_FIELD.matcher(object);
+            Matcher scoreField = SCORE_VALUE_FIELD.matcher(object);
+            if (!indexField.find() || !scoreField.find()) {
+                LOG.warn("Score object carries no index/score pair: {}", object);
+                continue;
+            }
 
-                // Domain correctness: clamp index to valid range [0, candidates.size()-1]
-                if (index < 0) {
-                    index = 0;
-                } else if (index >= candidates.size()) {
-                    index = candidates.size() - 1;
+            try {
+                int index = Integer.parseInt(indexField.group(1));
+                double score = Double.parseDouble(scoreField.group(1));
+                anyObjectRead = true;
+
+                // Domain correctness: skip invalid indices instead of clamping,
+                // which would silently attribute scores to wrong candidates
+                if (index < 0 || index >= candidates.size()) {
+                    LOG.warn("LLM returned invalid score index {} (candidates size {}), skipping",
+                        index, candidates.size());
+                    continue;
                 }
 
-                // Get candidate text if available
-                String candidateText = index < candidates.size() ? candidates.get(index) : null;
+                // Index is in range: the guard above skipped every other case.
+                String candidateText = candidates.get(index);
 
                 // RelevancyScore constructor clamps score to [0.0, 1.0]
                 scores.add(new RelevancyScore(index, score, candidateText));
             } catch (NumberFormatException e) {
-                LOG.warn("Failed to parse score object: {}", matcher.group());
+                LOG.warn("Failed to parse score object: {}", object);
                 // Continue parsing other objects
             }
+        }
+
+        // A non-empty array in which nothing at all could be read is a reply that was not
+        // understood, and saying so is what lets the caller fall back to the vector ranking.
+        // Returning an empty list instead reported success, counted a success on the circuit
+        // breaker, and answered the query with nothing.
+        //
+        // An object that was read and then discarded for naming a candidate that does not exist
+        // is a different case: the reply was understood, and discarding is the documented
+        // handling - clamping would attribute the model's score to a document it never saw.
+        if (!anyObjectRead) {
+            throw new LLMException(
+                "Response is a JSON array but contains no readable score objects: " + content,
+                ErrorType.PARSE_ERROR);
         }
 
         return scores;

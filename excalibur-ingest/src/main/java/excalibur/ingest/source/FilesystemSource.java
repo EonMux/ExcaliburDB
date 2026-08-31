@@ -458,17 +458,31 @@ public class FilesystemSource implements Source {
         }
     }
 
+    /**
+     * Resolves a document id to the file it names, inside the root.
+     *
+     * <p>Traversal is rejected a segment at a time. A substring test for ".." also rejects
+     * ordinary file names - "report..final.pdf", "schema..v2.sql" - which the crawl happily
+     * lists and then cannot fetch, so those files are never indexed and never reported as
+     * failed. What actually contains traversal is the {@code startsWith} check below, on the
+     * normalised path.</p>
+     *
+     * @param documentId The document id, as produced by the crawl
+     * @return The resolved path, inside the root
+     * @throws IllegalArgumentException if the id names a path outside the root
+     */
     private Path toFilePath(String documentId) {
-        if (documentId.contains("..")) {
-            throw new IllegalArgumentException("Document ID contains invalid path traversal: " + documentId);
-        }
-
         String[] parts = documentId.split("/");
         Path resolved = rootPath;
         for (String part : parts) {
-            if (!part.isEmpty()) {
-                resolved = resolved.resolve(part);
+            if (part.isEmpty() || ".".equals(part)) {
+                continue;
             }
+            if ("..".equals(part)) {
+                throw new IllegalArgumentException(
+                    "Document ID contains invalid path traversal: " + documentId);
+            }
+            resolved = resolved.resolve(part);
         }
         resolved = resolved.normalize();
 

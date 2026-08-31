@@ -44,6 +44,20 @@ class DocumentAtomicityFilterTest {
     }
 
     @Test
+    @DisplayName("DocumentAtomicityFilter passes through results with no document identity")
+    void testResultsWithoutDocumentIdPassThrough() {
+        testChecker.setVisible("1", true);
+
+        // No string document ID: the atomicity model has no opinion on this result.
+        // Synthesising one from the numeric node ID would guarantee a lookup miss and
+        // silently drop a legitimate match.
+        QueryResultItem noIdentity = new QueryResultItem(7L, 0.5f);
+
+        assertTrue(filter.isResultVisible(noIdentity, 1L));
+        assertEquals(1, filter.filterPartialDocuments(List.of(noIdentity), 1L).size());
+    }
+
+    @Test
     @DisplayName("DocumentAtomicityFilter should return empty list for empty input")
     void testFilterEmptyList() {
         List<QueryResultItem> filtered = filter.filterPartialDocuments(Collections.emptyList(), 1L);
@@ -204,14 +218,27 @@ class DocumentAtomicityFilterTest {
             new DocumentAtomicityFilter((DocumentVisibilityChecker) null));
     }
 
+    /**
+     * Builds a result that carries an explicit string document identity, which is what
+     * the filter looks up. The numeric ID is the HNSW node ID and lives in a different
+     * namespace, so it is never used as a document identity.
+     */
     private QueryResultItem createResult(long documentId, double score) {
-        return new QueryResultItem(documentId, (float) score);
+        return new QueryResultItem(
+            documentId, String.valueOf(documentId), (float) score, null, 0L, documentId);
     }
 
     /**
      * Test implementation of DocumentVisibilityChecker.
      */
     private static class TestVisibilityChecker implements DocumentVisibilityChecker {
+        @Override
+        public long currentEpoch() {
+            // A test double with no epoch of its own. Unbounded keeps these tests asserting the
+            // completeness behaviour they were written for, rather than an epoch bound.
+            return Long.MAX_VALUE;
+        }
+
         private java.util.Map<String, Boolean> visibility = new java.util.HashMap<>();
 
         void setVisible(String documentId, boolean visible) {

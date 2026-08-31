@@ -18,7 +18,7 @@ import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.store.WriteLog;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
@@ -114,7 +114,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
         // Create storage infrastructure
         Path dataDir = tempDir.resolve("data");
         Files.createDirectories(dataDir);
-        storageEngine = new TestStorageEngine(dataDir);
+        storageEngine = new TestStorageEngine(dataDir, arena);
 
         // Create visibility tracker
         visibilityTracker = new TestVisibilityTracker();
@@ -132,7 +132,9 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             documentRegistry,
             visibilityRegistry,
             null,  // cuckooFilter - not needed for this test
-            writeLog::sync,
+            // io.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
+            // durability barrier is already satisfied before the adapter runs.
+            () -> { },
             new ReentrantLock()
         );
     }
@@ -226,10 +228,9 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                         graph.registerDocumentId(nodeId, documentId);
 
                         // CRITICAL: Update lastIntegratedOffset so query pipeline knows vectors are in graph
-                        graph.setLastIntegratedOffset(writeLog.writeHead());
+                        graph.setLastIntegratedOffset(writeLog.writeOffset());
 
                         // Sync write log and advance epoch
-                        writeLog.sync();
                         long newEpoch = visibilityTracker.advanceEpoch();
 
                         // CRITICAL: Register document with visibility registry for document atomicity filtering
@@ -339,9 +340,21 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                 .as("No exceptions should occur during concurrent ingestion/query. Exceptions: " + exceptions)
                 .isEqualTo(0);
 
+            assertThat(queriesCompleted)
+                .as("All query threads must finish within the timeout")
+                .isTrue();
+
             // Verify queries were executed
             assertThat(queryCount.get())
                 .as("Queries should have been executed during ingestion")
+                .isGreaterThan(0);
+
+            // The point of the test is that queries WORK during ingestion. A pipeline that
+            // returned an empty result set for every query would satisfy every assertion
+            // above, so the count of queries that actually saw data has to be asserted too.
+            assertThat(querySuccessCount.get())
+                .as("Queries issued during ingestion must return data, not just complete "
+                    + "(%d of %d returned results)", querySuccessCount.get(), queryCount.get())
                 .isGreaterThan(0);
 
             System.out.println("Concurrent test: " + queryCount.get() + " queries, " +
@@ -406,9 +419,8 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                     graph.registerDocumentId(nodeId, documentId);
 
                     // CRITICAL: Update lastIntegratedOffset so query pipeline knows vectors are in graph
-                    graph.setLastIntegratedOffset(writeLog.writeHead());
+                    graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                    writeLog.sync();
                     long newEpoch = visibilityTracker.advanceEpoch();
 
                     // CRITICAL: Register document with visibility registry for document atomicity filtering
@@ -757,7 +769,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                         for (int c = 0; c < chunks.size(); c++) {
                             TextChunk chunk = chunks.get(c);
                             String chunkId = documentId + ":" + c;
-                            long offset = writeLog.writeHead();
+                            long offset = writeLog.writeOffset();
                             batchBuffer.addChunk(chunkId, chunk, offset);
                         }
 
@@ -768,7 +780,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                         float[] vector = createRandomVector(dimension);
                         long nodeId = graph.insert(vector);
                         graph.registerDocumentId(nodeId, documentId);
-                        graph.setLastIntegratedOffset(writeLog.writeHead());
+                        graph.setLastIntegratedOffset(writeLog.writeOffset());
 
                         // Publish atomically - this registers document in visibilityRegistry
                         DocumentMetadata metadata = DocumentMetadata.builder()
@@ -783,7 +795,6 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                         publisher.publish(batchBuffer, metadata);
 
                         // Sync write log and advance epoch
-                        writeLog.sync();
                         long publicationEpoch = visibilityTracker.advanceEpoch();
 
                         // Register document with visibility registry for atomicity filtering
@@ -954,7 +965,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                 for (int c = 0; c < chunks.size(); c++) {
                     TextChunk chunk = chunks.get(c);
                     String chunkId = documentId + ":" + c;
-                    long offset = writeLog.writeHead();
+                    long offset = writeLog.writeOffset();
                     batchBuffer.addChunk(chunkId, chunk, offset);
                 }
 
@@ -981,9 +992,8 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                 graph.registerDocumentId(nodeId, documentId);
 
                 // CRITICAL: Update lastIntegratedOffset so query pipeline knows vector is in graph
-                graph.setLastIntegratedOffset(writeLog.writeHead());
+                graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                writeLog.sync();
                 long newEpoch = visibilityTracker.advanceEpoch();
 
                 // CRITICAL: Register document with visibility registry for document atomicity filtering
@@ -1152,9 +1162,8 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
         graph.registerDocumentId(nodeId, documentId);
 
         // CRITICAL: Update lastIntegratedOffset so query pipeline knows vectors are in graph
-        graph.setLastIntegratedOffset(writeLog.writeHead());
+        graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-        writeLog.sync();
         long newEpoch = visibilityTracker.advanceEpoch();
 
         // CRITICAL: Register document with visibility registry for document atomicity filtering
@@ -1190,10 +1199,13 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
         private final Arena arena;
         private int segmentCounter = 0;
 
-        TestStorageEngine(Path dataDir) throws IOException {
-            super(dataDir, Arena.ofShared());
+        TestStorageEngine(Path dataDir, Arena arena) throws IOException {
+            // The caller's arena backs both the engine's mapped catalog and the segments
+            // created here. Allocating fresh shared arenas would leak them: a shared arena
+            // is released only by an explicit close(), never by the collector.
+            super(dataDir, arena);
             this.dataDir = dataDir;
-            this.arena = Arena.ofShared();
+            this.arena = arena;
             this.catalog = new TestSegmentCatalog();
         }
 
@@ -1246,6 +1258,9 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
             }
             segments.clear();
             catalog.clear();
+            // The base engine owns the mapped catalog and the split worker; skipping it
+            // leaves both alive for the lifetime of the test fork.
+            super.close();
         }
     }
 

@@ -306,6 +306,82 @@ class LlmRelevancyScorerTest {
         }
     }
 
+    @Nested
+    @DisplayName("Partial LLM responses")
+    class PartialResponseTests {
+
+        @Test
+        @DisplayName("a candidate the LLM did not score keeps its vector ranking")
+        void unscoredCandidatesAreKept() throws Exception {
+            List<QueryResultItem> items = List.of(
+                createItem(1L, 0.8f, "Result 1", 1L, 1L),
+                createItem(2L, 0.7f, "Result 2", 1L, 2L),
+                createItem(3L, 0.6f, "Result 3", 1L, 3L)
+            );
+
+            // The batching layer caps how many prompts one query may send, and the parser keeps
+            // only the objects it recognised - so a short list is routine, not exceptional.
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any()))
+                .thenReturn(List.of(new RelevancyScore(0, 0.9)));
+
+            List<QueryResultItem> result = scorer.scoreResults("query", items, 0.5f);
+
+            // Dropping them was a verdict of irrelevance the LLM never reached.
+            assertThat(result.stream().map(QueryResultItem::documentId).toList())
+                .containsExactlyInAnyOrder(1L, 2L, 3L);
+        }
+
+        @Test
+        @DisplayName("an empty score list leaves the vector ranking untouched")
+        void anEmptyResponseKeepsEverything() throws Exception {
+            List<QueryResultItem> items = List.of(
+                createItem(1L, 0.8f, "Result 1", 1L, 1L),
+                createItem(2L, 0.7f, "Result 2", 1L, 2L)
+            );
+
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any()))
+                .thenReturn(List.of());
+
+            List<QueryResultItem> result = scorer.scoreResults("query", items, 0.5f);
+
+            assertThat(result).hasSize(2);
+        }
+
+        @Test
+        @DisplayName("an unscored candidate keeps its own score, not a scored one")
+        void unscoredCandidatesKeepTheirOwnScore() throws Exception {
+            List<QueryResultItem> items = List.of(
+                createItem(1L, 0.8f, "Result 1", 1L, 1L),
+                createItem(2L, 0.25f, "Result 2", 1L, 2L)
+            );
+
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any()))
+                .thenReturn(List.of(new RelevancyScore(0, 0.9)));
+
+            List<QueryResultItem> result = scorer.scoreResults("query", items, 0.5f);
+
+            assertThat(result.get(0).score()).isEqualTo(0.9f);
+            assertThat(result.get(1).score()).isEqualTo(0.25f);
+        }
+
+        @Test
+        @DisplayName("a scored candidate below the threshold is still dropped")
+        void scoredCandidatesStillObeyTheThreshold() throws Exception {
+            List<QueryResultItem> items = List.of(
+                createItem(1L, 0.8f, "Result 1", 1L, 1L),
+                createItem(2L, 0.7f, "Result 2", 1L, 2L)
+            );
+
+            when(llmClient.scoreRelevancyWithCircuitBreaker(anyString(), anyList(), any()))
+                .thenReturn(List.of(new RelevancyScore(0, 0.9), new RelevancyScore(1, 0.1)));
+
+            List<QueryResultItem> result = scorer.scoreResults("query", items, 0.5f);
+
+            assertThat(result.stream().map(QueryResultItem::documentId).toList())
+                .containsExactly(1L);
+        }
+    }
+
     // Helper method to create QueryResultItem with payload
     private QueryResultItem createItem(long docId, float score, String payload, long segmentId, long nodeId) {
         return new QueryResultItem(docId, score, payload.getBytes(StandardCharsets.UTF_8), segmentId, nodeId);

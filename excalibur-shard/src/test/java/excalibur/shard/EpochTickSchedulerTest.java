@@ -1,6 +1,7 @@
 package excalibur.shard;
 
 import io.excalibur.store.SegmentCatalog;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -42,6 +43,30 @@ class EpochTickSchedulerTest {
         if (catalog != null) {
             catalog.close();
         }
+    }
+
+    /**
+     * Maximum time a test waits for the scheduler to reach a tick count.
+     *
+     * <p>Generous on purpose: the build runs test forks in parallel, so a fixed sleep
+     * sized to the tick interval measures the machine's load, not the scheduler.</p>
+     */
+    private static final long AWAIT_TIMEOUT_MS = 5_000;
+
+    /**
+     * Waits until the scheduler has recorded at least {@code minTicks} ticks.
+     *
+     * @param minTicks Tick count to wait for
+     */
+    private void awaitTicks(long minTicks) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AWAIT_TIMEOUT_MS);
+        while (scheduler.getTickCount() < minTicks && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+        assertThat(scheduler.getTickCount())
+            .as("scheduler should have ticked at least %d times within %dms",
+                minTicks, AWAIT_TIMEOUT_MS)
+            .isGreaterThanOrEqualTo(minTicks);
     }
 
     @Test
@@ -103,14 +128,10 @@ class EpochTickSchedulerTest {
 
         scheduler.start();
 
-        // Wait for 3 ticks at 10ms interval (35ms with buffer)
-        Thread.sleep(35);
+        awaitTicks(2);
 
         long epochAfter = tracker.currentEpoch();
-
-        // Should have at least 2 ticks (could be 3+ due to timing)
         assertThat(epochAfter).isGreaterThan(epochBefore);
-        assertThat(scheduler.getTickCount()).isGreaterThanOrEqualTo(2L);
     }
 
     @Test
@@ -129,16 +150,18 @@ class EpochTickSchedulerTest {
     @Test
     @DisplayName("No ticks should occur after stop")
     void noTicksAfterStop() throws InterruptedException {
-        scheduler = new EpochTickScheduler(tracker, 10); // Use 20ms interval
+        scheduler = new EpochTickScheduler(tracker, 10);
         scheduler.start();
-        Thread.sleep(25); // Let some ticks happen
+        awaitTicks(1); // Let some ticks happen
         scheduler.stop();
 
+        // stop() fences a tick that was already dispatched, so the counts read here are
+        // final rather than racing an in-flight tick.
         long tickCountAfterStop = scheduler.getTickCount();
         long epochAfterStop = tracker.currentEpoch();
 
-        // Wait another period
-        Thread.sleep(50);
+        // Wait several tick intervals to give a leaked tick every chance to fire
+        Thread.sleep(200);
 
         // Tick count and epoch should not have changed
         assertThat(scheduler.getTickCount()).isEqualTo(tickCountAfterStop);
@@ -161,14 +184,10 @@ class EpochTickSchedulerTest {
 
         scheduler.start();
 
-        // Wait for 5 ticks at 10ms interval (50ms with buffer)
-        Thread.sleep(50);
+        awaitTicks(4);
 
         long epochAfter = tracker.currentEpoch();
-
-        // Should have at least 4 ticks with 20ms interval
         assertThat(epochAfter).isGreaterThan(epochBefore);
-        assertThat(scheduler.getTickCount()).isGreaterThanOrEqualTo(4L);
     }
 
     @Test
@@ -196,7 +215,7 @@ class EpochTickSchedulerTest {
     void getStatsShouldReturnCorrectStats() throws InterruptedException {
         scheduler = new EpochTickScheduler(tracker, 10);
         scheduler.start();
-        Thread.sleep(50);
+        awaitTicks(2);
 
         EpochTickScheduler.EpochTickStats stats = scheduler.getStats();
 
@@ -215,7 +234,7 @@ class EpochTickSchedulerTest {
 
         // Start, wait, stop
         scheduler.start();
-        Thread.sleep(50);
+        awaitTicks(1);
         scheduler.stop();
 
         long tickCountAfterFirstRun = scheduler.getTickCount();
@@ -227,10 +246,7 @@ class EpochTickSchedulerTest {
         assertThat(scheduler.isRunning()).isTrue();
 
         // Wait for more ticks
-        Thread.sleep(50);
-
-        // Should have more ticks now
-        assertThat(scheduler.getTickCount()).isGreaterThan(tickCountAfterFirstRun);
+        awaitTicks(tickCountAfterFirstRun + 1);
     }
 
     @Test
@@ -238,7 +254,7 @@ class EpochTickSchedulerTest {
     void closeShouldStopAndShutdown() throws InterruptedException {
         scheduler = new EpochTickScheduler(tracker, 10);
         scheduler.start();
-        Thread.sleep(15);
+        awaitTicks(1);
 
         scheduler.close();
 

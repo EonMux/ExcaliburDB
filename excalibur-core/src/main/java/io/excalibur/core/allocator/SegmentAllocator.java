@@ -90,12 +90,15 @@ public class SegmentAllocator {
         long newOffset;
         do {
             oldOffset = currentOffset.get();
-            newOffset = oldOffset + size;
-            if (newOffset > endOffset) {
+            // Compare against the remaining space rather than computing oldOffset + size
+            // first: a huge size would overflow to a negative newOffset, slip past the
+            // capacity check and commit a bump pointer outside the segment.
+            if (size > endOffset - oldOffset) {
                 throw new AllocationException(
                     "Cannot allocate " + size + " bytes at offset " + oldOffset +
                     ", only " + (endOffset - oldOffset) + " bytes remaining");
             }
+            newOffset = oldOffset + size;
         } while (!currentOffset.compareAndSet(oldOffset, newOffset));
 
         AllocatedRegion region = new AllocatedRegion(oldOffset, size, segment);
@@ -128,7 +131,9 @@ public class SegmentAllocator {
      * @throws AllocationException if offset is invalid or not enough space available
      */
     public AllocatedRegion allocateAt(long offset, long size) {
-        if (offset < startOffset || offset + size > endOffset) {
+        // Bound size against the space left after offset instead of computing offset + size,
+        // which overflows for a huge size and would accept an out-of-segment range.
+        if (size <= 0 || offset < startOffset || offset > endOffset || size > endOffset - offset) {
             throw new IllegalArgumentException(
                 "Invalid allocation range: offset=" + offset +
                 ", size=" + size + ", bounds=[" + startOffset + ", " + endOffset + "]");

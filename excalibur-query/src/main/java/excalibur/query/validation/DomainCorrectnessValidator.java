@@ -539,42 +539,6 @@ public final class DomainCorrectnessValidator {
     // ==================== Utility Methods ====================
 
     /**
-     * Normalizes a raw distance value to a score in [0.0, 1.0].
-     *
-     * <p>This is a convenience method that delegates to DistanceValidator.
-     * The normalization formula depends on the distance type:</p>
-     * <ul>
-     *   <li>Cosine similarity: [-1, 1] → [0, 1] via (x+1)/2</li>
-     *   <li>L2 distance: [0, ∞) → (0, 1] via 1/(1+x)</li>
-     *   <li>Inner product: (-∞, ∞) → (0, 1) via sigmoid</li>
-     * </ul>
-     *
-     * @param rawDistance The raw distance value
-     * @param isDistanceMetric true if smaller is better (L2), false if larger is better (cosine, IP)
-     * @return Normalized score in [0.0, 1.0]
-     */
-    public static float normalizeDistanceToScore(float rawDistance, boolean isDistanceMetric) {
-        float score;
-        if (isDistanceMetric) {
-            // L2-style: 0 is perfect match, larger is worse
-            // Use 1/(1+x) to map [0, ∞) → (0, 1]
-            score = 1.0f / (1.0f + Math.max(0, rawDistance));
-        } else {
-            // Similarity-style (cosine/IP): larger is better
-            // For cosine: [-1, 1] → [0, 1] via (x+1)/2
-            // For inner product: use sigmoid
-            if (rawDistance >= -1.0f && rawDistance <= 1.0f) {
-                // Looks like cosine similarity
-                score = (rawDistance + 1.0f) / 2.0f;
-            } else {
-                // Treat as inner product, use sigmoid
-                score = (float) (1.0 / (1.0 + Math.exp(-rawDistance)));
-            }
-        }
-        return clampScore(score);
-    }
-
-    /**
      * Validates that a count/size value is non-negative.
      *
      * @param count The count to validate

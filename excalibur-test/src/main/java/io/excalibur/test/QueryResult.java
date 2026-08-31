@@ -53,7 +53,8 @@ public class QueryResult {
      *
      * <h3>Field Mapping</h3>
      * <ul>
-     *   <li>{@code documentId}: Prefers string ID if available, falls back to numeric ID as string</li>
+     *   <li>{@code documentId}: Prefers the string ID when present and non-blank, otherwise
+     *       the numeric ID rendered as a string</li>
      *   <li>{@code score}: Copied directly</li>
      *   <li>{@code metadata}: Includes segmentId and nodeId from query result</li>
      *   <li>{@code content/source/chunkIndex}: Not available from QueryResponse, set to defaults</li>
@@ -72,8 +73,9 @@ public class QueryResult {
         // Convert each QueryResultItem from query pipeline to test framework format
         List<QueryResultItem> items = response.results().stream()
             .map(r -> {
-                // Prefer string document ID if available, otherwise convert numeric ID
-                String docId = r.documentIdStr() != null
+                // Prefer string document ID if available, otherwise convert numeric ID.
+                // A blank string is not a usable identity, so it falls back too.
+                String docId = (r.documentIdStr() != null && !r.documentIdStr().isBlank())
                     ? r.documentIdStr()
                     : String.valueOf(r.documentId());
 

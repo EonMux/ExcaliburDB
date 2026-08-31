@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
@@ -82,14 +83,70 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
     private final ConcurrentHashMap<String, String> chunkToDocument;
 
     /**
+     * Documents that were tombstoned, and the chunk ids they owned.
+     *
+     * <p>A tombstone is a fact, not an absence. Erasing every trace of a deleted document makes
+     * it indistinguishable from one this registry never saw - and a caller that passes unknown
+     * documents through, which is the only safe reading of unknown, would then show deleted
+     * content again. Remembering costs an id per deletion and is what makes the deletion
+     * enforceable.</p>
+     *
+     * <p>The set grows with deletions and is not reclaimed here; erasure and compaction are what
+     * eventually retire a document's chunks, and a registry rebuilt from them starts clean.</p>
+     */
+    private final Set<String> tombstoned;
+
+    /**
+     * Serializes every write that spans more than one of the three maps.
+     *
+     * <p>The maps are individually concurrent, but a document's epoch, its chunk set and the
+     * reverse chunk index only make sense together. Two writers touching the same document
+     * without this lock interleave their updates: a register racing a tombstone can leave the
+     * epoch removed while the chunk index still points at the document, or the chunk set
+     * replaced while the epoch is the old one. Reads stay lock-free.</p>
+     */
+    private final ReentrantLock mutationLock;
+
+    /**
      * Creates a new empty DocumentVisibilityRegistry.
      */
     public DocumentVisibilityRegistry() {
         this.visibleEpochs = new ConcurrentHashMap<>();
+        this.tombstoned = ConcurrentHashMap.newKeySet();
         this.documentChunks = new ConcurrentHashMap<>();
         this.chunkToDocument = new ConcurrentHashMap<>();
+        this.mutationLock = new ReentrantLock();
         
         LOGGER.debug("DocumentVisibilityRegistry created");
+    }
+
+    /**
+     * Always true: every epoch this registry holds was handed to it by
+     * {@code DocumentBatchPublisher}, which reads it from the node visibility tracker.
+     *
+     * @return true
+     */
+    @Override
+    public boolean sharesNodeEpochClock() {
+        return true;
+    }
+
+    /**
+     * The highest epoch any registered document became visible at.
+     *
+     * <p>This registry keeps no separate epoch counter — it records a per-document epoch as each is
+     * published — so the current epoch is the maximum of those. An empty registry reports 0, which
+     * is the epoch before anything was committed and correctly makes every document invisible.
+     */
+    @Override
+    public long currentEpoch() {
+        long highest = 0L;
+        for (Long epoch : visibleEpochs.values()) {
+            if (epoch != null && epoch > highest) {
+                highest = epoch;
+            }
+        }
+        return highest;
     }
 
     /**
@@ -118,12 +175,20 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
         }
 
         Set<String> immutableChunks = Collections.unmodifiableSet(new HashSet<>(chunkIds));
-        
-        visibleEpochs.put(documentId, visibleEpoch);
-        documentChunks.put(documentId, immutableChunks);
-        
-        for (String chunkId : chunkIds) {
-            chunkToDocument.put(chunkId, documentId);
+
+        mutationLock.lock();
+        try {
+            visibleEpochs.put(documentId, visibleEpoch);
+            documentChunks.put(documentId, immutableChunks);
+            // Re-registering revives a tombstoned id. Leaving the tombstone would make the
+            // document permanently invisible however many times it is written again.
+            tombstoned.remove(documentId);
+
+            for (String chunkId : chunkIds) {
+                chunkToDocument.put(chunkId, documentId);
+            }
+        } finally {
+            mutationLock.unlock();
         }
 
         LOGGER.debug("Document '{}' registered with {} chunks at epoch {}",
@@ -273,15 +338,26 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
     public boolean tombstoneDocument(String documentId) {
         Objects.requireNonNull(documentId, "documentId must not be null");
 
-        Set<String> chunks = documentChunks.remove(documentId);
-        if (chunks != null) {
-            for (String chunkId : chunks) {
-                chunkToDocument.remove(chunkId);
+        Long removed;
+        mutationLock.lock();
+        try {
+            Set<String> chunks = documentChunks.remove(documentId);
+            if (chunks != null) {
+                for (String chunkId : chunks) {
+                    chunkToDocument.remove(chunkId);
+                }
             }
+
+            // The chunk ids go, the document id stays. At chunk level an unrecognised id is
+            // already treated as invisible, so dropping the chunks still enforces the deletion;
+            // at document level the opposite holds -- an unrecognised document is passed
+            // through -- so forgetting the document would put deleted content back into results.
+            removed = visibleEpochs.remove(documentId);
+            tombstoned.add(documentId);
+        } finally {
+            mutationLock.unlock();
         }
-        
-        Long removed = visibleEpochs.remove(documentId);
-        
+
         if (removed != null) {
             LOGGER.debug("Document '{}' tombstoned (was visible at epoch {})", 
                 documentId, removed);
@@ -314,7 +390,8 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
 
         Set<String> immutableChunks = Collections.unmodifiableSet(new HashSet<>(newChunkIds));
         
-        synchronized (this) {
+        mutationLock.lock();
+        try {
             Set<String> oldChunks = documentChunks.get(documentId);
             if (oldChunks != null) {
                 for (String oldChunkId : oldChunks) {
@@ -328,6 +405,8 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
             for (String newChunkId : newChunkIds) {
                 chunkToDocument.put(newChunkId, documentId);
             }
+        } finally {
+            mutationLock.unlock();
         }
 
         LOGGER.debug("Document '{}' replaced with {} chunks at epoch {}",
@@ -342,6 +421,30 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
      */
     public boolean isRegistered(String documentId) {
         return visibleEpochs.containsKey(documentId);
+    }
+
+    /**
+     * Whether this registry knows about the document.
+     *
+     * <p>It holds no in-flight state - a document appears here only once it is published - so
+     * tracked and registered are the same question.
+     *
+     * @param documentId The document ID
+     * @return true if the document is registered
+     */
+    @Override
+    public boolean isDocumentTracked(String documentId) {
+        return isRegistered(documentId) || tombstoned.contains(documentId);
+    }
+
+    /**
+     * Whether a document has been tombstoned.
+     *
+     * @param documentId The document ID
+     * @return true if the document was deleted
+     */
+    public boolean isTombstoned(String documentId) {
+        return tombstoned.contains(documentId);
     }
 
     /**
@@ -378,9 +481,15 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
      * <p>This is typically only used during testing or reset scenarios.</p>
      */
     public void clear() {
-        visibleEpochs.clear();
-        documentChunks.clear();
-        chunkToDocument.clear();
+        mutationLock.lock();
+        try {
+            visibleEpochs.clear();
+            documentChunks.clear();
+            chunkToDocument.clear();
+            tombstoned.clear();
+        } finally {
+            mutationLock.unlock();
+        }
         LOGGER.debug("DocumentVisibilityRegistry cleared");
     }
 

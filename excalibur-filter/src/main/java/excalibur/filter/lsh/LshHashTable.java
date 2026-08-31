@@ -40,14 +40,14 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * BUCKET DIRECTORY (starting at offset 56):
  *   Array of BucketEntry (24 bytes each):
  *   [0:8]   Hash value
- *   [8:16]  EntryOffset (offset into entry storage, 0 if empty)
+ *   [8:16]  EntryOffset (absolute file offset of the first entry, 0 if empty)
  *   [16:20] EntryCount (number of entries in this bucket)
  *   [20:24] Reserved (padding)
  *
  * ENTRY STORAGE (starting at EntryStorageOffset):
  *   Variable-length entry list per bucket:
  *   [0:8]   EntryId
- *   [8:16]  NextEntryOffset (0 if last in bucket)
+ *   [8:16]  NextEntryOffset (absolute file offset, 0 if last in bucket)
  *   [16]    Tombstone (0=active, 1=tombstoned)
  *   [17:24] Reserved (padding)
  * </pre>
@@ -117,6 +117,9 @@ public class LshHashTable implements AutoCloseable {
 
     /** Load factor threshold for growing bucket directory. */
     private static final float LOAD_FACTOR_THRESHOLD = 0.7f;
+
+    /** Chunk size used when relocating the entry-storage region. */
+    private static final int RELOCATION_CHUNK_SIZE = 8192;
 
     /** Value layouts for memory access. */
     private static final ValueLayout.OfInt INT_LAYOUT =
@@ -199,29 +202,39 @@ public class LshHashTable implements AutoCloseable {
      * @param path         Path to the file
      * @param dimensions   Vector dimensionality
      * @param numBits      Number of hash bits
-     * @param seed         Random seed for hash function
+     * @param seed         Random seed for hash function. Ignored when the file already
+     *                     exists: the seed stored in its header wins, because the
+     *                     persisted buckets were filled using that seed.
      * @param initialSize  Initial file size in bytes (0 for default)
      * @throws IOException if the file cannot be created or opened
      */
     public LshHashTable(Path path, int dimensions, int numBits, long seed, long initialSize) throws IOException {
         this.numBits = numBits;
         this.dimensions = dimensions;
-        this.seed = seed;
-        this.hashFunction = new RandomHyperplaneHash(dimensions, numBits, seed);
         this.probeGenerator = new MultiProbeGenerator(numBits);
         this.ownsMappedFile = true;
 
         boolean fileExists = java.nio.file.Files.exists(path) && java.nio.file.Files.size(path) > 0;
 
-        long size = initialSize > 0 ? initialSize : DEFAULT_INITIAL_SIZE;
+        // Never map less than the file already holds: a short mapping hides the tail, and the
+        // next extend() would truncate the file back down to the mapped length.
+        long requestedSize = initialSize > 0 ? initialSize : DEFAULT_INITIAL_SIZE;
+        long size = fileExists ? Math.max(requestedSize, java.nio.file.Files.size(path)) : requestedSize;
         this.mappedFile = MappedFile.create(path, size);
 
         if (fileExists) {
             // Read existing header
             validateHeader();
+            // Rebuild the hash function from the persisted seed. Hashing with the
+            // caller's seed instead would send every vector to a different bucket
+            // than the one holding its entries, silently emptying every query.
+            this.seed = mappedFile.segment().get(LONG_LAYOUT, OFFSET_SEED);
+            this.hashFunction = new RandomHyperplaneHash(dimensions, numBits, this.seed);
             this.entryStorageOffset = new AtomicLong(readEntryStorageOffset());
         } else {
             // Initialize new file
+            this.seed = seed;
+            this.hashFunction = new RandomHyperplaneHash(dimensions, numBits, seed);
             this.entryStorageOffset = new AtomicLong(calculateInitialEntryStorageOffset());
             initializeHeader();
         }
@@ -249,13 +262,27 @@ public class LshHashTable implements AutoCloseable {
      * @param seed       Random seed for hash function
      */
     public LshHashTable(MappedFile mappedFile, int dimensions, int numBits, long seed) {
+        this(mappedFile, dimensions, numBits, seed, false);
+    }
+
+    /**
+     * Creates a new LshHashTable backed by an existing MappedFile, stating who owns it.
+     *
+     * @param mappedFile     The mapped file to use
+     * @param dimensions     Vector dimensionality
+     * @param numBits        Number of hash bits
+     * @param seed           Random seed for hash function
+     * @param ownsMappedFile true when {@link #close()} must release the mapping
+     */
+    private LshHashTable(MappedFile mappedFile, int dimensions, int numBits, long seed,
+                         boolean ownsMappedFile) {
         this.numBits = numBits;
         this.dimensions = dimensions;
         this.seed = seed;
         this.hashFunction = new RandomHyperplaneHash(dimensions, numBits, seed);
         this.probeGenerator = new MultiProbeGenerator(numBits);
         this.mappedFile = mappedFile;
-        this.ownsMappedFile = false;
+        this.ownsMappedFile = ownsMappedFile;
 
         if (mappedFile.size() < HEADER_SIZE) {
             throw new IllegalArgumentException("MappedFile too small for LSH hash table");
@@ -376,16 +403,25 @@ public class LshHashTable implements AutoCloseable {
                 // Bucket directory is full, need to grow
                 growBucketDirectory();
                 bucketOffset = findOrCreateBucket(hash);
+
+                if (bucketOffset < 0) {
+                    // Doubling always exposes a never-occupied slot, so this cannot happen;
+                    // fail loudly rather than write the entry at a negative offset.
+                    throw new IllegalStateException(
+                        "Bucket directory still full after growing it");
+                }
             }
+
+            // Allocate first: allocateEntry() can extend the file, and MappedFile.extend()
+            // installs a brand new mapping, which closes the arena backing any segment
+            // captured before the call. Every access below therefore uses a fresh segment.
+            long newEntryOffset = allocateEntry();
 
             MemorySegment segment = mappedFile.segment();
 
             // Read current entry count and first entry offset
             int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
             long firstEntryOffset = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
-
-            // Allocate new entry
-            long newEntryOffset = allocateEntry();
 
             // Write new entry
             segment.set(LONG_LAYOUT, newEntryOffset + ENTRY_ID, entryId);
@@ -408,6 +444,13 @@ public class LshHashTable implements AutoCloseable {
     /**
      * Finds or creates a bucket for the given hash.
      *
+     * <p>The probe run for a hash ends at the first never-occupied slot
+     * ({@code hash == 0 && count == 0}), which is exactly the terminator every read path
+     * uses. A slot emptied by deletion keeps its hash and must therefore not be claimed
+     * for a different hash until the run has been walked to that terminator - claiming it
+     * early would leave two directory slots carrying the same hash, and the readers stop
+     * at the first one.</p>
+     *
      * @param hash The hash value
      * @return Offset to the bucket entry, or -1 if bucket directory is full
      */
@@ -417,6 +460,7 @@ public class LshHashTable implements AutoCloseable {
         long bucketCount = segment.get(LONG_LAYOUT, OFFSET_BUCKET_COUNT);
 
         int startIndex = (int) ((hash & 0x7FFFFFFFFFFFFFFFL) % bucketDirCapacity);
+        long reusableOffset = -1; // First slot emptied by deletion, reused only as a fallback
 
         // Linear probe to find the bucket
         for (int i = 0; i < bucketDirCapacity; i++) {
@@ -426,65 +470,92 @@ public class LshHashTable implements AutoCloseable {
             long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
             int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
 
-            if (bucketEntryCount == 0) {
-                // Empty slot - create new bucket
-                segment.set(LONG_LAYOUT, bucketOffset + BUCKET_HASH, hash);
-                segment.set(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET, 0L);
-                segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, 0);
-                segment.set(INT_LAYOUT, bucketOffset + BUCKET_RESERVED, 0);
+            if (bucketHash == 0 && bucketEntryCount == 0) {
+                // Never-occupied slot: the hash is provably absent from this probe run,
+                // so a slot emptied earlier in the run can now be safely recycled.
+                long target = reusableOffset >= 0 ? reusableOffset : bucketOffset;
+                initializeBucket(segment, target, hash);
 
-                // Update bucket count if this is a new bucket
                 if (bucketCount < bucketDirCapacity) {
                     segment.set(LONG_LAYOUT, OFFSET_BUCKET_COUNT, bucketCount + 1);
                 }
 
-                return bucketOffset;
+                return target;
             }
 
             if (bucketHash == hash) {
-                // Found existing bucket
+                // Found existing bucket. When it was emptied by deletion it is about to
+                // become occupied again, so it counts as a live bucket once more.
+                if (bucketEntryCount == 0 && bucketCount < bucketDirCapacity) {
+                    segment.set(LONG_LAYOUT, OFFSET_BUCKET_COUNT, bucketCount + 1);
+                }
                 return bucketOffset;
             }
+
+            if (bucketEntryCount == 0 && reusableOffset < 0) {
+                // Emptied by deletion - remember it, but keep probing for a real match.
+                reusableOffset = bucketOffset;
+            }
+        }
+
+        // The run never reached a never-occupied slot. Recycle an emptied slot if the
+        // scan found one, otherwise the directory is genuinely full.
+        if (reusableOffset >= 0) {
+            initializeBucket(segment, reusableOffset, hash);
+            if (bucketCount < bucketDirCapacity) {
+                segment.set(LONG_LAYOUT, OFFSET_BUCKET_COUNT, bucketCount + 1);
+            }
+            return reusableOffset;
         }
 
         return -1; // Bucket directory is full
     }
 
     /**
+     * Claims a directory slot for a hash, discarding whatever it held before.
+     */
+    private static void initializeBucket(MemorySegment segment, long bucketOffset, long hash) {
+        segment.set(LONG_LAYOUT, bucketOffset + BUCKET_HASH, hash);
+        segment.set(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET, 0L);
+        segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, 0);
+        segment.set(INT_LAYOUT, bucketOffset + BUCKET_RESERVED, 0);
+    }
+
+    /**
      * Grows the bucket directory by doubling its capacity.
+     *
+     * <p>The entry-storage region starts immediately behind the directory, so doubling
+     * the directory relocates it. Bucket-to-entry and entry-to-next links are absolute
+     * file offsets, therefore every one of them is rebased by the relocation delta. Skipping
+     * the rebase would leave every chain pointing into the rewritten directory, where the
+     * walk in {@link #collectEntriesFromBucket} would read bucket rows as entry records.</p>
      */
     private void growBucketDirectory() throws IOException {
         MemorySegment segment = mappedFile.segment();
         long oldCapacity = segment.get(LONG_LAYOUT, OFFSET_BUCKET_DIR_CAPACITY);
         long newCapacity = oldCapacity * 2;
 
-        // Calculate new size needed
-        long oldBucketDirEnd = HEADER_SIZE + oldCapacity * BUCKET_ENTRY_SIZE;
         long oldEntryStorageOffset = segment.get(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET);
         long entryStorageSize = entryStorageOffset.get() - oldEntryStorageOffset;
 
-        long newBucketDirEnd = HEADER_SIZE + newCapacity * BUCKET_ENTRY_SIZE;
-        long newEntryStorageOffset = newBucketDirEnd;
+        long newEntryStorageOffset = HEADER_SIZE + newCapacity * BUCKET_ENTRY_SIZE;
+        long relocationDelta = newEntryStorageOffset - oldEntryStorageOffset;
         long newFileSize = newEntryStorageOffset + entryStorageSize + DEFAULT_INITIAL_SIZE;
 
-        // Extend file
-        mappedFile.extend(newFileSize - mappedFile.size());
-        segment = mappedFile.segment(); // Refresh segment reference
+        // Snapshot the directory before anything moves.
+        BucketSnapshot snapshot = snapshotBuckets(segment, oldCapacity);
 
-        // Move entry storage to new location
+        // Extend only when the mapping is genuinely too small: allocateEntry() grows the
+        // file in doublings, so it is frequently already large enough, and MappedFile.extend()
+        // rejects a negative extension.
+        if (newFileSize > mappedFile.size()) {
+            mappedFile.extend(newFileSize - mappedFile.size());
+            segment = mappedFile.segment(); // extend() remaps; the previous segment is dead
+        }
+
         if (entryStorageSize > 0) {
-            // Copy entry storage from old location to new location
-            byte[] buffer = new byte[(int) Math.min(entryStorageSize, 8192)];
-            long readOffset = oldEntryStorageOffset;
-            long writeOffset = newEntryStorageOffset;
-
-            while (readOffset < oldEntryStorageOffset + entryStorageSize) {
-                int chunkSize = (int) Math.min(buffer.length, oldEntryStorageOffset + entryStorageSize - readOffset);
-                MemorySegment.copy(segment, BYTE_LAYOUT, readOffset, buffer, 0, chunkSize);
-                MemorySegment.copy(buffer, 0, segment, BYTE_LAYOUT, writeOffset, chunkSize);
-                readOffset += chunkSize;
-                writeOffset += chunkSize;
-            }
+            relocateEntryStorage(segment, oldEntryStorageOffset, newEntryStorageOffset, entryStorageSize);
+            rebaseEntryLinks(segment, newEntryStorageOffset, entryStorageSize, relocationDelta);
         }
 
         // Update entry storage offset
@@ -495,27 +566,86 @@ public class LshHashTable implements AutoCloseable {
         segment.set(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET, newEntryStorageOffset);
 
         // Rehash all buckets
-        rehashBuckets(oldCapacity, newCapacity);
+        rehashBuckets(segment, snapshot, newCapacity, relocationDelta);
     }
 
     /**
-     * Rehashes all buckets after growing the directory.
+     * The bucket directory rows captured before a relocation.
      */
-    private void rehashBuckets(long oldCapacity, long newCapacity) {
-        MemorySegment segment = mappedFile.segment();
+    private record BucketSnapshot(long[] hashes, long[] entryOffsets, int[] entryCounts) {
+    }
 
-        // Create temporary storage for old buckets
-        long[] oldHashes = new long[(int) oldCapacity];
-        long[] oldEntryOffsets = new long[(int) oldCapacity];
-        int[] oldEntryCounts = new int[(int) oldCapacity];
+    /**
+     * Copies the bucket directory into heap arrays so the relocation and the rewrite of the
+     * enlarged directory cannot destroy the rows still to be re-inserted.
+     */
+    private static BucketSnapshot snapshotBuckets(MemorySegment segment, long capacity) {
+        long[] hashes = new long[(int) capacity];
+        long[] entryOffsets = new long[(int) capacity];
+        int[] entryCounts = new int[(int) capacity];
 
-        for (int i = 0; i < oldCapacity; i++) {
+        for (int i = 0; i < capacity; i++) {
             long bucketOffset = HEADER_SIZE + (long) i * BUCKET_ENTRY_SIZE;
-            oldHashes[i] = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
-            oldEntryOffsets[i] = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
-            oldEntryCounts[i] = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
+            hashes[i] = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
+            entryOffsets[i] = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
+            entryCounts[i] = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
         }
 
+        return new BucketSnapshot(hashes, entryOffsets, entryCounts);
+    }
+
+    /**
+     * Moves the entry-storage region to a higher offset.
+     *
+     * <p>Source and destination overlap whenever the directory grows by less than the size
+     * of the region, so the copy runs from the high end downwards and never writes over
+     * bytes it has not read yet.</p>
+     *
+     * @param fromOffset Current start of the region
+     * @param toOffset   New start of the region; must not be below {@code fromOffset}
+     * @param size       Region size in bytes
+     */
+    private static void relocateEntryStorage(MemorySegment segment, long fromOffset,
+                                             long toOffset, long size) {
+        byte[] buffer = new byte[(int) Math.min(size, RELOCATION_CHUNK_SIZE)];
+        long copied = 0;
+
+        while (copied < size) {
+            int chunkSize = (int) Math.min(buffer.length, size - copied);
+            long readOffset = fromOffset + size - copied - chunkSize;
+            long writeOffset = toOffset + size - copied - chunkSize;
+
+            MemorySegment.copy(segment, BYTE_LAYOUT, readOffset, buffer, 0, chunkSize);
+            MemorySegment.copy(buffer, 0, segment, BYTE_LAYOUT, writeOffset, chunkSize);
+            copied += chunkSize;
+        }
+    }
+
+    /**
+     * Adds the relocation delta to every non-zero next-entry link inside the relocated region.
+     * Records are fixed size and densely bump-allocated, so the region can be walked directly.
+     */
+    private static void rebaseEntryLinks(MemorySegment segment, long regionOffset,
+                                         long regionSize, long delta) {
+        long regionEnd = regionOffset + regionSize;
+
+        for (long offset = regionOffset; offset + ENTRY_SIZE <= regionEnd; offset += ENTRY_SIZE) {
+            long next = segment.get(LONG_LAYOUT, offset + ENTRY_NEXT_OFFSET);
+            if (next != 0) {
+                segment.set(LONG_LAYOUT, offset + ENTRY_NEXT_OFFSET, next + delta);
+            }
+        }
+    }
+
+    /**
+     * Rehashes the snapshotted buckets into the enlarged directory.
+     *
+     * <p>Chain heads are rebased by the same delta the entry region moved by. Slots that were
+     * emptied by deletion are dropped rather than re-inserted, which compacts the directory
+     * and shortens every probe run; the header bucket count is recomputed to match.</p>
+     */
+    private static void rehashBuckets(MemorySegment segment, BucketSnapshot snapshot,
+                                      long newCapacity, long relocationDelta) {
         // Clear all buckets
         for (int i = 0; i < newCapacity; i++) {
             long bucketOffset = HEADER_SIZE + (long) i * BUCKET_ENTRY_SIZE;
@@ -524,26 +654,36 @@ public class LshHashTable implements AutoCloseable {
             segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, 0);
         }
 
+        long occupied = 0;
+
         // Re-insert non-empty buckets
-        for (int i = 0; i < oldCapacity; i++) {
-            if (oldEntryCounts[i] > 0) {
-                int newIndex = (int) ((oldHashes[i] & 0x7FFFFFFFFFFFFFFFL) % newCapacity);
+        for (int i = 0; i < snapshot.entryCounts().length; i++) {
+            if (snapshot.entryCounts()[i] <= 0) {
+                continue;
+            }
 
-                // Linear probe to find empty slot
-                for (int j = 0; j < newCapacity; j++) {
-                    int index = (int) ((newIndex + j) % newCapacity);
-                    long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
-                    int count = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
+            long hash = snapshot.hashes()[i];
+            long entryOffset = snapshot.entryOffsets()[i];
+            long rebasedEntryOffset = entryOffset == 0 ? 0 : entryOffset + relocationDelta;
+            int newIndex = (int) ((hash & 0x7FFFFFFFFFFFFFFFL) % newCapacity);
 
-                    if (count == 0) {
-                        segment.set(LONG_LAYOUT, bucketOffset + BUCKET_HASH, oldHashes[i]);
-                        segment.set(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET, oldEntryOffsets[i]);
-                        segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, oldEntryCounts[i]);
-                        break;
-                    }
+            // Linear probe to find empty slot
+            for (int j = 0; j < newCapacity; j++) {
+                int index = (int) ((newIndex + j) % newCapacity);
+                long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
+                int count = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
+
+                if (count == 0) {
+                    segment.set(LONG_LAYOUT, bucketOffset + BUCKET_HASH, hash);
+                    segment.set(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET, rebasedEntryOffset);
+                    segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, snapshot.entryCounts()[i]);
+                    occupied++;
+                    break;
                 }
             }
         }
+
+        segment.set(LONG_LAYOUT, OFFSET_BUCKET_COUNT, occupied);
     }
 
     /**
@@ -625,14 +765,15 @@ public class LshHashTable implements AutoCloseable {
             int index = (int) ((startIndex + i) % bucketDirCapacity);
             long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
 
+            long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
             int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
 
-            if (bucketEntryCount == 0) {
-                // Empty slot - bucket not found
+            if (bucketHash == 0 && bucketEntryCount == 0) {
+                // Never-occupied slot - bucket not found.
+                // Note: a slot with hash!=0 but count==0 was emptied by deletion
+                // and must NOT terminate the probe (items may exist past it).
                 return;
             }
-
-            long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
             if (bucketHash == hash) {
                 // Found bucket - collect all entries
                 long entryOffset = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
@@ -775,13 +916,13 @@ public class LshHashTable implements AutoCloseable {
                 int index = (int) ((startIndex + i) % bucketDirCapacity);
                 long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
 
+                long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
                 int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
 
-                if (bucketEntryCount == 0) {
-                    return false; // Bucket not found
+                if (bucketHash == 0 && bucketEntryCount == 0) {
+                    return false; // Never-occupied slot - bucket not found
                 }
 
-                long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
                 if (bucketHash == hash) {
                     // Found bucket - search for entry
                     long entryOffset = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
@@ -843,13 +984,13 @@ public class LshHashTable implements AutoCloseable {
                 int index = (int) ((startIndex + i) % bucketDirCapacity);
                 long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
 
+                long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
                 int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
 
-                if (bucketEntryCount == 0) {
-                    return false;
+                if (bucketHash == 0 && bucketEntryCount == 0) {
+                    return false; // Never-occupied slot
                 }
 
-                long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
                 if (bucketHash == hash) {
                     long entryOffset = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
 
@@ -952,9 +1093,12 @@ public class LshHashTable implements AutoCloseable {
                 segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, 0);
             }
 
-            // Reset entry storage offset
-            entryStorageOffset.set(calculateInitialEntryStorageOffset());
-            segment.set(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET, entryStorageOffset.get());
+            // Restart the bump allocator behind the CURRENT directory. The directory may
+            // have been grown past its initial capacity, and resetting to the initial end
+            // would hand out entry offsets that land on top of live directory slots.
+            long entryStorageBase = HEADER_SIZE + bucketDirCapacity * BUCKET_ENTRY_SIZE;
+            entryStorageOffset.set(entryStorageBase);
+            segment.set(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET, entryStorageBase);
 
         } finally {
             lock.writeLock().unlock();
@@ -1185,8 +1329,9 @@ public class LshHashTable implements AutoCloseable {
         int dimensions = segment.get(INT_LAYOUT, OFFSET_DIMENSIONS);
         long seed = segment.get(LONG_LAYOUT, OFFSET_SEED);
 
-        // Create new table using the existing MappedFile
-        LshHashTable table = new LshHashTable(mappedFile, dimensions, numBits, seed);
+        // Create new table using the existing MappedFile. load() opened it, so the
+        // returned table owns it and close() must release the mapping and descriptor.
+        LshHashTable table = new LshHashTable(mappedFile, dimensions, numBits, seed, true);
 
         // Read entry storage offset
         if (version == VERSION) {

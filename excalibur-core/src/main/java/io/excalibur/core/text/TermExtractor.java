@@ -185,8 +185,10 @@ public final class TermExtractor {
         // Strip punctuation from boundaries
         String term = stripPunctuation(rawTerm);
 
-        // Convert to lowercase
-        term = term.toLowerCase();
+        // Convert to lowercase with a fixed locale: the default locale would make
+        // tokenization JVM-dependent (Turkish 'I' maps to a dotless i), silently
+        // desynchronizing persisted term filters from the terms a query produces.
+        term = term.toLowerCase(java.util.Locale.ROOT);
 
         // Check minimum length
         if (term.length() < minTermLength) {

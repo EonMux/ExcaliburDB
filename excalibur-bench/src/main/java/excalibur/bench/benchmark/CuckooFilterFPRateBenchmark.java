@@ -106,13 +106,33 @@ public class CuckooFilterFPRateBenchmark {
      */
     public static final double MAX_ACCEPTABLE_FP_RATE = 0.001; // 0.1%
 
+    /**
+     * Maximum allowed difference between the requested and the realized load factor.
+     */
+    public static final double LOAD_FACTOR_TOLERANCE = 0.005;
+
+    /**
+     * Number of standard errors of headroom allowed before the measured FP rate is
+     * treated as a genuine specification breach rather than sampling noise.
+     */
+    private static final double FP_RATE_SIGMA_ALLOWANCE = 3.0;
+
+    /**
+     * Load factor at and above which the FP-rate specification is enforced.
+     */
+    private static final double SPEC_LOAD_FACTOR = 0.95;
+
     @Setup(Level.Trial)
     public void setup() {
         // Create the filter with specified capacity and fingerprint bits
         filter = CuckooFilter.create(capacity, fingerprintBits);
 
-        // Calculate how many entries to insert for target load factor
-        insertedCount = (long) (capacity * targetLoadFactor);
+        // Derive the insert count from the REALIZED capacity, not the requested one.
+        // CuckooFilter.create rounds the bucket count up to a power of two, so a
+        // requested 2,000,000 becomes 2,097,152 slots: inserting
+        // requestedCapacity * targetLoadFactor would measure the filter at a materially
+        // lower load factor than the one this run is named after.
+        insertedCount = (long) (filter.capacity() * targetLoadFactor);
 
         // Pre-generate and insert keys
         byte[][] insertedKeys = new byte[(int) insertedCount][];
@@ -161,12 +181,21 @@ public class CuckooFilterFPRateBenchmark {
         double effectiveSlots = 2 * 4 * loadFactor; // 2 buckets × 4 fingerprints × load
         expectedFPRate = 1 - Math.pow(1 - fpPerFingerprint, effectiveSlots);
 
+        // The realized load factor must be the one this run claims to measure.
+        if (Math.abs(loadFactor - targetLoadFactor) > LOAD_FACTOR_TOLERANCE) {
+            throw new IllegalStateException(String.format(
+                "Realized load factor %.4f differs from the target %.4f by more than %.4f; "
+                    + "the measurement would not describe the operating point it is named after.",
+                loadFactor, targetLoadFactor, LOAD_FACTOR_TOLERANCE));
+        }
+
         // Log setup information
         System.out.println("========================================");
         System.out.println("Cuckoo Filter FP Rate Benchmark Setup");
         System.out.println("========================================");
         System.out.println("  Target load factor: " + targetLoadFactor);
         System.out.println("  Actual load factor: " + String.format("%.4f", loadFactor));
+        System.out.println("  Realized capacity: " + filter.capacity());
         System.out.println("  Capacity: " + capacity);
         System.out.println("  Inserted entries: " + successfulInserts);
         System.out.println("  Fingerprint bits: " + fingerprintBits);
@@ -179,6 +208,54 @@ public class CuckooFilterFPRateBenchmark {
 
         // Initialize query index
         queryIndex = 0;
+    }
+
+    /**
+     * Enforces the FP-rate specification at the end of the trial.
+     *
+     * <p>The FP rate is not a JMH score - this class is scored in ns/op - so without
+     * this check nothing in the pipeline could ever fail on it. The measurement sweeps
+     * the whole miss-key pool once and is compared against the spec with a
+     * {@value #FP_RATE_SIGMA_ALLOWANCE}-sigma allowance for binomial sampling noise, so
+     * a genuine breach fails while a borderline sample does not flake.</p>
+     *
+     * <p>Only the high-load configurations are gated: the lower load factors exist to
+     * chart how the FP rate grows and are not covered by the specification.</p>
+     */
+    @TearDown(Level.Trial)
+    public void enforceFPRateSpecification() {
+        if (filter == null || nonInsertedKeys == null || nonInsertedKeys.length == 0) {
+            return;
+        }
+
+        long falsePositives = 0;
+        for (byte[] key : nonInsertedKeys) {
+            if (filter.contains(key)) {
+                falsePositives++;
+            }
+        }
+        long queries = nonInsertedKeys.length;
+        double measuredFPRate = (double) falsePositives / queries;
+
+        System.out.println(String.format(
+            "Measured FP rate at load factor %.4f: %.6f (%.4f%%) over %d miss queries "
+                + "(theoretical %.6f)",
+            filter.loadFactor(), measuredFPRate, measuredFPRate * 100, queries, expectedFPRate));
+
+        if (targetLoadFactor < SPEC_LOAD_FACTOR) {
+            return;
+        }
+
+        double standardError = Math.sqrt(
+            Math.max(measuredFPRate * (1 - measuredFPRate), Double.MIN_NORMAL) / queries);
+        double threshold = MAX_ACCEPTABLE_FP_RATE + FP_RATE_SIGMA_ALLOWANCE * standardError;
+        if (measuredFPRate > threshold) {
+            throw new IllegalStateException(String.format(
+                "False positive rate %.6f (%.4f%%) at load factor %.4f exceeds the "
+                    + "%.4f%% specification beyond %.0f standard errors (threshold %.6f).",
+                measuredFPRate, measuredFPRate * 100, filter.loadFactor(),
+                MAX_ACCEPTABLE_FP_RATE * 100, FP_RATE_SIGMA_ALLOWANCE, threshold));
+        }
     }
 
     /**

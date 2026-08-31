@@ -1,5 +1,7 @@
 package excalibur.bench;
 
+import java.util.Locale;
+
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
@@ -52,7 +54,7 @@ public class BenchmarkRunner {
         String benchmarkPattern = ".*Benchmark.*"; // Default: run all benchmarks
 
         if (args.length > 0) {
-            String benchmarkName = args[0].toLowerCase();
+            String benchmarkName = args[0].toLowerCase(Locale.ROOT);
             if (benchmarkName.contains("segment")) {
                 benchmarkPattern = ".*SegmentBenchmark.*";
             } else if (benchmarkName.contains("cuckoo") && benchmarkName.contains("insert")) {

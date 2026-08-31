@@ -41,6 +41,16 @@ public final class DocumentVisibilityTrackerAdapter implements DocumentVisibilit
     }
 
     @Override
+    public boolean sharesNodeEpochClock() {
+        return tracker.sharesNodeEpochClock();
+    }
+
+    @Override
+    public boolean isDocumentTracked(String documentId) {
+        return tracker.isDocumentTracked(documentId);
+    }
+
+    @Override
     public boolean isDocumentVisible(String documentId, long queryEpoch) {
         return tracker.isDocumentFullyVisible(documentId, queryEpoch);
     }
@@ -58,6 +68,11 @@ public final class DocumentVisibilityTrackerAdapter implements DocumentVisibilit
     @Override
     public Set<String> getVisibleDocuments(long queryEpoch) {
         return tracker.getVisibleDocuments(queryEpoch);
+    }
+
+    @Override
+    public long currentEpoch() {
+        return tracker.currentEpoch();
     }
 
     @Override

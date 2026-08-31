@@ -432,26 +432,70 @@ class BenchmarkResultCaptureTest {
     }
 
     @Test
-    void benchmarkTargetRegistry_shouldHaveCuckooFilterFPRateTarget() {
-        BenchmarkTargetRegistry.TargetConfig target =
-            BenchmarkTargetRegistry.getTarget("excalibur.bench.benchmark.CuckooFilterFPRateBenchmark.measureFpRate");
-
-        assertThat(target).isNotNull();
-        assertThat(target.higherIsBetter()).isFalse();  // Lower is better for FP rate
-        assertThat(target.isMet(0.0005)).isTrue();      // 0.05% < 0.1%
-        assertThat(target.isMet(0.002)).isFalse();      // 0.2% > 0.1%
+    void benchmarkTargetRegistry_shouldNotAttachFpRateTargetToATimeModeBenchmark() {
+        // CuckooFilterFPRateBenchmark runs in AverageTime mode, so its JMH score is
+        // ns/op. A 0.001 "rate" target on that score can never be met and says nothing
+        // about the filter. The FP rate itself is enforced in the benchmark's own
+        // trial teardown and in CuckooFilterFPRateBenchmarkTest.
+        assertThat(BenchmarkTargetRegistry.getTargets(
+            "excalibur.bench.benchmark.CuckooFilterFPRateBenchmark.measureFPRateBatch"))
+            .isEmpty();
     }
 
     @Test
-    void benchmarkTargetRegistry_shouldHaveHnswRecallTarget() {
+    void benchmarkTargetRegistry_shouldNotAttachRecallTargetToATimeModeBenchmark() {
+        // Same reasoning for recall: HnswRecallBenchmark reports ms/op, so a 0.99
+        // recall target on its primary score was comparing milliseconds to a ratio.
+        assertThat(BenchmarkTargetRegistry.getTargets(
+            "excalibur.bench.benchmark.HnswRecallBenchmark.measureRecall"))
+            .isEmpty();
+    }
+
+    @Test
+    void benchmarkTargetRegistry_hnswSearchLatencyTargetIsInMilliseconds() {
         BenchmarkTargetRegistry.TargetConfig target =
-            BenchmarkTargetRegistry.getTarget("excalibur.bench.benchmark.HnswRecallBenchmark.measureRecall");
+            BenchmarkTargetRegistry.getTarget("excalibur.bench.benchmark.HnswRecallBenchmark.searchLatency");
 
         assertThat(target).isNotNull();
-        assertThat(target.targetValue()).isEqualTo(0.99);  // 99% recall
-        assertThat(target.higherIsBetter()).isTrue();
-        assertThat(target.isMet(0.995)).isTrue();  // 99.5% >= 99%
-        assertThat(target.isMet(0.95)).isFalse();  // 95% < 99%
+        assertThat(target.higherIsBetter()).isFalse();
+        assertThat(MetricUnits.dimensionOf(target.unit()))
+            .isEqualTo(MetricUnits.Dimension.TIME_PER_OP);
+        assertThat(target.isMet(5.0)).isTrue();
+        assertThat(target.isMet(50.0)).isFalse();
+    }
+
+    @Test
+    void benchmarkResult_shouldNotEvaluateATargetWhoseUnitDoesNotMatchTheMeasurement() {
+        BenchmarkResult result = BenchmarkResult.builder()
+            .benchmarkName("test.benchmark.Latency.measure")
+            .mode("avgt")
+            .primaryScore(12.0)
+            .primaryScoreUnit("ms/op")
+            .higherIsBetter(false)
+            .addTarget(new BenchmarkTargetRegistry.TargetConfig(
+                ".*", BenchmarkTargetRegistry.PRIMARY_METRIC, 0.99, true, "recall", null,
+                "recall target on a latency benchmark"))
+            .build();
+
+        assertThat(result.hasTarget()).isTrue();
+        assertThat(result.hasUnevaluatedTarget()).isTrue();
+        assertThat(result.meetsTarget())
+            .as("an unevaluated target must never be reported as met")
+            .isFalse();
+        assertThat(result.targetEvaluations().get(0).detail()).contains("incompatible");
+    }
+
+    @Test
+    void benchmarkResultSet_shouldNotReportAnEmptyRunAsPassed() {
+        BenchmarkResultSet empty = BenchmarkResultSet.builder()
+            .name("empty run")
+            .build();
+
+        assertThat(empty.resultCount()).isZero();
+        assertThat(empty.allPassed())
+            .as("a run that measured nothing has proved nothing")
+            .isFalse();
+        assertThat(empty.passRate()).isZero();
     }
 
     @Test
@@ -564,19 +608,17 @@ class BenchmarkResultCaptureTest {
 
     @Test
     void domainCorrectness_recallShouldBeBetweenZeroAndOne() {
-        BenchmarkTargetRegistry.TargetConfig target =
-            BenchmarkTargetRegistry.getTarget("excalibur.bench.benchmark.HnswRecallBenchmark.measureRecall");
-
-        // Recall target should be in [0, 1]
-        assertThat(target.targetValue()).isBetween(0.0, 1.0);
+        // The recall requirement lives with the code that can act on it.
+        assertThat(RecallValidator.TARGET_RECALL_10).isBetween(0.0, 1.0);
+        assertThat(excalibur.bench.benchmark.HnswRecallBenchmark.TARGET_RECALL_10)
+            .isEqualTo(RecallValidator.TARGET_RECALL_10);
     }
 
     @Test
     void domainCorrectness_fpRateShouldBeLow() {
-        BenchmarkTargetRegistry.TargetConfig target =
-            BenchmarkTargetRegistry.getTarget("excalibur.bench.benchmark.CuckooFilterFPRateBenchmark.measureFpRate");
-
-        // FP rate target should be low (≤0.1% = 0.001)
-        assertThat(target.targetValue()).isLessThanOrEqualTo(0.001);
+        // FP rate spec is 0.1%.
+        assertThat(FPRateValidator.MAX_FP_RATE).isLessThanOrEqualTo(0.001);
+        assertThat(excalibur.bench.benchmark.CuckooFilterFPRateBenchmark.MAX_ACCEPTABLE_FP_RATE)
+            .isEqualTo(FPRateValidator.MAX_FP_RATE);
     }
 }

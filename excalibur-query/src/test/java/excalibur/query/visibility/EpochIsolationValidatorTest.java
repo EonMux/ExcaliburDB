@@ -1,5 +1,6 @@
 package excalibur.query.visibility;
 
+import excalibur.shard.visibility.EpochIsolationValidator;
 import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -56,16 +57,23 @@ class EpochIsolationValidatorTest {
         }
 
         @Test
-        @DisplayName("registers multiple nodes with same visibility epoch")
+        @DisplayName("registers a batch of nodes with one visibility epoch")
         void registersMultipleNodes() {
-            Set<Long> nodeIds = Set.of(1L, 2L, 3L, 4L, 5L);
-            validator.registerNodes(nodeIds, 10L);
+            // A batch is registered by its FIRST node ID: an insertion batch allocates a
+            // contiguous ascending block, so one checkpoint covers all of it. Registering
+            // through the unordered Set overload cannot express that - the batch's lowest
+            // ID is whichever element the set happens to yield first.
+            long segmentId = 0L;
+            validator.registerNodeRange(segmentId, 1L, 10L);
 
-            for (Long nodeId : nodeIds) {
-                assertThat(validator.isNodeVisible(nodeId, 10L)).isTrue();
-                assertThat(validator.isNodeVisible(nodeId, 11L)).isTrue();
-                assertThat(validator.isNodeVisible(nodeId, 9L)).isFalse();
+            for (long nodeId = 1L; nodeId <= 5L; nodeId++) {
+                assertThat(validator.isNodeVisible(segmentId, nodeId, 10L)).isTrue();
+                assertThat(validator.isNodeVisible(segmentId, nodeId, 11L)).isTrue();
+                assertThat(validator.isNodeVisible(segmentId, nodeId, 9L)).isFalse();
             }
+
+            // Node 0 predates the batch, so it is visible at every epoch
+            assertThat(validator.isNodeVisible(segmentId, 0L, 9L)).isTrue();
         }
 
         @Test
@@ -213,33 +221,35 @@ class EpochIsolationValidatorTest {
         @Test
         @DisplayName("filters results based on visibility epoch")
         void filtersBasedOnVisibilityEpoch() {
-            // Register nodes with different visibility epochs
-            validator.registerNode(1L, 5L);   // Visible at epoch 5+
-            validator.registerNode(2L, 10L);  // Visible at epoch 10+
-            validator.registerNode(3L, 15L);  // Visible at epoch 15+
-            // Node 4 not registered (should be visible)
+            // Visibility is tracked as node-ID RANGES, not per node: a checkpoint at node
+            // N says "every node from N upward became visible at this epoch", which is how
+            // HNSW insertion allocates IDs. So node 4 inherits node 3's epoch, and node 0
+            // - below every checkpoint - predates them all.
+            validator.registerNode(1L, 5L);   // Nodes 1..1 visible at epoch 5+
+            validator.registerNode(2L, 10L);  // Nodes 2..2 visible at epoch 10+
+            validator.registerNode(3L, 15L);  // Nodes 3 and up visible at epoch 15+
 
             List<HnswSearchResult> results = new ArrayList<>();
+            results.add(createResult(0L, 0.0f));
             results.add(createResult(1L, 0.1f));
             results.add(createResult(2L, 0.2f));
             results.add(createResult(3L, 0.3f));
             results.add(createResult(4L, 0.4f));
 
-            // Query at epoch 8 should see nodes 1 and 4 only
+            // Query at epoch 8 sees the pre-existing node 0 and node 1
             List<HnswSearchResult> filtered8 = validator.filterResults(results, 8L);
-            assertThat(filtered8).hasSize(2);
             assertThat(filtered8.stream().map(HnswSearchResult::nodeId))
-                .containsExactlyInAnyOrder(1L, 4L);
+                .containsExactlyInAnyOrder(0L, 1L);
 
-            // Query at epoch 12 should see nodes 1, 2, and 4
+            // Query at epoch 12 additionally sees node 2
             List<HnswSearchResult> filtered12 = validator.filterResults(results, 12L);
-            assertThat(filtered12).hasSize(3);
             assertThat(filtered12.stream().map(HnswSearchResult::nodeId))
-                .containsExactlyInAnyOrder(1L, 2L, 4L);
+                .containsExactlyInAnyOrder(0L, 1L, 2L);
 
-            // Query at epoch 20 should see all nodes
+            // Query at epoch 20 sees everything, including node 4 which the last
+            // checkpoint covers
             List<HnswSearchResult> filtered20 = validator.filterResults(results, 20L);
-            assertThat(filtered20).hasSize(4);
+            assertThat(filtered20).hasSize(5);
         }
 
         @Test
@@ -385,18 +395,21 @@ class EpochIsolationValidatorTest {
     class Statistics {
 
         @Test
-        @DisplayName("tracks registered node count")
-        void tracksNodeCount() {
-            assertThat(validator.getRegisteredNodeCount()).isEqualTo(0);
+        @DisplayName("tracks visibility checkpoint count")
+        void tracksCheckpointCount() {
+            assertThat(validator.getCheckpointCount()).isEqualTo(0);
 
             validator.registerNode(1L, 5L);
-            assertThat(validator.getRegisteredNodeCount()).isEqualTo(1);
+            assertThat(validator.getCheckpointCount()).isEqualTo(1);
 
+            // Nodes registered at one epoch form ONE contiguous range, so they cost a
+            // single checkpoint no matter how many nodes they cover. That is what bounds
+            // the validator's memory as a graph grows.
             validator.registerNodes(Set.of(2L, 3L, 4L), 10L);
-            assertThat(validator.getRegisteredNodeCount()).isEqualTo(4);
+            assertThat(validator.getCheckpointCount()).isEqualTo(2);
 
             validator.unregisterNode(1L);
-            assertThat(validator.getRegisteredNodeCount()).isEqualTo(3);
+            assertThat(validator.getCheckpointCount()).isEqualTo(1);
         }
 
         @Test
@@ -420,7 +433,7 @@ class EpochIsolationValidatorTest {
 
             EpochIsolationValidator.ValidatorStats stats = validator.getStats();
 
-            assertThat(stats.registeredNodes()).isEqualTo(2);
+            assertThat(stats.checkpoints()).isEqualTo(2);
             assertThat(stats.registeredSegments()).isEqualTo(1);
         }
 
@@ -432,7 +445,7 @@ class EpochIsolationValidatorTest {
 
             validator.clear();
 
-            assertThat(validator.getRegisteredNodeCount()).isEqualTo(0);
+            assertThat(validator.getCheckpointCount()).isEqualTo(0);
             assertThat(validator.getRegisteredSegmentCount()).isEqualTo(0);
         }
     }
@@ -448,12 +461,14 @@ class EpochIsolationValidatorTest {
             int nodesPerThread = 100;
             Thread[] threads = new Thread[numThreads];
 
+            // Each thread owns a segment and registers ascending node IDs at ascending
+            // epochs, which is exactly how the HNSW integration worker drives this: node
+            // IDs are allocated in order within one graph.
             for (int t = 0; t < numThreads; t++) {
-                final int threadId = t;
+                final int segmentId = t;
                 threads[t] = new Thread(() -> {
                     for (int i = 0; i < nodesPerThread; i++) {
-                        long nodeId = threadId * 1000L + i;
-                        validator.registerNode(nodeId, i);
+                        validator.registerNodeRange(segmentId, i, i);
                     }
                 });
             }
@@ -461,7 +476,16 @@ class EpochIsolationValidatorTest {
             for (Thread t : threads) t.start();
             for (Thread t : threads) t.join();
 
-            assertThat(validator.getRegisteredNodeCount()).isEqualTo(numThreads * nodesPerThread);
+            // Distinct epochs never coalesce, so every registration is retained
+            assertThat(validator.getCheckpointCount()).isEqualTo(numThreads * nodesPerThread);
+            assertThat(validator.getCheckpointedSegmentCount()).isEqualTo(numThreads);
+
+            // Every registration resolves to the epoch it was registered with
+            for (int t = 0; t < numThreads; t++) {
+                for (int i = 0; i < nodesPerThread; i++) {
+                    assertThat(validator.getNodeVisibilityEpoch(t, i)).isEqualTo(i);
+                }
+            }
         }
 
         @Test

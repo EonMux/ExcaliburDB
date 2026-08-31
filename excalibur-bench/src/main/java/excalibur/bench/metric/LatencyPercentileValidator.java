@@ -1,5 +1,7 @@
 package excalibur.bench.metric;
 
+import java.util.Locale;
+
 /**
  * Validates latency percentile metrics for domain correctness.
  *
@@ -285,7 +287,9 @@ public final class LatencyPercentileValidator {
         BenchmarkMetric p99 = result.getP99();
 
         if (p50 == null && p99 == null) {
-            return new ValidationResult(true, "", "No p50/p99 metrics present");
+            return ValidationResult.notApplicable(
+                "No p50/p99 metrics present - latency percentiles were never captured, "
+                    + "so this benchmark's latency was not validated; ");
         }
 
         if (p50 == null) {
@@ -296,8 +300,8 @@ public final class LatencyPercentileValidator {
         }
 
         // Verify units are milliseconds
-        String p50Unit = p50.unit().toLowerCase();
-        String p99Unit = p99.unit().toLowerCase();
+        String p50Unit = p50.unit().toLowerCase(Locale.ROOT);
+        String p99Unit = p99.unit().toLowerCase(Locale.ROOT);
 
         StringBuilder errors = new StringBuilder();
 
@@ -342,7 +346,9 @@ public final class LatencyPercentileValidator {
         BenchmarkMetric p99 = result.getP99();
 
         if (p0 == null && p50 == null && p99 == null) {
-            return new ValidationResult(true, "", "No p0/p50/p99 metrics present");
+            return ValidationResult.notApplicable(
+                "No p0/p50/p99 metrics present - latency percentiles were never captured, "
+                    + "so this benchmark's latency was not validated; ");
         }
 
         StringBuilder errors = new StringBuilder();
@@ -362,9 +368,9 @@ public final class LatencyPercentileValidator {
         }
 
         // Verify units are milliseconds
-        String p0Unit = p0.unit().toLowerCase();
-        String p50Unit = p50.unit().toLowerCase();
-        String p99Unit = p99.unit().toLowerCase();
+        String p0Unit = p0.unit().toLowerCase(Locale.ROOT);
+        String p50Unit = p50.unit().toLowerCase(Locale.ROOT);
+        String p99Unit = p99.unit().toLowerCase(Locale.ROOT);
 
         if (!p0Unit.equals("ms") && !p0Unit.equals("millis") && !p0Unit.equals("milliseconds")) {
             if (p0Unit.contains("ns") || p0Unit.contains("nano")) {
@@ -512,7 +518,31 @@ public final class LatencyPercentileValidator {
      * @param errors error messages if validation failed (empty string if valid)
      * @param warnings warning messages (may be non-empty even if valid)
      */
-    public record ValidationResult(boolean valid, String errors, String warnings) {
+    public record ValidationResult(boolean valid, String errors, String warnings, boolean applicable) {
+
+        /**
+         * Creates an applicable validation result.
+         *
+         * @param valid whether the percentiles satisfy every rule
+         * @param errors accumulated error text, empty when valid
+         * @param warnings accumulated warning text
+         */
+        public ValidationResult(boolean valid, String errors, String warnings) {
+            this(valid, errors, warnings, true);
+        }
+
+        /**
+         * Creates a result for a benchmark that carries no percentile metrics at all.
+         *
+         * <p>This is not a pass: nothing was measured, so nothing was validated.</p>
+         *
+         * @param reason why the validation could not run
+         * @return an inapplicable, invalid result
+         */
+        public static ValidationResult notApplicable(String reason) {
+            return new ValidationResult(false, reason, "", false);
+        }
+
 
         /**
          * Checks if there are any warnings.

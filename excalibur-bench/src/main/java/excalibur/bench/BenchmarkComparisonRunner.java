@@ -11,17 +11,15 @@ import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 import org.openjdk.jmh.runner.options.TimeValue;
 
-import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
+import org.openjdk.jmh.results.RunResult;
+
 import java.io.IOException;
-import java.io.PrintStream;
-import java.io.StringReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 /**
@@ -245,12 +243,18 @@ public class BenchmarkComparisonRunner {
 
     /**
      * Runs benchmarks with the given pattern and returns structured results.
+     *
+     * <p>Results are taken from JMH's own return value. A failure inside JMH propagates
+     * to the caller: the previous implementation returned from inside a {@code finally}
+     * block, which discarded the exception and compared an empty result set against the
+     * baseline, reporting "no regressions" for a run in which nothing executed.</p>
+     *
+     * @param pattern the JMH include pattern
+     * @return the structured results of the run
+     * @throws RunnerException if JMH fails to run the benchmarks
+     * @throws IllegalStateException if the run produced no results at all
      */
-    private static BenchmarkResultSet runBenchmarks(String pattern) throws Exception {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        PrintStream captureStream = new PrintStream(baos);
-        PrintStream originalOut = System.out;
-
+    private static BenchmarkResultSet runBenchmarks(String pattern) throws RunnerException {
         Options options = new OptionsBuilder()
             .include(pattern)
             .warmupIterations(2)
@@ -261,6 +265,7 @@ public class BenchmarkComparisonRunner {
             .jvmArgsAppend(
                 "--enable-preview",
                 "--enable-native-access=ALL-UNNAMED",
+                "--add-modules=jdk.incubator.vector",
                 "-Xms1g",
                 "-Xmx1g"
             )
@@ -268,24 +273,22 @@ public class BenchmarkComparisonRunner {
             .build();
 
         Instant startTime = Instant.now();
+        Collection<RunResult> runResults = new Runner(options).run();
+        Instant endTime = Instant.now();
 
-        try {
-            new Runner(options).run();
-        } finally {
-            Instant endTime = Instant.now();
-
-            String capturedOutput = baos.toString();
-            List<String> outputLines = parseLines(capturedOutput);
-
-            List<BenchmarkResult> results = BenchmarkResultCapture.parseConsoleOutput(outputLines);
-
-            return BenchmarkResultSet.builder()
-                .name("ExcaliburDB Benchmark Run " + TIMESTAMP_FORMAT.format(startTime))
-                .startTime(startTime)
-                .endTime(endTime)
-                .results(results)
-                .build();
+        List<BenchmarkResult> results = BenchmarkResultCapture.fromRunResults(runResults);
+        if (results.isEmpty()) {
+            throw new IllegalStateException(
+                "JMH returned no results for pattern '" + pattern
+                    + "'. There is nothing to compare against the baseline.");
         }
+
+        return BenchmarkResultSet.builder()
+            .name("ExcaliburDB Benchmark Run " + TIMESTAMP_FORMAT.format(startTime))
+            .startTime(startTime)
+            .endTime(endTime)
+            .results(results)
+            .build();
     }
 
     /**
@@ -349,19 +352,6 @@ public class BenchmarkComparisonRunner {
         System.out.println("───────────────────────────────────────────────────────────────────────────");
         System.out.println("  JSON: " + jsonPath.toAbsolutePath());
         System.out.println("  Text: " + txtPath.toAbsolutePath());
-    }
-
-    private static List<String> parseLines(String output) {
-        List<String> lines = new ArrayList<>();
-        try (BufferedReader reader = new BufferedReader(new StringReader(output))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                lines.add(line);
-            }
-        } catch (IOException e) {
-            // Should not happen with StringReader
-        }
-        return lines;
     }
 
     private static String extractJsonString(String json, String key) {

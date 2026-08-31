@@ -12,7 +12,8 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.BiConsumer;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.IntSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -63,19 +64,26 @@ import java.util.logging.Logger;
  * <ul>
  *   <li>Split interval: {@value #DEFAULT_SPLIT_INTERVAL_MS} ms (configurable, min 100ms)</li>
  *   <li>Load factor threshold: Uses Segment's LOAD_FACTOR_THRESHOLD (0.7)</li>
- *   <li>Split bit: Increments with each split level (starts at 0)</li>
+ *   <li>Split bit: supplied by the owning routing table, never derived here. It is the
+ *       bit the router will newly consult once the routing table doubles, i.e.
+ *       {@code Integer.numberOfTrailingZeros(routingSegmentCount)}. Partitioning on any
+ *       other bit produces children the router cannot address.</li>
  *   <li>Child segment capacity: Same as parent's slot count</li>
  * </ul>
+ *
+ * <h2>Split Serialization</h2>
+ * <p>All splits - background and explicitly requested - run one at a time. The split bit
+ * is read from the supplier inside that critical section and stays valid until the
+ * listener has published the children, so the partitioning and the routing table can
+ * never disagree.</p>
  *
  * <h2>Example Usage</h2>
  * <pre>{@code
  * // Create a split worker
  * SplitWorker worker = new SplitWorker(arena, (parent, leftChild, rightChild) -> {
- *     // Called when split completes
- *     segments.remove(parent.path());
- *     segments.put(leftChild.path(), leftChild);
- *     segments.put(rightChild.path(), rightChild);
- * });
+ *     // Called to publish the split: rename the children into their canonical
+ *     // segment_&lt;index&gt;.dat names and install them in the routing table.
+ * }, () -> Integer.numberOfTrailingZeros(routingSegmentCount));
  *
  * // Register segments for monitoring
  * worker.registerSegment(segment1);
@@ -132,6 +140,21 @@ public class SplitWorker {
 
     private final Arena arena;
     private final SplitListener listener;
+
+    /**
+     * Supplies the hash bit to partition on, owned by the routing table.
+     *
+     * <p>This is an explicit collaborator rather than a global read: the worker has no
+     * knowledge of the routing table and must never invent a split bit of its own.</p>
+     */
+    private final IntSupplier splitBitSupplier;
+
+    /** Serializes splits so a split bit cannot go stale before publication. */
+    private final ReentrantLock splitExecutionLock = new ReentrantLock();
+
+    /** Threads started by {@link #requestSplit(Segment, int)}, awaited by {@link #stop()}. */
+    private final CopyOnWriteArrayList<Thread> requestedSplitThreads = new CopyOnWriteArrayList<>();
+
     private final CopyOnWriteArrayList<Segment> registeredSegments;
     private final AtomicBoolean running;
     private final AtomicBoolean stopped;
@@ -149,12 +172,13 @@ public class SplitWorker {
     /**
      * Creates a new SplitWorker with default configuration.
      *
-     * @param arena    The Arena for allocating new segment memory (must not be null)
-     * @param listener Callback for split completion events (must not be null)
-     * @throws NullPointerException if arena or listener is null
+     * @param arena            The Arena for allocating new segment memory (must not be null)
+     * @param listener         Callback for split completion events (must not be null)
+     * @param splitBitSupplier Supplies the hash bit to partition on (must not be null)
+     * @throws NullPointerException if any argument is null
      */
-    public SplitWorker(Arena arena, SplitListener listener) {
-        this(arena, listener, DEFAULT_SPLIT_INTERVAL_MS, DEFAULT_MAX_CONCURRENT_SPLITS);
+    public SplitWorker(Arena arena, SplitListener listener, IntSupplier splitBitSupplier) {
+        this(arena, listener, splitBitSupplier, DEFAULT_SPLIT_INTERVAL_MS, DEFAULT_MAX_CONCURRENT_SPLITS);
     }
 
     /**
@@ -162,18 +186,22 @@ public class SplitWorker {
      *
      * @param arena                The Arena for allocating new segment memory
      * @param listener             Callback for split completion events
+     * @param splitBitSupplier     Supplies the hash bit to partition on
      * @param splitIntervalMs      Interval between split checks (ms)
      * @param maxConcurrentSplits  Maximum concurrent split operations
-     * @throws NullPointerException if arena or listener is null
+     * @throws NullPointerException if arena, listener or splitBitSupplier is null
      * @throws IllegalArgumentException if configuration values are out of range
      */
-    public SplitWorker(Arena arena, SplitListener listener,
+    public SplitWorker(Arena arena, SplitListener listener, IntSupplier splitBitSupplier,
                        long splitIntervalMs, int maxConcurrentSplits) {
         if (arena == null) {
             throw new NullPointerException("Arena cannot be null");
         }
         if (listener == null) {
             throw new NullPointerException("Listener cannot be null");
+        }
+        if (splitBitSupplier == null) {
+            throw new NullPointerException("Split bit supplier cannot be null");
         }
 
         // Validate configuration
@@ -182,6 +210,7 @@ public class SplitWorker {
 
         this.arena = arena;
         this.listener = listener;
+        this.splitBitSupplier = splitBitSupplier;
         this.registeredSegments = new CopyOnWriteArrayList<>();
         this.running = new AtomicBoolean(false);
         this.stopped = new AtomicBoolean(false);
@@ -262,6 +291,18 @@ public class SplitWorker {
                 }
             }
 
+            // Await splits started by requestSplit so no split can publish children
+            // into a routing table that is being torn down.
+            for (Thread thread : requestedSplitThreads) {
+                try {
+                    thread.join(5000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            requestedSplitThreads.clear();
+
             LOGGER.log(Level.INFO, "Split worker stopped. Total splits: {0}, entries split: {1}",
                 new Object[] { splitCount.get(), entriesSplit.get() });
         }
@@ -320,28 +361,47 @@ public class SplitWorker {
     // ==================== Manual Split ====================
 
     /**
-     * Requests immediate split of a specific segment.
-     *
-     * <p>This method queues the segment for splitting regardless of
-     * whether it meets the normal threshold. Use sparingly as it
-     * may cause unnecessary I/O if the segment doesn't need splitting.</p>
+     * Requests immediate split of a specific segment, partitioning on the current
+     * split bit reported by the routing table.
      *
      * @param segment The segment to split
      * @throws NullPointerException if segment is null
      */
     public void requestSplit(Segment segment) {
+        requestSplit(segment, splitBitSupplier.getAsInt());
+    }
+
+    /**
+     * Requests immediate split of a specific segment on an explicit hash bit.
+     *
+     * <p>This method queues the segment for splitting regardless of whether it meets
+     * the normal threshold. Use sparingly as it may cause unnecessary I/O if the
+     * segment doesn't need splitting.</p>
+     *
+     * <p>The requested bit is advisory: if the routing table has moved on by the time
+     * the split actually runs, the split uses the routing table's current bit so that
+     * the partitioning always matches the routing that will address the children.</p>
+     *
+     * @param segment  The segment to split
+     * @param splitBit The hash bit the caller expects to partition on
+     * @throws NullPointerException if segment is null
+     */
+    public void requestSplit(Segment segment, int splitBit) {
         if (segment == null) {
             throw new NullPointerException("Segment cannot be null");
         }
 
-        // Run split in a virtual thread
-        Thread.startVirtualThread(() -> {
+        Thread thread = Thread.ofVirtual().name("excalibur-split-request").unstarted(() -> {
             try {
-                splitSegment(segment);
+                splitSegment(segment, splitBit);
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Manual split failed for segment: " + segment.path(), e);
+            } finally {
+                requestedSplitThreads.remove(Thread.currentThread());
             }
         });
+        requestedSplitThreads.add(thread);
+        thread.start();
     }
 
     // ==================== Main Split Loop ====================
@@ -369,7 +429,7 @@ public class SplitWorker {
                         }
 
                         try {
-                            splitSegment(segment);
+                            splitSegment(segment, splitBitSupplier.getAsInt());
                             splitCount++;
                         } catch (Exception e) {
                             LOGGER.log(Level.WARNING, "Split failed for segment: " + segment.path(), e);
@@ -437,49 +497,69 @@ public class SplitWorker {
      * <p>This method:</p>
      * <ol>
      *   <li>Calls {@link Segment#beginSplit()} to create an immutable snapshot</li>
-     *   <li>Creates two new child segments (left and right)</li>
-     *   <li>Partitions entries from the snapshot into children based on hash bit</li>
-     *   <li>Calls {@link Segment#completeSplit(Segment, Segment)} to commit</li>
-     *   <li>Notifies listener to update routing</li>
+     *   <li>Creates two new child segments under temporary names</li>
+     *   <li>Partitions entries from the snapshot on {@code splitBit}</li>
+     *   <li>Notifies the listener, which renames the children into their canonical
+     *       {@code segment_<index>.dat} names and publishes them in the routing table</li>
+     *   <li>Calls {@link Segment#completeSplit(Segment, Segment, int)} to retire the parent</li>
      * </ol>
+     *
+     * <p>Splits are serialized: the split bit is read from the supplier inside the
+     * critical section and cannot change before the listener has published, so the
+     * partitioning always matches the routing that addresses the children.</p>
      *
      * <h3>Read Consistency Guarantee</h3>
      * <p>During the split, reads continue to be served from the pre-split snapshot.
      * After the split completes, reads are routed to the appropriate child.</p>
      *
-     * <h3>Domain Correctness</h3>
-     * <ul>
-     *   <li>Split bit is based on the parent segment's current depth (starts at 0)</li>
-     *   <li>Left child: entries where hash bit = 0</li>
-     *   <li>Right child: entries where hash bit = 1</li>
-     *   <li>Child capacity matches parent slot count</li>
-     * </ul>
-     *
-     * @param segment The segment to split
+     * @param segment           The segment to split
+     * @param requestedSplitBit The bit the caller expected to partition on
      * @throws IOException if split fails
      * @throws IllegalStateException if segment cannot be split
      */
-    private void splitSegment(Segment segment) throws IOException {
+    private void splitSegment(Segment segment, int requestedSplitBit) throws IOException {
+        splitExecutionLock.lock();
+        try {
+            runSplit(segment, requestedSplitBit);
+        } finally {
+            splitExecutionLock.unlock();
+        }
+    }
+
+    /**
+     * Performs one split. The caller must hold {@link #splitExecutionLock}.
+     *
+     * @param segment           The segment to split
+     * @param requestedSplitBit The bit the caller expected to partition on
+     * @throws IOException if split fails
+     */
+    private void runSplit(Segment segment, int requestedSplitBit) throws IOException {
         if (segment.isClosed()) {
             LOGGER.log(Level.FINE, "Skipping closed segment: {0}", segment.path());
             return;
         }
-
-        if (segment.isSplitting()) {
-            LOGGER.log(Level.FINE, "Segment already being split: {0}", segment.path());
+        if (segment.isSplitting() || segment.isSplitComplete()) {
+            LOGGER.log(Level.FINE, "Segment already split or splitting: {0}", segment.path());
             return;
+        }
+
+        // The routing table is authoritative for the split bit. A requested bit that
+        // has gone stale is discarded rather than used.
+        int splitBit = splitBitSupplier.getAsInt();
+        if (splitBit != requestedSplitBit) {
+            LOGGER.log(Level.FINE,
+                "Requested split bit {0} superseded by routing table bit {1} for {2}",
+                new Object[] { requestedSplitBit, splitBit, segment.path() });
         }
 
         long startTime = System.currentTimeMillis();
         Path parentPath = segment.path();
-
-        LOGGER.log(Level.INFO, "Starting split for segment: {0} (load factor: {1})",
-            new Object[] { parentPath, String.format("%.3f", segment.loadFactor()) });
-
-        // Record statistics before split
         int parentEntryCount = segment.entryCount();
 
-        // Step 1: Begin the split - creates immutable snapshot
+        LOGGER.log(Level.INFO, "Starting split for segment: {0} (load factor: {1}, split bit: {2})",
+            new Object[] { parentPath, String.format("%.3f", segment.loadFactor()), splitBit });
+
+        // Step 1: Begin the split - creates immutable snapshot, rejects writes
         SegmentSplitSnapshot snapshot;
         try {
             snapshot = segment.beginSplit();
@@ -489,87 +569,110 @@ public class SplitWorker {
             throw e;
         }
 
-        // Step 2: Create child segment paths
+        // Step 2: Children are built under temporary names. The listener moves them to
+        // their canonical segment_<index>.dat names as part of publishing the split.
         Path leftChildPath = Path.of(parentPath.toString() + ".left");
         Path rightChildPath = Path.of(parentPath.toString() + ".right");
-
-        // Clean up any existing child files
         Files.deleteIfExists(leftChildPath);
         Files.deleteIfExists(rightChildPath);
 
-        // Step 3: Create child segments
-        // Calculate capacity: slot table + data region
-        // Each child gets roughly half the entries, so use same slot count as parent
-        long childCapacity = (long) segment.slotCount() * 24L * 2 + 1024L * 1024; // Slot table + 1MB data
+        // Slot table + 1MB data region, matching the parent's slot count
+        long childCapacity = (long) segment.slotCount() * 24L * 2 + 1024L * 1024;
 
-        Segment leftChild;
-        Segment rightChild;
+        Segment leftChild = null;
+        Segment rightChild = null;
+        boolean published = false;
         try {
-            leftChild = new Segment(leftChildPath, childCapacity, arena);
-            rightChild = new Segment(rightChildPath, childCapacity, arena);
-        } catch (IOException e) {
-            LOGGER.log(Level.SEVERE, "Failed to create child segments for split", e);
-            segment.abortSplit();
-            throw e;
-        }
+            // The parent's threshold, not the default: a child created with the default
+            // silently discards the engine's configured load factor, and every segment in the
+            // store descends from a split.
+            double childThreshold = segment.loadFactorThreshold();
+            leftChild = new Segment(leftChildPath, childCapacity, arena, childThreshold);
+            rightChild = new Segment(rightChildPath, childCapacity, arena, childThreshold);
 
-        // Step 4: Partition entries from snapshot into children
-        int leftCount = 0;
-        int rightCount = 0;
-        int splitBit = 0; // Start with bit 0 for first split
+            int[] counts = partitionEntries(snapshot, leftChild, rightChild, splitBit);
 
-        try {
-            List<SegmentEntry> entries = snapshot.entries(false); // Exclude tombstones
-
-            for (SegmentEntry entry : entries) {
-                boolean goesRight = Segment.shouldGoToRightChild(entry.keyHash(), splitBit);
-
-                if (goesRight) {
-                    rightChild.putWithoutLock(entry.key(), entry.value());
-                    rightCount++;
-                } else {
-                    leftChild.putWithoutLock(entry.key(), entry.value());
-                    leftCount++;
-                }
-            }
-
-            // Flush children to disk
             leftChild.flush();
             rightChild.flush();
 
+            // Step 3: Publish. The listener owns the rename into the canonical names
+            // and the routing table update; it throws if it cannot publish.
+            listener.onSplitComplete(segment, leftChild, rightChild);
+            published = true;
+
+            // Step 4: Retire the parent, recording the bit the children were built on
+            segment.completeSplit(leftChild, rightChild, splitBit);
+
+            this.splitCount.incrementAndGet();
+            lastSplitTime.set(System.currentTimeMillis());
+            entriesSplit.addAndGet(parentEntryCount);
+
+            long duration = System.currentTimeMillis() - startTime;
+            LOGGER.log(Level.INFO, "Split complete for {0}: {1} entries -> left={2}, right={3} in {4}ms",
+                new Object[] { parentPath, parentEntryCount, counts[0], counts[1], duration });
         } catch (Exception e) {
-            // Clean up failed split
-            leftChild.close();
-            rightChild.close();
-            Files.deleteIfExists(leftChildPath);
-            Files.deleteIfExists(rightChildPath);
-            segment.abortSplit();
-            throw new IOException("Failed to partition entries during split", e);
+            if (!published) {
+                discardChildren(leftChild, rightChild, leftChildPath, rightChildPath);
+                if (segment.isSplitting()) {
+                    segment.abortSplit();
+                }
+            }
+            if (e instanceof IOException ioe) {
+                throw ioe;
+            }
+            throw new IOException("Split failed for segment: " + parentPath, e);
+        }
+    }
+
+    /**
+     * Partitions the snapshot's live entries into the two children on {@code splitBit}.
+     *
+     * @param snapshot   The pre-split snapshot
+     * @param leftChild  Receives entries whose split bit is 0
+     * @param rightChild Receives entries whose split bit is 1
+     * @param splitBit   The hash bit to partition on
+     * @return A two-element array of {left count, right count}
+     */
+    private int[] partitionEntries(SegmentSplitSnapshot snapshot, Segment leftChild,
+                                   Segment rightChild, int splitBit) {
+        int leftCount = 0;
+        int rightCount = 0;
+
+        for (SegmentEntry entry : snapshot.entries(false)) { // Exclude tombstones
+            if (Segment.shouldGoToRightChild(entry.keyHash(), splitBit)) {
+                rightChild.putWithoutLock(entry.key(), entry.value());
+                rightCount++;
+            } else {
+                leftChild.putWithoutLock(entry.key(), entry.value());
+                leftCount++;
+            }
         }
 
-        // Step 5: Complete the split
+        return new int[] { leftCount, rightCount };
+    }
+
+    /**
+     * Closes and removes children that were built but never published.
+     *
+     * @param leftChild      The left child, or null if it was never created
+     * @param rightChild     The right child, or null if it was never created
+     * @param leftChildPath  Temporary path of the left child
+     * @param rightChildPath Temporary path of the right child
+     */
+    private void discardChildren(Segment leftChild, Segment rightChild,
+                                 Path leftChildPath, Path rightChildPath) {
+        if (leftChild != null && !leftChild.isClosed()) {
+            leftChild.close();
+        }
+        if (rightChild != null && !rightChild.isClosed()) {
+            rightChild.close();
+        }
         try {
-            segment.completeSplit(leftChild, rightChild);
-        } catch (IllegalStateException e) {
-            // Clean up failed split
-            leftChild.close();
-            rightChild.close();
             Files.deleteIfExists(leftChildPath);
             Files.deleteIfExists(rightChildPath);
-            throw new IOException("Failed to complete split", e);
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to remove abandoned split children", e);
         }
-
-        // Step 6: Notify listener to update routing
-        listener.onSplitComplete(segment, leftChild, rightChild);
-
-        // Update statistics
-        this.splitCount.incrementAndGet();
-        lastSplitTime.set(System.currentTimeMillis());
-        entriesSplit.addAndGet(parentEntryCount);
-
-        long duration = System.currentTimeMillis() - startTime;
-        LOGGER.log(Level.INFO, "Split complete for {0}: {1} entries -> left={2}, right={3} in {4}ms",
-            new Object[] { parentPath, parentEntryCount, leftCount, rightCount, duration });
     }
 
     // ==================== Statistics ====================
@@ -646,34 +749,42 @@ public class SplitWorker {
     // ==================== Listener Interface ====================
 
     /**
-     * Callback interface for split completion events.
+     * Callback interface that publishes a completed split.
      *
-     * <p>The listener is responsible for updating any segment registry
-     * to route new operations to the child segments.</p>
+     * <p>The listener owns two things the worker cannot do itself, because only the
+     * routing table knows the children's indices:</p>
+     * <ol>
+     *   <li>Moving each child from its temporary build name to the canonical
+     *       {@code segment_<index>.dat} name that segment discovery matches.</li>
+     *   <li>Installing the children in the routing table and widening it.</li>
+     * </ol>
      */
     @FunctionalInterface
     public interface SplitListener {
 
         /**
-         * Called when a split is complete and the parent should be replaced
-         * with its two children.
+         * Called when the children are built and must be published.
          *
-         * <p><strong>Important:</strong> The implementation must update any
-         * segment registry to route operations to the appropriate child.
-         * After this method returns, the parent segment is marked as
-         * SPLIT_COMPLETE and should not receive new operations.</p>
+         * <p><strong>Important:</strong> the implementation must rename the children
+         * into their canonical names and update the routing table so operations reach
+         * the appropriate child. The parent is still in SPLITTING state when this is
+         * called and is retired only after this method returns normally.</p>
+         *
+         * <p>Throwing from this method aborts the split: the worker discards the
+         * children and returns the parent to service. Implementations must therefore
+         * publish atomically or not at all.</p>
          *
          * <h3>Routing Logic</h3>
-         * <p>After a split, routing should use the hash bit to determine
-         * which child to use:</p>
+         * <p>After a split, routing uses the bit the children were partitioned on,
+         * which the parent records and exposes as {@link Segment#splitBit()}:</p>
          * <pre>{@code
-         * boolean goesRight = Segment.shouldGoToRightChild(keyHash, splitBit);
+         * boolean goesRight = Segment.shouldGoToRightChild(keyHash, parent.splitBit());
          * Segment target = goesRight ? rightChild : leftChild;
          * }</pre>
          *
-         * @param parent     The parent segment (split complete, read-only)
-         * @param leftChild  The left child segment (entries with hash bit 0)
-         * @param rightChild The right child segment (entries with hash bit 1)
+         * @param parent     The parent segment being split
+         * @param leftChild  The left child segment (entries whose split bit is 0)
+         * @param rightChild The right child segment (entries whose split bit is 1)
          */
         void onSplitComplete(Segment parent, Segment leftChild, Segment rightChild);
     }

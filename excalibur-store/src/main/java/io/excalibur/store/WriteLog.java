@@ -91,7 +91,17 @@ public class WriteLog implements AutoCloseable {
     // ==================== Instance Fields ====================
 
     private final Path logFilePath;
-    private final Arena arena;
+    /**
+     * Arena backing the current mapping.
+     *
+     * <p>Owned by this log and replaced whenever the file is re-mapped. A mapping cannot be
+     * released on its own - only by closing the Arena that holds it - so a log that maps into
+     * an Arena belonging to something longer-lived can never give its address space back. Each
+     * log maps 64 MiB, and a segment retired by a split or a compaction takes its log with it,
+     * so borrowing the engine's Arena left one of those resident per retired segment for the
+     * life of the process.
+     */
+    private volatile Arena mappingArena;
     private final ReentrantLock appendLock;
     private final AtomicLong nextLsn;
     private final AtomicLong writeOffset;
@@ -121,8 +131,9 @@ public class WriteLog implements AutoCloseable {
 
     /**
      * Last integrated offset (for tail scan tracking).
+     * Uses AtomicLong for thread-safe monotonic updates.
      */
-    private volatile long lastIntegratedOffset = 0;
+    private final AtomicLong lastIntegratedOffset = new AtomicLong(0);
 
     /**
      * Domain correctness flag - true when all domain constraints are satisfied.
@@ -165,7 +176,7 @@ public class WriteLog implements AutoCloseable {
      * @return The last integrated offset (always >= 0)
      */
     public long getLastIntegratedOffset() {
-        return lastIntegratedOffset;
+        return lastIntegratedOffset.get();
     }
 
     /**
@@ -190,15 +201,22 @@ public class WriteLog implements AutoCloseable {
             throw new IllegalArgumentException(
                 "lastIntegratedOffset must be non-negative, got: " + offset);
         }
-        if (offset < this.lastIntegratedOffset) {
-            throw new IllegalStateException(String.format(
-                "lastIntegratedOffset must not go backwards: " +
-                "attempted to set %d but current value is %d",
-                offset, this.lastIntegratedOffset));
-        }
-        // Only update if actually different (idempotent)
-        if (offset > this.lastIntegratedOffset) {
-            this.lastIntegratedOffset = offset;
+        // Use CAS loop for atomic monotonic update (no TOCTOU race)
+        while (true) {
+            long current = lastIntegratedOffset.get();
+            if (offset < current) {
+                throw new IllegalStateException(String.format(
+                    "lastIntegratedOffset must not go backwards: " +
+                    "attempted to set %d but current value is %d",
+                    offset, current));
+            }
+            if (offset == current) {
+                return; // Idempotent - already at this value
+            }
+            if (lastIntegratedOffset.compareAndSet(current, offset)) {
+                return;
+            }
+            // CAS failed - another thread updated, retry
         }
     }
 
@@ -220,14 +238,20 @@ public class WriteLog implements AutoCloseable {
             throw new IllegalArgumentException(
                 "Delta must be non-negative, got: " + delta);
         }
-        long newValue = this.lastIntegratedOffset + delta;
-        // Check for overflow
-        if (newValue < this.lastIntegratedOffset) {
-            throw new IllegalStateException(
-                "Increment would cause overflow: current=" + this.lastIntegratedOffset +
-                ", delta=" + delta);
+        // CAS loop: detect overflow BEFORE mutating so the counter is never
+        // left in a corrupted wrapped state on an overflow throw.
+        while (true) {
+            long current = lastIntegratedOffset.get();
+            long newValue = current + delta;
+            if (newValue < current) {
+                throw new IllegalStateException(
+                    "Increment would cause overflow: current=" + current +
+                    ", delta=" + delta);
+            }
+            if (lastIntegratedOffset.compareAndSet(current, newValue)) {
+                return;
+            }
         }
-        this.lastIntegratedOffset = newValue;
     }
 
     // ==================== Constructors ====================
@@ -256,7 +280,6 @@ public class WriteLog implements AutoCloseable {
 
         this.logFilePath = logFilePath;
         this.usingPanama = MemorySegmentFactory.isPanamaAvailable();
-        this.arena = usingPanama ? Arena.ofShared() : null;
         this.appendLock = new ReentrantLock();
         this.nextLsn = new AtomicLong(0);
         this.writeOffset = new AtomicLong(0);
@@ -268,33 +291,6 @@ public class WriteLog implements AutoCloseable {
             new Object[] { logFilePath, usingPanama ? "Panama FFM" : "ByteBuffer fallback" });
     }
 
-    /**
-     * Creates or opens a write-ahead log at the specified path with an explicit Arena.
-     *
-     * <p>If the log file exists, it will be opened and the next LSN will be
-     * determined by scanning existing entries. If the file does not exist,
-     * it will be created.</p>
-     *
-     * @param logFilePath The path to the log file
-     * @param arena       The Arena for memory allocation (must outlive this WriteLog)
-     * @throws IOException if the file cannot be created or opened
-     * @throws NullPointerException if logFilePath or arena is null
-     */
-    public WriteLog(Path logFilePath, Arena arena) throws IOException {
-        Objects.requireNonNull(logFilePath, "Log file path cannot be null");
-        Objects.requireNonNull(arena, "Arena cannot be null");
-
-        this.logFilePath = logFilePath;
-        this.arena = arena;
-        this.usingPanama = true;
-        this.appendLock = new ReentrantLock();
-        this.nextLsn = new AtomicLong(0);
-        this.writeOffset = new AtomicLong(0);
-        this.closed = false;
-
-        initializeLogFile();
-    }
-
     // ==================== Initialization ====================
 
     /**
@@ -303,28 +299,25 @@ public class WriteLog implements AutoCloseable {
      * @throws IOException if initialization fails
      */
     private void initializeLogFile() throws IOException {
-        boolean fileExists = Files.exists(logFilePath);
+        boolean hasExistingEntries = Files.exists(logFilePath) && Files.size(logFilePath) > 0;
 
-        if (fileExists) {
-            // Open existing file and determine next LSN from existing entries
-            long fileSize = Files.size(logFilePath);
-            if (fileSize == 0) {
-                // Empty file, start fresh
-                openFileChannel(INITIAL_FILE_SIZE);
-            } else {
-                // Scan to find the highest LSN and write offset
-                openFileChannel(Math.max(fileSize, INITIAL_FILE_SIZE));
-                scanExistingEntries();
-            }
-        } else {
+        if (!hasExistingEntries) {
             // Create parent directories if needed
             Path parent = logFilePath.getParent();
             if (parent != null && !Files.exists(parent)) {
                 Files.createDirectories(parent);
             }
+        }
 
-            // Create new file with initial size
-            openFileChannel(INITIAL_FILE_SIZE);
+        // The log is mapped once, at its maximum size, and never re-mapped. Growing by
+        // re-mapping into a long-lived Arena leaves every previous mapping resident for
+        // the life of that Arena, and invalidates nothing, so the whole mapping history
+        // accumulates. The file is sparse: blocks are allocated as entries are written.
+        openFileChannel(MAX_FILE_SIZE);
+
+        if (hasExistingEntries) {
+            // Scan to find the highest LSN and write offset
+            scanExistingEntries();
         }
 
         LOGGER.log(Level.INFO, "WriteLog initialized at {0}, nextLSN={1}, writeOffset={2}",
@@ -348,12 +341,18 @@ public class WriteLog implements AutoCloseable {
             StandardOpenOption.WRITE
         );
 
-        // Allocate file space
-        fileChannel.truncate(size);
-
         if (usingPanama) {
-            // Memory-map the file using Panama FFM
-            mappedSegment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, size, arena);
+            // One Arena per mapping, so the previous one can be released. Rotation re-maps,
+            // and without this the log kept every mapping it had ever made.
+            releaseMapping();
+            Arena mapping = Arena.ofShared();
+            try {
+                mappedSegment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, size, mapping);
+            } catch (IOException | RuntimeException e) {
+                mapping.close();
+                throw e;
+            }
+            this.mappingArena = mapping;
 
             // Create Segment wrapper for abstraction layer access
             mappedSegmentWrapper = MemorySegmentFactory.wrapNative(mappedSegment);
@@ -361,6 +360,25 @@ public class WriteLog implements AutoCloseable {
             // Use fallback implementation via MemorySegmentFactory
             mappedSegment = null; // Not available in fallback mode
             mappedSegmentWrapper = MemorySegmentFactory.mapChannel(fileChannel, size);
+        }
+    }
+
+    /**
+     * Releases the current mapping, if there is one.
+     *
+     * <p>Closing the Arena is what unmaps: a {@link MemorySegment} obtained from
+     * {@link FileChannel#map} lives exactly as long as the Arena it was mapped into.</p>
+     */
+    private void releaseMapping() {
+        Arena mapping = this.mappingArena;
+        this.mappingArena = null;
+        if (mapping != null) {
+            try {
+                mapping.close();
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING,
+                    "Could not release the mapping for write log " + logFilePath, e);
+            }
         }
     }
 
@@ -475,7 +493,7 @@ public class WriteLog implements AutoCloseable {
             totalEntriesAppended.incrementAndGet();
 
             // Fsync for durability
-            fsync();
+            fsync(offset, entrySize);
 
             return lsn;
         } finally {
@@ -518,6 +536,10 @@ public class WriteLog implements AutoCloseable {
      * <p>Corrupted entries (CRC32 mismatch) are skipped with a warning log.
      * Recovery continues until the end of valid data is reached.</p>
      *
+     * <p>A failure thrown by {@code handler} is <strong>not</strong> a corruption: it is
+     * wrapped in a {@link LogReplayException} and propagated, because the remaining log
+     * would otherwise be dropped without any caller being able to tell.</p>
+     *
      * <p><strong>Important:</strong> This method should only be called during
      * initialization when no concurrent appends are happening.</p>
      *
@@ -527,6 +549,7 @@ public class WriteLog implements AutoCloseable {
      *
      * @param handler The consumer to process each recovered entry
      * @return true if recovery was successful and domain correctness verified
+     * @throws LogReplayException if the handler fails to apply a valid entry
      * @throws IOException if reading the log fails
      * @throws IllegalStateException if the log is closed
      * @throws NullPointerException if handler is null
@@ -550,9 +573,15 @@ public class WriteLog implements AutoCloseable {
                 break;
             }
 
+            // Parsing and applying are kept apart on purpose. A record that will not
+            // parse is a storage problem recovery can step over; a handler that rejects
+            // a well-formed record means the segment cannot be restored to the state its
+            // log describes, and the rest of the log must not be quietly dropped.
+            LogEntry entry;
+            int entrySize;
             try {
                 // Read key_len and value_len to determine entry size
-                int entrySize = LogEntry.sizeAt(mappedSegmentWrapper, offset);
+                entrySize = LogEntry.sizeAt(mappedSegmentWrapper, offset);
 
                 // Check if we have enough bytes for the full entry
                 if (offset + entrySize > endOffset) {
@@ -573,19 +602,26 @@ public class WriteLog implements AutoCloseable {
                     continue;
                 }
 
-                // Read and process the entry
-                LogEntry entry = LogEntry.readFrom(mappedSegmentWrapper, offset);
-                handler.accept(entry);
-                entriesRecovered++;
-
-                offset += entrySize;
+                entry = LogEntry.readFrom(mappedSegmentWrapper, offset);
             } catch (Exception e) {
-                // Invalid entry, stop recovery
+                // Unparseable entry, stop recovery
                 LOGGER.log(Level.WARNING,
                     "Invalid log entry at offset " + offset + ", stopping recovery", e);
                 domainCorrect = false;
                 break;
             }
+
+            try {
+                handler.accept(entry);
+            } catch (RuntimeException e) {
+                throw new LogReplayException(
+                    "Write-ahead log replay failed at offset " + offset + " (lsn=" + entry.lsn()
+                    + ") in " + logFilePath + " after " + entriesRecovered
+                    + " entries; the segment's committed state cannot be reconstructed.", e);
+            }
+
+            entriesRecovered++;
+            offset += entrySize;
         }
 
         // Set domain correctness flag
@@ -637,8 +673,10 @@ public class WriteLog implements AutoCloseable {
             Files.deleteIfExists(rotatedPath);
             Files.move(logFilePath, rotatedPath);
 
-            // Create new file
-            openFileChannel(INITIAL_FILE_SIZE);
+            // Create new file. The same capacity a fresh log is given: rotating into a
+            // smaller mapping would cap the new log at a fraction of what the full-check
+            // in isFull() measures it against.
+            openFileChannel(MAX_FILE_SIZE);
 
             // Reset counters
             nextLsn.set(0);
@@ -691,38 +729,36 @@ public class WriteLog implements AutoCloseable {
      */
     private void ensureCapacity(int requiredBytes) throws IOException {
         long currentOffset = writeOffset.get();
-        long currentSize = mappedSegmentWrapper.byteSize();
+        long capacity = mappedSegmentWrapper.byteSize();
 
-        if (currentOffset + requiredBytes > currentSize) {
-            // Calculate new size (double or minimum required)
-            long newSize = Math.max(currentSize * 2, currentOffset + requiredBytes + INITIAL_FILE_SIZE);
-
-            // Extend the file
-            fileChannel.truncate(newSize);
-
-            // Re-map the file using the abstraction layer
-            if (usingPanama) {
-                mappedSegment = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, newSize, arena);
-                mappedSegmentWrapper = MemorySegmentFactory.wrapNative(mappedSegment);
-            } else {
-                mappedSegmentWrapper = MemorySegmentFactory.mapChannel(fileChannel, newSize);
-            }
-
-            LOGGER.log(Level.FINE, "Extended log file to {0} bytes", newSize);
+        if (currentOffset + requiredBytes > capacity) {
+            throw new IOException(
+                "Write-ahead log " + logFilePath + " is full (" + currentOffset + " of "
+                + capacity + " bytes used, " + requiredBytes + " more required). "
+                + "The log is reclaimed by compaction, which rebuilds the segment and "
+                + "starts a fresh log; enable or unblock compaction for this segment.");
         }
     }
 
     // ==================== Fsync ====================
 
     /**
-     * Forces all written data to be persisted to the storage device.
+     * Forces a written range to be persisted to the storage device.
      *
-     * <p>This is called after every append to ensure durability guarantees.</p>
-     * <p>Uses fsync(true) to include metadata updates for complete durability.</p>
+     * <p>Entries are written <em>through the memory mapping</em>, so the mapped range
+     * has to be msync'd as well: {@code FileChannel.force} alone is not specified to
+     * flush pages dirtied through a mapping. Only the range just written is forced, so
+     * the cost does not scale with the size of the log.</p>
      *
+     * @param offset Offset of the range to persist
+     * @param length Length of the range to persist
      * @throws IOException if fsync fails
      */
-    private void fsync() throws IOException {
+    private void fsync(long offset, int length) throws IOException {
+        MemorySegment mapping = this.mappedSegment;
+        if (mapping != null) {
+            mapping.asSlice(offset, length).force();
+        }
         fileChannel.force(true); // true = include metadata per project spec
     }
 
@@ -985,7 +1021,7 @@ public class WriteLog implements AutoCloseable {
      * @return The last integrated offset
      */
     public long lastIntegratedOffset() {
-        return lastIntegratedOffset;
+        return lastIntegratedOffset.get();
     }
 
     /**
@@ -1046,6 +1082,12 @@ public class WriteLog implements AutoCloseable {
                 fileChannel.close();
             }
 
+            // Unmap. Readers hold no mapping of their own, so this is the only reference;
+            // a read racing this close fails loudly rather than reading unmapped memory.
+            releaseMapping();
+            mappedSegment = null;
+            mappedSegmentWrapper = null;
+
             LOGGER.log(Level.INFO, "WriteLog closed: {0} (entries={1}, bytes={2}, corrupt={3}, domainCorrect={4})",
                 new Object[] {
                     logFilePath,
@@ -1073,7 +1115,7 @@ public class WriteLog implements AutoCloseable {
             totalEntriesAppended.get(),
             totalBytesWritten.get(),
             corruptEntriesFound.get(),
-            lastIntegratedOffset,
+            lastIntegratedOffset.get(),
             domainCorrect
         );
     }
@@ -1097,7 +1139,7 @@ public class WriteLog implements AutoCloseable {
 
             // Create WriteLog
             Arena arena = Arena.ofShared();
-            WriteLog writeLog = new WriteLog(tempLog, arena);
+            WriteLog writeLog = new WriteLog(tempLog);
 
             System.out.println("Created WriteLog: " + writeLog);
 

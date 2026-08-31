@@ -700,63 +700,6 @@ class DomainCorrectnessValidatorTest {
         }
     }
 
-    // ==================== Distance Normalization Tests ====================
-
-    @Nested
-    @DisplayName("Distance normalization")
-    class DistanceNormalization {
-
-        @Test
-        @DisplayName("normalizes L2 distance (0 -> 1.0)")
-        void normalizesL2ZeroToOne() {
-            float score = DomainCorrectnessValidator.normalizeDistanceToScore(0.0f, true);
-            assertThat(score).isEqualTo(1.0f);
-        }
-
-        @Test
-        @DisplayName("normalizes L2 distance (1 -> 0.5)")
-        void normalizesL2OneToHalf() {
-            float score = DomainCorrectnessValidator.normalizeDistanceToScore(1.0f, true);
-            assertThat(score).isEqualTo(0.5f);
-        }
-
-        @Test
-        @DisplayName("normalizes L2 distance (large -> near 0)")
-        void normalizesL2LargeToNearZero() {
-            float score = DomainCorrectnessValidator.normalizeDistanceToScore(1000.0f, true);
-            assertThat(score).isLessThan(0.01f);
-            assertThat(score).isGreaterThanOrEqualTo(0.0f);
-        }
-
-        @Test
-        @DisplayName("normalizes cosine similarity (-1 -> 0.0)")
-        void normalizesCosineMinusOneToZero() {
-            float score = DomainCorrectnessValidator.normalizeDistanceToScore(-1.0f, false);
-            assertThat(score).isEqualTo(0.0f);
-        }
-
-        @Test
-        @DisplayName("normalizes cosine similarity (0 -> 0.5)")
-        void normalizesCosineZeroToHalf() {
-            float score = DomainCorrectnessValidator.normalizeDistanceToScore(0.0f, false);
-            assertThat(score).isEqualTo(0.5f);
-        }
-
-        @Test
-        @DisplayName("normalizes cosine similarity (1 -> 1.0)")
-        void normalizesCosineOneToOne() {
-            float score = DomainCorrectnessValidator.normalizeDistanceToScore(1.0f, false);
-            assertThat(score).isEqualTo(1.0f);
-        }
-
-        @Test
-        @DisplayName("clamps negative L2 to valid score")
-        void clampsNegativeL2() {
-            float score = DomainCorrectnessValidator.normalizeDistanceToScore(-5.0f, true);
-            assertThat(score).isGreaterThanOrEqualTo(0.0f);
-            assertThat(score).isLessThanOrEqualTo(1.0f);
-        }
-    }
 
     // ==================== Utility Method Tests ====================
 

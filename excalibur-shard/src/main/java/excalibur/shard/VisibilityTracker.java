@@ -190,20 +190,18 @@ public class VisibilityTracker implements io.excalibur.store.VisibilityTracker {
      * @return The new epoch value after advancement
      */
     public long advanceEpoch() {
-        long previousEpoch = globalEpoch.get();
-        long newEpoch = globalEpoch.incrementAndGet();
+        // Use getAndIncrement to atomically obtain the true predecessor,
+        // avoiding TOCTOU race between get() and incrementAndGet().
+        long previousEpoch = globalEpoch.getAndIncrement();
+        long newEpoch = previousEpoch + 1;
 
-        // Domain correctness: detect overflow
-        if (newEpoch < previousEpoch && previousEpoch > 0) {
-            // Epoch overflow detected - this is extremely unlikely in practice
-            // (would require ~9.2e18 advances) but we log it for debugging
+        // Domain correctness: the only way newEpoch can be <= previousEpoch
+        // under getAndIncrement is Long overflow (previousEpoch == Long.MAX_VALUE
+        // wraps newEpoch to Long.MIN_VALUE). Log it for debugging, even though
+        // the wrap is handled downstream by visibility comparisons.
+        if (newEpoch < previousEpoch) {
+            // Extremely unlikely in practice (requires ~9.2e18 advances)
             LOGGER.warn("Epoch overflow detected: {} -> {}. Visibility tracking may be compromised.",
-                previousEpoch, newEpoch);
-        }
-
-        // Validate monotonicity
-        if (newEpoch <= previousEpoch && previousEpoch >= 0 && newEpoch >= 0) {
-            LOGGER.error("Epoch did not advance monotonically: {} -> {}. This indicates a bug.",
                 previousEpoch, newEpoch);
         }
 
@@ -312,8 +310,10 @@ public class VisibilityTracker implements io.excalibur.store.VisibilityTracker {
                 "Cannot mark tombstoned: segment " + segmentId + " is not registered");
         }
 
-        long previousTombstone = tombstoneEpochs.put(segmentId, epoch);
-        if (previousTombstone == NOT_TOMBSTONED) {
+        // A concurrent unregisterSegment can remove the mapping between the containsKey
+        // check above and this put, in which case put returns null.
+        Long previousTombstone = tombstoneEpochs.put(segmentId, epoch);
+        if (previousTombstone == null || previousTombstone == NOT_TOMBSTONED) {
             LOGGER.info("Segment {} tombstoned at epoch {}", segmentId, epoch);
         } else {
             LOGGER.debug("Segment {} tombstone epoch updated from {} to {}",

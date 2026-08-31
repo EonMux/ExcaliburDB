@@ -37,10 +37,19 @@ import java.util.Objects;
  * List<QueryResultItem> atomic = filter.filterPartialDocuments(merged, queryEpoch);
  * }</pre>
  *
+ * <h2>Scope of the Filter</h2>
+ * <p>The filter only removes results it can positively identify as belonging to a
+ * document that is <em>not</em> yet fully visible. Two kinds of result are passed through
+ * instead, for the same reason: one carrying no document identity at all, and one whose
+ * document the visibility checker has never seen. In both cases the atomicity model has no
+ * opinion, and discarding the result would silently drop a legitimate match rather than
+ * uphold a guarantee.</p>
+ *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Results are filtered based on document-level visibility, not chunk-level</li>
  *   <li>All chunks from a visible document are included; none from partial documents</li>
+ *   <li>Results with no document ID are passed through, never dropped</li>
  *   <li>Epoch is always non-negative</li>
  *   <li>Empty input produces empty output (no null values)</li>
  * </ul>
@@ -172,7 +181,23 @@ public final class DocumentAtomicityFilter {
 
         String documentId = extractDocumentId(result);
         if (documentId == null) {
-            return false;
+            // The result carries no document identity, so the atomicity model has nothing
+            // to say about it. Filtering here would be a false negative, not a guarantee:
+            // it would drop the result on the basis of an identity we never had.
+            LOGGER.trace("Result has no document ID (segment={}, node={}); atomicity filter passes it through",
+                result.segmentId(), result.nodeId());
+            return true;
+        }
+
+        if (!visibilityChecker.isDocumentTracked(documentId)) {
+            // Same reasoning, one step further in: the checker has never seen this document,
+            // which is not the same as knowing it to be incomplete. These checkers are built
+            // in memory as documents are ingested, so after a restart everything written by a
+            // previous process is unknown -- and treating unknown as invisible would drop all
+            // of it from every result the moment one new document arrives.
+            LOGGER.trace("Document {} is not tracked; atomicity filter passes it through",
+                documentId);
+            return true;
         }
 
         return visibilityChecker.isDocumentVisible(documentId, queryEpoch);
@@ -240,26 +265,22 @@ public final class DocumentAtomicityFilter {
     /**
      * Extracts the document ID from a query result.
      *
-     * <p>The document ID is extracted from the result's documentIdStr field,
-     * which contains the actual string document ID (e.g., "doc1", "source1:file1")
-     * from the ingestion pipeline. This is populated via the HNSW node-to-document
-     * mapping during search.</p>
+     * <p>The document ID is the result's {@code documentIdStr}: the actual string
+     * document ID (e.g. {@code "doc1"}, {@code "source1:file1"}) from the ingestion
+     * pipeline, populated from the HNSW node-to-document mapping during search or
+     * decoded from the write-log entry key during a tail scan.</p>
      *
-     * <p><strong>Fallback:</strong> If documentIdStr is null (for backward compatibility
-     * with older data), the numeric documentId is converted to a string. This should
-     * rarely happen in production with properly indexed data.</p>
+     * <p>There is deliberately no fallback to the numeric ID. That value is the HNSW
+     * node ID, which lives in a different namespace from document IDs and can never
+     * match a registered document, so synthesising a document ID from it turns "we do
+     * not know which document this is" into "this document is not visible" - a
+     * guaranteed false negative rather than a safety net.</p>
      *
      * @param result The query result
-     * @return The document ID string, or null if not available
+     * @return The document ID string, or null if the result carries no document identity
      */
     private String extractDocumentId(QueryResultItem result) {
-        // Prefer the string document ID (actual document identifier like "doc1")
-        String docIdStr = result.documentIdStr();
-        if (docIdStr != null) {
-            return docIdStr;
-        }
-        // Fallback to numeric ID converted to string (backward compatibility)
-        return String.valueOf(result.documentId());
+        return result.documentIdStr();
     }
 
     /**
@@ -308,6 +329,11 @@ public final class DocumentAtomicityFilter {
         @Override
         public java.util.Set<String> getVisibleDocuments(long queryEpoch) {
             return tracker.getVisibleDocuments(queryEpoch);
+        }
+
+        @Override
+        public long currentEpoch() {
+            return tracker.currentEpoch();
         }
 
         @Override

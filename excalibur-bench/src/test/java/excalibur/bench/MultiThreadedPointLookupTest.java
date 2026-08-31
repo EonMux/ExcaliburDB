@@ -26,17 +26,22 @@ import static org.junit.jupiter.api.Assertions.*;
  * <p>This test demonstrates the aggregate throughput achievable with
  * concurrent access across multiple threads and segments.</p>
  *
- * <h2>Target</h2>
- * <p>≥1,000,000,000 ops/sec (1 billion lookups per second) aggregate</p>
+ * <h2>What is asserted</h2>
+ * <p>The property this test can honestly establish is <em>scalability</em>: running the
+ * same workload on {@link #NUM_THREADS} threads must deliver more aggregate throughput
+ * than running it on one. Comparing the aggregate against the single-threaded
+ * point-lookup target instead would compare two different workloads - this one is random
+ * access across {@value #NUM_SEGMENTS} segments, while the single-threaded target was set
+ * for sequential access within one - so the verdict would say more about cache locality
+ * than about concurrency.</p>
  *
- * <h2>Approach</h2>
- * <p>The 1B ops/sec target is achieved through:</p>
- * <ul>
- *   <li>Multiple threads accessing segments concurrently</li>
- *   <li>Striped locking - each segment has its own lock</li>
- *   <li>Pre-computed hashes for hot path</li>
- *   <li>Batch operations to amortize lock overhead</li>
- * </ul>
+ * <p>The single-threaded baseline is measured here, in the same JVM, on exactly the same
+ * workload, after a shared warmup. A regression that makes the segment lock serialize
+ * readers fails this test; the previous version only asserted that the lookups returned
+ * the right values and printed the throughput.</p>
+ *
+ * <p>Tagged {@code benchmark}; run with
+ * {@code ./gradlew :excalibur-bench:benchmarkTest}.</p>
  *
  * @author ExcaliburDB
  */
@@ -58,6 +63,19 @@ class MultiThreadedPointLookupTest {
     private static final int VALUE_SIZE = 64;
     private static final int ITERATIONS_PER_THREAD = 10_000_000;
     private static final int NUM_THREADS = Runtime.getRuntime().availableProcessors();
+
+    /** Iterations used to warm the JIT before either measurement. */
+    private static final int WARMUP_ITERATIONS = 1_000_000;
+
+    /**
+     * Minimum acceptable ratio of multi-threaded aggregate throughput to the
+     * single-threaded baseline on the identical workload.
+     *
+     * <p>1.0 means "concurrency must not make the system slower overall". This is a
+     * deliberately weak scalability claim, but it is one the test can establish and it
+     * fails outright if reads ever serialize.</p>
+     */
+    private static final double MIN_SCALING_FACTOR = 1.0;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -126,78 +144,27 @@ class MultiThreadedPointLookupTest {
         System.out.println("  Threads: " + NUM_THREADS);
         System.out.println("  Iterations per thread: " + ITERATIONS_PER_THREAD);
 
-        ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch doneLatch = new CountDownLatch(NUM_THREADS);
-        AtomicLong totalFound = new AtomicLong(0);
-
-        // Create workers
-        for (int t = 0; t < NUM_THREADS; t++) {
-            final int threadId = t;
-            executor.submit(() -> {
-                try {
-                    // Wait for all threads to be ready
-                    startLatch.await();
-
-                    int found = 0;
-                    Random random = new Random(123 + threadId);
-
-                    // Each thread works on all segments
-                    for (int i = 0; i < ITERATIONS_PER_THREAD; i++) {
-                        // Pick a random segment
-                        int segIdx = random.nextInt(NUM_SEGMENTS);
-                        // Pick a random key index
-                        int keyIdx = random.nextInt(ENTRIES_PER_SEGMENT);
-
-                        if (segments[segIdx].getByHash(
-                                keysPerSegment[segIdx][keyIdx],
-                                hashesPerSegment[segIdx][keyIdx]) != null) {
-                            found++;
-                        }
-                    }
-
-                    totalFound.addAndGet(found);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    doneLatch.countDown();
+        Workload lockedLookup = (threadId, iterations) -> {
+            int found = 0;
+            Random random = new Random(123 + threadId);
+            for (int i = 0; i < iterations; i++) {
+                int segIdx = random.nextInt(NUM_SEGMENTS);
+                int keyIdx = random.nextInt(ENTRIES_PER_SEGMENT);
+                if (segments[segIdx].getByHash(
+                        keysPerSegment[segIdx][keyIdx],
+                        hashesPerSegment[segIdx][keyIdx]) != null) {
+                    found++;
                 }
-            });
-        }
+            }
+            return found;
+        };
 
-        // Start all threads simultaneously
-        long startNanos = System.nanoTime();
-        startLatch.countDown();
+        measure(1, WARMUP_ITERATIONS, lockedLookup, "warmup");
+        double baselineOpsPerSec = measure(1, ITERATIONS_PER_THREAD, lockedLookup, "single thread");
+        double aggregateOpsPerSec =
+            measure(NUM_THREADS, ITERATIONS_PER_THREAD, lockedLookup, NUM_THREADS + " threads");
 
-        // Wait for completion
-        doneLatch.await();
-        long elapsedNanos = System.nanoTime() - startNanos;
-
-        executor.shutdown();
-        executor.awaitTermination(10, TimeUnit.SECONDS);
-
-        // Calculate metrics
-        long totalIterations = (long) NUM_THREADS * ITERATIONS_PER_THREAD;
-        double opsPerSec = (totalIterations * 1_000_000_000.0) / elapsedNanos;
-        double latencyNs = (double) elapsedNanos / totalIterations;
-
-        System.out.println("  Total iterations: " + totalIterations);
-        System.out.println("  Found: " + totalFound.get());
-        System.out.println("  Elapsed: " + String.format("%.3f", elapsedNanos / 1_000_000_000.0) + " sec");
-        System.out.println("  Throughput: " + formatOpsPerSec(opsPerSec));
-        System.out.println("  Latency: " + String.format("%.2f", latencyNs) + " ns/op");
-        System.out.println("  Target: " + formatOpsPerSec(1_000_000_000.0));
-
-        if (opsPerSec >= 1_000_000_000.0) {
-            System.out.println("  ✓ TARGET MET!");
-        } else {
-            double percent = (opsPerSec / 1_000_000_000.0) * 100;
-            System.out.println("  ⚠ At " + String.format("%.1f", percent) + "% of target");
-            double threadsNeeded = Math.ceil(1_000_000_000.0 / opsPerSec * NUM_THREADS);
-            System.out.println("  → Need ~" + (int) threadsNeeded + " threads to reach target");
-        }
-
-        assertEquals(totalIterations, totalFound.get(), "All lookups should succeed");
+        assertScales(baselineOpsPerSec, aggregateOpsPerSec, "locked point lookup");
     }
 
     @Test
@@ -205,45 +172,85 @@ class MultiThreadedPointLookupTest {
         System.out.println("\n=== Multi-Threaded Batch Throughput Test ===");
         System.out.println("  Threads: " + NUM_THREADS);
 
-        int batchSize = 100;
-        int numBatches = ITERATIONS_PER_THREAD / batchSize;
+        final int batchSize = 100;
 
-        ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+        Workload batchedLookup = (threadId, iterations) -> {
+            int found = 0;
+            Random random = new Random(456 + threadId);
+            int batches = iterations / batchSize;
+            for (int b = 0; b < batches; b++) {
+                int segIdx = random.nextInt(NUM_SEGMENTS);
+                segments[segIdx].readLock().lock();
+                try {
+                    for (int i = 0; i < batchSize; i++) {
+                        int keyIdx = random.nextInt(ENTRIES_PER_SEGMENT);
+                        if (segments[segIdx].getByHashWithoutLock(
+                                keysPerSegment[segIdx][keyIdx],
+                                hashesPerSegment[segIdx][keyIdx]) != null) {
+                            found++;
+                        }
+                    }
+                } finally {
+                    segments[segIdx].readLock().unlock();
+                }
+            }
+            return found;
+        };
+
+        System.out.println("  Batch size: " + batchSize);
+
+        measure(1, WARMUP_ITERATIONS, batchedLookup, "warmup");
+        double baselineOpsPerSec = measure(1, ITERATIONS_PER_THREAD, batchedLookup, "single thread");
+        double aggregateOpsPerSec =
+            measure(NUM_THREADS, ITERATIONS_PER_THREAD, batchedLookup, NUM_THREADS + " threads");
+
+        assertScales(baselineOpsPerSec, aggregateOpsPerSec, "batched point lookup");
+    }
+
+    // ==================== Measurement Harness ====================
+
+    /**
+     * A lookup workload executed by one thread.
+     */
+    @FunctionalInterface
+    private interface Workload {
+        /**
+         * Performs {@code iterations} lookups.
+         *
+         * @param threadId identifies the thread, used to seed its key sequence
+         * @param iterations how many lookups to perform
+         * @return the number of lookups that found their entry
+         */
+        int run(int threadId, int iterations);
+    }
+
+    /**
+     * Runs a workload on the given number of threads and returns aggregate throughput.
+     *
+     * <p>Every lookup targets a key that was inserted, so any miss means the segment
+     * lost data under concurrent reads; that is asserted here rather than printed.</p>
+     *
+     * @param threads how many threads to run
+     * @param iterationsPerThread lookups performed by each thread
+     * @param workload the workload to run
+     * @param label a label for the printed result
+     * @return aggregate throughput in ops/sec
+     * @throws InterruptedException if waiting for the workers is interrupted
+     */
+    private double measure(int threads, int iterationsPerThread, Workload workload, String label)
+            throws InterruptedException {
+
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
         CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch doneLatch = new CountDownLatch(NUM_THREADS);
+        CountDownLatch doneLatch = new CountDownLatch(threads);
         AtomicLong totalFound = new AtomicLong(0);
 
-        // Create workers
-        for (int t = 0; t < NUM_THREADS; t++) {
+        for (int t = 0; t < threads; t++) {
             final int threadId = t;
             executor.submit(() -> {
                 try {
                     startLatch.await();
-
-                    int found = 0;
-                    Random random = new Random(456 + threadId);
-
-                    for (int b = 0; b < numBatches; b++) {
-                        // Pick a segment for this batch
-                        int segIdx = random.nextInt(NUM_SEGMENTS);
-
-                        // Acquire lock once for the batch
-                        segments[segIdx].readLock().lock();
-                        try {
-                            for (int i = 0; i < batchSize; i++) {
-                                int keyIdx = random.nextInt(ENTRIES_PER_SEGMENT);
-                                if (segments[segIdx].getByHashWithoutLock(
-                                        keysPerSegment[segIdx][keyIdx],
-                                        hashesPerSegment[segIdx][keyIdx]) != null) {
-                                    found++;
-                                }
-                            }
-                        } finally {
-                            segments[segIdx].readLock().unlock();
-                        }
-                    }
-
-                    totalFound.addAndGet(found);
+                    totalFound.addAndGet(workload.run(threadId, iterationsPerThread));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 } finally {
@@ -254,33 +261,37 @@ class MultiThreadedPointLookupTest {
 
         long startNanos = System.nanoTime();
         startLatch.countDown();
-
         doneLatch.await();
         long elapsedNanos = System.nanoTime() - startNanos;
 
         executor.shutdown();
-        executor.awaitTermination(10, TimeUnit.SECONDS);
+        assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS),
+            "worker threads must terminate");
 
-        long totalIterations = (long) NUM_THREADS * numBatches * batchSize;
+        long totalIterations = (long) threads * iterationsPerThread;
+        assertEquals(totalIterations, totalFound.get(),
+            "every lookup targets an inserted key, so all must succeed");
+
         double opsPerSec = (totalIterations * 1_000_000_000.0) / elapsedNanos;
-        double latencyNs = (double) elapsedNanos / totalIterations;
+        System.out.printf("  %-16s %s (%.3f sec, %.2f ns/op)%n",
+            label + ":", formatOpsPerSec(opsPerSec),
+            elapsedNanos / 1_000_000_000.0, (double) elapsedNanos / totalIterations);
+        return opsPerSec;
+    }
 
-        System.out.println("  Batch size: " + batchSize);
-        System.out.println("  Total iterations: " + totalIterations);
-        System.out.println("  Found: " + totalFound.get());
-        System.out.println("  Elapsed: " + String.format("%.3f", elapsedNanos / 1_000_000_000.0) + " sec");
-        System.out.println("  Throughput: " + formatOpsPerSec(opsPerSec));
-        System.out.println("  Latency: " + String.format("%.2f", latencyNs) + " ns/op");
-        System.out.println("  Target: " + formatOpsPerSec(1_000_000_000.0));
+    /**
+     * Asserts that concurrency increases aggregate throughput.
+     */
+    private static void assertScales(double baselineOpsPerSec, double aggregateOpsPerSec,
+                                     String what) {
+        double scaling = aggregateOpsPerSec / baselineOpsPerSec;
+        System.out.printf("  Scaling factor across %d threads: %.2fx%n", NUM_THREADS, scaling);
 
-        if (opsPerSec >= 1_000_000_000.0) {
-            System.out.println("  ✓ TARGET MET!");
-        } else {
-            double percent = (opsPerSec / 1_000_000_000.0) * 100;
-            System.out.println("  ⚠ At " + String.format("%.1f", percent) + "% of target");
-        }
-
-        assertEquals(totalIterations, totalFound.get(), "All lookups should succeed");
+        assertTrue(scaling >= MIN_SCALING_FACTOR, String.format(
+            "%s on %d threads must deliver at least %.2fx the single-threaded throughput "
+                + "(%s), got %s (%.2fx) - concurrent reads are serializing",
+            what, NUM_THREADS, MIN_SCALING_FACTOR,
+            formatOpsPerSec(baselineOpsPerSec), formatOpsPerSec(aggregateOpsPerSec), scaling));
     }
 
     private static String formatOpsPerSec(double ops) {

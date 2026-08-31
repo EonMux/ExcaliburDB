@@ -73,9 +73,12 @@ public class PathUtils {
             Files.createDirectories(parent);
         }
 
-        // Create file with specified size using FileChannel
+        // Create file with specified size using FileChannel.
+        // Note: truncate() only shrinks; to extend, write a byte at the last position.
         try (FileOutputStream fos = new FileOutputStream(p.toFile())) {
-            fos.getChannel().truncate(size);
+            if (size > 0) {
+                fos.getChannel().write(java.nio.ByteBuffer.allocate(1), size - 1);
+            }
         }
 
         return p.toFile();

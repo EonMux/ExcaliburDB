@@ -177,11 +177,20 @@ class ConfigShardTest {
         }
 
         @Test
-        @DisplayName("loadFactor with invalid value falls back to default")
-        void loadFactor_invalidValue_fallsBackToDefault() {
+        @DisplayName("loadFactor with unparseable value is rejected")
+        void loadFactor_invalidValue_isRejected() {
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.shard.segment-load-factor", "not-a-number");
-            // When parsing fails, Config falls back to the default value
+            // Falling back to the default would make a typo indistinguishable from
+            // correct configuration, so the misconfiguration is reported instead
+            assertThrows(IllegalArgumentException.class, () -> new Config(props));
+        }
+
+        @Test
+        @DisplayName("loadFactor with blank value falls back to default")
+        void loadFactor_blankValue_fallsBackToDefault() {
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.shard.segment-load-factor", "  ");
             Config config = new Config(props);
             assertEquals(0.7, config.shard().getLoadFactor(), 0.001);
         }

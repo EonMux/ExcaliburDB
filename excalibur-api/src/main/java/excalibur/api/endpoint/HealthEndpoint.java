@@ -2,6 +2,8 @@ package excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import excalibur.api.protocol.JsonText;
+import excalibur.api.protocol.ResponseBody;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.VisibilityTracker;
 import io.excalibur.store.SegmentCatalog;
@@ -9,7 +11,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
@@ -297,11 +298,7 @@ public class HealthEndpoint implements HttpHandler {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(200, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, 200, bytes);
     }
 
     /**
@@ -328,15 +325,15 @@ public class HealthEndpoint implements HttpHandler {
      * <p>Hand-serialized JSON following the project's minimal dependency approach.</p>
      */
     private String toJson(HealthStatus status) {
-        return String.format(
-            "{\"live\": %s, \"ready\": %s, \"healthy\": %s, \"epoch\": %d, \"coverage\": %.4f, \"latencyMs\": %d}",
-            status.live(),
-            status.ready(),
-            status.healthy(),
-            status.epoch(),
-            status.coverage(),
-            status.latencyMs()
-        );
+        // Locale.ROOT: the default locale decides the decimal separator, and a
+        // comma-decimal locale would emit "coverage": 0,9500 - not valid JSON.
+        return "{\"live\": " + status.live()
+            + ", \"ready\": " + status.ready()
+            + ", \"healthy\": " + status.healthy()
+            + ", \"epoch\": " + status.epoch()
+            + ", \"coverage\": " + JsonText.number(status.coverage(), 4)
+            + ", \"latencyMs\": " + status.latencyMs()
+            + "}";
     }
 
     /**

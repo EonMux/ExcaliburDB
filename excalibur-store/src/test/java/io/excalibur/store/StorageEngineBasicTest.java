@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -41,6 +42,16 @@ class StorageEngineBasicTest {
         if (arena != null) {
             arena.close();
         }
+    }
+
+    /**
+     * Copies a returned zero-copy slice onto the heap so its bytes can be compared.
+     *
+     * @param slice The slice returned by the engine
+     * @return The bytes it points at
+     */
+    private static byte[] bytesOf(MemorySegment slice) {
+        return slice.toArray(ValueLayout.JAVA_BYTE);
     }
 
     @Nested
@@ -99,6 +110,9 @@ class StorageEngineBasicTest {
 
             MemorySegment result = engine.get(key);
             assertThat(result).isNotNull();
+            assertThat(bytesOf(result))
+                .as("overwrite must replace the stored value, not keep the first one")
+                .isEqualTo(value2);
         }
 
         @Test
@@ -142,6 +156,7 @@ class StorageEngineBasicTest {
             MemorySegment result = engine.get(key);
 
             assertThat(result).isNotNull();
+            assertThat(bytesOf(result)).isEqualTo(value);
         }
 
         @Test
@@ -151,8 +166,8 @@ class StorageEngineBasicTest {
 
             MemorySegment result = engine.get(key);
 
-            // MemorySegment for missing key may be null or empty
-            // depending on implementation
+            // A key that was never written must not resolve to any value.
+            assertThat(result).isNull();
         }
 
         @Test
@@ -164,7 +179,10 @@ class StorageEngineBasicTest {
 
             for (int i = 0; i < 100; i++) {
                 MemorySegment result = engine.get(("key" + i).getBytes());
-                assertThat(result).isNotNull();
+                assertThat(result).as("key%d must be readable", i).isNotNull();
+                assertThat(bytesOf(result))
+                    .as("key%d must resolve to its own value", i)
+                    .isEqualTo(("value" + i).getBytes());
             }
         }
     }

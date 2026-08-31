@@ -1,7 +1,11 @@
 package excalibur.api.server;
 
+import excalibur.api.protocol.JsonText;
+import excalibur.api.protocol.ResponseBody;
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsServer;
 import excalibur.api.endpoint.HealthEndpoint;
 import excalibur.api.endpoint.StatsEndpoint;
 import excalibur.api.endpoint.QueryEndpoint;
@@ -9,6 +13,12 @@ import excalibur.api.endpoint.QueryCancelEndpoint;
 import excalibur.api.endpoint.IngestEndpoint;
 import excalibur.api.endpoint.ReindexEndpoint;
 import excalibur.api.endpoint.IngestStatusEndpoint;
+import excalibur.api.endpoint.InMemorySourceRegistry;
+import excalibur.api.endpoint.SourceRegistry;
+import excalibur.api.reindex.ReindexCoordinator;
+import excalibur.api.security.ApiSecurityConfig;
+import excalibur.api.security.IngestTargetValidator;
+import excalibur.api.security.RequestGuard;
 import excalibur.query.executor.QueryRegistry;
 import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
@@ -39,8 +49,9 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
+import java.security.GeneralSecurityException;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.concurrent.Executors;
@@ -70,7 +81,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <h2>Domain Correctness</h2>
  * <ul>
- *   <li>Server binds to specified port on all interfaces (0.0.0.0)</li>
+ *   <li>Server binds to 127.0.0.1 unless an explicit bind address and an
+ *       authentication token are configured</li>
  *   <li>Graceful shutdown waits for in-flight requests</li>
  *   <li>Health endpoint always returns 200 if process is alive</li>
  *   <li>Stats reflect current system state (no stale data)</li>
@@ -109,8 +121,28 @@ public class ExcaliburDBServer {
     private final Config config;
     private QueryPipeline queryPipeline;
 
+    /**
+     * The graph-RAG path, or null where no graph store is configured.
+     *
+     * <p>Optional rather than required, so a deployment that only does vector search is unaffected
+     * by its absence: the route is simply not registered, and an unregistered route already
+     * answers 404 rather than failing at startup.
+     */
+    private io.excalibur.retrieval.pipeline.GraphRagPipeline graphPipeline;
+
+    /** Every namespace's graph, when this node builds its own. */
+    private excalibur.api.bootstrap.GraphTenants graphTenants;
+
     // Registries for ingestion endpoints
-    private final IngestEndpoint.SourceRegistry ingestSourceRegistry;
+    /**
+     * Where ingestion sources are registered.
+     *
+     * <p>Not final: its bound comes from the security policy, and {@link #withSecurity} can
+     * replace that policy before the server starts. Rebuilding it there is what makes the
+     * configured bound apply however the policy was supplied - it is always empty at that
+     * point, because the method refuses once the server is running.</p>
+     */
+    private volatile SourceRegistry ingestSourceRegistry;
     private final ReindexEndpoint.ReindexStatusRegistry reindexStatusRegistry;
     private final IngestStatusEndpoint.IngestionStatusRegistry ingestionStatusRegistry;
 
@@ -131,7 +163,23 @@ public class ExcaliburDBServer {
     // HNSW configuration factory for creating graphs with proper config
     private final HnswConfigFactory hnswConfigFactory;
 
-    private HttpServer server;
+    /**
+     * Security policy for the HTTP surface: bind address, bearer token, rate limits
+     * and the ingest allow-lists. Never null.
+     */
+    private ApiSecurityConfig security;
+
+    /**
+     * The single mutual exclusion for reindexing, shared by {@code POST /v1/reindex}
+     * and the scheduled reindex handler.
+     */
+    private final ReindexCoordinator reindexCoordinator = new ReindexCoordinator();
+
+    // Endpoints that own executors and must be drained on stop
+    private volatile QueryEndpoint queryEndpoint;
+    private volatile ReindexEndpoint reindexEndpoint;
+
+    private volatile HttpServer server;
     private final AtomicBoolean running;
 
     /**
@@ -251,9 +299,14 @@ public class ExcaliburDBServer {
         this.config = config;
         this.queryPipeline = queryPipeline;
         this.running = new AtomicBoolean(false);
+        this.security = resolveSecurity(config);
 
-        // Initialize registries for ingestion endpoints
-        this.ingestSourceRegistry = new IngestEndpoint.InMemorySourceRegistry();
+        // Initialize registries for ingestion endpoints. Bounded by the configured limit rather
+        // than by the compiled-in default: excalibur.ingest.max-sources was parsed, validated and
+        // documented while reaching nothing, so setting it in either direction had no effect and
+        // an authenticated caller could always register the default 256 - each a retained source,
+        // and for an HTTP source a pinned client and its selector thread.
+        this.ingestSourceRegistry = new InMemorySourceRegistry(security.maxRegisteredSources());
         this.reindexStatusRegistry = new ReindexEndpoint.InMemoryReindexStatusRegistry();
         this.ingestionStatusRegistry = new IngestStatusEndpoint.InMemoryIngestionStatusRegistry();
 
@@ -268,6 +321,77 @@ public class ExcaliburDBServer {
         LOGGER.debug("ExcaliburDBServer configured for port {} with VolumeManager: {}, Config: {}, HnswConfigFactory: efConstruction={}, efSearch={}",
             port, volumeManager != null ? "enabled" : "disabled", config != null ? "enabled" : "disabled",
             hnswConfigFactory.getEfConstruction(), hnswConfigFactory.getEfSearch());
+    }
+
+    /**
+     * Resolves the security policy from the application configuration.
+     *
+     * <p>{@link Config} exposes typed sections only, so the API keys are read from the
+     * same properties file and the same {@code EXCALIBUR_*} environment the rest of the
+     * configuration comes from. With no configuration at all the safe default applies:
+     * loopback binding, no authentication, both ingest allow-lists empty.</p>
+     *
+     * @param config The application configuration (may be null)
+     * @return The resolved policy, never null
+     */
+    private static ApiSecurityConfig resolveSecurity(Config config) {
+        if (config == null) {
+            return ApiSecurityConfig.defaults();
+        }
+        return ApiSecurityConfig.fromProperties(config.getEffectiveProperties());
+    }
+
+    /**
+     * Overrides the security policy resolved from configuration.
+     *
+     * <p>Intended for wiring that builds its policy elsewhere and for tests that need
+     * a specific allow-list or token. Must be called before {@link #start()}.</p>
+     *
+     * @param securityConfig The policy to enforce
+     * @throws IllegalStateException if the server is already running
+     * @throws NullPointerException if securityConfig is null
+     */
+    public void withSecurity(ApiSecurityConfig securityConfig) {
+        if (running.get()) {
+            throw new IllegalStateException("Cannot configure security after server has started");
+        }
+        this.security = Objects.requireNonNull(securityConfig, "securityConfig cannot be null");
+        // The registry's bound comes from the policy, and the one built in the constructor was
+        // sized by whatever policy applied then. The server is not running, so nothing has been
+        // registered yet.
+        this.ingestSourceRegistry = new InMemorySourceRegistry(security.maxRegisteredSources());
+        LOGGER.info("API security policy configured: {}", securityConfig);
+    }
+
+    /**
+     * Returns the ingestion orchestrator, once one has been wired.
+     *
+     * <p>For a caller that has to attach an optional collaborator to it after the pipeline is
+     * built - the graph sink, which belongs to a stack assembled later than this server.</p>
+     *
+     * @return The orchestrator, or null when ingestion runs in stub mode
+     */
+    public excalibur.ingest.pipeline.IngestionOrchestrator getIngestionOrchestrator() {
+        return ingestionOrchestrator;
+    }
+
+    /**
+     * Returns the security policy this server enforces.
+     *
+     * @return The security policy (never null)
+     */
+    public ApiSecurityConfig getSecurity() {
+        return security;
+    }
+
+    /**
+     * Returns the reindex coordinator shared by the reindex endpoint and the
+     * scheduled reindex handler.
+     *
+     * @return The reindex coordinator (never null)
+     */
+    public ReindexCoordinator getReindexCoordinator() {
+        return reindexCoordinator;
     }
 
     // ==================== Static Factory Methods ====================
@@ -518,41 +642,8 @@ public class ExcaliburDBServer {
 
         // Wire the reindexer to the scheduler for automatic scheduled reindexing
         if (documentReindexer != null && sourceResolver != null) {
-            indexOrchestrator.setReindexOperationHandler(sourceId -> {
-                try {
-                    Source source = sourceResolver.resolve(sourceId);
-                    if (source == null) {
-                        LOGGER.warn("ReindexOperationHandler: Source not found: {}", sourceId);
-                        return false;
-                    }
-
-                    // Use rolling replacement if available
-                    boolean useRollingReplacement = volumeManager != null
-                        && storageEngine.getCatalog() != null
-                        && documentReindexer.hasRollingReplacement();
-
-                    if (useRollingReplacement) {
-                        // Select a volume for the new segment
-                        java.nio.file.Path volumePath = volumeManager.getVolumeWithMostSpace();
-                        if (volumePath == null) {
-                            LOGGER.warn("ReindexOperationHandler: No volume available for source: {}", sourceId);
-                            return false;
-                        }
-                        DocumentReindexer.RollingReindexResult result =
-                            documentReindexer.reindexWithRollingReplacement(source, volumePath);
-                        // Success if no errors OR if some documents were indexed (partial success)
-                        return !result.hasErrors() || result.getDocumentsIndexed() > 0;
-                    } else {
-                        // Fall back to standard reindex
-                        DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
-                        // Success if no errors OR if some documents were indexed (partial success)
-                        return !result.hasErrors() || result.getDocumentsIndexed() > 0;
-                    }
-                } catch (Exception e) {
-                    LOGGER.error("ReindexOperationHandler failed for source {}: {}", sourceId, e.getMessage());
-                    return false;
-                }
-            });
+            indexOrchestrator.setReindexOperationHandler(
+                sourceId -> runScheduledReindex(sourceId, documentReindexer, sourceResolver));
         } else {
             // Clear the handler if reindexer is being disabled
             indexOrchestrator.setReindexOperationHandler(null);
@@ -565,7 +656,7 @@ public class ExcaliburDBServer {
      * Creates a SourceResolver that delegates to the internal source registry.
      *
      * <p>This method provides a convenient way to create a SourceResolver that
-     * resolves sources from the internal {@link IngestEndpoint.InMemorySourceRegistry},
+     * resolves sources from the internal {@link InMemorySourceRegistry},
      * enabling reindex operations for sources registered via /v1/ingest.</p>
      *
      * <h3>Domain Correctness</h3>
@@ -607,7 +698,7 @@ public class ExcaliburDBServer {
      * <ul>
      *   <li>Automatically creates SourceResolver that resolves from internal registry</li>
      *   <li>Method must be called before {@link #start()} to take effect</li>
-     *   <li>SourceResolver delegates to the shared IngestEndpoint.SourceRegistry</li>
+     *   <li>SourceResolver delegates to the shared SourceRegistry</li>
      * </ul>
      *
      * <h3>Thread Safety</h3>
@@ -627,43 +718,69 @@ public class ExcaliburDBServer {
         this.sourceResolver = createSourceResolver();
 
         // Wire the handler to enable scheduled reindex operations
-        this.indexOrchestrator.setReindexOperationHandler(sourceId -> {
-            try {
-                Source source = this.sourceResolver.resolve(sourceId);
-                if (source == null) {
-                    LOGGER.warn("ReindexOperationHandler: Source not found: {}", sourceId);
-                    return false;
-                }
-
-                // Use rolling replacement if available
-                boolean useRollingReplacement = volumeManager != null
-                    && storageEngine.getCatalog() != null
-                    && documentReindexer.hasRollingReplacement();
-
-                if (useRollingReplacement) {
-                    // Select a volume for the new segment
-                    java.nio.file.Path volumePath = volumeManager.getVolumeWithMostSpace();
-                    if (volumePath == null) {
-                        LOGGER.warn("ReindexOperationHandler: No volume available for source: {}", sourceId);
-                        return false;
-                    }
-                    DocumentReindexer.RollingReindexResult result =
-                        documentReindexer.reindexWithRollingReplacement(source, volumePath);
-                    // Success if no errors OR if some documents were indexed (partial success)
-                    return !result.hasErrors() || result.getDocumentsIndexed() > 0;
-                } else {
-                    // Fall back to standard reindex
-                    DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
-                    // Success if no errors OR if some documents were indexed (partial success)
-                    return !result.hasErrors() || result.getDocumentsIndexed() > 0;
-                }
-            } catch (Exception e) {
-                LOGGER.error("ReindexOperationHandler failed for source {}: {}", sourceId, e.getMessage());
-                return false;
-            }
-        });
+        SourceResolver resolver = this.sourceResolver;
+        this.indexOrchestrator.setReindexOperationHandler(
+            sourceId -> runScheduledReindex(sourceId, documentReindexer, resolver));
 
         LOGGER.info("Document reindexer configured with automatic source resolution and scheduled reindex support");
+    }
+
+    /**
+     * Executes one scheduled reindex under the shared reindex claim.
+     *
+     * <p>The scheduler and {@code POST /v1/reindex} are two independent triggers for
+     * the same operation. Both take the same per-source claim from
+     * {@link ReindexCoordinator}, because two rolling replacements of one source run
+     * concurrently will each tombstone the segment the other has just published.</p>
+     *
+     * @param sourceId          The source to reindex
+     * @param documentReindexer The reindexer to run
+     * @param sourceResolver    Resolver for the source instance
+     * @return true when the reindex made progress
+     */
+    private boolean runScheduledReindex(String sourceId,
+                                        DocumentReindexer documentReindexer,
+                                        SourceResolver sourceResolver) {
+        ReindexCoordinator.Lease lease = reindexCoordinator.tryAcquire(sourceId);
+        if (lease == null) {
+            LOGGER.info("Scheduled reindex skipped: source {} is already being reindexed", sourceId);
+            return false;
+        }
+        try {
+            Source source = sourceResolver.resolve(sourceId);
+            if (source == null) {
+                LOGGER.warn("ReindexOperationHandler: Source not found: {}", sourceId);
+                return false;
+            }
+
+            // Use rolling replacement if available
+            boolean useRollingReplacement = volumeManager != null
+                && storageEngine.getCatalog() != null
+                && documentReindexer.hasRollingReplacement();
+
+            if (useRollingReplacement) {
+                // Select a volume for the new segment
+                java.nio.file.Path volumePath = volumeManager.getVolumeWithMostSpace();
+                if (volumePath == null) {
+                    LOGGER.warn("ReindexOperationHandler: No volume available for source: {}", sourceId);
+                    return false;
+                }
+                DocumentReindexer.RollingReindexResult result =
+                    documentReindexer.reindexWithRollingReplacement(source, volumePath);
+                // Success if no errors OR if some documents were indexed (partial success)
+                return !result.hasErrors() || result.getDocumentsIndexed() > 0;
+            }
+
+            // Fall back to standard reindex
+            DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
+            // Success if no errors OR if some documents were indexed (partial success)
+            return !result.hasErrors() || result.getDocumentsIndexed() > 0;
+        } catch (Exception e) {
+            LOGGER.error("ReindexOperationHandler failed for source {}: {}", sourceId, e.getMessage());
+            return false;
+        } finally {
+            lease.release();
+        }
     }
 
     /**
@@ -721,9 +838,12 @@ public class ExcaliburDBServer {
             ? config.ingest().getDocumentTimeoutMs()
             : IngestionOrchestrator.DEFAULT_DOCUMENT_TIMEOUT_MS;
 
-        // Create document visibility tracker for atomic document-level visibility
-        // This ensures queries never see partially-ingested documents
-        this.documentVisibilityTracker = new DocumentVisibilityTracker(new DocumentRegistry());
+        // Document visibility on the node's own epoch clock -- the same counter the query
+        // pipeline captures in stage 0. Sharing it is what makes the atomicity filter a
+        // snapshot bound rather than a completeness check; a tracker with a private counter
+        // would produce epochs the query has no way to compare against.
+        this.documentVisibilityTracker = new DocumentVisibilityTracker(
+            new DocumentRegistry(), indexOrchestrator.getVisibilityTracker());
 
         // Create term frequency tracker for selectivity estimation
         // This enables query optimization by tracking term frequencies in segment sketches
@@ -755,7 +875,13 @@ public class ExcaliburDBServer {
                 }
             },
             null,  // lshIngestionService - not configured here
-            null,  // documentChunkBuffer - not configured here
+            // No document chunk buffer. Document visibility does not depend on it -- publishDocument
+            // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
+            // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
+            // is not active. Wiring it needs a write log this buffer can own (it appends and
+            // assumes exclusive use), and the node has no such log today: every WriteLog here
+            // belongs to a segment. That is a lifecycle decision, not a call-site one.
+            null,
             documentVisibilityTracker,  // Wire visibility tracker for document atomicity
             termFrequencyTracker,  // Term frequency tracker for selectivity estimation
             documentTimeoutMs
@@ -841,7 +967,13 @@ public class ExcaliburDBServer {
                 }
             },
             null,  // lshIngestionService - not configured here
-            null,  // documentChunkBuffer - not configured here
+            // No document chunk buffer. Document visibility does not depend on it -- publishDocument
+            // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
+            // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
+            // is not active. Wiring it needs a write log this buffer can own (it appends and
+            // assumes exclusive use), and the node has no such log today: every WriteLog here
+            // belongs to a segment. That is a lifecycle decision, not a call-site one.
+            null,
             visibilityTracker,  // Use provided visibility tracker (may be null)
             termFrequencyTracker,  // Term frequency tracker for selectivity estimation
             documentTimeoutMs
@@ -933,7 +1065,13 @@ public class ExcaliburDBServer {
                 }
             },
             lshIngestionService,  // Pass LSH ingestion service for vector indexing
-            null,  // documentChunkBuffer - not configured here
+            // No document chunk buffer. Document visibility does not depend on it -- publishDocument
+            // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
+            // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
+            // is not active. Wiring it needs a write log this buffer can own (it appends and
+            // assumes exclusive use), and the node has no such log today: every WriteLog here
+            // belongs to a segment. That is a lifecycle decision, not a call-site one.
+            null,
             visibilityTracker,
             termFrequencyTracker,  // Term frequency tracker for selectivity estimation
             documentTimeoutMs
@@ -965,24 +1103,66 @@ public class ExcaliburDBServer {
             throw new IllegalStateException("Server is already running");
         }
 
-        LOGGER.info("Starting ExcaliburDB API server on port {}", port);
+        // Refuse a configuration that would expose an unauthenticated or cleartext listener
+        // before anything is bound.
+        security.requireSafeToServe();
 
-        server = HttpServer.create(new InetSocketAddress(port), backlog);
+        // Built before the bind, not after: reading the keystore, locating the key entry and
+        // reducing the protocol and suite lists to what this JVM supports can all fail, and a
+        // failure after HttpsServer.create leaves a listening socket behind that stop() will
+        // not clean up, because stop() does nothing until `running` is set.
+        HttpsConfigurator tls = null;
+        if (security.tls().isEnabled()) {
+            try {
+                tls = security.tls().configurator();
+            } catch (GeneralSecurityException e) {
+                throw new IOException("TLS is configured but could not be initialised: "
+                    + e.getMessage(), e);
+            }
+        }
 
-        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        InetSocketAddress bindTo = new InetSocketAddress(security.bindInetAddress(), port);
+        LOGGER.info("Starting ExcaliburDB API server on {}://{}:{}",
+            tls != null ? "https" : "http", security.bindAddress(), port);
 
-        registerEndpoints();
+        HttpServer created;
+        if (tls != null) {
+            HttpsServer https = HttpsServer.create(bindTo, backlog);
+            https.setHttpsConfigurator(tls);
+            created = https;
+        } else {
+            created = HttpServer.create(bindTo, backlog);
+        }
+        boolean orchestratorStarted = false;
+        try {
+            created.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
 
-        // Start the index orchestrator (including epoch tick scheduler) before accepting requests
-        // This ensures the visibility epoch advances automatically without manual intervention
-        indexOrchestrator.start();
-        LOGGER.info("Index orchestrator started - epoch tick scheduler running at {}ms interval",
-            indexOrchestrator.getEpochTickScheduler().getTickIntervalMs());
+            registerEndpoints(created);
 
-        server.start();
+            // Start the index orchestrator (including epoch tick scheduler) before accepting requests
+            // This ensures the visibility epoch advances automatically without manual intervention
+            indexOrchestrator.start();
+            orchestratorStarted = true;
+            LOGGER.info("Index orchestrator started - epoch tick scheduler running at {}ms interval",
+                indexOrchestrator.getEpochTickScheduler().getTickIntervalMs());
+
+            created.start();
+        } catch (RuntimeException e) {
+            // The listening socket is already bound at this point; leaving it - and a
+            // started orchestrator - behind on a failed start leaks both, because stop()
+            // does nothing until `running` is set.
+            created.stop(0);
+            if (orchestratorStarted) {
+                indexOrchestrator.close();
+            }
+            throw e;
+        }
+
+        server = created;
         running.set(true);
 
-        LOGGER.info("ExcaliburDB API server started successfully on port {}", port);
+        LOGGER.info("ExcaliburDB API server started successfully on port {} ({})",
+            port, security.tls().isEnabled() ? "TLS" : "cleartext");
         LOGGER.info("Endpoints available:");
         LOGGER.info("  GET    /health           - Health check");
         LOGGER.info("  GET    /v1/stats         - System statistics");
@@ -1008,9 +1188,36 @@ public class ExcaliburDBServer {
 
         LOGGER.info("Stopping ExcaliburDB API server...");
 
-        if (server != null) {
-            server.stop(timeoutSeconds);
+        // Order matters. Stop accepting first, then drain everything that can still be
+        // touching storage, and only then let the caller close the storage engine and
+        // the shared arena. A background task still writing into a mapping whose arena
+        // has been closed crashes the JVM rather than throwing.
+        HttpServer current = server;
+        if (current != null) {
+            current.stop(timeoutSeconds);
             server = null;
+        }
+
+        ReindexEndpoint reindex = reindexEndpoint;
+        if (reindex != null) {
+            reindex.close();
+        }
+
+        QueryEndpoint query = queryEndpoint;
+        if (query != null) {
+            query.shutdown();
+        }
+
+        IngestionOrchestrator ingestion = ingestionOrchestrator;
+        if (ingestion != null && !ingestion.shutdown()) {
+            LOGGER.warn("Ingestion threads did not finish before shutdown timeout");
+        }
+
+        // The registry owns the sources it published; nothing else may close them.
+        try {
+            ingestSourceRegistry.close();
+        } catch (Exception e) {
+            LOGGER.warn("Error closing ingestion sources: {}", e.getMessage());
         }
 
         // Stop the index orchestrator after the HTTP server stops
@@ -1043,10 +1250,11 @@ public class ExcaliburDBServer {
      * @return The port number, or -1 if not started
      */
     public int getPort() {
-        if (server == null) {
+        HttpServer current = server;
+        if (current == null) {
             return -1;
         }
-        return server.getAddress().getPort();
+        return current.getAddress().getPort();
     }
 
     /**
@@ -1106,9 +1314,53 @@ public class ExcaliburDBServer {
     }
 
     /**
-     * Registers all API endpoints.
+     * Registers all API endpoints on the given server.
+     *
+     * @param target The HTTP server to register contexts on
      */
-    private void registerEndpoints() {
+    /**
+     * Attaches the graph-RAG pipeline, enabling {@code POST /v1/graph/query}.
+     *
+     * <p>Must be called before {@link #start()}; endpoints are registered there, so a pipeline
+     * supplied afterwards would be silently ignored. Rejecting it late is better than accepting it
+     * and serving 404.
+     */
+    public ExcaliburDBServer withGraphPipeline(
+            io.excalibur.retrieval.pipeline.GraphRagPipeline pipeline) {
+        if (isRunning()) {
+            throw new IllegalStateException(
+                "graph pipeline must be attached before start(); endpoints are registered there");
+        }
+        this.graphPipeline = pipeline;
+        return this;
+    }
+
+    /**
+     * Attaches a graph this node builds and serves itself, enabling {@code POST /v1/graph/query}
+     * and {@code POST /v1/graph/build}.
+     *
+     * <p>Both routes are registered whether or not a graph exists yet. A node that has ingested
+     * but not built has the second and needs it; registering the first only when a graph happened
+     * to be present at startup is what made a freshly built graph invisible until a restart.
+     *
+     * <p>Must be called before {@link #start()}; endpoints are registered there.
+     *
+     * @param holder       Holds the stack currently being served
+     * @param buildService Builds a new stack from staged facts and installs it
+     * @return this server, for chaining
+     */
+    public ExcaliburDBServer withGraphSupport(excalibur.api.bootstrap.GraphTenants tenants) {
+        if (isRunning()) {
+            throw new IllegalStateException(
+                "graph support must be attached before start(); endpoints are registered there");
+        }
+        this.graphTenants = Objects.requireNonNull(tenants, "tenants cannot be null");
+        return this;
+    }
+
+    private void registerEndpoints(HttpServer target) {
+        RequestGuard guard = new RequestGuard(security);
+
         // Determine health config values from config or use defaults
         double readinessThreshold = config != null
             ? config.health().getReadinessThreshold()
@@ -1125,8 +1377,12 @@ public class ExcaliburDBServer {
             indexOrchestrator, readinessThreshold, healthyThreshold, maxLatencyMs);
         StatsEndpoint statsEndpoint = new StatsEndpoint(indexOrchestrator, storageEngine, volumeManager);
 
-        // QueryEndpoint - pass config for include_partial_segments default and queryRegistry for cancellation
-        QueryEndpoint queryEndpoint = new QueryEndpoint(queryPipeline, config, null, queryRegistry);
+        // QueryEndpoint - pass config for defaults, queryRegistry for cancellation,
+        // and embeddingClient so clients can submit raw query text (recommended path)
+        // instead of computing embeddings client-side.
+        QueryEndpoint queryHandler = new QueryEndpoint(
+            queryPipeline, config, null, queryRegistry, embeddingClient, security);
+        this.queryEndpoint = queryHandler;
 
         // QueryCancelEndpoint for user-initiated query cancellation
         // Note: This endpoint is registered at the same path as QueryEndpoint
@@ -1139,7 +1395,8 @@ public class ExcaliburDBServer {
         IngestEndpoint ingestEndpoint = new IngestEndpoint(
             ingestSourceRegistry,
             ingestionStatusRegistry,
-            ingestionOrchestrator
+            ingestionOrchestrator,
+            new IngestTargetValidator(security)
         );
         LOGGER.info("IngestEndpoint configured with status registry (orchestrator: {})",
             ingestionOrchestrator != null ? "enabled" : "disabled (stub mode)");
@@ -1147,9 +1404,9 @@ public class ExcaliburDBServer {
         // Wire the reindex scheduler to the ingest source registry for periodic reindexing
         // When sources are registered via /v1/ingest, they will be automatically
         // registered with the scheduler for periodic reindexing at the configured interval
-        if (ingestSourceRegistry instanceof IngestEndpoint.InMemorySourceRegistry) {
-            IngestEndpoint.InMemorySourceRegistry inMemRegistry =
-                (IngestEndpoint.InMemorySourceRegistry) ingestSourceRegistry;
+        if (ingestSourceRegistry instanceof InMemorySourceRegistry) {
+            InMemorySourceRegistry inMemRegistry =
+                (InMemorySourceRegistry) ingestSourceRegistry;
             long reindexIntervalMs = config != null
                 ? config.ingest().getReindexIntervalMs()
                 : SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
@@ -1164,57 +1421,96 @@ public class ExcaliburDBServer {
         // If documentReindexer is configured, actual reindexing will occur
         // Auto-create sourceResolver if not explicitly set
         // Pass VolumeManager and SegmentCatalog for zero-downtime rolling replacement
-        ReindexEndpoint reindexEndpoint;
+        ReindexEndpoint reindexHandler;
         if (documentReindexer != null) {
             // Auto-create sourceResolver if not explicitly set
             SourceResolver resolver = (sourceResolver != null)
                 ? sourceResolver
                 : createSourceResolver();
-            reindexEndpoint = new ReindexEndpoint(
+            reindexHandler = new ReindexEndpoint(
                 new SourceRegistryAdapter(ingestSourceRegistry),
                 reindexStatusRegistry,
                 documentReindexer,
                 resolver,
-                volumeManager,              // For selecting volumes for new segments
-                storageEngine.getCatalog()  // For segment lifecycle management
+                volumeManager,               // For selecting volumes for new segments
+                storageEngine.getCatalog(),  // For segment lifecycle management
+                reindexCoordinator           // Shared with the scheduled reindex handler
             );
             boolean hasRollingReplacement = volumeManager != null && storageEngine.getCatalog() != null;
             LOGGER.info("ReindexEndpoint configured with DocumentReindexer for actual reindex operations, rolling replacement: {}",
                 hasRollingReplacement ? "enabled" : "disabled");
         } else {
-            reindexEndpoint = new ReindexEndpoint(
+            reindexHandler = new ReindexEndpoint(
                 new SourceRegistryAdapter(ingestSourceRegistry),
                 reindexStatusRegistry
             );
-            LOGGER.info("ReindexEndpoint configured in stub mode (no DocumentReindexer)");
+            LOGGER.info("ReindexEndpoint configured without a DocumentReindexer; "
+                + "POST /v1/reindex will answer 503 until one is wired");
         }
+        this.reindexEndpoint = reindexHandler;
 
         IngestStatusEndpoint ingestStatusEndpoint = new IngestStatusEndpoint(ingestionStatusRegistry);
 
-        // Register endpoints
-        server.createContext("/health", wrapHandler(healthEndpoint));
-        server.createContext("/v1/stats", wrapHandler(statsEndpoint));
+        // Register endpoints. Every path goes through the guard: /health is the one
+        // unauthenticated route, because a liveness probe cannot carry a token, and it
+        // is still rate limited.
+        target.createContext("/health",
+            wrapHandler(guard.protect(RequestGuard.Access.PUBLIC, healthEndpoint)));
+        target.createContext("/v1/stats",
+            wrapHandler(guard.protect(RequestGuard.Access.READ, statsEndpoint)));
         // Create a composite handler for /v1/query that routes based on HTTP method
-        server.createContext("/v1/query", createQueryMethodRouter(queryEndpoint, queryCancelEndpoint));
-        server.createContext("/v1/ingest", wrapHandler(ingestEndpoint));
-        server.createContext("/v1/reindex", wrapHandler(reindexEndpoint));
-        server.createContext("/v1/ingest/status", wrapHandler(ingestStatusEndpoint));
+        target.createContext("/v1/query", createQueryMethodRouter(
+            guard.protect(RequestGuard.Access.READ, queryHandler),
+            guard.protect(RequestGuard.Access.MUTATE, queryCancelEndpoint)));
+        target.createContext("/v1/ingest",
+            wrapHandler(guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint)));
+        target.createContext("/v1/reindex",
+            wrapHandler(guard.protect(RequestGuard.Access.MUTATE, reindexHandler)));
+        target.createContext("/v1/ingest/status",
+            wrapHandler(guard.protect(RequestGuard.Access.READ, ingestStatusEndpoint)));
 
-        server.createContext("/", this::handleNotFound);
+        // Registered only when a graph store is configured. A read, not a mutation: it walks the
+        // graph and returns context, and charging it against the smaller mutate budget would
+        // throttle ordinary questions.
+        if (graphTenants != null) {
+            target.createContext("/v1/graph/query", wrapHandler(guard.protect(
+                RequestGuard.Access.READ,
+                new excalibur.api.endpoint.GraphQueryEndpoint(graphTenants))));
+            // Both mutations: they rewrite the served graph.
+            target.createContext("/v1/graph/build", wrapHandler(guard.protect(
+                RequestGuard.Access.MUTATE,
+                new excalibur.api.endpoint.GraphBuildEndpoint(graphTenants))));
+            target.createContext("/v1/graph/erasure", wrapHandler(guard.protect(
+                RequestGuard.Access.MUTATE,
+                new excalibur.api.endpoint.GraphErasureEndpoint(graphTenants))));
+        } else if (graphPipeline != null) {
+            target.createContext("/v1/graph/query", wrapHandler(guard.protect(
+                RequestGuard.Access.READ,
+                new excalibur.api.endpoint.GraphQueryEndpoint(graphPipeline))));
+        }
 
-        LOGGER.debug("Registered endpoints: /health, /v1/stats, /v1/query (POST=query, DELETE=cancel), /v1/ingest, /v1/reindex, /v1/ingest/status");
+        target.createContext("/",
+            wrapHandler(guard.protect(RequestGuard.Access.PUBLIC, this::handleNotFound)));
+
+        LOGGER.info("Registered endpoints with authentication {}: /health (public), /v1/stats, "
+                + "/v1/query (POST=query, DELETE=cancel), /v1/ingest, /v1/reindex, "
+                + "/v1/ingest/status{}",
+            security.isAuthenticationRequired() ? "required" : "disabled",
+            graphTenants != null
+                ? ", /v1/graph/query, /v1/graph/build, /v1/graph/erasure"
+                : (graphPipeline != null ? ", /v1/graph/query" : ""));
     }
 
     /**
-     * Adapts IngestEndpoint.SourceRegistry to ReindexEndpoint.SourceRegistry interface.
+     * Adapts SourceRegistry to ReindexEndpoint.SourceRegistry interface.
      *
      * <p>This adapter bridges the two registry interfaces, ensuring that sources
      * registered via /v1/ingest are visible to /v1/reindex for consistency.</p>
      */
     private static class SourceRegistryAdapter implements ReindexEndpoint.SourceRegistry {
-        private final IngestEndpoint.SourceRegistry delegate;
+        private final SourceRegistry delegate;
 
-        SourceRegistryAdapter(IngestEndpoint.SourceRegistry delegate) {
+        SourceRegistryAdapter(SourceRegistry delegate) {
             this.delegate = Objects.requireNonNull(delegate);
         }
 
@@ -1324,32 +1620,27 @@ public class ExcaliburDBServer {
      */
     private void sendError(com.sun.net.httpserver.HttpExchange exchange, int statusCode, String message) 
             throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", escapeJson(message));
+        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, statusCode, bytes);
     }
 
-    /**
-     * Escapes special characters for JSON strings.
-     */
-    private String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t");
-    }
 
     @Override
     public String toString() {
-        return String.format("ExcaliburDBServer{port=%d, running=%s}", 
-            server != null ? server.getAddress().getPort() : port, running.get());
+        HttpServer current = server;
+        return String.format("ExcaliburDBServer{port=%d, running=%s}",
+            current != null ? current.getAddress().getPort() : port, running.get());
+    }
+
+    /**
+     * Returns the registry ingestion sources are registered in.
+     *
+     * @return The source registry
+     */
+    public SourceRegistry getIngestSourceRegistry() {
+        return ingestSourceRegistry;
     }
 }

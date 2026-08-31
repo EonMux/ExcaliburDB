@@ -1,5 +1,6 @@
 package io.excalibur.llm.client;
 
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -466,5 +467,23 @@ class ResponseSanitizerTest {
         String result = sanitizer.sanitize(input);
 
         assertEquals("[]", result);
+    }
+
+    @Test
+    @DisplayName("prose containing brackets does not shadow the score array")
+    void prefersTheBracketPairCarryingScores() {
+        // A model that labels its answer puts a bracket pair ahead of the real array. Returning
+        // the first pair produced something that passed for a JSON array and then parsed to no
+        // scores at all - a query answered with nothing, reported as a success.
+        String response = "Scores [0-1 scale]:\n[{\"index\": 0, \"score\": 0.9}]";
+
+        assertEquals("[{\"index\": 0, \"score\": 0.9}]",
+            ResponseSanitizer.sanitizeStatic(response));
+    }
+
+    @Test
+    @DisplayName("falls back to the first bracket pair when none carries scores")
+    void fallsBackToTheFirstPair() {
+        assertEquals("[1, 2, 3]", ResponseSanitizer.sanitizeStatic("values: [1, 2, 3]"));
     }
 }

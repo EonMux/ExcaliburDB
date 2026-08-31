@@ -108,7 +108,7 @@ public class SegmentCatalog {
      * 
      * <p>Key: volumePath → Value: list of segmentIds</p>
      */
-    private final Map<Path, java.util.List<Long>> volumeToSegments = new HashMap<>();
+    private final Map<Path, java.util.List<Long>> volumeToSegments = new ConcurrentHashMap<>();
 
     /**
      * Global segment ID generator.
@@ -265,7 +265,22 @@ public class SegmentCatalog {
     public void updateEntryCount(long segmentId, int deltaChange) {
         SegmentMetadata metadata = segments.get(segmentId);
         if (metadata != null) {
-            metadata.setEntryCount(metadata.getEntryCount() + deltaChange);
+            metadata.addEntryCount(deltaChange);
+        }
+    }
+
+    /**
+     * Records that an entry was tombstoned in a segment.
+     *
+     * <p>The tombstone count is what drives compaction scheduling, so it must be
+     * recorded on the delete path rather than inferred from a timer.</p>
+     *
+     * @param segmentId Unique segment identifier
+     */
+    public void recordTombstone(long segmentId) {
+        SegmentMetadata metadata = segments.get(segmentId);
+        if (metadata != null) {
+            metadata.addTombstoneCount(1);
         }
     }
 
@@ -314,18 +329,91 @@ public class SegmentCatalog {
         SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
             new SegmentMetadata(segmentId));
 
+        // A caller-supplied id must never be handed out again by create().
+        reserveSegmentId(segmentId);
+
         metadata.setVolumePath(volumePath);
         metadata.setCreationTime(System.currentTimeMillis());
-        metadata.transitionToIndexing();
 
-        // Register in volume index
-        volumeToSegments.computeIfAbsent(volumePath, k -> new java.util.ArrayList<>())
-            .add(segmentId);
+        // Only a freshly created entry is moved into INDEXING. Re-registering a segment
+        // whose recovered state is already ACTIVE (or later) must not be rejected -
+        // ACTIVE -> INDEXING is not a legal transition, and throwing here would abort
+        // startup or leave a split half-applied.
+        if (metadata.getLifecycleState() == LifecycleState.BOOTSTRAPPING) {
+            metadata.transitionToIndexing();
+        }
+
+        indexByVolume(volumePath, segmentId);
 
         // Persist to disk
         persistSegment(metadata);
 
         return metadata;
+    }
+
+    /**
+     * Registers or re-points a segment file without forcing a lifecycle transition.
+     *
+     * <p>Used when a segment's backing file is replaced in place - split publication
+     * repoints the parent's index at the left child, compaction repoints an index at
+     * the compacted file. Both can happen while the segment is ACTIVE, and
+     * {@code ACTIVE -> INDEXING} is not a legal transition, so {@link #add(long, Path)}
+     * cannot be used for them.</p>
+     *
+     * @param segmentId  The segment index whose file changed
+     * @param volumePath The new segment file path
+     * @return The metadata for the segment
+     */
+    public SegmentMetadata registerFile(long segmentId, Path volumePath) {
+        SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
+            new SegmentMetadata(segmentId));
+
+        reserveSegmentId(segmentId);
+
+        Path previousPath = metadata.getVolumePath();
+        if (previousPath != null && !previousPath.equals(volumePath)) {
+            java.util.List<Long> ids = volumeToSegments.get(previousPath);
+            if (ids != null) {
+                synchronized (ids) {
+                    ids.remove(Long.valueOf(segmentId));
+                }
+            }
+        }
+
+        metadata.setVolumePath(volumePath);
+        if (metadata.getCreationTime() == 0) {
+            metadata.setCreationTime(System.currentTimeMillis());
+        }
+
+        indexByVolume(volumePath, segmentId);
+        persistSegment(metadata);
+
+        return metadata;
+    }
+
+    /**
+     * Records a segment id in the volume index exactly once.
+     *
+     * @param volumePath The segment file path
+     * @param segmentId  The segment id
+     */
+    private void indexByVolume(Path volumePath, long segmentId) {
+        java.util.List<Long> ids = volumeToSegments.computeIfAbsent(
+            volumePath, k -> java.util.Collections.synchronizedList(new java.util.ArrayList<>()));
+        synchronized (ids) {
+            if (!ids.contains(segmentId)) {
+                ids.add(segmentId);
+            }
+        }
+    }
+
+    /**
+     * Ensures the id generator can never hand out an id that is already in use.
+     *
+     * @param segmentId The id that has just been taken
+     */
+    private void reserveSegmentId(long segmentId) {
+        segmentIdGenerator.accumulateAndGet(segmentId, Math::max);
     }
 
     /**
@@ -356,22 +444,27 @@ public class SegmentCatalog {
             throw new NullPointerException("volumePath cannot be null");
         }
 
-        // Generate unique segment ID
-        long segmentId = segmentIdGenerator.incrementAndGet();
+        // Generate a unique segment ID. The generator is also advanced by add() and
+        // recover(), but a concurrent add() can still take the next id, so keep
+        // drawing until an unused key is claimed rather than overwriting a live
+        // routing segment's metadata with a blind put().
+        long segmentId;
+        SegmentMetadata metadata;
+        while (true) {
+            segmentId = segmentIdGenerator.incrementAndGet();
+            metadata = new SegmentMetadata(segmentId);
+            if (segments.putIfAbsent(segmentId, metadata) == null) {
+                break;
+            }
+        }
 
-        SegmentMetadata metadata = new SegmentMetadata(segmentId);
         metadata.setVolumePath(volumePath);
         metadata.setSourceId(sourceId);
         metadata.setCreationTime(System.currentTimeMillis());
         // Segment is in BOOTSTRAPPING state by default - invisible to queries
         // Caller should call beginIndexing() to make it queryable
 
-        // Add to registry
-        segments.put(segmentId, metadata);
-
-        // Register in volume index
-        volumeToSegments.computeIfAbsent(volumePath, k -> new java.util.ArrayList<>())
-            .add(segmentId);
+        indexByVolume(volumePath, segmentId);
 
         // Persist to disk
         persistSegment(metadata);
@@ -460,7 +553,9 @@ public class SegmentCatalog {
         if (metadata.getVolumePath() != null) {
             java.util.List<Long> segmentIds = volumeToSegments.get(metadata.getVolumePath());
             if (segmentIds != null) {
-                segmentIds.remove(segmentId);
+                synchronized (segmentIds) {
+                    segmentIds.remove(Long.valueOf(segmentId));
+                }
                 if (segmentIds.isEmpty()) {
                     volumeToSegments.remove(metadata.getVolumePath());
                 }
@@ -556,6 +651,8 @@ public class SegmentCatalog {
         metadata.setLifecycleState(LifecycleState.ACTIVE);
         metadata.setEntryState(ENTRY_STATE_ACTIVE);
         metadata.setLastCompactionTime(System.currentTimeMillis());
+        // Compaction is what removes tombstoned records, so the count starts over.
+        metadata.clearTombstoneCount();
         persistSegment(metadata);
     }
 
@@ -1068,10 +1165,36 @@ public class SegmentCatalog {
      */
     public static class SegmentMetadata {
         private final long segmentId;
-        private Path volumePath;
-        private int entryCount = 0;
-        private int entryState = ENTRY_STATE_NONE;
-        private LifecycleState lifecycleState = LifecycleState.BOOTSTRAPPING;
+        private volatile Path volumePath;
+
+        /**
+         * Entry count. Atomic because every put and delete adjusts it by a delta from
+         * whichever ingest thread performed the write.
+         */
+        private final java.util.concurrent.atomic.AtomicInteger entryCount =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+        private volatile int entryState = ENTRY_STATE_NONE;
+
+        /**
+         * Number of entries tombstoned in this segment since the last compaction.
+         *
+         * <p>Atomic for the same reason as {@code entryCount}: it is adjusted from
+         * whichever thread performed the delete. Reset to zero when compaction
+         * completes, since compaction is what removes tombstoned records.</p>
+         */
+        private final java.util.concurrent.atomic.AtomicInteger tombstoneCount =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+        /**
+         * Lifecycle state. Volatile because query threads read it lock-free while
+         * background workers transition it; all transitions go through the
+         * {@code stateLock} monitor so validate-and-assign is atomic.
+         */
+        private volatile LifecycleState lifecycleState = LifecycleState.BOOTSTRAPPING;
+
+        /** Monitor guarding lifecycle transitions. */
+        private final Object stateLock = new Object();
 
         /**
          * Source ID that this segment belongs to.
@@ -1202,7 +1325,7 @@ public class SegmentCatalog {
          * @return Entry count
          */
         public int getEntryCount() {
-            return entryCount;
+            return entryCount.get();
         }
 
         /**
@@ -1211,7 +1334,57 @@ public class SegmentCatalog {
          * @param entryCount Entry count
          */
         public void setEntryCount(int entryCount) {
-            this.entryCount = entryCount;
+            this.entryCount.set(entryCount);
+        }
+
+        /**
+         * Atomically adjusts the entry count by a delta.
+         *
+         * @param delta The change to apply (may be negative)
+         * @return The updated entry count
+         */
+        public int addEntryCount(int delta) {
+            return entryCount.addAndGet(delta);
+        }
+
+        /**
+         * Gets the number of tombstoned entries since the last compaction.
+         *
+         * @return Tombstone count
+         */
+        public int getTombstoneCount() {
+            return tombstoneCount.get();
+        }
+
+        /**
+         * Records tombstoned entries.
+         *
+         * @param delta Number of entries tombstoned
+         * @return The updated tombstone count
+         */
+        public int addTombstoneCount(int delta) {
+            return tombstoneCount.addAndGet(delta);
+        }
+
+        /**
+         * Clears the tombstone count, e.g. after a compaction removed the records.
+         */
+        public void clearTombstoneCount() {
+            tombstoneCount.set(0);
+        }
+
+        /**
+         * Returns the fraction of this segment's records that are tombstones.
+         *
+         * <p>Denominator is live entries plus tombstones, matching
+         * {@code Segment.tombstoneCount() / Segment.entryCount()}.</p>
+         *
+         * @return Tombstone ratio in [0.0, 1.0]; 0.0 when the segment holds no records
+         */
+        public double tombstoneRatio() {
+            int tombstones = tombstoneCount.get();
+            long total = (long) entryCount.get() + tombstones;
+            return total <= 0 ? 0.0 : (double) tombstones / total;
         }
 
         /**
@@ -1251,11 +1424,10 @@ public class SegmentCatalog {
          * @throws IllegalStateException if the transition is invalid
          */
         public void setLifecycleState(LifecycleState state) {
-            LifecycleState.validateTransition(this.lifecycleState, state);
-            LifecycleState oldState = this.lifecycleState;
-            this.lifecycleState = state;
-            // Notify catalog to update metadata if we're in a cataloged segment
-            // This is called via reflection from SegmentCatalog when needed
+            synchronized (stateLock) {
+                LifecycleState.validateTransition(this.lifecycleState, state);
+                this.lifecycleState = state;
+            }
         }
 
         /**
@@ -1272,7 +1444,27 @@ public class SegmentCatalog {
          * @param state The new lifecycle state
          */
         void setLifecycleStateInternal(LifecycleState state) {
-            this.lifecycleState = state;
+            synchronized (stateLock) {
+                this.lifecycleState = state;
+            }
+        }
+
+        /**
+         * Restores a persisted lifecycle state without transition validation.
+         *
+         * <p>For catalog recovery only: the state read back from disk is wherever the
+         * segment actually was, and replaying it through the transition rules would
+         * reject perfectly valid states such as a persisted ACTIVE or TOMBSTONED.</p>
+         *
+         * @param state The state read from the catalog file (ignored if null)
+         */
+        public void restoreLifecycleState(LifecycleState state) {
+            if (state == null) {
+                return;
+            }
+            synchronized (stateLock) {
+                this.lifecycleState = state;
+            }
         }
 
         /**

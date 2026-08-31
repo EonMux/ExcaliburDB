@@ -191,7 +191,7 @@ class SegmentSplitTest {
             Segment leftChild = new Segment(leftPath, 64 * 1024, arena);
             Segment rightChild = new Segment(rightPath, 64 * 1024, arena);
 
-            segment.completeSplit(leftChild, rightChild);
+            segment.completeSplit(leftChild, rightChild, 0);
 
             assertTrue(segment.isSplitComplete(), "Segment should be SPLIT_COMPLETE");
             assertEquals(leftChild, segment.leftChild(), "Left child should be set");
@@ -211,7 +211,7 @@ class SegmentSplitTest {
             Segment rightChild = new Segment(rightPath, 64 * 1024, arena);
 
             assertThrows(IllegalStateException.class, () -> {
-                segment.completeSplit(leftChild, rightChild);
+                segment.completeSplit(leftChild, rightChild, 0);
             }, "completeSplit should fail if not in SPLITTING state");
 
             leftChild.close();
@@ -227,11 +227,11 @@ class SegmentSplitTest {
             Segment leftChild = new Segment(leftPath, 64 * 1024, arena);
 
             assertThrows(NullPointerException.class, () -> {
-                segment.completeSplit(null, leftChild);
+                segment.completeSplit(null, leftChild, 0);
             }, "completeSplit should reject null left child");
 
             assertThrows(NullPointerException.class, () -> {
-                segment.completeSplit(leftChild, null);
+                segment.completeSplit(leftChild, null, 0);
             }, "completeSplit should reject null right child");
 
             leftChild.close();
@@ -563,7 +563,7 @@ class SegmentSplitTest {
             rightChild.flush();
 
             // Complete split
-            segment.completeSplit(leftChild, rightChild);
+            segment.completeSplit(leftChild, rightChild, 0);
 
             // Verify state
             assertTrue(segment.isSplitComplete());
@@ -644,7 +644,7 @@ class SegmentSplitTest {
 
             leftChild.flush();
             rightChild.flush();
-            segment.completeSplit(leftChild, rightChild);
+            segment.completeSplit(leftChild, rightChild, 0);
 
             // Verify only live entries were copied
             assertEquals(25, liveCount, "Only 25 live entries should be copied");
@@ -692,7 +692,7 @@ class SegmentSplitTest {
             Segment leftChild = new Segment(leftPath, 64 * 1024, arena);
             Segment rightChild = new Segment(rightPath, 64 * 1024, arena);
 
-            segment.completeSplit(leftChild, rightChild);
+            segment.completeSplit(leftChild, rightChild, 0);
 
             assertEquals("domain-left.bin", segment.leftChild().path().getFileName().toString());
             assertEquals("domain-right.bin", segment.rightChild().path().getFileName().toString());

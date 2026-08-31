@@ -9,6 +9,7 @@ import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Locale;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -65,6 +66,16 @@ public class ResultAggregator {
      */
     public static final double DEFAULT_COVERAGE_THRESHOLD = 0.5;
 
+    /**
+     * Upper bound on the initial capacity handed to the top-k selection heap.
+     *
+     * <p>{@code topK} is client-controlled, so it must never be used directly as an
+     * array-backed collection's initial capacity: a large value would allocate that
+     * much memory before a single result had been produced. The heap grows on demand,
+     * so capping the initial size costs nothing for genuinely large result sets.</p>
+     */
+    static final int MAX_HEAP_INITIAL_CAPACITY = 1024;
+
     private final int topK;
     private final float threshold;
     private final double coverageThreshold;
@@ -106,8 +117,10 @@ public class ResultAggregator {
     /**
      * Merges results from multiple segment queries with score normalization.
      *
-     * <p>This method normalizes raw distance values to [0.0, 1.0] scores where
-     * higher is always better, regardless of the underlying distance metric.</p>
+     * <p>Segment results carry {@link HnswSearchResult#distance()}, which is a monotone
+     * dissimilarity (smaller is closer) for every metric. This method converts those
+     * values to [0.0, 1.0] scores where higher is always better, regardless of the
+     * underlying distance metric.</p>
      *
      * <h3>Normalization</h3>
      * <ul>
@@ -150,14 +163,18 @@ public class ResultAggregator {
             }
 
             for (HnswSearchResult hnswResult : segmentResult.results()) {
-                // Normalize the raw distance to [0.0, 1.0] score
-                float normalizedScore = DistanceValidator.validateClampAndNormalize(
-                    hnswResult.distance(), distanceFunction);
-
-                // Apply threshold filter on normalized score (lower = worse, so filter out)
-                if (threshold > 0 && normalizedScore < threshold) {
+                // Drop non-finite distances at the source: they cannot be ranked and would
+                // otherwise abort the whole aggregation when QueryResultItem validates them.
+                if (!Float.isFinite(hnswResult.distance())) {
+                    LOGGER.debug("Skipping result with non-finite distance {}: nodeId={}, documentId={}",
+                        hnswResult.distance(), hnswResult.nodeId(), hnswResult.documentId());
                     continue;
                 }
+
+                // distance() is an ordered dissimilarity (smaller is closer) for every metric,
+                // so it must be converted back to the metric's natural scale before normalizing.
+                float normalizedScore = DistanceValidator.validateClampAndNormalizeOrderedDistance(
+                    hnswResult.distance(), distanceFunction);
 
                 // Skip items with NaN scores - they cannot be properly ranked
                 if (Float.isNaN(normalizedScore)) {
@@ -166,21 +183,29 @@ public class ResultAggregator {
                     continue;
                 }
 
+                // Apply threshold filter on normalized score (lower = worse, so filter out)
+                if (threshold > 0 && normalizedScore < threshold) {
+                    continue;
+                }
+
                 String documentIdStr = hnswResult.documentId();
                 long nodeId = hnswResult.nodeId();
 
-                // Create result item with normalized score
+                // Create result item with normalized score. A tail-scan hit carries the
+                // chunk text the scan already read; a graph hit has none here and is
+                // resolved from storage later, once selection has narrowed the set.
                 QueryResultItem item = new QueryResultItem(
                     nodeId,
                     documentIdStr,
                     normalizedScore,
-                    null,
+                    segmentResult.payload(nodeId),
                     segmentResult.segmentId(),
-                    nodeId
+                    nodeId,
+                    hnswResult.generation()
                 );
 
                 // Keep the best (highest normalized score) result for each document
-                String dedupeKey = documentIdStr != null ? documentIdStr : String.valueOf(nodeId);
+                String dedupeKey = dedupeKey(documentIdStr, segmentResult.segmentId(), nodeId);
                 bestResultsByDocId.merge(dedupeKey, item, (existing, newItem) ->
                     newItem.score() > existing.score() ? newItem : existing
                 );
@@ -190,7 +215,7 @@ public class ResultAggregator {
         // Phase 2: Select top-k results using a min-heap
         // Min-heap: keep smallest at top so we can remove the worst
         PriorityQueue<QueryResultItem> topResults = new PriorityQueue<>(
-            topK,
+            heapCapacity(topK),
             Comparator.comparingDouble(QueryResultItem::score)
         );
 
@@ -264,7 +289,16 @@ public class ResultAggregator {
             }
 
             for (HnswSearchResult hnswResult : segmentResult.results()) {
-                // Apply threshold filter
+                // Drop non-finite distances at the source rather than letting
+                // QueryResultItem's finiteness check abort the entire query.
+                if (!Float.isFinite(hnswResult.distance())) {
+                    LOGGER.debug("Skipping result with non-finite distance {}: nodeId={}, documentId={}",
+                        hnswResult.distance(), hnswResult.nodeId(), hnswResult.documentId());
+                    continue;
+                }
+
+                // Apply threshold filter (distance() is an ordered dissimilarity:
+                // larger means further away, so anything above the threshold is dropped)
                 if (threshold > 0 && hnswResult.distance() > threshold) {
                     continue;
                 }
@@ -279,14 +313,15 @@ public class ResultAggregator {
                     nodeId, // Numeric ID for backward compatibility
                     documentIdStr, // Actual string document ID
                     hnswResult.distance(),
-                    null, // Payload would be fetched separately
+                    segmentResult.payload(nodeId), // Chunk text, for tail-scan hits
                     segmentResult.segmentId(),
-                    nodeId
+                    nodeId,
+                    hnswResult.generation()
                 );
 
                 // Keep the best (lowest distance) result for each document ID
                 // Use string document ID for deduplication when available
-                String dedupeKey = documentIdStr != null ? documentIdStr : String.valueOf(nodeId);
+                String dedupeKey = dedupeKey(documentIdStr, segmentResult.segmentId(), nodeId);
                 bestResultsByDocIdStr.merge(dedupeKey, item, (existing, newItem) ->
                     newItem.score() < existing.score() ? newItem : existing
                 );
@@ -296,7 +331,7 @@ public class ResultAggregator {
         // Phase 2: Select top-k results using a max-heap
         // Max-heap: keep largest (worst) at top so we can remove it
         PriorityQueue<QueryResultItem> topResults = new PriorityQueue<>(
-            topK,
+            heapCapacity(topK),
             Comparator.comparingDouble(QueryResultItem::score).reversed()
         );
 
@@ -317,6 +352,39 @@ public class ResultAggregator {
             results.size(), segmentResults.size(), bestResultsByDocIdStr.size());
 
         return results;
+    }
+
+    /**
+     * Builds the deduplication key for a result.
+     *
+     * <p>The string document ID identifies a document across the whole corpus and is
+     * used whenever it is available. Node IDs, in contrast, are dense and allocated
+     * per HNSW graph - every segment restarts them at 0, and write-log tail scans
+     * derive theirs from a per-segment LSN - so a bare node ID collides across
+     * segments and would silently discard a legitimate hit from another segment.
+     * The fallback key is therefore scoped by segment.</p>
+     *
+     * @param documentIdStr The string document ID, or null when unknown
+     * @param segmentId The segment that produced the result
+     * @param nodeId The node ID within that segment
+     * @return A key that is unique per document, or per (segment, node) when the
+     *         document ID is unknown
+     */
+    private static String dedupeKey(String documentIdStr, long segmentId, long nodeId) {
+        if (documentIdStr != null) {
+            return documentIdStr;
+        }
+        return segmentId + ":" + nodeId;
+    }
+
+    /**
+     * Returns a safe initial capacity for a top-k selection heap.
+     *
+     * @param topK The requested result count (client-controlled)
+     * @return The initial capacity, capped at {@link #MAX_HEAP_INITIAL_CAPACITY}
+     */
+    private static int heapCapacity(int topK) {
+        return Math.max(1, Math.min(topK, MAX_HEAP_INITIAL_CAPACITY));
     }
 
     /**
@@ -353,7 +421,7 @@ public class ResultAggregator {
                 segmentsWithErrors++;
                 // Check if error was a timeout (simplified check)
                 if (result.errorMessage() != null &&
-                    result.errorMessage().toLowerCase().contains("timeout")) {
+                    result.errorMessage().toLowerCase(Locale.ROOT).contains("timeout")) {
                     segmentsTimedOut++;
                 }
             }
@@ -389,6 +457,13 @@ public class ResultAggregator {
      * the result with the BEST (lowest) distance. This ensures no duplicates
      * in the output and the best matching result is always retained.</p>
      *
+     * <p><strong>Node IDs must share one address space.</strong> Every HNSW graph
+     * allocates node IDs from zero, so results from different segments collide here.
+     * Use this method only to merge result lists that come from a single segment
+     * (for example an HNSW search and that segment's write-log tail scan); to merge
+     * across segments use {@link #mergeAndRankWithNormalization}, which deduplicates
+     * on a segment-scoped key.</p>
+     *
      * <h3>Domain Correctness</h3>
      * <ul>
      *   <li>Results are sorted by distance (ascending - closest first)</li>
@@ -404,7 +479,7 @@ public class ResultAggregator {
     public static List<HnswSearchResult> mergeResults(
             List<List<HnswSearchResult>> allResults, int k) {
 
-        if (allResults == null || allResults.isEmpty()) {
+        if (allResults == null || allResults.isEmpty() || k <= 0) {
             return new ArrayList<>();
         }
 
@@ -424,7 +499,7 @@ public class ResultAggregator {
 
         // Phase 2: Select top-k using a max-heap
         PriorityQueue<HnswSearchResult> topResults = new PriorityQueue<>(
-            k,
+            heapCapacity(k),
             Comparator.comparingDouble(HnswSearchResult::distance).reversed()
         );
 

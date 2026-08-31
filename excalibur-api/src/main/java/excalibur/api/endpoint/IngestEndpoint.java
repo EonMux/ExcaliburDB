@@ -1,23 +1,30 @@
 package excalibur.api.endpoint;
 
+import java.util.Locale;
+
+import excalibur.api.protocol.RequestBody;
+
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
 import excalibur.ingest.source.FilesystemSource;
 import excalibur.ingest.source.HttpSource;
 import excalibur.ingest.source.Source;
-import excalibur.shard.worker.SegmentReindexScheduler;
+import excalibur.api.security.ApiSecurityConfig;
+import excalibur.api.security.IngestTargetRejectedException;
+import excalibur.api.security.IngestTargetValidator;
+import excalibur.api.protocol.JsonText;
+import excalibur.api.protocol.ResponseBody;
 import io.excalibur.core.logging.StructuredLoggingHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+
 
 /**
  * HTTP endpoint for the /v1/ingest API.
@@ -54,6 +61,19 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>{@code http} - HTTP-based document source</li>
  * </ul>
  *
+ * <h2>Target Allow-Lists</h2>
+ * <p>Both source types point the server at something a caller names, so both are
+ * allow-listed by {@link excalibur.api.security.IngestTargetValidator}:</p>
+ * <ul>
+ *   <li>{@code root_path} must resolve, after canonicalisation, inside one of the
+ *       directories listed in {@code excalibur.ingest.allowed-roots}</li>
+ *   <li>{@code base_url} must use http or https, name a host listed in
+ *       {@code excalibur.ingest.allowed-hosts}, and resolve only to public addresses</li>
+ * </ul>
+ * <p>An empty allow-list disables that source type; it never means "unrestricted".
+ * A refused request is answered with 403 and a message that does not describe the
+ * server's filesystem or network.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe. Source registration uses concurrent collections.</p>
  *
@@ -67,17 +87,28 @@ public class IngestEndpoint implements HttpHandler {
     /**
      * Maximum request body size in bytes.
      */
-    private static final int MAX_REQUEST_SIZE = 1024 * 1024; // 1MB
 
     private final SourceRegistry sourceRegistry;
 
     /**
+     * Validates client-supplied ingest targets against the configured allow-lists.
+     * Never null: an endpoint built without an explicit policy gets the default one,
+     * which disables both filesystem and URL ingest.
+     */
+    private final IngestTargetValidator targetValidator;
+
+    /**
      * Creates a new IngestEndpoint with a source registry.
+     *
+     * <p>Ingest targets are validated against the default security policy, which has
+     * no allow-listed roots or hosts and therefore refuses every target. Production
+     * callers must pass a configured {@link IngestTargetValidator}.</p>
      *
      * @param sourceRegistry The registry for managing sources
      */
     public IngestEndpoint(SourceRegistry sourceRegistry) {
-        this.sourceRegistry = Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+        this(sourceRegistry, (IngestStatusEndpoint.IngestionStatusRegistry) null, null,
+            new IngestTargetValidator(ApiSecurityConfig.defaults()));
     }
 
     /**
@@ -90,14 +121,8 @@ public class IngestEndpoint implements HttpHandler {
      * @param statusRegistry The registry for tracking ingestion status (may be null)
      */
     public IngestEndpoint(SourceRegistry sourceRegistry, IngestStatusEndpoint.IngestionStatusRegistry statusRegistry) {
-        Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
-
-        // If it's an InMemorySourceRegistry and we have a status registry, configure it
-        if (sourceRegistry instanceof InMemorySourceRegistry && statusRegistry != null) {
-            ((InMemorySourceRegistry) sourceRegistry).setStatusRegistry(statusRegistry);
-        }
-
-        this.sourceRegistry = sourceRegistry;
+        this(sourceRegistry, statusRegistry, null,
+            new IngestTargetValidator(ApiSecurityConfig.defaults()));
     }
 
     /**
@@ -111,14 +136,8 @@ public class IngestEndpoint implements HttpHandler {
      * @param orchestrator The ingestion orchestrator for background processing (may be null)
      */
     public IngestEndpoint(SourceRegistry sourceRegistry, IngestionOrchestrator orchestrator) {
-        Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
-
-        // If it's an InMemorySourceRegistry and we have an orchestrator, configure it
-        if (sourceRegistry instanceof InMemorySourceRegistry && orchestrator != null) {
-            ((InMemorySourceRegistry) sourceRegistry).setIngestionOrchestrator(orchestrator);
-        }
-
-        this.sourceRegistry = sourceRegistry;
+        this(sourceRegistry, null, orchestrator,
+            new IngestTargetValidator(ApiSecurityConfig.defaults()));
     }
 
     /**
@@ -141,7 +160,30 @@ public class IngestEndpoint implements HttpHandler {
     public IngestEndpoint(SourceRegistry sourceRegistry,
                           IngestStatusEndpoint.IngestionStatusRegistry statusRegistry,
                           IngestionOrchestrator orchestrator) {
+        this(sourceRegistry, statusRegistry, orchestrator,
+            new IngestTargetValidator(ApiSecurityConfig.defaults()));
+    }
+
+    /**
+     * Creates a new IngestEndpoint with an explicit ingest target policy.
+     *
+     * <p>This is the constructor production wiring uses. The validator decides which
+     * filesystem roots and which hosts a client may point the crawler at; without it
+     * {@code root_path} is an arbitrary local file read and {@code base_url} is a
+     * server-side request forgery primitive.</p>
+     *
+     * @param sourceRegistry  The registry for managing sources
+     * @param statusRegistry  The registry for tracking ingestion status (may be null)
+     * @param orchestrator    The ingestion orchestrator for background processing (may be null)
+     * @param targetValidator The allow-list policy for ingest targets
+     * @throws NullPointerException if sourceRegistry or targetValidator is null
+     */
+    public IngestEndpoint(SourceRegistry sourceRegistry,
+                          IngestStatusEndpoint.IngestionStatusRegistry statusRegistry,
+                          IngestionOrchestrator orchestrator,
+                          IngestTargetValidator targetValidator) {
         Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+        this.targetValidator = Objects.requireNonNull(targetValidator, "IngestTargetValidator cannot be null");
 
         // Configure InMemorySourceRegistry with both status and orchestrator
         if (sourceRegistry instanceof InMemorySourceRegistry) {
@@ -190,17 +232,35 @@ public class IngestEndpoint implements HttpHandler {
 
                 LOGGER.info("Registering ingestion source: type={}", request.sourceType);
 
-                // Validate source ID is not already registered
-                if (sourceRegistry.isRegistered(request.sourceId)) {
-                    sendError(exchange, 409, "Source already registered: " + request.sourceId);
+                // Build the source. The target is validated against the configured
+                // allow-lists first, so an unknown root or host never reaches a crawler.
+                Source source;
+                try {
+                    source = createSource(request);
+                } catch (IngestTargetRejectedException e) {
+                    sendError(exchange, 403, e.getMessage());
+                    return;
+                } catch (IllegalArgumentException | IllegalStateException e) {
+                    // Source construction failures can echo server-side detail; log it
+                    // and answer with a fixed message.
+                    LOGGER.warn("Rejected ingest source configuration: {}", e.getMessage());
+                    sendError(exchange, 400, "Invalid source configuration");
                     return;
                 }
 
-                // Create source based on type
-                Source source = createSource(request);
-
-                // Register the source (ingestion runs in background)
-                sourceRegistry.register(source);
+                // Registration is a single atomic claim on the source ID: checking
+                // first and registering afterwards lets two concurrent requests both
+                // start ingestion and orphan one unclosed Source.
+                try {
+                    sourceRegistry.register(source);
+                } catch (SourceRegistrationException e) {
+                    closeQuietly(source);
+                    sendError(exchange, e.reason().statusCode(), e.getMessage());
+                    return;
+                } catch (RuntimeException e) {
+                    closeQuietly(source);
+                    throw e;
+                }
 
                 // Send success response
                 IngestResponse response = new IngestResponse(
@@ -228,31 +288,25 @@ public class IngestEndpoint implements HttpHandler {
      * Reads the request body from the HTTP exchange.
      */
     private String readRequestBody(HttpExchange exchange) throws IOException {
-        try (InputStream is = exchange.getRequestBody()) {
-            byte[] bytes = is.readNBytes(MAX_REQUEST_SIZE + 1);
-            if (bytes.length > MAX_REQUEST_SIZE) {
-                throw new IllegalArgumentException("Request body too large (max " + MAX_REQUEST_SIZE + " bytes)");
-            }
-            return new String(bytes, StandardCharsets.UTF_8);
-        }
+        return RequestBody.read(exchange);
     }
 
     /**
      * Parses the JSON request body into an IngestRequest.
      */
     private IngestRequest parseRequest(String json) {
-        String sourceType = extractString(json, "source_type");
+        String sourceType = JsonText.string(json, "source_type");
         if (sourceType == null || sourceType.isEmpty()) {
             throw new IllegalArgumentException("Field 'source_type' is required");
         }
 
         // Extract config object
-        String configJson = extractObject(json, "config");
+        String configJson = JsonText.object(json, "config");
         if (configJson == null) {
             throw new IllegalArgumentException("Field 'config' is required");
         }
 
-        String sourceId = extractString(configJson, "source_id");
+        String sourceId = JsonText.string(configJson, "source_id");
         if (sourceId == null || sourceId.isEmpty()) {
             throw new IllegalArgumentException("Field 'config.source_id' is required");
         }
@@ -260,9 +314,9 @@ public class IngestEndpoint implements HttpHandler {
         // Type-specific config parsing
         Map<String, String> config = new HashMap<>();
 
-        switch (sourceType.toLowerCase()) {
+        switch (sourceType.toLowerCase(Locale.ROOT)) {
             case "filesystem":
-                String rootPath = extractString(configJson, "root_path");
+                String rootPath = JsonText.string(configJson, "root_path");
                 if (rootPath == null || rootPath.isEmpty()) {
                     throw new IllegalArgumentException("Field 'config.root_path' is required for filesystem source");
                 }
@@ -270,7 +324,7 @@ public class IngestEndpoint implements HttpHandler {
                 break;
 
             case "http":
-                String baseUrl = extractString(configJson, "base_url");
+                String baseUrl = JsonText.string(configJson, "base_url");
                 if (baseUrl == null || baseUrl.isEmpty()) {
                     throw new IllegalArgumentException("Field 'config.base_url' is required for HTTP source");
                 }
@@ -282,12 +336,12 @@ public class IngestEndpoint implements HttpHandler {
         }
 
         // Optional fields
-        String[] includedExtensions = extractStringArray(configJson, "included_extensions");
+        String[] includedExtensions = JsonText.stringArray(configJson, "included_extensions");
         if (includedExtensions != null) {
             config.put("included_extensions", String.join(",", includedExtensions));
         }
 
-        String[] excludedDirectories = extractStringArray(configJson, "excluded_directories");
+        String[] excludedDirectories = JsonText.stringArray(configJson, "excluded_directories");
         if (excludedDirectories != null) {
             config.put("excluded_directories", String.join(",", excludedDirectories));
         }
@@ -299,7 +353,7 @@ public class IngestEndpoint implements HttpHandler {
      * Creates a Source instance based on the request.
      */
     private Source createSource(IngestRequest request) {
-        switch (request.sourceType.toLowerCase()) {
+        switch (request.sourceType.toLowerCase(Locale.ROOT)) {
             case "filesystem":
                 return createFilesystemSource(request);
             case "http":
@@ -311,13 +365,17 @@ public class IngestEndpoint implements HttpHandler {
 
     /**
      * Creates a FilesystemSource from the request config.
+     *
+     * <p>The requested root is canonicalised and matched against the configured
+     * allow-list before a crawler is built, and the crawler is given the resolved
+     * real path so it cannot be re-pointed by a symlink swapped in afterwards.</p>
      */
     private FilesystemSource createFilesystemSource(IngestRequest request) {
-        String rootPath = request.config.get("root_path");
+        Path rootPath = targetValidator.resolveFilesystemRoot(request.config.get("root_path"));
 
         FilesystemSource.Builder builder = FilesystemSource.builder()
             .sourceId(request.sourceId)
-            .rootPath(Path.of(rootPath));
+            .rootPath(rootPath);
 
         String extensions = request.config.get("included_extensions");
         if (extensions != null && !extensions.isEmpty()) {
@@ -334,15 +392,40 @@ public class IngestEndpoint implements HttpHandler {
 
     /**
      * Creates an HttpSource from the request config.
+     *
+     * <p>The URL is checked against the host allow-list and every address the host
+     * resolves to must be public, which is what keeps the crawler off cloud metadata
+     * endpoints and internal services. The crawl is then pinned to that single host so
+     * a redirect cannot walk it somewhere else: {@link HttpSource} follows redirects
+     * itself, with {@code Redirect.NEVER} on its client, and re-applies its domain
+     * policy to every hop.</p>
      */
     private HttpSource createHttpSource(IngestRequest request) {
-        String baseUrl = request.config.get("base_url");
+        URI baseUrl = targetValidator.resolveUrl(request.config.get("base_url"));
 
         HttpSource.Builder builder = HttpSource.builder()
             .sourceId(request.sourceId)
-            .baseUrl(baseUrl);
+            .baseUrl(baseUrl)
+            .allowedDomains(Set.of(IngestTargetValidator.hostOf(baseUrl)));
 
         return builder.build();
+    }
+
+    /**
+     * Closes a source that never made it into the registry.
+     *
+     * <p>An HTTP source owns a client and a selector thread; dropping the reference
+     * without closing leaks both.</p>
+     */
+    private static void closeQuietly(Source source) {
+        if (source == null) {
+            return;
+        }
+        try {
+            source.close();
+        } catch (Exception e) {
+            LOGGER.debug("Error closing unregistered source: {}", e.getMessage());
+        }
     }
 
     /**
@@ -353,26 +436,18 @@ public class IngestEndpoint implements HttpHandler {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, statusCode, bytes);
     }
 
     /**
      * Sends an error response.
      */
     private void sendError(HttpExchange exchange, int statusCode, String message) throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", escapeJson(message));
+        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, statusCode, bytes);
     }
 
     /**
@@ -381,97 +456,12 @@ public class IngestEndpoint implements HttpHandler {
     private String toJson(IngestResponse response) {
         return String.format(
             "{\"source_id\": \"%s\", \"source_type\": \"%s\", \"status\": \"%s\"}",
-            escapeJson(response.sourceId),
-            escapeJson(response.sourceType),
-            escapeJson(response.status)
+            JsonText.escape(response.sourceId),
+            JsonText.escape(response.sourceType),
+            JsonText.escape(response.status)
         );
     }
 
-    // ==================== JSON Parsing Utilities ====================
-
-    private String extractString(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return null;
-
-        start = json.indexOf("\"", start + pattern.length() + 1);
-        if (start < 0) return null;
-
-        int end = json.indexOf("\"", start + 1);
-        if (end < 0) return null;
-
-        return unescapeJson(json.substring(start + 1, end));
-    }
-
-    private String extractObject(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return null;
-
-        start = json.indexOf("{", start);
-        if (start < 0) return null;
-
-        int depth = 1;
-        int end = start + 1;
-        while (end < json.length() && depth > 0) {
-            char c = json.charAt(end);
-            if (c == '{') depth++;
-            else if (c == '}') depth--;
-            end++;
-        }
-
-        return json.substring(start, end);
-    }
-
-    private String[] extractStringArray(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return null;
-
-        start = json.indexOf("[", start);
-        if (start < 0) return null;
-
-        int end = json.indexOf("]", start);
-        if (end < 0) return null;
-
-        String arrayContent = json.substring(start + 1, end).trim();
-        if (arrayContent.isEmpty()) return new String[0];
-
-        List<String> items = new ArrayList<>();
-        int i = 0;
-        while (i < arrayContent.length()) {
-            // Find opening quote
-            int openQuote = arrayContent.indexOf("\"", i);
-            if (openQuote < 0) break;
-
-            // Find closing quote
-            int closeQuote = arrayContent.indexOf("\"", openQuote + 1);
-            if (closeQuote < 0) break;
-
-            items.add(unescapeJson(arrayContent.substring(openQuote + 1, closeQuote)));
-            i = closeQuote + 1;
-        }
-
-        return items.toArray(new String[0]);
-    }
-
-    private String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t");
-    }
-
-    private String unescapeJson(String s) {
-        if (s == null) return null;
-        return s.replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t");
-    }
 
     // ==================== Inner Classes ====================
 
@@ -484,186 +474,4 @@ public class IngestEndpoint implements HttpHandler {
      * Response after registering a source.
      */
     private record IngestResponse(String sourceId, String sourceType, String status) {}
-
-    /**
-     * Registry interface for managing sources.
-     */
-    public interface SourceRegistry {
-        /**
-         * Registers a new source.
-         *
-         * @param source The source to register
-         */
-        void register(Source source);
-
-        /**
-         * Checks if a source ID is already registered.
-         *
-         * @param sourceId The source ID to check
-         * @return true if registered
-         */
-        boolean isRegistered(String sourceId);
-
-        /**
-         * Gets a source by ID.
-         *
-         * @param sourceId The source ID
-         * @return The source, or null if not found
-         */
-        Source get(String sourceId);
-
-        /**
-         * Removes a source.
-         *
-         * @param sourceId The source ID to remove
-         * @return true if removed
-         */
-        boolean remove(String sourceId);
-
-        /**
-         * Gets all registered source IDs.
-         *
-         * @return Set of source IDs
-         */
-        Set<String> getAllSourceIds();
-    }
-
-    /**
-     * In-memory implementation of SourceRegistry.
-     *
-     * <p>When an IngestionOrchestrator is configured via
-     * {@link #setIngestionOrchestrator(IngestionOrchestrator)}, this registry
-     * triggers background ingestion when a source is registered.</p>
-     *
-     * <p>When an IngestionStatusRegistry is configured via
-     * {@link #setStatusRegistry(IngestStatusEndpoint.IngestionStatusRegistry)},
-     * status entries are automatically created when sources are registered.</p>
-     *
-     * <p>When a SegmentReindexScheduler is configured via
-     * {@link #setReindexScheduler(SegmentReindexScheduler, long)}, sources
-     * are automatically registered for periodic reindexing.</p>
-     */
-    public static class InMemorySourceRegistry implements SourceRegistry {
-        private final ConcurrentHashMap<String, Source> sources = new ConcurrentHashMap<>();
-        private volatile IngestionOrchestrator ingestionOrchestrator;
-        private volatile IngestStatusEndpoint.IngestionStatusRegistry statusRegistry;
-        private volatile SegmentReindexScheduler reindexScheduler;
-        private volatile long reindexIntervalMs = SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
-
-        /**
-         * Sets the ingestion orchestrator for background processing.
-         *
-         * @param orchestrator The orchestrator (may be null to disable)
-         */
-        public void setIngestionOrchestrator(IngestionOrchestrator orchestrator) {
-            this.ingestionOrchestrator = orchestrator;
-        }
-
-        /**
-         * Sets the status registry for tracking ingestion status.
-         *
-         * <p>When set, this registry will create initial status entries
-         * for registered sources with state "idle" and progress 0.0.</p>
-         *
-         * @param statusRegistry The status registry (may be null to disable)
-         */
-        public void setStatusRegistry(IngestStatusEndpoint.IngestionStatusRegistry statusRegistry) {
-            this.statusRegistry = statusRegistry;
-        }
-
-        /**
-         * Sets the reindex scheduler for periodic source reindexing.
-         *
-         * <p>When set, sources registered via {@link #register(Source)} will
-         * be automatically registered with the scheduler for periodic reindexing.
-         * The scheduler will trigger reindex operations at the configured interval.</p>
-         *
-         * <h3>Domain Correctness</h3>
-         * <ul>
-         *   <li>Source IDs must be parseable as long integers for scheduler registration</li>
-         *   <li>Non-numeric source IDs will be logged as warnings but won't fail registration</li>
-         *   <li>The interval must be within scheduler's valid range (1 min to 24 hours)</li>
-         * </ul>
-         *
-         * @param scheduler The reindex scheduler (may be null to disable scheduled reindexing)
-         * @param reindexIntervalMs The reindex interval in milliseconds
-         */
-        public void setReindexScheduler(SegmentReindexScheduler scheduler, long reindexIntervalMs) {
-            this.reindexScheduler = scheduler;
-            this.reindexIntervalMs = reindexIntervalMs;
-        }
-
-        /**
-         * Sets the reindex scheduler with default interval.
-         *
-         * <p>This is a convenience overload that uses the scheduler's default reindex interval.</p>
-         *
-         * @param scheduler The reindex scheduler (may be null to disable scheduled reindexing)
-         */
-        public void setReindexScheduler(SegmentReindexScheduler scheduler) {
-            this.reindexScheduler = scheduler;
-            this.reindexIntervalMs = scheduler != null ? scheduler.getDefaultReindexIntervalMs() :
-                SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
-        }
-
-        @Override
-        public void register(Source source) {
-            Objects.requireNonNull(source, "Source cannot be null");
-            String sourceId = source.getSourceId();
-            sources.put(sourceId, source);
-
-            // Create initial status entry if status registry is configured
-            // This ensures /v1/ingest/status returns data even without orchestrator
-            if (statusRegistry != null) {
-                IngestStatusEndpoint.IngestionStatus status = statusRegistry.getOrCreate(sourceId);
-                // Initialize with idle state, will be updated by orchestrator if present
-                status.update("idle", 0.0, 0, 0);
-                LOGGER.debug("Created initial status entry for source: {}", sourceId);
-            }
-
-            // Register with reindex scheduler for periodic reindexing
-            if (reindexScheduler != null) {
-                try {
-                    long numericSourceId = Long.parseLong(sourceId);
-                    reindexScheduler.registerSource(numericSourceId, reindexIntervalMs);
-                    LOGGER.debug("Registered source {} with reindex scheduler (interval={}ms)", sourceId, reindexIntervalMs);
-                } catch (NumberFormatException e) {
-                    LOGGER.warn("Source ID '{}' is not numeric, cannot register with reindex scheduler", sourceId);
-                }
-            }
-
-            // Trigger background ingestion
-            if (ingestionOrchestrator != null) {
-                // Full ingestion pipeline with orchestrator
-                ingestionOrchestrator.startIngestion(source);
-            } else if (statusRegistry != null) {
-                // Stub mode: use IngestionWorker for status updates without full pipeline
-                IngestionWorker worker = new IngestionWorker(source, statusRegistry);
-                Thread.ofVirtual()
-                    .name("ingestion-worker-" + sourceId)
-                    .start(worker);
-                LOGGER.debug("Started stub ingestion worker for source: {}", sourceId);
-            }
-        }
-
-        @Override
-        public boolean isRegistered(String sourceId) {
-            return sources.containsKey(sourceId);
-        }
-
-        @Override
-        public Source get(String sourceId) {
-            return sources.get(sourceId);
-        }
-
-        @Override
-        public boolean remove(String sourceId) {
-            return sources.remove(sourceId) != null;
-        }
-
-        @Override
-        public Set<String> getAllSourceIds() {
-            return Collections.unmodifiableSet(new HashSet<>(sources.keySet()));
-        }
-    }
 }

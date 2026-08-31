@@ -36,7 +36,8 @@ public class IndexCoverage {
      * @param warmingSegments Number of WARMING segments (being optimized)
      * @param estimatedCoverage Estimated fraction of corpus covered (must be in [0.0, 1.0])
      * @param degraded true if coverage is below readiness threshold
-     * @throws IllegalArgumentException if estimatedCoverage is outside [0.0, 1.0] or any count is negative
+     * @throws IllegalArgumentException if estimatedCoverage is outside [0.0, 1.0], any count is
+     *         negative, or the queryable states sum to more than totalSegments
      */
     public IndexCoverage(int totalSegments, int activeSegments, int indexingSegments,
                          int warmingSegments, double estimatedCoverage, boolean degraded) {
@@ -57,6 +58,16 @@ public class IndexCoverage {
         }
         if (warmingSegments < 0) {
             throw new IllegalArgumentException("warmingSegments cannot be negative: " + warmingSegments);
+        }
+        // ACTIVE, INDEXING and WARMING are disjoint segment states, so together they can never
+        // account for more segments than the index holds. Without this, getQueryableRatio()
+        // could report more than 100% coverage.
+        long queryable = (long) activeSegments + indexingSegments + warmingSegments;
+        if (queryable > totalSegments) {
+            throw new IllegalArgumentException(
+                "activeSegments + indexingSegments + warmingSegments cannot exceed totalSegments: "
+                    + activeSegments + " + " + indexingSegments + " + " + warmingSegments
+                    + " > " + totalSegments);
         }
         this.totalSegments = totalSegments;
         this.activeSegments = activeSegments;
@@ -83,9 +94,18 @@ public class IndexCoverage {
     }
     
     /**
-     * Create an IndexCoverage with a warm-up segment.
+     * Create an IndexCoverage where one of the segments is still warming.
+     *
+     * <p>WARMING segments are queryable, so the corpus is still fully covered.</p>
+     *
+     * @param segmentCount Total number of segments; at least one is required to be warming
+     * @throws IllegalArgumentException if segmentCount is less than 1
      */
     public static IndexCoverage withWarmUp(int segmentCount) {
+        if (segmentCount < 1) {
+            throw new IllegalArgumentException(
+                "withWarmUp requires at least one segment to warm, got: " + segmentCount);
+        }
         return new IndexCoverage(
             segmentCount, segmentCount - 1, 0, 1, 1.0, false
         );

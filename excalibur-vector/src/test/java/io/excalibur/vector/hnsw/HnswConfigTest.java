@@ -66,7 +66,9 @@ class HnswConfigTest {
         assertThatThrownBy(() -> new HnswConfig(16, 32, 0, 50, 0.5, 128))
             .isInstanceOf(IllegalArgumentException.class);
 
-        assertThatThrownBy(() -> new HnswConfig(16, 32, 1001, 50, 0.5, 128))
+        // The ceiling is HnswConfig.MAX_EF, aligned with the range ConfigValidation
+        // accepts for shard.default-ef-search so a valid config cannot fail later.
+        assertThatThrownBy(() -> new HnswConfig(16, 32, HnswConfig.MAX_EF + 1, 50, 0.5, 128))
             .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -75,7 +77,7 @@ class HnswConfigTest {
         assertThatThrownBy(() -> new HnswConfig(16, 32, 100, 0, 0.5, 128))
             .isInstanceOf(IllegalArgumentException.class);
 
-        assertThatThrownBy(() -> new HnswConfig(16, 32, 100, 1001, 0.5, 128))
+        assertThatThrownBy(() -> new HnswConfig(16, 32, 100, HnswConfig.MAX_EF + 1, 0.5, 128))
             .isInstanceOf(IllegalArgumentException.class);
     }
 

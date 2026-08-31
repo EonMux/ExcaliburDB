@@ -60,6 +60,9 @@ class LshPreFilterIntegrationTest {
     private static final int TOP_K = 10;
     private static final double DELTA = 0.001;
 
+    /** Fixed LSH hyperplane seed, so bucket assignment is reproducible. */
+    private static final long LSH_SEED = 20240517L;
+
     private Path tempDir;
     private HnswGraph graph;
     private LshIndex lshIndex;
@@ -87,11 +90,16 @@ class LshPreFilterIntegrationTest {
         graphPath = tempDir.resolve("test_graph.hnsw");
         graph = new HnswGraph(graphPath, hnswConfig, distanceFunction, MAX_GRAPH_NODES);
 
-        // Create LSH index with good recall characteristics
+        // Create LSH index with good recall characteristics.
+        // The seed is pinned: LshConfig.Builder otherwise defaults to System.nanoTime(),
+        // which re-randomises the hyperplanes on every run, so whether a given query
+        // vector lands in a populated bucket - and therefore whether these assertions
+        // hold - would vary from run to run.
         LshConfig lshConfig = LshConfig.builder(DIMENSIONS)
             .numHashTables(8)
             .numHashFunctions(12)
             .numProbes(3)
+            .seed(LSH_SEED)
             .build();
         lshIndex = new LshIndex(lshConfig);
 

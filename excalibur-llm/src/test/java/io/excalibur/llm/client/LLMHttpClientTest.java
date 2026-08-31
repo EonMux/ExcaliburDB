@@ -202,21 +202,20 @@ public class LLMHttpClientTest {
     }
 
     @Test
-    void scoreRelevancy_missingIndexField_returnsEmptyList() {
-        // Regex requires both index and score fields, so incomplete objects are ignored
+    void scoreRelevancy_missingIndexField_isAParseFailure() {
+        // A reply nothing could be read from is reported as a parse failure rather than as an
+        // empty ranking, so the caller falls back to the vector order instead of answering with
+        // nothing and calling it a success.
         server.setChatHandler(server.successChatHandler("[{\"score\": 0.5}]"));
 
-        List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("test"));
-        assertEquals(0, scores.size());
+        assertThrows(LLMException.class, () -> client.scoreRelevancy("query", List.of("test")));
     }
 
     @Test
-    void scoreRelevancy_missingScoreField_returnsEmptyList() {
-        // Regex requires both index and score fields, so incomplete objects are ignored
+    void scoreRelevancy_missingScoreField_isAParseFailure() {
         server.setChatHandler(server.successChatHandler("[{\"index\": 0}]"));
 
-        List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("test"));
-        assertEquals(0, scores.size());
+        assertThrows(LLMException.class, () -> client.scoreRelevancy("query", List.of("test")));
     }
 
     // ============= Correlation ID Tests =============
@@ -253,7 +252,7 @@ public class LLMHttpClientTest {
     // ============= Index Validation Tests =============
 
     @Test
-    void scoreRelevancy_indexOutOfBounds_clampsToValidRange() {
+    void scoreRelevancy_indexOutOfBounds_discardsScore() {
         // LLM returns index beyond candidates size - wrap in chat completion format
         server.setChatHandler(exchange -> {
             String content = "[{\"index\": 5, \"score\": 0.8}]";
@@ -270,8 +269,9 @@ public class LLMHttpClientTest {
         List<String> candidates = List.of("Only one");
         List<RelevancyScore> scores = client.scoreRelevancy("query", candidates);
 
-        // Index 5 should be clamped to 0 (only valid index for single-element list)
-        assertEquals(0, scores.get(0).getIndex());
+        // Index 5 identifies no candidate we sent. Clamping it to 0 would assert that the model
+        // scored "Only one" when it did not, so the score is discarded instead.
+        assertEquals(0, scores.size());
     }
 
     @Test

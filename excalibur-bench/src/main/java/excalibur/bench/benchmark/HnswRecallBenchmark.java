@@ -182,12 +182,23 @@ public class HnswRecallBenchmark {
         System.out.println("  Target recall@10: >= " + (TARGET_RECALL_10 * 100) + "%");
         System.out.println();
 
-        // Verify initial recall meets target
+        // Gate the recall requirement here, where it can actually fail the run.
+        //
+        // JMH scores this class in ms/op, so the recall number a @Benchmark method
+        // returns never reaches the JSON report or the target registry. Printing a
+        // WARNING left the >=99% recall@10 requirement unenforced everywhere. Throwing
+        // from @Setup aborts the trial, which JMH surfaces as a benchmark failure.
+        //
+        // The requirement is stated for the default efSearch; lower efSearch values are
+        // measured deliberately to show the recall/QPS tradeoff and must not fail.
         double initialRecall = measureRecallInternal();
         System.out.println("Initial recall@10: " + String.format("%.4f", initialRecall) +
             " (" + String.format("%.2f", initialRecall * 100) + "%)");
-        if (initialRecall < TARGET_RECALL_10) {
-            System.out.println("WARNING: Initial recall below target! This may indicate a configuration issue.");
+        if (efSearch >= HnswConfig.DEFAULT_EF_SEARCH && initialRecall < TARGET_RECALL_10) {
+            throw new IllegalStateException(String.format(
+                "HNSW recall@10 is %.4f at efSearch=%d (dataset=%d, dimension=%d), "
+                    + "below the required %.2f. The >=99%% recall@10 guarantee is not met.",
+                initialRecall, efSearch, datasetSize, dimension, TARGET_RECALL_10));
         }
         System.out.println();
     }

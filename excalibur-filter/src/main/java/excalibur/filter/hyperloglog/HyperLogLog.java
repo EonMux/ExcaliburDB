@@ -208,8 +208,9 @@ public class HyperLogLog {
         long remainingBits = hash << precision;
         int leadingZeros = Long.numberOfLeadingZeros(remainingBits) + 1;
 
-        // Clamp to max value that fits in a byte (max is 64 - precision)
-        int maxRegisterValue = 64 - precision;
+        // Clamp to max value: for (64-precision) remaining bits, rho ranges
+        // from 1 (first bit is 1) to (65-precision) (all bits are zero).
+        int maxRegisterValue = 65 - precision;
         leadingZeros = Math.min(leadingZeros, maxRegisterValue);
 
         // Update register with striped lock

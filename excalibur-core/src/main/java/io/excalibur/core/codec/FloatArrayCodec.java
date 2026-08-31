@@ -127,20 +127,17 @@ public class FloatArrayCodec implements Codec<float[]> {
         ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
-        // Check that length is non-negative and data contains full payload
-        int expectedSize = LENGTH_PREFIX_SIZE + (length * FLOAT_SIZE);
+        // Check that length is non-negative and data contains full payload.
+        // Computed in long arithmetic: length * FLOAT_SIZE overflows for any length
+        // >= 0x20000000, which would make expectedSize negative, pass the size guard and
+        // then throw BufferUnderflowException out of this boolean predicate.
+        long expectedSize = LENGTH_PREFIX_SIZE + (long) length * FLOAT_SIZE;
         if (length < 0 || data.length < expectedSize) {
             return false;
         }
 
-        // Validate each float is a valid number (not NaN unless allowed)
-        for (int i = 0; i < length; i++) {
-            float f = buffer.getFloat();
-            // Note: We allow NaN and Infinity as they are valid IEEE 754 values
-            // If you want to reject them, uncomment the next line:
-            // if (Float.isNaN(f) || Float.isInfinite(f)) return false;
-        }
-
+        // All float bit patterns are valid IEEE 754 values (NaN and Infinity included),
+        // so once the payload is known to be present there is nothing further to check.
         return true;
     }
 
@@ -166,14 +163,9 @@ public class FloatArrayCodec implements Codec<float[]> {
             .order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
-        int expectedSize = LENGTH_PREFIX_SIZE + (length * FLOAT_SIZE);
-        if (length < 0 || data.length < offset + expectedSize) {
+        long expectedSize = LENGTH_PREFIX_SIZE + (long) length * FLOAT_SIZE;
+        if (length < 0 || (long) data.length - offset < expectedSize) {
             return false;
-        }
-
-        // Validate each float
-        for (int i = 0; i < length; i++) {
-            buffer.getFloat(); // Just read to validate buffer has data
         }
 
         return true;

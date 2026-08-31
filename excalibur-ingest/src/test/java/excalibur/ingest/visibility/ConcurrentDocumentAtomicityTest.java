@@ -1,5 +1,7 @@
 package excalibur.ingest.visibility;
 
+import io.excalibur.core.text.ChunkIdentifiers;
+
 import excalibur.ingest.buffer.AtomicDocumentBatch;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
@@ -87,7 +89,7 @@ class ConcurrentDocumentAtomicityTest {
                         String docId = "writer" + writerId + "_doc" + d;
                         List<String> chunkIds = new ArrayList<>();
                         for (int c = 0; c < chunksPerDoc; c++) {
-                            chunkIds.add(docId + ":chunk" + c);
+                            chunkIds.add(docId + ":chunk:" + c);
                         }
 
                         AtomicDocumentBatch batch = new AtomicDocumentBatch(
@@ -124,7 +126,7 @@ class ConcurrentDocumentAtomicityTest {
                         Set<String> allChunks = new HashSet<>();
                         for (String docId : documentCommitEpochs.keySet()) {
                             for (int c = 0; c < chunksPerDoc; c++) {
-                                allChunks.add(docId + ":chunk" + c);
+                                allChunks.add(docId + ":chunk:" + c);
                             }
                         }
 
@@ -240,7 +242,7 @@ class ConcurrentDocumentAtomicityTest {
         int numChunks = 10;
         List<String> chunkIds = new ArrayList<>();
         for (int i = 0; i < numChunks; i++) {
-            chunkIds.add(docId + ":chunk" + i);
+            chunkIds.add(docId + ":chunk:" + i);
         }
 
         AtomicDocumentBatch batch = new AtomicDocumentBatch(
@@ -251,7 +253,7 @@ class ConcurrentDocumentAtomicityTest {
         tracker.registerAtomicDocument(batch, commitEpoch);
 
         for (int i = 0; i < numChunks; i++) {
-            String chunkId = docId + ":chunk" + i;
+            String chunkId = docId + ":chunk:" + i;
             assertTrue(tracker.isChunkVisible(chunkId, commitEpoch),
                 "Chunk " + chunkId + " should be visible at commit epoch");
             assertTrue(tracker.isChunkVisible(chunkId, commitEpoch + 1),
@@ -287,7 +289,7 @@ class ConcurrentDocumentAtomicityTest {
                     String docId = "concurrentDoc" + docIndex;
                     List<String> chunkIds = new ArrayList<>();
                     for (int c = 0; c < chunksPerDoc; c++) {
-                        chunkIds.add(docId + ":chunk" + c);
+                        chunkIds.add(docId + ":chunk:" + c);
                     }
 
                     AtomicDocumentBatch batch = new AtomicDocumentBatch(
@@ -349,7 +351,7 @@ class ConcurrentDocumentAtomicityTest {
                     String docId = "registryDoc" + docIndex;
                     Set<String> chunkIds = new HashSet<>();
                     for (int c = 0; c < chunksPerDoc; c++) {
-                        chunkIds.add(docId + ":chunk" + c);
+                        chunkIds.add(docId + ":chunk:" + c);
                     }
 
                     long commitEpoch = epochCounter.incrementAndGet();
@@ -407,7 +409,7 @@ class ConcurrentDocumentAtomicityTest {
                         String docId = "live_doc_" + threadId + "_" + d;
                         Set<String> chunkIds = new HashSet<>();
                         for (int c = 0; c < chunksPerDoc; c++) {
-                            chunkIds.add(docId + ":chunk" + c);
+                            chunkIds.add(docId + ":chunk:" + c);
                         }
 
                         AtomicDocumentBatch batch = new AtomicDocumentBatch(
@@ -549,11 +551,11 @@ class ConcurrentDocumentAtomicityTest {
         );
     }
 
+    /**
+     * Recovers the document key from a chunk id using the pipeline's own convention, so this
+     * test cannot drift from the format the visibility tracker parses.
+     */
     private String extractDocumentId(String chunkId) {
-        int lastColon = chunkId.lastIndexOf(':');
-        if (lastColon > 0) {
-            return chunkId.substring(0, lastColon);
-        }
-        return chunkId;
+        return io.excalibur.core.text.ChunkIdentifiers.documentKeyOfChunk(chunkId);
     }
 }

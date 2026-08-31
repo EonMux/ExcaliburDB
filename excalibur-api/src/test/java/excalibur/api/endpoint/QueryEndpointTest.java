@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpExchange;
 import excalibur.query.*;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.pipeline.QueryPipeline;
+import excalibur.llm.embedding.EmbeddingClient;
 import io.excalibur.config.Config;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -31,12 +32,19 @@ import static org.mockito.Mockito.*;
 class QueryEndpointTest {
 
     private QueryPipeline queryPipeline;
+    private EmbeddingClient embeddingClient;
     private QueryEndpoint endpoint;
 
     @BeforeEach
     void setUp() {
         queryPipeline = mock(QueryPipeline.class);
-        endpoint = new QueryEndpoint(queryPipeline);
+        embeddingClient = mock(EmbeddingClient.class);
+        // Default: successful embedding returning a valid 3-dim vector
+        when(embeddingClient.embed(anyString(), anyString()))
+            .thenReturn(new float[]{0.1f, 0.2f, 0.3f});
+        when(embeddingClient.embed(anyString()))
+            .thenReturn(new float[]{0.1f, 0.2f, 0.3f});
+        endpoint = new QueryEndpoint(queryPipeline, null, null, null, embeddingClient);
     }
 
     @Nested
@@ -88,8 +96,8 @@ class QueryEndpointTest {
     class RequestParsing {
 
         @Test
-        @DisplayName("rejects missing vector field")
-        void rejectsMissingVectorField() throws IOException {
+        @DisplayName("rejects missing query field")
+        void rejectsMissingQueryField() throws IOException {
             String json = "{\"top_k\": 10}";
             HttpExchange exchange = createMockExchange("POST", json);
 
@@ -99,9 +107,9 @@ class QueryEndpointTest {
         }
 
         @Test
-        @DisplayName("rejects empty vector field")
-        void rejectsEmptyVectorField() throws IOException {
-            String json = "{\"vector\": []}";
+        @DisplayName("rejects empty query field")
+        void rejectsEmptyQueryField() throws IOException {
+            String json = "{\"query\": \"\"}";
             HttpExchange exchange = createMockExchange("POST", json);
 
             endpoint.handle(exchange);
@@ -129,7 +137,7 @@ class QueryEndpointTest {
         @Test
         @DisplayName("returns 200 for valid POST request")
         void returns200ForValidPostRequest() throws Exception {
-            String json = "{\"vector\": [0.1, 0.2, 0.3], \"top_k\": 10}";
+            String json = "{\"query\": \"test\", \"top_k\": 10}";
             HttpExchange exchange = createMockExchange("POST", json);
 
             QueryResponse mockResponse = createMockResponse();
@@ -145,7 +153,7 @@ class QueryEndpointTest {
         @Test
         @DisplayName("response includes results array")
         void responseIncludesResultsArray() throws Exception {
-            String json = "{\"vector\": [0.1, 0.2, 0.3], \"top_k\": 10}";
+            String json = "{\"query\": \"test\", \"top_k\": 10}";
             ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
             HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
 
@@ -163,7 +171,7 @@ class QueryEndpointTest {
         @Test
         @DisplayName("response includes coverage object")
         void responseIncludesCoverageObject() throws Exception {
-            String json = "{\"vector\": [0.1, 0.2, 0.3], \"top_k\": 10}";
+            String json = "{\"query\": \"test\", \"top_k\": 10}";
             ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
             HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
 
@@ -193,7 +201,7 @@ class QueryEndpointTest {
         @Test
         @DisplayName("returns timeout response when query times out")
         void returnsTimeoutResponseWhenQueryTimesOut() throws Exception {
-            String json = "{\"vector\": [0.1, 0.2, 0.3], \"timeout_ms\": 100}";
+            String json = "{\"query\": \"test\", \"timeout_ms\": 100}";
             ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
             HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
 
@@ -214,9 +222,9 @@ class QueryEndpointTest {
     class ErrorHandling {
 
         @Test
-        @DisplayName("returns 500 for internal errors")
+        @DisplayName("returns 500 when the pipeline fails")
         void returns500ForInternalErrors() throws Exception {
-            String json = "{\"vector\": [0.1, 0.2, 0.3], \"top_k\": 10}";
+            String json = "{\"query\": \"test\", \"top_k\": 10}";
             HttpExchange exchange = createMockExchange("POST", json);
 
             CompletableFuture<QueryResponse> failedFuture = new CompletableFuture<>();
@@ -226,7 +234,30 @@ class QueryEndpointTest {
 
             endpoint.handle(exchange);
 
-            verify(exchange).sendResponseHeaders(eq(200), anyLong());
+            // A failed query must not be reported as 200 with an empty result list:
+            // that is indistinguishable from "nothing matched", so a caller retries
+            // nothing and silently loses results.
+            verify(exchange).sendResponseHeaders(eq(500), anyLong());
+        }
+
+        @Test
+        @DisplayName("does not leak internal failure detail to the client")
+        void doesNotLeakFailureDetail() throws Exception {
+            String json = "{\"query\": \"test\", \"top_k\": 10}";
+            ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
+
+            CompletableFuture<QueryResponse> failedFuture = new CompletableFuture<>();
+            failedFuture.completeExceptionally(new ExecutionException(
+                new IllegalStateException("/var/lib/excalibur/data/segment-7 is corrupt")));
+            when(queryPipeline.execute(any(QueryRequest.class), any(CancellationToken.class)))
+                .thenReturn(failedFuture);
+
+            endpoint.handle(exchange);
+
+            String response = responseBody.toString(StandardCharsets.UTF_8);
+            assertThat(response).doesNotContain("/var/lib/excalibur");
+            assertThat(response).contains("Query execution failed");
         }
     }
 
@@ -237,7 +268,7 @@ class QueryEndpointTest {
         @Test
         @DisplayName("parses string fields correctly")
         void parsesStringFieldsCorrectly() throws Exception {
-            String json = "{\"query\": \"search text\", \"vector\": [0.1]}";
+            String json = "{\"query\": \"search text\"}";
             ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
             HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
 
@@ -255,7 +286,7 @@ class QueryEndpointTest {
         @Test
         @DisplayName("uses default values for missing optional fields")
         void usesDefaultValuesForMissingOptionalFields() throws Exception {
-            String json = "{\"vector\": [0.1, 0.2, 0.3]}";
+            String json = "{\"query\": \"test\"}";
             ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
             HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
 
@@ -295,10 +326,11 @@ class QueryEndpointTest {
         @DisplayName("uses hardcoded default for topK when not specified in request")
         void usesDefaultTopK() throws Exception {
             Config mockConfig = createMockConfig();
-            QueryEndpoint endpointWithConfig = new QueryEndpoint(queryPipeline, mockConfig);
+            QueryEndpoint endpointWithConfig = new QueryEndpoint(
+                queryPipeline, mockConfig, null, null, embeddingClient);
 
             // Request without top_k specified - uses hardcoded default 10
-            String json = "{\"vector\": [0.1, 0.2, 0.3]}";
+            String json = "{\"query\": \"test\"}";
             ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
             HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
 

@@ -102,7 +102,11 @@ public final class BootstrapApplication {
         } catch (IOException e) {
             // File not found or read error - fall back to defaults
             logger.warn("Failed to load configuration file, using defaults: {}", e.getMessage());
-            config = new Config(new HashMap<>());
+            // The environment still applies. The 1-arg constructor forwards an empty override map,
+            // so falling back through it silently ignores every EXCALIBUR_* variable -- including
+            // EXCALIBUR_LLM_API_KEY, which is the documented way to supply a secret and is the one
+            // setting most likely to be present when the properties file is not.
+            config = new Config("excalibur.properties", System.getenv(), new HashMap<>());
             // Even defaults need validation
             ConfigValidation.validate(config);
             return;
@@ -116,7 +120,6 @@ public final class BootstrapApplication {
             logger.info("Configuration loaded and validated from excalibur.properties");
             logger.info("Visibility epoch tick: {}ms", config.visibility().getEpochTickMs());
             logger.info("Query include partial segments: {}", config.query().isIncludePartialSegments());
-            logger.info("Ingest HNSW queue depth limit: {}", config.ingest().getHnswQueueDepthLimit());
             logger.info("Health readiness threshold: {}", config.health().getReadinessThreshold());
         } catch (IllegalStateException e) {
             // Validation failure - this is FATAL
@@ -199,7 +202,6 @@ public final class BootstrapApplication {
             System.out.println("Configuration:");
             System.out.println("  Epoch tick: " + config.visibility().getEpochTickMs() + "ms");
             System.out.println("  Include partial segments: " + config.query().isIncludePartialSegments());
-            System.out.println("  HNSW queue depth limit: " + config.ingest().getHnswQueueDepthLimit());
             System.out.println("  Readiness threshold: " + config.health().getReadinessThreshold());
         }
         System.out.println();

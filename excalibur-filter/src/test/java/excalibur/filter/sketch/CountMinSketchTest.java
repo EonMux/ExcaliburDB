@@ -180,9 +180,13 @@ class CountMinSketchTest {
         void frequencyRatio() {
             sketch.insert(ITEM_A, 30);
             sketch.insert(ITEM_B, 70);
-            // Total = 100, ITEM_A should be ~30%
-            double freq = sketch.estimateFrequency(ITEM_A);
-            assertTrue(freq >= 0.3 && freq <= 1.0);
+
+            // Total = 100. A Count-Min Sketch never underestimates, so a lower bound of 0.3
+            // is satisfied by construction and an upper bound of 1.0 excludes nothing - an
+            // estimator that always returned 1.0 would pass. With only two distinct items in
+            // a correctly sized sketch there is no collision slack, so pin both values.
+            assertEquals(0.30, sketch.estimateFrequency(ITEM_A), 0.01);
+            assertEquals(0.70, sketch.estimateFrequency(ITEM_B), 0.01);
         }
 
         @Test

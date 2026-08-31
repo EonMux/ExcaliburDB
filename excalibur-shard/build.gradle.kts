@@ -3,8 +3,6 @@ plugins {
     `java-library`
 }
 
-group = "com.excaliburdb"
-version = "1.0.0-SNAPSHOT"
 
 dependencies {
     // SLF4J API for logging

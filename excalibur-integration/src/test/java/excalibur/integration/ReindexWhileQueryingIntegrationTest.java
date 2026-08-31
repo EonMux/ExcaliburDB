@@ -17,12 +17,11 @@ import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.store.WriteLog;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
 import io.excalibur.vector.hnsw.HnswGraph;
-import io.excalibur.vector.hnsw.HnswSearchResult;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -126,7 +125,9 @@ class ReindexWhileQueryingIntegrationTest {
             visibilityTracker,
             documentRegistry,
             null,
-            writeLog::sync,
+            // io.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
+            // durability barrier is already satisfied before the adapter runs.
+            () -> { },
             new ReentrantLock()
         );
     }
@@ -184,6 +185,9 @@ class ReindexWhileQueryingIntegrationTest {
                         return null; // New segment not ready yet
                     }
             );
+
+            // The reindex thread's graph, closed by the main thread once the queries have stopped.
+            AtomicReference<HnswGraph> reindexedGraph = new AtomicReference<>();
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
@@ -307,9 +311,12 @@ class ReindexWhileQueryingIntegrationTest {
                     storageEngine.getTestCatalog().setSegmentState(oldSegmentId, LifecycleState.TOMBSTONED);
                     visibilityTracker.advanceEpoch();
 
+                    // Handed to the main thread rather than closed here. The graph provider still
+                    // points at it and the query threads are still running: they stop only after
+                    // the main thread sees this countdown, so closing it here races them into
+                    // querying a closed graph.
+                    reindexedGraph.set(newGraph);
                     reindexComplete.countDown();
-
-                    newGraph.close();
                 } catch (Exception e) {
                     exceptionCount.incrementAndGet();
                     exceptions.add("Reindex: " + e.getClass().getSimpleName() + " - " + e.getMessage());
@@ -337,6 +344,12 @@ class ReindexWhileQueryingIntegrationTest {
             executor.shutdown();
             executor.awaitTermination(10, TimeUnit.SECONDS);
 
+            // Only once nothing can query it any more.
+            HnswGraph reindexed = reindexedGraph.get();
+            if (reindexed != null) {
+                reindexed.close();
+            }
+
             // Verify no exceptions
             assertThat(exceptionCount.get())
                 .as("No exceptions should occur during re-index/query. Exceptions: " + exceptions)
@@ -347,16 +360,23 @@ class ReindexWhileQueryingIntegrationTest {
                 .as("Queries should have been executed during re-index")
                 .isGreaterThan(0);
 
-            // Verify no data gaps - queries should have returned results
-            // Allow some empty results due to timing, but most should have results
-            double emptyRatio = (double) emptyResultCount.get() / queryCount.get();
-            assertThat(emptyRatio)
-                .as("Most queries should return results (empty ratio should be low)")
-                .isLessThan(0.5);
+            // The re-index thread must actually have finished; a hang that throws nothing
+            // would otherwise leave this test green.
+            assertThat(completed)
+                .as("The re-index must complete within the timeout")
+                .isTrue();
+
+            // Verify no data gaps. The guarantee this test exists for is that a query never
+            // returns empty because a re-index is in progress, so the threshold is zero -
+            // not "fewer than half".
+            assertThat(emptyResultCount.get())
+                .as("No query may return empty during re-indexing (%d of %d did)",
+                    emptyResultCount.get(), queryCount.get())
+                .isZero();
 
             System.out.println("Re-index test: " + queryCount.get() + " queries, " +
                 totalResultCount.get() + " total results, " +
-                emptyResultCount.get() + " empty (" + (emptyRatio * 100) + "%), " +
+                emptyResultCount.get() + " empty, " +
                 exceptionCount.get() + " exceptions");
 
             oldGraph.close();
@@ -387,19 +407,30 @@ class ReindexWhileQueryingIntegrationTest {
                 ingestDocument(documentId, 2, oldGraph);
             }
 
+            // The new segment gets its own, still-empty graph. Handing every segment id the
+            // OLD graph would satisfy the assertions below even if the visibility layer
+            // wrongly exposed the not-yet-ready segment, because its graph would be the one
+            // already full of data.
+            Path newGraphPath = tempDir.resolve("new-serve.graph");
+            HnswGraph newGraph = new HnswGraph(newGraphPath, config, distanceFunction, 10000);
+
+            // Create and register new segment, using its actual ID
+            long newSegmentId = storageEngine.createAndRegisterSegment();
+            visibilityTracker.registerSegment(newSegmentId, visibilityTracker.currentEpoch());
+            storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.BOOTSTRAPPING);
+
             // Create query pipeline
-            QueryPipeline.HnswGraphProvider graphProvider = segmentId -> oldGraph;
+            QueryPipeline.HnswGraphProvider graphProvider = segmentId -> {
+                if (segmentId == oldSegmentId) return oldGraph;
+                if (segmentId == newSegmentId) return newGraph;
+                return null;
+            };
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
                 graphProvider,
                 distanceFunction
             );
-
-            // Create and register new segment, using its actual ID
-            long newSegmentId = storageEngine.createAndRegisterSegment();
-            visibilityTracker.registerSegment(newSegmentId, visibilityTracker.currentEpoch());
-            storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.BOOTSTRAPPING);
 
             // Query while new segment is BOOTSTRAPPING - old segment should serve
             QueryRequest request = QueryRequest.builder()
@@ -415,10 +446,13 @@ class ReindexWhileQueryingIntegrationTest {
             CancellationToken token = new CancellationToken();
             QueryResponse response = pipeline.executeSync(request, token);
 
-            // Old segment should still serve results
+            // Old segment should still serve results, and every one of them must come from it
             assertThat(response.results())
                 .as("Old segment should serve queries while new segment is BOOTSTRAPPING")
                 .isNotEmpty();
+            assertThat(response.results())
+                .as("No result may originate from the BOOTSTRAPPING segment")
+                .allSatisfy(result -> assertThat(result.segmentId()).isEqualTo(oldSegmentId));
 
             // Transition new segment to INDEXING
             storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.INDEXING);
@@ -429,10 +463,14 @@ class ReindexWhileQueryingIntegrationTest {
             assertThat(response.results())
                 .as("Old segment should serve queries while new segment is INDEXING")
                 .isNotEmpty();
+            assertThat(response.results())
+                .as("No result may originate from the INDEXING segment")
+                .allSatisfy(result -> assertThat(result.segmentId()).isEqualTo(oldSegmentId));
 
             System.out.println("Old segment served " + response.results().size() +
                 " results while new segment was building");
 
+            newGraph.close();
             oldGraph.close();
         }
 
@@ -440,114 +478,111 @@ class ReindexWhileQueryingIntegrationTest {
          * Test: Rolling replacement maintains continuous data availability.
          *
          * <p>Domain correctness: At every point during the rolling replacement,
-         * at least one segment must be queryable.</p>
+         * a query must return results - the guarantee is that the index is queryable at
+         * all times, including while it is being replaced.</p>
          *
-         * <p>This test directly queries HNSW graphs to verify continuous availability
-         * during rolling replacement, bypassing the complex pipeline infrastructure
-         * to focus on the core requirement.</p>
+         * <p>The phases are driven through the real catalog lifecycle and the visibility
+         * tracker and observed through {@link QueryPipeline}: calling
+         * {@code HnswGraph.search()} directly would prove only that two graphs contain
+         * vectors, which is not what "continuous availability" means. Each segment keeps
+         * its own graph so a result's segment id says which one served it.</p>
          */
         @Test
         @DisplayName("rolling replacement maintains continuous availability")
         void rollingReplacementMaintainsContinuousAvailability() throws Exception {
-            // Create old segment with its own graph
             HnswConfig config = HnswConfig.create(dimension);
+
+            // Old segment, ACTIVE and holding the corpus
             Path oldGraphPath = tempDir.resolve("old-rolling.graph");
             HnswGraph oldGraph = new HnswGraph(oldGraphPath, config, distanceFunction, 10000);
-
-            // Insert documents into old segment's graph
-            List<float[]> oldVectors = new ArrayList<>();
+            long oldSegmentId = storageEngine.createAndRegisterSegment();
+            visibilityTracker.registerSegment(oldSegmentId, 0L);
+            storageEngine.getTestCatalog().setSegmentState(oldSegmentId, LifecycleState.ACTIVE);
             for (int d = 0; d < 15; d++) {
-                float[] vector = createRandomVector(dimension);
-                oldVectors.add(vector);
-                oldGraph.insert(vector);
+                ingestDocument("rolling-old-" + d, 2, oldGraph);
             }
             oldGraph.flush();
 
-            // Create new segment with its own graph
+            // Replacement segment, starting empty in BOOTSTRAPPING
             Path newGraphPath = tempDir.resolve("new-rolling.graph");
             HnswGraph newGraph = new HnswGraph(newGraphPath, config, distanceFunction, 10000);
+            long newSegmentId = storageEngine.createAndRegisterSegment();
+            visibilityTracker.registerSegment(newSegmentId, visibilityTracker.currentEpoch());
+            storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.BOOTSTRAPPING);
+            visibilityTracker.advanceEpoch();
 
-            // Insert documents into new segment's graph
-            List<float[]> newVectors = new ArrayList<>();
+            ConcurrentHashMap<Long, HnswGraph> graphs = new ConcurrentHashMap<>();
+            graphs.put(oldSegmentId, oldGraph);
+            graphs.put(newSegmentId, newGraph);
+
+            QueryPipeline pipeline = new QueryPipeline(
+                storageEngine,
+                visibilityTracker,
+                graphs::get,
+                distanceFunction
+            );
+
+            QueryRequest request = QueryRequest.builder()
+                .queryText("rolling replacement query")
+                .queryVector(createRandomVector(dimension))
+                .topK(50)
+                .timeoutMs(5000)
+                .includePartialSegments(true)
+                .enableLlmScoring(false)
+                .correlationId(UUID.randomUUID().toString())
+                .build();
+            CancellationToken token = new CancellationToken();
+
+            // Phase 1: only the old segment holds data
+            QueryResponse response = pipeline.executeSync(request, token);
+            assertThat(response.results())
+                .as("Phase OLD_ONLY: the old segment must serve the query")
+                .isNotEmpty();
+            assertThat(response.results())
+                .as("Phase OLD_ONLY: nothing may come from the empty replacement")
+                .allSatisfy(result -> assertThat(result.segmentId()).isEqualTo(oldSegmentId));
+
+            // Phase 2: the replacement is being built
+            storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.INDEXING);
+            visibilityTracker.advanceEpoch();
             for (int d = 0; d < 15; d++) {
-                float[] vector = createRandomVector(dimension);
-                newVectors.add(vector);
-                newGraph.insert(vector);
+                ingestDocument("rolling-new-" + d, 2, newGraph);
             }
             newGraph.flush();
-
-            // Create a query vector (random, but any vector should return nearest neighbors)
-            float[] queryVector = createRandomVector(dimension);
-
-            // Track availability at each phase
-            int queryCount = 0;
-            int availableCount = 0;
-
-            // Phase 1: Only old segment is active
-            List<HnswSearchResult> results = oldGraph.search(queryVector, 10);
-            queryCount++;
-            if (!results.isEmpty()) {
-                availableCount++;
-            }
-            System.out.println("Phase OLD_ONLY: " + results.size() + " results from old segment");
-            assertThat(results)
-                .as("Old segment should return results")
+            response = pipeline.executeSync(request, token);
+            assertThat(response.results())
+                .as("Phase NEW_INDEXING: the old segment must keep serving")
                 .isNotEmpty();
 
-            // Phase 2: Old segment active, new segment indexing
-            // Query should still work on old segment
-            results = oldGraph.search(queryVector, 10);
-            queryCount++;
-            if (!results.isEmpty()) {
-                availableCount++;
-            }
-            System.out.println("Phase NEW_INDEXING: " + results.size() + " results from old segment");
-            assertThat(results)
-                .as("Old segment should serve while new segment is indexing")
+            // Phase 3: the replacement warms
+            storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.WARMING);
+            visibilityTracker.advanceEpoch();
+            response = pipeline.executeSync(request, token);
+            assertThat(response.results())
+                .as("Phase NEW_WARMING: the index must stay queryable")
                 .isNotEmpty();
 
-            // Phase 3: New segment becomes active
-            // Query should work on new segment
-            results = newGraph.search(queryVector, 10);
-            queryCount++;
-            if (!results.isEmpty()) {
-                availableCount++;
-            }
-            System.out.println("Phase NEW_ACTIVE: " + results.size() + " results from new segment");
-            assertThat(results)
-                .as("New segment should return results when active")
+            // Phase 4: the replacement becomes ACTIVE
+            storageEngine.getTestCatalog().setSegmentState(newSegmentId, LifecycleState.ACTIVE);
+            visibilityTracker.advanceEpoch();
+            response = pipeline.executeSync(request, token);
+            assertThat(response.results())
+                .as("Phase NEW_ACTIVE: the index must stay queryable")
                 .isNotEmpty();
 
-            // Phase 4: Old segment tombstoned, only new segment available
-            // Query should still work on new segment
-            results = newGraph.search(queryVector, 10);
-            queryCount++;
-            if (!results.isEmpty()) {
-                availableCount++;
-            }
-            System.out.println("Phase OLD_TOMBSTONED: " + results.size() + " results from new segment");
-            assertThat(results)
-                .as("New segment should serve after old segment is tombstoned")
+            // Phase 5: the old segment is tombstoned - the replacement alone must serve
+            visibilityTracker.markTombstoned(oldSegmentId, visibilityTracker.currentEpoch());
+            storageEngine.getTestCatalog().setSegmentState(oldSegmentId, LifecycleState.TOMBSTONED);
+            visibilityTracker.advanceEpoch();
+            response = pipeline.executeSync(request, token);
+            assertThat(response.results())
+                .as("Phase OLD_TOMBSTONED: the replacement must serve the query alone")
                 .isNotEmpty();
+            assertThat(response.results())
+                .as("Phase OLD_TOMBSTONED: nothing may come from the tombstoned segment")
+                .allSatisfy(result -> assertThat(result.segmentId()).isEqualTo(newSegmentId));
 
-            // Phase 5: Verify we can query from a vector in old graph and find it in new graph
-            // (simulating the rolling replacement where data is migrated)
-            float[] queryFromOldData = oldVectors.get(0);
-            results = newGraph.search(queryFromOldData, 5);
-            queryCount++;
-            if (!results.isEmpty()) {
-                availableCount++;
-            }
-            System.out.println("Phase MIGRATION_QUERY: " + results.size() + " results from new segment");
-            // Note: Results may be empty if vectors are very different, but graph should be functional
-
-            // Verify continuous availability - ALL phases should have queryable data
-            assertThat(availableCount)
-                .as("All queries during rolling replacement should have data available")
-                .isGreaterThanOrEqualTo(4); // At least 4 of 5 phases must have results
-
-            System.out.println("Rolling replacement: " + availableCount + "/" + queryCount +
-                " phases had available data");
+            System.out.println("Rolling replacement: all five phases returned results");
 
             oldGraph.close();
             newGraph.close();
@@ -700,7 +735,7 @@ class ReindexWhileQueryingIntegrationTest {
             startLatch.countDown();
 
             // Wait for completion
-            reindexComplete.await(60, TimeUnit.SECONDS);
+            boolean reindexesCompleted = reindexComplete.await(60, TimeUnit.SECONDS);
             queriesRunning.set(false);
 
             Thread.sleep(300);
@@ -717,13 +752,17 @@ class ReindexWhileQueryingIntegrationTest {
                 .as("Queries should have been executed")
                 .isGreaterThan(0);
 
-            double emptyRatio = (double) emptyResultCount.get() / queryCount.get();
-            assertThat(emptyRatio)
-                .as("Most queries should return results")
-                .isLessThan(0.5);
+            assertThat(reindexesCompleted)
+                .as("Every re-index must complete within the timeout")
+                .isTrue();
+
+            assertThat(emptyResultCount.get())
+                .as("No query may return empty across repeated re-indexes (%d of %d did)",
+                    emptyResultCount.get(), queryCount.get())
+                .isZero();
 
             System.out.println("Multiple re-index test: " + queryCount.get() + " queries, " +
-                emptyResultCount.get() + " empty (" + (emptyRatio * 100) + "%), " +
+                emptyResultCount.get() + " empty, " +
                 exceptionCount.get() + " exceptions");
 
             graph1.close();
@@ -892,7 +931,6 @@ class ReindexWhileQueryingIntegrationTest {
         float[] vector = createRandomVector(dimension);
         graph.insert(vector);
 
-        writeLog.sync();
         visibilityTracker.advanceEpoch();
     }
 
@@ -912,7 +950,10 @@ class ReindexWhileQueryingIntegrationTest {
         private final AtomicLong segmentFileCounter = new AtomicLong(0);
 
         TestStorageEngine(Path dataDir, Arena arena) throws IOException {
-            super(dataDir, Arena.ofShared());
+            // The caller's arena backs both the engine's mapped catalog and the segments
+            // created here. Allocating a fresh shared arena would leak it: a shared arena
+            // is released only by an explicit close(), never by the collector.
+            super(dataDir, arena);
             this.dataDir = dataDir;
             this.arena = arena;
             this.catalog = new TestSegmentCatalog();
@@ -960,6 +1001,7 @@ class ReindexWhileQueryingIntegrationTest {
             return segments.get(segmentId);
         }
 
+        @Override
         public void close() {
             for (Segment segment : segments.values()) {
                 try {
@@ -969,6 +1011,8 @@ class ReindexWhileQueryingIntegrationTest {
                 }
             }
             segments.clear();
+            // The base engine owns the mapped catalog and the split worker
+            super.close();
         }
     }
 

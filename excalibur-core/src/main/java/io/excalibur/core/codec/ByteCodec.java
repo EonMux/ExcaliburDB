@@ -132,8 +132,11 @@ public class ByteCodec implements Codec<byte[]> {
         ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
-        // Check that length is non-negative and data contains full payload
-        return length >= 0 && data.length >= LENGTH_PREFIX_SIZE + length;
+        // Check that length is non-negative and data contains full payload.
+        // Widened to long: LENGTH_PREFIX_SIZE + length overflows for a length near
+        // Integer.MAX_VALUE, which would make the guard trivially true and let decode()
+        // allocate a ~2 GB array from an unvalidated length prefix.
+        return length >= 0 && (long) data.length >= (long) LENGTH_PREFIX_SIZE + length;
     }
 
     /**
@@ -158,7 +161,7 @@ public class ByteCodec implements Codec<byte[]> {
             .order(ByteOrder.LITTLE_ENDIAN);
         int length = buffer.getInt();
 
-        return length >= 0 && data.length >= offset + LENGTH_PREFIX_SIZE + length;
+        return length >= 0 && (long) data.length - offset >= (long) LENGTH_PREFIX_SIZE + length;
     }
 
     /**

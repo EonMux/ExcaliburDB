@@ -273,6 +273,13 @@ class NoFalseNegativeVerificationTest {
 
             System.out.println("Test " + n + " items: inserted " + inserted + " items");
 
+            // Precondition: without this the containment loop below can be empty and the
+            // test would pass having verified nothing at all.
+            assertTrue(inserted >= n * 0.95,
+                "insert() must succeed for nearly all items at scale " + n + ", but only " +
+                inserted + " of " + n + " were inserted");
+            assertEquals(inserted, tracker.count(), "tracker must hold every inserted item");
+
             // CRITICAL: Verify all inserted items are found
             for (byte[] item : tracker.items()) {
                 assertTrue(filter.contains(item), ASSERTION_MESSAGE + " at scale " + n);
@@ -292,6 +299,10 @@ class NoFalseNegativeVerificationTest {
                     tracker.add(item);
                 }
             }
+
+            // Precondition: an empty tracker would make the loop below vacuous.
+            assertTrue(tracker.count() >= 9500,
+                "insert() must succeed for nearly all sequential integers, got " + tracker.count());
 
             // Verify all are found
             for (byte[] item : tracker.items()) {
@@ -363,6 +374,16 @@ class NoFalseNegativeVerificationTest {
             System.out.println("Load factor test: target=" + targetLoadFactor +
                 ", actual=" + String.format("%.4f", actualLoadFactor) +
                 ", inserted=" + inserted + ", failed=" + failed);
+
+            // Preconditions: the invariant below is only meaningful if the filter really
+            // reached the load factor this test claims to exercise.
+            assertTrue(inserted > 0, "no item was inserted, so nothing was verified");
+            assertEquals(targetLoadFactor, actualLoadFactor, 0.02,
+                "filter did not reach the load factor under test");
+            // The random generator can repeat a value, and the tracker de-duplicates, so the
+            // counts are allowed to differ slightly - but not by enough to hollow out the loop.
+            assertTrue(tracker.count() >= inserted * 0.99,
+                "tracker holds only " + tracker.count() + " of " + inserted + " inserted items");
 
             // CRITICAL: Verify ALL inserted items are found
             int falseNegatives = 0;

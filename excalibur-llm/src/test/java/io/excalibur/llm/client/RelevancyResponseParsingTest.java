@@ -393,18 +393,17 @@ class RelevancyResponseParsingTest {
     class IndexHandlingTests {
 
         @Test
-        @DisplayName("Index out of upper bound is clamped")
-        void indexOutOfBoundsClamped() {
+        @DisplayName("Index above upper bound is discarded, not clamped")
+        void indexOutOfBoundsDiscarded() {
             // LLM returns index 5 but we only have 2 candidates
             String json = "[{\"index\": 5, \"score\": 0.8}]";
             server.setChatHandler(server.successChatHandler(json));
 
             List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("A", "B"));
 
-            assertEquals(1, scores.size());
-            // Index should be clamped to last valid index (1)
-            assertEquals(1, scores.get(0).getIndex());
-            assertEquals("B", scores.get(0).getCandidateText());
+            // Clamping to index 1 would attribute this score to candidate "B", which the model
+            // never scored. The score carries no recoverable meaning, so it is dropped.
+            assertEquals(0, scores.size());
         }
 
         @Test
@@ -451,16 +450,17 @@ class RelevancyResponseParsingTest {
         }
 
         @Test
-        @DisplayName("Large index is clamped to valid range")
-        void largeIndexClamped() {
-            String json = "[{\"index\": 999999, \"score\": 0.8}]";
+        @DisplayName("Large index is discarded and valid siblings survive")
+        void largeIndexDiscarded() {
+            String json = "[{\"index\": 999999, \"score\": 0.8}, {\"index\": 1, \"score\": 0.6}]";
             server.setChatHandler(server.successChatHandler(json));
 
             List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("A", "B", "C"));
 
+            // The unusable entry is dropped; the well-formed one in the same response is kept.
             assertEquals(1, scores.size());
-            assertEquals(2, scores.get(0).getIndex());  // Clamped to last index
-            assertEquals("C", scores.get(0).getCandidateText());
+            assertEquals(1, scores.get(0).getIndex());
+            assertEquals("B", scores.get(0).getCandidateText());
         }
     }
 
@@ -471,51 +471,63 @@ class RelevancyResponseParsingTest {
     class MalformedInputTests {
 
         @Test
-        @DisplayName("Missing index field returns empty list")
+        @DisplayName("Missing index field is a parse failure, not an empty answer")
         void missingIndexField() {
             String json = "[{\"score\": 0.8}]";
             server.setChatHandler(server.successChatHandler(json));
 
-            List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("candidate"));
-
-            // Regex doesn't match, so empty list returned
-            assertTrue(scores.isEmpty());
+            // An unreadable reply reported as an empty score list is indistinguishable from a
+            // reply that scored nothing, so the caller cannot know to fall back to the vector
+            // ranking - and the circuit breaker counts the exchange as a success.
+            assertThrows(LLMException.class, () ->
+                client.scoreRelevancy("query", List.of("candidate")));
         }
 
         @Test
-        @DisplayName("Missing score field returns empty list")
+        @DisplayName("Missing score field is a parse failure, not an empty answer")
         void missingScoreField() {
             String json = "[{\"index\": 0}]";
             server.setChatHandler(server.successChatHandler(json));
 
-            List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("candidate"));
-
-            // Regex doesn't match, so empty list returned
-            assertTrue(scores.isEmpty());
+            assertThrows(LLMException.class, () ->
+                client.scoreRelevancy("query", List.of("candidate")));
         }
 
         @Test
-        @DisplayName("Wrong field names are ignored")
+        @DisplayName("Wrong field names are a parse failure")
         void wrongFieldNames() {
             String json = "[{\"idx\": 0, \"value\": 0.8}]";
             server.setChatHandler(server.successChatHandler(json));
 
-            List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("candidate"));
-
-            assertTrue(scores.isEmpty());
+            assertThrows(LLMException.class, () ->
+                client.scoreRelevancy("query", List.of("candidate")));
         }
 
         @Test
-        @DisplayName("Extra fields in object break regex match")
-        void extraFieldsBreakMatch() {
-            // The regex pattern is strict - extra fields after score break the match
+        @DisplayName("Extra fields in an object are tolerated")
+        void extraFieldsAreTolerated() {
+            // A model that explains itself is answering the question, and a parser that rejects
+            // the reply over an extra key throws the whole ranking away.
             String json = "[{\"index\": 0, \"score\": 0.85, \"reason\": \"highly relevant\"}]";
             server.setChatHandler(server.successChatHandler(json));
 
             List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("candidate"));
 
-            // Regex doesn't match due to extra fields after score
-            assertTrue(scores.isEmpty());
+            assertEquals(1, scores.size());
+            assertEquals(0, scores.get(0).getIndex());
+            assertEquals(0.85, scores.get(0).getScore(), 1e-6);
+        }
+
+        @Test
+        @DisplayName("Transposed fields are read")
+        void transposedFieldsAreRead() {
+            String json = "[{\"score\": 0.85, \"index\": 0}]";
+            server.setChatHandler(server.successChatHandler(json));
+
+            List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("candidate"));
+
+            assertEquals(1, scores.size());
+            assertEquals(0.85, scores.get(0).getScore(), 1e-6);
         }
 
         @Test

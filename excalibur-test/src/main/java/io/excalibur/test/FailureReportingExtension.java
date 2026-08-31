@@ -10,13 +10,11 @@
 package io.excalibur.test;
 
 import org.junit.jupiter.api.extension.AfterAllCallback;
-import org.junit.jupiter.api.extension.BeforeAllCallback;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestExecutionExceptionHandler;
+import org.junit.jupiter.api.extension.TestWatcher;
 
 import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -25,7 +23,9 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -57,19 +57,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * @since 10.0
  */
 public final class FailureReportingExtension
-    implements BeforeAllCallback, AfterAllCallback, TestExecutionExceptionHandler {
-
-    private static final ExtensionContext.Namespace NAMESPACE =
-        ExtensionContext.Namespace.create(FailureReportingExtension.class);
-
-    private static final String FAILURES_KEY = "FAILURES";
-    private static final String TEST_CLASS_KEY = "TEST_CLASS";
+    implements AfterAllCallback, TestExecutionExceptionHandler, TestWatcher {
 
     private final Path reportDirectory;
     private final boolean writeJsonReport;
     private final boolean consoleReport;
 
-    // Track all failures across test classes (for global reporting)
+    // Failures keyed by fully-qualified test class name. This is the single store: a
+    // per-method ExtensionContext store is invisible to the class-level afterAll context.
     private static final Map<String, List<FailureCategory>> globalFailures = new ConcurrentHashMap<>();
     private static final AtomicInteger totalTests = new AtomicInteger(0);
     private static final AtomicInteger totalFailures = new AtomicInteger(0);
@@ -115,9 +110,23 @@ public final class FailureReportingExtension
     }
 
     @Override
-    public void beforeAll(ExtensionContext context) {
-        // Store the test class name for reporting
-        context.getStore(NAMESPACE).put(TEST_CLASS_KEY, context.getRequiredTestClass().getSimpleName());
+    public void testSuccessful(ExtensionContext context) {
+        totalTests.incrementAndGet();
+    }
+
+    @Override
+    public void testFailed(ExtensionContext context, Throwable cause) {
+        totalTests.incrementAndGet();
+    }
+
+    @Override
+    public void testAborted(ExtensionContext context, Throwable cause) {
+        totalTests.incrementAndGet();
+    }
+
+    @Override
+    public void testDisabled(ExtensionContext context, Optional<String> reason) {
+        // A disabled test was never executed, so it does not count as a test run.
     }
 
     @Override
@@ -126,9 +135,8 @@ public final class FailureReportingExtension
         totalFailures.incrementAndGet();
 
         // Extract test name
-        String testName = context.getDisplayName();
-        String className = context.getRequiredTestClass().getSimpleName();
-        String fullName = className + "." + testName;
+        Class<?> testClass = context.getRequiredTestClass();
+        String fullName = testClass.getSimpleName() + "." + context.getDisplayName();
 
         // Extract error message
         String errorMessage = extractErrorMessage(throwable);
@@ -136,17 +144,10 @@ public final class FailureReportingExtension
         // Categorize the failure
         FailureCategory category = FailureCategorizer.categorize(fullName, errorMessage);
 
-        // Store in context for this test class
-        @SuppressWarnings("unchecked")
-        List<FailureCategory> failures = context.getStore(NAMESPACE)
-            .getOrComputeIfAbsent(FAILURES_KEY, k -> new ArrayList<FailureCategory>(), List.class);
-
-        synchronized (failures) {
-            ((List<FailureCategory>) failures).add(category);
-        }
-
-        // Also store in global failures map
-        globalFailures.computeIfAbsent(className, k -> new ArrayList<>()).add(category);
+        // Record against the test class so afterAll (a class-level context) can find it.
+        // The list is copy-on-write because test methods may fail on several threads at once.
+        globalFailures.computeIfAbsent(testClass.getName(), k -> new CopyOnWriteArrayList<>())
+            .add(category);
 
         // Re-throw the exception so JUnit handles it properly
         throw throwable;
@@ -154,26 +155,27 @@ public final class FailureReportingExtension
 
     @Override
     public void afterAll(ExtensionContext context) throws Exception {
-        // Get failures for this test class
-        @SuppressWarnings("unchecked")
-        List<FailureCategory> failures = context.getStore(NAMESPACE)
-            .get(FAILURES_KEY, List.class);
+        Class<?> testClass = context.getRequiredTestClass();
+        List<FailureCategory> failures = globalFailures.get(testClass.getName());
 
         if (failures == null || failures.isEmpty()) {
             return;
         }
 
+        // Snapshot so the report is stable even if a sibling container is still running
+        List<FailureCategory> snapshot = new ArrayList<>(failures);
+
         // Generate summary for this test class
-        FailureCategorizer.FailureSummary summary = buildSummary(failures);
+        FailureCategorizer.FailureSummary summary = buildSummary(snapshot);
 
         // Console report
         if (consoleReport) {
-            System.out.println("\n" + generateConsoleReport(context.getRequiredTestClass().getSimpleName(), summary));
+            System.out.println("\n" + generateConsoleReport(testClass.getSimpleName(), summary));
         }
 
         // JSON report
         if (writeJsonReport && reportDirectory != null) {
-            writeJsonReport(context.getRequiredTestClass().getSimpleName(), failures, summary);
+            writeJsonReport(testClass.getSimpleName(), snapshot, summary);
         }
     }
 

@@ -84,6 +84,17 @@ public final class CosineSimilarity implements DistanceFunction {
         return INSTANCE;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Cosine similarity is a similarity: 1.0 means identical direction and
+     * -1.0 means opposite direction, so larger values are closer.</p>
+     */
+    @Override
+    public Ordering ordering() {
+        return Ordering.LARGER_IS_CLOSER;
+    }
+
     @Override
     public String name() {
         return "cosine";

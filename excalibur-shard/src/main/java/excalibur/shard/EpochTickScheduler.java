@@ -77,7 +77,7 @@ public class EpochTickScheduler implements AutoCloseable {
      * Scheduled executor for epoch ticks.
      * Uses virtual threads for lightweight scheduling.
      */
-    private final ScheduledExecutorService scheduler;
+    private volatile ScheduledExecutorService scheduler;
 
     /**
      * The scheduled tick task.
@@ -103,6 +103,12 @@ public class EpochTickScheduler implements AutoCloseable {
      * Timestamp of the last tick.
      */
     private final AtomicLong lastTickTimestamp;
+
+    /**
+     * Guards a tick against a concurrent stop, so {@link #stop()} returns only once no
+     * tick can still advance the epoch.
+     */
+    private final Object tickLock = new Object();
 
     // ==================== Constructors ====================
 
@@ -136,7 +142,7 @@ public class EpochTickScheduler implements AutoCloseable {
         this.visibilityTracker = visibilityTracker;
         this.tickIntervalMs = tickIntervalMs;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(
-            Thread.ofVirtual().factory()
+            Thread.ofVirtual().name("excalibur-epoch-tick-scheduler").factory()
         );
         this.running = new AtomicBoolean(false);
         this.tickCount = new AtomicLong(0);
@@ -158,6 +164,15 @@ public class EpochTickScheduler implements AutoCloseable {
     public boolean start() {
         if (running.compareAndSet(false, true)) {
             LOGGER.info("Starting epoch tick scheduler with interval {}ms", tickIntervalMs);
+
+            // A previous close() shut the executor down. Recreate it so a stop/start
+            // cycle - an embedded server restart, or an integration test - does not
+            // throw RejectedExecutionException out of the orchestrator's start().
+            if (scheduler == null || scheduler.isShutdown() || scheduler.isTerminated()) {
+                scheduler = Executors.newSingleThreadScheduledExecutor(
+                    Thread.ofVirtual().name("excalibur-epoch-tick-scheduler").factory()
+                );
+            }
 
             tickTask = scheduler.scheduleAtFixedRate(
                 this::performTick,
@@ -194,6 +209,13 @@ public class EpochTickScheduler implements AutoCloseable {
                 tickTask = null;
             }
 
+            // Fence out a tick that was already dispatched: cancel(false) lets it run to
+            // completion, so without this the epoch could still advance after stop()
+            // returned.
+            synchronized (tickLock) {
+                LOGGER.debug("Epoch tick scheduler quiesced");
+            }
+
             LOGGER.info("Epoch tick scheduler stopped. Total ticks: {}, Current epoch: {}",
                 tickCount.get(), visibilityTracker.currentEpoch());
         }
@@ -220,26 +242,33 @@ public class EpochTickScheduler implements AutoCloseable {
      * stop the scheduler.</p>
      */
     private void performTick() {
-        try {
-            long previousEpoch = visibilityTracker.currentEpoch();
-            long newEpoch = visibilityTracker.advanceEpoch();
+        synchronized (tickLock) {
+            if (!running.get()) {
+                // stop() was called while this tick was queued or dispatched.
+                return;
+            }
 
-            tickCount.incrementAndGet();
-            lastTickTimestamp.set(System.currentTimeMillis());
+            try {
+                long previousEpoch = visibilityTracker.currentEpoch();
+                long newEpoch = visibilityTracker.advanceEpoch();
 
-            // Record epoch in JMX metrics for observability
-            Metrics.recordEpoch(newEpoch);
+                tickCount.incrementAndGet();
+                lastTickTimestamp.set(System.currentTimeMillis());
 
-            // Calculate and record estimated coverage based on visible segment ratio
-            VisibilityTracker.VisibilityStats stats = visibilityTracker.getStats();
-            double coverage = stats.visibilityRatio();
-            Metrics.setEstimatedCoverage(coverage);
+                // Record epoch in JMX metrics for observability
+                Metrics.recordEpoch(newEpoch);
 
-            LOGGER.trace("Epoch tick: {} -> {}, coverage={}", previousEpoch, newEpoch, coverage);
+                // Calculate and record estimated coverage based on visible segment ratio
+                VisibilityTracker.VisibilityStats stats = visibilityTracker.getStats();
+                double coverage = stats.visibilityRatio();
+                Metrics.setEstimatedCoverage(coverage);
 
-        } catch (Exception e) {
-            LOGGER.error("Error during epoch tick: {}", e.getMessage(), e);
-            // Continue scheduling despite errors
+                LOGGER.trace("Epoch tick: {} -> {}, coverage={}", previousEpoch, newEpoch, coverage);
+
+            } catch (Exception e) {
+                LOGGER.error("Error during epoch tick: {}", e.getMessage(), e);
+                // Continue scheduling despite errors
+            }
         }
     }
 

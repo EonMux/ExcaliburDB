@@ -196,13 +196,18 @@ public final class QueryOptions {
         /**
          * Sets the number of results to return.
          *
-         * @param topK The number of results (must be positive)
+         * @param topK The number of results (must be positive and at most
+         *             {@link QueryRequest#MAX_TOP_K})
          * @return This builder
-         * @throws IllegalArgumentException if topK is not positive
+         * @throws IllegalArgumentException if topK is not in [1, {@link QueryRequest#MAX_TOP_K}]
          */
         public Builder topK(int topK) {
             if (topK <= 0) {
                 throw new IllegalArgumentException("topK must be positive: " + topK);
+            }
+            if (topK > QueryRequest.MAX_TOP_K) {
+                throw new IllegalArgumentException(
+                    "topK must be at most " + QueryRequest.MAX_TOP_K + ": " + topK);
             }
             this.topK = topK;
             return this;

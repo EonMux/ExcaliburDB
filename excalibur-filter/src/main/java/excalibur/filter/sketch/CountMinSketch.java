@@ -206,8 +206,8 @@ public class CountMinSketch {
             return;
         }
 
-        // Use striped locking based on first hash
-        int lockIndex = (int) (Math.abs(hashItem(item, 0)) % NUM_LOCKS);
+        // Use striped locking based on first hash (bitmask for guaranteed non-negative)
+        int lockIndex = (int) ((hashItem(item, 0) & 0x7FFFFFFFFFFFFFFFL) % NUM_LOCKS);
         locks[lockIndex].lock();
         try {
             for (int row = 0; row < depth; row++) {
@@ -427,8 +427,8 @@ public class CountMinSketch {
      */
     private int hashToColumn(byte[] item, int row) {
         long hash = hashItem(item, row);
-        // Use absolute value and modulo to get valid column index
-        return (int) (Math.abs(hash) % width);
+        // Use bitmask to guarantee non-negative value (Math.abs fails for Long.MIN_VALUE)
+        return (int) ((hash & 0x7FFFFFFFFFFFFFFFL) % width);
     }
 
     @Override

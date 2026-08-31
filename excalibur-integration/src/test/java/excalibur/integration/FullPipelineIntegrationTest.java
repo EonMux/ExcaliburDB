@@ -19,7 +19,7 @@ import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.SegmentCatalog.SegmentMetadata;
 import io.excalibur.store.StorageEngine;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.store.WriteLog;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
@@ -124,7 +124,9 @@ class FullPipelineIntegrationTest {
             visibilityTracker,
             documentRegistry,
             (CuckooFilter) null,
-            writeLog::sync,
+            // io.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
+            // durability barrier is already satisfied before the adapter runs.
+            () -> { },
             new ReentrantLock()
         );
     }
@@ -183,11 +185,10 @@ class FullPipelineIntegrationTest {
 
                 // Commit to write log
                 AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
-                writeLog.sync();
 
                 // Insert vector into HNSW graph
                 graph.insert(vector);
-                graph.setLastIntegratedOffset(writeLog.writeHead());
+                graph.setLastIntegratedOffset(writeLog.writeOffset());
 
                 // Advance visibility epoch
                 visibilityTracker.advanceEpoch();
@@ -516,12 +517,11 @@ class FullPipelineIntegrationTest {
                 Map<Integer, float[]> embeddings = new HashMap<>();
                 embeddings.put(0, vector);
                 AtomicDocumentBatch batch = chunkBuffer.commitDocumentWithEmbeddings(documentId, embeddings);
-                writeLog.sync();
 
                 // Insert vector into HNSW graph and register document ID
                 long nodeId = graph.insert(vector);
                 graph.registerDocumentId(nodeId, documentId);
-                graph.setLastIntegratedOffset(writeLog.writeHead());
+                graph.setLastIntegratedOffset(writeLog.writeOffset());
 
                 // Advance visibility epoch
                 visibilityTracker.advanceEpoch();
@@ -664,7 +664,6 @@ class FullPipelineIntegrationTest {
             Map<Integer, float[]> embeddings = new HashMap<>();
             embeddings.put(0, vector);
             AtomicDocumentBatch batch = chunkBuffer.commitDocumentWithEmbeddings(testDocumentId, embeddings);
-            writeLog.sync();
 
             // Verify batch was created correctly
             assertThat(batch).isNotNull();
@@ -678,7 +677,7 @@ class FullPipelineIntegrationTest {
 
             // Verify the key exists in the write log
             // The write log stores entries that can be read back
-            assertThat(writeLog.writeHead()).isGreaterThan(0);
+            assertThat(writeLog.writeOffset()).isGreaterThan(0);
 
             // CRITICAL VERIFICATION: Verify content can be decoded from encoded format
             // Create a sample encoded value using the same format as DocumentChunkBuffer
@@ -755,11 +754,10 @@ class FullPipelineIntegrationTest {
                 Map<Integer, float[]> embeddings = new HashMap<>();
                 embeddings.put(0, vector);
                 chunkBuffer.commitDocumentWithEmbeddings(documentId, embeddings);
-                writeLog.sync();
 
                 long nodeId = graph.insert(vector);
                 graph.registerDocumentId(nodeId, documentId);
-                graph.setLastIntegratedOffset(writeLog.writeHead());
+                graph.setLastIntegratedOffset(writeLog.writeOffset());
 
                 visibilityTracker.advanceEpoch();
             }

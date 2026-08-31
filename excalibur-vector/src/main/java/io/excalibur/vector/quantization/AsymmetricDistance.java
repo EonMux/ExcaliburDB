@@ -112,7 +112,7 @@ public final class AsymmetricDistance {
      *     <ul>
      *       <li>For each centroid c in codebook[s]:
      *         <ul>
-     *           <li>Compute squared L2 distance from query sub-vector to centroid</li>
+     *           <li>Compute the metric's per-subspace term from query sub-vector to centroid</li>
      *           <li>Store in table[s][c]</li>
      *         </ul>
      *       </li>
@@ -120,9 +120,24 @@ public final class AsymmetricDistance {
      *   </li>
      * </ol>
      *
+     * <h3>Which metrics work, and why the table is always smaller-is-closer</h3>
+     * <p>The technique needs a metric whose value is the sum of independent per-subspace terms,
+     * because {@link #compute} adds one table entry per subspace. Squared L2 decomposes exactly.
+     * So does the inner product. Cosine does not in general — its normalisation is global — but for
+     * unit-norm vectors, which is what embedding models produce, cosine equals the inner product
+     * and decomposes with it.</p>
+     *
+     * <p>Entries for the larger-is-closer metrics are <strong>negated</strong>, so an accumulated
+     * table value is always a dissimilarity where smaller means nearer. That matches
+     * {@link DistanceFunction.Ordering#toDistance}, which is what puts a PQ result on the same
+     * scale as an exact one — previously this always computed squared L2 whatever metric the graph
+     * was built with, so a cosine graph's PQ results were normalised against a range they were
+     * never on.</p>
+     *
      * @param query Full-precision query vector
      * @param codebooks PQ codebooks [numSubspaces × numCentroids × subvectorDim]
-     * @param distFn Distance function to use (null = L2 squared distance)
+     * @param distFn Metric the table is built for; null means L2. Must be decomposable across
+     *               subspaces — see the note above on which metrics qualify.
      * @return Precomputed distance table [numSubspaces × numCentroids]
      * @throws IllegalArgumentException if dimensions are invalid
      * @throws NullPointerException if query or codebooks is null
@@ -167,18 +182,27 @@ public final class AsymmetricDistance {
 
         float[][] distanceTable = new float[numSubspaces][numCentroids];
 
-        // Build table by computing distances to all centroids
+        boolean largerIsCloser = distFn != null
+            && distFn.ordering() == DistanceFunction.Ordering.LARGER_IS_CLOSER;
+
         for (int s = 0; s < numSubspaces; s++) {
             int startOffset = s * subvectorDim;
 
             for (int c = 0; c < numCentroids; c++) {
-                // Compute squared L2 distance from query sub-vector to centroid
-                double dist = 0.0;
-                for (int d = 0; d < subvectorDim; d++) {
-                    double diff = (double) query[startOffset + d] - (double) codebooks[s][c][d];
-                    dist += diff * diff;
+                double term = 0.0;
+                if (largerIsCloser) {
+                    // Inner product, negated so the accumulated table stays smaller-is-closer.
+                    for (int d = 0; d < subvectorDim; d++) {
+                        term += (double) query[startOffset + d] * (double) codebooks[s][c][d];
+                    }
+                    term = -term;
+                } else {
+                    for (int d = 0; d < subvectorDim; d++) {
+                        double diff = (double) query[startOffset + d] - (double) codebooks[s][c][d];
+                        term += diff * diff;
+                    }
                 }
-                distanceTable[s][c] = (float) dist;
+                distanceTable[s][c] = (float) term;
             }
         }
 
@@ -206,7 +230,7 @@ public final class AsymmetricDistance {
      *
      * @param distanceTable Precomputed distance table
      * @param pqCodesBatch Array of PQ codes for multiple database vectors
-     * @return Array of approximate squared L2 distances
+     * @return Approximate dissimilarities on the table's metric, smaller being nearer
      * @throws IllegalArgumentException if inputs are invalid
      */
     public static float[] computeBatch(float[][] distanceTable, byte[][] pqCodesBatch) {

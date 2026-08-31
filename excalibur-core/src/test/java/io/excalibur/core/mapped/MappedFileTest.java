@@ -484,6 +484,10 @@ class MappedFileTest {
     /**
      * Test: Concurrent reads during extend don't corrupt data.
      * This tests thread safety during file growth.
+     *
+     * <p>The reader thread must never assert directly: an AssertionFailedError raised off
+     * the JUnit thread only kills that thread and the test would pass regardless. Failures
+     * are recorded and re-raised from the test thread after the join.</p>
      */
     @Test
     void testConcurrentReadDuringExtend() throws Exception {
@@ -491,6 +495,9 @@ class MappedFileTest {
             // Write initial data
             byte[] originalData = new byte[]{1, 2, 3, 4, 5, 6, 7, 8};
             mf.writeBytes(0, originalData);
+
+            java.util.concurrent.atomic.AtomicReference<String> readerFailure =
+                new java.util.concurrent.atomic.AtomicReference<>();
 
             // Start a thread that continuously reads the data
             Thread readerThread = new Thread(() -> {
@@ -500,13 +507,16 @@ class MappedFileTest {
                         // Either we read the original data, or we get an exception
                         // during remap - both are valid
                         if (!java.util.Arrays.equals(originalData, read)) {
-                            fail("Concurrent read returned corrupted data");
+                            readerFailure.compareAndSet(null,
+                                "Concurrent read returned corrupted data: "
+                                    + java.util.Arrays.toString(read));
+                            return;
                         }
                     }
-                } catch (Exception e) {
+                } catch (Throwable t) {
                     // Expected during remap - IllegalStateException is acceptable
-                    if (!(e instanceof IllegalStateException)) {
-                        fail("Unexpected exception: " + e);
+                    if (!(t instanceof IllegalStateException)) {
+                        readerFailure.compareAndSet(null, "Unexpected exception: " + t);
                     }
                 }
             });
@@ -519,7 +529,11 @@ class MappedFileTest {
                 Thread.sleep(1); // Small delay to allow interleaving
             }
 
-            readerThread.join(1000);
+            // Join before the try-with-resources closes the file, so the reader can never
+            // race against close() and have that failure silently discarded.
+            readerThread.join(30_000);
+            assertFalse(readerThread.isAlive(), "Reader thread did not finish in time");
+            assertNull(readerFailure.get(), readerFailure.get());
 
             // Final verification - original data should still be intact
             assertArrayEquals(originalData, mf.readBytes(0, 8),
@@ -1130,5 +1144,99 @@ class MappedFileTest {
                 }
             }
         }
+    }
+    // ==================== Regression Tests ====================
+
+    /**
+     * Test: extend() never shrinks the backing file.
+     *
+     * <p>A file reopened with a smaller nominal size than it has on disk used to be
+     * truncated to the new mapping size by the very next extend(), destroying every byte
+     * beyond it. Growing must only ever grow.</p>
+     */
+    @Test
+    void testExtendNeverTruncatesLargerFile() throws IOException {
+        byte[] marker = {(byte) 0xDE, (byte) 0xAD, (byte) 0xBE, (byte) 0xEF};
+        long markerOffset = 120_000L;
+
+        // Phase 1: grow well past the initial size and persist a marker near the end.
+        try (MappedFile mf = MappedFile.create(testFile, 65536)) {
+            mf.extend(65536);
+            mf.writeBytes(markerOffset, marker);
+            mf.flush();
+        }
+
+        long grownLength = Files.size(testFile);
+        assertTrue(grownLength > markerOffset + marker.length,
+            "Setup failed: file should have grown past the marker");
+
+        // Phase 2: reopen with the smaller nominal size and grow by one page.
+        try (MappedFile mf = MappedFile.create(testFile, 65536)) {
+            mf.extend(4096);
+            assertTrue(Files.size(testFile) >= grownLength,
+                "extend() must not shrink the backing file");
+        }
+
+        // Phase 3: the marker must survive.
+        try (MappedFile mf = MappedFile.create(testFile, grownLength)) {
+            assertArrayEquals(marker, mf.readBytes(markerOffset, marker.length),
+                "Data beyond the reopened mapping must survive an extend()");
+        }
+    }
+
+    /**
+     * Test: truncate() is still allowed to shrink the backing file.
+     */
+    @Test
+    void testTruncateStillShrinksFile() throws IOException {
+        try (MappedFile mf = MappedFile.create(testFile, 16384)) {
+            assertEquals(16384, Files.size(testFile));
+            mf.truncate(4096);
+            assertEquals(4096, mf.size());
+            assertEquals(4096, Files.size(testFile));
+        }
+    }
+
+    /**
+     * Test: open(Path) works for a file whose length is not a multiple of the page size.
+     */
+    @Test
+    void testOpenReadOnlyWithNonPageAlignedLength() throws IOException {
+        byte[] content = new byte[100];
+        for (int i = 0; i < content.length; i++) {
+            content[i] = (byte) i;
+        }
+        Files.write(testFile, content);
+
+        try (MappedFile mf = MappedFile.open(testFile)) {
+            assertTrue(mf.isReadOnly());
+            assertEquals(100, mf.size());
+            assertArrayEquals(content, mf.readBytes(0, content.length));
+        }
+    }
+
+    /**
+     * Test: open(Path) works for an empty file.
+     */
+    @Test
+    void testOpenReadOnlyEmptyFile() throws IOException {
+        Files.write(testFile, new byte[0]);
+
+        try (MappedFile mf = MappedFile.open(testFile)) {
+            assertEquals(0, mf.size());
+            assertThrows(IndexOutOfBoundsException.class, () -> mf.readByte(0));
+        }
+    }
+
+    /**
+     * Test: a successful close reports no flush failure.
+     */
+    @Test
+    void testCloseReportsNoFlushFailure() throws IOException {
+        MappedFile mf = MappedFile.create(testFile, 4096);
+        mf.writeInt(0, 42);
+        mf.close();
+
+        assertNull(mf.closeFlushFailure(), "A successful close must not record a flush failure");
     }
 }

@@ -12,7 +12,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
-import java.lang.foreign.Arena;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
@@ -47,7 +46,6 @@ class TailScanBenchmarkValidationTest {
     @TempDir
     Path tempDir;
 
-    private Arena arena;
     private Path tempFile;
     private WriteLog writeLog;
     private TailScanner tailScanner;
@@ -59,7 +57,6 @@ class TailScanBenchmarkValidationTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        arena = Arena.ofShared();
         tempFile = Files.createTempFile(tempDir, "tail_scan_validation_", ".log");
         tailScanner = new TailScanner(100_000); // No backpressure during validation
     }
@@ -68,9 +65,6 @@ class TailScanBenchmarkValidationTest {
     void tearDown() throws IOException {
         if (writeLog != null) {
             writeLog.close();
-        }
-        if (arena != null) {
-            arena.close();
         }
     }
 
@@ -84,7 +78,7 @@ class TailScanBenchmarkValidationTest {
         int tailSize = 1000;
         int dimension = 128;
 
-        writeLog = new WriteLog(tempFile, arena);
+        writeLog = new WriteLog(tempFile);
         populateWriteLog(tailSize, dimension);
 
         float[] queryVector = createNormalizedVector(dimension, 12345);
@@ -128,7 +122,7 @@ class TailScanBenchmarkValidationTest {
         int tailSize = 1000;
         int dimension = 128;
 
-        writeLog = new WriteLog(tempFile, arena);
+        writeLog = new WriteLog(tempFile);
         populateWriteLog(tailSize, dimension);
 
         float[] queryVector = createNormalizedVector(dimension, 12345);
@@ -179,7 +173,7 @@ class TailScanBenchmarkValidationTest {
                 writeLog.close();
             }
             tempFile = Files.createTempFile(tempDir, "tail_scan_" + tailSize + "_", ".log");
-            writeLog = new WriteLog(tempFile, arena);
+            writeLog = new WriteLog(tempFile);
             populateWriteLog(tailSize, dimension);
 
             float[] queryVector = createNormalizedVector(dimension, 12345);
@@ -227,7 +221,7 @@ class TailScanBenchmarkValidationTest {
                 writeLog.close();
             }
             tempFile = Files.createTempFile(tempDir, "tail_scan_dim_" + dimension + "_", ".log");
-            writeLog = new WriteLog(tempFile, arena);
+            writeLog = new WriteLog(tempFile);
             populateWriteLog(tailSize, dimension);
 
             float[] queryVector = createNormalizedVector(dimension, 12345);
@@ -258,7 +252,7 @@ class TailScanBenchmarkValidationTest {
         TailScanner limitedScanner = new TailScanner(500);
         int dimension = 64;
 
-        writeLog = new WriteLog(tempFile, arena);
+        writeLog = new WriteLog(tempFile);
         // Populate more entries than the limit
         populateWriteLog(1000, dimension);
 
@@ -287,7 +281,7 @@ class TailScanBenchmarkValidationTest {
      */
     @Test
     void validateEmptyTailRange() throws IOException {
-        writeLog = new WriteLog(tempFile, arena);
+        writeLog = new WriteLog(tempFile);
         populateWriteLog(100, 64);
 
         float[] queryVector = createNormalizedVector(64, 12345);
@@ -314,7 +308,7 @@ class TailScanBenchmarkValidationTest {
         int dimension = 64;
         int largeK = 100;
 
-        writeLog = new WriteLog(tempFile, arena);
+        writeLog = new WriteLog(tempFile);
         populateWriteLog(tailSize, dimension);
 
         float[] queryVector = createNormalizedVector(dimension, 12345);
@@ -348,7 +342,7 @@ class TailScanBenchmarkValidationTest {
         int dimension = 64;
         int numQueries = 5;
 
-        writeLog = new WriteLog(tempFile, arena);
+        writeLog = new WriteLog(tempFile);
         populateWriteLog(tailSize, dimension);
 
         Random random = new Random(99999);

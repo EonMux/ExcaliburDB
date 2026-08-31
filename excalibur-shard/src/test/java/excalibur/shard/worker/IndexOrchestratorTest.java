@@ -958,6 +958,15 @@ class IndexOrchestratorTest {
         io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
         IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
 
+        // A reindex only "succeeds" when something actually re-indexed the source, so the
+        // handler that does that work has to be configured.
+        java.util.concurrent.atomic.AtomicInteger handlerCalls =
+            new java.util.concurrent.atomic.AtomicInteger();
+        orchestrator.setReindexOperationHandler(sourceId -> {
+            handlerCalls.incrementAndGet();
+            return true;
+        });
+
         SegmentReindexScheduler scheduler = orchestrator.getReindexScheduler();
 
         // Register a source
@@ -971,6 +980,7 @@ class IndexOrchestratorTest {
         boolean result = scheduler.triggerReindexNow(1L);
 
         assertTrue(result, "Reindex should have been triggered successfully");
+        assertEquals(1, handlerCalls.get(), "The configured handler should have run");
         assertEquals(triggeredBefore + 1, scheduler.getTotalReindexesTriggered(),
             "Triggered count should have incremented");
 
@@ -978,6 +988,36 @@ class IndexOrchestratorTest {
         // onReindexNeeded calls markReindexComplete
         assertEquals(completedBefore + 1, scheduler.getTotalReindexesCompleted(),
             "Completed count should have incremented because onReindexNeeded calls markReindexComplete");
+
+        orchestrator.close();
+        storageEngine.close();
+        arena.close();
+        catalog.close();
+    }
+
+    @Test
+    @DisplayName("IndexOrchestrator should report a reindex it cannot run as failed")
+    void testIndexOrchestratorReindexWithoutHandlerFails() throws Exception {
+        SegmentCatalog catalog = new SegmentCatalog();
+        Path dataDir = tempDir.resolve("data15b");
+        Files.createDirectories(dataDir);
+        Arena arena = Arena.ofShared();
+        io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
+        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+
+        SegmentReindexScheduler scheduler = orchestrator.getReindexScheduler();
+        scheduler.registerSource(1L);
+
+        // No ReindexOperationHandler is configured, so no document can be re-indexed.
+        boolean result = scheduler.triggerReindexNow(1L);
+
+        assertFalse(result, "A reindex with no handler to run it has not been triggered");
+        assertEquals(0L, scheduler.getTotalReindexesTriggered(),
+            "Nothing was triggered");
+        assertEquals(0L, scheduler.getTotalReindexesCompleted(),
+            "A reindex that never touched a document must not be recorded as completed");
+        assertEquals(1L, scheduler.getTotalReindexesFailed(),
+            "The attempt must be recorded as failed so the staleness clock is not reset");
 
         orchestrator.close();
         storageEngine.close();
@@ -994,6 +1034,7 @@ class IndexOrchestratorTest {
         Arena arena = Arena.ofShared();
         io.excalibur.store.StorageEngine storageEngine = new io.excalibur.store.StorageEngine(dataDir, arena);
         IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
+        orchestrator.setReindexOperationHandler(sourceId -> true);
 
         SegmentReindexScheduler scheduler = orchestrator.getReindexScheduler();
         scheduler.registerSource(1L);
@@ -1251,4 +1292,5 @@ class IndexOrchestratorTest {
         arena.close();
         catalog.close();
     }
+
 }

@@ -4,12 +4,12 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -24,10 +24,11 @@ import java.util.logging.Logger;
  * <p>The worker uses a copy-on-write approach to ensure non-blocking operation:</p>
  * <ol>
  *   <li>Identify segments that need compaction based on tombstone ratio</li>
- *   <li>Create a new segment file</li>
- *   <li>Copy all live (non-tombstoned) entries to the new segment</li>
- *   <li>Atomically swap the old segment for the new one</li>
- *   <li>Delete the old segment file and its write log</li>
+ *   <li>Build the compacted segment at {@code <segment>.dat.compact}</li>
+ *   <li>Copy all live (non-tombstoned) entries into it</li>
+ *   <li>Rename it onto the canonical {@code segment_&lt;index&gt;.dat} with a single
+ *       atomic move, which both installs the new file and removes the old one</li>
+ *   <li>Swap the registry entry, then retire the old segment</li>
  * </ol>
  *
  * <h2>When Compaction is Triggered</h2>
@@ -138,6 +139,15 @@ public class CompactionWorker {
      */
     public static final long MAX_WRITE_LOG_SIZE_THRESHOLD = 1024L * 1024 * 1024; // 1 GB
 
+    /**
+     * Suffix of the scratch file a compacted segment is built at.
+     *
+     * <p>It is appended to the full segment path, e.g. {@code segment_0.dat.compact},
+     * and is renamed onto {@code segment_0.dat} by the atomic swap. The suffix is never
+     * matched by segment discovery, so a scratch file left behind by a crash is inert.</p>
+     */
+    private static final String COMPACT_SUFFIX = ".compact";
+
     // ==================== Instance Fields ====================
 
     private final Arena arena;
@@ -150,11 +160,42 @@ public class CompactionWorker {
     private final AtomicLong bytesReclaimed;
 
     private volatile long compactionIntervalMs;
+
+    /**
+     * How long the loop waits before its first check.
+     *
+     * <p>Zero unless configured. Set from {@code excalibur.shard.compaction-delay-ms}, which was
+     * documented, shipped, validated and logged at startup while reaching no compaction code -
+     * an operator who set it saw it echoed back and got the same schedule as before.</p>
+     */
+    private volatile long startDelayMs;
     private volatile double tombstoneRatioThreshold;
     private volatile long writeLogSizeThreshold;
     private volatile int maxConcurrentCompactions;
 
     private volatile Thread workerThread;
+
+    /**
+     * Sets how long the loop waits before its first compaction check.
+     *
+     * <p>Takes effect on the next {@link #start()}.</p>
+     *
+     * @param startDelayMs Delay in milliseconds; negative is treated as none
+     * @return this worker, for chaining
+     */
+    public CompactionWorker withStartDelayMs(long startDelayMs) {
+        this.startDelayMs = Math.max(0, startDelayMs);
+        return this;
+    }
+
+    /**
+     * Returns how long the loop waits before its first compaction check.
+     *
+     * @return The delay in milliseconds
+     */
+    public long getStartDelayMs() {
+        return startDelayMs;
+    }
 
     // ==================== Constructors ====================
 
@@ -388,6 +429,18 @@ public class CompactionWorker {
      * Main compaction loop that runs in the background virtual thread.
      */
     private void runCompactionLoop() {
+        // The configured delay before the first check. It exists so an operator can keep
+        // compaction off the back of a bulk load: the work is not urgent, and contending with a
+        // load for the same disk makes both slower.
+        if (startDelayMs > 0) {
+            try {
+                Thread.sleep(startDelayMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+
         while (running.get() && !stopped.get()) {
             try {
                 // Find and compact eligible segments
@@ -487,24 +540,28 @@ public class CompactionWorker {
             }
         }
 
-        // Check write log size (if segment has a write log)
-        // Note: WriteLog is attached to Segment but managed separately
-        // This check is done via the segment's associated write log file
-        Path writeLogPath = getWriteLogPath(segment);
-        if (writeLogPath != null && Files.exists(writeLogPath)) {
-            try {
-                long writeLogSize = Files.size(writeLogPath);
-                if (writeLogSize >= writeLogSizeThreshold) {
-                    LOGGER.log(Level.FINE, "Segment {0} write log exceeds size: {1} >= {2}",
-                        new Object[] { segment.path(), writeLogSize, writeLogSizeThreshold });
-                    return true;
-                }
-            } catch (IOException e) {
-                LOGGER.log(Level.FINE, "Could not check write log size for segment: " + segment.path(), e);
-            }
+        // Check write log size. The logical write offset is used, not the file size:
+        // the log file is pre-allocated to its maximum size and is sparse, so its
+        // on-disk size says nothing about how much log there is to reclaim.
+        long writeLogSize = writeLogSize(segment);
+        if (writeLogSize >= writeLogSizeThreshold) {
+            LOGGER.log(Level.FINE, "Segment {0} write log exceeds size: {1} >= {2}",
+                new Object[] { segment.path(), writeLogSize, writeLogSizeThreshold });
+            return true;
         }
 
         return false;
+    }
+
+    /**
+     * Returns how many bytes of write log a segment has accumulated.
+     *
+     * @param segment The segment
+     * @return Logical write log size in bytes, or 0 if the segment has no log
+     */
+    private long writeLogSize(Segment segment) {
+        WriteLog writeLog = segment.writeLog();
+        return writeLog != null ? writeLog.writeOffset() : 0L;
     }
 
     /**
@@ -541,51 +598,28 @@ public class CompactionWorker {
         return segmentPath.getParent().resolve(filename + ".wal");
     }
 
-    /**
-     * Gets the write log path for a new segment being created during compaction.
-     *
-     * <p>During compaction, the new segment is created with a ".compact" extension.
-     * This method computes the correct write log path that will be used after
-     * the segment is renamed to ".dat".</p>
-     *
-     * <p>For a segment at /path/segment_0.compact, the write log should be at
-     * /path/segment_0.wal (after rename from .compact to .dat).</p>
-     *
-     * @param segment The new segment being created during compaction
-     * @return The write log path for the new segment, or null if not applicable
-     */
-    private Path getWriteLogPathForNewSegment(Segment segment) {
-        Path segmentPath = segment.path();
-        if (segmentPath == null) {
-            return null;
-        }
-        // For new segment at /path/segment_0.compact, the write log should be at
-        // /path/segment_0.wal (after rename from .compact to .dat)
-        String filename = segmentPath.getFileName().toString();
-        if (filename.endsWith(".compact")) {
-            String baseName = filename.substring(0, filename.length() - 8); // Remove .compact
-            return segmentPath.getParent().resolve(baseName + ".wal");
-        }
-        // Fallback for other naming patterns (e.g., .dat extension)
-        return getWriteLogPath(segment);
-    }
-
     // ==================== Core Compaction Logic ====================
 
     /**
      * Compacts a single segment.
      *
-     * <p>This method creates a new segment file, copies all live entries
-     * from the old segment, and atomically swaps them. The old segment
-     * is closed and its file is deleted.</p>
+     * <p>Compaction copies every live entry into a scratch file, then swaps that file
+     * over the segment's canonical name with a single atomic rename. The canonical name
+     * {@code segment_<index>.dat} therefore always holds the live data, which is what
+     * {@link SegmentDiscovery} looks for on the next start.</p>
      *
-     * <h3>Non-Blocking Guarantee</h3>
-     * <p>This method does not block reads or writes to the segment because:</p>
-     * <ul>
-     *   <li>A new segment is created independently</li>
-     *   <li>Entries are read using the segment's iterator (which holds only a read lock)</li>
-     *   <li>The swap is performed via the listener callback, which handles atomicity</li>
-     * </ul>
+     * <h3>Ordering</h3>
+     * <ol>
+     *   <li>The old segment's write lock is held for the whole operation. Copying
+     *       without it drops every write accepted between the end of the copy and the
+     *       registry swap.</li>
+     *   <li>The file swap is a single {@code Files.move(..., REPLACE_EXISTING,
+     *       ATOMIC_MOVE)} performed here, by the one owner. There is no separate delete
+     *       of the original: a failed swap leaves the original intact and removes only
+     *       the scratch file.</li>
+     *   <li>The registry swap happens before the old segment is closed, so in-flight
+     *       reads and writes are never handed a closed segment.</li>
+     * </ol>
      *
      * @param segment The segment to compact
      * @throws IOException if compaction fails
@@ -598,83 +632,48 @@ public class CompactionWorker {
 
         long startTime = System.currentTimeMillis();
         Path oldPath = segment.path();
+        Path compactPath = Path.of(oldPath.toString() + COMPACT_SUFFIX);
+        Path writeLogPath = getWriteLogPath(segment);
 
         LOGGER.log(Level.INFO, "Starting compaction for segment: {0}", oldPath);
 
-        // Record statistics before compaction
-        int oldEntryCount = segment.entryCount();
         int oldTombstoneCount = segment.tombstoneCount();
         long bytesToReclaim = segment.estimatedReclaimableBytes();
 
-        // Create new segment file
-        Path newPath = Path.of(oldPath.toString() + ".compact");
-        Files.deleteIfExists(newPath);
+        Files.deleteIfExists(compactPath);
 
-        // Determine capacity for new segment (same slot count as old)
-        long capacity = (long) segment.slotCount() * 24 * 2 + 1024 * 1024; // Slot table + 1MB data
+        // Same slot count as the old segment, plus a 1MB data region
+        long capacity = (long) segment.slotCount() * 24 * 2 + 1024 * 1024;
 
-        Segment newSegment;
+        int entriesCopied;
+        Segment newSegment = null;
+        java.util.concurrent.locks.Lock writeLock = segment.writeLock();
+        writeLock.lock();
         try {
-            newSegment = new Segment(newPath, capacity, arena);
-        } catch (IOException e) {
-            LOGGER.log(Level.SEVERE, "Failed to create new segment for compaction: " + newPath, e);
-            throw e;
-        }
+            // The threshold the segment being replaced was created with, so a compaction
+            // does not quietly reset the engine's configured load factor to the default.
+            newSegment = new Segment(compactPath, capacity, arena, segment.loadFactorThreshold());
+            entriesCopied = copyLiveEntries(segment, newSegment);
+            newSegment.flush();
 
-        // Copy live entries from old segment to new segment
-        int entriesCopied = 0;
-        try (Segment.EntryIterator iterator = segment.liveEntries()) {
-            while (iterator.hasNext()) {
-                var entry = iterator.next();
+            swapIntoPlace(newSegment, compactPath, oldPath, writeLogPath);
 
-                // Use putWithoutLock since we're writing to a brand new segment
-                // that no other thread has access to
-                newSegment.putWithoutLock(entry.key(), entry.value());
-                entriesCopied++;
-            }
+            // Registry swap happens while the old segment is still open.
+            listener.onCompactionComplete(segment, newSegment);
         } catch (Exception e) {
-            // Clean up failed compaction
-            newSegment.close();
-            Files.deleteIfExists(newPath);
-            throw new IOException("Failed to copy entries during compaction", e);
-        }
-
-        // Flush the new segment to disk
-        newSegment.flush();
-
-        // Create and attach a new write log for the compacted segment
-        // This ensures crash recovery works after compaction
-        Path newWriteLogPath = getWriteLogPathForNewSegment(newSegment);
-        if (newWriteLogPath != null) {
-            try {
-                WriteLog newWriteLog = new WriteLog(newWriteLogPath, arena);
-                newSegment.attachWriteLog(newWriteLog);
-                LOGGER.log(Level.FINE, "Attached write log to compacted segment: {0}", newWriteLogPath);
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to create write log for compacted segment: " + newWriteLogPath, e);
-                // Continue without write log - compaction still succeeds, but crash recovery
-                // for this segment will not be available until next compaction
+            discardCompacted(newSegment, compactPath);
+            if (e instanceof IOException ioe) {
+                throw ioe;
             }
+            throw new IOException("Compaction failed for segment: " + oldPath, e);
+        } finally {
+            writeLock.unlock();
         }
 
-        // Close the old segment
+        // The registry no longer references the old segment, so it can be retired.
+        // Its mapping and descriptor survive the rename that unlinked its file.
         segment.close();
 
-        // Notify listener to perform atomic swap
-        listener.onCompactionComplete(segment, newSegment);
-
-        // Clean up old files
-        try {
-            Files.deleteIfExists(oldPath);
-            Path oldWriteLog = getWriteLogPath(segment);
-            if (oldWriteLog != null) {
-                Files.deleteIfExists(oldWriteLog);
-            }
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to delete old segment files after compaction", e);
-        }
-
-        // Update statistics
         compactionCount.incrementAndGet();
         lastCompactionTime.set(System.currentTimeMillis());
         bytesReclaimed.addAndGet(bytesToReclaim);
@@ -683,6 +682,75 @@ public class CompactionWorker {
         LOGGER.log(Level.INFO, "Compaction complete for {0}: {1} entries ({2} tombstones removed) " +
             "in {3}ms, reclaimed {4} bytes",
             new Object[] { oldPath, entriesCopied, oldTombstoneCount, duration, bytesToReclaim });
+    }
+
+    /**
+     * Copies every live entry from the old segment into the compacted segment.
+     *
+     * @param segment    The segment being compacted (its write lock is held)
+     * @param newSegment The compacted segment, not yet visible to any other thread
+     * @return Number of entries copied
+     */
+    private int copyLiveEntries(Segment segment, Segment newSegment) {
+        int entriesCopied = 0;
+        try (Segment.EntryIterator iterator = segment.liveEntries()) {
+            while (iterator.hasNext()) {
+                var entry = iterator.next();
+                // putWithoutLock is safe: no other thread can reach newSegment yet
+                newSegment.putWithoutLock(entry.key(), entry.value());
+                entriesCopied++;
+            }
+        }
+        return entriesCopied;
+    }
+
+    /**
+     * Installs the compacted segment at the canonical segment name.
+     *
+     * <p>The rename is atomic, so the canonical name always resolves to a complete
+     * segment file. The mapping and descriptor of both segments follow their inodes,
+     * so the old segment keeps serving reads until it is closed.</p>
+     *
+     * <p>The compacted segment starts from an empty write log at the canonical WAL
+     * name: everything the old log contained is already in the compacted file.</p>
+     *
+     * @param newSegment   The compacted segment
+     * @param compactPath  Scratch path the compacted segment was built at
+     * @param canonicalPath The canonical segment path to install it at
+     * @param writeLogPath The canonical write log path, or null if the segment has none
+     * @throws IOException if the swap or the new write log cannot be created
+     */
+    private void swapIntoPlace(Segment newSegment, Path compactPath, Path canonicalPath,
+                               Path writeLogPath) throws IOException {
+        Files.move(compactPath, canonicalPath,
+            StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        newSegment.renamedTo(canonicalPath);
+
+        if (writeLogPath != null) {
+            Files.deleteIfExists(writeLogPath);
+            newSegment.attachWriteLog(new WriteLog(writeLogPath));
+            LOGGER.log(Level.FINE, "Attached write log to compacted segment: {0}", writeLogPath);
+        }
+    }
+
+    /**
+     * Removes a compacted segment that was never installed.
+     *
+     * <p>The original segment file is deliberately left untouched.</p>
+     *
+     * @param newSegment  The compacted segment, or null if it was never created
+     * @param compactPath The scratch path to remove
+     */
+    private void discardCompacted(Segment newSegment, Path compactPath) {
+        if (newSegment != null && !newSegment.isClosed()) {
+            newSegment.close();
+        }
+        try {
+            Files.deleteIfExists(compactPath);
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to remove abandoned compaction scratch file: "
+                + compactPath, e);
+        }
     }
 
     // ==================== Statistics ====================
@@ -801,8 +869,12 @@ public class CompactionWorker {
     /**
      * Callback interface for compaction completion events.
      *
-     * <p>The listener is responsible for atomically swapping the old segment
-     * for the new compacted segment in any segment registry or map.</p>
+     * <p>The listener is responsible only for swapping the old segment for the new one
+     * in any segment registry or map. The <em>file</em> swap is owned by
+     * {@link CompactionWorker} and has already happened: by the time this is called the
+     * compacted segment is installed at the canonical {@code segment_&lt;index&gt;.dat}
+     * path and reports that path from {@link Segment#path()}. Listeners must not rename
+     * or delete segment files themselves.</p>
      */
     @FunctionalInterface
     public interface CompactionListener {
@@ -811,13 +883,14 @@ public class CompactionWorker {
          * Called when compaction is complete and the old segment should be
          * replaced with the new segment.
          *
-         * <p><strong>Important:</strong> The implementation must atomically
-         * update any segment registry to point to the new segment. After
-         * this method returns, the old segment is considered retired and
-         * its file will be deleted.</p>
+         * <p><strong>Important:</strong> The implementation must atomically update any
+         * segment registry to point to the new segment. The old segment is still open
+         * when this is called and is closed only after this method returns, so in-flight
+         * operations are never handed a closed segment.</p>
          *
-         * @param oldSegment The old segment (closed, to be replaced)
-         * @param newSegment The new compacted segment (active, to be used)
+         * @param oldSegment The old segment (still open, to be replaced)
+         * @param newSegment The new compacted segment, already installed at the
+         *                   canonical segment path (active, to be used)
          */
         void onCompactionComplete(Segment oldSegment, Segment newSegment);
     }

@@ -10,7 +10,6 @@ import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 
 import java.io.IOException;
-import java.lang.foreign.Arena;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
@@ -78,7 +77,6 @@ public class TailScanBenchmark {
     public int k;
 
     // Benchmark state
-    private Arena arena;
     private Path tempFile;
     private WriteLog writeLog;
     private TailScanner tailScanner;
@@ -89,8 +87,6 @@ public class TailScanBenchmark {
 
     @Setup(Level.Trial)
     public void setup() throws IOException {
-        // Create shared arena
-        arena = Arena.ofShared();
 
         // Create temp file for write log
         tempFile = Files.createTempFile("tail_scan_bench_", ".log");
@@ -98,7 +94,7 @@ public class TailScanBenchmark {
         // Create write log
         // Each entry: ~50 bytes header + key + vector (4 + dim*4)
         // The WriteLog will automatically grow as needed
-        writeLog = new WriteLog(tempFile, arena);
+        writeLog = new WriteLog(tempFile);
 
         // Create tail scanner
         tailScanner = new TailScanner(tailSize * 2); // No backpressure during benchmark
@@ -150,9 +146,6 @@ public class TailScanBenchmark {
     public void tearDown() throws IOException {
         if (writeLog != null) {
             writeLog.close();
-        }
-        if (arena != null) {
-            arena.close();
         }
         if (tempFile != null) {
             Files.deleteIfExists(tempFile);

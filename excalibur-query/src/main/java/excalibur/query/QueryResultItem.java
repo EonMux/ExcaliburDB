@@ -1,5 +1,7 @@
 package excalibur.query;
 
+import io.excalibur.vector.hnsw.HnswSearchResult;
+
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -17,6 +19,15 @@ import java.util.Objects;
  *   <li><strong>Cosine similarity:</strong> Higher scores are better (closer to 1)</li>
  *   <li><strong>Inner product:</strong> Higher scores are better</li>
  * </ul>
+ *
+ * <h2>Graph Generation</h2>
+ * <p>{@link #nodeId()} is only meaningful within the HNSW graph generation that
+ * produced it, because compaction renumbers nodes. {@link #generation()} records
+ * that generation so a later re-read can pass it to
+ * {@link io.excalibur.vector.hnsw.HnswGraph#readNode(long, long)} and have a stale
+ * ID rejected rather than silently resolving to a different vector. Items that did
+ * not come from a graph - write-log tail-scan hits in particular - carry
+ * {@link HnswSearchResult#GENERATION_UNKNOWN}.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -39,6 +50,7 @@ public final class QueryResultItem {
     private final byte[] payload;
     private final long segmentId;
     private final long nodeId;
+    private final long generation;
 
     /**
      * Creates a new QueryResultItem.
@@ -51,12 +63,7 @@ public final class QueryResultItem {
      * @throws IllegalArgumentException if score is NaN or Infinity
      */
     public QueryResultItem(long documentId, float score, byte[] payload, long segmentId, long nodeId) {
-        this.documentId = documentId;
-        this.documentIdStr = null;
-        this.score = validateScore(score);
-        this.payload = payload != null ? payload.clone() : null;
-        this.segmentId = segmentId;
-        this.nodeId = nodeId;
+        this(documentId, null, score, payload, segmentId, nodeId, HnswSearchResult.GENERATION_UNKNOWN);
     }
 
     /**
@@ -73,12 +80,8 @@ public final class QueryResultItem {
      * @throws IllegalArgumentException if score is NaN or Infinity
      */
     public QueryResultItem(String documentIdStr, float score, byte[] payload, long segmentId, long nodeId) {
-        this.documentId = nodeId; // Use nodeId as fallback for backward compatibility
-        this.documentIdStr = documentIdStr;
-        this.score = validateScore(score);
-        this.payload = payload != null ? payload.clone() : null;
-        this.segmentId = segmentId;
-        this.nodeId = nodeId;
+        // nodeId doubles as the numeric ID for backward compatibility
+        this(nodeId, documentIdStr, score, payload, segmentId, nodeId, HnswSearchResult.GENERATION_UNKNOWN);
     }
 
     /**
@@ -93,12 +96,32 @@ public final class QueryResultItem {
      * @throws IllegalArgumentException if score is NaN or Infinity
      */
     public QueryResultItem(long documentId, String documentIdStr, float score, byte[] payload, long segmentId, long nodeId) {
+        this(documentId, documentIdStr, score, payload, segmentId, nodeId, HnswSearchResult.GENERATION_UNKNOWN);
+    }
+
+    /**
+     * Creates a new QueryResultItem bound to the graph generation its node ID belongs to.
+     *
+     * @param documentId The numeric document identifier (for backward compatibility)
+     * @param documentIdStr The string document identifier (actual document ID)
+     * @param score The similarity score or distance (must be finite)
+     * @param payload Optional payload data (may be null)
+     * @param segmentId The segment that produced this result
+     * @param nodeId The node ID within the segment's HNSW graph
+     * @param generation The graph generation {@code nodeId} belongs to, or
+     *                   {@link HnswSearchResult#GENERATION_UNKNOWN} when the item did
+     *                   not come from a graph
+     * @throws IllegalArgumentException if score is NaN or Infinity
+     */
+    public QueryResultItem(long documentId, String documentIdStr, float score, byte[] payload,
+                           long segmentId, long nodeId, long generation) {
         this.documentId = documentId;
         this.documentIdStr = documentIdStr;
         this.score = validateScore(score);
         this.payload = payload != null ? payload.clone() : null;
         this.segmentId = segmentId;
         this.nodeId = nodeId;
+        this.generation = generation;
     }
 
     /**
@@ -192,6 +215,20 @@ public final class QueryResultItem {
     }
 
     /**
+     * Returns the HNSW graph generation this item's {@link #nodeId()} belongs to.
+     *
+     * <p>Pass this to {@link io.excalibur.vector.hnsw.HnswGraph#readNode(long, long)}
+     * when re-reading the node so a node ID invalidated by a concurrent compaction is
+     * rejected instead of resolving to a different vector.</p>
+     *
+     * @return The graph generation, or {@link HnswSearchResult#GENERATION_UNKNOWN}
+     *         if this item did not come from a graph
+     */
+    public long generation() {
+        return generation;
+    }
+
+    /**
      * Creates a new QueryResultItem with a different score.
      *
      * @param newScore The new score value (must be finite)
@@ -199,7 +236,8 @@ public final class QueryResultItem {
      * @throws IllegalArgumentException if newScore is NaN or Infinity
      */
     public QueryResultItem withScore(float newScore) {
-        return new QueryResultItem(documentId, documentIdStr, validateScore(newScore), payload, segmentId, nodeId);
+        return new QueryResultItem(documentId, documentIdStr, validateScore(newScore), payload,
+            segmentId, nodeId, generation);
     }
 
     /**
@@ -228,7 +266,7 @@ public final class QueryResultItem {
      * @return A new QueryResultItem with the payload
      */
     public QueryResultItem withPayload(byte[] newPayload) {
-        return new QueryResultItem(documentId, documentIdStr, score, newPayload, segmentId, nodeId);
+        return new QueryResultItem(documentId, documentIdStr, score, newPayload, segmentId, nodeId, generation);
     }
 
     /**
@@ -238,7 +276,17 @@ public final class QueryResultItem {
      * @return A new QueryResultItem with the string document ID
      */
     public QueryResultItem withDocumentIdStr(String newDocumentIdStr) {
-        return new QueryResultItem(documentId, newDocumentIdStr, score, payload, segmentId, nodeId);
+        return new QueryResultItem(documentId, newDocumentIdStr, score, payload, segmentId, nodeId, generation);
+    }
+
+    /**
+     * Creates a new QueryResultItem bound to the given graph generation.
+     *
+     * @param newGeneration The graph generation this item's node ID belongs to
+     * @return A new QueryResultItem with the updated generation
+     */
+    public QueryResultItem withGeneration(long newGeneration) {
+        return new QueryResultItem(documentId, documentIdStr, score, payload, segmentId, nodeId, newGeneration);
     }
 
     @Override
@@ -250,6 +298,7 @@ public final class QueryResultItem {
             Float.compare(that.score, score) == 0 &&
             segmentId == that.segmentId &&
             nodeId == that.nodeId &&
+            generation == that.generation &&
             Objects.equals(documentIdStr, that.documentIdStr) &&
             Arrays.equals(payload, that.payload);
     }
@@ -262,6 +311,7 @@ public final class QueryResultItem {
         result = 31 * result + Arrays.hashCode(payload);
         result = 31 * result + Long.hashCode(segmentId);
         result = 31 * result + Long.hashCode(nodeId);
+        result = 31 * result + Long.hashCode(generation);
         return result;
     }
 

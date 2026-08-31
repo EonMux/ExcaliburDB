@@ -1,9 +1,6 @@
 package io.excalibur.metrics;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.SortedMap;
-import java.util.TreeMap;
+import java.util.Arrays;
 
 /**
  * Fixed-bucket histogram for collecting latency measurements.
@@ -30,13 +27,13 @@ public final class FixedBucketHistogram {
     private static final FixedBucketHistogram histogram = new FixedBucketHistogram();
     
     private long[] buckets;
-    private int totalEntries;
+    private long totalEntries;
     private volatile long currentEpoch;
-    
+
     // FP rate metrics - per-epoch statistics
     private static final int NUM_FP_RATES = 10000;
     private long[] fpRateBuckets;
-    private int fpRateEntries;
+    private long fpRateEntries;
     private volatile long fpRateEpoch;
     
     /**
@@ -78,18 +75,31 @@ public final class FixedBucketHistogram {
     }
     
     /**
-     * Records an FP rate measurement for the current epoch.
+     * Records an FP rate measurement, stamping it with the epoch this histogram
+     * was last told about via {@link #setEpoch(long)} or {@link #recordFpRate(double, long)}.
      *
      * @param fpRate False positive rate as a value between 0.0 and 1.0
      */
     public void recordFpRate(double fpRate) {
+        recordFpRate(fpRate, this.currentEpoch);
+    }
+
+    /**
+     * Records an FP rate measurement and stamps it with the supplied epoch,
+     * which also becomes this histogram's current epoch.
+     *
+     * @param fpRate False positive rate as a value between 0.0 and 1.0
+     * @param epoch Visibility epoch the measurement was taken in
+     */
+    public void recordFpRate(double fpRate, long epoch) {
         double normalizedRate = Math.max(0.0, Math.min(1.0, fpRate));
         // Clamp index to prevent ArrayIndexOutOfBoundsException when normalizedRate == 1.0
         int bucketIndex = Math.min((int) (normalizedRate * NUM_FP_RATES), NUM_FP_RATES - 1);
         synchronized (this) {
             fpRateBuckets[bucketIndex]++;
             fpRateEntries++;
-            this.fpRateEpoch = currentEpoch;
+            this.currentEpoch = epoch;
+            this.fpRateEpoch = epoch;
         }
     }
     
@@ -102,15 +112,6 @@ public final class FixedBucketHistogram {
         synchronized (this) {
             this.currentEpoch = epoch;
         }
-    }
-    
-    /**
-     * Gets the time until next epoch tick.
-     *
-     * @return Time in ms until next epoch
-     */
-    public long timeUntilEpochTick() {
-        return System.currentTimeMillis() % 100;  // Default epoch tick is 100ms
     }
     
     /**
@@ -195,16 +196,23 @@ public final class FixedBucketHistogram {
     }
 
     /**
-     * Gets the FP rate epoch (instance method).
+     * Gets the epoch the most recent FP rate measurement was stamped with (instance method).
      */
-    public double getFpRateEpoch() {
+    public long getFpRateEpoch() {
         return fpRateEpoch;
+    }
+
+    /**
+     * Gets the epoch this histogram was last told about (instance method).
+     */
+    public long getCurrentEpoch() {
+        return currentEpoch;
     }
 
     /**
      * Gets the FP rate count (instance method).
      */
-    public int getFpRateCount() {
+    public long getFpRateCount() {
         synchronized (this) {
             return fpRateEntries;
         }
@@ -277,6 +285,18 @@ public final class FixedBucketHistogram {
      */
     public static FixedBucketHistogram getInstance() {
         return histogram;
+    }
+
+    /**
+     * Discards all recorded measurements and FP rate samples.
+     */
+    public void reset() {
+        synchronized (this) {
+            Arrays.fill(buckets, 0L);
+            Arrays.fill(fpRateBuckets, 0L);
+            totalEntries = 0;
+            fpRateEntries = 0;
+        }
     }
 
     /**

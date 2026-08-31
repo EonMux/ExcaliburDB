@@ -14,12 +14,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import excalibur.api.security.ApiSecurityConfig;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -39,8 +41,15 @@ import static org.mockito.Mockito.*;
  */
 class ReindexIntegrationTest {
 
-    private static final Path TEST_DOCS_DIR = Path.of("/tmp/test-docs");
+    /**
+     * Per-test crawl root. A fixed shared directory under /tmp is visible to every
+     * concurrently running fork, and deleting it in @AfterEach pulls it out from under
+     * a sibling that is still using it.
+     */
+    @TempDir
+    Path testDocsDir;
 
+    private ApiSecurityConfig security;
     private IndexOrchestrator indexOrchestrator;
     private StorageEngine storageEngine;
     private QueryPipeline queryPipeline;
@@ -50,8 +59,11 @@ class ReindexIntegrationTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        // Create test directory for filesystem source validation
-        Files.createDirectories(TEST_DOCS_DIR);
+        // Filesystem ingest is allow-list driven: an empty allow-list disables it, so
+        // the test grants exactly the temporary root it crawls.
+        security = ApiSecurityConfig.builder()
+            .allowIngestRoot(testDocsDir)
+            .build();
 
         segmentCatalog = new SegmentCatalog();
 
@@ -73,18 +85,15 @@ class ReindexIntegrationTest {
         when(indexOrchestrator.getTotalCuckooDeletions()).thenReturn(0L);
 
         server = new excalibur.api.server.ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+        server.withSecurity(security);
         server.start();
         serverPort = server.getPort();
     }
 
     @AfterEach
-    void tearDown() throws IOException {
+    void tearDown() {
         if (server != null) {
             server.stop(1);
-        }
-        // Clean up test directory
-        if (Files.exists(TEST_DOCS_DIR)) {
-            Files.deleteIfExists(TEST_DOCS_DIR);
         }
     }
 
@@ -105,44 +114,42 @@ class ReindexIntegrationTest {
             HttpURLConnection ingestConn = connect("POST", "/v1/ingest",
                 "{\"source_type\": \"filesystem\", \"config\": {" +
                 "\"source_id\": \"test-source\"," +
-                "\"root_path\": \"/tmp/test-docs\"" +
+                "\"root_path\": \"" + testDocsDir + "\"" +
                 "}}");
             assertThat(ingestConn.getResponseCode()).isEqualTo(200);
             String ingestResponse = readResponse(ingestConn);
             assertThat(ingestResponse).contains("\"status\": \"registered\"");
             ingestConn.disconnect();
 
-            // Now try to reindex the same source - should get 202 (accepted, even in stub mode)
+            // The source is now visible to /v1/reindex: the answer is no longer 404.
+            // Without a DocumentReindexer the request is refused with 503 rather than
+            // accepted with 202 - reporting success while nothing runs would leave the
+            // source marked "reindexing" for the lifetime of the process and block
+            // every later request for it.
             HttpURLConnection reindexConn2 = connect("POST", "/v1/reindex",
                 "{\"source_id\": \"test-source\"}");
-            assertThat(reindexConn2.getResponseCode()).isEqualTo(202);
-            String reindexResponse = readResponse(reindexConn2);
-            assertThat(reindexResponse).contains("\"status\": \"reindexing\"");
+            assertThat(reindexConn2.getResponseCode()).isEqualTo(503);
             reindexConn2.disconnect();
         }
 
         @Test
-        @DisplayName("reindex endpoint returns correct status for existing source")
-        void reindexReturnsCorrectStatusForExistingSource() throws Exception {
+        @DisplayName("reindex without a configured reindexer is refused, not silently accepted")
+        void reindexWithoutReindexerIsRefused() throws Exception {
             // Register a source
             HttpURLConnection ingestConn = connect("POST", "/v1/ingest",
                 "{\"source_type\": \"filesystem\", \"config\": {" +
                 "\"source_id\": \"status-test-source\"," +
-                "\"root_path\": \"/tmp/test-docs\"" +
+                "\"root_path\": \"" + testDocsDir + "\"" +
                 "}}");
             assertThat(ingestConn.getResponseCode()).isEqualTo(200);
             ingestConn.disconnect();
 
-            // Reindex should return 202 Accepted
+            // No DocumentReindexer is wired, so the endpoint reports that reindexing
+            // is unavailable instead of accepting work it will never do.
             HttpURLConnection reindexConn = connect("POST", "/v1/reindex",
                 "{\"source_id\": \"status-test-source\"}");
-            assertThat(reindexConn.getResponseCode()).isEqualTo(202);
+            assertThat(reindexConn.getResponseCode()).isEqualTo(503);
             assertThat(reindexConn.getContentType()).contains("application/json");
-
-            String response = readResponse(reindexConn);
-            assertThat(response).contains("\"source_id\": \"status-test-source\"");
-            assertThat(response).contains("\"status\": \"reindexing\"");
-            assertThat(response).contains("\"message\": \"Reindex started in background\"");
             reindexConn.disconnect();
         }
     }
@@ -187,6 +194,7 @@ class ReindexIntegrationTest {
 
             excalibur.api.server.ExcaliburDBServer serverWithReindexer =
                 new excalibur.api.server.ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+            serverWithReindexer.withSecurity(security);
             serverWithReindexer.withReindexer(mockReindexer, mockResolver);
             serverWithReindexer.start();
             int portWithReindexer = serverWithReindexer.getPort();
@@ -196,7 +204,7 @@ class ReindexIntegrationTest {
                 HttpURLConnection ingestConn = connectTo(portWithReindexer, "POST", "/v1/ingest",
                     "{\"source_type\": \"filesystem\", \"config\": {" +
                     "\"source_id\": \"reindex-exec-test\"," +
-                    "\"root_path\": \"/tmp/test-docs\"" +
+                    "\"root_path\": \"" + testDocsDir + "\"" +
                     "}}");
                 assertThat(ingestConn.getResponseCode()).isEqualTo(200);
                 ingestConn.disconnect();

@@ -351,7 +351,7 @@ class LatencyPercentileValidatorTest {
         }
 
         @Test
-        @DisplayName("Should pass when no percentile metrics present")
+        @DisplayName("Should report NOT APPLICABLE, not valid, when no percentile metrics present")
         void testNoPercentileMetrics() {
             BenchmarkResult result = BenchmarkResult.builder()
                 .benchmarkName("test.benchmark")
@@ -363,8 +363,31 @@ class LatencyPercentileValidatorTest {
             LatencyPercentileValidator.ValidationResult validation =
                 LatencyPercentileValidator.validate(result);
 
+            // A benchmark with no captured percentiles has not had its latency
+            // validated. Returning valid=true made "latency percentile validation"
+            // pass unconditionally on every result the capture pipeline produced.
+            assertThat(validation.applicable()).isFalse();
+            assertThat(validation.valid()).isFalse();
+            assertThat(validation.errors()).contains("No p50/p99 metrics present");
+        }
+
+        @Test
+        @DisplayName("A benchmark WITH percentiles is applicable and validated")
+        void testPercentilesPresentAreApplicable() {
+            BenchmarkResult result = BenchmarkResult.builder()
+                .benchmarkName("test.benchmark")
+                .mode("sample")
+                .primaryScore(100.0)
+                .primaryScoreUnit("ms")
+                .addMetric(BenchmarkMetric.latencyPercentile(50, 5.0, 0.5))
+                .addMetric(BenchmarkMetric.latencyPercentile(99, 25.0, 2.0))
+                .build();
+
+            LatencyPercentileValidator.ValidationResult validation =
+                LatencyPercentileValidator.validate(result);
+
+            assertThat(validation.applicable()).isTrue();
             assertThat(validation.valid()).isTrue();
-            assertThat(validation.warnings()).contains("No p50/p99 metrics present");
         }
     }
 

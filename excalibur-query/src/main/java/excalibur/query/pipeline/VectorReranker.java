@@ -24,11 +24,21 @@ import java.util.Objects;
  *
  * <h2>Reranking Process</h2>
  * <ol>
- *   <li>Take candidates with nodeId and approximate distance from Stage 3</li>
+ *   <li>Take candidates with nodeId and a normalized score from Stage 3</li>
  *   <li>Fetch the full-precision vector from the HNSW graph for each nodeId</li>
- *   <li>Compute exact distance using the distance function</li>
- *   <li>Re-sort by exact distance and return top-k</li>
+ *   <li>Compute the exact dissimilarity using the distance function</li>
+ *   <li>Re-sort by the resulting normalized score and return top-k</li>
  * </ol>
+ *
+ * <h2>Score Scale</h2>
+ * <p>Candidates arrive already normalized to [0.0, 1.0] (higher is better) by
+ * {@link excalibur.query.executor.ResultAggregator#mergeAndRankWithNormalization}.
+ * Reranking replaces that score with one computed the same way from the exact
+ * distance, so the output stays on a single scale. Candidates this reranker cannot
+ * re-measure - write-log tail-scan hits, whose vectors are not in the graph - keep
+ * the score they arrived with. Normalizing them a second time would map an already
+ * normalized [0,1] score into [0.5,1.0] under cosine and float every tail hit above
+ * genuine graph matches.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -72,8 +82,9 @@ public class VectorReranker {
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>Results are sorted by exact distance (closest first)</li>
+     *   <li>Results are sorted by normalized score descending (closest first)</li>
      *   <li>Distances are validated and clamped to valid ranges</li>
+     *   <li>Every result carries a [0.0, 1.0] score normalized exactly once</li>
      *   <li>Exactly topK results are returned (or fewer if insufficient valid candidates)</li>
      * </ul>
      *
@@ -110,23 +121,23 @@ public class VectorReranker {
         for (QueryResultItem candidate : candidates) {
             long nodeId = candidate.nodeId();
 
-            // Handle tail scan results - normalize their scores to [0.0, 1.0] range
-            // (Tail scan computes exact distances on full-precision vectors from write log)
+            // Tail scan results have no node in the graph, so there is nothing to
+            // re-measure. Their score was already normalized by the aggregator on the
+            // same scale as every other candidate, so it passes through untouched.
             if (TailScanner.isTailScanResult(nodeId)) {
-                // Normalize the raw distance to [0.0, 1.0] score for consistency with HNSW results
-                // This ensures all results use the same scoring semantics
-                float normalizedScore = DistanceValidator.validateClampAndNormalize(
-                    candidate.score(), distanceFunction);
-                reranked.add(candidate.withScore(normalizedScore));
+                reranked.add(candidate);
                 continue;
             }
 
             try {
-                // Fetch the full-precision vector from the HNSW graph
-                NodeView nodeView = graph.readNode(nodeId);
+                // Fetch the full-precision vector from the HNSW graph. The generation
+                // check rejects a node ID invalidated by a concurrent compaction rather
+                // than letting it resolve to whatever vector now holds that ID.
+                NodeView nodeView = graph.readNode(nodeId, candidate.generation());
 
                 if (nodeView == null) {
-                    LOGGER.trace("Node {} not found in graph, skipping", nodeId);
+                    LOGGER.trace("Node {} not found in graph (generation {}), skipping",
+                        nodeId, candidate.generation());
                     continue;
                 }
 
@@ -151,13 +162,24 @@ public class VectorReranker {
                     continue;
                 }
 
-                // Compute exact distance
-                float exactDistance = distanceFunction.compute(queryVector, storedVector);
+                // Compute the exact dissimilarity (smaller is closer for every metric)
+                float exactDistance = distanceFunction.distance(queryVector, storedVector);
+
+                if (!Float.isFinite(exactDistance)) {
+                    LOGGER.trace("Node {} produced non-finite distance {}, skipping",
+                        nodeId, exactDistance);
+                    continue;
+                }
 
                 // Validate, clamp, and normalize to [0.0, 1.0] score range
                 // This ensures all scores are in the valid [0.0, 1.0] range for ranking
-                float normalizedScore = DistanceValidator.validateClampAndNormalize(
+                float normalizedScore = DistanceValidator.validateClampAndNormalizeOrderedDistance(
                     exactDistance, distanceFunction);
+
+                if (Float.isNaN(normalizedScore)) {
+                    LOGGER.trace("Node {} produced NaN score, skipping", nodeId);
+                    continue;
+                }
 
                 // Create new result with normalized score
                 reranked.add(candidate.withScore(normalizedScore));

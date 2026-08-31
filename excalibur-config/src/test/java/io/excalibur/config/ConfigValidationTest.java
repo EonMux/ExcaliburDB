@@ -26,7 +26,6 @@ class ConfigValidationTest {
         // Set all required properties with valid defaults
         baseProps.put("excalibur.visibility.epoch-tick-ms", "100");
         baseProps.put("excalibur.visibility.query-timeout-ms", "30000");
-        baseProps.put("excalibur.ingest.hnsw-queue-depth-limit", "100000");
         baseProps.put("excalibur.ingest.document-atomicity-timeout-ms", "2000");
         baseProps.put("excalibur.health.readiness-threshold", "0.5");
         baseProps.put("excalibur.health.healthy-threshold", "0.9");
@@ -124,27 +123,7 @@ class ConfigValidationTest {
     @DisplayName("Ingest validation")
     class IngestValidation {
 
-        @Test
-        @DisplayName("rejects hnsw-queue-depth-limit below minimum")
-        void rejectsHnswQueueDepthBelowMinimum() {
-            baseProps.put("excalibur.ingest.hnsw-queue-depth-limit", "9999");
-            Config config = new Config(baseProps);
 
-            assertThatThrownBy(() -> ConfigValidation.validate(config))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("ingest.hnsw-queue-depth-limit must be >= 10000");
-        }
-
-        @Test
-        @DisplayName("rejects hnsw-queue-depth-limit above maximum")
-        void rejectsHnswQueueDepthAboveMaximum() {
-            baseProps.put("excalibur.ingest.hnsw-queue-depth-limit", "1000001");
-            Config config = new Config(baseProps);
-
-            assertThatThrownBy(() -> ConfigValidation.validate(config))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("ingest.hnsw-queue-depth-limit must be <= 1000000");
-        }
 
         @Test
         @DisplayName("rejects document-timeout-ms below minimum")
@@ -166,6 +145,42 @@ class ConfigValidationTest {
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("ingest.document-atomicity-timeout-ms must be <= 30000");
+        }
+
+        @Test
+        @DisplayName("rejects reindex-interval-ms below the scheduler minimum")
+        void rejectsReindexIntervalBelowMinimum() {
+            baseProps.put("excalibur.ingest.reindex-interval-ms", "30000");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("ingest.reindex-interval-ms must be >= 60000");
+        }
+
+        @Test
+        @DisplayName("rejects reindex-interval-ms above the scheduler maximum")
+        void rejectsReindexIntervalAboveMaximum() {
+            baseProps.put("excalibur.ingest.reindex-interval-ms", "604800000");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("ingest.reindex-interval-ms must be <= 86400000");
+        }
+
+        @Test
+        @DisplayName("accepts reindex-interval-ms at boundaries")
+        void acceptsReindexIntervalAtBoundaries() {
+            baseProps.put("excalibur.ingest.reindex-interval-ms", "60000");
+            Config atMinimum = new Config(baseProps);
+            assertThatCode(() -> ConfigValidation.validate(atMinimum))
+                .doesNotThrowAnyException();
+
+            baseProps.put("excalibur.ingest.reindex-interval-ms", "86400000");
+            Config atMaximum = new Config(baseProps);
+            assertThatCode(() -> ConfigValidation.validate(atMaximum))
+                .doesNotThrowAnyException();
         }
     }
 
@@ -432,6 +447,178 @@ class ConfigValidationTest {
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("llm.retry-base-delay-ms must be <= 30000");
+        }
+
+        @Test
+        @DisplayName("rejects relevancy-threshold above 1.0")
+        void rejectsRelevancyThresholdAboveOne() {
+            baseProps.put("excalibur.llm.relevancy-threshold", "30");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.relevancy-threshold must be <= 1.0");
+        }
+
+        @Test
+        @DisplayName("rejects relevancy-threshold below 0.0")
+        void rejectsRelevancyThresholdBelowZero() {
+            baseProps.put("excalibur.llm.relevancy-threshold", "-0.1");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.relevancy-threshold must be >= 0.0");
+        }
+
+        @Test
+        @DisplayName("rejects max-retries above the client maximum")
+        void rejectsMaxRetriesAboveMaximum() {
+            baseProps.put("excalibur.llm.max-retries", "20");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.max-retries must be <= 10");
+        }
+
+        @Test
+        @DisplayName("rejects failure-threshold below the client minimum")
+        void rejectsFailureThresholdBelowMinimum() {
+            baseProps.put("excalibur.llm.failure-threshold", "0");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.failure-threshold must be >= 1");
+        }
+
+        @Test
+        @DisplayName("rejects cooldown-period-ms below minimum")
+        void rejectsCooldownPeriodBelowMinimum() {
+            baseProps.put("excalibur.llm.cooldown-period-ms", "0");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.cooldown-period-ms must be >= 1000");
+        }
+
+        @Test
+        @DisplayName("rejects max-prompts-per-query above maximum")
+        void rejectsMaxPromptsPerQueryAboveMaximum() {
+            baseProps.put("excalibur.llm.max-prompts-per-query", "101");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.max-prompts-per-query must be <= 100");
+        }
+
+        @Test
+        @DisplayName("rejects max-batch-tokens below minimum")
+        void rejectsMaxBatchTokensBelowMinimum() {
+            baseProps.put("excalibur.llm.max-batch-tokens", "0");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.max-batch-tokens must be >= 100");
+        }
+
+        @Test
+        @DisplayName("rejects timeout-ms below minimum")
+        void rejectsTimeoutBelowMinimum() {
+            baseProps.put("excalibur.llm.timeout-ms", "0");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.timeout-ms must be >= 1000");
+        }
+
+        @Test
+        @DisplayName("rejects base-url with no authority")
+        void rejectsBaseUrlWithoutAuthority() {
+            baseProps.put("excalibur.llm.base-url", "http://");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.base-url must be a valid URL");
+        }
+
+        @Test
+        @DisplayName("rejects base-url with embedded userinfo credentials")
+        void rejectsBaseUrlWithUserInfo() {
+            baseProps.put("excalibur.llm.base-url", "https://user:secret@api.example.com/v1");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.base-url must be a valid URL");
+        }
+    }
+
+    @Nested
+    @DisplayName("LLM credential transport validation")
+    class LlmCredentialTransportValidation {
+
+        @Test
+        @DisplayName("rejects an api-key sent over cleartext http to a remote host")
+        void rejectsApiKeyOverCleartextHttp() {
+            baseProps.put("excalibur.llm.base-url", "http://llm-gateway.internal/v1");
+            baseProps.put("excalibur.llm.api-key", "test-key");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("llm.api-key would be sent in cleartext")
+                .hasMessageContaining("llm-gateway.internal");
+        }
+
+        @Test
+        @DisplayName("does not leak the api-key into the failure message")
+        void failureMessageOmitsApiKey() {
+            baseProps.put("excalibur.llm.base-url", "http://llm-gateway.internal/v1");
+            baseProps.put("excalibur.llm.api-key", "sk-do-not-log-me");
+            Config config = new Config(baseProps);
+
+            assertThatThrownBy(() -> ConfigValidation.validate(config))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageNotContaining("sk-do-not-log-me");
+        }
+
+        @Test
+        @DisplayName("accepts an api-key over https")
+        void acceptsApiKeyOverHttps() {
+            baseProps.put("excalibur.llm.base-url", "https://api.example.com/v1");
+            baseProps.put("excalibur.llm.api-key", "test-key");
+            Config config = new Config(baseProps);
+
+            assertThatCode(() -> ConfigValidation.validate(config))
+                .doesNotThrowAnyException();
+        }
+
+        @Test
+        @DisplayName("accepts an api-key over http to a loopback host")
+        void acceptsApiKeyOverLoopbackHttp() {
+            baseProps.put("excalibur.llm.base-url", "http://127.0.0.1:11434/v1");
+            baseProps.put("excalibur.llm.api-key", "test-key");
+            Config config = new Config(baseProps);
+
+            assertThatCode(() -> ConfigValidation.validate(config))
+                .doesNotThrowAnyException();
+        }
+
+        @Test
+        @DisplayName("accepts a credential-free http endpoint on a remote host")
+        void acceptsCleartextHttpWithoutApiKey() {
+            baseProps.put("excalibur.llm.base-url", "http://ollama:11434/v1");
+            Config config = new Config(baseProps);
+
+            assertThatCode(() -> ConfigValidation.validate(config))
+                .doesNotThrowAnyException();
         }
     }
 

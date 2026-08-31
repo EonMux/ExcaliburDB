@@ -35,6 +35,7 @@ public final class BenchmarkResultSet {
     private final int passCount;
     private final int failCount;
     private final int skipCount;
+    private final int unevaluatedCount;
     private final boolean allPassed;
 
     private BenchmarkResultSet(Builder builder) {
@@ -46,25 +47,30 @@ public final class BenchmarkResultSet {
         this.results = Collections.unmodifiableList(new ArrayList<>(builder.results));
         this.resultsByCategory = categorizeResults(builder.results);
 
-        // Compute pass/fail counts
+        // Compute pass/fail counts. A target that could not be compared against a
+        // measurement is counted separately and never as a pass: it means the report
+        // has no evidence either way.
         int passes = 0;
         int fails = 0;
         int skips = 0;
+        int unevaluated = 0;
         for (BenchmarkResult result : results) {
-            if (result.hasTarget()) {
-                if (result.meetsTarget()) {
-                    passes++;
-                } else {
-                    fails++;
-                }
-            } else {
+            if (!result.hasTarget()) {
                 skips++;
+            } else if (result.hasUnevaluatedTarget()) {
+                unevaluated++;
+            } else if (result.meetsTarget()) {
+                passes++;
+            } else {
+                fails++;
             }
         }
         this.passCount = passes;
         this.failCount = fails;
         this.skipCount = skips;
-        this.allPassed = fails == 0;
+        this.unevaluatedCount = unevaluated;
+        // An empty run proves nothing, so it is a failure rather than a vacuous pass.
+        this.allPassed = !results.isEmpty() && fails == 0 && unevaluated == 0;
     }
 
     private Map<String, List<BenchmarkResult>> categorizeResults(List<BenchmarkResult> results) {
@@ -188,18 +194,36 @@ public final class BenchmarkResultSet {
     }
 
     /**
-     * Checks if all benchmarks with targets passed.
+     * Gets the count of benchmarks whose target could not be compared against a
+     * measurement (metric absent, or incompatible units).
+     *
+     * @return the number of results carrying an unevaluated target
+     */
+    public int unevaluatedCount() {
+        return unevaluatedCount;
+    }
+
+    /**
+     * Checks if the run produced at least one result and every target was compared
+     * and met.
+     *
+     * <p>An empty result set returns false: a run that measured nothing cannot have
+     * demonstrated that any target was met.</p>
+     *
+     * @return true if the run is a genuine pass
      */
     public boolean allPassed() {
         return allPassed;
     }
 
     /**
-     * Gets the pass rate as a percentage.
+     * Gets the pass rate as a percentage of targets that were compared and met.
+     *
+     * @return the pass rate, or 0.0 when nothing was evaluated
      */
     public double passRate() {
-        int total = passCount + failCount;
-        if (total == 0) return 100.0;
+        int total = passCount + failCount + unevaluatedCount;
+        if (total == 0) return 0.0;
         return (passCount * 100.0) / total;
     }
 
@@ -208,7 +232,18 @@ public final class BenchmarkResultSet {
      */
     public List<BenchmarkResult> getFailedResults() {
         return results.stream()
-            .filter(r -> r.hasTarget() && !r.meetsTarget())
+            .filter(r -> r.hasTarget() && !r.hasUnevaluatedTarget() && !r.meetsTarget())
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * Gets results carrying a target that could not be evaluated.
+     *
+     * @return the results whose targets were not compared against a measurement
+     */
+    public List<BenchmarkResult> getUnevaluatedResults() {
+        return results.stream()
+            .filter(BenchmarkResult::hasUnevaluatedTarget)
             .collect(Collectors.toList());
     }
 
@@ -241,8 +276,9 @@ public final class BenchmarkResultSet {
         sb.append(String.format("  Total Benchmarks: %d\n", results.size()));
         sb.append(String.format("  Passed: %d (%.1f%%)\n", passCount, passRate()));
         sb.append(String.format("  Failed: %d\n", failCount));
+        sb.append(String.format("  Not Evaluated: %d\n", unevaluatedCount));
         sb.append(String.format("  No Target: %d\n", skipCount));
-        sb.append(String.format("  Status: %s\n\n", allPassed ? "✓ ALL PASSED" : "✗ SOME FAILED"));
+        sb.append(String.format("  Status: %s\n\n", statusLabel()));
 
         // Results by category
         if (!resultsByCategory.isEmpty()) {
@@ -272,14 +308,39 @@ public final class BenchmarkResultSet {
 
             for (BenchmarkResult result : failed) {
                 sb.append("\n  ").append(result.methodName()).append(":\n");
-                sb.append(String.format("    Actual: %.2f %s\n", result.primaryScore(), result.primaryScoreUnit()));
-                sb.append(String.format("    Target: %.2f %s\n", result.targetValue(), result.primaryScoreUnit()));
-                double gap = result.higherIsBetter() ?
-                    result.targetValue() - result.primaryScore() :
-                    result.primaryScore() - result.targetValue();
-                sb.append(String.format("    Gap:    %.2f %s (%.1f%%)\n",
-                    gap, result.primaryScoreUnit(),
-                    (gap / result.targetValue()) * 100));
+                for (BenchmarkResult.TargetEvaluation evaluation : result.targetEvaluations()) {
+                    if (evaluation.status() != BenchmarkResult.TargetStatus.MISSED) {
+                        continue;
+                    }
+                    // Report the comparison in the TARGET's unit: the raw score may be in
+                    // a different one (ops/s scaled to bytes/sec, ns/op shown as ms).
+                    double target = evaluation.target().targetValue();
+                    double measured = evaluation.comparedValue();
+                    String unit = evaluation.target().unit();
+                    double gap = evaluation.target().higherIsBetter()
+                        ? target - measured
+                        : measured - target;
+                    sb.append(String.format("    Metric: %s\n", evaluation.target().metric()));
+                    sb.append(String.format("    Actual: %.2f %s\n", measured, unit));
+                    sb.append(String.format("    Target: %.2f %s\n", target, unit));
+                    sb.append(String.format("    Gap:    %.2f %s (%.1f%%)\n",
+                        gap, unit, target == 0.0 ? 0.0 : (gap / target) * 100));
+                }
+            }
+        }
+
+        List<BenchmarkResult> unevaluatedResults = getUnevaluatedResults();
+        if (!unevaluatedResults.isEmpty()) {
+            sb.append("\n──────────────────────────────────────────────────────────────────────────\n");
+            sb.append("TARGETS NOT EVALUATED (no measurement to compare against)\n");
+            sb.append("──────────────────────────────────────────────────────────────────────────\n");
+            for (BenchmarkResult result : unevaluatedResults) {
+                sb.append("\n  ").append(result.methodName()).append(":\n");
+                for (BenchmarkResult.TargetEvaluation evaluation : result.targetEvaluations()) {
+                    if (evaluation.status() == BenchmarkResult.TargetStatus.NOT_EVALUABLE) {
+                        sb.append("    ").append(evaluation.format()).append("\n");
+                    }
+                }
             }
         }
 
@@ -290,6 +351,19 @@ public final class BenchmarkResultSet {
     /**
      * Converts the result set to JSON format.
      */
+    private String statusLabel() {
+        if (results.isEmpty()) {
+            return "✗ NO RESULTS CAPTURED";
+        }
+        if (allPassed) {
+            return "✓ ALL PASSED";
+        }
+        if (failCount == 0) {
+            return "✗ TARGETS NOT EVALUATED";
+        }
+        return "✗ SOME FAILED";
+    }
+
     public String toJson() {
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
@@ -305,6 +379,7 @@ public final class BenchmarkResultSet {
         sb.append("    \"total\": ").append(results.size()).append(",\n");
         sb.append("    \"passed\": ").append(passCount).append(",\n");
         sb.append("    \"failed\": ").append(failCount).append(",\n");
+        sb.append("    \"unevaluated\": ").append(unevaluatedCount).append(",\n");
         sb.append("    \"skipped\": ").append(skipCount).append(",\n");
         sb.append("    \"passRate\": ").append(String.format("%.2f", passRate())).append(",\n");
         sb.append("    \"allPassed\": ").append(allPassed).append("\n");

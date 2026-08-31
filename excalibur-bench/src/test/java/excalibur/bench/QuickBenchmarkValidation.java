@@ -12,11 +12,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
 
+import excalibur.bench.metric.FPRateValidator;
+import excalibur.bench.metric.ThroughputValidator;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Quick validation tests for benchmark targets.
- * Runs fast micro-benchmarks to validate against spec requirements.
+ *
+ * <p>Runs fast micro-benchmarks and asserts the measured values against the targets in
+ * {@link excalibur.bench.metric.BenchmarkTargetRegistry}. Tagged {@code benchmark} and
+ * therefore excluded from ordinary builds; run with
+ * {@code ./gradlew :excalibur-bench:benchmarkTest}.</p>
  */
 @Tag("benchmark")
 public class QuickBenchmarkValidation {
@@ -31,40 +38,44 @@ public class QuickBenchmarkValidation {
         System.out.println("Target: ≤0.1% FP rate at 95% load factor");
         System.out.println("========================================\n");
 
-        int capacity = 100000;
+        int requestedCapacity = 100000;
         int fingerprintBits = 13;
         double targetLoadFactor = 0.95;
 
-        CuckooFilter filter = CuckooFilter.create(capacity, fingerprintBits);
-        int entriesToInsert = (int) (capacity * targetLoadFactor);
+        CuckooFilter filter = CuckooFilter.create(requestedCapacity, fingerprintBits);
 
-        // Insert entries
-        Random random = new Random(42);
+        // The insert count must come from the REALIZED capacity: create() rounds the
+        // bucket count up to a power of two, so 100,000 * 0.95 would have filled only
+        // 72.5% of the filter while the test claimed to measure 95% load.
+        long realizedCapacity = filter.capacity();
+        int entriesToInsert = (int) (realizedCapacity * targetLoadFactor);
+
         for (int i = 0; i < entriesToInsert; i++) {
             byte[] key = ("key-" + i).getBytes();
             assertTrue(filter.insert(key), "Insert should succeed at 95% load factor");
         }
 
         double actualLoadFactor = filter.loadFactor();
+        System.out.println("Realized capacity: " + realizedCapacity);
         System.out.println("Actual load factor: " + String.format("%.4f", actualLoadFactor));
+        assertEquals(targetLoadFactor, actualLoadFactor, 0.005,
+            "measurement must be taken at the load factor it claims");
 
         // Measure false positive rate with keys NOT inserted
         int falsePositives = 0;
-        int fpSampleSize = 50000;
+        int fpSampleSize = 200000;
         for (int i = 0; i < fpSampleSize; i++) {
-            byte[] nonExistentKey = ("fp-test-" + (i + capacity)).getBytes();
+            byte[] nonExistentKey = ("fp-test-" + (i + realizedCapacity)).getBytes();
             if (filter.contains(nonExistentKey)) {
                 falsePositives++;
             }
         }
 
         double fpRate = (double) falsePositives / fpSampleSize;
-        double fpRatePercent = fpRate * 100;
 
         System.out.println("False positives: " + falsePositives + " / " + fpSampleSize);
-        System.out.println("FP rate: " + String.format("%.4f%%", fpRatePercent));
-        System.out.println("Target: ≤0.1%");
-        System.out.println("Result: " + (fpRatePercent <= 0.1 ? "PASS ✓" : "FAIL ✗"));
+        System.out.println("FP rate: " + String.format("%.4f%%", fpRate * 100));
+        System.out.println("Spec: " + String.format("%.4f%%", FPRateValidator.MAX_FP_RATE * 100));
 
         // Verify no false negatives (all inserted items must be found)
         int falseNegatives = 0;
@@ -77,8 +88,15 @@ public class QuickBenchmarkValidation {
 
         System.out.println("False negatives: " + falseNegatives + " (must be 0)");
         assertEquals(0, falseNegatives, "Cuckoo filter must have zero false negatives");
-        assertTrue(fpRatePercent <= 0.15, // Allow 50% tolerance for sampling variance
-            "FP rate should be ≤0.15% (with tolerance), got " + fpRatePercent + "%");
+
+        // One-sided binomial bound rather than a flat 50% tolerance.
+        double standardError = Math.sqrt(
+            FPRateValidator.MAX_FP_RATE * (1 - FPRateValidator.MAX_FP_RATE) / fpSampleSize);
+        double threshold = FPRateValidator.MAX_FP_RATE + 3.0 * standardError;
+        assertTrue(fpRate <= threshold, String.format(
+            "FP rate at %.4f load must be at most %.4f%% (0.1%% spec + 3 standard errors "
+                + "at n=%d), got %.4f%%",
+            actualLoadFactor, threshold * 100, fpSampleSize, fpRate * 100));
     }
 
     // ==================== STORAGE LOOKUP TARGETS ====================
@@ -163,8 +181,14 @@ public class QuickBenchmarkValidation {
         System.out.println("  Iterations: " + iterations);
         System.out.println("  Duration: " + String.format("%.3f", durationSeconds * 1000) + " ms");
         System.out.println("  Throughput: " + formatOpsPerSec(opsPerSec));
-        System.out.println("  Target: ≥1,000,000,000 ops/sec");
-        System.out.println("  Result: " + (opsPerSec >= 1_000_000_000.0 ? "PASS ✓" : "BELOW TARGET (expected in JVM)"));
+        System.out.println("  Enforced target: " + formatOpsPerSec(ThroughputValidator.TARGET_POINT_LOOKUP));
+        System.out.println("  PROJECT GOAL (aspirational): " + formatOpsPerSec(1_000_000_000.0));
+
+        // Assert against the target the registry actually gates on. Printing
+        // "BELOW TARGET (expected in JVM)" let any throughput at all pass.
+        assertTrue(opsPerSec >= ThroughputValidator.TARGET_POINT_LOOKUP, String.format(
+            "lock-free point lookup throughput must be at least %s, got %s",
+            formatOpsPerSec(ThroughputValidator.TARGET_POINT_LOOKUP), formatOpsPerSec(opsPerSec)));
 
         // Measure batch throughput (10 lookups with single lock)
         int batchSize = 10;
@@ -193,6 +217,10 @@ public class QuickBenchmarkValidation {
         System.out.println("  Total operations: " + (long) totalBatchOps);
         System.out.println("  Throughput: " + formatOpsPerSec(batchOpsPerSec));
         System.out.println("  Per-op latency: " + String.format("%.2f", 1_000_000_000.0 / batchOpsPerSec) + " ns");
+
+        assertTrue(batchOpsPerSec >= ThroughputValidator.TARGET_POINT_LOOKUP, String.format(
+            "batched point lookup throughput must be at least %s, got %s",
+            formatOpsPerSec(ThroughputValidator.TARGET_POINT_LOOKUP), formatOpsPerSec(batchOpsPerSec)));
 
         // Cleanup
         segment.close();
@@ -251,45 +279,6 @@ public class QuickBenchmarkValidation {
         assertEquals(1.0, ip_v1_v3, 0.001, "Inner product check");
 
         System.out.println("\nDistance functions: PASS ✓");
-    }
-
-    // ==================== HNSW RECALL TARGET ====================
-    // Target: ≥99% recall@10
-    // Note: This requires a full HNSW implementation which is in Phase 4
-
-    @Test
-    void checkHNSWImplementation() {
-        System.out.println("\n========================================");
-        System.out.println("HNSW Implementation Check");
-        System.out.println("Target: ≥99% recall@10");
-        System.out.println("========================================\n");
-
-        // Check if HNSW implementation exists (correct package location)
-        boolean found = false;
-        String[] possibleLocations = {
-            "io.excalibur.vector.hnsw.HnswGraph",
-            "io.excalibur.vector.HNSWIndex",
-            "io.excalibur.vector.HNSWGraph"
-        };
-
-        for (String location : possibleLocations) {
-            try {
-                Class<?> hnswClass = Class.forName(location);
-                System.out.println("HNSW implementation found: " + hnswClass.getName());
-                found = true;
-                break;
-            } catch (ClassNotFoundException e) {
-                // Try next location
-            }
-        }
-
-        if (found) {
-            System.out.println("Status: Implementation exists - full benchmark required for recall validation");
-            System.out.println("Note: Run HnswRecallBenchmarkRunner to validate ≥99% recall@10");
-        } else {
-            System.out.println("WARNING: HNSW implementation not found in any expected location");
-            fail("HNSW implementation not found");
-        }
     }
 
     // ==================== HELPER METHODS ====================

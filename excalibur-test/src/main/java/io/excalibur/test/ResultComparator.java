@@ -226,23 +226,38 @@ public class ResultComparator {
      * @return true if values match
      */
     private boolean compareValues(Object actual, Object expected) {
+        // Integral metadata (segment IDs, node IDs, counts) is exact by nature and can exceed
+        // the 53-bit mantissa of a double, so it is compared without any tolerance.
+        if (isIntegral(actual) && isIntegral(expected)) {
+            return ((Number) actual).longValue() == ((Number) expected).longValue();
+        }
+
         if (actual instanceof Number a && expected instanceof Number e) {
-            double actualD = (double) a;
-            double expectedD = (double) e;
+            // Number.doubleValue() is required here: casting a Number reference to double
+            // compiles to a checkcast against java.lang.Double and fails for every other box.
+            double actualD = a.doubleValue();
+            double expectedD = e.doubleValue();
             double diff = Math.abs(actualD - expectedD);
-            
+
             if (diff <= tolerance) return true;
-            if (expectedD != 0 && diff <= relativeTolerance * Math.max(Math.abs(actualD), Math.abs(expectedD))) {
-                return true;
-            }
-            return false;
+            double max = Math.max(Math.abs(actualD), Math.abs(expectedD));
+            return max > 0 && diff <= relativeTolerance * max;
         }
-        
-        if (actual instanceof Float f && expected instanceof Float e) {
-            return Math.abs(f - e) <= tolerance;
-        }
-        
+
         return Objects.equals(actual, expected);
+    }
+
+    /**
+     * Check whether a value is a boxed integral number that fits a long.
+     *
+     * @param value The value to test
+     * @return true for Byte, Short, Integer and Long
+     */
+    private static boolean isIntegral(Object value) {
+        return value instanceof Long
+            || value instanceof Integer
+            || value instanceof Short
+            || value instanceof Byte;
     }
     
     /**

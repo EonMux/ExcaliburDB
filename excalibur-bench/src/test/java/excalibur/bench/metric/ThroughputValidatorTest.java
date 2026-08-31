@@ -156,15 +156,7 @@ class ThroughputValidatorTest {
             assertThat(result.meetsTarget()).isTrue();
         }
 
-        @Test
-        @DisplayName("Throughput exactly at target should pass")
-        void throughputExactlyAtTarget_shouldPass() {
-            ThroughputValidator.ValidationResult result =
-                ThroughputValidator.validateWithTarget(10_000_000.0, 10_000_000.0);
 
-            assertThat(result.valid()).isTrue();
-            assertThat(result.meetsTarget()).isTrue();
-        }
 
         @Test
         @DisplayName("Throughput below target should fail")
@@ -178,15 +170,39 @@ class ThroughputValidatorTest {
         }
 
         @Test
-        @DisplayName("Throughput close to target (within 10%) should warn but pass")
-        void throughputCloseToTarget_shouldWarnButPass() {
-            // 9.5M is 5% below 10M target - should be accepted within tolerance
+        @DisplayName("Throughput just below target must FAIL, however small the gap")
+        void throughputJustBelowTarget_shouldFail() {
+            // 9.5M is 5% below the 10M target. A shortfall is a shortfall: silently
+            // promoting a near miss to a pass would let every documented target be
+            // reported as met while being up to 10% short.
             ThroughputValidator.ValidationResult result =
                 ThroughputValidator.validateWithTarget(9_500_000.0, 10_000_000.0);
 
+            assertThat(result.valid()).isFalse();
+            assertThat(result.meetsTarget()).isFalse();
+            assertThat(result.errors()).contains("below target");
+            assertThat(result.hasWarnings())
+                .as("a near miss is still annotated for the reader")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("Throughput one operation below target must FAIL")
+        void throughputMarginallyBelowTarget_shouldFail() {
+            ThroughputValidator.ValidationResult result =
+                ThroughputValidator.validateWithTarget(9_999_999.0, 10_000_000.0);
+
+            assertThat(result.meetsTarget()).isFalse();
+        }
+
+        @Test
+        @DisplayName("Throughput exactly at target should pass")
+        void throughputExactlyAtTarget_shouldPass() {
+            ThroughputValidator.ValidationResult result =
+                ThroughputValidator.validateWithTarget(10_000_000.0, 10_000_000.0);
+
             assertThat(result.valid()).isTrue();
             assertThat(result.meetsTarget()).isTrue();
-            assertThat(result.hasWarnings()).isTrue();
         }
     }
 

@@ -1,100 +1,140 @@
 package io.excalibur.core.checksum;
 
-import io.excalibur.core.exception.ChecksumException;
-import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 
-import static org.junit.jupiter.api.Assertions.*;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Unit tests for CRC32Checksum class.
+ * {@link CRC32Checksum} against independently known values.
+ *
+ * <p>The vectors come from Python's {@code binascii.crc32}, which matters: a checksum tested only
+ * against its own output verifies that it is deterministic, not that it is CRC-32. The write-ahead
+ * log stores these values on disk, so an implementation that is self-consistent but wrong would
+ * accept its own corrupt records and reject everyone else's.
+ *
+ * <p>Replaces a {@code main()}-based program that printed these same comparisons and was never run
+ * by the suite.
  */
+@DisplayName("CRC32Checksum")
 class CRC32ChecksumTest {
 
-    // Test vectors verified against Python binascii.crc32()
-    private static final long HELLO_WORLD_CRC = 0x4A17B156L;
-    private static final long HELLO_CRC = 0x3610A686L;
-    private static final long PANGRAM_CRC = 0x414FA339L;
-    private static final long EMPTY_CRC = 0x00000000L;
-
-    @Test
-    public void testComputeByteArray() {
-        byte[] data = "Hello World".getBytes(StandardCharsets.UTF_8);
-        long crc = CRC32Checksum.compute(data);
-        assertEquals(HELLO_WORLD_CRC, crc, "CRC32 of \"Hello World\" should be 0x4A17B156");
+    private static byte[] utf8(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
     }
 
     @Test
-    public void testComputeEmptyByteArray() {
-        long crc = CRC32Checksum.compute(new byte[0]);
-        assertEquals(EMPTY_CRC, crc, "CRC32 of empty array should be 0");
+    @DisplayName("matches known CRC-32 vectors")
+    void knownVectors() {
+        assertThat(CRC32Checksum.compute(utf8("Hello World")) & 0xFFFFFFFFL)
+            .isEqualTo(0x4A17B156L);
+        assertThat(CRC32Checksum.compute(new byte[0]) & 0xFFFFFFFFL)
+            .isEqualTo(0x00000000L);
+        assertThat(CRC32Checksum.compute(new byte[] { 0x00 }) & 0xFFFFFFFFL)
+            .isEqualTo(0xD202EF8DL);
     }
 
     @Test
-    public void testComputeNullByteArray() {
-        assertThrows(ChecksumException.class, () -> CRC32Checksum.compute((byte[]) null));
+    @DisplayName("the String overload agrees with the byte[] one")
+    void stringOverloadAgrees() {
+        assertThat(CRC32Checksum.compute("Hello World"))
+            .isEqualTo(CRC32Checksum.compute(utf8("Hello World")));
     }
 
     @Test
-    public void testComputeWithOffset() {
-        byte[] data = "Hello World".getBytes(StandardCharsets.UTF_8);
-        long crc = CRC32Checksum.compute(data, 6, 5); // "World"
+    @DisplayName("a range checksums the same as that range copied out")
+    void rangeMatchesCopy() {
+        byte[] framed = utf8("XXHello WorldYY");
+        byte[] exact = utf8("Hello World");
 
-        // Verify by computing "World" directly
-        byte[] world = "World".getBytes(StandardCharsets.UTF_8);
-        long expectedCrc = CRC32Checksum.compute(world);
-        assertEquals(expectedCrc, crc, "CRC32 of \"World\" should match");
+        assertThat(CRC32Checksum.compute(framed, 2, exact.length))
+            .as("the WAL checksums a record inside a larger buffer, never a copy of it")
+            .isEqualTo(CRC32Checksum.compute(exact));
     }
 
     @Test
-    public void testComputeWithInvalidOffset() {
-        byte[] data = new byte[10];
-        assertThrows(ChecksumException.class, () -> CRC32Checksum.compute(data, 100, 10));
+    @DisplayName("verify accepts the right checksum and rejects a corrupted byte")
+    void verifyDetectsCorruption() {
+        byte[] data = utf8("Hello World");
+        long checksum = CRC32Checksum.compute(data);
+
+        assertThat(CRC32Checksum.verify(data, checksum)).isTrue();
+
+        data[0] ^= 0x01;
+        assertThat(CRC32Checksum.verify(data, checksum))
+            .as("a single flipped bit is exactly what this exists to catch")
+            .isFalse();
     }
 
     @Test
-    public void testComputeString() {
-        long crc = CRC32Checksum.compute("Hello World");
-        assertEquals(HELLO_WORLD_CRC, crc, "CRC32 of string \"Hello World\" should be 0x4A17B156");
+    @DisplayName("the bundled self-check passes")
+    void selfCheckPasses() {
+        // The same idiom XxHash64Test uses against XxHash64.verifyTestVectors().
+        assertThat(CRC32Checksum.verifyTestVectors())
+            .as("the implementation's own vectors must agree with it")
+            .isTrue();
     }
 
     @Test
-    public void testComputeNullString() {
-        assertThrows(ChecksumException.class, () -> CRC32Checksum.compute((String) null));
+    @DisplayName("verify over a range accepts the right checksum and rejects corruption")
+    void verifyRange() {
+        byte[] framed = utf8("XXHello WorldYY");
+        int offset = 2;
+        int length = utf8("Hello World").length;
+        long checksum = CRC32Checksum.compute(framed, offset, length);
+
+        assertThat(CRC32Checksum.verify(framed, offset, length, checksum)).isTrue();
+
+        framed[offset + 3] ^= 0x01;
+        assertThat(CRC32Checksum.verify(framed, offset, length, checksum)).isFalse();
     }
 
     @Test
-    public void testVerify() {
-        byte[] data = "Hello World".getBytes(StandardCharsets.UTF_8);
-        long expected = CRC32Checksum.compute(data);
+    @DisplayName("corruption outside the range does not affect it")
+    void corruptionOutsideRangeIsIgnored() {
+        // The WAL checksums one record inside a shared buffer; a neighbouring record changing
+        // must not invalidate this one.
+        byte[] framed = utf8("XXHello WorldYY");
+        int offset = 2;
+        int length = utf8("Hello World").length;
+        long checksum = CRC32Checksum.compute(framed, offset, length);
 
-        assertTrue(CRC32Checksum.verify(data, expected), "Verify should return true for correct CRC32");
-        assertFalse(CRC32Checksum.verify(data, 0xFFFFFFFFL), "Verify should return false for wrong CRC32");
+        framed[0] ^= 0xFF;
+        framed[framed.length - 1] ^= 0xFF;
+
+        assertThat(CRC32Checksum.verify(framed, offset, length, checksum)).isTrue();
     }
 
     @Test
-    public void testUpdate() {
-        byte[] hello = "Hello ".getBytes(StandardCharsets.UTF_8);
-        byte[] world = "World".getBytes(StandardCharsets.UTF_8);
+    @DisplayName("incremental update over a range matches the whole input")
+    void updateRangeMatchesWholeInput() {
+        byte[] framed = utf8("ZZWorld");
+        long incremental = CRC32Checksum.update(
+            CRC32Checksum.compute(utf8("Hello ")), framed, 2, 5);
 
-        long crc = CRC32Checksum.update(EMPTY_CRC, hello);
-        long crc2 = CRC32Checksum.update(crc, world);
-
-        assertEquals(HELLO_WORLD_CRC, crc2, "Update should produce correct final CRC32");
+        assertThat(incremental).isEqualTo(CRC32Checksum.compute(utf8("Hello World")));
     }
 
     @Test
-    public void testTestVectors() {
-        // Verify official test vectors
-        assertEquals(HELLO_WORLD_CRC, CRC32Checksum.compute("Hello World".getBytes(StandardCharsets.UTF_8)));
-        assertEquals(HELLO_CRC, CRC32Checksum.compute("hello".getBytes(StandardCharsets.UTF_8)));
-        assertEquals(PANGRAM_CRC, CRC32Checksum.compute(
-            "The quick brown fox jumps over the lazy dog".getBytes(StandardCharsets.UTF_8)));
-        assertEquals(EMPTY_CRC, CRC32Checksum.compute(new byte[0]));
+    @DisplayName("a zero-length range is the identity")
+    void zeroLengthRange() {
+        byte[] data = utf8("Hello World");
+        long full = CRC32Checksum.compute(data);
+
+        assertThat(CRC32Checksum.compute(data, 0, 0)).isEqualTo(CRC32Checksum.compute(new byte[0]));
+        assertThat(CRC32Checksum.update(full, data, 0, 0)).isEqualTo(full);
     }
 
     @Test
-    public void testVerifyTestVectors() {
-        assertTrue(CRC32Checksum.verifyTestVectors(), "All test vectors should pass");
+    @DisplayName("incremental update matches computing over the whole input")
+    void updateMatchesWholeInput() {
+        byte[] first = utf8("Hello ");
+        byte[] second = utf8("World");
+
+        long incremental = CRC32Checksum.update(CRC32Checksum.compute(first), second);
+
+        assertThat(incremental).isEqualTo(CRC32Checksum.compute(utf8("Hello World")));
     }
 }

@@ -117,6 +117,27 @@ public class TailOffsetTracker {
      * @param writeLogHead The current write log head offset
      * @return true if there are entries beyond the integrated offset
      */
+    /**
+     * Rebases the checkpoint onto a replacement write log.
+     *
+     * <p>Only for the case where the segment's log has been replaced wholesale — compaction
+     * discards the old log and starts an empty one, and the checkpoint is a byte offset into a file
+     * that no longer exists. Left alone it sits above the new log's head and every subsequent
+     * append is skipped, so the segment quietly stops being indexed.
+     *
+     * <p>Not monotone, unlike everything else here. See
+     * {@link HnswGraph#resetLastIntegratedOffset(long)}.
+     *
+     * @param offset the new checkpoint, normally the origin of the replacement log
+     */
+    public void resetTo(long offset) {
+        // Both copies. This tracker caches the offset in its own AtomicLong, which every read here
+        // goes through, so persisting to the graph alone would leave the tracker answering from a
+        // stale value and the rebase would appear to do nothing.
+        graph.resetLastIntegratedOffset(offset);
+        lastIntegratedOffset.set(offset);
+    }
+
     public boolean hasTailEntries(long writeLogHead) {
         return writeLogHead > lastIntegratedOffset.get();
     }
@@ -330,8 +351,10 @@ public class TailOffsetTracker {
         // Use the graph's CAS method which handles persistence ordering
         boolean updated = graph.compareAndSetLastIntegratedOffset(newOffset);
         if (updated) {
-            // Update our local atomic to match
-            lastIntegratedOffset.set(newOffset);
+            // Accumulate the maximum rather than blind-setting: a concurrent caller
+            // may already have advanced the local offset past newOffset, and a plain
+            // set() would move the tracker backwards behind the graph.
+            lastIntegratedOffset.accumulateAndGet(newOffset, Math::max);
         }
         return updated;
     }

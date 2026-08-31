@@ -114,6 +114,23 @@ class IndexCoverageTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("warmingSegments");
         }
+
+        @Test
+        @DisplayName("rejects queryable segments exceeding totalSegments")
+        void rejectsQueryableSegmentsExceedingTotal() {
+            assertThatThrownBy(() ->
+                    new IndexCoverage(10, 8, 2, 1, 0.5, false))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("totalSegments");
+        }
+
+        @Test
+        @DisplayName("accepts queryable segments exactly filling totalSegments")
+        void acceptsQueryableSegmentsEqualToTotal() {
+            IndexCoverage coverage = new IndexCoverage(10, 7, 2, 1, 1.0, false);
+
+            assertThat(coverage.getQueryableRatio()).isEqualTo(1.0);
+        }
     }
 
     @Nested
@@ -157,6 +174,28 @@ class IndexCoverageTest {
             assertThat(coverage.getEstimatedCoverage()).isEqualTo(1.0);
             assertThat(coverage.isDegraded()).isFalse();
         }
+
+        @Test
+        @DisplayName("withWarmUp(1) leaves the single segment warming")
+        void withWarmUpOfOneSegment() {
+            IndexCoverage coverage = IndexCoverage.withWarmUp(1);
+
+            assertThat(coverage.getTotalSegments()).isEqualTo(1);
+            assertThat(coverage.getActiveSegments()).isEqualTo(0);
+            assertThat(coverage.getWarmingSegments()).isEqualTo(1);
+            assertThat(coverage.getQueryableRatio()).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("withWarmUp() rejects a segment count below 1")
+        void withWarmUpRejectsZeroSegments() {
+            assertThatThrownBy(() -> IndexCoverage.withWarmUp(0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at least one segment");
+
+            assertThatThrownBy(() -> IndexCoverage.withWarmUp(-1))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
     }
 
     @Nested
@@ -194,6 +233,15 @@ class IndexCoverageTest {
             IndexCoverage coverage = IndexCoverage.empty();
 
             assertThat(coverage.getQueryableRatio()).isEqualTo(0.0);
+        }
+
+        @Test
+        @DisplayName("getQueryableRatio never exceeds 1.0")
+        void queryableRatioNeverExceedsOne() {
+            assertThat(new IndexCoverage(10, 4, 3, 3, 1.0, false).getQueryableRatio())
+                .isLessThanOrEqualTo(1.0);
+            assertThat(IndexCoverage.fullyActive(7).getQueryableRatio()).isEqualTo(1.0);
+            assertThat(IndexCoverage.withWarmUp(7).getQueryableRatio()).isEqualTo(1.0);
         }
     }
 

@@ -39,9 +39,15 @@ import static org.assertj.core.api.Assertions.*;
  *   <li>Distance values non-negative for L2</li>
  * </ul>
  *
+ * <h2>Tagging</h2>
+ * <p>The recall assertions are the project's only enforceable ANN quality guarantee,
+ * so they must run in the default build. The root build excludes {@code slow} and
+ * {@code benchmark} from every {@code test} task, so only the largest dataset - which
+ * measures the same property as the 1000-vector case, just more slowly - carries
+ * {@code @Tag("slow")}.</p>
+ *
  * @author ExcaliburDB
  */
-@Tag("slow")
 @DisplayName("HNSW Recall@10 Validation")
 class HnswRecallValidationTest {
 
@@ -90,6 +96,7 @@ class HnswRecallValidationTest {
     }
 
     @Test
+    @Tag("slow")
     @DisplayName("Default config achieves ≥99% recall@10 with 5000 vectors")
     void testRecallAt10With5000Vectors() throws IOException {
         int datasetSize = 5000;
@@ -184,10 +191,15 @@ class HnswRecallValidationTest {
         System.out.println("Recall run 1: " + String.format("%.4f", recall1));
         System.out.println("Recall run 2: " + String.format("%.4f", recall2));
 
-        // Should be identical (deterministic)
+        // Node levels are drawn from ThreadLocalRandom, so two builds of the same
+        // dataset are not bit-identical graphs. What must hold is that recall does
+        // not swing between runs and that both runs meet the target.
         assertThat(recall1)
             .as("Recall should be consistent across runs")
-            .isEqualTo(recall2);
+            .isCloseTo(recall2, within(0.02));
+        assertThat(Math.min(recall1, recall2))
+            .as("Both runs should meet the recall target")
+            .isGreaterThanOrEqualTo(TARGET_RECALL);
     }
 
     /**

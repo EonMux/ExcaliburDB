@@ -1,8 +1,11 @@
 package excalibur.ingest.registry;
 
+import excalibur.ingest.source.DocumentNotFoundException;
 import excalibur.ingest.source.FetchedDocument;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.HashSet;
@@ -38,6 +41,8 @@ import java.util.stream.Stream;
  */
 public class ChangeDetector {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(ChangeDetector.class);
+
     private final DocumentRegistry registry;
 
     /**
@@ -69,8 +74,9 @@ public class ChangeDetector {
         
         try (Stream<String> crawl = source.crawl()) {
             crawl.forEach(documentId -> {
-                seenDocumentIds.add(documentId);
-                processDocument(source, sourceId, documentId, builder);
+                if (processDocument(source, sourceId, documentId, builder)) {
+                    seenDocumentIds.add(documentId);
+                }
             });
         }
         
@@ -112,8 +118,9 @@ public class ChangeDetector {
             int batchCount = 0;
             
             for (String documentId : (Iterable<String>) crawl::iterator) {
-                seenDocumentIds.add(documentId);
-                processDocument(source, sourceId, documentId, batchBuilder);
+                if (processDocument(source, sourceId, documentId, batchBuilder)) {
+                    seenDocumentIds.add(documentId);
+                }
                 batchCount++;
                 totalCrawled++;
                 
@@ -189,13 +196,25 @@ public class ChangeDetector {
         return source.hasChanged(lastCrawlTime);
     }
 
-    private void processDocument(Source source, String sourceId, String documentId,
-                                 ChangeSet.Builder builder) {
+    /**
+     * Classifies one crawled document as new, changed or unchanged.
+     *
+     * <p>A fetch failure is not evidence of either outcome, and the two kinds have to be told
+     * apart. A {@link DocumentNotFoundException} means the crawl listed a document that is no
+     * longer there, so it is reported as unseen and the deleted-document pass tombstones it. Any
+     * other failure is transient - the host is down, the request timed out - and treating it as
+     * unseen would tombstone a document that still exists, so the previous version is kept and
+     * the failure is logged rather than silently recorded as "unchanged".</p>
+     *
+     * @return true if the document was accounted for, false if the source says it is gone
+     */
+    private boolean processDocument(Source source, String sourceId, String documentId,
+                                    ChangeSet.Builder builder) {
         DocumentMetadata existing = registry.get(sourceId, documentId);
         
         if (existing == null) {
             builder.addNew(documentId);
-            return;
+            return true;
         }
         
         try {
@@ -205,8 +224,15 @@ public class ChangeDetector {
             if (existing.isChanged(fetchedInfo)) {
                 builder.addChanged(documentId, existing, fetchedInfo);
             }
+            return true;
+        } catch (DocumentNotFoundException e) {
+            LOGGER.info("Document {} of source {} disappeared between crawl and fetch; treating as deleted",
+                documentId, sourceId);
+            return false;
         } catch (SourceException e) {
-            // Treat fetch failures as unchanged - will be caught in deleted detection
+            LOGGER.warn("Could not determine whether document {} of source {} changed: {}. "
+                + "Keeping the indexed version.", documentId, sourceId, e.getMessage());
+            return true;
         }
     }
 

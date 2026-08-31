@@ -10,7 +10,6 @@
 package io.excalibur.test;
 
 import java.util.*;
-import java.util.function.Supplier;
 
 /**
  * Fluent builder for creating QueryResultItem instances.
@@ -146,8 +145,13 @@ public class QueryResultItemBuilder {
     
     /**
      * Build the QueryResultItem.
-     * 
+     *
+     * <p>{@link #documentId(String)} must have been called with a non-blank value:
+     * result items are sorted and matched by document ID.</p>
+     *
      * @return The built QueryResultItem
+     * @throws NullPointerException if no document ID was set
+     * @throws IllegalArgumentException if the document ID is blank
      */
     public QueryResultItem build() {
         return new QueryResultItem(documentId, score, metadata, content, source, chunkIndex);

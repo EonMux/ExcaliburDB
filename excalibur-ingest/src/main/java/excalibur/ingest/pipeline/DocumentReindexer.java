@@ -1,5 +1,6 @@
 package excalibur.ingest.pipeline;
 
+import io.excalibur.core.text.ChunkIdentifiers;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.registry.ChangeDetector;
@@ -353,7 +354,10 @@ public class DocumentReindexer {
             // Step 5: Perform the actual reindexing with segment-targeted writers
             ReindexResult reindexResult = reindexAllWithSegmentWriter(source, segmentWriter, segmentPublisher);
 
-            if (reindexResult.hasErrors() && reindexResult.getDocumentsIndexed() == 0) {
+            // The new segment is only usable if something was actually written to it. Guarding on
+            // the document count alone lets a run in which every document failed fall through and
+            // tombstone every populated old segment.
+            if (reindexResult.hasErrors() && reindexResult.getChunksCreated() == 0) {
                 // Complete failure - mark segment for cleanup
                 LOG.error("Reindex failed completely for source {}, tombstoning new segment {}", sourceId, newSegmentId);
                 segmentCatalog.tombstone(newSegmentId, visibilityTracker.currentEpoch());
@@ -513,10 +517,12 @@ public class DocumentReindexer {
                 changeSet.getDeletedCount());
         
         ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId);
-        
-        UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processChanges(changeSet);
+
+        // Only removals are safe to apply before the replacement content exists; see
+        // UpsertHandler.processDeletions.
+        UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processDeletions(changeSet);
         resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
-        resultBuilder.chunksTombstoned(tombstoneResult.getChunksTombstoned());
+        int chunksTombstoned = tombstoneResult.getChunksTombstoned();
         tombstoneResult.getErrors().forEach(error -> 
             resultBuilder.addError("tombstone", error.getChunkId(), error.getMessage()));
         
@@ -541,6 +547,7 @@ public class DocumentReindexer {
                 FetchedDocument fetched = source.fetch(changed.getDocumentId());
                 DocumentResult docResult = reindexDocument(sourceId, changed.getDocumentId(), fetched);
                 resultBuilder.addDocumentResult(docResult);
+                chunksTombstoned += retireReplacedVersion(changed, docResult);
             } catch (SourceException e) {
                 String msg = "Failed to fetch changed document " + changed.getDocumentId() + ": " + e.getMessage();
                 LOG.error(msg, e);
@@ -551,7 +558,8 @@ public class DocumentReindexer {
                 resultBuilder.addError("reindex", changed.getDocumentId(), msg);
             }
         }
-        
+
+        resultBuilder.chunksTombstoned(chunksTombstoned);
         ReindexResult result = resultBuilder.build();
         LOG.info("Re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
                 sourceId, result.getDocumentsIndexed(), result.getChunksCreated(), result.getErrorCount());
@@ -603,9 +611,11 @@ public class DocumentReindexer {
 
         ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId);
 
-        UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processChanges(changeSet);
+        // Only removals are safe to apply before the replacement content exists; see
+        // UpsertHandler.processDeletions.
+        UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processDeletions(changeSet);
         resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
-        resultBuilder.chunksTombstoned(tombstoneResult.getChunksTombstoned());
+        int chunksTombstoned = tombstoneResult.getChunksTombstoned();
         tombstoneResult.getErrors().forEach(error ->
             resultBuilder.addError("tombstone", error.getChunkId(), error.getMessage()));
 
@@ -634,6 +644,7 @@ public class DocumentReindexer {
                 DocumentResult docResult = reindexDocumentWithSegmentWriter(
                     sourceId, changed.getDocumentId(), fetched, segmentWriter, segmentPublisher);
                 resultBuilder.addDocumentResult(docResult);
+                chunksTombstoned += retireReplacedVersion(changed, docResult);
             } catch (SourceException e) {
                 String msg = "Failed to fetch changed document " + changed.getDocumentId() + ": " + e.getMessage();
                 LOG.error(msg, e);
@@ -645,11 +656,36 @@ public class DocumentReindexer {
             }
         }
 
+        resultBuilder.chunksTombstoned(chunksTombstoned);
         ReindexResult result = resultBuilder.build();
         LOG.info("Segment-targeted re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
                 sourceId, result.getDocumentsIndexed(), result.getChunksCreated(), result.getErrorCount());
 
         return result;
+    }
+
+    /**
+     * Tombstones whatever remains of a changed document's previous version once its replacement
+     * has been published.
+     *
+     * <p>Tombstoning before the replacement exists is what makes a failed re-embed destructive:
+     * the old chunks are gone and nothing re-inserts them. Doing it here, after publication, means
+     * a failed document simply keeps serving its previous version. Chunk ids are deterministic, so
+     * the new version has already overwritten the ids it reuses; only the surplus tail is
+     * removed.</p>
+     *
+     * @param changed   The changed document, carrying the previous version's metadata
+     * @param docResult The outcome of re-indexing it
+     * @return The number of obsolete chunks tombstoned
+     */
+    private int retireReplacedVersion(ChangeSet.ChangedDocument changed, DocumentResult docResult) {
+        if (docResult.getSuccessfulChunks() == 0) {
+            LOG.warn("Keeping previous version of document {}: replacement produced no chunks",
+                changed.getDocumentId());
+            return 0;
+        }
+        return upsertHandler.tombstoneObsoleteChunks(
+            changed.getOldMetadata().getChunkIds(), docResult.getChunkIds());
     }
 
     /**
@@ -686,7 +722,7 @@ public class DocumentReindexer {
                 "Content length " + content.length + " exceeds maximum " + MAX_CONTENT_LENGTH);
         }
 
-        String text = new String(content, StandardCharsets.UTF_8);
+        String text = fetched.getText();
 
         List<TextChunk> chunks = chunker.chunk(documentId, text);
         if (chunks.isEmpty()) {
@@ -703,7 +739,7 @@ public class DocumentReindexer {
         // Write all chunks to the TARGET SEGMENT and accumulate in batch buffer
         for (int i = 0; i < chunks.size(); i++) {
             TextChunk chunk = chunks.get(i);
-            String chunkId = generateChunkId(documentId, i);
+            String chunkId = generateChunkId(sourceId, documentId, i);
 
             try {
                 float[] embedding = llmClient.generateEmbedding(chunk.getText(),
@@ -730,10 +766,17 @@ public class DocumentReindexer {
             }
         }
 
-        // If no chunks were written successfully, return failure
-        if (successCount.get() == 0) {
+        // A document is indexed whole or not at all. Publishing the chunks that survived would
+        // register the new content hash beside a partial chunk list, and change detection compares
+        // exactly that hash: the document would then read as unchanged forever, so the chunks that
+        // failed would never be retried and their content would be permanently missing. Leaving
+        // the previous registry entry alone keeps the document classified as changed, so the next
+        // run picks it up again.
+        if (failureCount.get() > 0) {
             return new DocumentResult(documentId, chunks.size(), 0, failureCount.get(),
-                System.currentTimeMillis() - startTime, "All chunks failed: " + String.join("; ", errors));
+                System.currentTimeMillis() - startTime,
+                "Document left unchanged, " + failureCount.get() + " of " + chunks.size()
+                    + " chunks failed: " + String.join("; ", errors));
         }
 
         // Seal the buffer for atomic publication
@@ -762,7 +805,7 @@ public class DocumentReindexer {
                 documentId, result.epoch(), chunks.size(), successCount.get(), failureCount.get(), elapsed);
 
             return new DocumentResult(documentId, chunks.size(), successCount.get(),
-                failureCount.get(), elapsed, errorMsg);
+                failureCount.get(), elapsed, errorMsg, chunkIds);
 
         } catch (DocumentBatchPublisher.PublicationException e) {
             // Publication failed - document should not be visible
@@ -826,7 +869,7 @@ public class DocumentReindexer {
                 "Content length " + content.length + " exceeds maximum " + MAX_CONTENT_LENGTH);
         }
 
-        String text = new String(content, StandardCharsets.UTF_8);
+        String text = fetched.getText();
 
         List<TextChunk> chunks = chunker.chunk(documentId, text);
         if (chunks.isEmpty()) {
@@ -869,7 +912,7 @@ public class DocumentReindexer {
         // Write all chunks to storage and accumulate in batch buffer
         for (int i = 0; i < chunks.size(); i++) {
             TextChunk chunk = chunks.get(i);
-            String chunkId = generateChunkId(documentId, i);
+            String chunkId = generateChunkId(sourceId, documentId, i);
 
             try {
                 float[] embedding = llmClient.generateEmbedding(chunk.getText(),
@@ -896,10 +939,17 @@ public class DocumentReindexer {
             }
         }
 
-        // If no chunks were written successfully, return failure
-        if (successCount.get() == 0) {
+        // A document is indexed whole or not at all. Publishing the chunks that survived would
+        // register the new content hash beside a partial chunk list, and change detection compares
+        // exactly that hash: the document would then read as unchanged forever, so the chunks that
+        // failed would never be retried and their content would be permanently missing. Leaving
+        // the previous registry entry alone keeps the document classified as changed, so the next
+        // run picks it up again.
+        if (failureCount.get() > 0) {
             return new DocumentResult(documentId, chunks.size(), 0, failureCount.get(),
-                System.currentTimeMillis() - startTime, "All chunks failed: " + String.join("; ", errors));
+                System.currentTimeMillis() - startTime,
+                "Document left unchanged, " + failureCount.get() + " of " + chunks.size()
+                    + " chunks failed: " + String.join("; ", errors));
         }
 
         // Seal the buffer for atomic publication
@@ -928,7 +978,7 @@ public class DocumentReindexer {
                 documentId, result.epoch(), chunks.size(), successCount.get(), failureCount.get(), elapsed);
 
             return new DocumentResult(documentId, chunks.size(), successCount.get(),
-                failureCount.get(), elapsed, errorMsg);
+                failureCount.get(), elapsed, errorMsg, chunkIds);
 
         } catch (DocumentBatchPublisher.PublicationException e) {
             // Publication failed - document should not be visible
@@ -966,7 +1016,7 @@ public class DocumentReindexer {
 
         for (int i = 0; i < chunks.size(); i++) {
             TextChunk chunk = chunks.get(i);
-            String chunkId = generateChunkId(documentId, i);
+            String chunkId = generateChunkId(sourceId, documentId, i);
 
             try {
                 float[] embedding = llmClient.generateEmbedding(chunk.getText(),
@@ -989,6 +1039,21 @@ public class DocumentReindexer {
             }
         }
 
+        // As in the atomic paths: the registry entry is what change detection reads, so recording
+        // the new hash for anything less than a complete document retires it from ever being
+        // reindexed again. This path had no such guard at all - a run with the embedding endpoint
+        // down replaced the entry with one naming no chunks, leaving the previous chunks in
+        // storage with nothing recording their ids.
+        if (failureCount.get() > 0) {
+            long failedElapsed = System.currentTimeMillis() - startTime;
+            LOG.warn("Document {} left unchanged: {} of {} chunks failed",
+                documentId, failureCount.get(), chunks.size());
+            return new DocumentResult(documentId, chunks.size(), 0, failureCount.get(),
+                failedElapsed,
+                "Document left unchanged, " + failureCount.get() + " of " + chunks.size()
+                    + " chunks failed: " + String.join("; ", errors));
+        }
+
         long contentHash = DocumentRegistry.computeContentHash(content);
         DocumentMetadata metadata = DocumentMetadata.builder()
             .sourceId(sourceId)
@@ -1009,22 +1074,26 @@ public class DocumentReindexer {
             documentId, chunks.size(), successCount.get(), failureCount.get(), elapsed);
 
         return new DocumentResult(documentId, chunks.size(), successCount.get(),
-            failureCount.get(), elapsed, errorMsg);
+            failureCount.get(), elapsed, errorMsg, chunkIds);
     }
 
     /**
-     * Generates a unique chunk ID from a document ID and chunk index.
+     * Generates a unique chunk ID from a source ID, document ID and chunk index.
      *
-     * <p>Format: "{documentId}:chunk:{index}"</p>
+     * <p>Format: {@code sourceId:documentId:chunk:index}. The source-qualified form is what
+     * excalibur-shard parses back into a document id when it registers an HNSW node, and what
+     * the ingestion pipeline writes, so a reindex overwrites and tombstones exactly the keys the
+     * initial ingest created. See {@link ChunkIdentifiers}.</p>
      *
      * <p>Domain correctness: chunk IDs are unique, deterministic, and URL-safe.</p>
      *
+     * @param sourceId The source ID
      * @param documentId The document ID
      * @param chunkIndex The chunk index (0-based)
      * @return Unique chunk identifier
      */
-    private String generateChunkId(String documentId, int chunkIndex) {
-        return documentId + ":chunk:" + chunkIndex;
+    private String generateChunkId(String sourceId, String documentId, int chunkIndex) {
+        return ChunkIdentifiers.chunkId(sourceId, documentId, chunkIndex);
     }
 
     /**
@@ -1037,15 +1106,34 @@ public class DocumentReindexer {
         private final int failedChunks;
         private final long elapsedMillis;
         private final String error;
+        private final List<String> chunkIds;
 
         public DocumentResult(String documentId, int totalChunks, int successfulChunks, 
                             int failedChunks, long elapsedMillis, String error) {
+            this(documentId, totalChunks, successfulChunks, failedChunks, elapsedMillis, error, List.of());
+        }
+
+        public DocumentResult(String documentId, int totalChunks, int successfulChunks,
+                            int failedChunks, long elapsedMillis, String error, List<String> chunkIds) {
             this.documentId = documentId;
             this.totalChunks = totalChunks;
             this.successfulChunks = successfulChunks;
             this.failedChunks = failedChunks;
             this.elapsedMillis = elapsedMillis;
             this.error = error;
+            this.chunkIds = chunkIds != null ? List.copyOf(chunkIds) : List.of();
+        }
+
+        /**
+         * Returns the chunk ids that were written for this document's new version.
+         *
+         * <p>Used to work out which chunk ids of the previous version the new one did not
+         * overwrite, and therefore have to be tombstoned.</p>
+         *
+         * @return Immutable list of chunk ids (empty when nothing was written)
+         */
+        public List<String> getChunkIds() {
+            return chunkIds;
         }
 
         public String getDocumentId() {
@@ -1206,8 +1294,19 @@ public class DocumentReindexer {
                 return this;
             }
 
+            /**
+             * Folds one document's outcome into the result.
+             *
+             * <p>{@code documentsIndexed} counts documents that actually produced data. A
+             * document whose every chunk failed is not "indexed": rolling replacement uses this
+             * count to decide whether the new segment is usable before it tombstones the old
+             * ones, and counting total failures there would retire a populated segment in favour
+             * of an empty one.</p>
+             */
             public Builder addDocumentResult(DocumentResult docResult) {
-                documentsIndexed++;
+                if (docResult.getSuccessfulChunks() > 0) {
+                    documentsIndexed++;
+                }
                 chunksCreated += docResult.getSuccessfulChunks();
                 chunksFailed += docResult.getFailedChunks();
                 if (docResult.hasError()) {

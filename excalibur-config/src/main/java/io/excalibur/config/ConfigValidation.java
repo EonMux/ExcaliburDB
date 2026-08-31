@@ -1,12 +1,14 @@
 package io.excalibur.config;
 
+import java.util.Locale;
+
 /**
  * Configuration validator that checks configuration values for correctness.
- * 
+ *
  * <h2>Thread-Safety</h2>
  * <p>This class is NOT thread-safe. It is a stateless validator that
  * can be instantiated and reused safely.</p>
- * 
+ *
  * <h2>Validation Rules</h2>
  * <p>The validator enforces the following constraints:
  * <ul>
@@ -18,14 +20,15 @@ package io.excalibur.config;
  *   </li>
  *   <li><strong>Ingest:</strong>
  *     <ul>
- *       <li>hnsw-queue-depth-limit: 10000-1000000 (default: 100000)</li>
  *       <li>document-atomicity-timeout-ms: 1000-30000 (default: 2000)</li>
+ *       <li>reindex-interval-ms: 60000-86400000 (default: 3600000)</li>
  *     </ul>
  *   </li>
  *   <li><strong>Health:</strong>
  *     <ul>
  *       <li>readiness-threshold: 0.0-1.0 (default: 0.5)</li>
  *       <li>healthy-threshold: 0.0-1.0 (default: 0.9)</li>
+ *       <li>readiness-threshold must not exceed healthy-threshold</li>
  *       <li>max-latency-ms: 100-60000 (default: 5000)</li>
  *     </ul>
  *   </li>
@@ -41,7 +44,15 @@ package io.excalibur.config;
  *   <li><strong>LLM:</strong>
  *     <ul>
  *       <li>base-url: must be a valid URL (http:// or https://)</li>
+ *       <li>api-key: must not be sent over cleartext http:// to a non-loopback host</li>
  *       <li>embeddings-dimensions: 128-4096 (default: 1536)</li>
+ *       <li>timeout-ms: 1000-300000 (default: 60000)</li>
+ *       <li>max-retries: 0-10 (default: 3)</li>
+ *       <li>failure-threshold: 1-100 (default: 5)</li>
+ *       <li>cooldown-period-ms: 1000-600000 (default: 60000)</li>
+ *       <li>max-prompts-per-query: 1-100 (default: 10)</li>
+ *       <li>relevancy-threshold: 0.0-1.0 (default: 0.3)</li>
+ *       <li>max-batch-tokens: 100-100000 (default: 4000)</li>
  *       <li>retry-base-delay-ms: 10-30000 (default: 500)</li>
  *     </ul>
  *   </li>
@@ -54,11 +65,14 @@ package io.excalibur.config;
  *     </ul>
  *   </li>
  * </ul>
- * 
+ *
  * @author ExcaliburDB
  */
 public final class ConfigValidation {
-    
+
+    private static final String HTTP_PREFIX = "http://";
+    private static final String HTTPS_PREFIX = "https://";
+
     /**
      * Validates the configuration and throws IllegalStateException if invalid.
      *
@@ -73,7 +87,7 @@ public final class ConfigValidation {
         validateLlm(config.llm());
         validateShard(config.shard());
     }
-    
+
     /**
      * Validates visibility configuration.
      *
@@ -81,29 +95,12 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateVisibility(Config.Visibility visibility) {
-        // Epoch tick must be between 10 and 10000 ms
-        long epochTickMs = visibility.getEpochTickMs();
-        if (epochTickMs < 10) {
-            throw new IllegalStateException(
-                "visibility.epoch-tick-ms must be >= 10, got: " + epochTickMs);
-        }
-        if (epochTickMs > 10000) {
-            throw new IllegalStateException(
-                "visibility.epoch-tick-ms must be <= 10000, got: " + epochTickMs);
-        }
-
-        // Query timeout must be between 1000 and 300000 ms
-        int queryTimeoutMs = visibility.getQueryTimeoutMs();
-        if (queryTimeoutMs < 1000) {
-            throw new IllegalStateException(
-                "visibility.query-timeout-ms must be >= 1000, got: " + queryTimeoutMs);
-        }
-        if (queryTimeoutMs > 300000) {
-            throw new IllegalStateException(
-                "visibility.query-timeout-ms must be <= 300000, got: " + queryTimeoutMs);
-        }
+        requireInRange("visibility.epoch-tick-ms", visibility.getEpochTickMs(),
+            Config.Visibility.MIN_EPOCH_TICK_MS, Config.Visibility.MAX_EPOCH_TICK_MS);
+        requireInRange("visibility.query-timeout-ms", visibility.getQueryTimeoutMs(),
+            Config.Visibility.MIN_QUERY_TIMEOUT_MS, Config.Visibility.MAX_QUERY_TIMEOUT_MS);
     }
-    
+
     /**
      * Validates ingest configuration.
      *
@@ -111,29 +108,16 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateIngest(Config.Ingest ingest) {
-        // HNSW queue depth limit must be between 10000 and 1000000
-        long hnswQueueDepthLimit = ingest.getHnswQueueDepthLimit();
-        if (hnswQueueDepthLimit < 10000) {
-            throw new IllegalStateException(
-                "ingest.hnsw-queue-depth-limit must be >= 10000, got: " + hnswQueueDepthLimit);
-        }
-        if (hnswQueueDepthLimit > 1000000) {
-            throw new IllegalStateException(
-                "ingest.hnsw-queue-depth-limit must be <= 1000000, got: " + hnswQueueDepthLimit);
-        }
+        requireInRange("ingest.document-atomicity-timeout-ms", ingest.getDocumentTimeoutMs(),
+            Config.Ingest.MIN_DOCUMENT_TIMEOUT_MS, Config.Ingest.MAX_DOCUMENT_TIMEOUT_MS);
 
-        // Document timeout must be between 1000 and 30000 ms
-        int documentTimeoutMs = ingest.getDocumentTimeoutMs();
-        if (documentTimeoutMs < 1000) {
-            throw new IllegalStateException(
-                "ingest.document-atomicity-timeout-ms must be >= 1000, got: " + documentTimeoutMs);
-        }
-        if (documentTimeoutMs > 30000) {
-            throw new IllegalStateException(
-                "ingest.document-atomicity-timeout-ms must be <= 30000, got: " + documentTimeoutMs);
-        }
+        // The shard module's reindex scheduler rejects an interval outside this window
+        // when a source registers, which happens inside the /v1/ingest request path and
+        // after the source has already been recorded. Reject it at startup instead.
+        requireInRange("ingest.reindex-interval-ms", ingest.getReindexIntervalMs(),
+            Config.Ingest.MIN_REINDEX_INTERVAL_MS, Config.Ingest.MAX_REINDEX_INTERVAL_MS);
     }
-    
+
     /**
      * Validates health configuration.
      *
@@ -141,38 +125,26 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateHealth(Config.Health health) {
-        // Readiness threshold must be between 0.0 and 1.0
         double readinessThreshold = health.getReadinessThreshold();
-        if (readinessThreshold < 0.0) {
-            throw new IllegalStateException(
-                "health.readiness-threshold must be >= 0.0, got: " + readinessThreshold);
-        }
-        if (readinessThreshold > 1.0) {
-            throw new IllegalStateException(
-                "health.readiness-threshold must be <= 1.0, got: " + readinessThreshold);
-        }
+        requireInRange("health.readiness-threshold", readinessThreshold,
+            Config.Health.MIN_THRESHOLD, Config.Health.MAX_THRESHOLD);
 
-        // Healthy threshold must be between 0.0 and 1.0
         double healthyThreshold = health.getHealthyThreshold();
-        if (healthyThreshold < 0.0) {
+        requireInRange("health.healthy-threshold", healthyThreshold,
+            Config.Health.MIN_THRESHOLD, Config.Health.MAX_THRESHOLD);
+
+        // Semantic invariant: readiness is a lower bar than full health, so
+        // readiness-threshold must not exceed healthy-threshold. Otherwise a
+        // coverage value can report healthy=true, ready=false, which violates
+        // the contract that ready is always at least as permissive as healthy.
+        if (readinessThreshold > healthyThreshold) {
             throw new IllegalStateException(
-                "health.healthy-threshold must be >= 0.0, got: " + healthyThreshold);
-        }
-        if (healthyThreshold > 1.0) {
-            throw new IllegalStateException(
-                "health.healthy-threshold must be <= 1.0, got: " + healthyThreshold);
+                "health.readiness-threshold must be <= health.healthy-threshold, got: readiness="
+                    + readinessThreshold + ", healthy=" + healthyThreshold);
         }
 
-        // Max latency must be between 100 and 60000 ms
-        int maxLatencyMs = health.getMaxLatencyMs();
-        if (maxLatencyMs < 100) {
-            throw new IllegalStateException(
-                "health.max-latency-ms must be >= 100, got: " + maxLatencyMs);
-        }
-        if (maxLatencyMs > 60000) {
-            throw new IllegalStateException(
-                "health.max-latency-ms must be <= 60000, got: " + maxLatencyMs);
-        }
+        requireInRange("health.max-latency-ms", health.getMaxLatencyMs(),
+            Config.Health.MIN_MAX_LATENCY_MS, Config.Health.MAX_MAX_LATENCY_MS);
     }
 
     /**
@@ -182,60 +154,16 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateQuery(Config.Query query) {
-        // Default top-k must be between 1 and 10000
-        int defaultTopK = query.getDefaultTopK();
-        if (defaultTopK < 1) {
-            throw new IllegalStateException(
-                "query.top-k-default must be >= 1, got: " + defaultTopK);
-        }
-        if (defaultTopK > 10000) {
-            throw new IllegalStateException(
-                "query.top-k-default must be <= 10000, got: " + defaultTopK);
-        }
-
-        // Recall target must be between 0.0 and 1.0
-        double recallTarget = query.getRecallTarget();
-        if (recallTarget < 0.0) {
-            throw new IllegalStateException(
-                "query.recall-target must be >= 0.0, got: " + recallTarget);
-        }
-        if (recallTarget > 1.0) {
-            throw new IllegalStateException(
-                "query.recall-target must be <= 1.0, got: " + recallTarget);
-        }
-
-        // Threshold must be between 0.0 and 1.0
-        double threshold = query.getThreshold();
-        if (threshold < 0.0) {
-            throw new IllegalStateException(
-                "query.threshold must be >= 0.0, got: " + threshold);
-        }
-        if (threshold > 1.0) {
-            throw new IllegalStateException(
-                "query.threshold must be <= 1.0, got: " + threshold);
-        }
-
-        // Vector dimensions must be between 128 and 4096
-        int vectorDimensions = query.getVectorDimensions();
-        if (vectorDimensions < 128) {
-            throw new IllegalStateException(
-                "query.vector-dimensions must be >= 128, got: " + vectorDimensions);
-        }
-        if (vectorDimensions > 4096) {
-            throw new IllegalStateException(
-                "query.vector-dimensions must be <= 4096, got: " + vectorDimensions);
-        }
-
-        // LLM timeout must be between 5000 and 300000 ms
-        int llmTimeoutMs = query.getLlmTimeoutMs();
-        if (llmTimeoutMs < 5000) {
-            throw new IllegalStateException(
-                "query.llm-timeout-ms must be >= 5000, got: " + llmTimeoutMs);
-        }
-        if (llmTimeoutMs > 300000) {
-            throw new IllegalStateException(
-                "query.llm-timeout-ms must be <= 300000, got: " + llmTimeoutMs);
-        }
+        requireInRange("query.top-k-default", query.getDefaultTopK(),
+            Config.Query.MIN_TOP_K, Config.Query.MAX_TOP_K);
+        requireInRange("query.recall-target", query.getRecallTarget(),
+            Config.Query.MIN_PROBABILITY, Config.Query.MAX_PROBABILITY);
+        requireInRange("query.threshold", query.getThreshold(),
+            Config.Query.MIN_PROBABILITY, Config.Query.MAX_PROBABILITY);
+        requireInRange("query.vector-dimensions", query.getVectorDimensions(),
+            Config.Query.MIN_VECTOR_DIMENSIONS, Config.Query.MAX_VECTOR_DIMENSIONS);
+        requireInRange("query.llm-timeout-ms", query.getLlmTimeoutMs(),
+            Config.Query.MIN_LLM_TIMEOUT_MS, Config.Query.MAX_LLM_TIMEOUT_MS);
     }
 
     /**
@@ -245,36 +173,71 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateLlm(Config.Llm llm) {
-        // Base URL must be a valid URL
+        validateLlmEndpoint(llm);
+        validateLlmLimits(llm);
+    }
+
+    /**
+     * Validates the LLM endpoint and the safety of sending the credential to it.
+     *
+     * @param llm LLM configuration
+     * @throws IllegalStateException if invalid
+     */
+    private static void validateLlmEndpoint(Config.Llm llm) {
         String baseUrl = llm.getBaseUrl();
-        if (baseUrl != null && !isValidUrl(baseUrl)) {
+        if (baseUrl == null) {
+            return;
+        }
+        if (!isValidUrl(baseUrl)) {
             throw new IllegalStateException(
                 "llm.base-url must be a valid URL (http:// or https://), got: " + baseUrl);
         }
 
-        // Embeddings dimensions must be between 128 and 4096
-        int embeddingsDimensions = llm.getEmbeddingsDimensions();
-        if (embeddingsDimensions < 128) {
+        // The API key is attached as a Bearer header to every embedding and scoring
+        // request. Plain http:// exists for a local model server, which needs no
+        // credential; combined with a key and a remote host it puts that key on the
+        // wire in cleartext.
+        String apiKey = llm.getApiKey();
+        String host = hostOf(baseUrl);
+        if (apiKey != null && !apiKey.isEmpty()
+                && baseUrl.startsWith(HTTP_PREFIX) && !isLoopbackHost(host)) {
             throw new IllegalStateException(
-                "llm.embeddings-dimensions must be >= 128, got: " + embeddingsDimensions);
-        }
-        if (embeddingsDimensions > 4096) {
-            throw new IllegalStateException(
-                "llm.embeddings-dimensions must be <= 4096, got: " + embeddingsDimensions);
-        }
-
-        // Retry base delay must be between 10 and 30000 ms
-        long retryBaseDelayMs = llm.getRetryBaseDelayMs();
-        if (retryBaseDelayMs < 10) {
-            throw new IllegalStateException(
-                "llm.retry-base-delay-ms must be >= 10, got: " + retryBaseDelayMs);
-        }
-        if (retryBaseDelayMs > 30000) {
-            throw new IllegalStateException(
-                "llm.retry-base-delay-ms must be <= 30000, got: " + retryBaseDelayMs);
+                "llm.api-key would be sent in cleartext: llm.base-url uses http:// with the "
+                    + "non-loopback host '" + host + "'. Use https://, or leave llm.api-key empty.");
         }
     }
-    
+
+    /**
+     * Validates the numeric bounds the LLM client enforces at construction time.
+     *
+     * <p>These are checked here so a violation aborts startup, rather than surfacing
+     * later where the client is built inside a catch block that degrades the LLM
+     * subsystems to a silent no-op.</p>
+     *
+     * @param llm LLM configuration
+     * @throws IllegalStateException if invalid
+     */
+    private static void validateLlmLimits(Config.Llm llm) {
+        requireInRange("llm.embeddings-dimensions", llm.getEmbeddingsDimensions(),
+            Config.Llm.MIN_EMBEDDINGS_DIMENSIONS, Config.Llm.MAX_EMBEDDINGS_DIMENSIONS);
+        requireInRange("llm.timeout-ms", llm.getTimeoutMs(),
+            Config.Llm.MIN_TIMEOUT_MS, Config.Llm.MAX_TIMEOUT_MS);
+        requireInRange("llm.max-retries", llm.getMaxRetries(),
+            Config.Llm.MIN_MAX_RETRIES, Config.Llm.MAX_MAX_RETRIES);
+        requireInRange("llm.failure-threshold", llm.getFailureThreshold(),
+            Config.Llm.MIN_FAILURE_THRESHOLD, Config.Llm.MAX_FAILURE_THRESHOLD);
+        requireInRange("llm.cooldown-period-ms", llm.getCooldownPeriodMs(),
+            Config.Llm.MIN_COOLDOWN_PERIOD_MS, Config.Llm.MAX_COOLDOWN_PERIOD_MS);
+        requireInRange("llm.max-prompts-per-query", llm.getMaxPromptsPerQuery(),
+            Config.Llm.MIN_MAX_PROMPTS_PER_QUERY, Config.Llm.MAX_MAX_PROMPTS_PER_QUERY);
+        requireInRange("llm.relevancy-threshold", llm.getRelevancyThreshold(),
+            Config.Llm.MIN_RELEVANCY_THRESHOLD, Config.Llm.MAX_RELEVANCY_THRESHOLD);
+        requireInRange("llm.max-batch-tokens", llm.getMaxBatchTokens(),
+            Config.Llm.MIN_MAX_BATCH_TOKENS, Config.Llm.MAX_MAX_BATCH_TOKENS);
+        requireInRange("llm.retry-base-delay-ms", llm.getRetryBaseDelayMs(),
+            Config.Llm.MIN_RETRY_BASE_DELAY_MS, Config.Llm.MAX_RETRY_BASE_DELAY_MS);
+    }
+
     /**
      * Validates shard configuration.
      *
@@ -282,51 +245,53 @@ public final class ConfigValidation {
      * @throws IllegalStateException if invalid
      */
     private static void validateShard(Config.Shard shard) {
-        // Load factor must be between 0.5 and 0.9
-        double loadFactor = shard.getLoadFactor();
-        if (loadFactor < 0.5) {
-            throw new IllegalStateException(
-                "shard.segment-load-factor must be >= 0.5, got: " + loadFactor);
+        requireInRange("shard.segment-load-factor", shard.getLoadFactor(), 0.5, 0.9);
+        requireInRange("shard.default-ef-construction", shard.getEfConstruction(), 16, 1024);
+        requireInRange("shard.default-ef-search", shard.getEfSearch(), 8, 1024);
+        requireInRange("shard.hnsw-integration-queue-depth-limit", shard.getHnswQueueLimit(),
+            10000, 1000000);
+    }
+
+    /**
+     * Requires an integral setting to fall within an inclusive range.
+     *
+     * @param key Setting name used in the failure message
+     * @param value Configured value
+     * @param min Inclusive lower bound
+     * @param max Inclusive upper bound
+     * @throws IllegalStateException if the value is out of range
+     */
+    private static void requireInRange(String key, long value, long min, long max) {
+        if (value < min) {
+            throw new IllegalStateException(key + " must be >= " + min + ", got: " + value);
         }
-        if (loadFactor > 0.9) {
-            throw new IllegalStateException(
-                "shard.segment-load-factor must be <= 0.9, got: " + loadFactor);
-        }
-        
-        // efConstruction must be between 16 and 1024
-        int efConstruction = shard.getEfConstruction();
-        if (efConstruction < 16) {
-            throw new IllegalStateException(
-                "shard.default-ef-construction must be >= 16, got: " + efConstruction);
-        }
-        if (efConstruction > 1024) {
-            throw new IllegalStateException(
-                "shard.default-ef-construction must be <= 1024, got: " + efConstruction);
-        }
-        
-        // efSearch must be between 8 and 1024
-        int efSearch = shard.getEfSearch();
-        if (efSearch < 8) {
-            throw new IllegalStateException(
-                "shard.default-ef-search must be >= 8, got: " + efSearch);
-        }
-        if (efSearch > 1024) {
-            throw new IllegalStateException(
-                "shard.default-ef-search must be <= 1024, got: " + efSearch);
-        }
-        
-        // HNSW queue limit must be between 10000 and 1000000
-        int hnswQueueLimit = shard.getHnswQueueLimit();
-        if (hnswQueueLimit < 10000) {
-            throw new IllegalStateException(
-                "shard.hnsw-integration-queue-depth-limit must be >= 10000, got: " + hnswQueueLimit);
-        }
-        if (hnswQueueLimit > 1000000) {
-            throw new IllegalStateException(
-                "shard.hnsw-integration-queue-depth-limit must be <= 1000000, got: " + hnswQueueLimit);
+        if (value > max) {
+            throw new IllegalStateException(key + " must be <= " + max + ", got: " + value);
         }
     }
-    
+
+    /**
+     * Requires a floating-point setting to fall within an inclusive range.
+     *
+     * <p>NaN is rejected explicitly: it fails no ordered comparison, so an unguarded
+     * range check admits it and every downstream score comparison then evaluates
+     * false.</p>
+     *
+     * @param key Setting name used in the failure message
+     * @param value Configured value
+     * @param min Inclusive lower bound
+     * @param max Inclusive upper bound
+     * @throws IllegalStateException if the value is out of range or NaN
+     */
+    private static void requireInRange(String key, double value, double min, double max) {
+        if (Double.isNaN(value) || value < min) {
+            throw new IllegalStateException(key + " must be >= " + min + ", got: " + value);
+        }
+        if (value > max) {
+            throw new IllegalStateException(key + " must be <= " + max + ", got: " + value);
+        }
+    }
+
     /**
      * Validates a URL format.
      *
@@ -337,11 +302,80 @@ public final class ConfigValidation {
         if (url == null || url.isEmpty()) {
             return false;
         }
-        
-        // Check for http:// or https:// prefix
-        return url.startsWith("http://") || url.startsWith("https://");
+        if (!url.startsWith(HTTP_PREFIX) && !url.startsWith(HTTPS_PREFIX)) {
+            return false;
+        }
+
+        // Reject a scheme with no authority ("http://") and an authority carrying
+        // embedded userinfo ("http://user:pass@host"): neither is a usable endpoint,
+        // and the latter is a credential in the config value.
+        String authority = authorityOf(url);
+        return !authority.isEmpty() && authority.indexOf('@') < 0;
     }
-    
+
+    /**
+     * Extracts the authority component of a URL (everything between the scheme
+     * separator and the path, query or fragment).
+     *
+     * @param url The URL
+     * @return The authority, or an empty string if there is none
+     */
+    private static String authorityOf(String url) {
+        int schemeEnd = url.indexOf("://");
+        if (schemeEnd < 0) {
+            return "";
+        }
+
+        int start = schemeEnd + 3;
+        int end = url.length();
+        for (int i = start; i < url.length(); i++) {
+            char c = url.charAt(i);
+            if (c == '/' || c == '?' || c == '#') {
+                end = i;
+                break;
+            }
+        }
+        return url.substring(start, end);
+    }
+
+    /**
+     * Extracts the host of a URL, without the port.
+     *
+     * @param url The URL
+     * @return The host, or an empty string if there is none
+     */
+    private static String hostOf(String url) {
+        String authority = authorityOf(url);
+
+        // Bracketed IPv6 literal: the colons inside the brackets are not a port
+        if (authority.startsWith("[")) {
+            int closingBracket = authority.indexOf(']');
+            return closingBracket > 0 ? authority.substring(0, closingBracket + 1) : authority;
+        }
+
+        int portSeparator = authority.indexOf(':');
+        return portSeparator >= 0 ? authority.substring(0, portSeparator) : authority;
+    }
+
+    /**
+     * Checks whether a host resolves to the loopback interface.
+     *
+     * @param host Host extracted from a URL
+     * @return true if traffic to this host never leaves the machine
+     */
+    private static boolean isLoopbackHost(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+
+        String normalized = host.toLowerCase(Locale.ROOT);
+        return normalized.equals("localhost")
+            || normalized.endsWith(".localhost")
+            || normalized.equals("::1")
+            || normalized.equals("[::1]")
+            || normalized.startsWith("127.");
+    }
+
     /**
      * Validates that all required configuration sections are present.
      *
@@ -352,7 +386,7 @@ public final class ConfigValidation {
         // All sections are non-null by default (created with default values)
         // This validation ensures that custom Config instances are properly initialized
     }
-    
+
     /**
      * Creates a new ConfigValidation instance.
      *

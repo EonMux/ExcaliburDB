@@ -1,5 +1,9 @@
 package excalibur.api.endpoint;
 
+import excalibur.api.protocol.JsonText;
+import excalibur.api.protocol.ResponseBody;
+
+import java.util.Locale;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import io.excalibur.core.logging.StructuredLoggingHelper;
@@ -7,7 +11,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -172,11 +175,7 @@ public class IngestStatusEndpoint implements HttpHandler {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(200, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, 200, bytes);
     }
 
     /**
@@ -198,33 +197,28 @@ public class IngestStatusEndpoint implements HttpHandler {
         byte[] bytes = sb.toString().getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(200, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, 200, bytes);
     }
 
     /**
      * Sends an error response.
      */
     private void sendError(HttpExchange exchange, int statusCode, String message) throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", escapeJson(message));
+        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, statusCode, bytes);
     }
 
     /**
      * Converts IngestionStatus to JSON.
      */
     private String toJson(IngestionStatus status) {
+        // Locale.ROOT, because the default locale picks the decimal separator: under de_DE
+        // a progress of 0.73 is formatted "0,7300", and the comma ends the JSON value.
         return String.format(
+            Locale.ROOT,
             "{" +
             "\"source_id\": \"%s\", " +
             "\"state\": \"%s\", " +
@@ -233,23 +227,15 @@ public class IngestStatusEndpoint implements HttpHandler {
             "\"entries_pending\": %d, " +
             "\"last_error\": %s" +
             "}",
-            escapeJson(status.sourceId()),
-            escapeJson(status.state()),
+            JsonText.escape(status.sourceId()),
+            JsonText.escape(status.state()),
             status.progress(),
             status.entriesIngested(),
             status.entriesPending(),
-            status.lastError() != null ? "\"" + escapeJson(status.lastError()) + "\"" : "null"
+            status.lastError() != null ? "\"" + JsonText.escape(status.lastError()) + "\"" : "null"
         );
     }
 
-    private String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t");
-    }
 
     // ==================== Inner Classes ====================
 

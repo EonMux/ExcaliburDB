@@ -27,6 +27,7 @@ class MBeanNotificationObserverTest {
     void setUp() {
         observer = new DefaultNotificationObserver();
         broadcaster = new MBeanNotificationBroadcaster(
+            this,
             "TestMBean",
             new String[]{
                 MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY,
@@ -705,16 +706,16 @@ class MBeanNotificationObserverTest {
         // Verify expected attribute counts
         assertEquals(9, Metrics.getQueryLatencyMBean().getAttributes().size(),
             "QueryLatencyMBean should have 9 attributes");
-        assertEquals(3, Metrics.getSystemHealthMBean().getAttributes().size(),
-            "SystemHealthMBean should have 3 attributes");
+        assertEquals(4, Metrics.getSystemHealthMBean().getAttributes().size(),
+            "SystemHealthMBean should have 4 attributes");
         assertEquals(5, Metrics.getIngestionQueueMBean().getAttributes().size(),
             "IngestionQueueMBean should have 5 attributes");
         assertEquals(1, Metrics.getVisibilityEpochMBean().getAttributes().size(),
             "VisibilityEpochMBean should have 1 attribute");
         assertEquals(6, Metrics.getCuckooFpRateMBean().getAttributes().size(),
             "CuckooFpRateMBean should have 6 attributes");
-        assertEquals(8, Metrics.getHnswQueueDepthMBean().getAttributes().size(),
-            "HnswQueueDepthMBean should have 8 attributes");
+        assertEquals(9, Metrics.getHnswQueueDepthMBean().getAttributes().size(),
+            "HnswQueueDepthMBean should have 9 attributes");
     }
 
     @Test
@@ -737,6 +738,7 @@ class MBeanNotificationObserverTest {
         assertTrue(healthAttrs.contains("health"), "Should contain 'health'");
         assertTrue(healthAttrs.contains("isHealthy"), "Should contain 'isHealthy'");
         assertTrue(healthAttrs.contains("ready"), "Should contain 'ready'");
+        assertTrue(healthAttrs.contains("coverage"), "Should contain 'coverage'");
 
         // IngestionQueueMBean attributes (this was missing before fix)
         java.util.Set<String> ingestionAttrs = Metrics.getIngestionQueueMBean().getAttributes();
@@ -769,6 +771,7 @@ class MBeanNotificationObserverTest {
         assertTrue(hnswAttrs.contains("averageTailScan"), "Should contain 'averageTailScan'");
         assertTrue(hnswAttrs.contains("maxTailScan"), "Should contain 'maxTailScan'");
         assertTrue(hnswAttrs.contains("totalTailScanned"), "Should contain 'totalTailScanned'");
+        assertTrue(hnswAttrs.contains("totalVectorEntriesFound"), "Should contain 'totalVectorEntriesFound'");
     }
 
     // ============================================

@@ -325,27 +325,27 @@ public class EndToEndQueryBenchmark {
             int idx = (queryIndex + i) % queryVectors.length;
             float[] query = queryVectors[idx];
 
-            try {
-                QueryRequest request = QueryRequest.builder()
-                    .queryText("benchmark query")
-                    .queryVector(query)
-                    .topK(topK)
-                    .timeoutMs(30_000)
-                    .includePartialSegments(true)
-                    .enableLlmScoring(false)
-                    .correlationId(UUID.randomUUID().toString())
-                    .build();
+            // Query failures propagate deliberately. Swallowing them here let this
+            // benchmark keep reporting a throughput number while 100% of queries threw,
+            // in which case it was measuring exception construction. JMH treats a thrown
+            // benchmark as a failure, which is the correct outcome.
+            QueryRequest request = QueryRequest.builder()
+                .queryText("benchmark query")
+                .queryVector(query)
+                .topK(topK)
+                .timeoutMs(30_000)
+                .includePartialSegments(true)
+                .enableLlmScoring(false)
+                .correlationId(UUID.randomUUID().toString())
+                .build();
 
-                CancellationToken token = new CancellationToken();
-                QueryResponse response = queryPipeline.executeSync(request, token);
+            CancellationToken token = new CancellationToken();
+            QueryResponse response = queryPipeline.executeSync(request, token);
 
-                if (!response.isEmpty()) {
-                    successCount++;
-                }
-                bh.consume(response);
-            } catch (Exception e) {
-                // Query failed, count as unsuccessful
+            if (!response.isEmpty()) {
+                successCount++;
             }
+            bh.consume(response);
         }
 
         queryIndex += 10;

@@ -1,5 +1,6 @@
 package excalibur.ingest.visibility;
 
+import io.excalibur.core.text.ChunkIdentifiers;
 import excalibur.ingest.buffer.AtomicDocumentBatch;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
@@ -43,9 +44,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p><strong>This class is fully thread-safe.</strong></p>
  * <ul>
  *   <li>Document registrations use ConcurrentHashMap</li>
- *   <li>Epoch tracking uses AtomicLong</li>
+ *   <li>Epoch tracking is delegated to a {@link VisibilityEpochClock}, which is itself
+ *       thread-safe</li>
  *   <li>All public methods can be called from any thread</li>
  * </ul>
+ *
+ * <h2>Which clock</h2>
+ * <p>Production wiring builds this against the node visibility tracker, so a document's commit
+ * epoch and a query's captured epoch are the same counter and can be compared. Built without
+ * one, the tracker keeps a private counter, still enforces all-or-nothing per document, and
+ * reports {@link #sharesNodeEpochClock()} as false so that no caller mistakes its epochs for
+ * a query snapshot.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -64,7 +73,8 @@ public class DocumentVisibilityTracker {
 
     private final DocumentRegistry documentRegistry;
     private final Map<String, DocumentVisibility> documentVisibility;
-    private final AtomicLong currentVisibilityEpoch;
+    private final VisibilityEpochClock clock;
+    private final boolean nodeClock;
     private final Map<String, Set<String>> pendingChunks;
 
     /**
@@ -74,12 +84,7 @@ public class DocumentVisibilityTracker {
      * document metadata persistence is not required.</p>
      */
     public DocumentVisibilityTracker() {
-        this.documentRegistry = new DocumentRegistry();
-        this.documentVisibility = new ConcurrentHashMap<>();
-        this.currentVisibilityEpoch = new AtomicLong(0);
-        this.pendingChunks = new ConcurrentHashMap<>();
-
-        LOGGER.info("DocumentVisibilityTracker initialized with in-memory registry");
+        this(new DocumentRegistry(), privateClock(0));
     }
 
     /**
@@ -89,12 +94,7 @@ public class DocumentVisibilityTracker {
      * @throws NullPointerException if documentRegistry is null
      */
     public DocumentVisibilityTracker(DocumentRegistry documentRegistry) {
-        this.documentRegistry = Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
-        this.documentVisibility = new ConcurrentHashMap<>();
-        this.currentVisibilityEpoch = new AtomicLong(0);
-        this.pendingChunks = new ConcurrentHashMap<>();
-
-        LOGGER.info("DocumentVisibilityTracker initialized");
+        this(documentRegistry, privateClock(0));
     }
 
     /**
@@ -106,15 +106,82 @@ public class DocumentVisibilityTracker {
      * @throws IllegalArgumentException if initialEpoch is negative
      */
     public DocumentVisibilityTracker(DocumentRegistry documentRegistry, long initialEpoch) {
-        this.documentRegistry = Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
+        this(documentRegistry, privateClock(initialEpoch));
         if (initialEpoch < 0) {
             throw new IllegalArgumentException("initialEpoch must be non-negative: " + initialEpoch);
         }
+    }
+
+    /**
+     * Creates a tracker publishing on the node's visibility clock.
+     *
+     * <p>This is the constructor production wiring uses. Sharing the clock with the query
+     * pipeline is what turns the atomicity filter from a completeness check into a real
+     * snapshot bound: a document committed at epoch E is then invisible to a query that
+     * captured any epoch before E, which is a statement the two counters could not make about
+     * each other while they were separate.
+     *
+     * @param documentRegistry The document registry for metadata access
+     * @param nodeVisibility   The node visibility tracker whose epoch queries capture
+     * @throws NullPointerException if either argument is null
+     */
+    public DocumentVisibilityTracker(DocumentRegistry documentRegistry,
+                                     io.excalibur.store.VisibilityTracker nodeVisibility) {
+        this(documentRegistry, VisibilityEpochClock.of(nodeVisibility), true);
+    }
+
+    private DocumentVisibilityTracker(DocumentRegistry documentRegistry,
+                                      VisibilityEpochClock clock) {
+        this(documentRegistry, clock, false);
+    }
+
+    private DocumentVisibilityTracker(DocumentRegistry documentRegistry,
+                                      VisibilityEpochClock clock, boolean nodeClock) {
+        this.documentRegistry =
+            Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
+        this.clock = Objects.requireNonNull(clock, "clock must not be null");
+        this.nodeClock = nodeClock;
         this.documentVisibility = new ConcurrentHashMap<>();
-        this.currentVisibilityEpoch = new AtomicLong(initialEpoch);
         this.pendingChunks = new ConcurrentHashMap<>();
 
-        LOGGER.info("DocumentVisibilityTracker initialized with epoch {}", initialEpoch);
+        LOGGER.info("DocumentVisibilityTracker initialized on {} clock",
+            nodeClock ? "the node" : "a private");
+    }
+
+    /**
+     * A counter of this tracker's own.
+     *
+     * <p>Kept for standalone and test use. Epochs from it mean nothing to anything else in the
+     * process, which is exactly why {@link #sharesNodeEpochClock()} reports false for a tracker
+     * built this way and the query pipeline declines to bound by them.
+     */
+    private static VisibilityEpochClock privateClock(long initialEpoch) {
+        AtomicLong counter = new AtomicLong(Math.max(0, initialEpoch));
+        return new VisibilityEpochClock() {
+            @Override
+            public long currentEpoch() {
+                return counter.get();
+            }
+
+            @Override
+            public long advanceEpoch() {
+                return counter.incrementAndGet();
+            }
+
+            @Override
+            public String toString() {
+                return "VisibilityEpochClock[private]";
+            }
+        };
+    }
+
+    /**
+     * Whether this tracker's epochs are the ones queries capture.
+     *
+     * @return true when built against the node visibility tracker
+     */
+    public boolean sharesNodeEpochClock() {
+        return nodeClock;
     }
 
     /**
@@ -183,6 +250,10 @@ public class DocumentVisibilityTracker {
         );
 
         documentVisibility.put(key, visibility);
+        // Clearing the in-flight marker is what completes the publish. Without it a document
+        // begun with beginIngestion and finished through this path stays pending forever:
+        // invisible to every query, and never released.
+        pendingChunks.remove(key);
 
         LOGGER.debug("Document {} recovered from metadata at epoch {} with {} chunks",
             key, commitEpoch, chunkIds.size());
@@ -247,6 +318,17 @@ public class DocumentVisibilityTracker {
      * @param queryEpoch The epoch at which the query was started
      * @return true if the document is fully visible at the query epoch
      */
+    /**
+     * Whether this tracker knows about the document, committed or in flight.
+     *
+     * @param documentId The document identifier
+     * @return true when the document is tracked
+     */
+    public boolean isDocumentTracked(String documentId) {
+        Objects.requireNonNull(documentId, "documentId must not be null");
+        return documentVisibility.containsKey(documentId) || pendingChunks.containsKey(documentId);
+    }
+
     public boolean isDocumentFullyVisible(String documentId, long queryEpoch) {
         Objects.requireNonNull(documentId, "documentId must not be null");
 
@@ -263,7 +345,7 @@ public class DocumentVisibilityTracker {
      *
      * <p>A chunk is visible if its document is fully visible.</p>
      *
-     * @param chunkId The chunk identifier (format: documentId:chunkIndex)
+     * @param chunkId The chunk identifier (format: sourceId:documentId:chunk:index)
      * @param queryEpoch The epoch at which the query was started
      * @return true if the chunk is visible at the query epoch
      */
@@ -347,10 +429,14 @@ public class DocumentVisibilityTracker {
     /**
      * Advances the visibility epoch.
      *
+     * <p>On the node clock this is the same advance segment registration and the epoch tick
+     * scheduler perform, so a document published here becomes visible to queries in the same
+     * ordering as everything else that becomes visible.
+     *
      * @return The new epoch value
      */
     public long advanceEpoch() {
-        long newEpoch = currentVisibilityEpoch.incrementAndGet();
+        long newEpoch = clock.advanceEpoch();
         LOGGER.trace("Visibility epoch advanced to {}", newEpoch);
         return newEpoch;
     }
@@ -361,7 +447,7 @@ public class DocumentVisibilityTracker {
      * @return The current epoch
      */
     public long currentEpoch() {
-        return currentVisibilityEpoch.get();
+        return clock.currentEpoch();
     }
 
     /**
@@ -414,20 +500,18 @@ public class DocumentVisibilityTracker {
      * Creates a composite key from source ID and document ID.
      */
     private static String makeKey(String sourceId, String documentId) {
-        return sourceId + ":" + documentId;
+        return ChunkIdentifiers.documentKey(sourceId, documentId);
     }
 
     /**
-     * Extracts the document ID from a chunk ID.
+     * Extracts the document key from a chunk ID.
      *
-     * <p>Chunk ID format: documentId:chunkIndex</p>
+     * <p>Chunk ID format: {@code sourceId:documentId:chunk:index}. Splitting on the last colon
+     * would be wrong: both the source-qualified prefix and document ids such as URLs contain
+     * colons of their own.</p>
      */
     private static String extractDocumentId(String chunkId) {
-        int lastColon = chunkId.lastIndexOf(':');
-        if (lastColon > 0) {
-            return chunkId.substring(0, lastColon);
-        }
-        return chunkId;
+        return ChunkIdentifiers.documentKeyOfChunk(chunkId);
     }
 
     /**

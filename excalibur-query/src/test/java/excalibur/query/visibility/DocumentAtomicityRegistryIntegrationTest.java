@@ -55,13 +55,44 @@ class DocumentAtomicityRegistryIntegrationTest {
     }
 
     @Test
-    void testFilterPartialDocuments_noRegisteredDocuments() {
+    void testFilterPartialDocuments_unknownDocumentsPassThrough() {
         QueryResultItem r1 = createResult(1L, 0.5f);
         QueryResultItem r2 = createResult(2L, 0.4f);
 
         List<QueryResultItem> filtered = filter.filterPartialDocuments(Arrays.asList(r1, r2), 10L);
 
-        assertTrue(filtered.isEmpty(), "No results should be visible when no documents are registered");
+        assertEquals(2, filtered.size(),
+            "A document this registry has never seen is not the same as one it knows to be "
+                + "incomplete. The registry is built in memory as documents are published, so "
+                + "after a restart everything written earlier is unknown -- excluding those "
+                + "would drop them from every result once one new document arrives.");
+    }
+
+    @Test
+    void testFilterPartialDocuments_tombstonedIsExcludedNotForgotten() {
+        registry.registerDocument("1", List.of("1:0"), 5L);
+        registry.tombstoneDocument("1");
+
+        List<QueryResultItem> filtered =
+            filter.filterPartialDocuments(List.of(createResult(1L, 0.5f)), 10L);
+
+        assertTrue(filtered.isEmpty(),
+            "A deleted document is known and deliberately invisible; forgetting it entirely "
+                + "would make it indistinguishable from an unknown one and bring it back");
+    }
+
+    @Test
+    void testFilterPartialDocuments_resultWithoutDocumentIdPassesThrough() {
+        registry.registerDocument("1", List.of("1:0"), 5L);
+
+        // A result with no document identity - a write-log tail-scan hit whose key could
+        // not be decoded, for instance - is not something the atomicity model can classify.
+        // Dropping it would be a false negative rather than a guarantee.
+        QueryResultItem noIdentity = new QueryResultItem(99L, 0.9f, null, -1L, 99L);
+
+        List<QueryResultItem> filtered = filter.filterPartialDocuments(List.of(noIdentity), 10L);
+
+        assertEquals(1, filtered.size());
     }
 
     @Test
@@ -133,7 +164,11 @@ class DocumentAtomicityRegistryIntegrationTest {
 
     @Test
     void testVerifyAtomicity() {
+        // Document 2 is registered but not yet visible at the query epoch, which is what the
+        // verification is meant to count. An unregistered document would not be: the registry
+        // has no opinion about it.
         registry.registerDocument("1", List.of("1:0"), 5L);
+        registry.registerDocument("2", List.of("2:0"), 15L);
 
         QueryResultItem visible = createResult(1L, 0.5f);
         QueryResultItem partial = createResult(2L, 0.4f);
@@ -151,13 +186,16 @@ class DocumentAtomicityRegistryIntegrationTest {
     @Test
     void testIsResultVisible() {
         registry.registerDocument("1", List.of("1:0"), 5L);
+        registry.registerDocument("2", List.of("2:0"), 15L);
 
         QueryResultItem visible = createResult(1L, 0.5f);
-        QueryResultItem notVisible = createResult(2L, 0.4f);
+        QueryResultItem notYetVisible = createResult(2L, 0.4f);
+        QueryResultItem unknown = createResult(3L, 0.3f);
 
         assertTrue(filter.isResultVisible(visible, 10L));
-        assertFalse(filter.isResultVisible(notVisible, 10L));
-        assertFalse(filter.isResultVisible(visible, 3L));
+        assertFalse(filter.isResultVisible(notYetVisible, 10L), "registered, epoch not reached");
+        assertFalse(filter.isResultVisible(visible, 3L), "query started before the commit");
+        assertTrue(filter.isResultVisible(unknown, 10L), "the registry has no opinion about it");
     }
 
     @Test
@@ -200,7 +238,13 @@ class DocumentAtomicityRegistryIntegrationTest {
         assertThrows(IllegalArgumentException.class, () -> filter.filterPartialDocuments(List.of(), -1L));
     }
 
+    /**
+     * Builds a result carrying an explicit string document identity - the only identity
+     * the filter consults. The numeric field is the HNSW node ID, which lives in a
+     * different namespace and is never treated as a document ID.
+     */
     private QueryResultItem createResult(long documentId, float score) {
-        return new QueryResultItem(documentId, score, null, -1, documentId);
+        return new QueryResultItem(
+            documentId, String.valueOf(documentId), score, null, -1L, documentId);
     }
 }

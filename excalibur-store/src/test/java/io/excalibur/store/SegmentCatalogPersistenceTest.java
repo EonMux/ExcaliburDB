@@ -133,7 +133,39 @@ class SegmentCatalogPersistenceTest {
     }
 
     /**
-     * Test: Corrupt catalog file, verify graceful handling.
+     * Test: a torn header slot must not cost the catalog its records.
+     *
+     * <p>The header is written to alternating slots, so a crash part-way through an
+     * update leaves the other slot intact and the catalog opens from it.</p>
+     */
+    @Test
+    void testCorruptHeaderSlotIsRecovered() throws IOException {
+        // Create catalog and add data
+        SegmentCatalog catalog = new SegmentCatalog(catalogPath, arena);
+        catalog.add(1L, tempDir.resolve("segment_1.dat"));
+        catalog.update(1L, SegmentCatalog.ENTRY_STATE_ACTIVE, 50);
+        catalog.flush();
+        catalog.close();
+
+        // Corrupt the CRC of the first header slot
+        try (RandomAccessFile raf = new RandomAccessFile(catalogPath.toFile(), "rw")) {
+            raf.seek(28);
+            raf.writeInt(0xDEADBEEF);
+        }
+
+        SegmentCatalog recovered = new SegmentCatalog(catalogPath, arena);
+        recovered.recover();
+
+        assertEquals(1, recovered.size(),
+            "A single torn header slot must not discard the catalog");
+        assertNotNull(recovered.get(1L));
+
+        recovered.close();
+    }
+
+    /**
+     * Test: with both header slots unusable, the records themselves are checksummed,
+     * so the count is rebuilt from them instead of the catalog being reset to empty.
      */
     @Test
     void testCorruptCatalogFile() throws IOException {
@@ -144,20 +176,20 @@ class SegmentCatalogPersistenceTest {
         catalog.flush();
         catalog.close();
 
-        // Corrupt the catalog file
+        // Corrupt the CRC of both header slots
         try (RandomAccessFile raf = new RandomAccessFile(catalogPath.toFile(), "rw")) {
-            // Corrupt the header CRC
-            raf.seek(20);
+            raf.seek(28);
+            raf.writeInt(0xDEADBEEF);
+            raf.seek(60);
             raf.writeInt(0xDEADBEEF);
         }
 
-        // Reopen - should handle corruption gracefully
-        // The CatalogFile should detect the invalid header and recreate
         SegmentCatalog recovered = new SegmentCatalog(catalogPath, arena);
         recovered.recover();
 
-        // Should have empty catalog due to corruption
-        assertEquals(0, recovered.size());
+        assertEquals(1, recovered.size(),
+            "Records that still checksum must be rebuilt, not discarded");
+        assertNotNull(recovered.get(1L));
 
         recovered.close();
     }

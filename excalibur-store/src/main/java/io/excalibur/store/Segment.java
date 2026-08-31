@@ -147,6 +147,9 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class Segment implements AutoCloseable {
 
+    private static final java.util.logging.Logger LOGGER =
+        java.util.logging.Logger.getLogger(Segment.class.getName());
+
     // ==================== Constants ====================
 
     /** Minimum segment capacity (number of slots). Must be power of 2. */
@@ -157,6 +160,14 @@ public class Segment implements AutoCloseable {
 
     /** Load factor threshold for triggering split/rejection. */
     public static final double LOAD_FACTOR_THRESHOLD = 0.7;
+
+    /**
+     * This segment's threshold, defaulting to {@link #LOAD_FACTOR_THRESHOLD}.
+     *
+     * <p>Per-segment rather than static so it can be configured. The constant remains the default
+     * and the documented value.
+     */
+    private final double loadFactorThreshold;
 
     /** Maximum probe length before giving up. */
     public static final int MAX_PROBE_LENGTH = 128;
@@ -213,7 +224,15 @@ public class Segment implements AutoCloseable {
 
     // ==================== Instance Fields ====================
 
-    private final Path path;
+    /**
+     * Path to the backing file.
+     *
+     * <p>Not final: compaction and split publication rename the backing file into its
+     * canonical {@code segment_<index>.dat} name while this segment stays mapped, and
+     * {@link #renamedTo(Path)} then records the new name.</p>
+     */
+    private volatile Path path;
+
     private final Arena arena;
     private final FileChannel fileChannel;
     private final MemorySegment segment;
@@ -222,7 +241,19 @@ public class Segment implements AutoCloseable {
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private volatile boolean closed = false;
+
+    /**
+     * Number of OCCUPIED slots, tombstoned or not.
+     *
+     * <p>This is the number the Robin Hood probe budget has to be measured against,
+     * because a tombstoned slot is never reused. {@link #liveEntryCount} tracks the
+     * number of readable entries.</p>
+     */
     private volatile int entryCount = 0;
+
+    /** Number of occupied slots that are not tombstoned. */
+    private volatile int liveEntryCount = 0;
+
     private volatile long dataOffset = 0; // Current write offset in data region
 
     /**
@@ -243,14 +274,18 @@ public class Segment implements AutoCloseable {
      * Every mutation (put, delete) is first appended to this log
      * before updating the in-memory hash map.
      */
-    private WriteLog writeLog;
+    private volatile WriteLog writeLog;
+
+    /** Guards {@link #warnUnlogged()} so the warning is issued once per segment. */
+    private final java.util.concurrent.atomic.AtomicBoolean unloggedWarningIssued =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
      * Locality-Sensitive Hashing index for approximate nearest neighbor pre-filtering.
      * Used during Stage 2 of the query pipeline to reduce candidates to ~10x-100x top_k.
      * The index is populated during document ingestion when vectors are written.
      */
-    private excalibur.filter.lsh.LshIndex lshIndex;
+    private volatile excalibur.filter.lsh.LshIndex lshIndex;
 
     /**
      * Count-Min Sketch for term/token frequency estimation.
@@ -261,7 +296,7 @@ public class Segment implements AutoCloseable {
      * allowing the query planner to make informed decisions about segment prioritization
      * and filter ordering without exact counts.</p>
      */
-    private excalibur.filter.sketch.CountMinSketch termFrequencySketch;
+    private volatile excalibur.filter.sketch.CountMinSketch termFrequencySketch;
 
     /**
      * HNSW graph for approximate nearest neighbor search.
@@ -302,6 +337,12 @@ public class Segment implements AutoCloseable {
     private volatile Segment leftChild;
     private volatile Segment rightChild;
 
+    /**
+     * Hash bit used to partition this segment's entries between its two children.
+     * Set by {@link #completeSplit(Segment, Segment, int)}; -1 until a split completes.
+     */
+    private volatile int splitBit = -1;
+
     // ==================== Constructors ====================
 
     /**
@@ -331,6 +372,31 @@ public class Segment implements AutoCloseable {
      * @throws IllegalArgumentException if path is null, arena is null, or capacity is invalid
      */
     public Segment(Path path, long capacityBytes, Arena arena) throws IOException {
+        this(path, capacityBytes, arena, LOAD_FACTOR_THRESHOLD);
+    }
+
+    /**
+     * Creates a segment with an explicit load-factor threshold.
+     *
+     * <p>The threshold decides when the segment refuses further inserts and therefore when it is
+     * split. It is a parameter rather than a constant because it is an operational trade-off —
+     * lower splits sooner and wastes space, higher packs tighter and lengthens probe chains — and
+     * {@code excalibur.shard.segment-load-factor} exists to express it. This module has no
+     * dependency on the config module, so the value is passed in rather than read here.
+     *
+     * @param loadFactorThreshold fraction of slots that may be occupied, in (0, 1)
+     */
+    public Segment(Path path, long capacityBytes, Arena arena, double loadFactorThreshold)
+            throws IOException {
+        if (loadFactorThreshold <= 0.0 || loadFactorThreshold >= 1.0
+                || Double.isNaN(loadFactorThreshold)) {
+            // At or above 1.0 an open-addressed table cannot terminate its probe; at or below 0
+            // it can never accept anything.
+            throw new IllegalArgumentException(
+                "loadFactorThreshold must be in (0, 1), got " + loadFactorThreshold);
+        }
+        this.loadFactorThreshold = loadFactorThreshold;
+
         // Validate parameters
         if (path == null) {
             throw new IllegalArgumentException("Path cannot be null");
@@ -438,6 +504,26 @@ public class Segment implements AutoCloseable {
      * @throws IllegalArgumentException if path or arena is null, or file doesn't exist
      */
     public static Segment openExisting(Path path, Arena arena) throws IOException {
+        return openExisting(path, arena, LOAD_FACTOR_THRESHOLD);
+    }
+
+    /**
+     * Opens an existing segment with an explicit load-factor threshold.
+     *
+     * <p>The threshold is not stored in the file - it governs when to stop accepting inserts,
+     * not how the file is laid out - so it has to be supplied on every open. Defaulting it
+     * meant a segment written under a configured 0.9 was reopened at 0.7 and then rejected
+     * replay of its own already-acknowledged entries, which fails the startup and keeps failing
+     * it.
+     *
+     * @param path                Segment file
+     * @param arena               Arena owning the mapping
+     * @param loadFactorThreshold Fraction of slots that may be occupied, in (0, 1)
+     * @return The opened segment
+     * @throws IOException if the file cannot be opened
+     */
+    public static Segment openExisting(Path path, Arena arena, double loadFactorThreshold)
+            throws IOException {
         if (path == null) {
             throw new IllegalArgumentException("Path cannot be null");
         }
@@ -478,7 +564,8 @@ public class Segment implements AutoCloseable {
 
         // Create a Segment instance using private constructor pattern
         // We need to recover the state from the file
-        Segment result = new Segment(path, arena, fileChannel, segment, slotCount, slotTableSize);
+        Segment result = new Segment(path, arena, fileChannel, segment, slotCount, slotTableSize,
+            loadFactorThreshold);
 
         // Recover entry count and data offset by scanning the slot table
         result.recoverStateFromSlotTable();
@@ -528,7 +615,12 @@ public class Segment implements AutoCloseable {
      * create a Segment instance without truncating the file.</p>
      */
     private Segment(Path path, Arena arena, FileChannel fileChannel, MemorySegment segment,
-                    int slotCount, long slotTableSize) {
+                    int slotCount, long slotTableSize, double loadFactorThreshold) {
+        if (loadFactorThreshold <= 0.0 || loadFactorThreshold >= 1.0
+                || Double.isNaN(loadFactorThreshold)) {
+            throw new IllegalArgumentException(
+                "loadFactorThreshold must be in (0, 1), got " + loadFactorThreshold);
+        }
         this.path = path;
         this.arena = arena;
         this.fileChannel = fileChannel;
@@ -536,6 +628,10 @@ public class Segment implements AutoCloseable {
         this.slotCount = slotCount;
         this.slotTableSize = slotTableSize;
         this.segmentId = SEGMENT_ID_GENERATOR.getAndIncrement();
+        // Supplied by the caller, because it is not in the file. A reopened segment that took
+        // the compile-time default would reject replay of entries it had already acknowledged
+        // under a larger configured threshold.
+        this.loadFactorThreshold = loadFactorThreshold;
         // entryCount and dataOffset will be recovered by recoverStateFromSlotTable()
     }
 
@@ -544,7 +640,8 @@ public class Segment implements AutoCloseable {
      *
      * <p>This method scans all slots in the slot table to:</p>
      * <ul>
-     *   <li>Count occupied entries (non-tombstoned)</li>
+     *   <li>Count occupied slots (tombstoned included) into {@code entryCount}</li>
+     *   <li>Count non-tombstoned slots into {@code liveEntryCount}</li>
      *   <li>Find the maximum data offset (for future writes)</li>
      * </ul>
      *
@@ -552,6 +649,7 @@ public class Segment implements AutoCloseable {
      */
     private void recoverStateFromSlotTable() {
         int recoveredEntryCount = 0;
+        int recoveredLiveCount = 0;
         long maxEndOffset = 0;  // Track the END of the last entry (offset + size)
         long segmentSize = segment.byteSize();
 
@@ -586,14 +684,18 @@ public class Segment implements AutoCloseable {
                     maxEndOffset = entryEndOffset;
                 }
 
-                // Count non-tombstoned entries
+                // Every occupied slot counts towards occupancy: a tombstoned slot is
+                // never reused, so it still consumes probe budget. Live entries are
+                // counted separately for the read-side index space.
+                recoveredEntryCount++;
                 if ((flags & FLAG_TOMBSTONE) == 0) {
-                    recoveredEntryCount++;
+                    recoveredLiveCount++;
                 }
             }
         }
 
         this.entryCount = recoveredEntryCount;
+        this.liveEntryCount = recoveredLiveCount;
         this.dataOffset = maxEndOffset;
     }
 
@@ -619,60 +721,132 @@ public class Segment implements AutoCloseable {
      * @throws IllegalArgumentException if key or value is null, or too large
      */
     public void put(byte[] key, byte[] value) {
-        validateNotClosed();
-        validateNotSplitting();
         validateKey(key);
         validateValue(value);
 
         lock.writeLock().lock();
         try {
-            // Check load factor using integer arithmetic to avoid floating-point precision issues
-            // Reject when: (entryCount + 1) >= ceil(slotCount * LOAD_FACTOR_THRESHOLD)
-            // This ensures we reject when the resulting load factor would be >= 0.7
-            long maxEntriesAtThreshold = (long) Math.ceil(slotCount * LOAD_FACTOR_THRESHOLD);
-            if (entryCount + 1 >= maxEntriesAtThreshold) {
-                double loadFactor = (double) (entryCount + 1) / slotCount;
-                throw new IllegalStateException(
-                    "Load factor " + loadFactor + " would reach or exceed threshold " + LOAD_FACTOR_THRESHOLD);
-            }
-
-            // Check if there's enough space in data region for new entry
-            int entrySize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
-            if (!hasDataSpace(entrySize)) {
-                throw new IllegalStateException(
-                    "Insufficient space in segment data region. Entry size: " + entrySize +
-                    ", available: " + (segment.byteSize() - dataOffset));
-            }
-
-            // Compute hash
-            long keyHash = computeHash(key);
-
-            // WAL: Append to write-ahead log BEFORE modifying the segment
-            // This ensures the log is the source of truth for crash recovery
-            if (writeLog != null) {
-                try {
-                    writeLog.appendPut(key, value);
-                } catch (IOException e) {
-                    throw new IllegalStateException("Failed to append to write-ahead log", e);
-                }
-            }
-
-            // Check if key already exists (update case)
-            int existingSlot = findSlot(keyHash, key);
-            if (existingSlot >= 0) {
-                // Update existing entry
-                updateEntry(existingSlot, key, value);
-                // Increment modification epoch to invalidate existing zero-copy slices
-                modificationEpoch++;
-                return;
-            }
-
-            // Insert new entry
-            insertEntry(keyHash, key, value);
-            // Increment modification epoch to invalidate existing zero-copy slices
-            modificationEpoch++;
+            // Inside the lock, not before it. beginSplit() and close() both take this same
+            // write lock to set their state, so a check made outside it is a check-then-act:
+            // the write blocks acquiring the lock, the split snapshots the segment while it
+            // waits, and the write then lands in a segment whose contents have already been
+            // copied into the children. The caller is told it succeeded and the entry is gone.
+            requireWritable();
+            putInternal(key, value);
         } finally {
             lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Applies a put to the segment. The caller must hold the write lock.
+     *
+     * <p>Ordering matters here:</p>
+     * <ol>
+     *   <li>An overwrite of an existing key consumes no new slot, so the load-factor
+     *       guard is evaluated only for a genuine insert. Otherwise a segment at the
+     *       capacity boundary would reject updates it can trivially satisfy.</li>
+     *   <li>The segment mutation happens <em>before</em> the write-ahead log append.
+     *       The log is a live read source for tail-scan queries, so a write that the
+     *       segment rejects must never be visible in the log or replayed on restart.</li>
+     * </ol>
+     *
+     * @param key   The key (already validated)
+     * @param value The value (already validated)
+     * @throws SegmentCapacityExceededException if the segment cannot admit the write
+     */
+    private void putInternal(byte[] key, byte[] value) {
+        long keyHash = computeHash(key);
+        int existingSlot = findSlot(keyHash, key);
+
+        if (existingSlot >= 0) {
+            updateEntry(existingSlot, key, value);
+        } else {
+            if (isFull()) {
+                double loadFactor = (double) (entryCount + 1) / slotCount;
+                throw new SegmentCapacityExceededException(
+                    SegmentCapacityExceededException.Reason.LOAD_FACTOR,
+                    "Load factor " + loadFactor + " would reach or exceed threshold " + loadFactorThreshold);
+            }
+
+            int entrySize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
+            requireDataSpace(entrySize);
+            insertEntry(keyHash, key, value);
+        }
+
+        appendPutToLog(key, value);
+
+        // Increment modification epoch to invalidate existing zero-copy slices
+        modificationEpoch++;
+    }
+
+    /**
+     * Says once that this segment is accepting mutations that nothing is logging.
+     *
+     * <p>Every segment the engine creates - on discovery, on creation, on a split, on a
+     * compaction - is given a log, so reaching here means the segment was built directly and
+     * its writes survive only if the mapping happens to be written back. Silence made that
+     * indistinguishable from a healthy segment.</p>
+     */
+    private void warnUnlogged() {
+        if (unloggedWarningIssued.compareAndSet(false, true)) {
+            LOGGER.log(java.util.logging.Level.SEVERE,
+                "Segment {0} has no write-ahead log attached: its mutations are not logged and "
+                + "will not survive a crash.", path);
+        }
+    }
+
+    /**
+     * Appends a PUT record to the attached write-ahead log, if any.
+     *
+     * @param key   The key
+     * @param value The value
+     * @throws IllegalStateException if the log append fails
+     */
+    private void appendPutToLog(byte[] key, byte[] value) {
+        WriteLog log = this.writeLog;
+        if (log == null) {
+            warnUnlogged();
+            return;
+        }
+        try {
+            log.appendPut(key, value);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to append to write-ahead log", e);
+        }
+    }
+
+    /**
+     * Appends a DELETE record to the attached write-ahead log, if any.
+     *
+     * @param key The key
+     * @throws IllegalStateException if the log append fails
+     */
+    private void appendDeleteToLog(byte[] key) {
+        WriteLog log = this.writeLog;
+        if (log == null) {
+            warnUnlogged();
+            return;
+        }
+        try {
+            log.appendDelete(key);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to append to write-ahead log", e);
+        }
+    }
+
+    /**
+     * Ensures the data region can hold one more entry record of the given size.
+     *
+     * @param entrySize Size of the record about to be appended
+     * @throws SegmentCapacityExceededException if the data region is exhausted
+     */
+    private void requireDataSpace(int entrySize) {
+        if (!hasDataSpace(entrySize)) {
+            throw new SegmentCapacityExceededException(
+                SegmentCapacityExceededException.Reason.DATA_REGION,
+                "Insufficient space in segment data region. Entry size: " + entrySize +
+                ", available: " + (segment.byteSize() - slotTableSize - dataOffset));
         }
     }
 
@@ -907,12 +1081,13 @@ public class Segment implements AutoCloseable {
      * @throws IllegalArgumentException if key is null
      */
     public boolean delete(byte[] key) {
-        validateNotClosed();
-        validateNotSplitting();
         validateKey(key);
 
         lock.writeLock().lock();
         try {
+            // Inside the lock, for the same reason as put: an acknowledged delete that a
+            // concurrent split discards leaves the key readable through the children.
+            requireWritable();
             long keyHash = computeHash(key);
             int slotIndex = findSlot(keyHash, key);
 
@@ -925,24 +1100,17 @@ public class Segment implements AutoCloseable {
                 return false;
             }
 
-            // WAL: Append to write-ahead log BEFORE modifying the segment
-            // This ensures the log is the source of truth for crash recovery
-            if (writeLog != null) {
-                try {
-                    writeLog.appendDelete(key);
-                } catch (IOException e) {
-                    throw new IllegalStateException("Failed to append to write-ahead log", e);
-                }
-            }
-
-            // Mark slot and entry as tombstoned
+            // Mark slot and entry as tombstoned first: a delete the segment rejects
+            // must never appear in the log, which tail-scan queries read live.
             markAsTombstoned(slotIndex);
+
+            appendDeleteToLog(key);
 
             // Increment modification epoch to invalidate existing zero-copy slices
             modificationEpoch++;
 
-            // Note: entryCount is NOT decremented for tombstones
-            // Compaction will handle cleanup
+            // Note: entryCount is NOT decremented for tombstones - the slot stays
+            // occupied until compaction. liveEntryCount is decremented instead.
 
             return true;
         } finally {
@@ -960,12 +1128,28 @@ public class Segment implements AutoCloseable {
     }
 
     /**
-     * Returns the number of entries in this segment.
+     * Returns the number of occupied slots in this segment.
      *
-     * @return Entry count
+     * <p>Tombstoned entries are included: their slots stay occupied until compaction
+     * rebuilds the segment, so they still consume probe budget and count towards the
+     * load factor. Use {@link #liveEntryCount()} for the number of readable entries.</p>
+     *
+     * @return Occupied slot count
      */
     public int entryCount() {
         return entryCount;
+    }
+
+    /**
+     * Returns the number of readable (non-tombstoned) entries in this segment.
+     *
+     * <p>This is the index space accepted by {@link #readEntryKey(int)} and
+     * {@link #readEntryValue(int)}.</p>
+     *
+     * @return Live entry count
+     */
+    public int liveEntryCount() {
+        return liveEntryCount;
     }
 
     /**
@@ -984,6 +1168,23 @@ public class Segment implements AutoCloseable {
      */
     public Path path() {
         return path;
+    }
+
+    /**
+     * Records that the backing file has been renamed.
+     *
+     * <p>Compaction and split publication move the backing file into its canonical
+     * {@code segment_<index>.dat} name with an atomic rename while this segment stays
+     * mapped. The mapping and the open file descriptor follow the inode, so only the
+     * recorded path has to be updated.</p>
+     *
+     * <p>Callers must have completed the rename successfully before calling this.</p>
+     *
+     * @param newPath The path the backing file now lives at (must not be null)
+     * @throws NullPointerException if newPath is null
+     */
+    void renamedTo(Path newPath) {
+        this.path = Objects.requireNonNull(newPath, "newPath cannot be null");
     }
 
     /**
@@ -1047,6 +1248,47 @@ public class Segment implements AutoCloseable {
 
             // Force any dirty pages to disk
             segment.force();
+
+            // Close the write-ahead log this segment owns, so its descriptor and
+            // final force() are not leaked when the segment is retired.
+            WriteLog log = this.writeLog;
+            if (log != null) {
+                try {
+                    log.close();
+                } catch (IOException e) {
+                    LOGGER.log(java.util.logging.Level.WARNING,
+                        "Failed to close write log for segment " + path, e);
+                }
+            }
+
+            // Close the HNSW graph this segment owns. It holds a FileChannel, an Arena and a
+            // whole-file mapping, and nothing else in production releases them -- so every retired
+            // segment leaked one of each until the process exited, which is what eventually
+            // exhausts the descriptor and mapping budgets. A graph carried onto a replacement by
+            // compaction is detached first (see detachHnswGraph), so this only ever closes a graph
+            // no one else is using.
+            io.excalibur.vector.hnsw.HnswGraph graph = this.hnswGraph;
+            if (graph != null) {
+                try {
+                    graph.close();
+                } catch (Exception e) {
+                    LOGGER.log(java.util.logging.Level.WARNING,
+                        "Failed to close HNSW graph for segment " + path, e);
+                }
+            }
+
+            // Close the LSH index this segment owns. It maps one file per hash table plus a
+            // descriptor, so leaving it open leaks every one of those mappings when the segment
+            // is retired. Only the owner can release them.
+            excalibur.filter.lsh.LshIndex lsh = this.lshIndex;
+            if (lsh != null) {
+                try {
+                    lsh.close();
+                } catch (Exception e) {
+                    LOGGER.log(java.util.logging.Level.WARNING,
+                        "Failed to close LSH index for segment " + path, e);
+                }
+            }
 
             // Close the file channel
             try {
@@ -1321,51 +1563,7 @@ public class Segment implements AutoCloseable {
         validateValue(value);
 
         // Caller must hold write lock - no lock acquisition here
-
-        // Check load factor using integer arithmetic to avoid floating-point precision issues
-        // Reject when: (entryCount + 1) >= ceil(slotCount * LOAD_FACTOR_THRESHOLD)
-        long maxEntriesAtThreshold = (long) Math.ceil(slotCount * LOAD_FACTOR_THRESHOLD);
-        if (entryCount + 1 >= maxEntriesAtThreshold) {
-            double loadFactor = (double) (entryCount + 1) / slotCount;
-            throw new IllegalStateException(
-                "Load factor " + loadFactor + " would reach or exceed threshold " + LOAD_FACTOR_THRESHOLD);
-        }
-
-        // Check if there's enough space in data region for new entry
-        int entrySize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
-        if (!hasDataSpace(entrySize)) {
-            throw new IllegalStateException(
-                "Insufficient space in segment data region. Entry size: " + entrySize +
-                ", available: " + (segment.byteSize() - dataOffset));
-        }
-
-        // Compute hash
-        long keyHash = computeHash(key);
-
-        // WAL: Append to write-ahead log BEFORE modifying the segment
-        // This ensures the log is the source of truth for crash recovery
-        if (writeLog != null) {
-            try {
-                writeLog.appendPut(key, value);
-            } catch (IOException e) {
-                throw new IllegalStateException("Failed to append to write-ahead log", e);
-            }
-        }
-
-        // Check if key already exists (update case)
-        int existingSlot = findSlot(keyHash, key);
-        if (existingSlot >= 0) {
-            // Update existing entry
-            updateEntry(existingSlot, key, value);
-            // Increment modification epoch to invalidate existing zero-copy slices
-            modificationEpoch++;
-            return;
-        }
-
-        // Insert new entry
-        insertEntry(keyHash, key, value);
-        // Increment modification epoch to invalidate existing zero-copy slices
-        modificationEpoch++;
+        putInternal(key, value);
     }
 
     /**
@@ -1399,18 +1597,11 @@ public class Segment implements AutoCloseable {
             return false;
         }
 
-        // WAL: Append to write-ahead log BEFORE modifying the segment
-        // This ensures the log is the source of truth for crash recovery
-        if (writeLog != null) {
-            try {
-                writeLog.appendDelete(key);
-            } catch (IOException e) {
-                throw new IllegalStateException("Failed to append to write-ahead log", e);
-            }
-        }
-
-        // Mark slot and entry as tombstoned
+        // Mark slot and entry as tombstoned first: a delete the segment rejects
+        // must never appear in the log, which tail-scan queries read live.
         markAsTombstoned(slotIndex);
+
+        appendDeleteToLog(key);
 
         // Increment modification epoch to invalidate existing zero-copy slices
         modificationEpoch++;
@@ -1483,79 +1674,134 @@ public class Segment implements AutoCloseable {
      * @param value The value bytes
      */
     private void insertEntry(long keyHash, byte[] key, byte[] value) {
-        int idealSlot = (int) (keyHash & (slotCount - 1));
+        // The incoming entry's record is appended to the data region exactly once.
+        // A Robin Hood displacement then moves only slot metadata: the displaced
+        // entry keeps the data-region record it already owns, so a probe chain of
+        // length k consumes one record, not k + 1.
+        int entrySize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
+        long newRecordOffset = dataOffset;
+        writeEntryAtOffset(slotTableSize + newRecordOffset, keyHash, 0, key, value);
+        dataOffset += entrySize;
+
+        // Metadata of the entry currently being carried along the probe chain.
+        long carriedHash = keyHash;
+        long carriedRecordOffset = newRecordOffset;
+        byte carriedFlags = FLAG_OCCUPIED;
+
+        // Ideal slot of the carried entry; recalculated after every displacement
+        // because the displaced entry hashes elsewhere.
+        int currentIdealSlot = (int) (keyHash & (slotCount - 1));
         int distance = 0;
 
-        // Data to insert (may change due to swaps)
-        long insertKeyHash = keyHash;
-        byte[] insertKey = key;
-        byte[] insertValue = value;
-        // CRITICAL: Track the ideal slot for the CURRENT entry being inserted.
-        // After a Robin Hood swap, this must be recalculated for the displaced entry.
-        int currentIdealSlot = idealSlot;
+        // Victims overwritten so far, newest last, so a failure part-way through
+        // the chain can be unwound instead of losing a pre-existing entry.
+        List<SlotSnapshot> displaced = null;
 
         while (distance < MAX_PROBE_LENGTH) {
-            // Use currentIdealSlot, not idealSlot, to probe from the correct ideal slot
             int slotIndex = (currentIdealSlot + distance) & (slotCount - 1);
             long slotOffset = (long) slotIndex * SLOT_SIZE;
 
-            // Check if slot is empty (unoccupied)
             byte flags = segment.get(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET);
             if ((flags & FLAG_OCCUPIED) == 0) {
-                // Found empty slot - insert here
-                writeToSlot(slotIndex, insertKeyHash, distance, insertKey, insertValue);
+                // Found an empty slot - the chain terminates here
+                writeSlotMetadata(slotIndex, carriedHash, distance, carriedFlags, carriedRecordOffset);
                 entryCount++;
+                liveEntryCount++;
                 return;
             }
 
-            // Check if current occupant has smaller distance (Robin Hood swap condition)
-            // Swap when: new_entry.distance > existing_entry.distance
-            byte slotDistance = segment.get(BYTE_LAYOUT, slotOffset + SLOT_DISTANCE_OFFSET);
+            // Robin Hood swap condition: the occupant travelled less far than we have
+            int slotDistance = segment.get(BYTE_LAYOUT, slotOffset + SLOT_DISTANCE_OFFSET) & 0xFF;
             if (slotDistance < distance) {
-                // Robin Hood swap: displace this entry and continue inserting the displaced one
-                // The displaced entry has traveled less far from its ideal slot,
-                // so we "steal" its slot and continue searching for the displaced entry.
+                SlotSnapshot victim = new SlotSnapshot(
+                    slotIndex,
+                    segment.get(LONG_LAYOUT, slotOffset + SLOT_KEY_HASH_OFFSET),
+                    slotDistance,
+                    flags,
+                    readDataOffset(slotIndex));
 
-                SwapData displaced = readSwapData(slotIndex);
-                writeToSlot(slotIndex, insertKeyHash, distance, insertKey, insertValue);
+                writeSlotMetadata(slotIndex, carriedHash, distance, carriedFlags, carriedRecordOffset);
 
-                // Continue with displaced entry
-                insertKeyHash = displaced.keyHash;
-                insertKey = displaced.key;
-                insertValue = displaced.value;
+                if (displaced == null) {
+                    displaced = new ArrayList<>();
+                }
+                displaced.add(victim);
 
-                // CRITICAL FIX: Recalculate ideal slot for the displaced entry.
-                // The displaced entry has a different key hash, so its ideal slot
-                // is different from the original entry's ideal slot.
-                currentIdealSlot = (int) (insertKeyHash & (slotCount - 1));
-
-                // Critical: The displaced entry's distance must be incremented by 1.
-                // We've taken its slot, so from the next position, it's one step further
-                // from its ideal slot than it was at the current position.
-                // The displaced entry was at slotDistance from its ideal slot.
-                // After we move to the next slot, its distance becomes slotDistance + 1.
+                // Carry the victim onwards from the slot after the one we took
+                carriedHash = victim.keyHash();
+                carriedRecordOffset = victim.dataRegionOffset();
+                carriedFlags = victim.flags();
+                currentIdealSlot = (int) (carriedHash & (slotCount - 1));
                 distance = slotDistance + 1;
 
-                // Domain correctness: validate distance is in range [0, 127]
-                // If slotDistance was 127, distance becomes 128 which overflows unsigned byte
                 if (distance > MAX_DISTANCE) {
-                    throw new IllegalStateException(
+                    rollbackInsert(displaced, newRecordOffset);
+                    throw new SegmentCapacityExceededException(
+                        SegmentCapacityExceededException.Reason.DISTANCE_OVERFLOW,
                         "Distance overflow: displaced entry would have distance " + distance +
                         " which exceeds maximum " + MAX_DISTANCE + ". " +
                         "Hash table is too full or has pathological collision pattern.");
                 }
 
-                // Continue the loop without incrementing distance again
-                // (the increment above already accounts for moving to the next position)
+                // The distance was already advanced for the new position
                 continue;
             }
 
             distance++;
         }
 
-        // Should not happen if load factor is enforced
-        throw new IllegalStateException("Failed to insert after " + MAX_PROBE_LENGTH + " probes. " +
-            "Load factor: " + loadFactor());
+        rollbackInsert(displaced, newRecordOffset);
+        throw new SegmentCapacityExceededException(
+            SegmentCapacityExceededException.Reason.PROBE_EXHAUSTED,
+            "Failed to insert after " + MAX_PROBE_LENGTH + " probes. Load factor: " + loadFactor());
+    }
+
+    /**
+     * Restores every slot overwritten by a failed insertion and releases the data
+     * region record that was appended for the incoming entry.
+     *
+     * <p>Victims are restored newest-first so that a slot overwritten more than once
+     * ends up holding its original occupant.</p>
+     *
+     * @param displaced      Victims in the order they were overwritten, or null if none
+     * @param recordOffset   Data region offset of the record appended for this insert
+     */
+    private void rollbackInsert(List<SlotSnapshot> displaced, long recordOffset) {
+        if (displaced != null) {
+            for (int i = displaced.size() - 1; i >= 0; i--) {
+                SlotSnapshot victim = displaced.get(i);
+                writeSlotMetadata(victim.slotIndex(), victim.keyHash(), victim.distance(),
+                    victim.flags(), victim.dataRegionOffset());
+            }
+        }
+        // Nothing references the record we appended, so the space is reclaimed.
+        dataOffset = recordOffset;
+    }
+
+    /**
+     * Points a slot at an existing data region record.
+     *
+     * <p>The record's distance byte is kept in sync with the slot's, so a record moved
+     * by Robin Hood displacement stays self-describing without being re-appended.</p>
+     *
+     * @param slotIndex        The slot to write
+     * @param keyHash          The entry's key hash
+     * @param distance         Distance from the entry's ideal slot, in [0, {@link #MAX_DISTANCE}]
+     * @param flags            Slot flags to store (preserves the tombstone bit)
+     * @param dataRegionOffset Offset of the entry's record within the data region
+     * @throws IllegalStateException if distance is out of range
+     */
+    private void writeSlotMetadata(int slotIndex, long keyHash, int distance,
+                                   byte flags, long dataRegionOffset) {
+        validateDistance(distance);
+
+        segment.set(BYTE_LAYOUT, slotTableSize + dataRegionOffset + ENTRY_DISTANCE_OFFSET, (byte) distance);
+
+        long slotOffset = (long) slotIndex * SLOT_SIZE;
+        segment.set(LONG_LAYOUT, slotOffset + SLOT_KEY_HASH_OFFSET, keyHash);
+        segment.set(BYTE_LAYOUT, slotOffset + SLOT_DISTANCE_OFFSET, (byte) distance);
+        segment.set(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET, flags);
+        writeDataOffset(slotIndex, dataRegionOffset);
     }
 
     /**
@@ -1587,7 +1833,8 @@ public class Segment implements AutoCloseable {
             long keyHash = segment.get(LONG_LAYOUT, entryOffset + ENTRY_KEY_HASH_OFFSET);
             writeEntryAtOffset(entryOffset, keyHash, distance, key, value);
         } else {
-            // Need to append new entry and update slot
+            // Need to append a new record and repoint the slot at it
+            requireDataSpace(newEntrySize);
             long newDataOffset = dataOffset;
             long keyHash = segment.get(LONG_LAYOUT, slotOffset + SLOT_KEY_HASH_OFFSET);
             writeEntryAtOffset(slotTableSize + newDataOffset, keyHash, distance, key, value);
@@ -1599,41 +1846,13 @@ public class Segment implements AutoCloseable {
 
         // Clear tombstone flag in case we're resurrecting a deleted entry
         byte flags = segment.get(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET);
+        if ((flags & FLAG_TOMBSTONE) != 0) {
+            liveEntryCount++;
+        }
         segment.set(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET, (byte) (flags & ~FLAG_TOMBSTONE));
     }
 
     // ==================== Memory Operations ====================
-
-    /**
-     * Writes entry data to a slot.
-     *
-     * @param slotIndex The slot index to write to
-     * @param keyHash The 64-bit key hash
-     * @param distance Distance from ideal slot (must be in range [0, 127])
-     * @param key The key bytes
-     * @param value The value bytes
-     * @throws IllegalStateException if distance is out of range [0, 127]
-     */
-    private void writeToSlot(int slotIndex, long keyHash, int distance, byte[] key, byte[] value) {
-        // Domain correctness: validate distance before writing
-        validateDistance(distance);
-
-        long slotOffset = (long) slotIndex * SLOT_SIZE;
-        long entryDataOffset = dataOffset;
-
-        // Write entry to data region (includes distance in entry as per spec)
-        writeEntryAtOffset(slotTableSize + entryDataOffset, keyHash, distance, key, value);
-
-        // Write slot metadata (distance duplicated in slot for fast probing)
-        segment.set(LONG_LAYOUT, slotOffset + SLOT_KEY_HASH_OFFSET, keyHash);
-        segment.set(BYTE_LAYOUT, slotOffset + SLOT_DISTANCE_OFFSET, (byte) distance);
-        segment.set(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET, FLAG_OCCUPIED);
-        writeDataOffset(slotIndex, entryDataOffset);
-
-        // Advance data offset
-        int entrySize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
-        dataOffset += entrySize;
-    }
 
     /**
      * Writes an entry at the specified offset in the data region.
@@ -1745,6 +1964,11 @@ public class Segment implements AutoCloseable {
 
     /**
      * Marks a slot and its entry as tombstoned.
+     *
+     * <p>Callers must have verified the slot is occupied and not already tombstoned,
+     * so this method is the single live-to-tombstoned transition point and is where
+     * {@code liveEntryCount} is decremented. {@code entryCount} is unchanged: the slot
+     * stays occupied until compaction rebuilds the segment.</p>
      */
     private void markAsTombstoned(int slotIndex) {
         long slotOffset = (long) slotIndex * SLOT_SIZE;
@@ -1763,6 +1987,8 @@ public class Segment implements AutoCloseable {
         long tombstoneOffset = entryOffset + ENTRY_KEY_BYTES_OFFSET + keyLen + valueLen;
 
         segment.set(BYTE_LAYOUT, tombstoneOffset, (byte) 1);
+
+        liveEntryCount--;
     }
 
     /**
@@ -1939,27 +2165,6 @@ public class Segment implements AutoCloseable {
     }
 
     /**
-     * Reads swap data from a slot for Robin Hood displacement.
-     */
-    private SwapData readSwapData(int slotIndex) {
-        long slotOffset = (long) slotIndex * SLOT_SIZE;
-        long dataRegionOffset = readDataOffset(slotIndex);
-        long entryOffset = slotTableSize + dataRegionOffset;
-
-        long keyHash = segment.get(LONG_LAYOUT, entryOffset + ENTRY_KEY_HASH_OFFSET);
-        int keyLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_KEY_LEN_OFFSET);
-        int valueLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_VALUE_LEN_OFFSET);
-
-        byte[] key = new byte[keyLen];
-        byte[] value = new byte[valueLen];
-
-        MemorySegment.copy(segment, BYTE_LAYOUT, entryOffset + ENTRY_KEY_BYTES_OFFSET, key, 0, keyLen);
-        MemorySegment.copy(segment, BYTE_LAYOUT, entryOffset + ENTRY_KEY_BYTES_OFFSET + keyLen, value, 0, valueLen);
-
-        return new SwapData(keyHash, key, value);
-    }
-
-    /**
      * Clears all slots in the slot table.
      */
     private void clearSlotTable() {
@@ -2071,6 +2276,35 @@ public class Segment implements AutoCloseable {
             throw new IllegalStateException(
                 "Cannot modify segment during split: " + path);
         }
+        // A retired parent no longer appears in the directory and its file has been replaced by
+        // the left child's, so a mutation applied here lands in an inode nothing can reach and
+        // is gone at process exit. A writer that resolved this segment before the split
+        // published still holds a reference to it; refusing tells the caller to route again
+        // rather than losing the write silently.
+        if (splitState == SplitState.SPLIT_COMPLETE) {
+            throw new SegmentRetiredException(
+                "Segment was replaced by its split children: " + path);
+        }
+    }
+
+    /**
+     * Rejects a mutation the segment can no longer honour.
+     *
+     * <p>Both conditions are set by holders of this segment's write lock, so this has to be
+     * called with that lock held to mean anything. Called before acquiring it, it answers a
+     * question about a moment that has passed by the time the write actually happens.
+     *
+     * <p>Split state is checked first. A retired parent is closed shortly after it is replaced,
+     * and "closed" says nothing about where the caller should go instead - while "replaced by
+     * its split children" tells the routing layer to resolve again, which is the difference
+     * between a failed write and one that lands in the right child.
+     *
+     * @throws SegmentRetiredException if the segment was replaced by its split children
+     * @throws IllegalStateException if the segment is closed or splitting
+     */
+    private void requireWritable() {
+        validateNotSplitting();
+        validateNotClosed();
     }
 
     private void validateKey(byte[] key) {
@@ -2126,19 +2360,28 @@ public class Segment implements AutoCloseable {
      * <p><strong>Thread Safety:</strong> This method uses the read lock,
      * allowing concurrent reads but exclusive writes.</p>
      *
-     * @param index The entry index (0-based)
-     * @return Key bytes, or null if index is out of range
-     * @throws IndexOutOfBoundsException if index is negative or >= entryCount
+     * @param index The live entry index (0-based, in [0, {@link #liveEntryCount()}))
+     * @return Key bytes
+     * @throws IndexOutOfBoundsException if index is negative or &gt;= liveEntryCount()
      * @throws IllegalStateException if segment is closed
      */
     public byte[] readEntryKey(int index) {
-        validateIndex(index);
         lock.readLock().lock();
         try {
-            int dataOffset = readEntryDataOffset(index);
-            long keyOffset = slotTableSize + dataOffset;
-            int keyLen = segment.get(INT_LAYOUT, keyOffset + ENTRY_KEY_LEN_OFFSET);
-            return new byte[keyLen];
+            // In a Robin Hood hash table, entries are NOT contiguous in slots 0..N.
+            // We must scan all slots and find the Nth occupied (non-tombstoned) one.
+            validateLiveIndex(index);
+            int slotIndex = findNthOccupiedSlot(index);
+            if (slotIndex < 0) {
+                throw new IndexOutOfBoundsException(
+                    "No live entry at index " + index + " in " + path);
+            }
+            int dataOffset = readSlotDataOffset(slotIndex);
+            long entryOffset = slotTableSize + dataOffset;
+            int keyLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_KEY_LEN_OFFSET);
+            byte[] key = new byte[keyLen];
+            MemorySegment.copy(segment, BYTE_LAYOUT, entryOffset + ENTRY_KEY_BYTES_OFFSET, key, 0, keyLen);
+            return key;
         } finally {
             lock.readLock().unlock();
         }
@@ -2154,23 +2397,53 @@ public class Segment implements AutoCloseable {
      * <p><strong>Thread Safety:</strong> This method uses the read lock,
      * allowing concurrent reads but exclusive writes.</p>
      *
-     * @param index The entry index (0-based)
-     * @return Value bytes, or null if index is out of range
-     * @throws IndexOutOfBoundsException if index is negative or >= entryCount
+     * @param index The live entry index (0-based, in [0, {@link #liveEntryCount()}))
+     * @return Value bytes
+     * @throws IndexOutOfBoundsException if index is negative or &gt;= liveEntryCount()
      * @throws IllegalStateException if segment is closed
      */
     public byte[] readEntryValue(int index) {
-        validateIndex(index);
         lock.readLock().lock();
         try {
-            int dataOffset = readEntryDataOffset(index);
-            long keyOffset = slotTableSize + dataOffset;
-            int keyLen = segment.get(INT_LAYOUT, keyOffset + ENTRY_KEY_LEN_OFFSET);
-            int valueLen = segment.get(INT_LAYOUT, keyOffset + ENTRY_VALUE_LEN_OFFSET);
-            return new byte[valueLen];
+            validateLiveIndex(index);
+            int slotIndex = findNthOccupiedSlot(index);
+            if (slotIndex < 0) {
+                throw new IndexOutOfBoundsException(
+                    "No live entry at index " + index + " in " + path);
+            }
+            int dataOffset = readSlotDataOffset(slotIndex);
+            long entryOffset = slotTableSize + dataOffset;
+            int keyLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_KEY_LEN_OFFSET);
+            int valueLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_VALUE_LEN_OFFSET);
+            byte[] value = new byte[valueLen];
+            MemorySegment.copy(segment, BYTE_LAYOUT,
+                entryOffset + ENTRY_KEY_BYTES_OFFSET + keyLen, value, 0, valueLen);
+            return value;
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /**
+     * Finds the slot index of the Nth occupied (non-tombstoned) entry.
+     * Must be called while holding the read lock.
+     *
+     * @param n The 0-based entry index
+     * @return The slot index, or -1 if not found
+     */
+    private int findNthOccupiedSlot(int n) {
+        int found = 0;
+        for (int slot = 0; slot < slotCount; slot++) {
+            long slotOffset = (long) slot * SLOT_SIZE;
+            byte flags = segment.get(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET);
+            if ((flags & FLAG_OCCUPIED) != 0 && (flags & FLAG_TOMBSTONE) == 0) {
+                if (found == n) {
+                    return slot;
+                }
+                found++;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -2182,13 +2455,9 @@ public class Segment implements AutoCloseable {
      * @throws IllegalStateException if segment is closed
      */
     private int readEntryDataOffset(int index) {
-        int dataOffset = readSlotDataOffset(index);
-        int numEntriesBefore = index;
-        for (int i = 0; i < numEntriesBefore; i++) {
-            int prevOffset = readSlotDataOffset(i);
-            dataOffset += readEntrySize(prevOffset);
-        }
-        return dataOffset;
+        // The slot data offset is already the absolute offset within the data region.
+        // No accumulation of previous entry sizes is needed.
+        return readSlotDataOffset(index);
     }
 
     /**
@@ -2226,10 +2495,16 @@ public class Segment implements AutoCloseable {
         return readEntrySize(dataOffset);
     }
 
-    private void validateIndex(int index) {
-        if (index < 0 || index >= entryCount) {
+    /**
+     * Validates an index into the live (non-tombstoned) entry space.
+     *
+     * @param index The index to validate
+     * @throws IndexOutOfBoundsException if the index is outside [0, liveEntryCount)
+     */
+    private void validateLiveIndex(int index) {
+        if (index < 0 || index >= liveEntryCount) {
             throw new IndexOutOfBoundsException(
-                "Index " + index + " out of range [0, " + entryCount + ")");
+                "Index " + index + " out of range [0, " + liveEntryCount + ")");
         }
     }
 
@@ -2401,6 +2676,22 @@ public class Segment implements AutoCloseable {
      *
      * @return The HNSW graph, or null if none is attached
      */
+    /**
+     * Gives up ownership of the attached HNSW graph without closing it.
+     *
+     * <p>For handing a graph to a replacement segment. {@link #close()} closes whatever is still
+     * attached, so a compaction swap that attaches the same graph to the replacement and then lets
+     * the old segment close would leave the replacement holding a closed graph — mappings released
+     * underneath a live index. Detaching first makes the transfer explicit.
+     *
+     * @return the graph that was attached, or null if there was none
+     */
+    public io.excalibur.vector.hnsw.HnswGraph detachHnswGraph() {
+        io.excalibur.vector.hnsw.HnswGraph detached = this.hnswGraph;
+        this.hnswGraph = null;
+        return detached;
+    }
+
     public io.excalibur.vector.hnsw.HnswGraph hnswGraph() {
         return hnswGraph;
     }
@@ -2529,28 +2820,24 @@ public class Segment implements AutoCloseable {
      * @param value The value bytes
      */
     private void insertEntryForRecovery(long keyHash, byte[] key, byte[] value) {
-        // Check load factor
-        long maxEntriesAtThreshold = (long) Math.ceil(slotCount * LOAD_FACTOR_THRESHOLD);
-        if (entryCount + 1 >= maxEntriesAtThreshold) {
-            throw new IllegalStateException(
-                "Recovery would exceed load factor threshold. Segment needs splitting.");
-        }
-
-        // Check data space
-        int entrySize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
-        if (!hasDataSpace(entrySize)) {
-            throw new IllegalStateException("Insufficient space during recovery");
-        }
-
-        // Check if key already exists
+        // Replaying an update of an already-present key adds no entry, so the
+        // load-factor guard must not be applied to it - otherwise a segment sitting
+        // at its capacity boundary can never replay its own log.
         int existingSlot = findSlot(keyHash, key);
         if (existingSlot >= 0) {
-            // Update existing entry
             updateEntry(existingSlot, key, value);
             return;
         }
 
-        // Insert new entry
+        if (isFull()) {
+            throw new SegmentCapacityExceededException(
+                SegmentCapacityExceededException.Reason.LOAD_FACTOR,
+                "Recovery would exceed load factor threshold. Segment needs splitting.");
+        }
+
+        int entrySize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
+        requireDataSpace(entrySize);
+
         insertEntry(keyHash, key, value);
     }
 
@@ -2577,14 +2864,56 @@ public class Segment implements AutoCloseable {
     /**
      * Checks if this segment should be split.
      *
-     * <p>A segment should split when its load factor reaches or exceeds
-     * the threshold (0.7). This is called by the orchestration layer
-     * to determine when to initiate a background split.</p>
+     * <p>A segment should split once it can take no further insert under its own threshold —
+     * the one it was opened with, which is {@code excalibur.shard.segment-load-factor} in a
+     * configured deployment and {@value #LOAD_FACTOR_THRESHOLD} otherwise. This is called by the
+     * orchestration layer to determine when to initiate a background split.</p>
+
+     * <p>Deliberately the same predicate the insert path refuses on, and not
+     * {@code loadFactor() >= threshold}: see {@link #isFull()} for why those are not the same
+     * question and what the difference cost.</p>
      *
      * @return true if the segment should be split
      */
     public boolean shouldSplit() {
-        return loadFactor() >= LOAD_FACTOR_THRESHOLD;
+        return isFull();
+    }
+
+    /**
+     * Whether the next insert would be refused for load factor.
+     *
+     * <p>The one definition of full, because the two that existed disagreed by an entry and the
+     * disagreement disabled automatic splitting entirely. Inserts were refused when
+     * {@code entryCount + 1} reached {@code ceil(slotCount * threshold)}, so the largest
+     * {@code entryCount} a segment could reach was one below that — and {@link #shouldSplit()}
+     * asked whether {@code loadFactor() >= threshold}, which that entry count is always just
+     * short of. A segment could therefore fill up, refuse every subsequent write, and never once
+     * report that it wanted splitting. The {@link SplitWorker} scanned it every 100ms and always
+     * saw false.
+     *
+     * <p>Defining both in terms of the same predicate makes the split trigger fire on exactly
+     * the insert after the last accepted one, so the worker has the segment queued before a
+     * client is ever told the segment is full.
+     *
+     * @return true when a further insert would exceed the threshold
+     */
+    /**
+     * Returns the fraction of slots this segment may occupy before it is considered full.
+     *
+     * <p>Configured per engine and fixed for the life of a segment. A segment created to
+     * replace or succeed this one - a split child, a compacted rebuild - has to be given the
+     * same value, or the engine's configured threshold silently reverts to the default for
+     * every segment created after the first split.</p>
+     *
+     * @return The load factor threshold, in (0, 1)
+     */
+    public double loadFactorThreshold() {
+        return loadFactorThreshold;
+    }
+
+    private boolean isFull() {
+        // Integer arithmetic avoids floating-point precision issues at the boundary.
+        return entryCount + 1 >= (long) Math.ceil(slotCount * loadFactorThreshold);
     }
 
     /**
@@ -2671,14 +3000,21 @@ public class Segment implements AutoCloseable {
      * <p>After this call, the segment is ready for retirement. New reads
      * and writes should be directed to the child segments.</p>
      *
-     * @param leftChild  The left child segment (keys with hash bit 0)
-     * @param rightChild The right child segment (keys with hash bit 1)
+     * @param leftChild  The left child segment (keys whose {@code splitBit} is 0)
+     * @param rightChild The right child segment (keys whose {@code splitBit} is 1)
+     * @param splitBit   The hash bit the entries were partitioned on. This is the bit
+     *                   the router will newly consult after the routing table doubles,
+     *                   i.e. {@code Integer.numberOfTrailingZeros(routingSegmentCount)}.
      * @throws IllegalStateException if segment is not in SPLITTING state
+     * @throws IllegalArgumentException if splitBit is not in [0, 63]
      * @throws NullPointerException if any child is null
      */
-    public void completeSplit(Segment leftChild, Segment rightChild) {
+    public void completeSplit(Segment leftChild, Segment rightChild, int splitBit) {
         Objects.requireNonNull(leftChild, "Left child cannot be null");
         Objects.requireNonNull(rightChild, "Right child cannot be null");
+        if (splitBit < 0 || splitBit > 63) {
+            throw new IllegalArgumentException("Split bit must be in [0, 63], got: " + splitBit);
+        }
 
         lock.writeLock().lock();
         try {
@@ -2689,6 +3025,7 @@ public class Segment implements AutoCloseable {
 
             this.leftChild = leftChild;
             this.rightChild = rightChild;
+            this.splitBit = splitBit;
             this.splitSnapshot = null;
             this.splitState = SplitState.SPLIT_COMPLETE;
 
@@ -2696,6 +3033,19 @@ public class Segment implements AutoCloseable {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Returns the hash bit this segment's entries were partitioned on.
+     *
+     * <p>Every consumer that has to pick a child for a key must read this value rather
+     * than deriving a bit of its own, so the partitioning and the routing can never
+     * disagree.</p>
+     *
+     * @return The split bit, or -1 if this segment has not completed a split
+     */
+    public int splitBit() {
+        return splitBit;
     }
 
     /**
@@ -2884,9 +3234,19 @@ public class Segment implements AutoCloseable {
     }
 
     /**
-     * Helper class to hold swap data during Robin Hood displacement.
+     * Slot metadata captured before a Robin Hood displacement overwrites it.
+     *
+     * <p>The displaced entry keeps its data region record, so restoring the slot
+     * restores the entry completely.</p>
+     *
+     * @param slotIndex        The slot that was overwritten
+     * @param keyHash          The displaced entry's key hash
+     * @param distance         The displaced entry's distance from its ideal slot
+     * @param flags            The displaced entry's slot flags (including tombstone)
+     * @param dataRegionOffset Offset of the displaced entry's record in the data region
      */
-    private record SwapData(long keyHash, byte[] key, byte[] value) {}
+    private record SlotSnapshot(int slotIndex, long keyHash, int distance,
+                                byte flags, long dataRegionOffset) {}
 
     /**
      * Snapshot of segment state for copy-on-write splitting.

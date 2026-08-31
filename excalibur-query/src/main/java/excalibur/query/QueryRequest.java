@@ -31,7 +31,7 @@ import java.util.Objects;
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Query vector must be non-null and non-empty</li>
- *   <li>topK must be positive</li>
+ *   <li>topK must be positive and at most {@link #MAX_TOP_K}</li>
  *   <li>recallTarget must be in range [0.0, 1.0]</li>
  *   <li>timeoutMs must be positive</li>
  *   <li>threshold must be in range [0.0, 1.0]</li>
@@ -45,6 +45,16 @@ import java.util.Objects;
  * @since 6.0
  */
 public final class QueryRequest {
+
+    /**
+     * Largest result count a request may ask for.
+     *
+     * <p>topK is client-supplied and flows into collection sizings, oversampling
+     * multipliers and per-segment search widths, so it is bounded at the request boundary
+     * rather than left to overflow or to allocate on a client's say-so. Ten thousand
+     * results is far beyond any realistic top-k query.</p>
+     */
+    public static final int MAX_TOP_K = 10_000;
 
     // ==================== Instance Fields ====================
 
@@ -138,6 +148,9 @@ public final class QueryRequest {
         }
         if (topK <= 0) {
             throw new IllegalStateException("topK must be positive: " + topK);
+        }
+        if (topK > MAX_TOP_K) {
+            throw new IllegalStateException("topK must be at most " + MAX_TOP_K + ": " + topK);
         }
         if (recallTarget < 0.0 || recallTarget > 1.0) {
             throw new IllegalStateException("recallTarget must be in [0.0, 1.0]: " + recallTarget);
@@ -421,12 +434,16 @@ public final class QueryRequest {
         /**
          * Sets the number of results to return.
          *
-         * @param topK The number of results (must be positive)
+         * @param topK The number of results (must be positive and at most {@link #MAX_TOP_K})
          * @return This builder
+         * @throws IllegalArgumentException if topK is not in [1, {@link #MAX_TOP_K}]
          */
         public Builder topK(int topK) {
             if (topK <= 0) {
                 throw new IllegalArgumentException("topK must be positive: " + topK);
+            }
+            if (topK > MAX_TOP_K) {
+                throw new IllegalArgumentException("topK must be at most " + MAX_TOP_K + ": " + topK);
             }
             this.topK = topK;
             return this;

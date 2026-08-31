@@ -327,16 +327,28 @@ public class GoldenTest {
     
     /**
      * Compare metadata maps.
+     *
+     * <p>Walks the expected keys, not the actual ones. Streaming the actual map cannot see a key
+     * that is missing from it - and an item whose metadata came back empty produced an empty
+     * stream, which matches everything. A regression that dropped provenance fields entirely was
+     * therefore reported as a pass.</p>
+     *
+     * @param actual The metadata the query returned
+     * @param expected The metadata the golden case declares
+     * @param tolerance Tolerance for numeric comparisons
+     * @return true when the two describe the same metadata
      */
     protected boolean compareMetadata(Map<String, Object> actual, Map<String, Object> expected, double tolerance) {
         if (actual == null && expected == null) return true;
         if (actual == null || expected == null) return false;
-        
-        return actual.entrySet().stream()
+        if (actual.size() != expected.size()) return false;
+
+        return expected.entrySet().stream()
             .allMatch(entry -> {
                 String key = entry.getKey();
-                Object actualVal = entry.getValue();
-                Object expectedVal = expected.get(key);
+                Object expectedVal = entry.getValue();
+                if (!actual.containsKey(key)) return false;
+                Object actualVal = actual.get(key);
                 
                 if (actualVal == null && expectedVal == null) return true;
                 if (actualVal == null || expectedVal == null) return false;
@@ -375,17 +387,35 @@ public class GoldenTest {
         if (actual instanceof String s && expected instanceof String es) {
             return s.equals(es);
         }
-        
+
+        // Integral metadata (segment IDs, node IDs, counts) is exact by nature and can exceed
+        // the 53-bit mantissa of a double, so it is compared without any tolerance.
+        if (isIntegral(actual) && isIntegral(expected)) {
+            return ((Number) actual).longValue() == ((Number) expected).longValue();
+        }
+
         if (actual instanceof Number a && expected instanceof Number e) {
-            double diff = Math.abs((double) a - (double) e);
+            // Number.doubleValue() is required here: casting a Number reference to double
+            // compiles to a checkcast against java.lang.Double and fails for every other box.
+            double diff = Math.abs(a.doubleValue() - e.doubleValue());
             return diff <= tolerance;
         }
-        
+
         if (actual instanceof Boolean b && expected instanceof Boolean e) {
-            return b == e;
+            return b.equals(e);
         }
-        
+
         return Objects.equals(actual, expected);
+    }
+
+    /**
+     * Check whether a value is a boxed integral number that fits a long.
+     */
+    private static boolean isIntegral(Object value) {
+        return value instanceof Long
+            || value instanceof Integer
+            || value instanceof Short
+            || value instanceof Byte;
     }
     
     /**

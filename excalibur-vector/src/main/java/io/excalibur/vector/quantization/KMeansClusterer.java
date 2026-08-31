@@ -274,15 +274,24 @@ public final class KMeansClusterer {
                 totalDistance += minDist;
             }
 
-            // Handle edge case: all points are identical
+            // Handle edge case: every remaining point coincides with a chosen centroid.
+            // The guard below is exactly the condition isDuplicate() tests, summed over
+            // all points, so rejection-sampling for a non-duplicate point would spin
+            // forever. Fill the remaining centroids with the points we have instead:
+            // duplicate centroids are harmless (encode() takes the first minimum and
+            // lookup() still sums valid sub-distances).
             if (totalDistance < 1e-10) {
-                // Choose randomly from remaining points
-                int idx;
-                do {
-                    idx = randomIndex(data.length);
-                } while (isDuplicate(data[idx], centroids, c));
-                centroids[c] = data[idx].clone();
-                LOGGER.trace("K-means++: centroid {} at index {} (all points identical)", c, idx);
+                int distinctIdx = findNonDuplicateIndex(data, centroids, c);
+                if (distinctIdx < 0) {
+                    for (int remaining = c; remaining < k; remaining++) {
+                        centroids[remaining] = centroids[0].clone();
+                    }
+                    LOGGER.debug("K-means++: all points coincide with existing centroids; " +
+                        "filling centroids {}..{} with duplicates", c, k - 1);
+                    break;
+                }
+                centroids[c] = data[distinctIdx].clone();
+                LOGGER.trace("K-means++: centroid {} at index {} (degenerate spread)", c, distinctIdx);
                 continue;
             }
 
@@ -374,6 +383,24 @@ public final class KMeansClusterer {
     /**
      * Checks if a point is a duplicate of any existing centroids.
      */
+    /**
+     * Finds the first data point that is not already used as a centroid.
+     *
+     * @param data The data points
+     * @param centroids The centroids chosen so far
+     * @param count Number of valid entries in {@code centroids}
+     * @return The index of the first non-duplicate point, or -1 if every point
+     *         coincides with an existing centroid
+     */
+    private int findNonDuplicateIndex(float[][] data, float[][] centroids, int count) {
+        for (int i = 0; i < data.length; i++) {
+            if (!isDuplicate(data[i], centroids, count)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     private boolean isDuplicate(float[] point, float[][] centroids, int count) {
         for (int i = 0; i < count; i++) {
             if (squaredDistance(point, centroids[i]) < 1e-10) {

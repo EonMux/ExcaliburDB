@@ -72,9 +72,10 @@ public final class BenchmarkReportWriter {
         sb.append(String.format("| Total Benchmarks | %d |\n", results.resultCount()));
         sb.append(String.format("| Passed | %d |\n", results.passCount()));
         sb.append(String.format("| Failed | %d |\n", results.failCount()));
+        sb.append(String.format("| Not Evaluated | %d |\n", results.unevaluatedCount()));
         sb.append(String.format("| No Target | %d |\n", results.skipCount()));
         sb.append(String.format("| Pass Rate | %.1f%% |\n", results.passRate()));
-        sb.append(String.format("| Status | %s |\n\n", results.allPassed() ? "✅ ALL PASSED" : "❌ SOME FAILED"));
+        sb.append(String.format("| Status | %s |\n\n", markdownStatus(results)));
 
         // Results by category
         sb.append("## Results by Category\n\n");
@@ -96,13 +97,30 @@ public final class BenchmarkReportWriter {
 
                 if (result.hasTarget()) {
                     sb.append("| ").append(String.format("%.2f", result.targetValue())).append(" ");
-                    sb.append("| ").append(result.meetsTarget() ? "✅" : "❌").append(" ");
+                    sb.append("| ").append(statusIcon(result)).append(" ");
                 } else {
                     sb.append("| - | - ");
                 }
                 sb.append("|\n");
             }
             sb.append("\n");
+        }
+
+        // Targets that could not be evaluated at all
+        List<BenchmarkResult> unevaluated = results.getUnevaluatedResults();
+        if (!unevaluated.isEmpty()) {
+            sb.append("## Targets Not Evaluated\n\n");
+            sb.append("These benchmarks carry a target that could not be compared against a ")
+              .append("measurement. Treat them as failures of the reporting pipeline:\n\n");
+            for (BenchmarkResult result : unevaluated) {
+                sb.append("### ").append(result.methodName()).append("\n\n");
+                for (BenchmarkResult.TargetEvaluation evaluation : result.targetEvaluations()) {
+                    if (evaluation.status() == BenchmarkResult.TargetStatus.NOT_EVALUABLE) {
+                        sb.append("- ").append(evaluation.format()).append("\n");
+                    }
+                }
+                sb.append("\n");
+            }
         }
 
         // Failed benchmarks detail
@@ -113,19 +131,28 @@ public final class BenchmarkReportWriter {
 
             for (BenchmarkResult result : failed) {
                 sb.append("### ").append(result.methodName()).append("\n\n");
-                sb.append("- **Actual:** ").append(String.format("%.2f", result.primaryScore()))
-                    .append(" ").append(result.primaryScoreUnit()).append("\n");
-                sb.append("- **Target:** ").append(String.format("%.2f", result.targetValue()))
-                    .append(" ").append(result.primaryScoreUnit()).append("\n");
+                for (BenchmarkResult.TargetEvaluation evaluation : result.targetEvaluations()) {
+                    if (evaluation.status() != BenchmarkResult.TargetStatus.MISSED) {
+                        continue;
+                    }
+                    // Reported in the target's unit, which is not always the raw score's.
+                    double target = evaluation.target().targetValue();
+                    double measured = evaluation.comparedValue();
+                    String unit = evaluation.target().unit();
+                    double gap = evaluation.target().higherIsBetter()
+                        ? target - measured
+                        : measured - target;
+                    double gapPercent = target == 0.0 ? 0.0 : (gap / target) * 100;
 
-                double gap = result.higherIsBetter() ?
-                    result.targetValue() - result.primaryScore() :
-                    result.primaryScore() - result.targetValue();
-                double gapPercent = (gap / result.targetValue()) * 100;
-
-                sb.append("- **Gap:** ").append(String.format("%.2f", gap))
-                    .append(" ").append(result.primaryScoreUnit())
-                    .append(" (").append(String.format("%.1f%%", gapPercent)).append(")\n\n");
+                    sb.append("- **Metric:** ").append(evaluation.target().metric()).append("\n");
+                    sb.append("- **Actual:** ").append(String.format("%.2f", measured))
+                        .append(" ").append(unit).append("\n");
+                    sb.append("- **Target:** ").append(String.format("%.2f", target))
+                        .append(" ").append(unit).append("\n");
+                    sb.append("- **Gap:** ").append(String.format("%.2f", gap))
+                        .append(" ").append(unit)
+                        .append(" (").append(String.format("%.1f%%", gapPercent)).append(")\n\n");
+                }
             }
         }
 
@@ -179,7 +206,9 @@ public final class BenchmarkReportWriter {
 
                 if (result.hasTarget()) {
                     sb.append(result.targetValue()).append(",");
-                    sb.append(result.meetsTarget() ? "true" : "false");
+                    sb.append(result.hasUnevaluatedTarget()
+                        ? "not-evaluated"
+                        : Boolean.toString(result.meetsTarget()));
                 } else {
                     sb.append(",n/a");
                 }
@@ -219,7 +248,8 @@ public final class BenchmarkReportWriter {
                 sb.append(String.format("  %-40s %12.2f ops/sec", result.methodName(), throughput.value()));
                 if (result.hasTarget()) {
                     sb.append(" (target: ≥").append(String.format("%.0f", result.targetValue())).append(")");
-                    sb.append(result.meetsTarget() ? " ✓" : " ✗");
+                    sb.append(result.hasUnevaluatedTarget() ? " ?"
+                        : result.meetsTarget() ? " ✓" : " ✗");
                 }
                 sb.append("\n");
                 foundThroughput = true;
@@ -284,5 +314,31 @@ public final class BenchmarkReportWriter {
 
     private BenchmarkReportWriter() {
         // Utility class
+    }
+
+    /**
+     * Status icon for one result: pass, fail, or "could not be evaluated".
+     */
+    private static String statusIcon(BenchmarkResult result) {
+        if (result.hasUnevaluatedTarget()) {
+            return "⚠️";
+        }
+        return result.meetsTarget() ? "✅" : "❌";
+    }
+
+    /**
+     * Overall run status for the Markdown summary table.
+     */
+    private static String markdownStatus(BenchmarkResultSet results) {
+        if (results.resultCount() == 0) {
+            return "❌ NO RESULTS CAPTURED";
+        }
+        if (results.allPassed()) {
+            return "✅ ALL PASSED";
+        }
+        if (results.failCount() == 0) {
+            return "⚠️ TARGETS NOT EVALUATED";
+        }
+        return "❌ SOME FAILED";
     }
 }

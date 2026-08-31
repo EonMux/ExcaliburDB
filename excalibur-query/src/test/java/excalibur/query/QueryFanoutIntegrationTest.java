@@ -115,22 +115,23 @@ class QueryFanoutIntegrationTest {
     void testResultAggregationWithDuplicates() {
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
 
-        // Segment 1: Document 100 with distance 0.1
+        // Segment 1: doc100 with distance 0.1. Two segments are the same document only
+        // when they report the same document ID - node IDs are per-graph and collide.
         segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
             1L,
             List.of(
-                new HnswSearchResult(100L, 0.1f),  // Best match
-                new HnswSearchResult(200L, 0.3f)
+                new HnswSearchResult(100L, 0.1f, "doc100"),  // Best match
+                new HnswSearchResult(200L, 0.3f, "doc200")
             ),
             0, 10, true, null
         ));
 
-        // Segment 2: Same document 100 with distance 0.2 (duplicate, worse)
+        // Segment 2: Same document with distance 0.2 (duplicate, worse)
         segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
             2L,
             List.of(
-                new HnswSearchResult(100L, 0.2f),  // Duplicate
-                new HnswSearchResult(300L, 0.4f)
+                new HnswSearchResult(100L, 0.2f, "doc100"),  // Duplicate
+                new HnswSearchResult(300L, 0.4f, "doc300")
             ),
             0, 10, true, null
         ));
@@ -141,12 +142,15 @@ class QueryFanoutIntegrationTest {
         // Should have 3 unique documents
         assertThat(merged).hasSize(3);
 
-        // Document 100 should appear once with the first-encountered distance
-        assertThat(merged.stream().filter(r -> r.documentId() == 100L)).hasSize(1);
+        // doc100 should appear once, with the best (lowest) distance
+        assertThat(merged.stream().filter(r -> "doc100".equals(r.documentIdStr()))).hasSize(1);
+        assertThat(merged.stream()
+            .filter(r -> "doc100".equals(r.documentIdStr()))
+            .findFirst().orElseThrow().score()).isEqualTo(0.1f);
 
         // Verify all documents present
-        assertThat(merged.stream().mapToLong(QueryResultItem::documentId))
-            .containsExactlyInAnyOrder(100L, 200L, 300L);
+        assertThat(merged.stream().map(QueryResultItem::documentIdStr))
+            .containsExactlyInAnyOrder("doc100", "doc200", "doc300");
     }
 
     /**

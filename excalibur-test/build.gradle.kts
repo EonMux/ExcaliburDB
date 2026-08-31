@@ -3,16 +3,7 @@ plugins {
     `maven-publish`
 }
 
-group = "io.excalibur"
-version = "1.0.0-SNAPSHOT"
 
-java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
-    }
-}
 
 repositories {
     mavenCentral()
@@ -20,10 +11,14 @@ repositories {
 
 dependencies {
     implementation("org.slf4j:slf4j-api:2.0.16")
-    implementation(project(":excalibur-query"))
 
-    // JUnit Platform API for FailureReportingExtension (needed in main scope)
-    implementation("org.junit.jupiter:junit-jupiter-api:5.11.3")
+    // Exposed in public signatures (TestAssertionMessages, QueryResult.fromQueryResponse),
+    // so consumers need it on their compile classpath.
+    api(project(":excalibur-query"))
+
+    // JUnit Platform API for FailureReportingExtension (exposed via ExtensionContext in
+    // the extension's public callbacks, so it leaks into consumers' compile classpath)
+    api("org.junit.jupiter:junit-jupiter-api:5.11.3")
     implementation("org.junit.platform:junit-platform-commons:1.11.3")
 
     // Test dependencies
@@ -31,8 +26,6 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter-params:5.11.3")
     testImplementation("org.junit.jupiter:junit-jupiter-engine:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
-    testImplementation("org.mockito:mockito-core:5.15.2")
-    testImplementation("org.mockito:mockito-junit-jupiter:5.15.2")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.16")
     
     // JMH benchmarks

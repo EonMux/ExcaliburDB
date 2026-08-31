@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Set;
@@ -29,6 +30,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>This class is thread-safe. Uses striped locking (64 stripes) for write operations,
  * following the same pattern as CuckooFilter. Reads are lock-free.</p>
  *
+ * <h2>Resource Management</h2>
+ * <p>Every hash table owns a memory mapping, a file descriptor and a shared Arena, none of
+ * which the garbage collector can reclaim. An index must therefore be closed by whoever
+ * owns it - for a per-segment index, that is the segment.</p>
+ *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li><strong>Hash tables</strong>: Each table uses a different random seed for independent hashing</li>
@@ -38,7 +44,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * @author ExcaliburDB
  */
-public class LshIndex {
+public class LshIndex implements AutoCloseable {
 
     /** Magic number for serialization validation. */
     private static final int MAGIC = 0x4C534849; // "LSHI" in ASCII
@@ -61,6 +67,18 @@ public class LshIndex {
     /** Number of lock stripes. */
     private static final int NUM_LOCKS = 64;
 
+    /** File name prefix used by {@link #open(LshConfig, Path)}. */
+    private static final String TABLE_FILE_PREFIX = "lsh_table_";
+
+    /** File name suffix used by {@link #open(LshConfig, Path)}. */
+    private static final String TABLE_FILE_SUFFIX = ".dat";
+
+    /** Offset applied to the base seed to derive per-table seeds (golden ratio constant). */
+    private static final long TABLE_SEED_STRIDE = 0x9E3779B97F4A7C15L;
+
+    /** Flag indicating whether this index has been closed. */
+    private volatile boolean closed = false;
+
     /**
      * Creates a new LshIndex with the specified configuration.
      *
@@ -68,29 +86,120 @@ public class LshIndex {
      * @throws IllegalArgumentException if config is null
      */
     public LshIndex(LshConfig config) {
-        if (config == null) {
-            throw new IllegalArgumentException("config cannot be null");
-        }
+        this(requireConfig(config), createInMemoryTables(config));
+    }
 
+    /**
+     * Creates an LshIndex over a set of already-built hash tables.
+     *
+     * @param config The LSH configuration
+     * @param tables The tables this index takes ownership of
+     */
+    private LshIndex(LshConfig config, LshHashTable[] tables) {
         this.config = config;
-        this.tables = new LshHashTable[config.numHashTables()];
+        this.tables = tables;
         this.entryCount = new AtomicLong(0);
-
-        // Initialize hash tables with different seeds
-        // Each table gets a unique seed derived from the base seed
-        for (int i = 0; i < config.numHashTables(); i++) {
-            long tableSeed = config.seed() + i * 0x9E3779B97F4A7C15L; // Golden ratio constant
-            tables[i] = new LshHashTable(
-                config.dimensions(),
-                config.numHashFunctions(),
-                tableSeed
-            );
-        }
 
         // Initialize striped locks
         this.locks = new ReentrantLock[NUM_LOCKS];
         for (int i = 0; i < NUM_LOCKS; i++) {
             locks[i] = new ReentrantLock();
+        }
+    }
+
+    /**
+     * Creates an LshIndex whose tables are backed by files in the given directory.
+     *
+     * <p>Unlike the in-memory constructor, which backs every table with a
+     * {@code deleteOnExit} temporary file, this factory produces an index that survives a
+     * restart: re-opening the same directory re-attaches the persisted tables, each of which
+     * rebuilds its hash function from the seed stored in its own header, so the persisted
+     * buckets stay reachable even when the configured seed has changed.</p>
+     *
+     * @param config    The LSH configuration
+     * @param directory Directory holding the table files (created if absent)
+     * @return A new LshIndex backed by {@code directory}
+     * @throws IllegalArgumentException if config or directory is null
+     * @throws IOException              if the table files cannot be created or opened
+     */
+    public static LshIndex open(LshConfig config, Path directory) throws IOException {
+        requireConfig(config);
+        if (directory == null) {
+            throw new IllegalArgumentException("directory cannot be null");
+        }
+
+        Files.createDirectories(directory);
+
+        LshHashTable[] tables = new LshHashTable[config.numHashTables()];
+        try {
+            for (int i = 0; i < tables.length; i++) {
+                tables[i] = new LshHashTable(
+                    directory.resolve(TABLE_FILE_PREFIX + i + TABLE_FILE_SUFFIX),
+                    config.dimensions(),
+                    config.numHashFunctions(),
+                    tableSeed(config, i)
+                );
+            }
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(tables);
+            throw e;
+        }
+
+        LshIndex index = new LshIndex(config, tables);
+
+        long restored = 0;
+        for (LshHashTable table : tables) {
+            restored += table.entryCount();
+        }
+        index.entryCount.set(restored);
+
+        return index;
+    }
+
+    /**
+     * Validates the configuration shared by every constructor and factory.
+     */
+    private static LshConfig requireConfig(LshConfig config) {
+        if (config == null) {
+            throw new IllegalArgumentException("config cannot be null");
+        }
+        return config;
+    }
+
+    /**
+     * Builds one temporary-file-backed table per configured hash table, each with its own seed.
+     */
+    private static LshHashTable[] createInMemoryTables(LshConfig config) {
+        LshHashTable[] tables = new LshHashTable[config.numHashTables()];
+        for (int i = 0; i < tables.length; i++) {
+            tables[i] = new LshHashTable(
+                config.dimensions(),
+                config.numHashFunctions(),
+                tableSeed(config, i)
+            );
+        }
+        return tables;
+    }
+
+    /**
+     * Derives the seed for one table from the index seed.
+     */
+    private static long tableSeed(LshConfig config, int tableIndex) {
+        return config.seed() + tableIndex * TABLE_SEED_STRIDE;
+    }
+
+    /**
+     * Closes every non-null table, ignoring individual failures.
+     */
+    private static void closeQuietly(LshHashTable[] toClose) {
+        for (LshHashTable table : toClose) {
+            if (table != null) {
+                try {
+                    table.close();
+                } catch (RuntimeException ignored) {
+                    // Closing the remaining tables matters more than one failure.
+                }
+            }
         }
     }
 
@@ -328,6 +437,41 @@ public class LshIndex {
     }
 
     /**
+     * Flushes every table to its backing storage.
+     *
+     * <p>A no-op for tables backed by temporary files, meaningful for an index created by
+     * {@link #open(LshConfig, Path)}.</p>
+     */
+    public void flush() {
+        for (LshHashTable table : tables) {
+            table.flush();
+        }
+    }
+
+    /**
+     * Closes this index and releases the mapping, descriptor and Arena of every table.
+     *
+     * <p>Idempotent. After closing, the index must not be queried or written to.</p>
+     */
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        closeQuietly(tables);
+    }
+
+    /**
+     * Checks whether this index has been closed.
+     *
+     * @return true if closed
+     */
+    public boolean isClosed() {
+        return closed;
+    }
+
+    /**
      * Estimates memory usage in bytes.
      *
      * @return Estimated memory usage
@@ -498,8 +642,13 @@ public class LshIndex {
             MemorySegment tableSlice = segment.asSlice(offset, tableSize);
             LshHashTable deserializedTable = LshHashTable.fromMemorySegment(tableSlice);
 
-            // Replace the empty table with the deserialized one
+            // Replace the empty table with the deserialized one, releasing the mapping,
+            // descriptor and Arena the discarded table was holding.
+            LshHashTable discarded = index.tables[t];
             index.tables[t] = deserializedTable;
+            if (discarded != null) {
+                discarded.close();
+            }
             offset += tableSize;
         }
 

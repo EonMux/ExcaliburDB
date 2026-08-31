@@ -12,7 +12,8 @@ build/
 
 # Gradle
 .gradle/
-build/
+bin/
+gradle/wrapper/dists/
 !gradle/wrapper/gradle-wrapper.jar
 wrapper.gradle-tasks-json
 
@@ -38,13 +39,11 @@ temp/
 *.swo
 *~
 
-# Generated files
-!**/src/main/java/com/excaliburdb/**/Generated*
+# Generated / external build layouts
 **/target/
 **/out/
 
 # JMH benchmark results
-!**/src/main/java/com/excaliburdb/**/Generated*
 **/jmh-results/
 **/benchmark-results/
 
@@ -52,13 +51,19 @@ temp/
 *.lock
 
 # Maven
-!**/src/main/java/com/excaliburdb/**/Generated*
 pom.xml.tag
-tpns
-tmp_
 
-# ExcaliburDB specific
-!**/src/main/java/com/excaliburdb/**/Generated*
+# Engine runtime state. The storage engine writes segments, write-ahead logs, catalogs and
+# per-segment index files into its data directory; none of it belongs in version control.
+data/
 *.db
 *.dat
-*.log
+*.wal
+*.idx
+*.csr
+*.hnsw
+*.lsh
+
+# Local configuration working copy. Track excalibur.properties.example instead; the
+# working copy may hold a real EXCALIBUR_LLM_API_KEY value.
+/excalibur.properties

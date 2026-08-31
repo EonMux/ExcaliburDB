@@ -2,7 +2,7 @@ package excalibur.ingest.buffer;
 
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.visibility.DocumentVisibilityRegistry;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.store.WriteLog;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

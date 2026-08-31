@@ -5,7 +5,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -94,6 +93,12 @@ public class HnswCompactionWorker {
      */
     public static final double MAX_TOMBSTONE_THRESHOLD = 0.50;
 
+    /**
+     * How long {@link #stop()} waits for an in-progress compaction to finish its file
+     * swap before giving up and warning.
+     */
+    private static final long STOP_JOIN_TIMEOUT_MS = 30_000;
+
     // ==================== Instance Fields ====================
 
     /**
@@ -136,6 +141,13 @@ public class HnswCompactionWorker {
      * The background worker thread.
      */
     private volatile Thread workerThread;
+
+    /**
+     * Optional listener notified after each compaction attempt.
+     * Compaction renumbers node IDs, so components holding node-scoped state need to hear
+     * about it.
+     */
+    private volatile CompactionListener listener;
 
     // ==================== Constructors ====================
 
@@ -235,13 +247,27 @@ public class HnswCompactionWorker {
     /**
      * Stops the compaction worker.
      *
-     * <p>The worker will finish any in-progress compaction before stopping.</p>
+     * <p>A compaction already in progress is not interruptible: it closes the graph's
+     * mapping and renames files into place, and abandoning it midway would leave the
+     * graph closed or the files half swapped. This method therefore waits for the worker
+     * thread to finish before returning, so callers that tear down the arena and the
+     * storage engine afterwards cannot race a live file swap.</p>
      */
     public void stop() {
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
-            if (workerThread != null) {
-                workerThread.interrupt();
+            Thread worker = workerThread;
+            if (worker != null) {
+                worker.interrupt();
+                try {
+                    worker.join(STOP_JOIN_TIMEOUT_MS);
+                    if (worker.isAlive()) {
+                        LOGGER.warn("HnswCompactionWorker did not finish within {}ms; a graph "
+                            + "compaction may still be swapping files", STOP_JOIN_TIMEOUT_MS);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
             LOGGER.info("HnswCompactionWorker stopped. Total compactions: {}, total nodes removed: {}",
                 compactionCount.get(), totalNodesRemoved.get());
@@ -383,43 +409,166 @@ public class HnswCompactionWorker {
 
         double ratio = (double) tombstones / total;
 
-        // Check if threshold is exceeded
-        if (ratio >= tombstoneThreshold) {
-            LOGGER.info("Graph tombstone ratio ({}) exceeds threshold ({}). Starting compaction. " +
-                "Total nodes: {}, Tombstones: {}",
-                String.format("%.2f%%", ratio * 100),
-                String.format("%.2f%%", tombstoneThreshold * 100),
-                total, tombstones);
-
-            try {
-                // Create temp directory for compaction
-                Path tempDir = Files.createTempDirectory("hnsw-compact");
-                try {
-                    long removed = graph.compact(tempDir);
-
-                    // Update statistics
-                    compactionCount.incrementAndGet();
-                    totalNodesRemoved.addAndGet(removed);
-
-                    LOGGER.info("HNSW compaction completed: removed {} tombstoned nodes. " +
-                        "Total compactions: {}, Total removed: {}",
-                        removed, compactionCount.get(), totalNodesRemoved.get());
-
-                } finally {
-                    // Clean up temp directory
-                    try {
-                        Files.deleteIfExists(tempDir);
-                    } catch (Exception e) {
-                        LOGGER.warn("Failed to delete temp directory: {}", e.getMessage());
-                    }
-                }
-            } catch (IOException e) {
-                LOGGER.error("HNSW compaction failed: {}", e.getMessage(), e);
-            }
-        } else {
+        if (ratio < tombstoneThreshold) {
             LOGGER.trace("Graph tombstone ratio ({}) below threshold ({}). Skipping compaction.",
                 String.format("%.2f%%", ratio * 100),
                 String.format("%.2f%%", tombstoneThreshold * 100));
+            return;
+        }
+
+        // A compaction cannot be abandoned once started, so never begin one after a stop.
+        if (!running.get() || stopped.get()) {
+            return;
+        }
+
+        LOGGER.info("Graph tombstone ratio ({}) exceeds threshold ({}). Starting compaction. " +
+            "Total nodes: {}, Tombstones: {}",
+            String.format("%.2f%%", ratio * 100),
+            String.format("%.2f%%", tombstoneThreshold * 100),
+            total, tombstones);
+
+        try {
+            // HnswGraph.compact builds the replacement next to the live file and owns the
+            // swap, so there is nothing here to stage or clean up. The graph's own
+            // directory is passed because the parameter is retained for compatibility.
+            long removed = graph.compact(compactionScratchDir(graph));
+
+            compactionCount.incrementAndGet();
+            totalNodesRemoved.addAndGet(removed);
+
+            LOGGER.info("HNSW compaction completed: removed {} tombstoned nodes. " +
+                "Total compactions: {}, Total removed: {}",
+                removed, compactionCount.get(), totalNodesRemoved.get());
+
+            notifyCompacted(graph, removed);
+
+        } catch (IOException | RuntimeException e) {
+            handleCompactionFailure(graph, e);
+        }
+    }
+
+    /**
+     * Returns the directory the graph lives in, used as the compaction scratch location.
+     *
+     * @param graph The graph being compacted
+     * @return The graph's directory, or the graph path itself when it has no parent
+     */
+    private Path compactionScratchDir(HnswGraph graph) {
+        Path graphPath = graph.path();
+        Path parent = graphPath != null ? graphPath.getParent() : null;
+        return parent != null ? parent : Path.of(".");
+    }
+
+    /**
+     * Reports a failed compaction and retires a graph that the failure left unusable.
+     *
+     * <p>A compaction that fails after the live mapping has been released leaves the graph
+     * closed. Keeping such a graph registered means retrying the failure every interval
+     * while every query against it throws, so it is unregistered and reported loudly
+     * instead of being silently retried.</p>
+     *
+     * @param graph   The graph that failed to compact
+     * @param failure The failure
+     */
+    private void handleCompactionFailure(HnswGraph graph, Exception failure) {
+        if (graph.isClosed()) {
+            LOGGER.error("HNSW compaction failed and left graph {} closed; unregistering it. "
+                + "The segment is unsearchable until it is reopened: {}",
+                graph.path(), failure.getMessage(), failure);
+            unregisterGraph(graph);
+            notifyCompactionFailed(graph, failure);
+            return;
+        }
+
+        LOGGER.error("HNSW compaction failed for graph {}: {}", graph.path(),
+            failure.getMessage(), failure);
+        notifyCompactionFailed(graph, failure);
+    }
+
+    /**
+     * Notifies the listener that a graph was compacted, if one is configured.
+     *
+     * @param graph   The compacted graph
+     * @param removed Number of tombstoned nodes removed
+     */
+    private void notifyCompacted(HnswGraph graph, long removed) {
+        CompactionListener current = listener;
+        if (current == null) {
+            return;
+        }
+        try {
+            current.onGraphCompacted(graph, removed);
+        } catch (Exception e) {
+            LOGGER.error("HNSW compaction listener failed for graph {}: {}",
+                graph.path(), e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Notifies the listener that a compaction failed, if one is configured.
+     *
+     * @param graph   The graph that failed to compact
+     * @param failure The failure
+     */
+    private void notifyCompactionFailed(HnswGraph graph, Exception failure) {
+        CompactionListener current = listener;
+        if (current == null) {
+            return;
+        }
+        try {
+            current.onGraphCompactionFailed(graph, failure);
+        } catch (Exception e) {
+            LOGGER.error("HNSW compaction listener failed for graph {}: {}",
+                graph.path(), e.getMessage(), e);
+        }
+    }
+
+    // ==================== Listener ====================
+
+    /**
+     * Sets the listener notified after each compaction attempt.
+     *
+     * @param listener The listener, or null to clear
+     */
+    public void setCompactionListener(CompactionListener listener) {
+        this.listener = listener;
+    }
+
+    /**
+     * Returns the configured compaction listener.
+     *
+     * @return The listener, or null if none is configured
+     */
+    public CompactionListener getCompactionListener() {
+        return listener;
+    }
+
+    /**
+     * Callback interface for graph compaction events.
+     *
+     * <p>Compaction re-inserts the surviving nodes into a fresh graph, so every node ID
+     * changes. Anything keyed by node ID must be reset when this fires.</p>
+     */
+    public interface CompactionListener {
+
+        /**
+         * Called after a graph was compacted and its node IDs renumbered.
+         *
+         * @param graph        The compacted graph
+         * @param nodesRemoved Number of tombstoned nodes removed
+         */
+        void onGraphCompacted(HnswGraph graph, long nodesRemoved);
+
+        /**
+         * Called when a compaction attempt failed.
+         *
+         * <p>The default implementation does nothing.</p>
+         *
+         * @param graph   The graph that failed to compact
+         * @param failure The failure
+         */
+        default void onGraphCompactionFailed(HnswGraph graph, Exception failure) {
+            // No action required by default.
         }
     }
 

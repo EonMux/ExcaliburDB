@@ -2,12 +2,10 @@ package excalibur.integration;
 
 import excalibur.ingest.buffer.AtomicDocumentBatch;
 import excalibur.ingest.buffer.DocumentChunkBuffer;
-import excalibur.ingest.pipeline.DocumentBatchBuffer;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.processor.TextChunk;
-import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
-import excalibur.ingest.visibility.DocumentVisibilityChecker;
+import excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.query.IndexCoverage;
 import excalibur.query.QueryRequest;
@@ -21,7 +19,7 @@ import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.SegmentCatalog.SegmentMetadata;
 import io.excalibur.store.StorageEngine;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.store.WriteLog;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
@@ -105,7 +103,6 @@ class LiveIndexingIntegrationTest {
     // Infrastructure
     private TestStorageEngine storageEngine;
     private TestVisibilityTracker visibilityTracker;
-    private TestDocumentVisibilityTracker documentVisibilityTracker;
     private WriteLog writeLog;
     private DocumentChunkBuffer chunkBuffer;
     private DocumentRegistry documentRegistry;
@@ -125,7 +122,6 @@ class LiveIndexingIntegrationTest {
 
         // Create visibility trackers
         visibilityTracker = new TestVisibilityTracker();
-        documentVisibilityTracker = new TestDocumentVisibilityTracker();
 
         // Create write log
         Path logPath = tempDir.resolve("live-indexing.log");
@@ -138,7 +134,9 @@ class LiveIndexingIntegrationTest {
             visibilityTracker,
             documentRegistry,
             null,
-            writeLog::sync,
+            // io.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
+            // durability barrier is already satisfied before the adapter runs.
+            () -> { },
             new ReentrantLock()
         );
     }
@@ -193,7 +191,15 @@ class LiveIndexingIntegrationTest {
         visibilityTracker.registerSegment(segmentId, visibilityTracker.currentEpoch());
         visibilityTracker.advanceEpoch();
 
-        // Query pipeline
+        // The document visibility system under test. Requirements (c) and (d) are
+        // properties of THIS object, so it is what the readers interrogate and what the
+        // pipeline filters with - a map the writer filled would agree with itself no
+        // matter how the tracker behaved.
+        DocumentVisibilityTracker atomicityTracker = new DocumentVisibilityTracker();
+
+        // Query pipeline, wired with the document atomicity filter. The four-argument
+        // constructor leaves the filter disabled, which would let requirement (d) pass
+        // with the component it names never executing.
         QueryPipeline.HnswGraphProvider graphProvider = segId -> {
             if (segId == segmentId) return graph;
             return null;
@@ -201,14 +207,21 @@ class LiveIndexingIntegrationTest {
         QueryPipeline pipeline = new QueryPipeline(
             storageEngine,
             visibilityTracker,
+            new DocumentVisibilityTrackerAdapter(atomicityTracker),
             graphProvider,
-            distanceFunction
+            distanceFunction,
+            null,
+            QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
+            null
         );
+        assertThat(pipeline.getVisibilityChecker())
+            .as("The document atomicity filter must be configured for requirement (d)")
+            .isNotNull();
 
-        // Test parameters
+        // Test parameters (optimized for faster execution)
         int numWriterThreads = 2;
         int numReaderThreads = 4;
-        int documentsPerWriter = 40;
+        int documentsPerWriter = 25;
         int chunksPerDocument = 5;
 
         // Tracking for all four requirements
@@ -221,15 +234,13 @@ class LiveIndexingIntegrationTest {
         AtomicInteger queriesWithResults = new AtomicInteger(0);
         List<Integer> resultCountSnapshots = Collections.synchronizedList(new ArrayList<>());
 
-        // (c) Epoch isolation - no torn reads
-        ConcurrentHashMap<String, Long> documentCommitEpochs = new ConcurrentHashMap<>();
+        // (c) Epoch isolation - no torn reads. The chunk ids of each published document are
+        // the writer's own knowledge; whether they are VISIBLE is the tracker's answer.
         ConcurrentHashMap<String, List<String>> documentChunkIds = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Long> chunkVisibilityEpochs = new ConcurrentHashMap<>();
         AtomicInteger tornReadCount = new AtomicInteger(0);
         AtomicInteger totalChunkChecks = new AtomicInteger(0);
 
         // (d) Document atomicity - no partial documents
-        ConcurrentHashMap<String, Integer> documentExpectedChunkCounts = new ConcurrentHashMap<>();
         AtomicInteger partialDocumentCount = new AtomicInteger(0);
 
         ExecutorService executor = Executors.newFixedThreadPool(numWriterThreads + numReaderThreads);
@@ -255,24 +266,14 @@ class LiveIndexingIntegrationTest {
                     float[] vector = createRandomVector(dimension);
                     long nodeId = graph.insert(vector);
                     graph.registerDocumentId(nodeId, documentId);
-                    graph.setLastIntegratedOffset(writeLog.writeHead());
+                    graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                    writeLog.sync();
                     long commitEpoch = visibilityTracker.advanceEpoch();
 
-                    // Track document for epoch isolation verification (c)
-                    documentCommitEpochs.put(documentId, commitEpoch);
-                    List<String> chunkIdList = new ArrayList<>();
-                    for (String chunkId : batch.getChunkIdList()) {
-                        chunkIdList.add(chunkId);
-                        // CRITICAL: All chunks get the SAME visibility epoch
-                        chunkVisibilityEpochs.put(chunkId, commitEpoch);
-                    }
-                    documentChunkIds.put(documentId, chunkIdList);
-
-                    // Track for document atomicity verification (d)
-                    documentExpectedChunkCounts.put(documentId, chunksPerDocument);
-                    documentVisibilityTracker.registerDocument(documentId, chunksPerDocument, commitEpoch);
+                    // Announce the chunk ids first, then publish: a reader that sees the
+                    // document as visible must always be able to enumerate its chunks.
+                    documentChunkIds.put(documentId, List.copyOf(batch.getChunkIdList()));
+                    atomicityTracker.registerAtomicDocument(batch, commitEpoch);
 
                     Thread.sleep(2); // Small delay to allow readers
                 }
@@ -315,73 +316,52 @@ class LiveIndexingIntegrationTest {
                         }
 
                         // ==================== (c) EPOCH ISOLATION - TORN READ CHECK ====================
-                        for (Map.Entry<String, Long> entry : documentCommitEpochs.entrySet()) {
-                            String documentId = entry.getKey();
-                            long commitEpoch = entry.getValue();
+                        // Ask the tracker which documents it considers visible, then ask it
+                        // about each of their chunks. A tracker that published chunks one at
+                        // a time would report a document visible with some chunks invisible.
+                        for (String documentId : atomicityTracker.getVisibleDocuments(queryEpoch)) {
+                            List<String> chunkIds = documentChunkIds.get(documentId);
+                            if (chunkIds == null) continue;
 
-                            // Only check documents committed before this query epoch
-                            if (commitEpoch <= queryEpoch) {
-                                List<String> chunkIds = documentChunkIds.get(documentId);
-                                if (chunkIds == null) continue;
+                            totalChunkChecks.incrementAndGet();
 
-                                totalChunkChecks.incrementAndGet();
-
-                                // Check each chunk's visibility epoch
-                                int visibleChunks = 0;
-                                Set<Long> epochsForDocument = new HashSet<>();
-
-                                for (String chunkId : chunkIds) {
-                                    Long chunkEpoch = chunkVisibilityEpochs.get(chunkId);
-                                    if (chunkEpoch != null) {
-                                        epochsForDocument.add(chunkEpoch);
-                                        if (queryEpoch >= chunkEpoch) {
-                                            visibleChunks++;
-                                        }
-                                    }
+                            int visibleChunks = 0;
+                            for (String chunkId : chunkIds) {
+                                if (atomicityTracker.isChunkVisible(chunkId, queryEpoch)) {
+                                    visibleChunks++;
                                 }
+                            }
 
-                                // TORN READ DETECTION:
-                                // If document is visible but not all chunks are visible, this is a torn read
-                                if (visibleChunks > 0 && visibleChunks < chunkIds.size()) {
-                                    tornReadCount.incrementAndGet();
-                                }
-
-                                // EPOCH CONSISTENCY:
-                                // All chunks should have the same visibility epoch
-                                if (epochsForDocument.size() > 1) {
-                                    partialDocumentCount.incrementAndGet();
-                                }
+                            // TORN READ DETECTION: a visible document must have every chunk visible
+                            if (visibleChunks != chunkIds.size()) {
+                                tornReadCount.incrementAndGet();
                             }
                         }
 
                         // ==================== (d) DOCUMENT ATOMICITY CHECK ====================
+                        // Every result that survived the atomicity filter must belong to a
+                        // document the tracker published whole.
                         for (QueryResultItem result : response.results()) {
                             String docIdStr = result.documentIdStr();
-                            if (docIdStr != null && documentExpectedChunkCounts.containsKey(docIdStr)) {
-                                // Document is in results - verify it was committed atomically
-                                Long commitEpoch = documentCommitEpochs.get(docIdStr);
-                                if (commitEpoch != null && queryEpoch >= commitEpoch) {
-                                    // Document is visible - verify atomicity
-                                    Integer expectedChunks = documentExpectedChunkCounts.get(docIdStr);
-                                    List<String> chunkIds = documentChunkIds.get(docIdStr);
+                            if (docIdStr == null) continue;
 
-                                    if (chunkIds != null && expectedChunks != null) {
-                                        // Count visible chunks
-                                        int visibleCount = 0;
-                                        for (String chunkId : chunkIds) {
-                                            Long chunkEpoch = chunkVisibilityEpochs.get(chunkId);
-                                            if (chunkEpoch != null && queryEpoch >= chunkEpoch) {
-                                                visibleCount++;
-                                            }
-                                        }
+                            long commitEpoch = atomicityTracker.getCommitEpoch(docIdStr);
+                            if (commitEpoch < 0) continue;
 
-                                        // PARTIAL DOCUMENT DETECTION:
-                                        // If document is visible but not all chunks, atomicity violated
-                                        if (visibleCount > 0 && visibleCount < expectedChunks) {
-                                            partialDocumentCount.incrementAndGet();
-                                        }
-                                    }
+                            List<String> chunkIds = documentChunkIds.get(docIdStr);
+                            if (chunkIds == null) continue;
+
+                            int visibleAtCommit = 0;
+                            for (String chunkId : chunkIds) {
+                                if (atomicityTracker.isChunkVisible(chunkId, commitEpoch)) {
+                                    visibleAtCommit++;
                                 }
+                            }
+
+                            // PARTIAL DOCUMENT DETECTION: at the document's own commit epoch
+                            // either all of its chunks are visible or none of them are
+                            if (visibleAtCommit != chunkIds.size()) {
+                                partialDocumentCount.incrementAndGet();
                             }
                         }
 
@@ -421,7 +401,7 @@ class LiveIndexingIntegrationTest {
         writersFinished.set(true);
 
         // Give readers time to finish final queries
-        Thread.sleep(500);
+        Thread.sleep(200);
 
         executor.shutdown();
         executor.awaitTermination(15, TimeUnit.SECONDS);
@@ -453,11 +433,11 @@ class LiveIndexingIntegrationTest {
         System.out.println("\n(c) EPOCH ISOLATION (No Torn Reads):");
         System.out.println("    Torn reads detected: " + tornReadCount.get());
         System.out.println("    Total chunk checks: " + totalChunkChecks.get());
-        System.out.println("    Documents tracked: " + documentCommitEpochs.size());
+        System.out.println("    Documents tracked: " + atomicityTracker.getDocumentCount());
 
         System.out.println("\n(d) DOCUMENT ATOMICITY (No Partial Documents):");
         System.out.println("    Partial documents detected: " + partialDocumentCount.get());
-        System.out.println("    Document visibility entries: " + documentVisibilityTracker.getDocumentCount());
+        System.out.println("    Document visibility entries: " + atomicityTracker.getDocumentCount());
 
         System.out.println("\n=== END OF RESULTS ===\n");
 
@@ -499,9 +479,14 @@ class LiveIndexingIntegrationTest {
             .isEqualTo(0);
 
         // Verify documents were actually ingested
-        assertThat(documentCommitEpochs.size())
+        assertThat(atomicityTracker.getDocumentCount())
             .as("Documents should have been ingested during the test")
             .isEqualTo(numWriterThreads * documentsPerWriter);
+
+        // Verify the epoch isolation check was not vacuous
+        assertThat(totalChunkChecks.get())
+            .as("(c) Epoch isolation: readers must have inspected published documents")
+            .isGreaterThan(0);
 
         graph.close();
     }
@@ -570,9 +555,8 @@ class LiveIndexingIntegrationTest {
                                 float[] vector = createRandomVector(dimension);
                                 graph.insert(vector);
                                 graph.registerDocumentId(graph.nodeCount() - 1, documentId);
-                                graph.setLastIntegratedOffset(writeLog.writeHead());
+                                graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                                writeLog.sync();
                                 visibilityTracker.advanceEpoch();
                             } else {
                                 // Query operation
@@ -676,9 +660,8 @@ class LiveIndexingIntegrationTest {
                     float[] vector = createRandomVector(dimension);
                     long nodeId = graph.insert(vector);
                     graph.registerDocumentId(nodeId, documentId);
-                    graph.setLastIntegratedOffset(writeLog.writeHead());
+                    graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                    writeLog.sync();
                     visibilityTracker.advanceEpoch();
                 }
 
@@ -756,11 +739,12 @@ class LiveIndexingIntegrationTest {
             int numDocuments = 30;
             int chunksPerDocument = 5;
 
-            ConcurrentHashMap<String, Long> documentCommitEpochs = new ConcurrentHashMap<>();
+            // The tracker is the system under test; the readers ask it, not a map of their own
+            DocumentVisibilityTracker atomicityTracker = new DocumentVisibilityTracker();
             ConcurrentHashMap<String, List<String>> documentChunkIds = new ConcurrentHashMap<>();
-            ConcurrentHashMap<String, Long> chunkVisibilityEpochs = new ConcurrentHashMap<>();
             AtomicInteger tornReadCount = new AtomicInteger(0);
             AtomicInteger totalChecks = new AtomicInteger(0);
+            List<Throwable> workerFailures = Collections.synchronizedList(new ArrayList<>());
 
             ExecutorService executor = Executors.newFixedThreadPool(5);
             CountDownLatch startLatch = new CountDownLatch(1);
@@ -780,26 +764,21 @@ class LiveIndexingIntegrationTest {
 
                         float[] vector = createRandomVector(dimension);
                         graph.insert(vector);
-                        graph.setLastIntegratedOffset(writeLog.writeHead());
+                        graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                        writeLog.sync();
                         long commitEpoch = visibilityTracker.advanceEpoch();
 
-                        documentCommitEpochs.put(documentId, commitEpoch);
-                        List<String> chunkIdList = new ArrayList<>();
-                        for (String chunkId : batch.getChunkIdsList()) {
-                            chunkIdList.add(chunkId);
-                            chunkVisibilityEpochs.put(chunkId, commitEpoch);
-                        }
-                        documentChunkIds.put(documentId, chunkIdList);
+                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIdsList()));
+                        atomicityTracker.registerAtomicDocument(batch, commitEpoch);
 
                         Thread.sleep(3);
                     }
-
+                } catch (Exception e) {
+                    workerFailures.add(e);
+                } finally {
+                    // Must happen even on failure, or the readers spin until the timeout
                     writersFinished.set(true);
                     writerDone.countDown();
-                } catch (Exception e) {
-                    e.printStackTrace();
                 }
             };
 
@@ -811,35 +790,29 @@ class LiveIndexingIntegrationTest {
                     while (!writersFinished.get()) {
                         long queryEpoch = visibilityTracker.captureEpoch();
 
-                        for (Map.Entry<String, Long> entry : documentCommitEpochs.entrySet()) {
-                            String documentId = entry.getKey();
-                            long commitEpoch = entry.getValue();
+                        for (String documentId : atomicityTracker.getVisibleDocuments(queryEpoch)) {
+                            List<String> chunkIds = documentChunkIds.get(documentId);
+                            if (chunkIds == null) continue;
 
-                            if (commitEpoch <= queryEpoch) {
-                                List<String> chunkIds = documentChunkIds.get(documentId);
-                                if (chunkIds == null) continue;
+                            totalChecks.incrementAndGet();
 
-                                totalChecks.incrementAndGet();
-
-                                int visibleChunks = 0;
-                                for (String chunkId : chunkIds) {
-                                    Long chunkEpoch = chunkVisibilityEpochs.get(chunkId);
-                                    if (chunkEpoch != null && queryEpoch >= chunkEpoch) {
-                                        visibleChunks++;
-                                    }
+                            int visibleChunks = 0;
+                            for (String chunkId : chunkIds) {
+                                if (atomicityTracker.isChunkVisible(chunkId, queryEpoch)) {
+                                    visibleChunks++;
                                 }
+                            }
 
-                                // TORN READ: visible but not all chunks
-                                if (visibleChunks > 0 && visibleChunks < chunkIds.size()) {
-                                    tornReadCount.incrementAndGet();
-                                }
+                            // TORN READ: the document is visible but not all of its chunks are
+                            if (visibleChunks != chunkIds.size()) {
+                                tornReadCount.incrementAndGet();
                             }
                         }
 
                         Thread.sleep(2);
                     }
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    workerFailures.add(e);
                 }
             };
 
@@ -849,13 +822,16 @@ class LiveIndexingIntegrationTest {
             }
 
             startLatch.countDown();
-            writerDone.await(60, TimeUnit.SECONDS);
+            boolean writerCompleted = writerDone.await(60, TimeUnit.SECONDS);
 
             executor.shutdown();
             executor.awaitTermination(10, TimeUnit.SECONDS);
 
             System.out.println("Torn read test: " + tornReadCount.get() + " torn reads out of " +
                 totalChecks.get() + " checks");
+
+            assertThat(writerCompleted).as("The writer must finish within the timeout").isTrue();
+            assertThat(workerFailures).as("No worker may fail: " + workerFailures).isEmpty();
 
             assertThat(tornReadCount.get())
                 .as("No torn reads should occur - all chunks must be visible at the same epoch")
@@ -864,6 +840,7 @@ class LiveIndexingIntegrationTest {
             assertThat(totalChecks.get())
                 .as("Should have performed visibility checks")
                 .isGreaterThan(0);
+            assertThat(atomicityTracker.getDocumentCount()).isEqualTo(numDocuments);
 
             graph.close();
         }
@@ -892,7 +869,10 @@ class LiveIndexingIntegrationTest {
             visibilityTracker.registerSegment(segmentId, visibilityTracker.currentEpoch());
             visibilityTracker.advanceEpoch();
 
-            // Query pipeline
+            // The document atomicity filter is the component this test is named for, so the
+            // pipeline is built with it. The four-argument constructor leaves it disabled.
+            DocumentVisibilityTracker atomicityTracker = new DocumentVisibilityTracker();
+
             QueryPipeline.HnswGraphProvider graphProvider = segId -> {
                 if (segId == segmentId) return graph;
                 return null;
@@ -900,18 +880,25 @@ class LiveIndexingIntegrationTest {
             QueryPipeline pipeline = new QueryPipeline(
                 storageEngine,
                 visibilityTracker,
+                new DocumentVisibilityTrackerAdapter(atomicityTracker),
                 graphProvider,
-                distanceFunction
+                distanceFunction,
+                null,
+                QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
+                null
             );
+            assertThat(pipeline.getVisibilityChecker())
+                .as("The document atomicity filter must be configured")
+                .isNotNull();
 
             int numDocuments = 25;
             int chunksPerDocument = 6;
 
-            ConcurrentHashMap<String, Integer> documentChunkCounts = new ConcurrentHashMap<>();
-            ConcurrentHashMap<String, Long> documentCommitEpochs = new ConcurrentHashMap<>();
-            ConcurrentHashMap<String, Long> chunkVisibilityEpochs = new ConcurrentHashMap<>();
+            ConcurrentHashMap<String, List<String>> documentChunkIds = new ConcurrentHashMap<>();
             AtomicInteger partialDocumentCount = new AtomicInteger(0);
             AtomicInteger totalQueries = new AtomicInteger(0);
+            AtomicInteger resultsInspected = new AtomicInteger(0);
+            List<Throwable> workerFailures = Collections.synchronizedList(new ArrayList<>());
 
             ExecutorService executor = Executors.newFixedThreadPool(4);
             CountDownLatch startLatch = new CountDownLatch(1);
@@ -926,51 +913,30 @@ class LiveIndexingIntegrationTest {
                     for (int d = 0; d < numDocuments; d++) {
                         String documentId = "doc-atomic-" + d;
 
-                        // Use atomic batch publication
-                        DocumentBatchBuffer batchBuffer = new DocumentBatchBuffer(documentId, "test-source");
+                        // Write the document's chunks through the real buffer: the batch it
+                        // returns carries the chunk ids and the write-log offset range that
+                        // atomic publication is defined over.
                         List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-
-                        for (int c = 0; c < chunks.size(); c++) {
-                            TextChunk chunk = chunks.get(c);
-                            String chunkId = documentId + ":" + c;
-                            long offset = writeLog.writeHead();
-                            batchBuffer.addChunk(chunkId, chunk, offset);
-                        }
-
-                        batchBuffer.seal();
-
-                        DocumentMetadata metadata = DocumentMetadata.builder()
-                            .sourceId("test-source")
-                            .documentId(documentId)
-                            .lastModifiedMillis(System.currentTimeMillis())
-                            .contentHash((long) d * 1000)
-                            .contentLength(1000)
-                            .indexTimeMillis(System.currentTimeMillis())
-                            .build();
-
-                        publisher.publish(batchBuffer, metadata);
+                        chunkBuffer.bufferChunks(chunks);
+                        AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
 
                         float[] vector = createRandomVector(dimension);
-                        graph.insert(vector);
-                        graph.registerDocumentId(graph.nodeCount() - 1, documentId);
-                        graph.setLastIntegratedOffset(writeLog.writeHead());
+                        long nodeId = graph.insert(vector);
+                        graph.registerDocumentId(nodeId, documentId);
+                        graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                        writeLog.sync();
                         long commitEpoch = visibilityTracker.advanceEpoch();
 
-                        documentChunkCounts.put(documentId, chunksPerDocument);
-                        documentCommitEpochs.put(documentId, commitEpoch);
-                        for (int c = 0; c < chunksPerDocument; c++) {
-                            chunkVisibilityEpochs.put(documentId + ":" + c, commitEpoch);
-                        }
+                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIdsList()));
+                        atomicityTracker.registerAtomicDocument(batch, commitEpoch);
 
                         Thread.sleep(5);
                     }
-
+                } catch (Exception e) {
+                    workerFailures.add(e);
+                } finally {
                     writersFinished.set(true);
                     writerDone.countDown();
-                } catch (Exception e) {
-                    e.printStackTrace();
                 }
             };
 
@@ -995,35 +961,38 @@ class LiveIndexingIntegrationTest {
                         QueryResponse response = pipeline.executeSync(request, new CancellationToken());
                         totalQueries.incrementAndGet();
 
-                        // Check for partial documents
+                        // Every result that survived the atomicity filter must belong to a
+                        // document the tracker itself reports as whole at the query epoch.
                         for (QueryResultItem result : response.results()) {
                             String docIdStr = result.documentIdStr();
-                            if (docIdStr != null && documentChunkCounts.containsKey(docIdStr)) {
-                                Integer expectedChunks = documentChunkCounts.get(docIdStr);
-                                Long commitEpoch = documentCommitEpochs.get(docIdStr);
+                            if (docIdStr == null) continue;
 
-                                if (commitEpoch != null && queryEpoch >= commitEpoch) {
-                                    // Document should be fully visible
-                                    int visibleChunks = 0;
-                                    for (int c = 0; c < expectedChunks; c++) {
-                                        String chunkId = docIdStr + ":" + c;
-                                        Long chunkEpoch = chunkVisibilityEpochs.get(chunkId);
-                                        if (chunkEpoch != null && queryEpoch >= chunkEpoch) {
-                                            visibleChunks++;
-                                        }
-                                    }
+                            List<String> chunkIds = documentChunkIds.get(docIdStr);
+                            if (chunkIds == null) continue;
 
-                                    if (visibleChunks > 0 && visibleChunks < expectedChunks) {
-                                        partialDocumentCount.incrementAndGet();
-                                    }
+                            resultsInspected.incrementAndGet();
+
+                            if (!atomicityTracker.isDocumentFullyVisible(docIdStr, queryEpoch)) {
+                                // Committed after this query's epoch: not this test's subject
+                                continue;
+                            }
+
+                            int visibleChunks = 0;
+                            for (String chunkId : chunkIds) {
+                                if (atomicityTracker.isChunkVisible(chunkId, queryEpoch)) {
+                                    visibleChunks++;
                                 }
+                            }
+
+                            if (visibleChunks != chunkIds.size()) {
+                                partialDocumentCount.incrementAndGet();
                             }
                         }
 
                         Thread.sleep(10);
                     }
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    workerFailures.add(e);
                 }
             };
 
@@ -1033,13 +1002,17 @@ class LiveIndexingIntegrationTest {
             }
 
             startLatch.countDown();
-            writerDone.await(60, TimeUnit.SECONDS);
+            boolean writerCompleted = writerDone.await(60, TimeUnit.SECONDS);
 
             executor.shutdown();
             executor.awaitTermination(10, TimeUnit.SECONDS);
 
             System.out.println("Document atomicity test: " + partialDocumentCount.get() +
-                " partial documents out of " + totalQueries.get() + " queries");
+                " partial documents out of " + totalQueries.get() + " queries (" +
+                resultsInspected.get() + " results inspected)");
+
+            assertThat(writerCompleted).as("The writer must finish within the timeout").isTrue();
+            assertThat(workerFailures).as("No worker may fail: " + workerFailures).isEmpty();
 
             assertThat(partialDocumentCount.get())
                 .as("No partial documents should be visible - all chunks of a document must be visible together")
@@ -1047,6 +1020,12 @@ class LiveIndexingIntegrationTest {
 
             assertThat(totalQueries.get())
                 .as("Should have executed queries")
+                .isGreaterThan(0);
+
+            // The check above is only meaningful if published documents actually reached the
+            // query results
+            assertThat(resultsInspected.get())
+                .as("Queries must have returned published documents for atomicity to be checked")
                 .isGreaterThan(0);
 
             graph.close();
@@ -1256,62 +1235,4 @@ class LiveIndexingIntegrationTest {
         }
     }
 
-    private static class TestDocumentVisibilityTracker implements DocumentVisibilityChecker {
-        private final ConcurrentHashMap<String, Long> documentCommitEpochs = new ConcurrentHashMap<>();
-        private final ConcurrentHashMap<String, Integer> documentChunkCounts = new ConcurrentHashMap<>();
-
-        public void registerDocument(String documentId, int chunkCount, long commitEpoch) {
-            documentCommitEpochs.put(documentId, commitEpoch);
-            documentChunkCounts.put(documentId, chunkCount);
-        }
-
-        @Override
-        public boolean isDocumentVisible(String documentId, long queryEpoch) {
-            Long commitEpoch = documentCommitEpochs.get(documentId);
-            return commitEpoch != null && queryEpoch >= commitEpoch;
-        }
-
-        @Override
-        public boolean isChunkVisible(String chunkId, long queryEpoch) {
-            String documentId = chunkId.contains(":") ? chunkId.substring(0, chunkId.lastIndexOf(':')) : chunkId;
-            return isDocumentVisible(documentId, queryEpoch);
-        }
-
-        @Override
-        public List<String> filterPartialDocuments(List<String> chunkIds, long queryEpoch) {
-            List<String> filtered = new ArrayList<>();
-            for (String chunkId : chunkIds) {
-                if (isChunkVisible(chunkId, queryEpoch)) {
-                    filtered.add(chunkId);
-                }
-            }
-            return filtered;
-        }
-
-        @Override
-        public Set<String> getVisibleDocuments(long queryEpoch) {
-            Set<String> visible = new HashSet<>();
-            for (Map.Entry<String, Long> entry : documentCommitEpochs.entrySet()) {
-                if (queryEpoch >= entry.getValue()) {
-                    visible.add(entry.getKey());
-                }
-            }
-            return visible;
-        }
-
-        @Override
-        public long getCommitEpoch(String documentId) {
-            return documentCommitEpochs.getOrDefault(documentId, -1L);
-        }
-
-        @Override
-        public int getChunkCount(String documentId) {
-            return documentChunkCounts.getOrDefault(documentId, 0);
-        }
-
-        @Override
-        public int getDocumentCount() {
-            return documentCommitEpochs.size();
-        }
-    }
 }

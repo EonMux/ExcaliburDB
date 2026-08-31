@@ -456,8 +456,11 @@ public final class EmbeddingClient {
                             attempt, maxRetries, correlationId);
                 }
 
+                // Bounded for the same reason as the chat client: an embedding reply that keeps
+                // arriving is not covered by the request timeout.
                 HttpResponse<String> response = httpClient.send(request,
-                        HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                        excalibur.llm.client.BoundedBody.ofString(
+                                config.getMaxResponseBytes(), StandardCharsets.UTF_8));
 
                 int statusCode = response.statusCode();
 

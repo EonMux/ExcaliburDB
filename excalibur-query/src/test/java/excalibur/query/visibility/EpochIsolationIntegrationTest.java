@@ -1,5 +1,6 @@
 package excalibur.query.visibility;
 
+import excalibur.shard.visibility.EpochIsolationValidator;
 import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -8,12 +9,12 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -64,11 +65,13 @@ class EpochIsolationIntegrationTest {
         @Test
         @DisplayName("query at epoch E does not see data from epoch E+1")
         void queryDoesNotSeeFutureEpochData() {
-            // Setup: Register nodes at different epochs
-            validator.registerNode(1L, 5L);   // Visible at epoch 5
-            validator.registerNode(2L, 8L);   // Visible at epoch 8
-            validator.registerNode(3L, 12L);  // Visible at epoch 12 (AFTER query epoch)
-            validator.registerNode(4L, 15L);  // Visible at epoch 15 (AFTER query epoch)
+            // Setup: Register batches at different epochs, scoped by segment exactly as
+            // the HNSW integration worker does
+            long segmentId = 0L;
+            validator.registerNodeRange(segmentId, 1L, 5L);   // Visible at epoch 5
+            validator.registerNodeRange(segmentId, 2L, 8L);   // Visible at epoch 8
+            validator.registerNodeRange(segmentId, 3L, 12L);  // Visible at epoch 12 (AFTER query)
+            validator.registerNodeRange(segmentId, 4L, 15L);  // Visible at epoch 15 (AFTER query)
 
             // Simulate query at epoch 10
             long queryEpoch = 10L;
@@ -81,7 +84,8 @@ class EpochIsolationIntegrationTest {
             allResults.add(new HnswSearchResult(4L, 0.4f));
 
             // Filter results to only include nodes visible at query epoch
-            List<HnswSearchResult> filtered = validator.filterResults(allResults, queryEpoch);
+            List<HnswSearchResult> filtered =
+                validator.filterResults(segmentId, allResults, queryEpoch);
 
             // Verify: Only nodes 1 and 2 should be visible at epoch 10
             assertThat(filtered).hasSize(2);
@@ -90,7 +94,7 @@ class EpochIsolationIntegrationTest {
 
             // Validate no epoch isolation violations
             EpochIsolationValidator.ValidationResult validation =
-                validator.validateResults(filtered, queryEpoch);
+                validator.validateResults(segmentId, filtered, queryEpoch);
             assertThat(validation.valid()).isTrue();
             assertThat(validation.violations()).isEqualTo(0);
         }
@@ -107,23 +111,32 @@ class EpochIsolationIntegrationTest {
 
             AtomicInteger violationCount = new AtomicInteger(0);
             AtomicInteger totalReads = new AtomicInteger(0);
+            AtomicInteger resultsRead = new AtomicInteger(0);
 
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch writersDone = new CountDownLatch(numWriterThreads);
             AtomicInteger currentEpoch = new AtomicInteger(0);
 
+            // Per segment: how many node IDs have been registered, published only after
+            // the registration itself. A node below this watermark has its covering
+            // checkpoint fixed forever, because every later checkpoint has a higher ID -
+            // which is exactly how a graph allocates node IDs.
+            AtomicIntegerArray registeredUpTo = new AtomicIntegerArray(numWriterThreads);
+
             ExecutorService executor = Executors.newFixedThreadPool(numWriterThreads + numReaderThreads);
 
-            // Writer threads: Register nodes at increasing epochs
+            // Writer threads: each owns a segment and registers ascending node IDs at
+            // ascending epochs, registering BEFORE the node exists, as the integration
+            // worker does.
             for (int t = 0; t < numWriterThreads; t++) {
-                final int threadId = t;
+                final int segmentId = t;
                 executor.submit(() -> {
                     try {
                         startLatch.await();
                         for (int i = 0; i < nodesPerWriter; i++) {
-                            long nodeId = threadId * 1000L + i;
                             int epoch = currentEpoch.incrementAndGet();
-                            validator.registerNode(nodeId, epoch);
+                            validator.registerNodeRange(segmentId, i, epoch);
+                            registeredUpTo.set(segmentId, i + 1);
                             Thread.yield();
                         }
                     } catch (InterruptedException e) {
@@ -134,31 +147,42 @@ class EpochIsolationIntegrationTest {
                 });
             }
 
-            // Reader threads: Query at various epochs and verify isolation
+            // Reader threads: capture an epoch, then read the nodes that already existed
+            // when it was captured. Every one of them was registered at an epoch at or
+            // below the captured one, so all must survive the filter and none may be
+            // reported as a violation.
             for (int t = 0; t < numReaderThreads; t++) {
                 executor.submit(() -> {
                     try {
                         startLatch.await();
                         while (writersDone.getCount() > 0) {
-                            // Capture a query epoch
-                            int queryEpoch = currentEpoch.get();
+                            for (int segmentId = 0; segmentId < numWriterThreads; segmentId++) {
+                                int existingNodes = registeredUpTo.get(segmentId);
+                                int queryEpoch = currentEpoch.get();
+                                if (existingNodes == 0) {
+                                    continue;
+                                }
 
-                            // Create results from some nodes
-                            List<HnswSearchResult> results = new ArrayList<>();
-                            for (int i = 0; i < 10; i++) {
-                                results.add(new HnswSearchResult(i * 100L, i * 0.1f));
+                                List<HnswSearchResult> results = new ArrayList<>();
+                                for (int i = 0; i < existingNodes; i++) {
+                                    results.add(new HnswSearchResult(i, i * 0.001f));
+                                }
+
+                                List<HnswSearchResult> filtered =
+                                    validator.filterResults(segmentId, results, queryEpoch);
+                                EpochIsolationValidator.ValidationResult validation =
+                                    validator.validateResults(segmentId, filtered, queryEpoch);
+
+                                totalReads.incrementAndGet();
+                                resultsRead.addAndGet(filtered.size());
+                                if (filtered.size() != results.size()) {
+                                    // A node that existed at the captured epoch was hidden
+                                    violationCount.addAndGet(results.size() - filtered.size());
+                                }
+                                if (!validation.valid()) {
+                                    violationCount.addAndGet(validation.violations());
+                                }
                             }
-
-                            // Filter and validate
-                            List<HnswSearchResult> filtered = validator.filterResults(results, queryEpoch);
-                            EpochIsolationValidator.ValidationResult validation =
-                                validator.validateResults(filtered, queryEpoch);
-
-                            totalReads.incrementAndGet();
-                            if (!validation.valid()) {
-                                violationCount.addAndGet(validation.violations());
-                            }
-
                             Thread.yield();
                         }
                     } catch (InterruptedException e) {
@@ -175,7 +199,6 @@ class EpochIsolationIntegrationTest {
             executor.shutdown();
             executor.awaitTermination(10, TimeUnit.SECONDS);
 
-            // Verify no violations
             assertThat(violationCount.get())
                 .as("No epoch isolation violations should occur during concurrent operations")
                 .isEqualTo(0);
@@ -184,8 +207,9 @@ class EpochIsolationIntegrationTest {
                 .as("Should have performed reads during concurrent operations")
                 .isGreaterThan(0);
 
-            System.out.println("Concurrency test: " + totalReads.get() + " reads, " +
-                violationCount.get() + " violations");
+            assertThat(resultsRead.get())
+                .as("Reads should have returned the nodes that existed at their epoch")
+                .isGreaterThan(0);
         }
     }
 
@@ -367,9 +391,12 @@ class EpochIsolationIntegrationTest {
             // Document 2: nodes 4, 5, 6 - visible at epoch 10
             // Document 3: nodes 7, 8, 9 - visible at epoch 15
 
-            validator.registerNodes(Set.of(1L, 2L, 3L), 5L);
-            validator.registerNodes(Set.of(4L, 5L, 6L), 10L);
-            validator.registerNodes(Set.of(7L, 8L, 9L), 15L);
+            // Each document's chunks occupy a contiguous ascending block of node IDs, so
+            // each is one checkpoint keyed on the block's first node ID.
+            long segmentId = 0L;
+            validator.registerNodeRange(segmentId, 1L, 5L);
+            validator.registerNodeRange(segmentId, 4L, 10L);
+            validator.registerNodeRange(segmentId, 7L, 15L);
 
             // Query at epoch 12 should see documents 1 and 2 only
             List<HnswSearchResult> results = new ArrayList<>();
@@ -377,7 +404,7 @@ class EpochIsolationIntegrationTest {
                 results.add(new HnswSearchResult(i, i * 0.1f));
             }
 
-            List<HnswSearchResult> filtered = validator.filterResults(results, 12L);
+            List<HnswSearchResult> filtered = validator.filterResults(segmentId, results, 12L);
 
             // Should see all 6 nodes from documents 1 and 2
             assertThat(filtered).hasSize(6);
@@ -386,7 +413,7 @@ class EpochIsolationIntegrationTest {
 
             // Validate no violations
             EpochIsolationValidator.ValidationResult validation =
-                validator.validateResults(filtered, 12L);
+                validator.validateResults(segmentId, filtered, 12L);
             assertThat(validation.valid()).isTrue();
         }
     }

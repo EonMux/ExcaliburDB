@@ -6,6 +6,7 @@ import io.excalibur.store.Segment;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Tracks term frequencies during document ingestion for query selectivity estimation.
@@ -58,6 +59,13 @@ public class TermFrequencyTracker {
      * Targets ~99.9% confidence (δ ≈ 2^-depth = 0.001).
      */
     public static final int DEFAULT_SKETCH_DEPTH = 10;
+
+    /**
+     * Serializes the "does this segment have a sketch yet, and if not attach one" step.
+     *
+     * @see #getOrCreateSketch(Segment)
+     */
+    private final ReentrantLock attachLock = new ReentrantLock();
 
     /**
      * Creates a new Count-Min Sketch with default parameters optimized
@@ -198,16 +206,32 @@ public class TermFrequencyTracker {
      * <p>If the segment already has a sketch attached, returns it.
      * Otherwise, creates a new sketch with default parameters and attaches it.</p>
      *
+     * <p>{@link Segment} exposes no compare-and-set for the sketch, so the test and the attach
+     * are serialized here. Without that, two ingestions reaching a segment with no sketch both
+     * create one and the second attach replaces the first - discarding every term already
+     * counted into it, and leaving the thread holding the first sketch writing into an object
+     * the segment no longer publishes.</p>
+     *
      * @param segment The segment to get or create a sketch for
      * @return The Count-Min Sketch (never null)
      */
     private CountMinSketch getOrCreateSketch(Segment segment) {
         CountMinSketch sketch = segment.termFrequencySketch();
-        if (sketch == null) {
-            sketch = createSketch();
-            segment.attachTermFrequencySketch(sketch);
+        if (sketch != null) {
+            return sketch;
         }
-        return sketch;
+
+        attachLock.lock();
+        try {
+            sketch = segment.termFrequencySketch();
+            if (sketch == null) {
+                sketch = createSketch();
+                segment.attachTermFrequencySketch(sketch);
+            }
+            return sketch;
+        } finally {
+            attachLock.unlock();
+        }
     }
 
     /**

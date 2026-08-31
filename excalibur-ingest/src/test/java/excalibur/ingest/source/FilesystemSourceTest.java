@@ -404,4 +404,28 @@ class FilesystemSourceTest {
             assertThat(documentIds).contains("UPPER.TXT");
         }
     }
+
+    @Test
+    void doubleDotInAFileNameIsCrawledAndFetched() throws IOException, SourceException {
+        // A substring test for ".." also rejects ordinary names. The crawl lists such a file and
+        // the fetch then throws IllegalArgumentException, which is not part of fetch's contract,
+        // so the document is skipped as an unexpected error: never indexed, never reported.
+        Files.writeString(testRoot.resolve("notes..2024.md"), "Double dot content");
+
+        try (Stream<String> ids = source.crawl()) {
+            assertThat(ids.toList()).contains("notes..2024.md");
+        }
+
+        assertThat(source.fetch("notes..2024.md").getText()).isEqualTo("Double dot content");
+    }
+
+    @Test
+    void realTraversalIsStillRejected() {
+        assertThatThrownBy(() -> source.fetch("../outside.txt"))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("traversal");
+        assertThatThrownBy(() -> source.fetch("subdir/../../outside.txt"))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("traversal");
+    }
 }

@@ -1,8 +1,6 @@
 package excalibur.query;
 
 import excalibur.query.executor.CancellationToken;
-import excalibur.query.executor.QueryExecutor;
-import excalibur.query.executor.QueryExecutor.SegmentWithGraph;
 import excalibur.query.executor.QueryRegistry;
 import excalibur.query.pipeline.QueryPipeline;
 import org.junit.jupiter.api.Test;

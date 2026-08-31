@@ -5,8 +5,6 @@ plugins {
     `java-library`
 }
 
-group = "io.excalibur"
-version = "1.0.0-SNAPSHOT"
 
 // Java 21 configuration
 java {

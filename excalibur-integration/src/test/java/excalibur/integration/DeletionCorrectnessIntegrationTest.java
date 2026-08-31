@@ -163,15 +163,26 @@ class DeletionCorrectnessIntegrationTest {
                 filter.insert(("key-" + i).getBytes(StandardCharsets.UTF_8));
             }
 
-            // Try to delete non-existent keys
+            // Deleting a key that was never inserted almost always fails, and occasionally
+            // does not: a cuckoo filter matches fingerprints, so a key that was never inserted
+            // can match one that was. That is the documented reason a caller must only delete
+            // what it inserted -- a spurious success here removes a real key's fingerprint and
+            // turns it into a false negative. Asserting zero made this test fail roughly one
+            // run in fifteen for behaviour the structure is defined to have.
+            int spuriousSuccesses = 0;
             for (int i = 1000; i < 1100; i++) {
-                boolean deleted = filter.delete(("nonexistent-" + i).getBytes(StandardCharsets.UTF_8));
-                assertThat(deleted)
-                    .as("Delete should fail for non-existent key")
-                    .isFalse();
+                if (filter.delete(("nonexistent-" + i).getBytes(StandardCharsets.UTF_8))) {
+                    spuriousSuccesses++;
+                }
             }
 
-            System.out.println("Delete non-existent keys correctly returns false");
+            assertThat(spuriousSuccesses)
+                .as("deleting a never-inserted key succeeds only on a fingerprint collision, "
+                    + "which must stay rare")
+                .isLessThan(5);
+
+            System.out.println("Delete of non-existent keys: " + spuriousSuccesses
+                + " fingerprint collisions out of 100");
         }
 
         /**
@@ -611,6 +622,14 @@ class DeletionCorrectnessIntegrationTest {
 
         /**
          * Test: Concurrent insert and delete operations are safe.
+         *
+         * <p>The two threads work on disjoint key ranges. They used to share one: the insert
+         * thread added a key to its expected-set <em>after</em> inserting it, so a delete of
+         * that key landing in between was recorded in the filter and then undone in the
+         * expected-set — and the test reported a key "missing" that it had itself asked to be
+         * deleted. That is the test's own bookkeeping racing, not the filter, and it made a
+         * genuine concurrency test fail about one run in six for a reason that had nothing to
+         * do with concurrency in the code under test.
          */
         @Test
         @DisplayName("concurrent insert and delete operations are safe")
@@ -618,14 +637,26 @@ class DeletionCorrectnessIntegrationTest {
             CuckooFilter filter = CuckooFilter.create(10000);
 
             int numOperations = 1000;
+            int preloaded = 500;
+
+            // Deleted concurrently with the inserts below, and never inserted by that thread,
+            // so each key has exactly one writer and the expectations are unambiguous.
+            Set<String> toDelete = ConcurrentHashMap.newKeySet();
+            for (int i = 0; i < preloaded; i++) {
+                String key = "predeleted-key-" + i;
+                if (filter.insert(key.getBytes(StandardCharsets.UTF_8))) {
+                    toDelete.add(key);
+                }
+            }
+
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch doneLatch = new CountDownLatch(2);
             AtomicInteger insertCount = new AtomicInteger(0);
             AtomicInteger deleteCount = new AtomicInteger(0);
             Set<String> insertedKeys = ConcurrentHashMap.newKeySet();
+            Set<String> deletedKeys = ConcurrentHashMap.newKeySet();
 
             try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
-                // Insert thread
                 executor.submit(() -> {
                     try {
                         startLatch.await();
@@ -643,15 +674,13 @@ class DeletionCorrectnessIntegrationTest {
                     }
                 });
 
-                // Delete thread (deletes odd keys that may or may not exist)
                 executor.submit(() -> {
                     try {
                         startLatch.await();
-                        for (int i = 0; i < numOperations; i += 2) {
-                            String key = "mixed-key-" + i;
+                        for (String key : toDelete) {
                             if (filter.delete(key.getBytes(StandardCharsets.UTF_8))) {
+                                deletedKeys.add(key);
                                 deleteCount.incrementAndGet();
-                                insertedKeys.remove(key);
                             }
                         }
                     } catch (InterruptedException e) {
@@ -666,22 +695,37 @@ class DeletionCorrectnessIntegrationTest {
                 assertThat(finished).as("Concurrent operations should complete in time").isTrue();
             }
 
-            // Verify consistency: filter count should match inserted keys still present
-            long filterCount = filter.count();
-            int expectedCount = insertedKeys.size();
+            System.out.println("Mixed operations: " + insertCount.get() + " inserts, "
+                + deleteCount.get() + " deletes, filter count=" + filter.count());
 
-            System.out.println("Mixed operations: " + insertCount.get() + " inserts, " +
-                deleteCount.get() + " deletes, filter count=" + filterCount +
-                ", expected=" + expectedCount);
+            assertThat(deleteCount.get())
+                .as("every preloaded key must be deletable while inserts run alongside")
+                .isEqualTo(toDelete.size());
 
-            // All keys still in insertedKeys should be present
-            int missingCount = 0;
+            int missing = 0;
             for (String key : insertedKeys) {
                 if (!filter.contains(key.getBytes(StandardCharsets.UTF_8))) {
-                    missingCount++;
+                    missing++;
                 }
             }
-            assertThat(missingCount).as("All remaining keys should be present").isEqualTo(0);
+            assertThat(missing)
+                .as("a key the filter accepted must still be found; losing one is a false "
+                    + "negative, which is the one answer a filter may never give")
+                .isEqualTo(0);
+
+            // Bounded, not zero. A thousand other keys were inserted alongside, and any of
+            // their fingerprints may land in a bucket a deleted key also hashes to -- that is
+            // an ordinary false positive, which the filter is allowed and expected to give. The
+            // guarantee runs the other way: never a false negative.
+            int stillMatching = 0;
+            for (String key : deletedKeys) {
+                if (filter.contains(key.getBytes(StandardCharsets.UTF_8))) {
+                    stillMatching++;
+                }
+            }
+            assertThat(stillMatching)
+                .as("a deleted key may still collide with a live one, but only rarely")
+                .isLessThan(Math.max(1, deletedKeys.size() / 50));
         }
     }
 
@@ -907,9 +951,23 @@ class DeletionCorrectnessIntegrationTest {
                 }
             }
 
+            // The corpus level holds each item once however many segments contain it, because
+            // findCandidateSegments gates on it -- an item missing there is invisible in every
+            // segment below. Removing the shared entry therefore needs to establish that no
+            // other segment still holds the item, and the only way to ask is contains(), which
+            // may answer yes when the truth is no. Where it does, the entry stays.
             assertThat(corpusFalsePositives)
-                .as("CRITICAL: No false positives at corpus level for deleted keys")
-                .isEqualTo(0);
+                .as("stale corpus entries after deleting everything are rare, and cost a wasted "
+                    + "candidate rather than a missing document")
+                .isLessThan(Math.max(1, allKeys.size() / 100));
+
+            // Exact, and what queries depend on: no deleted key resolves to any segment.
+            for (String keyWithSeg : allKeys) {
+                String key = keyWithSeg.split("@")[0];
+                assertThat(hcf.findCandidateSegments(HierarchicalCuckooFilter.toBytes(key)))
+                    .as("deleted key %s resolves to no segment", key)
+                    .isEmpty();
+            }
 
             System.out.println("Corpus level false positives: " + corpusFalsePositives);
         }
@@ -1124,16 +1182,40 @@ class DeletionCorrectnessIntegrationTest {
                 }
             }
 
-            // CRITICAL: All levels must have zero false positives
-            assertThat(corpusFPs)
-                .as("CRITICAL: Zero false positives at corpus level after deletion propagation")
-                .isEqualTo(0);
-            assertThat(clusterFPs)
-                .as("CRITICAL: Zero false positives at cluster level after deletion propagation")
-                .isEqualTo(0);
+            // The segment level is exact: a deletion there removes the one entry that was
+            // inserted there, and nothing else consults it.
             assertThat(segmentFPs)
                 .as("CRITICAL: Zero false positives at segment level after deletion propagation")
                 .isEqualTo(0);
+
+            // The cluster and corpus levels are not, and cannot be. They hold each item once
+            // however many segments contain it -- they have to, because findCandidateSegments
+            // gates on them, so an item missing there is invisible everywhere below. Removing
+            // the shared entry therefore requires knowing that no other segment still holds the
+            // item, and the only way to ask that is contains(), which is allowed to say yes
+            // when the answer is no. When it does, the entry is kept.
+            //
+            // That is the safe direction. The alternative -- what this used to do, inserting one
+            // shared entry per segment so deletion could be exact -- put the same fingerprint in
+            // the same bucket pair once per segment, so a term in nine segments failed to insert
+            // on the ninth and the rollback took the segment's own entry with it. A term the
+            // segment contained stopped being findable.
+            assertThat(corpusFPs)
+                .as("stale corpus entries are rare, and cost a wasted candidate rather than a "
+                    + "missing document")
+                .isLessThan(keyToSegment.size() / 100);
+            assertThat(clusterFPs)
+                .as("stale cluster entries are rare for the same reason")
+                .isLessThan(keyToSegment.size() / 100);
+
+            // What actually matters, and what is exact: no deleted key resolves to any segment.
+            // findCandidateSegments confirms at the segment level, so a stale shared entry costs
+            // a scan and changes no answer.
+            for (String key : keyToSegment.keySet()) {
+                assertThat(hcf.findCandidateSegments(HierarchicalCuckooFilter.toBytes(key)))
+                    .as("deleted key %s resolves to no segment", key)
+                    .isEmpty();
+            }
 
             System.out.println("Complete hierarchy verification - Corpus FPs: " + corpusFPs +
                 ", Cluster FPs: " + clusterFPs + ", Segment FPs: " + segmentFPs);
@@ -1213,7 +1295,11 @@ class DeletionCorrectnessIntegrationTest {
 
             System.out.println("Concurrently deleted " + totalDeleted.get() + " keys");
 
-            // CRITICAL: Verify no false positives at corpus level after concurrent deletion
+            // The corpus level can retain a stale entry: removing a shared entry requires
+            // establishing that no sibling segment still holds the item, and that question can
+            // only be asked of filters that are allowed to answer yes when the truth is no.
+            // Under concurrency it is also genuinely racy, and keeping the entry is the correct
+            // resolution of the race.
             int falsePositives = 0;
             for (String keyWithSeg : allKeys) {
                 String key = keyWithSeg.split("@")[0];
@@ -1223,8 +1309,17 @@ class DeletionCorrectnessIntegrationTest {
             }
 
             assertThat(falsePositives)
-                .as("CRITICAL: No false positives after concurrent deletion propagation")
-                .isEqualTo(0);
+                .as("stale corpus entries after concurrent deletion are rare")
+                .isLessThan(allKeys.size() / 100);
+
+            // Exact, and the property queries actually depend on: no deleted key resolves to a
+            // segment, whatever the shared levels still say.
+            for (String keyWithSeg : allKeys) {
+                String key = keyWithSeg.split("@")[0];
+                assertThat(hcf.findCandidateSegments(HierarchicalCuckooFilter.toBytes(key)))
+                    .as("deleted key %s resolves to no segment", key)
+                    .isEmpty();
+            }
 
             System.out.println("Concurrent deletion propagation - False positives: " + falsePositives);
         }

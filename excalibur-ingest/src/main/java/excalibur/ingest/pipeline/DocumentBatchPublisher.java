@@ -194,12 +194,34 @@ public class DocumentBatchPublisher {
             IndexOrchestrator orchestrator,
             LshIngestionService lshIngestionService,
             SegmentProvider segmentProvider) {
+        this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter, null, null,
+             writeLogAdapter, publicationLock, orchestrator, lshIngestionService, segmentProvider);
+    }
+
+    /**
+     * The one constructor that assigns the fields; every public constructor funnels into it.
+     *
+     * <p>Having a single canonical form is what lets {@link #withTargetSegment(long)} rebind the
+     * segment without having to know which filter flavour this publisher was built with.</p>
+     */
+    private DocumentBatchPublisher(
+            VisibilityTracker visibilityTracker,
+            DocumentRegistry documentRegistry,
+            DocumentVisibilityRegistry visibilityRegistry,
+            CuckooFilter cuckooFilter,
+            HierarchicalCuckooFilter hierarchicalFilter,
+            String segmentId,
+            WriteLogAdapter writeLogAdapter,
+            Lock publicationLock,
+            IndexOrchestrator orchestrator,
+            LshIngestionService lshIngestionService,
+            SegmentProvider segmentProvider) {
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
         this.documentRegistry = Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
         this.visibilityRegistry = visibilityRegistry;
         this.cuckooFilter = cuckooFilter;
-        this.hierarchicalFilter = null;
-        this.segmentId = null;
+        this.hierarchicalFilter = hierarchicalFilter;
+        this.segmentId = segmentId;
         this.writeLogAdapter = writeLogAdapter;
         this.publicationLock = publicationLock;
         this.orchestrator = orchestrator;
@@ -292,17 +314,8 @@ public class DocumentBatchPublisher {
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock,
             IndexOrchestrator orchestrator) {
-        this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
-        this.documentRegistry = Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
-        this.visibilityRegistry = visibilityRegistry;
-        this.cuckooFilter = null;
-        this.hierarchicalFilter = hierarchicalFilter;
-        this.segmentId = segmentId;
-        this.writeLogAdapter = writeLogAdapter;
-        this.publicationLock = publicationLock;
-        this.orchestrator = orchestrator;
-        this.lshIngestionService = null;
-        this.segmentProvider = null;
+        this(visibilityTracker, documentRegistry, visibilityRegistry, null, hierarchicalFilter,
+             segmentId, writeLogAdapter, publicationLock, orchestrator, null, null);
     }
 
     /**
@@ -381,36 +394,23 @@ public class DocumentBatchPublisher {
             throw new IllegalArgumentException("targetSegmentId must be non-negative: " + targetSegmentId);
         }
 
-        String newSegmentId = String.valueOf(targetSegmentId);
-
-        // Create a new publisher with the same configuration but different segment ID
-        // Use the appropriate constructor based on whether hierarchical filter is configured
-        if (this.hierarchicalFilter != null) {
-            // Use hierarchical filter constructor with orchestrator
-            return new DocumentBatchPublisher(
-                this.visibilityTracker,
-                this.documentRegistry,
-                this.visibilityRegistry,
-                this.hierarchicalFilter,
-                newSegmentId,
-                this.writeLogAdapter,
-                this.publicationLock,
-                this.orchestrator
-            );
-        } else {
-            // Use cuckoo filter constructor with optional orchestrator and LSH
-            return new DocumentBatchPublisher(
-                this.visibilityTracker,
-                this.documentRegistry,
-                this.visibilityRegistry,
-                this.cuckooFilter,
-                this.writeLogAdapter,
-                this.publicationLock,
-                this.orchestrator,
-                this.lshIngestionService,
-                this.segmentProvider
-            );
-        }
+        // Same configuration, bound to a different segment. The segment id is carried whichever
+        // filter flavour this publisher uses: it is also what selects the segment whose LSH index
+        // the chunks' vectors are inserted into, so dropping it here would silently unbind the
+        // copy from the segment the caller asked for.
+        return new DocumentBatchPublisher(
+            this.visibilityTracker,
+            this.documentRegistry,
+            this.visibilityRegistry,
+            this.cuckooFilter,
+            this.hierarchicalFilter,
+            String.valueOf(targetSegmentId),
+            this.writeLogAdapter,
+            this.publicationLock,
+            this.orchestrator,
+            this.lshIngestionService,
+            this.segmentProvider
+        );
     }
 
     /**
@@ -526,6 +526,11 @@ public class DocumentBatchPublisher {
 
             buffer.markPublished();
 
+            // The throughput counter the IngestionThroughput MBean reports. It had no writer
+            // outside the tests, so a server that had ingested millions of documents reported
+            // zero entries, zero rate and a zero peak - and any alert keyed on it never fired.
+            io.excalibur.metrics.Metrics.recordIngestEntries(chunkCount);
+
             LOGGER.info("Document batch published atomically: documentId={}, chunks={}, epoch={}",
                 documentId, chunkCount, newEpoch);
 
@@ -586,8 +591,11 @@ public class DocumentBatchPublisher {
                     continue;
                 }
 
-                // Extract terms from chunk text
-                List<String> terms = TermExtractor.extractTerms(textChunk.getText());
+                // Distinct terms: the filter answers whether a segment holds a term, so a
+                // term occurring forty times in a chunk is one fact, not forty. Inserting it
+                // once per occurrence is also what the cleanup path cannot undo - it removes
+                // each of a segment's distinct terms once.
+                Set<String> terms = TermExtractor.extractUniqueTerms(textChunk.getText());
                 if (terms.isEmpty()) {
                     LOGGER.debug("No significant terms extracted from chunk: {}", chunkId);
                     continue;
@@ -626,7 +634,7 @@ public class DocumentBatchPublisher {
                     continue;
                 }
 
-                List<String> terms = TermExtractor.extractTerms(textChunk.getText());
+                Set<String> terms = TermExtractor.extractUniqueTerms(textChunk.getText());
                 if (terms.isEmpty()) {
                     continue;
                 }
@@ -635,7 +643,9 @@ public class DocumentBatchPublisher {
                 for (String term : terms) {
                     byte[] termBytes = term.getBytes(StandardCharsets.UTF_8);
                     try {
-                        if (!cuckooFilter.insert(termBytes)) {
+                        // Chunks of one segment share terms, so the per-chunk set is not
+                        // enough on its own to keep one slot per term per segment.
+                        if (!cuckooFilter.insertIfAbsent(termBytes)) {
                             failedTerms++;
                         }
                     } catch (Exception e) {

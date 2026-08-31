@@ -6,9 +6,13 @@ import excalibur.query.QueryResultItem;
 import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.junit.jupiter.api.Test;
 
+import io.excalibur.vector.distance.CosineSimilarity;
+
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -90,6 +94,44 @@ class ResultAggregatorTest {
     }
 
     /**
+     * A tail-scan hit arrives with the chunk text the scan already read. The aggregator has
+     * to carry it onto the QueryResultItem: nothing downstream can recover it, because the
+     * synthetic node ID encodes an LSN rather than the chunk's storage key.
+     */
+    @Test
+    void testTailScanPayloadsAreCarriedOntoResults() {
+        ResultAggregator aggregator = new ResultAggregator(10);
+
+        long tailNodeId = Long.MIN_VALUE | 42L;
+        List<HnswSearchResult> results = List.of(
+            new HnswSearchResult(tailNodeId, -1.0f, "source1:doc1"),
+            new HnswSearchResult(7L, -0.5f, "source1:doc2")
+        );
+
+        SegmentQueryTask.SegmentQueryResult segmentResult = new SegmentQueryTask.SegmentQueryResult(
+            1L, results, 2, 10, true, null,
+            Map.of(tailNodeId, "the tail chunk".getBytes(StandardCharsets.UTF_8))
+        );
+
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(segmentResult), CosineSimilarity.getInstance());
+
+        QueryResultItem tailItem = merged.stream()
+            .filter(item -> item.nodeId() == tailNodeId)
+            .findFirst()
+            .orElseThrow();
+        QueryResultItem graphItem = merged.stream()
+            .filter(item -> item.nodeId() == 7L)
+            .findFirst()
+            .orElseThrow();
+
+        assertThat(new String(tailItem.payload(), StandardCharsets.UTF_8)).isEqualTo("the tail chunk");
+        assertThat(graphItem.hasPayload())
+            .as("graph hits carry no payload here; their text is resolved from storage later")
+            .isFalse();
+    }
+
+    /**
      * Test mergeAndRank with single segment.
      */
     @Test
@@ -160,15 +202,17 @@ class ResultAggregatorTest {
     void testMergeAndRankDeduplication() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
-        // Both segments have node ID 1, but with different distances
+        // The same DOCUMENT appears in both segments with different distances. Identity
+        // across segments is the document ID: node IDs are dense and per-graph, so two
+        // segments both holding node 1 are two unrelated vectors.
         List<HnswSearchResult> segment1Results = List.of(
-            new HnswSearchResult(1L, 0.1f),  // Better distance
-            new HnswSearchResult(2L, 0.3f)
+            new HnswSearchResult(1L, 0.1f, "doc1"),  // Better distance
+            new HnswSearchResult(2L, 0.3f, "doc2")
         );
 
         List<HnswSearchResult> segment2Results = List.of(
-            new HnswSearchResult(1L, 0.5f),  // Worse distance, should be deduplicated
-            new HnswSearchResult(3L, 0.2f)
+            new HnswSearchResult(1L, 0.5f, "doc1"),  // Worse distance, should be deduplicated
+            new HnswSearchResult(3L, 0.2f, "doc3")
         );
 
         SegmentQueryTask.SegmentQueryResult result1 = new SegmentQueryTask.SegmentQueryResult(
@@ -183,10 +227,11 @@ class ResultAggregatorTest {
         // Should have 3 unique document IDs
         assertThat(merged).hasSize(3);
 
-        // Document 1 should appear once with the BEST distance (0.1, not 0.5)
-        assertThat(merged.stream().anyMatch(r -> r.documentId() == 1L && r.score() == 0.1f)).isTrue();
+        // doc1 should appear once with the BEST distance (0.1, not 0.5)
+        assertThat(merged.stream().anyMatch(
+            r -> "doc1".equals(r.documentIdStr()) && r.score() == 0.1f)).isTrue();
         // Ensure no duplicate with worse score
-        assertThat(merged.stream().filter(r -> r.documentId() == 1L)).hasSize(1);
+        assertThat(merged.stream().filter(r -> "doc1".equals(r.documentIdStr()))).hasSize(1);
     }
 
     /**
@@ -200,14 +245,14 @@ class ResultAggregatorTest {
 
         // Segment 1 (old segment during re-index): doc 1 with WORSE distance
         List<HnswSearchResult> oldSegmentResults = List.of(
-            new HnswSearchResult(1L, 0.9f),  // Worse distance - should be replaced
-            new HnswSearchResult(2L, 0.5f)
+            new HnswSearchResult(1L, 0.9f, "doc1"),  // Worse distance - should be replaced
+            new HnswSearchResult(2L, 0.5f, "doc2")
         );
 
         // Segment 2 (new segment during re-index): doc 1 with BETTER distance
         List<HnswSearchResult> newSegmentResults = List.of(
-            new HnswSearchResult(1L, 0.1f),  // Better distance - should be kept
-            new HnswSearchResult(3L, 0.2f)
+            new HnswSearchResult(1L, 0.1f, "doc1"),  // Better distance - should be kept
+            new HnswSearchResult(3L, 0.2f, "doc3")
         );
 
         SegmentQueryTask.SegmentQueryResult oldResult = new SegmentQueryTask.SegmentQueryResult(
@@ -224,15 +269,15 @@ class ResultAggregatorTest {
         // Should have 3 unique document IDs
         assertThat(merged).hasSize(3);
 
-        // Document 1 should appear with the BEST distance (0.1), not the worse one (0.9)
+        // doc1 should appear with the BEST distance (0.1), not the worse one (0.9)
         QueryResultItem doc1Result = merged.stream()
-            .filter(r -> r.documentId() == 1L)
+            .filter(r -> "doc1".equals(r.documentIdStr()))
             .findFirst()
             .orElseThrow();
         assertThat(doc1Result.score()).isEqualTo(0.1f);
 
-        // Verify only one entry for document 1
-        assertThat(merged.stream().filter(r -> r.documentId() == 1L)).hasSize(1);
+        // Verify only one entry for doc1
+        assertThat(merged.stream().filter(r -> "doc1".equals(r.documentIdStr()))).hasSize(1);
     }
 
     /**
@@ -243,14 +288,14 @@ class ResultAggregatorTest {
     void testMergeAndRankDeduplicationOrderIndependent() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
-        // Segment 1: doc 1 with worse distance
+        // Segment 1: doc1 with worse distance
         List<HnswSearchResult> segment1Results = List.of(
-            new HnswSearchResult(1L, 0.8f)   // Worse distance
+            new HnswSearchResult(1L, 0.8f, "doc1")   // Worse distance
         );
 
-        // Segment 2: doc 1 with better distance
+        // Segment 2: doc1 with better distance
         List<HnswSearchResult> segment2Results = List.of(
-            new HnswSearchResult(1L, 0.2f)   // Better distance
+            new HnswSearchResult(7L, 0.2f, "doc1")   // Better distance, different node ID
         );
 
         SegmentQueryTask.SegmentQueryResult result1 = new SegmentQueryTask.SegmentQueryResult(
@@ -281,23 +326,25 @@ class ResultAggregatorTest {
     void testMergeAndRankMultipleDuplicatesAcrossSegments() {
         ResultAggregator aggregator = new ResultAggregator(5);
 
-        // Three segments, each containing some overlapping documents
+        // Three segments, each containing some overlapping documents. Node IDs repeat
+        // across segments because every graph numbers its nodes from zero; the document
+        // ID is what makes two results the same document.
         List<HnswSearchResult> segment1 = List.of(
-            new HnswSearchResult(1L, 0.5f),  // Doc 1: medium
-            new HnswSearchResult(2L, 0.3f),  // Doc 2: best
-            new HnswSearchResult(3L, 0.9f)   // Doc 3: worst
+            new HnswSearchResult(1L, 0.5f, "doc1"),  // doc1: medium
+            new HnswSearchResult(2L, 0.3f, "doc2"),  // doc2: best
+            new HnswSearchResult(3L, 0.9f, "doc3")   // doc3: worst
         );
 
         List<HnswSearchResult> segment2 = List.of(
-            new HnswSearchResult(1L, 0.2f),  // Doc 1: best
-            new HnswSearchResult(2L, 0.6f),  // Doc 2: worst
-            new HnswSearchResult(4L, 0.4f)   // Doc 4: only in this segment
+            new HnswSearchResult(1L, 0.2f, "doc1"),  // doc1: best
+            new HnswSearchResult(2L, 0.6f, "doc2"),  // doc2: worst
+            new HnswSearchResult(4L, 0.4f, "doc4")   // doc4: only in this segment
         );
 
         List<HnswSearchResult> segment3 = List.of(
-            new HnswSearchResult(1L, 0.8f),  // Doc 1: worst
-            new HnswSearchResult(3L, 0.1f),  // Doc 3: best
-            new HnswSearchResult(5L, 0.7f)   // Doc 5: only in this segment
+            new HnswSearchResult(1L, 0.8f, "doc1"),  // doc1: worst
+            new HnswSearchResult(3L, 0.1f, "doc3"),  // doc3: best
+            new HnswSearchResult(5L, 0.7f, "doc5")   // doc5: only in this segment
         );
 
         List<SegmentQueryTask.SegmentQueryResult> results = List.of(
@@ -312,29 +359,54 @@ class ResultAggregatorTest {
         assertThat(merged).hasSize(5);
 
         // Verify each document has its best score
-        java.util.Map<Long, Float> expectedScores = java.util.Map.of(
-            1L, 0.2f,  // Best of {0.5, 0.2, 0.8}
-            2L, 0.3f,  // Best of {0.3, 0.6}
-            3L, 0.1f,  // Best of {0.9, 0.1}
-            4L, 0.4f,  // Only one
-            5L, 0.7f   // Only one
+        java.util.Map<String, Float> expectedScores = java.util.Map.of(
+            "doc1", 0.2f,  // Best of {0.5, 0.2, 0.8}
+            "doc2", 0.3f,  // Best of {0.3, 0.6}
+            "doc3", 0.1f,  // Best of {0.9, 0.1}
+            "doc4", 0.4f,  // Only one
+            "doc5", 0.7f   // Only one
         );
 
         for (QueryResultItem item : merged) {
-            float expected = expectedScores.get(item.documentId());
+            float expected = expectedScores.get(item.documentIdStr());
             assertThat(item.score())
-                .withFailMessage("Document %d should have score %.2f but got %.2f",
-                    item.documentId(), expected, item.score())
+                .withFailMessage("Document %s should have score %.2f but got %.2f",
+                    item.documentIdStr(), expected, item.score())
                 .isEqualTo(expected);
         }
 
         // Verify no duplicates
-        java.util.Set<Long> seenIds = new java.util.HashSet<>();
+        java.util.Set<String> seenIds = new java.util.HashSet<>();
         for (QueryResultItem item : merged) {
-            assertThat(seenIds.add(item.documentId()))
-                .withFailMessage("Duplicate document ID %d in results", item.documentId())
+            assertThat(seenIds.add(item.documentIdStr()))
+                .withFailMessage("Duplicate document ID %s in results", item.documentIdStr())
                 .isTrue();
         }
+    }
+
+    /**
+     * Results that carry no document ID must NOT be deduplicated across segments.
+     *
+     * <p>Node IDs are dense and allocated per HNSW graph - every segment restarts them at
+     * zero - so keying the fallback on a bare node ID collapses unrelated vectors from
+     * different segments and silently discards legitimate top-k hits.</p>
+     */
+    @Test
+    void testMergeAndRankDoesNotCollapseSameNodeIdAcrossSegments() {
+        ResultAggregator aggregator = new ResultAggregator(10);
+
+        List<SegmentQueryTask.SegmentQueryResult> results = List.of(
+            new SegmentQueryTask.SegmentQueryResult(
+                1L, List.of(new HnswSearchResult(0L, 0.1f)), 0, 10, true, null),
+            new SegmentQueryTask.SegmentQueryResult(
+                2L, List.of(new HnswSearchResult(0L, 0.2f)), 0, 10, true, null)
+        );
+
+        List<QueryResultItem> merged = aggregator.mergeAndRank(results);
+
+        assertThat(merged).hasSize(2);
+        assertThat(merged).extracting(QueryResultItem::segmentId)
+            .containsExactlyInAnyOrder(1L, 2L);
     }
 
     /**

@@ -11,13 +11,15 @@
 package io.excalibur.test;
 
 import java.util.*;
-import java.util.function.Supplier;
 
 /**
  * Immutable representation of a single query result item.
- * 
+ *
  * Each item contains a document identifier, relevance score, and optional
  * content metadata for verification purposes.
+ *
+ * <p>The document identifier is the identity of a result item: comparison engines
+ * sort and match items by it, so it is mandatory and must be a non-blank string.</p>
  */
 public class QueryResultItem {
     
@@ -30,23 +32,30 @@ public class QueryResultItem {
     
     /**
      * Create a new QueryResultItem.
-     * 
-     * @param documentId  Unique document identifier
+     *
+     * @param documentId  Unique document identifier (required, must not be blank)
      * @param score        Relevance score (0.0 to 1.0)
      * @param metadata     Optional document metadata
      * @param content      Optional content snippet
      * @param source       Optional source identifier
      * @param chunkIndex   Optional chunk index within document
+     * @throws NullPointerException if documentId is null
+     * @throws IllegalArgumentException if documentId is blank
      */
-    public QueryResultItem(String documentId, float score, 
-                           Map<String, Object> metadata, 
+    public QueryResultItem(String documentId, float score,
+                           Map<String, Object> metadata,
                            String content, String source, int chunkIndex) {
+        Objects.requireNonNull(documentId,
+            "documentId is required: result items are sorted and matched by document ID");
+        if (documentId.isBlank()) {
+            throw new IllegalArgumentException("documentId cannot be blank");
+        }
         this.documentId = documentId;
         this.score = score;
         this.metadata = (metadata == null) ? Collections.emptyMap() : new HashMap<>(metadata);
-        this.content = (content == null) ? null : content;
-        this.source = (source == null) ? null : source;
-        this.chunkIndex = (chunkIndex == -1) ? -1 : chunkIndex;
+        this.content = content;
+        this.source = source;
+        this.chunkIndex = chunkIndex;
     }
     
     /**

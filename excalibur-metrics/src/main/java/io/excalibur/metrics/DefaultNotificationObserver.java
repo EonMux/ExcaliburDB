@@ -3,6 +3,8 @@ package io.excalibur.metrics;
 import javax.management.Notification;
 import javax.management.NotificationFilter;
 import javax.management.NotificationListener;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -102,14 +104,21 @@ public class DefaultNotificationObserver implements MBeanNotificationObserver, N
     }
 
     /**
-     * Gets all received notifications and clears the internal queue.
+     * Drains all received notifications from the internal queue.
+     *
+     * <p>Draining is done element by element so a notification delivered
+     * concurrently is either returned to this caller or left queued for the
+     * next one; it can never be removed without being handed back.</p>
      *
      * @return Array of all notifications received since last retrieval
      */
     public Notification[] getNotifications() {
-        Notification[] result = notifications.toArray(new Notification[0]);
-        notifications.clear();
-        return result;
+        List<Notification> drained = new ArrayList<>();
+        Notification notification;
+        while ((notification = notifications.poll()) != null) {
+            drained.add(notification);
+        }
+        return drained.toArray(new Notification[0]);
     }
 
     /**

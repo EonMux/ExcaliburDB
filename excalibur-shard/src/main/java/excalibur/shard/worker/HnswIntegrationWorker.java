@@ -14,16 +14,13 @@ import io.excalibur.vector.hnsw.TailOffsetTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
+import io.excalibur.core.codec.ChunkPayloadCodec;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * Virtual thread worker that integrates write log entries into the HNSW graph.
@@ -38,10 +35,12 @@ import java.util.concurrent.locks.LockSupport;
  * </ol>
  *
  * <h2>Backpressure Mechanism</h2>
- * <p>When the integration queue (entries between writeLogHead and lastIntegratedOffset)
- * exceeds the configured depth limit (default 100K entries), the worker applies
- * backpressure by parking the virtual thread. This prevents unbounded memory growth
- * during high-throughput ingestion.</p>
+ * <p>Every cycle the worker measures the integration queue (entries between
+ * writeLogHead and lastIntegratedOffset) and raises {@link #isBackpressured()} once it
+ * exceeds the configured depth limit (default 100K entries), clearing it again when the
+ * queue drains below half the limit. Producers - the ingestion pipeline - consult that
+ * flag and park; the integration worker itself never parks, because it is the thread
+ * that drains the queue.</p>
  *
  * <h2>Thread Safety</h2>
  * <p><strong>This class is fully thread-safe.</strong></p>
@@ -67,6 +66,14 @@ import java.util.concurrent.locks.LockSupport;
 public class HnswIntegrationWorker {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(HnswIntegrationWorker.class);
+
+    /**
+     * How many batches {@link #drainPendingIntegration} will read before giving up.
+     *
+     * <p>A bound rather than a loop until empty, so a log the worker cannot make progress on
+     * ends the drain instead of holding the compaction thread indefinitely.</p>
+     */
+    private static final int MAX_DRAIN_PASSES = 10_000;
 
     // ==================== Configuration Constants ====================
 
@@ -119,6 +126,17 @@ public class HnswIntegrationWorker {
      * Backpressure is released when queue depth falls below this ratio of the limit.
      */
     public static final double BACKPRESSURE_RELEASE_THRESHOLD = 0.5;
+
+    /**
+     * Maximum write log entries walked per segment when measuring queue depth.
+     * Beyond this the remaining tail is estimated from the average entry size.
+     */
+    private static final int QUEUE_DEPTH_SCAN_LIMIT = 4096;
+
+    /**
+     * Assumed entry size when a segment exposes no write log to measure.
+     */
+    private static final int ESTIMATED_ENTRY_BYTES = 100;
 
     // ==================== Instance Fields ====================
 
@@ -405,11 +423,11 @@ public class HnswIntegrationWorker {
     private void runIntegrationLoop() {
         while (running.get() && !stopped.get()) {
             try {
-                // Check for backpressure
-                if (checkBackpressure()) {
-                    applyBackpressure();
-                    continue;
-                }
+                // Maintain the backpressure flag and the depth metric. The flag throttles
+                // PRODUCERS; this worker never parks on it, because it is the thread that
+                // drains the queue -- parking here would deadlock ingestion against the
+                // very worker whose progress releases it.
+                updateBackpressureState();
 
                 // Integrate entries from all registered segments
                 int totalIntegratedThisCycle = 0;
@@ -452,11 +470,12 @@ public class HnswIntegrationWorker {
     // ==================== Backpressure Management ====================
 
     /**
-     * Checks if backpressure should be applied.
+     * Measures the integration queue and updates the backpressure flag and metric.
      *
-     * @return true if backpressure is needed
+     * <p>The flag is what producers park on, so it must be refreshed every cycle. This
+     * method never blocks: the drain thread must keep running while producers wait.</p>
      */
-    private boolean checkBackpressure() {
+    private void updateBackpressureState() {
         long queueDepth = calculateTotalQueueDepth();
         currentQueueDepth.set(queueDepth);
 
@@ -464,38 +483,36 @@ public class HnswIntegrationWorker {
         Metrics.recordHnswDepth(queueDepth);
 
         if (queueDepth > queueDepthLimit) {
-            if (!backpressured.get()) {
+            if (backpressured.compareAndSet(false, true)) {
                 LOGGER.warn("Backpressure triggered: queue depth {} exceeds limit {}",
                     queueDepth, queueDepthLimit);
             }
-            backpressured.set(true);
-            return true;
+            return;
         }
 
         // Release backpressure when queue drains below threshold
         if (backpressured.get() && queueDepth < queueDepthLimit * BACKPRESSURE_RELEASE_THRESHOLD) {
             LOGGER.info("Backpressure released: queue depth {} below release threshold {}",
-                queueDepth, (long)(queueDepthLimit * BACKPRESSURE_RELEASE_THRESHOLD));
+                queueDepth, (long) (queueDepthLimit * BACKPRESSURE_RELEASE_THRESHOLD));
             backpressured.set(false);
         }
-
-        return false;
-    }
-
-    /**
-     * Applies backpressure by parking the virtual thread.
-     */
-    private void applyBackpressure() {
-        // Park for a short duration to allow queue to drain
-        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(integrationIntervalMs * 2));
     }
 
     /**
      * Calculates the total queue depth across all registered segments.
      *
-     * <p>This method counts the actual number of entries pending integration,
-     * not the byte offset difference. Each entry in the write log is counted
-     * as one entry toward the queue depth limit.</p>
+     * <p>This method counts the number of entries pending integration, not the byte
+     * offset difference. Each entry in the write log is counted as one entry toward the
+     * queue depth limit.</p>
+     *
+     * <p><strong>Bounded cost:</strong> a cycle drains at most {@code batchSize} entries
+     * per segment, so an exact count of an arbitrarily deep backlog would make the cycle
+     * cost grow with the backlog it is trying to drain. At most
+     * {@link #QUEUE_DEPTH_SCAN_LIMIT} entries are walked per segment; beyond that the
+     * remaining bytes are converted with the average entry size measured during the
+     * walk. The count is therefore exact where it matters (a nearly drained queue) and a
+     * proportional estimate where only the order of magnitude matters (a deep backlog
+     * that must trigger backpressure).</p>
      *
      * <p><strong>Domain Correctness:</strong> The queue depth limit (default 100,000)
      * is specified in entries, not bytes. This ensures consistent backpressure
@@ -507,37 +524,102 @@ public class HnswIntegrationWorker {
         long totalEntries = 0;
         for (IndexableSegment indexable : registeredSegments) {
             WriteLog writeLog = indexable.segment.writeLog();
+            long lastIntegrated = indexable.tracker.getLastIntegratedOffset();
+
             if (writeLog == null) {
                 // Fallback: use byte offset difference if writeLog not available
                 long writeLogHead = indexable.segment.getWriteLogHead();
-                long lastIntegrated = indexable.tracker.getLastIntegratedOffset();
                 if (writeLogHead > lastIntegrated) {
-                    // Estimate ~100 bytes per entry as rough approximation
-                    totalEntries += ((writeLogHead - lastIntegrated) / 100);
+                    totalEntries += (writeLogHead - lastIntegrated) / ESTIMATED_ENTRY_BYTES;
                 }
                 continue;
             }
 
-            long writeLogHead = writeLog.writeOffset();
-            long lastIntegrated = indexable.tracker.getLastIntegratedOffset();
-
-            if (writeLogHead > lastIntegrated) {
-                // Count actual entries in the tail region by scanning
-                long offset = lastIntegrated;
-                while (offset < writeLogHead) {
-                    int entrySize = writeLog.entrySizeAt(offset);
-                    if (entrySize <= 0) {
-                        break; // Invalid entry or end of log
-                    }
-                    totalEntries++;
-                    offset += entrySize;
-                }
-            }
+            totalEntries += pendingEntries(writeLog, lastIntegrated, writeLog.writeOffset());
         }
         return totalEntries;
     }
 
+    /**
+     * Counts the entries between two write log offsets, capped at
+     * {@link #QUEUE_DEPTH_SCAN_LIMIT} scanned entries.
+     *
+     * @param writeLog     The segment's write log
+     * @param fromOffset   First un-integrated offset
+     * @param writeLogHead Current head of the write log
+     * @return Exact count when the tail fits within the scan limit, otherwise an estimate
+     */
+    private long pendingEntries(WriteLog writeLog, long fromOffset, long writeLogHead) {
+        if (writeLogHead <= fromOffset) {
+            return 0;
+        }
+
+        long counted = 0;
+        long offset = fromOffset;
+        while (offset < writeLogHead && counted < QUEUE_DEPTH_SCAN_LIMIT) {
+            int entrySize = writeLog.entrySizeAt(offset);
+            if (entrySize <= 0) {
+                return counted; // Invalid entry or end of log
+            }
+            counted++;
+            offset += entrySize;
+        }
+
+        if (offset >= writeLogHead) {
+            return counted;
+        }
+
+        // Scan limit reached: extrapolate the remainder from the observed entry size.
+        long averageEntryBytes = Math.max(1, (offset - fromOffset) / counted);
+        return counted + (writeLogHead - offset) / averageEntryBytes;
+    }
+
     // ==================== Integration Operations ====================
+
+    /**
+     * Integrates everything a segment's write log still holds, right now, on the calling thread.
+     *
+     * <p>For the moment a segment is about to lose the log its checkpoint was measured against.
+     * Compaction copies the live entries into a new file and deletes the log; the entries between
+     * the checkpoint and the head were copied as data and never indexed, and nothing ever reads a
+     * segment's data file into a graph - so without this they stay retrievable by key and vanish
+     * from vector search, silently, for good. Under sustained ingest the integration worker is
+     * always behind, which makes that the ordinary outcome of a compaction rather than a rare
+     * one.</p>
+     *
+     * <p>The caller must have unregistered the segment first: this writes to the same graph and
+     * checkpoint a background cycle would.</p>
+     *
+     * @param segment The segment whose log to drain
+     * @param graph   Its graph
+     * @param tracker Its checkpoint
+     * @return The number of vectors integrated
+     * @throws NullPointerException if any argument is null
+     */
+    public int drainPendingIntegration(Segment segment, HnswGraph graph, TailOffsetTracker tracker) {
+        java.util.Objects.requireNonNull(segment, "segment must not be null");
+        java.util.Objects.requireNonNull(graph, "graph must not be null");
+        java.util.Objects.requireNonNull(tracker, "tracker must not be null");
+
+        IndexableSegment indexable = new IndexableSegment(segment, graph, tracker);
+        int total = 0;
+
+        // Bounded: each pass either integrates something or advances past entries it cannot use,
+        // so a log that cannot be drained ends the loop rather than spinning on it.
+        for (int pass = 0; pass < MAX_DRAIN_PASSES; pass++) {
+            long before = tracker.getLastIntegratedOffset();
+            total += integrateSegmentBatch(indexable);
+            if (tracker.getLastIntegratedOffset() <= before) {
+                break;
+            }
+        }
+
+        if (total > 0) {
+            LOGGER.info("Drained {} pending vectors from the write log of {} before it was "
+                + "replaced", total, segment.path());
+        }
+        return total;
+    }
 
     /**
      * Integrates a batch of entries from a segment's write log into the HNSW graph.
@@ -567,42 +649,12 @@ public class HnswIntegrationWorker {
         List<Long> offsets = new ArrayList<>(batchSize);
         List<String> documentIds = new ArrayList<>(batchSize);
 
-        long currentOffset = lastIntegrated;
-        int entriesRead = 0;
-
-        while (currentOffset < writeLogHead && entriesRead < batchSize) {
-            LogEntry entry = writeLog.readEntryAt(currentOffset);
-            if (entry == null) {
-                break;
-            }
-
-            // Calculate entry size and end offset ONCE to ensure consistency
-            int entrySize = writeLog.entrySizeAt(currentOffset);
-            long entryEndOffset = currentOffset + entrySize;
-
-            // Only integrate PUT operations with vector data
-            if (entry.isPut() && entry.value().length > 0) {
-                float[] vector = extractVector(entry.value());
-                if (vector != null && vector.length > 0) {
-                    vectors.add(vector);
-                    // Pass END offset (not START offset) so tracker knows where next entry begins
-                    offsets.add(entryEndOffset);
-                    // Extract document ID from entry key (format: documentId:chunkIndex)
-                    String documentId = extractDocumentId(entry.key());
-                    documentIds.add(documentId);
-                    entriesRead++;
-                }
-            }
-
-            // Move to next entry using pre-calculated entrySize
-            currentOffset = entryEndOffset;
-            if (currentOffset < 0) {
-                break; // Safety check
-            }
-        }
+        long currentOffset = readBatch(writeLog, graph, lastIntegrated, writeLogHead,
+            vectors, offsets, documentIds);
 
         if (vectors.isEmpty()) {
-            // No valid vectors found, but update offset to skip non-vector entries
+            // No usable vectors found; advance past the entries that were skipped so a
+            // malformed or wrongly dimensioned entry cannot stall the log tail forever.
             if (currentOffset > lastIntegrated) {
                 tracker.compareAndSetOffset(currentOffset);
             }
@@ -611,39 +663,22 @@ public class HnswIntegrationWorker {
 
         // Integrate batch into HNSW graph
         try {
+            long batchEpoch = registerBatchVisibility(segment, graph);
+
             List<IncrementalInsertResult> results = tracker.integrateBatch(vectors, offsets);
 
-            int successCount = 0;
-            for (int i = 0; i < results.size(); i++) {
-                IncrementalInsertResult result = results.get(i);
-                if (result.isSuccess()) {
-                    successCount++;
-                    // Register the node-to-document mapping for atomicity filtering
-                    // This maps the HNSW node ID to the actual document ID string
-                    String documentId = documentIds.get(i);
-                    if (documentId != null) {
-                        graph.registerDocumentId(result.nodeId(), documentId);
-                        LOGGER.trace("Registered nodeId={} -> documentId={}",
-                            result.nodeId(), documentId);
-                    }
-
-                    // Register node with epoch isolation validator for torn-read prevention
-                    // This ensures queries only see nodes visible at their captured epoch
-                    if (epochIsolationValidator != null && visibilityTracker != null) {
-                        long currentEpoch = visibilityTracker.currentEpoch();
-                        epochIsolationValidator.registerNode(result.nodeId(), currentEpoch);
-                        LOGGER.trace("Registered nodeId={} with visibility epoch {}",
-                            result.nodeId(), currentEpoch);
-                    }
-                } else {
-                    LOGGER.debug("Vector integration failed at offset {} (nodeId={})",
-                        result.writeLogOffset(), result.nodeId());
-                }
-            }
+            int successCount = recordInsertResults(graph, results, documentIds);
 
             if (successCount > 0) {
-                LOGGER.debug("Integrated {}/{} vectors from segment {}",
-                    successCount, vectors.size(), segment.path());
+                LOGGER.debug("Integrated {}/{} vectors from segment {} at epoch {}",
+                    successCount, vectors.size(), segment.path(), batchEpoch);
+
+                // Checkpoint durably at the batch boundary. flush() writes the offset and
+                // forces the graph's mapping, so the node pages the checkpoint vouches for
+                // reach disk with it. A checkpoint that survived a crash without its nodes
+                // would silently lose vectors; one that was lost would re-insert the whole
+                // batch as duplicate nodes on restart.
+                tracker.flush();
 
                 // Notify listener
                 listener.onVectorsIntegrated(segment, successCount);
@@ -659,43 +694,139 @@ public class HnswIntegrationWorker {
     }
 
     /**
+     * Reads up to {@code batchSize} integrable entries from the write log tail.
+     *
+     * <p>Entries that carry no vector, or a vector whose dimension does not match the
+     * graph, are skipped rather than collected: passing one to the graph throws out of the
+     * batch insert, which would leave the offset unadvanced and re-insert every preceding
+     * vector of the batch on the next cycle, forever.</p>
+     *
+     * @param writeLog     The segment's write log
+     * @param graph        The segment's graph, whose dimension the vectors must match
+     * @param fromOffset   First un-integrated offset
+     * @param writeLogHead Current head of the write log
+     * @param vectors      Collects the vectors to insert
+     * @param offsets      Collects the END offset of each collected vector's entry
+     * @param documentIds  Collects the document ID of each collected vector's entry
+     * @return The offset immediately after the last entry examined
+     */
+    private long readBatch(WriteLog writeLog, HnswGraph graph, long fromOffset, long writeLogHead,
+                           List<float[]> vectors, List<Long> offsets, List<String> documentIds) {
+        int expectedDimension = graph.config().dimension();
+        long currentOffset = fromOffset;
+        int entriesRead = 0;
+
+        while (currentOffset < writeLogHead && entriesRead < batchSize) {
+            LogEntry entry = writeLog.readEntryAt(currentOffset);
+            if (entry == null) {
+                break;
+            }
+
+            // Calculate entry size and end offset ONCE to ensure consistency
+            int entrySize = writeLog.entrySizeAt(currentOffset);
+            long entryEndOffset = currentOffset + entrySize;
+
+            // Only integrate PUT operations with vector data
+            if (entry.isPut() && entry.value().length > 0) {
+                float[] vector = extractVector(entry.value());
+                if (vector != null && vector.length == expectedDimension) {
+                    vectors.add(vector);
+                    // Pass END offset (not START offset) so tracker knows where next entry begins
+                    offsets.add(entryEndOffset);
+                    // Extract document ID from entry key (format: documentId:chunkIndex)
+                    documentIds.add(extractDocumentId(entry.key()));
+                    entriesRead++;
+                } else if (vector != null) {
+                    LOGGER.warn("Skipping write log entry at offset {}: vector dimension {} does "
+                        + "not match graph dimension {}", currentOffset, vector.length,
+                        expectedDimension);
+                }
+            }
+
+            // Move to next entry using pre-calculated entrySize
+            currentOffset = entryEndOffset;
+            if (currentOffset < 0) {
+                break; // Safety check
+            }
+        }
+
+        return currentOffset;
+    }
+
+    /**
+     * Publishes the visibility epoch of the batch about to be inserted.
+     *
+     * <p>This runs <strong>before</strong> the insert. The graph links a node into the
+     * searchable structure as it is written, so a node registered afterwards is reachable
+     * by concurrent queries during the gap - and an unknown node reads as visible. The
+     * checkpoint covers every node ID from the graph's next ID upward, which is exactly
+     * the range this batch will occupy, so no node is ever searchable before its epoch is
+     * known.</p>
+     *
+     * @param segment The segment being integrated
+     * @param graph   The segment's graph
+     * @return The epoch recorded for the batch, or -1 if epoch isolation is not configured
+     */
+    private long registerBatchVisibility(Segment segment, HnswGraph graph) {
+        if (epochIsolationValidator == null || visibilityTracker == null) {
+            return -1;
+        }
+
+        long segmentId = getSegmentId(segment);
+        if (segmentId < 0) {
+            LOGGER.debug("Cannot scope node visibility: segment ID unavailable for {}", segment.path());
+            return -1;
+        }
+
+        long batchEpoch = visibilityTracker.currentEpoch();
+        epochIsolationValidator.registerNodeRange(segmentId, graph.nodeCount(), batchEpoch);
+        epochIsolationValidator.registerSegmentUpdate(segmentId, batchEpoch);
+        return batchEpoch;
+    }
+
+    /**
+     * Records the node-to-document mapping for the nodes a batch inserted.
+     *
+     * @param graph       The segment's graph
+     * @param results     The batch insertion results
+     * @param documentIds The document IDs, positionally aligned with the results
+     * @return Number of successful insertions
+     */
+    private int recordInsertResults(HnswGraph graph, List<IncrementalInsertResult> results,
+                                    List<String> documentIds) {
+        int successCount = 0;
+        for (int i = 0; i < results.size(); i++) {
+            IncrementalInsertResult result = results.get(i);
+            if (!result.isSuccess()) {
+                LOGGER.debug("Vector integration failed at offset {} (nodeId={})",
+                    result.writeLogOffset(), result.nodeId());
+                continue;
+            }
+
+            successCount++;
+            // Register the node-to-document mapping for atomicity filtering.
+            // This maps the HNSW node ID to the actual document ID string.
+            String documentId = i < documentIds.size() ? documentIds.get(i) : null;
+            if (documentId != null) {
+                graph.registerDocumentId(result.nodeId(), documentId);
+                LOGGER.trace("Registered nodeId={} -> documentId={}", result.nodeId(), documentId);
+            }
+        }
+        return successCount;
+    }
+
+    /**
      * Extracts a float vector from entry value bytes.
      *
-     * <p>The value is expected to contain a serialized float array.
-     * Format: [dimension(4 bytes, little-endian)][float values...]</p>
+     * <p>The layout belongs to {@link ChunkPayloadCodec}. This worker is the reader that decides
+     * whether a written vector ever reaches the HNSW graph, so a decoder here that disagrees
+     * with the writer does not fail loudly - it silently leaves vectors unindexed.</p>
      *
      * @param value The entry value bytes
-     * @return The float array, or null if extraction fails
+     * @return The float array, or null if the value carries no vector
      */
     private float[] extractVector(byte[] value) {
-        if (value == null || value.length < 4) {
-            return null;
-        }
-
-        try {
-            ByteBuffer buffer = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);
-            int dimension = buffer.getInt();
-
-            if (dimension <= 0 || dimension > 65536) {
-                return null; // Invalid dimension
-            }
-
-            int expectedBytes = 4 + dimension * 4;
-            if (value.length < expectedBytes) {
-                return null; // Not enough bytes
-            }
-
-            float[] vector = new float[dimension];
-            for (int i = 0; i < dimension; i++) {
-                vector[i] = buffer.getFloat();
-            }
-
-            return vector;
-
-        } catch (Exception e) {
-            LOGGER.debug("Failed to extract vector from value: {}", e.getMessage());
-            return null;
-        }
+        return ChunkPayloadCodec.embeddingOf(value);
     }
 
     /**
@@ -720,10 +851,15 @@ public class HnswIntegrationWorker {
 
         try {
             String keyStr = new String(key, java.nio.charset.StandardCharsets.UTF_8);
-            // Key format: documentId:chunkIndex
-            // For documentId like "doc1" with chunkIndex "0", key would be "doc1:0"
-            // For documentId like "source1:file1" with chunkIndex "2", key would be "source1:file1:2"
-            // So we need to find the LAST colon and strip the chunk index
+            // Key format from IngestionOrchestrator: sourceId:documentId:chunk:chunkIndex
+            // e.g., "mySource:doc1:chunk:3"
+            // The document ID is "sourceId:documentId" -- strip the ":chunk:N" suffix.
+            // Find the ":chunk:" marker and strip everything from there.
+            int chunkMarker = keyStr.lastIndexOf(":chunk:");
+            if (chunkMarker > 0) {
+                return keyStr.substring(0, chunkMarker);
+            }
+            // Fallback: strip from the last colon (legacy format documentId:chunkIndex)
             int lastColon = keyStr.lastIndexOf(':');
             if (lastColon > 0) {
                 return keyStr.substring(0, lastColon);
@@ -743,17 +879,28 @@ public class HnswIntegrationWorker {
      * @return The lifecycle state, or null if not found
      */
     private LifecycleState getSegmentState(Segment segment) {
+        long segmentId = getSegmentId(segment);
+        if (segmentId < 0) {
+            return null;
+        }
+
+        SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
+        return metadata != null ? metadata.getLifecycleState() : null;
+    }
+
+    /**
+     * Derives a segment's ID from its canonical {@code segment_N.dat} file name.
+     *
+     * @param segment The segment
+     * @return The segment ID, or -1 if the name does not carry one
+     */
+    private long getSegmentId(Segment segment) {
         try {
-            // Get segment ID from path (assumes format segment_N.dat)
             String filename = segment.path().getFileName().toString();
             String idStr = filename.replace("segment_", "").replace(".dat", "");
-            long segmentId = Long.parseLong(idStr);
-
-            SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
-            return metadata != null ? metadata.getLifecycleState() : null;
-
+            return Long.parseLong(idStr);
         } catch (Exception e) {
-            return null;
+            return -1;
         }
     }
 

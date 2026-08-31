@@ -11,7 +11,7 @@ import javax.management.ObjectName;
 import java.lang.management.ManagementFactory;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Metrics registry for managing MBean registration and attribute access.
@@ -19,21 +19,18 @@ import java.util.concurrent.atomic.AtomicReference;
  * <h2>Thread-Safety</h2>
  * <p>This class is thread-safe for concurrent MBean registration and attribute access.</p>
  *
+ * <h2>State Ownership</h2>
+ * <p>This class owns no metric values of its own. Every accessor reads the MBean when one is
+ * registered and otherwise falls back to the same global {@link Metrics} state that production
+ * code records into. A registry-local copy would diverge silently, because nothing outside
+ * {@code Metrics} ever writes one.</p>
+ *
  * @author ExcaliburDB
  */
 public final class MetricsRegistry {
 
     // Registered MBeans by name (stores DynamicMBean instances)
-    private final Map<String, DynamicMBean> registeredMBeans = new HashMap<>();
-
-    // Current epoch reference for thread-safe updates
-    private final AtomicReference<Long> currentEpoch = new AtomicReference<>(0L);
-
-    // Estimated coverage reference
-    private final AtomicReference<Double> estimatedCoverage = new AtomicReference<>(0.0);
-
-    // Query latency reference
-    private final AtomicReference<FixedBucketHistogram> queryLatency = new AtomicReference<>(new FixedBucketHistogram());
+    private final Map<String, DynamicMBean> registeredMBeans = new ConcurrentHashMap<>();
 
     /**
      * Creates a new MetricsRegistry instance.
@@ -61,7 +58,7 @@ public final class MetricsRegistry {
      * @param epoch New epoch number
      */
     public void setCurrentEpoch(long epoch) {
-        currentEpoch.set(epoch);
+        Metrics.recordEpoch(epoch);
     }
 
     /**
@@ -70,7 +67,7 @@ public final class MetricsRegistry {
      * @return Current epoch number
      */
     public long getCurrentEpoch() {
-        return currentEpoch.get();
+        return Metrics.getCurrentEpoch();
     }
 
     /**
@@ -79,9 +76,7 @@ public final class MetricsRegistry {
      * @param coverage Coverage value between 0.0 and 1.0
      */
     public void setEstimatedCoverage(double coverage) {
-        if (coverage < 0.0) coverage = 0.0;
-        if (coverage > 1.0) coverage = 1.0;
-        estimatedCoverage.set(coverage);
+        Metrics.setEstimatedCoverage(coverage);
     }
 
     /**
@@ -90,16 +85,16 @@ public final class MetricsRegistry {
      * @return Estimated coverage between 0.0 and 1.0
      */
     public double getEstimatedCoverage() {
-        return estimatedCoverage.get();
+        return Metrics.getEstimatedCoverage();
     }
 
     /**
-     * Gets the query latency histogram.
+     * Gets the query latency histogram that production query paths record into.
      *
      * @return Query latency histogram
      */
     public FixedBucketHistogram getQueryLatency() {
-        return queryLatency.get();
+        return Metrics.QueryLatency();
     }
 
     /**
@@ -131,7 +126,7 @@ public final class MetricsRegistry {
     /**
      * Gets the current epoch from MBean if available.
      *
-     * @return Current epoch, or current time-based epoch if MBean not available
+     * @return Current epoch, or the metrics value if MBean not available
      */
     public long getEpochFromMBean() {
         DynamicMBean mbean = getMBean("io.excalibur:type=VisibilityEpoch");
@@ -145,19 +140,19 @@ public final class MetricsRegistry {
                 // Ignore
             }
         }
-        return currentEpoch.get();
+        return Metrics.getCurrentEpoch();
     }
 
     /**
-     * Gets the current coverage from MBean if available.
+     * Gets the estimated corpus coverage from MBean if available.
      *
-     * @return Coverage, or estimated coverage if MBean not available
+     * @return Coverage, or the metrics value if MBean not available
      */
     public double getCoverageFromMBean() {
         DynamicMBean mbean = getMBean("io.excalibur:type=SystemHealth");
         if (mbean != null) {
             try {
-                Object value = mbean.getAttribute("health");
+                Object value = mbean.getAttribute("coverage");
                 if (value != null && value instanceof Double) {
                     return ((Double) value).doubleValue();
                 }
@@ -165,7 +160,7 @@ public final class MetricsRegistry {
                 // Ignore
             }
         }
-        return estimatedCoverage.get();
+        return Metrics.getEstimatedCoverage();
     }
 
     /**
@@ -187,7 +182,7 @@ public final class MetricsRegistry {
                 // Ignore
             }
         }
-        return queryLatency.get().getPercentile(percentile);
+        return Metrics.QueryLatency().getPercentile(percentile);
     }
 
     /**
@@ -207,7 +202,7 @@ public final class MetricsRegistry {
                 // Ignore
             }
         }
-        return queryLatency.get().getTotalCount();
+        return Metrics.QueryLatency().getTotalCount();
     }
 
     /**
@@ -281,11 +276,14 @@ public final class MetricsRegistry {
     }
 
     /**
-     * Clears all metrics.
+     * Clears the recorded metric values.
+     *
+     * <p>The visibility epoch is deliberately left alone: it is monotone state that drives
+     * which entries are visible to queries, so winding it back would corrupt reads rather
+     * than clear a measurement.</p>
      */
     public void clear() {
-        queryLatency.set(new FixedBucketHistogram());
-        estimatedCoverage.set(0.0);
-        currentEpoch.set(0L);
+        Metrics.QueryLatency().reset();
+        Metrics.setEstimatedCoverage(0.0);
     }
 }

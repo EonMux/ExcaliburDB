@@ -3,8 +3,6 @@ plugins {
     `java-library`
 }
 
-group = "com.excaliburdb"
-version = "1.0.0-SNAPSHOT"
 
 dependencies {
     // SLF4J API for logging
@@ -13,8 +11,6 @@ dependencies {
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
-    testImplementation("org.mockito:mockito-core:5.14.2")
-    testImplementation("org.mockito:mockito-junit-jupiter:5.14.2")
 
     // Phase 1 (Core primitives - TermExtractor for query text processing)
     implementation(project(":excalibur-core"))

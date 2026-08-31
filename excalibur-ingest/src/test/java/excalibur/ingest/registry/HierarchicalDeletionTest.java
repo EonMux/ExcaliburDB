@@ -13,22 +13,22 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Tests for document update and deletion handling with hierarchical Cuckoo filter.
+ * Tests for document update and deletion handling alongside the hierarchical Cuckoo filter.
  *
  * <h2>Test Categories</h2>
  * <ul>
- *   <li>Hierarchical deletion from segment → cluster → corpus filters</li>
+ *   <li>Hierarchical deletion from segment to cluster to corpus filters, driven directly</li>
  *   <li>UpsertHandler segment-aware processing</li>
- *   <li>No false positives after deletion</li>
- *   <li>Error handling during hierarchical deletion</li>
+ *   <li>Error handling during tombstoning</li>
  * </ul>
  *
  * <h2>Domain Correctness Verification</h2>
  * <ul>
- *   <li>Deleted entries are removed from ALL filter levels</li>
- *   <li>Queries after deletion see no false positives for deleted keys</li>
+ *   <li>A key explicitly deleted from the hierarchy is gone from every level</li>
  *   <li>Registry is properly updated for deleted documents</li>
  *   <li>Storage tombstoning is called for all chunks</li>
+ *   <li>Tombstoning a document does <strong>not</strong> touch the filter hierarchy: it indexes
+ *       terms, not chunk ids, and a Cuckoo delete matches fingerprints rather than keys</li>
  * </ul>
  */
 class HierarchicalDeletionTest {
@@ -96,7 +96,7 @@ class HierarchicalDeletionTest {
     }
 
     @Test
-    void testUpsertHandlerWithSegmentDeletesFromHierarchy() {
+    void testUpsertHandlerWithSegmentTombstonesStorageOnly() {
         List<String> tombstoned = new ArrayList<>();
         UpsertHandler.StorageAdapter storageAdapter = key -> {
             tombstoned.add(new String(key, StandardCharsets.UTF_8));
@@ -131,9 +131,10 @@ class HierarchicalDeletionTest {
         assertEquals(2, tombstoned.size());
         assertTrue(tombstoned.contains("chunk1"));
         assertTrue(tombstoned.contains("chunk2"));
-        
-        assertFalse(hierarchicalFilter.mightContain(toBytes("chunk1")));
-        assertFalse(hierarchicalFilter.mightContain(toBytes("chunk2")));
+
+        // The filter hierarchy is a term index; tombstoning must leave it alone.
+        assertTrue(hierarchicalFilter.mightContain(toBytes("chunk1")));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("chunk2")));
     }
 
     @Test
@@ -170,9 +171,9 @@ class HierarchicalDeletionTest {
         assertFalse(result.hasErrors());
         
         assertNull(registry.get(SOURCE_ID, "doc-deleted"));
-        
-        assertFalse(hierarchicalFilter.mightContain(toBytes("chunk-del1")));
-        assertFalse(hierarchicalFilter.mightContain(toBytes("chunk-del2")));
+
+        assertTrue(hierarchicalFilter.mightContain(toBytes("chunk-del1")));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("chunk-del2")));
     }
 
     @Test
@@ -238,11 +239,11 @@ class HierarchicalDeletionTest {
         assertEquals(1, result.getDocumentsDeleted());
         assertEquals(3, result.getChunksTombstoned());
         assertFalse(result.hasErrors());
-        
-        assertFalse(hierarchicalFilter.mightContain(toBytes("chunk-old1")));
-        assertFalse(hierarchicalFilter.mightContain(toBytes("chunk-old2")));
-        assertFalse(hierarchicalFilter.mightContain(toBytes("chunk-del1")));
-        
+
+        assertTrue(hierarchicalFilter.mightContain(toBytes("chunk-old1")));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("chunk-old2")));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("chunk-del1")));
+
         assertNull(registry.get(SOURCE_ID, "doc-deleted"));
     }
 
@@ -262,7 +263,7 @@ class HierarchicalDeletionTest {
         
         assertEquals(1, tombstoned.size());
         assertEquals("chunk-single", tombstoned.get(0));
-        assertFalse(hierarchicalFilter.mightContain(toBytes("chunk-single")));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("chunk-single")));
     }
 
     @Test
@@ -283,21 +284,10 @@ class HierarchicalDeletionTest {
         
         assertEquals(3, count);
         assertEquals(3, tombstoned.size());
-        
-        assertFalse(hierarchicalFilter.mightContain(toBytes("batch-1")));
-        assertFalse(hierarchicalFilter.mightContain(toBytes("batch-2")));
-        assertFalse(hierarchicalFilter.mightContain(toBytes("batch-3")));
-    }
 
-    @Test
-    void testRemoveFromFilterHierarchy() {
-        hierarchicalFilter.insert(toBytes("filter-only"), SEGMENT_ID);
-        
-        UpsertHandler handler = new UpsertHandler(registry, null, hierarchicalFilter, null);
-        
-        assertTrue(handler.removeFromFilterHierarchy("filter-only", SEGMENT_ID));
-        
-        assertFalse(hierarchicalFilter.mightContain(toBytes("filter-only")));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("batch-1")));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("batch-2")));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("batch-3")));
     }
 
     @Test
@@ -329,15 +319,8 @@ class HierarchicalDeletionTest {
         assertEquals(1, result.getErrors().size());
         assertEquals("storage", result.getErrors().get(0).getComponent());
         assertEquals("error-chunk", result.getErrors().get(0).getChunkId());
-        
-        assertFalse(hierarchicalFilter.mightContain(toBytes("error-chunk")));
-    }
 
-    @Test
-    void testDeletionFromUnknownSegmentReturnsFalse() {
-        UpsertHandler handler = new UpsertHandler(registry, null, hierarchicalFilter, null);
-        
-        assertFalse(handler.removeFromFilterHierarchy("unknown-chunk", "unknown-segment"));
+        assertTrue(hierarchicalFilter.mightContain(toBytes("error-chunk")));
     }
 
     @Test
@@ -355,13 +338,7 @@ class HierarchicalDeletionTest {
         
         assertThrows(NullPointerException.class, () -> 
             handler.tombstoneChunks(List.of("chunk"), null));
-        
-        assertThrows(NullPointerException.class, () -> 
-            handler.removeFromFilterHierarchy(null, SEGMENT_ID));
-        
-        assertThrows(NullPointerException.class, () -> 
-            handler.removeFromFilterHierarchy("chunk", null));
-        
+
         assertThrows(NullPointerException.class, () -> 
             handler.processChangesWithSegment(null, SEGMENT_ID));
         

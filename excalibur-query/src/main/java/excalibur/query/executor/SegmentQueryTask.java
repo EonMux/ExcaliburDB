@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -129,13 +130,33 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     public SegmentQueryResult call() {
         long startTime = System.nanoTime();
         List<HnswSearchResult> results = new ArrayList<>();
+        Map<Long, byte[]> payloads = Map.of();
         long tailScanEntries = 0;
         boolean success = false;
         String errorMessage = null;
 
         try {
-            // Step 1: Perform HNSW graph search with oversampling
-            int searchK = k * oversamplingFactor;
+            // Cooperative cancellation: a dispatcher timeout cancels this task with an
+            // interrupt, so bail out before doing any work rather than searching a
+            // segment nobody is waiting for.
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("Segment search cancelled before starting");
+            }
+
+            // Step 1: Capture the tail-scan range BEFORE searching.
+            //
+            // The graph search and the tail scan must together cover every entry. Reading
+            // the watermark after the search would miss any entry integrated while the
+            // search ran: too late for the search to see it, and already below the
+            // watermark by the time the tail scan starts. Capturing it first can only
+            // re-scan entries the search already returned, and those duplicates are
+            // collapsed by mergeResults.
+            long lastIntegratedOffset = graph.getLastIntegratedOffset();
+            long writeLogHead = segment.getWriteLogHead();
+            WriteLog writeLog = segment.writeLog();
+
+            // Step 2: Perform HNSW graph search with oversampling
+            int searchK = searchK();
             List<HnswSearchResult> hnswResults;
 
             // Use LSH pre-filtered candidates if available, otherwise do full search
@@ -150,14 +171,9 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
                 LOGGER.trace("Segment {}: HNSW search (full) returned {} results", segmentId, hnswResults.size());
             }
 
-            // Step 2: Check if tail scan is needed
-            long lastIntegratedOffset = graph.getLastIntegratedOffset();
-            long writeLogHead = segment.getWriteLogHead();
-            WriteLog writeLog = segment.writeLog();
-
+            // Step 3: Scan the captured tail range, if there is one
             if (writeLog != null && tailScanner.hasTailEntries(lastIntegratedOffset, writeLogHead)) {
-                // Step 3: Perform tail scan over un-integrated entries
-                List<HnswSearchResult> tailResults = tailScanner.performTailScan(
+                TailScanner.TailScanOutcome tailScan = tailScanner.scan(
                     queryVector,
                     writeLog,
                     lastIntegratedOffset,
@@ -166,11 +182,17 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
                     distanceFunction
                 );
 
-                tailScanEntries = tailResults.size();
-                LOGGER.trace("Segment {}: Tail scan returned {} results", segmentId, tailScanEntries);
+                // Report the work performed, not the number of results kept
+                tailScanEntries = tailScan.entriesScanned();
+
+                // The scan had each entry's value in hand, so its chunk text travels with
+                // the results rather than being read back out of storage later.
+                payloads = tailScan.payloads();
+                LOGGER.trace("Segment {}: Tail scan read {} entries and returned {} results",
+                    segmentId, tailScanEntries, tailScan.results().size());
 
                 // Step 4: Merge HNSW and tail scan results
-                results = mergeResults(hnswResults, tailResults, k);
+                results = mergeResults(hnswResults, tailScan.results(), k);
             } else {
                 // No tail scan needed - just use HNSW results
                 results = limitResults(hnswResults, k);
@@ -178,6 +200,10 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
 
             success = true;
 
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            errorMessage = "Interrupted";
+            LOGGER.debug("Segment {} search cancelled", segmentId);
         } catch (Exception e) {
             errorMessage = e.getMessage();
             LOGGER.warn("Segment {} search failed: {}", segmentId, errorMessage);
@@ -192,12 +218,29 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
             tailScanEntries,
             durationMs,
             success,
-            errorMessage
+            errorMessage,
+            payloads
         );
     }
 
     /**
+     * Returns the oversampled search width, saturating instead of overflowing.
+     *
+     * <p>{@code k} is client-controlled and {@code oversamplingFactor} is configurable,
+     * so the product can exceed {@link Integer#MAX_VALUE}; wrapping to a negative value
+     * would turn the search width into nonsense.</p>
+     */
+    private int searchK() {
+        long widened = (long) k * oversamplingFactor;
+        return widened > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) widened;
+    }
+
+    /**
      * Merges HNSW and tail scan results, removing duplicates.
+     *
+     * <p>Both inputs carry {@link HnswSearchResult#distance()}, a dissimilarity where
+     * smaller is closer for every metric, so a single ascending sort ranks them
+     * correctly against each other.</p>
      */
     private List<HnswSearchResult> mergeResults(
             List<HnswSearchResult> hnswResults,
@@ -250,6 +293,7 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
         private final long durationMs;
         private final boolean success;
         private final String errorMessage;
+        private final Map<Long, byte[]> payloads;
 
         public SegmentQueryResult(
                 long segmentId,
@@ -259,12 +303,36 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
                 boolean success,
                 String errorMessage) {
 
+            this(segmentId, results, tailScanEntries, durationMs, success, errorMessage, Map.of());
+        }
+
+        /**
+         * Creates a segment result carrying the chunk text of its write-log hits.
+         *
+         * @param segmentId The segment identifier
+         * @param results The search results
+         * @param tailScanEntries The number of write-log entries the tail scan read
+         * @param durationMs The search duration
+         * @param success Whether the search succeeded
+         * @param errorMessage The failure message, or null
+         * @param payloads The chunk text of tail-scan results, keyed by node ID
+         */
+        public SegmentQueryResult(
+                long segmentId,
+                List<HnswSearchResult> results,
+                long tailScanEntries,
+                long durationMs,
+                boolean success,
+                String errorMessage,
+                Map<Long, byte[]> payloads) {
+
             this.segmentId = segmentId;
             this.results = results != null ? Collections.unmodifiableList(new ArrayList<>(results)) : Collections.emptyList();
             this.tailScanEntries = tailScanEntries;
             this.durationMs = durationMs;
             this.success = success;
             this.errorMessage = errorMessage;
+            this.payloads = payloads != null ? Map.copyOf(payloads) : Map.of();
         }
 
         /**
@@ -282,6 +350,27 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
         }
 
         /**
+         * Returns the chunk text of a tail-scan result, or null.
+         *
+         * <p>Graph results carry no payload here: their node ID resolves to a document,
+         * not to the storage key of one chunk, so their text is resolved later by
+         * {@code excalibur.query.payload.ResultPayloadResolver}.</p>
+         *
+         * @param nodeId The node ID of a result in {@link #results()}
+         * @return The UTF-8 text bytes, or null when this result carries none
+         */
+        public byte[] payload(long nodeId) {
+            return payloads.get(nodeId);
+        }
+
+        /**
+         * Returns the chunk text of every tail-scan result, keyed by node ID.
+         */
+        public Map<Long, byte[]> payloads() {
+            return payloads;
+        }
+
+        /**
          * Returns the number of results.
          */
         public int resultCount() {
@@ -289,7 +378,10 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
         }
 
         /**
-         * Returns the number of entries scanned from the tail.
+         * Returns the number of write-log entries read by the tail scan.
+         *
+         * <p>This is the work performed, not the number of results kept: the scan reads
+         * every entry in the un-integrated range but keeps only the closest k.</p>
          */
         public long tailScanEntries() {
             return tailScanEntries;

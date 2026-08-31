@@ -397,7 +397,11 @@ public class ParallelQueryDispatcher {
 
         LOGGER.trace("Dispatching query to {} segments", queryableSegments.size());
 
-        // Create tasks for each segment with LSH candidates support
+        // Create tasks for each segment, passing through LSH candidates if provided.
+        // The candidate set (node IDs) is passed to every segment — HnswGraph.search
+        // filters its traversal to only visit nodes whose IDs appear in this set, and
+        // returns empty for a segment whose nodes don't intersect the filter.
+        // Passing null means "full search" (no pre-filtering).
         List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks = new ArrayList<>();
         for (SegmentInfo info : queryableSegments) {
             SegmentQueryTask task = new SegmentQueryTask(
@@ -408,7 +412,7 @@ public class ParallelQueryDispatcher {
                 options.topK(),
                 options.oversamplingFactor(),
                 distanceFunction,
-                null  // No LSH candidates at dispatcher level
+                lshCandidates
             );
             tasks.add(task);
         }
@@ -431,7 +435,7 @@ public class ParallelQueryDispatcher {
                 List.of(),
                 List.of(),
                 coverage,
-                System.nanoTime() - startTime
+                (System.nanoTime() - startTime) / 1_000_000
             );
         }
 
@@ -702,7 +706,7 @@ public class ParallelQueryDispatcher {
                 List.of(),
                 List.of(),
                 coverage,
-                System.nanoTime() - startTime
+                (System.nanoTime() - startTime) / 1_000_000
             );
         }
 

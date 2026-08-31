@@ -20,6 +20,10 @@ import java.nio.ByteOrder;
  * <p>All read/write methods are thread-safe with volatile memory ordering.
  * Compare-and-set and get-and-add operations are fully atomic.</p>
  *
+ * <p>The one exception is {@link #readLongUnaligned}, which guarantees only per-byte
+ * atomicity for arbitrary offsets; see its javadoc before relying on the assembled
+ * 64-bit value.</p>
+ *
  * <h2>Implementation Note</h2>
  * <p>In Java 21's FFM API, VarHandles from ValueLayout have 1 coordinate (MemorySegment).
  * This implementation uses MemorySegment slicing to provide offset-based access.
@@ -183,12 +187,23 @@ public final class SegmentVarHandle {
     }
 
     /**
-     * Atomically reads up to 8 bytes from a MemorySegment at the specified offset
-     * with volatile (acquire) semantics, even at unaligned offsets.
+     * Reads up to 8 bytes from a MemorySegment at the specified offset, assembling them
+     * into a long. Each individual byte is read with volatile (acquire) semantics.
      *
-     * <p>This method reads byte-by-byte using volatile semantics and assembles
-     * them into a long value. This works for any alignment and provides atomicity
-     * guarantees for each byte.</p>
+     * <h3>Atomicity - read this before relying on the result</h3>
+     * <p><strong>The assembled 64-bit value is NOT read atomically unless the access
+     * happens to be a naturally aligned 8-byte read.</strong> Only single-byte atomicity
+     * is guaranteed in the general case: a concurrent writer can land between two
+     * iterations, so the returned long can mix pre-write and post-write bytes. For a
+     * value that spans bytes - a packed multi-bit field, for instance - the result may
+     * then equal neither the old nor the new value.</p>
+     *
+     * <p>Callers that require a genuinely atomic 64-bit load must align the datum to
+     * 8 bytes and use {@link #readLong(MemorySegment, long)}, or serialize with the
+     * writer using the same lock the write path takes. As an optimisation this method
+     * performs a single atomic volatile load whenever the access is an aligned 8-byte
+     * read of a native segment, but that is a best-effort strengthening, not a contract
+     * the caller can depend on for arbitrary offsets.</p>
      *
      * <h3>Use Case</h3>
      * <p>This is designed for packed data structures where offsets may not be
@@ -211,7 +226,14 @@ public final class SegmentVarHandle {
         }
         checkBounds(segment, offset, bytesToRead);
 
-        // Read byte-by-byte with volatile semantics and assemble into long
+        // Fast path: a naturally aligned 8-byte read of a native segment can be done as a
+        // single atomic volatile load, which is both faster and free of tearing.
+        if (bytesToRead == 8 && isEightByteAligned(segment, offset)) {
+            return (long) LONG_HANDLE.getVolatile(segment.asSlice(offset, 8));
+        }
+
+        // General path: read byte-by-byte with volatile semantics and assemble into long.
+        // Only per-byte atomicity holds here - see the atomicity note above.
         long value = 0;
         for (int i = 0; i < bytesToRead; i++) {
             MemorySegment byteSlice = segment.asSlice(offset + i, 1);
@@ -221,6 +243,18 @@ public final class SegmentVarHandle {
         // Shift to left-align in 64-bit result (high bits)
         value <<= (8 - bytesToRead) * 8;
         return value;
+    }
+
+    /**
+     * Returns true if an access at {@code offset} within {@code segment} is naturally
+     * aligned for an 8-byte volatile access.
+     *
+     * <p>Only native segments are considered: a heap segment backed by a byte array has a
+     * maximum alignment of one byte regardless of its reported address, so an aligned
+     * volatile load is rejected by the FFM API there.</p>
+     */
+    private static boolean isEightByteAligned(MemorySegment segment, long offset) {
+        return segment.isNative() && ((segment.address() + offset) & 7L) == 0L;
     }
 
     /**

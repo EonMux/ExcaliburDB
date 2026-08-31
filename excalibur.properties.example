@@ -1,0 +1,152 @@
+# ExcaliburDB Configuration template.
+# Disk-backed data relevancy retrieval engine for LLMs.
+#
+# Copy to excalibur.properties (gitignored) and edit. Every key below can also be supplied
+# from the environment as EXCALIBUR_<KEY>, upper-cased with - and . replaced by _ , which
+# overrides the file. Supply secrets that way rather than writing them into a file.
+
+# Visibility Configuration
+excalibur.visibility.epoch-tick-ms=100
+excalibur.visibility.query-timeout-ms=30000
+
+# Ingest Configuration
+excalibur.ingest.document-atomicity-timeout-ms=2000
+
+# API Server Configuration
+# The API binds to loopback by default. Binding any other address requires an explicit
+# excalibur.api.bind-address, excalibur.api.auth-token, AND TLS; without them the server
+# refuses to start rather than serving the network unauthenticated or in cleartext.
+excalibur.api.bind-address=127.0.0.1
+# Never set the auth token here. Supply it as the EXCALIBUR_API_AUTH_TOKEN environment
+# variable. Every endpoint except GET /health requires it as a bearer token.
+#excalibur.api.auth-token=
+# Per-client rate limits: separate budgets for reads and for mutating requests.
+excalibur.api.read-rate-per-second=50
+excalibur.api.read-burst=200
+excalibur.api.mutate-rate-per-second=5
+excalibur.api.mutate-burst=20
+excalibur.api.rate-limit-max-clients=10000
+# Bounds applied to client-supplied query fields before they size anything server-side.
+excalibur.api.max-top-k=1000
+excalibur.api.max-query-timeout-ms=60000
+
+# Transport Security
+# Setting a keystore turns TLS on. The keystore holds the server certificate and its
+# private key; PKCS12 is the default format and the one keytool writes by default.
+#excalibur.api.tls-keystore=/etc/excalibur/server.p12
+# Never set the keystore password here. Supply it as the
+# EXCALIBUR_API_TLS_KEYSTORE_PASSWORD environment variable.
+#excalibur.api.tls-keystore-password=
+#excalibur.api.tls-keystore-type=PKCS12
+# Only needed when the keystore holds more than one private key entry, or when the key
+# entry has its own password (which PKCS12 does not support -- JKS does).
+#excalibur.api.tls-key-alias=
+#excalibur.api.tls-key-password=
+# Protocols and suites, in server preference order. The defaults are TLS 1.3 and 1.2 with
+# forward-secret AEAD suites only; override them only to narrow, not to widen.
+#excalibur.api.tls-protocols=TLSv1.3,TLSv1.2
+#excalibur.api.tls-cipher-suites=
+# Mutual TLS: none, want, or need. Anything but none should name a truststore, otherwise
+# client certificates are checked against the JVM default store, which trusts the public
+# web CAs and so accepts a certificate from almost anyone.
+#excalibur.api.tls-client-auth=none
+#excalibur.api.tls-truststore=/etc/excalibur/clients.p12
+#excalibur.api.tls-truststore-password=
+#excalibur.api.tls-truststore-type=PKCS12
+# Set this only when something in front of this process terminates TLS -- a sidecar or an
+# ingress forwarding over loopback. It permits a non-loopback bind to serve cleartext,
+# which otherwise refuses to start.
+#excalibur.api.allow-plaintext=false
+
+# Graph-RAG Configuration
+# POST /v1/graph/query answers from a graph store this node reads but does not build. Leave
+# the path unset to look in <data dir>/graph; a node with no graph store starts normally and
+# does not register the route.
+#excalibur.graph.path=
+# Documents each retrieval signal contributes before fusion, and the token budget the
+# serialised subgraph must fit into.
+excalibur.graph.top-k=10
+excalibur.graph.context-token-budget=2000
+# Abstention thresholds. Below these the endpoint declines rather than answering from evidence
+# it does not trust -- an empty "answered" reads to a client as "nothing found", which is a
+# different statement from "found something and did not believe it".
+excalibur.graph.min-score=0.005
+excalibur.graph.min-separation=0.001
+excalibur.graph.min-mean-confidence=0.3
+excalibur.graph.max-ambiguous-candidates=5
+excalibur.graph.ram-buffer-mb=16
+
+# Extracting facts from ingested documents. Off by default: it is one chat-model call per
+# document, the most expensive thing ingestion can do, and a node doing vector search should not
+# pay for a graph it never asked for.
+excalibur.graph.extraction-enabled=false
+# Recorded on every fact this node extracts, so one extractor's output can be erased by version.
+excalibur.graph.extractor-version=1
+# Embed each entity's text at build time, so retrieval can rerank BM25's candidates against real
+# vectors rather than stopping at term overlap. Costs one embedding call per batch of entities at
+# build time, and only happens at all when an embedding endpoint is configured.
+excalibur.graph.entity-vectors-enabled=true
+# Relations that hold one value at a time: a new value closes the previous interval rather than
+# sitting beside it. Empty by default, because closing an interval destroys information - a
+# relation wrongly left multi-valued returns a stale extra answer, one wrongly superseded silently
+# deletes a true fact ("authored" closing the previous book when someone writes another).
+#excalibur.graph.single-valued-relations=employer,lives_in
+
+# Graphs held open at once. A served store is thirteen memory mappings and a process has a finite
+# number of them, so the least recently used graph is evicted to make room rather than the node
+# running out at whatever unrelated allocation comes next.
+excalibur.graph.max-open-namespaces=16
+
+# When an erasure compaction becomes worthwhile. The ratio amortises the rewrite; the latency bound
+# is what makes an obligation a promise rather than a tuning knob, since a single request on a large
+# store would otherwise never reach the ratio.
+excalibur.graph.erasure-tombstone-ratio=0.2
+excalibur.graph.erasure-max-latency-seconds=3600
+
+# Ingest Target Allow-Lists
+# Empty means DISABLED, not unrestricted. Filesystem ingest may only read inside these
+# absolute directories; a requested root_path is canonicalised first and must resolve
+# inside one of them.
+excalibur.ingest.allowed-roots=
+# URL ingest may only crawl these hosts, and only over http/https. Hosts resolving to
+# loopback, private, link-local or multicast addresses are refused regardless.
+excalibur.ingest.allowed-hosts=
+# Bound on concurrently registered ingestion sources.
+excalibur.ingest.max-sources=256
+
+# Health Configuration
+excalibur.health.readiness-threshold=0.5
+excalibur.health.healthy-threshold=0.9
+excalibur.health.max-latency-ms=5000
+
+# Query Configuration
+excalibur.query.top-k-default=100
+excalibur.query.recall-target=0.95
+excalibur.query.include-partial-segments=true
+excalibur.query.vector-dimensions=1536
+excalibur.query.llm-timeout-ms=60000
+
+# LLM Configuration
+excalibur.llm.base-url=https://api.openai.com/v1
+# Never set the api key here. Supply it as the EXCALIBUR_LLM_API_KEY environment variable,
+# so it cannot be committed or read out of the working directory.
+#excalibur.llm.api-key=
+excalibur.llm.model=text-embedding-ada-002
+excalibur.llm.chat-model=gpt-4o-mini
+excalibur.llm.embedding-model=text-embedding-3-small
+excalibur.llm.embeddings-dimensions=1536
+excalibur.llm.timeout-ms=60000
+excalibur.llm.max-retries=3
+excalibur.llm.failure-threshold=5
+excalibur.llm.cooldown-period-ms=60000
+excalibur.llm.max-prompts-per-query=10
+excalibur.llm.relevancy-threshold=0.3
+excalibur.llm.max-batch-tokens=4000
+excalibur.llm.retry-base-delay-ms=500
+
+# Shard Configuration
+excalibur.shard.segment-load-factor=0.7
+excalibur.shard.default-ef-construction=128
+excalibur.shard.default-ef-search=64
+excalibur.shard.compaction-delay-ms=10000
+excalibur.shard.hnsw-integration-queue-depth-limit=100000

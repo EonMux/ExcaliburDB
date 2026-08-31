@@ -72,7 +72,7 @@ class ExcaliburDBServerTest {
     @AfterEach
     void tearDown() {
         if (server != null) {
-            server.stop(1);
+            server.stop(0); // Immediate stop for faster test teardown
         }
     }
 
@@ -98,14 +98,14 @@ class ExcaliburDBServerTest {
         @Test
         @DisplayName("stops successfully")
         void stopsSuccessfully() throws IOException {
-            server.stop(1);
+            server.stop(0);
             assertThat(server.isRunning()).isFalse();
         }
 
         @Test
         @DisplayName("closes index orchestrator when server stops")
         void closesIndexOrchestrator() {
-            server.stop(1);
+            server.stop(0);
             // Verify that indexOrchestrator.close() was called during server shutdown
             // This ensures the epoch tick scheduler is stopped cleanly
             verify(indexOrchestrator).close();
@@ -122,7 +122,7 @@ class ExcaliburDBServerTest {
         @Test
         @DisplayName("allows restart after stop")
         void allowsRestart() throws IOException {
-            server.stop(1);
+            server.stop(0);
             assertThat(server.isRunning()).isFalse();
 
             ExcaliburDBServer newServer = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);

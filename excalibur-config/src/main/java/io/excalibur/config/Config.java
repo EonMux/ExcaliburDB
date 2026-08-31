@@ -2,6 +2,7 @@ package io.excalibur.config;
 
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -36,10 +37,14 @@ public final class Config {
     private final Query query;
     private final Llm llm;
     private final Shard shard;
+    private final Graph graph;
 
     // Application settings - final for immutability
     private final String configPath;
     private final Map<String, String> envOverrides;
+
+    /** The file's properties with the environment applied; see {@link #getEffectiveProperties()}. */
+    private final Map<String, String> effectiveProperties;
 
     /**
      * Creates a new Config instance from a properties map.
@@ -54,7 +59,7 @@ public final class Config {
      * Creates a new Config instance with specified config path and environment overrides.
      *
      * @param configPath Path to the properties file
-     * @param envOverrides Map of environment variable overrides (format: "key" -> value)
+     * @param envOverrides Environment variables, keyed by variable name (EXCALIBUR_*)
      */
     public Config(String configPath, Map<String, String> envOverrides) {
         this(configPath, envOverrides, new HashMap<>());
@@ -63,9 +68,15 @@ public final class Config {
     /**
      * Creates a new Config instance with all parameters.
      *
+     * <p>Environment variables take precedence over the properties map, so a Config
+     * built directly honours <code>EXCALIBUR_*</code> exactly as one loaded through
+     * {@link ConfigLoader} does.</p>
+     *
      * @param configPath Path to the properties file
-     * @param envOverrides Map of environment variable overrides
+     * @param envOverrides Environment variables, keyed by variable name (EXCALIBUR_*)
      * @param props Map of property key-value pairs (from file)
+     * @throws IllegalArgumentException if any property value cannot be parsed or
+     *         violates a domain constraint
      */
     public Config(String configPath, Map<String, String> envOverrides, Map<String, String> props) {
         this.configPath = Objects.requireNonNull(configPath, "configPath cannot be null");
@@ -73,14 +84,17 @@ public final class Config {
             new HashMap<>(envOverrides != null ? envOverrides : Collections.emptyMap())
         );
 
-        // Initialize configuration sections with values from properties map
-        Map<String, String> effectiveProps = props != null ? props : new HashMap<>();
+        // Initialize configuration sections with the file values overlaid by the
+        // environment, so no construction path can silently discard an override.
+        Map<String, String> effectiveProps = EnvOverrides.apply(props, this.envOverrides);
+        this.effectiveProperties = Collections.unmodifiableMap(new HashMap<>(effectiveProps));
         this.visibility = new Visibility(effectiveProps);
         this.ingest = new Ingest(effectiveProps);
         this.health = new Health(effectiveProps);
         this.query = new Query(effectiveProps);
         this.llm = new Llm(effectiveProps);
         this.shard = new Shard(effectiveProps);
+        this.graph = new Graph(effectiveProps);
     }
 
     /**
@@ -126,6 +140,13 @@ public final class Config {
     }
 
     /**
+     * Gets the graph-RAG configuration.
+     */
+    public Graph graph() {
+        return graph;
+    }
+
+    /**
      * Gets the path to the configuration file.
      */
     public String getConfigPath() {
@@ -135,6 +156,22 @@ public final class Config {
     /**
      * Gets the environment variable overrides applied to configuration.
      */
+    /**
+     * Every property in effect: the file's values with {@code EXCALIBUR_*} overrides applied.
+     *
+     * <p>The typed sections below cover what this module knows about, but a module that owns its
+     * own keys — the API layer and its auth, bind and rate-limit settings — has nowhere else to
+     * read them from. Without this it has to reopen the file and reimplement the environment
+     * transform, which is a second parser that can disagree with this one about precedence.
+     *
+     * <p>Prefer a typed section when one exists. This is for keys this module does not model.
+     *
+     * @return an unmodifiable view of the merged properties
+     */
+    public Map<String, String> getEffectiveProperties() {
+        return effectiveProperties;
+    }
+
     public Map<String, String> getEnvOverrides() {
         return envOverrides;
     }
@@ -172,8 +209,8 @@ public final class Config {
          * @param props The properties map
          */
         public Visibility(Map<String, String> props) {
-            this.epochTickMs = parseLong(props, "excalibur.visibility.epoch-tick-ms", DEFAULT_EPOCH_TICK_MS);
-            this.queryTimeoutMs = parseInt(props, "excalibur.visibility.query-timeout-ms", DEFAULT_QUERY_TIMEOUT_MS);
+            this.epochTickMs = PropertyParser.parseLong(props, "excalibur.visibility.epoch-tick-ms", DEFAULT_EPOCH_TICK_MS);
+            this.queryTimeoutMs = PropertyParser.parseInt(props, "excalibur.visibility.query-timeout-ms", DEFAULT_QUERY_TIMEOUT_MS);
         }
 
         /**
@@ -232,7 +269,6 @@ public final class Config {
     public static final class Ingest {
 
         // HNSW integration queue depth limit
-        public static final long DEFAULT_QUEUE_DEPTH_LIMIT = 100000L;
 
         // Document atomicity timeout in milliseconds
         public static final int DEFAULT_DOCUMENT_TIMEOUT_MS = 2000;
@@ -249,8 +285,14 @@ public final class Config {
         public static final int MIN_DOCUMENT_TIMEOUT_MS = 1000;
         public static final int MAX_DOCUMENT_TIMEOUT_MS = 30000;
 
+        // Reindex interval bounds. These mirror the window the shard module's
+        // SegmentReindexScheduler enforces (1 minute to 24 hours); validating them
+        // here turns a misconfiguration into a startup failure instead of a
+        // half-completed source registration inside the /v1/ingest request path.
+        public static final long MIN_REINDEX_INTERVAL_MS = 60000L;
+        public static final long MAX_REINDEX_INTERVAL_MS = 86400000L;
+
         // All fields final for immutability
-        private final long hnswQueueDepthLimit;
         private final int documentTimeoutMs;
         private final boolean documentAtomicity;
         private final long reindexIntervalMs;
@@ -261,19 +303,9 @@ public final class Config {
          * @param props The properties map
          */
         public Ingest(Map<String, String> props) {
-            this.hnswQueueDepthLimit = parseLong(props, "excalibur.ingest.hnsw-queue-depth-limit", DEFAULT_QUEUE_DEPTH_LIMIT);
-            this.documentTimeoutMs = parseInt(props, "excalibur.ingest.document-atomicity-timeout-ms", DEFAULT_DOCUMENT_TIMEOUT_MS);
-            this.documentAtomicity = parseBoolean(props, "excalibur.ingest.document-atomicity", DEFAULT_DOCUMENT_ATOMICITY);
-            this.reindexIntervalMs = parseLong(props, "excalibur.ingest.reindex-interval-ms", DEFAULT_REINDEX_INTERVAL_MS);
-        }
-
-        /**
-         * Gets the HNSW queue depth limit.
-         *
-         * @return Maximum entries allowed in HNSW integration queue
-         */
-        public long getHnswQueueDepthLimit() {
-            return hnswQueueDepthLimit;
+            this.documentTimeoutMs = PropertyParser.parseInt(props, "excalibur.ingest.document-atomicity-timeout-ms", DEFAULT_DOCUMENT_TIMEOUT_MS);
+            this.documentAtomicity = PropertyParser.parseBoolean(props, "excalibur.ingest.document-atomicity", DEFAULT_DOCUMENT_ATOMICITY);
+            this.reindexIntervalMs = PropertyParser.parseLong(props, "excalibur.ingest.reindex-interval-ms", DEFAULT_REINDEX_INTERVAL_MS);
         }
 
         /**
@@ -310,8 +342,7 @@ public final class Config {
 
         @Override
         public String toString() {
-            return "Ingest{hnswQueueDepthLimit=" + hnswQueueDepthLimit +
-                   ", documentTimeoutMs=" + documentTimeoutMs +
+            return "Ingest{documentTimeoutMs=" + documentTimeoutMs +
                    ", documentAtomicity=" + documentAtomicity +
                    ", reindexIntervalMs=" + reindexIntervalMs + '}';
         }
@@ -354,9 +385,9 @@ public final class Config {
          * @param props The properties map
          */
         public Health(Map<String, String> props) {
-            this.readinessThreshold = parseDouble(props, "excalibur.health.readiness-threshold", DEFAULT_READINESS_THRESHOLD);
-            this.healthyThreshold = parseDouble(props, "excalibur.health.healthy-threshold", DEFAULT_HEALTHY_THRESHOLD);
-            this.maxLatencyMs = parseInt(props, "excalibur.health.max-latency-ms", DEFAULT_MAX_LATENCY_MS);
+            this.readinessThreshold = PropertyParser.parseDouble(props, "excalibur.health.readiness-threshold", DEFAULT_READINESS_THRESHOLD);
+            this.healthyThreshold = PropertyParser.parseDouble(props, "excalibur.health.healthy-threshold", DEFAULT_HEALTHY_THRESHOLD);
+            this.maxLatencyMs = PropertyParser.parseInt(props, "excalibur.health.max-latency-ms", DEFAULT_MAX_LATENCY_MS);
         }
 
         /**
@@ -438,12 +469,12 @@ public final class Config {
          * @param props The properties map
          */
         public Query(Map<String, String> props) {
-            this.defaultTopK = parseInt(props, "excalibur.query.top-k-default", DEFAULT_TOP_K);
-            this.recallTarget = parseDouble(props, "excalibur.query.recall-target", DEFAULT_RECALL_TARGET);
-            this.threshold = parseDouble(props, "excalibur.query.threshold", DEFAULT_THRESHOLD);
-            this.vectorDimensions = parseInt(props, "excalibur.query.vector-dimensions", DEFAULT_VECTOR_DIMENSIONS);
-            this.llmTimeoutMs = parseInt(props, "excalibur.query.llm-timeout-ms", DEFAULT_LLM_TIMEOUT_MS);
-            this.includePartialSegments = parseBoolean(props, "excalibur.query.include-partial-segments", true);
+            this.defaultTopK = PropertyParser.parseInt(props, "excalibur.query.top-k-default", DEFAULT_TOP_K);
+            this.recallTarget = PropertyParser.parseDouble(props, "excalibur.query.recall-target", DEFAULT_RECALL_TARGET);
+            this.threshold = PropertyParser.parseDouble(props, "excalibur.query.threshold", DEFAULT_THRESHOLD);
+            this.vectorDimensions = PropertyParser.parseInt(props, "excalibur.query.vector-dimensions", DEFAULT_VECTOR_DIMENSIONS);
+            this.llmTimeoutMs = PropertyParser.parseInt(props, "excalibur.query.llm-timeout-ms", DEFAULT_LLM_TIMEOUT_MS);
+            this.includePartialSegments = PropertyParser.parseBoolean(props, "excalibur.query.include-partial-segments", true);
         }
 
         /**
@@ -609,20 +640,20 @@ public final class Config {
          * @param props The properties map
          */
         public Llm(Map<String, String> props) {
-            this.baseUrl = parseString(props, "excalibur.llm.base-url", DEFAULT_BASE_URL);
-            this.apiKey = parseString(props, "excalibur.llm.api-key", DEFAULT_API_KEY);
-            this.model = parseString(props, "excalibur.llm.model", DEFAULT_MODEL);
-            this.chatModel = parseString(props, "excalibur.llm.chat-model", DEFAULT_CHAT_MODEL);
-            this.embeddingModel = parseString(props, "excalibur.llm.embedding-model", DEFAULT_EMBEDDING_MODEL);
-            this.embeddingsDimensions = parseInt(props, "excalibur.llm.embeddings-dimensions", DEFAULT_EMBEDDINGS_DIMENSIONS);
-            this.timeoutMs = parseInt(props, "excalibur.llm.timeout-ms", DEFAULT_TIMEOUT_MS);
-            this.maxRetries = parseInt(props, "excalibur.llm.max-retries", DEFAULT_MAX_RETRIES);
-            this.failureThreshold = parseInt(props, "excalibur.llm.failure-threshold", DEFAULT_FAILURE_THRESHOLD);
-            this.cooldownPeriodMs = parseLong(props, "excalibur.llm.cooldown-period-ms", DEFAULT_COOLDOWN_PERIOD_MS);
-            this.maxPromptsPerQuery = parseInt(props, "excalibur.llm.max-prompts-per-query", DEFAULT_MAX_PROMPTS_PER_QUERY);
-            this.relevancyThreshold = parseDouble(props, "excalibur.llm.relevancy-threshold", DEFAULT_RELEVANCY_THRESHOLD);
-            this.maxBatchTokens = parseInt(props, "excalibur.llm.max-batch-tokens", DEFAULT_MAX_BATCH_TOKENS);
-            this.retryBaseDelayMs = parseLong(props, "excalibur.llm.retry-base-delay-ms", DEFAULT_RETRY_BASE_DELAY_MS);
+            this.baseUrl = PropertyParser.parseString(props, "excalibur.llm.base-url", DEFAULT_BASE_URL);
+            this.apiKey = PropertyParser.parseString(props, "excalibur.llm.api-key", DEFAULT_API_KEY);
+            this.model = PropertyParser.parseString(props, "excalibur.llm.model", DEFAULT_MODEL);
+            this.chatModel = PropertyParser.parseString(props, "excalibur.llm.chat-model", DEFAULT_CHAT_MODEL);
+            this.embeddingModel = PropertyParser.parseString(props, "excalibur.llm.embedding-model", DEFAULT_EMBEDDING_MODEL);
+            this.embeddingsDimensions = PropertyParser.parseInt(props, "excalibur.llm.embeddings-dimensions", DEFAULT_EMBEDDINGS_DIMENSIONS);
+            this.timeoutMs = PropertyParser.parseInt(props, "excalibur.llm.timeout-ms", DEFAULT_TIMEOUT_MS);
+            this.maxRetries = PropertyParser.parseInt(props, "excalibur.llm.max-retries", DEFAULT_MAX_RETRIES);
+            this.failureThreshold = PropertyParser.parseInt(props, "excalibur.llm.failure-threshold", DEFAULT_FAILURE_THRESHOLD);
+            this.cooldownPeriodMs = PropertyParser.parseLong(props, "excalibur.llm.cooldown-period-ms", DEFAULT_COOLDOWN_PERIOD_MS);
+            this.maxPromptsPerQuery = PropertyParser.parseInt(props, "excalibur.llm.max-prompts-per-query", DEFAULT_MAX_PROMPTS_PER_QUERY);
+            this.relevancyThreshold = PropertyParser.parseDouble(props, "excalibur.llm.relevancy-threshold", DEFAULT_RELEVANCY_THRESHOLD);
+            this.maxBatchTokens = PropertyParser.parseInt(props, "excalibur.llm.max-batch-tokens", DEFAULT_MAX_BATCH_TOKENS);
+            this.retryBaseDelayMs = PropertyParser.parseLong(props, "excalibur.llm.retry-base-delay-ms", DEFAULT_RETRY_BASE_DELAY_MS);
         }
 
         /**
@@ -783,7 +814,7 @@ public final class Config {
          * @throws IllegalArgumentException if loadFactor is not in (0.0, 1.0]
          */
         public Shard(Map<String, String> props) {
-            double parsedLoadFactor = parseDouble(props, "excalibur.shard.segment-load-factor", DEFAULT_LOAD_FACTOR);
+            double parsedLoadFactor = PropertyParser.parseDouble(props, "excalibur.shard.segment-load-factor", DEFAULT_LOAD_FACTOR);
             // Domain correctness: load factor must be in (0.0, 1.0]
             // - 0 or negative: table would never split (broken behavior)
             // - > 1.0: impossible for open addressing (can't exceed 100% fill)
@@ -793,28 +824,28 @@ public final class Config {
             }
             this.loadFactor = parsedLoadFactor;
 
-            int parsedEfConstruction = parseInt(props, "excalibur.shard.default-ef-construction", DEFAULT_EF_CONSTRUCTION);
+            int parsedEfConstruction = PropertyParser.parseInt(props, "excalibur.shard.default-ef-construction", DEFAULT_EF_CONSTRUCTION);
             if (parsedEfConstruction < 1) {
                 throw new IllegalArgumentException(
                     "efConstruction must be at least 1, got: " + parsedEfConstruction);
             }
             this.efConstruction = parsedEfConstruction;
 
-            int parsedEfSearch = parseInt(props, "excalibur.shard.default-ef-search", DEFAULT_EF_SEARCH);
+            int parsedEfSearch = PropertyParser.parseInt(props, "excalibur.shard.default-ef-search", DEFAULT_EF_SEARCH);
             if (parsedEfSearch < 1) {
                 throw new IllegalArgumentException(
                     "efSearch must be at least 1, got: " + parsedEfSearch);
             }
             this.efSearch = parsedEfSearch;
 
-            int parsedCompactDelayMs = parseInt(props, "excalibur.shard.compaction-delay-ms", DEFAULT_COMPACT_DELAY_MS);
+            int parsedCompactDelayMs = PropertyParser.parseInt(props, "excalibur.shard.compaction-delay-ms", DEFAULT_COMPACT_DELAY_MS);
             if (parsedCompactDelayMs < 0) {
                 throw new IllegalArgumentException(
                     "compactDelayMs cannot be negative, got: " + parsedCompactDelayMs);
             }
             this.compactDelayMs = parsedCompactDelayMs;
 
-            int parsedHnswQueueLimit = parseInt(props, "excalibur.shard.hnsw-integration-queue-depth-limit", DEFAULT_HNSW_QUEUE_LIMIT);
+            int parsedHnswQueueLimit = PropertyParser.parseInt(props, "excalibur.shard.hnsw-integration-queue-depth-limit", DEFAULT_HNSW_QUEUE_LIMIT);
             if (parsedHnswQueueLimit < 1) {
                 throw new IllegalArgumentException(
                     "hnswQueueLimit must be at least 1, got: " + parsedHnswQueueLimit);
@@ -865,64 +896,6 @@ public final class Config {
         }
     }
 
-    // ============================================
-    // Static Helper Methods
-    // ============================================
-
-    private static int parseInt(Map<String, String> props, String key, int defaultValue) {
-        String value = props.get(key);
-        if (value == null) {
-            return defaultValue;
-        }
-        try {
-            return Integer.parseInt(value.trim());
-        } catch (NumberFormatException e) {
-            return defaultValue;
-        }
-    }
-
-    private static long parseLong(Map<String, String> props, String key, long defaultValue) {
-        String value = props.get(key);
-        if (value == null) {
-            return defaultValue;
-        }
-        try {
-            return Long.parseLong(value.trim());
-        } catch (NumberFormatException e) {
-            return defaultValue;
-        }
-    }
-
-    private static double parseDouble(Map<String, String> props, String key, double defaultValue) {
-        String value = props.get(key);
-        if (value == null) {
-            return defaultValue;
-        }
-        try {
-            return Double.parseDouble(value.trim());
-        } catch (NumberFormatException e) {
-            return defaultValue;
-        }
-    }
-
-    private static boolean parseBoolean(Map<String, String> props, String key, boolean defaultValue) {
-        String value = props.get(key);
-        if (value == null) {
-            return defaultValue;
-        }
-        return value.trim().equalsIgnoreCase("true") ||
-               value.trim().equalsIgnoreCase("1") ||
-               value.trim().equalsIgnoreCase("yes");
-    }
-
-    private static String parseString(Map<String, String> props, String key, String defaultValue) {
-        String value = props.get(key);
-        if (value == null || value.trim().isEmpty()) {
-            return defaultValue;
-        }
-        return value.trim();
-    }
-
     @Override
     public String toString() {
         return "Config{" +
@@ -933,6 +906,7 @@ public final class Config {
                 ", query=" + query +
                 ", llm=" + llm +
                 ", shard=" + shard +
+                ", graph=" + graph +
                 '}';
     }
 
@@ -946,11 +920,329 @@ public final class Config {
                Objects.equals(health, config.health) &&
                Objects.equals(query, config.query) &&
                Objects.equals(llm, config.llm) &&
-               Objects.equals(shard, config.shard);
+               Objects.equals(shard, config.shard) &&
+               Objects.equals(graph, config.graph);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(visibility, ingest, health, query, llm, shard);
+        return Objects.hash(visibility, ingest, health, query, llm, shard, graph);
+    }
+
+    /**
+     * Graph-RAG configuration.
+     *
+     * <p>Everything {@code POST /v1/graph/query} needs that is not on disk beside the graph
+     * itself: where to find it, how much evidence an answer requires, and how much context the
+     * model is given.
+     *
+     * <h2>Thread Safety</h2>
+     * <p>Immutable and thread-safe.</p>
+     */
+    public static final class Graph {
+
+        /** Smallest fused score any candidate must reach before an answer is attempted. */
+        public static final double DEFAULT_MIN_SCORE = 0.005;
+
+        /** Smallest gap between the best and second candidate before the result is ambiguous. */
+        public static final double DEFAULT_MIN_SEPARATION = 0.001;
+
+        /** Smallest mean confidence across the surviving evidence. */
+        public static final double DEFAULT_MIN_MEAN_CONFIDENCE = 0.3;
+
+        /** How many equally-plausible candidates are reported back rather than chosen between. */
+        public static final int DEFAULT_MAX_AMBIGUOUS_CANDIDATES = 5;
+
+        /** Tokens of serialised subgraph an answer may carry. */
+        public static final int DEFAULT_CONTEXT_TOKEN_BUDGET = 2000;
+
+        /** Documents each retrieval signal contributes before fusion. */
+        public static final int DEFAULT_TOP_K = 10;
+
+        /** Lucene RAM buffer, in megabytes, for the read-only indexes. */
+        public static final double DEFAULT_RAM_BUFFER_MB = 16.0;
+
+        /**
+         * Whether ingestion extracts facts by default.
+         *
+         * <p>Off. Extraction is one chat-model call per document, which is the most expensive
+         * thing ingestion can do, and a deployment that wants vector search should not start
+         * paying for a graph it never asked for.
+         */
+        public static final boolean DEFAULT_EXTRACTION_ENABLED = false;
+
+        /** Extractor version recorded on facts when none is configured. */
+        public static final int DEFAULT_EXTRACTOR_VERSION = 1;
+
+        /**
+         * Whether a build embeds each entity's text.
+         *
+         * <p>On, because it is what lets retrieval rerank against real vectors rather than stop at
+         * term overlap - and it only happens at all when an embedding endpoint is configured. It
+         * costs one embedding call per batch of entities at build time, which is why it can be
+         * turned off for a deployment that wants the graph and not that cost.
+         */
+        public static final boolean DEFAULT_ENTITY_VECTORS_ENABLED = true;
+
+        /**
+         * How many namespaces' graphs stay open at once.
+         *
+         * <p>A served store is thirteen memory mappings. The mapping budget is the hard bound;
+         * this is the count bound beside it, so a node with many small tenants does not hold every
+         * one of them open merely because none is individually expensive.
+         */
+        public static final int DEFAULT_MAX_OPEN_NAMESPACES = 16;
+
+        /**
+         * Tombstoned fraction of the store at which erasure compaction becomes worthwhile.
+         *
+         * <p>A compaction rewrites the whole store, so running one per request would make erasure
+         * a way to keep a node permanently busy. Waiting until a fifth of the edges are tombstoned
+         * amortises it.
+         */
+        public static final double DEFAULT_ERASURE_TOMBSTONE_RATIO = 0.2;
+
+        /**
+         * Longest an erasure obligation may wait, whatever has accumulated.
+         *
+         * <p>The ratio alone would let a single request sit indefinitely on a large store that
+         * never reaches the threshold. An obligation to erase is not a performance tuning knob;
+         * this is the bound that makes it a promise.
+         */
+        public static final long DEFAULT_ERASURE_MAX_LATENCY_SECONDS = 3600L;
+
+        private final String path;
+        private final double minScore;
+        private final double minSeparation;
+        private final double minMeanConfidence;
+        private final int maxAmbiguousCandidates;
+        private final int contextTokenBudget;
+        private final int topK;
+        private final double ramBufferMb;
+        private final boolean extractionEnabled;
+        private final int extractorVersion;
+        private final List<String> singleValuedRelations;
+        private final boolean entityVectorsEnabled;
+        private final int maxOpenNamespaces;
+        private final double erasureTombstoneRatio;
+        private final long erasureMaxLatencySeconds;
+
+        /**
+         * Creates a Graph config from properties.
+         *
+         * @param props The properties map
+         * @throws IllegalArgumentException if a threshold is outside its domain
+         */
+        public Graph(Map<String, String> props) {
+            this.path = PropertyParser.parseString(props, "excalibur.graph.path", null);
+            this.extractionEnabled = PropertyParser.parseBoolean(
+                props, "excalibur.graph.extraction-enabled", DEFAULT_EXTRACTION_ENABLED);
+            this.extractorVersion = PropertyParser.parseInt(
+                props, "excalibur.graph.extractor-version", DEFAULT_EXTRACTOR_VERSION);
+            this.entityVectorsEnabled = PropertyParser.parseBoolean(
+                props, "excalibur.graph.entity-vectors-enabled", DEFAULT_ENTITY_VECTORS_ENABLED);
+            this.maxOpenNamespaces = requirePositive(PropertyParser.parseInt(
+                props, "excalibur.graph.max-open-namespaces", DEFAULT_MAX_OPEN_NAMESPACES),
+                "max-open-namespaces");
+            this.erasureTombstoneRatio = requireInUnitRange(PropertyParser.parseDouble(
+                props, "excalibur.graph.erasure-tombstone-ratio",
+                DEFAULT_ERASURE_TOMBSTONE_RATIO), "erasure-tombstone-ratio");
+            this.erasureMaxLatencySeconds = PropertyParser.parseLong(
+                props, "excalibur.graph.erasure-max-latency-seconds",
+                DEFAULT_ERASURE_MAX_LATENCY_SECONDS);
+            if (erasureMaxLatencySeconds <= 0) {
+                throw new IllegalArgumentException(
+                    "excalibur.graph.erasure-max-latency-seconds must be positive, got: "
+                        + erasureMaxLatencySeconds);
+            }
+            if (extractorVersion < Short.MIN_VALUE || extractorVersion > Short.MAX_VALUE) {
+                throw new IllegalArgumentException(
+                    "excalibur.graph.extractor-version must fit in a short, got "
+                        + extractorVersion);
+            }
+            // Relations that hold one value at a time. Empty by default, because closing an
+            // interval destroys information: a relation wrongly left multi-valued returns a stale
+            // extra answer, while one wrongly superseded silently deletes a true fact.
+            this.singleValuedRelations = List.of(
+                PropertyParser.parseString(props, "excalibur.graph.single-valued-relations", "")
+                    .split(","))
+                .stream()
+                .map(String::trim)
+                .filter(value -> !value.isEmpty())
+                .toList();
+            this.minScore = requireInUnitRange(PropertyParser.parseDouble(
+                props, "excalibur.graph.min-score", DEFAULT_MIN_SCORE), "min-score");
+            this.minSeparation = requireInUnitRange(PropertyParser.parseDouble(
+                props, "excalibur.graph.min-separation", DEFAULT_MIN_SEPARATION),
+                "min-separation");
+            this.minMeanConfidence = requireInUnitRange(PropertyParser.parseDouble(
+                props, "excalibur.graph.min-mean-confidence", DEFAULT_MIN_MEAN_CONFIDENCE),
+                "min-mean-confidence");
+            this.maxAmbiguousCandidates = requirePositive(PropertyParser.parseInt(
+                props, "excalibur.graph.max-ambiguous-candidates",
+                DEFAULT_MAX_AMBIGUOUS_CANDIDATES), "max-ambiguous-candidates");
+            this.contextTokenBudget = requirePositive(PropertyParser.parseInt(
+                props, "excalibur.graph.context-token-budget", DEFAULT_CONTEXT_TOKEN_BUDGET),
+                "context-token-budget");
+            this.topK = requirePositive(PropertyParser.parseInt(
+                props, "excalibur.graph.top-k", DEFAULT_TOP_K), "top-k");
+            double buffer = PropertyParser.parseDouble(
+                props, "excalibur.graph.ram-buffer-mb", DEFAULT_RAM_BUFFER_MB);
+            if (Double.isNaN(buffer) || buffer <= 0) {
+                throw new IllegalArgumentException(
+                    "excalibur.graph.ram-buffer-mb must be positive, got: " + buffer);
+            }
+            this.ramBufferMb = buffer;
+        }
+
+        private static double requireInUnitRange(double value, String name) {
+            if (Double.isNaN(value) || value < 0.0 || value > 1.0) {
+                throw new IllegalArgumentException(
+                    "excalibur.graph." + name + " must be in [0.0, 1.0], got: " + value);
+            }
+            return value;
+        }
+
+        private static int requirePositive(int value, String name) {
+            if (value < 1) {
+                throw new IllegalArgumentException(
+                    "excalibur.graph." + name + " must be at least 1, got: " + value);
+            }
+            return value;
+        }
+
+        /** @return the configured graph directory, or null to use the data directory default */
+        public String getPath() {
+            return path;
+        }
+
+        /** @return smallest fused score a candidate must reach */
+        public double getMinScore() {
+            return minScore;
+        }
+
+        /** @return smallest gap between the best two candidates */
+        public double getMinSeparation() {
+            return minSeparation;
+        }
+
+        /** @return smallest mean confidence across the surviving evidence */
+        public double getMinMeanConfidence() {
+            return minMeanConfidence;
+        }
+
+        /** @return how many candidates are reported back when the answer is ambiguous */
+        public int getMaxAmbiguousCandidates() {
+            return maxAmbiguousCandidates;
+        }
+
+        /** @return tokens of serialised subgraph an answer may carry */
+        public int getContextTokenBudget() {
+            return contextTokenBudget;
+        }
+
+        /** @return documents each retrieval signal contributes before fusion */
+        public int getTopK() {
+            return topK;
+        }
+
+        /** @return Lucene RAM buffer in megabytes */
+        public List<String> getSingleValuedRelations() {
+            return singleValuedRelations;
+        }
+
+        /**
+         * Whether ingestion should extract facts from the documents it publishes.
+         *
+         * @return true when the graph is built from ingested documents
+         */
+        public boolean isEntityVectorsEnabled() {
+            return entityVectorsEnabled;
+        }
+
+        /**
+         * How many namespaces' graphs stay open at once.
+         *
+         * @return The bound
+         */
+        public int getMaxOpenNamespaces() {
+            return maxOpenNamespaces;
+        }
+
+        /**
+         * Tombstoned fraction of the store at which an erasure compaction becomes worthwhile.
+         *
+         * @return The ratio, in [0, 1]
+         */
+        public double getErasureTombstoneRatio() {
+            return erasureTombstoneRatio;
+        }
+
+        /**
+         * Longest an erasure obligation may wait before a compaction runs regardless.
+         *
+         * @return The bound in seconds
+         */
+        public long getErasureMaxLatencySeconds() {
+            return erasureMaxLatencySeconds;
+        }
+
+        /**
+         * Tombstoned fraction of the store at which an erasure compaction becomes worthwhile.
+         *
+         * @return The ratio, in [0, 1]
+         */
+        public boolean isExtractionEnabled() {
+            return extractionEnabled;
+        }
+
+        /**
+         * The version recorded on every fact this node extracts.
+         *
+         * @return The extractor version
+         */
+        public int getExtractorVersion() {
+            return extractorVersion;
+        }
+
+        public double getRamBufferMb() {
+            return ramBufferMb;
+        }
+
+        @Override
+        public String toString() {
+            return "Graph{path=" + (path != null ? path : "<data dir>/graph")
+                + ", minScore=" + minScore
+                + ", minSeparation=" + minSeparation
+                + ", minMeanConfidence=" + minMeanConfidence
+                + ", maxAmbiguousCandidates=" + maxAmbiguousCandidates
+                + ", contextTokenBudget=" + contextTokenBudget
+                + ", topK=" + topK + "}";
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            Graph other = (Graph) o;
+            return Double.compare(minScore, other.minScore) == 0
+                && Double.compare(minSeparation, other.minSeparation) == 0
+                && Double.compare(minMeanConfidence, other.minMeanConfidence) == 0
+                && maxAmbiguousCandidates == other.maxAmbiguousCandidates
+                && contextTokenBudget == other.contextTokenBudget
+                && topK == other.topK
+                && Double.compare(ramBufferMb, other.ramBufferMb) == 0
+                && Objects.equals(path, other.path);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(path, minScore, minSeparation, minMeanConfidence,
+                maxAmbiguousCandidates, contextTokenBudget, topK, ramBufferMb);
+        }
     }
 }

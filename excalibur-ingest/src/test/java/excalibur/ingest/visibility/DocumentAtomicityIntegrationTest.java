@@ -42,7 +42,7 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testDocumentNotVisibleBeforeRegistration() {
-        Set<String> chunkIds = Set.of("doc1:0", "doc1:1", "doc1:2");
+        Set<String> chunkIds = Set.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2");
         long queryEpoch = 10L;
 
         assertFalse(registry.isVisibleAt("doc1", queryEpoch));
@@ -51,7 +51,7 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testDocumentVisibleAfterRegistration() {
-        Set<String> chunkIds = Set.of("doc1:0", "doc1:1", "doc1:2");
+        Set<String> chunkIds = Set.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2");
         long visibleEpoch = 5L;
         
         registry.registerDocument("doc1", chunkIds, visibleEpoch);
@@ -65,22 +65,22 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testChunkVisibilityFollowsDocumentVisibility() {
-        Set<String> chunkIds = Set.of("doc1:0", "doc1:1", "doc1:2");
+        Set<String> chunkIds = Set.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2");
         long visibleEpoch = 10L;
         
         registry.registerDocument("doc1", chunkIds, visibleEpoch);
 
-        assertTrue(registry.isChunkVisibleAt("doc1:0", 10L));
-        assertTrue(registry.isChunkVisibleAt("doc1:1", 10L));
-        assertTrue(registry.isChunkVisibleAt("doc1:2", 10L));
-        assertFalse(registry.isChunkVisibleAt("doc1:0", 9L));
+        assertTrue(registry.isChunkVisibleAt("doc1:chunk:0", 10L));
+        assertTrue(registry.isChunkVisibleAt("doc1:chunk:1", 10L));
+        assertTrue(registry.isChunkVisibleAt("doc1:chunk:2", 10L));
+        assertFalse(registry.isChunkVisibleAt("doc1:chunk:0", 9L));
     }
 
     @Test
     void testFilterVisibleChunks() {
-        Set<String> doc1Chunks = Set.of("doc1:0", "doc1:1");
-        Set<String> doc2Chunks = Set.of("doc2:0", "doc2:1", "doc2:2");
-        Set<String> doc3Chunks = Set.of("doc3:0");
+        Set<String> doc1Chunks = Set.of("doc1:chunk:0", "doc1:chunk:1");
+        Set<String> doc2Chunks = Set.of("doc2:chunk:0", "doc2:chunk:1", "doc2:chunk:2");
+        Set<String> doc3Chunks = Set.of("doc3:chunk:0");
 
         registry.registerDocument("doc1", doc1Chunks, 5L);
         registry.registerDocument("doc2", doc2Chunks, 10L);
@@ -99,12 +99,12 @@ class DocumentAtomicityIntegrationTest {
         assertEquals(5, visibleAtEpoch10.size());
         assertTrue(visibleAtEpoch10.containsAll(doc1Chunks));
         assertTrue(visibleAtEpoch10.containsAll(doc2Chunks));
-        assertFalse(visibleAtEpoch10.contains("doc3:0"));
+        assertFalse(visibleAtEpoch10.contains("doc3:chunk:0"));
     }
 
     @Test
     void testTombstoneRemovesVisibility() {
-        Set<String> chunkIds = Set.of("doc1:0", "doc1:1");
+        Set<String> chunkIds = Set.of("doc1:chunk:0", "doc1:chunk:1");
         long visibleEpoch = 5L;
         
         registry.registerDocument("doc1", chunkIds, visibleEpoch);
@@ -114,13 +114,13 @@ class DocumentAtomicityIntegrationTest {
         assertTrue(removed);
         
         assertFalse(registry.isVisibleAt("doc1", 10L));
-        assertFalse(registry.isChunkVisibleAt("doc1:0", 10L));
+        assertFalse(registry.isChunkVisibleAt("doc1:chunk:0", 10L));
     }
 
     @Test
     void testReplaceDocumentAtomically() {
-        Set<String> oldChunks = Set.of("doc1:0", "doc1:1");
-        Set<String> newChunks = Set.of("doc1:0", "doc1:1", "doc1:2");
+        Set<String> oldChunks = Set.of("doc1:chunk:0", "doc1:chunk:1");
+        Set<String> newChunks = Set.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2");
         
         registry.registerDocument("doc1", oldChunks, 5L);
         
@@ -137,8 +137,8 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testNoPartialDocumentsInResults() {
-        Set<String> doc1Chunks = Set.of("doc1:0", "doc1:1", "doc1:2");
-        Set<String> doc2Chunks = Set.of("doc2:0", "doc2:1");
+        Set<String> doc1Chunks = Set.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2");
+        Set<String> doc2Chunks = Set.of("doc2:chunk:0", "doc2:chunk:1");
         
         registry.registerDocument("doc1", doc1Chunks, 5L);
 
@@ -149,14 +149,14 @@ class DocumentAtomicityIntegrationTest {
         Set<String> filtered = registry.filterVisibleChunks(allChunks, 10L);
 
         assertTrue(filtered.containsAll(doc1Chunks));
-        assertFalse(filtered.contains("doc2:0"));
-        assertFalse(filtered.contains("doc2:1"));
+        assertFalse(filtered.contains("doc2:chunk:0"));
+        assertFalse(filtered.contains("doc2:chunk:1"));
     }
 
     @Test
     void testEpochIsolation() {
-        Set<String> doc1Chunks = Set.of("doc1:0", "doc1:1");
-        Set<String> doc2Chunks = Set.of("doc2:0", "doc2:1");
+        Set<String> doc1Chunks = Set.of("doc1:chunk:0", "doc1:chunk:1");
+        Set<String> doc2Chunks = Set.of("doc2:chunk:0", "doc2:chunk:1");
         
         registry.registerDocument("doc1", doc1Chunks, 5L);
 
@@ -174,7 +174,7 @@ class DocumentAtomicityIntegrationTest {
         );
         assertEquals(2, chunksAtEpoch5After.size());
         assertTrue(chunksAtEpoch5After.containsAll(doc1Chunks));
-        assertFalse(chunksAtEpoch5After.contains("doc2:0"));
+        assertFalse(chunksAtEpoch5After.contains("doc2:chunk:0"));
 
         Set<String> chunksAtEpoch10 = registry.filterVisibleChunks(
             new HashSet<>() {{ addAll(doc1Chunks); addAll(doc2Chunks); }},
@@ -216,10 +216,10 @@ class DocumentAtomicityIntegrationTest {
     void testDocumentCountTracking() {
         assertEquals(0, registry.getDocumentCount());
         
-        registry.registerDocument("doc1", Set.of("doc1:0"), 1L);
+        registry.registerDocument("doc1", Set.of("doc1:chunk:0"), 1L);
         assertEquals(1, registry.getDocumentCount());
         
-        registry.registerDocument("doc2", Set.of("doc2:0", "doc2:1"), 2L);
+        registry.registerDocument("doc2", Set.of("doc2:chunk:0", "doc2:chunk:1"), 2L);
         assertEquals(2, registry.getDocumentCount());
         
         registry.tombstoneDocument("doc1");
@@ -230,10 +230,10 @@ class DocumentAtomicityIntegrationTest {
     void testChunkCountTracking() {
         assertEquals(0, registry.getTotalChunkCount());
         
-        registry.registerDocument("doc1", Set.of("doc1:0", "doc1:1"), 1L);
+        registry.registerDocument("doc1", Set.of("doc1:chunk:0", "doc1:chunk:1"), 1L);
         assertEquals(2, registry.getTotalChunkCount());
         
-        registry.registerDocument("doc2", Set.of("doc2:0", "doc2:1", "doc2:2"), 2L);
+        registry.registerDocument("doc2", Set.of("doc2:chunk:0", "doc2:chunk:1", "doc2:chunk:2"), 2L);
         assertEquals(5, registry.getTotalChunkCount());
         
         registry.tombstoneDocument("doc1");
@@ -242,9 +242,9 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testStatistics() {
-        registry.registerDocument("doc1", Set.of("doc1:0", "doc1:1"), 1L);
-        registry.registerDocument("doc2", Set.of("doc2:0", "doc2:1", "doc2:2"), 2L);
-        registry.registerDocument("doc3", Set.of("doc3:0"), 3L);
+        registry.registerDocument("doc1", Set.of("doc1:chunk:0", "doc1:chunk:1"), 1L);
+        registry.registerDocument("doc2", Set.of("doc2:chunk:0", "doc2:chunk:1", "doc2:chunk:2"), 2L);
+        registry.registerDocument("doc3", Set.of("doc3:chunk:0"), 3L);
 
         DocumentVisibilityRegistry.VisibilityStats stats = registry.getStats();
         
@@ -255,8 +255,8 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testClearRegistry() {
-        registry.registerDocument("doc1", Set.of("doc1:0"), 1L);
-        registry.registerDocument("doc2", Set.of("doc2:0"), 2L);
+        registry.registerDocument("doc1", Set.of("doc1:chunk:0"), 1L);
+        registry.registerDocument("doc2", Set.of("doc2:chunk:0"), 2L);
         
         assertEquals(2, registry.getDocumentCount());
         
@@ -270,17 +270,17 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testGetDocumentForChunk() {
-        registry.registerDocument("doc1", Set.of("doc1:0", "doc1:1", "doc1:2"), 1L);
+        registry.registerDocument("doc1", Set.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"), 1L);
 
-        assertEquals("doc1", registry.getDocumentForChunk("doc1:0"));
-        assertEquals("doc1", registry.getDocumentForChunk("doc1:1"));
-        assertEquals("doc1", registry.getDocumentForChunk("doc1:2"));
-        assertNull(registry.getDocumentForChunk("doc2:0"));
+        assertEquals("doc1", registry.getDocumentForChunk("doc1:chunk:0"));
+        assertEquals("doc1", registry.getDocumentForChunk("doc1:chunk:1"));
+        assertEquals("doc1", registry.getDocumentForChunk("doc1:chunk:2"));
+        assertNull(registry.getDocumentForChunk("doc2:chunk:0"));
     }
 
     @Test
     void testGetChunksForDocument() {
-        Set<String> originalChunks = Set.of("doc1:0", "doc1:1", "doc1:2");
+        Set<String> originalChunks = Set.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2");
         registry.registerDocument("doc1", originalChunks, 1L);
 
         Set<String> retrieved = registry.getChunksForDocument("doc1");
@@ -320,7 +320,7 @@ class DocumentAtomicityIntegrationTest {
     void testTrackerWithRegistry() {
         AtomicDocumentBatch batch = new AtomicDocumentBatch(
             "doc1", 0L, 100L, 
-            List.of("doc1:0", "doc1:1", "doc1:2"),
+            List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"),
             List.of(1L, 2L, 3L)
         );
         
@@ -330,38 +330,38 @@ class DocumentAtomicityIntegrationTest {
         assertTrue(tracker.isDocumentFullyVisible("doc1", 10L));
         assertFalse(tracker.isDocumentFullyVisible("doc1", 4L));
         
-        assertTrue(tracker.isChunkVisible("doc1:0", 5L));
-        assertTrue(tracker.isChunkVisible("doc1:1", 5L));
-        assertTrue(tracker.isChunkVisible("doc1:2", 5L));
+        assertTrue(tracker.isChunkVisible("doc1:chunk:0", 5L));
+        assertTrue(tracker.isChunkVisible("doc1:chunk:1", 5L));
+        assertTrue(tracker.isChunkVisible("doc1:chunk:2", 5L));
     }
 
     @Test
     void testTrackerFilterPartialDocuments() {
         AtomicDocumentBatch batch1 = new AtomicDocumentBatch(
             "doc1", 0L, 100L, 
-            List.of("doc1:0", "doc1:1"),
+            List.of("doc1:chunk:0", "doc1:chunk:1"),
             List.of(1L, 2L)
         );
         
         tracker.registerAtomicDocument(batch1, 5L);
         
         List<String> chunks = new ArrayList<>();
-        chunks.add("doc1:0");
-        chunks.add("doc1:1");
-        chunks.add("doc2:0");
+        chunks.add("doc1:chunk:0");
+        chunks.add("doc1:chunk:1");
+        chunks.add("doc2:chunk:0");
         
         List<String> filtered = tracker.filterPartialDocuments(chunks, 5L);
         
         assertEquals(2, filtered.size());
-        assertTrue(filtered.contains("doc1:0"));
-        assertTrue(filtered.contains("doc1:1"));
-        assertFalse(filtered.contains("doc2:0"));
+        assertTrue(filtered.contains("doc1:chunk:0"));
+        assertTrue(filtered.contains("doc1:chunk:1"));
+        assertFalse(filtered.contains("doc2:chunk:0"));
     }
 
     @Test
     void testAllChunksVisibleAtSameEpoch() {
         String docId = "atomicDoc";
-        List<String> chunkIds = List.of(docId + ":0", docId + ":1", docId + ":2", docId + ":3");
+        List<String> chunkIds = List.of(docId + ":chunk:0", docId + ":chunk:1", docId + ":chunk:2", docId + ":chunk:3");
         
         AtomicDocumentBatch batch = new AtomicDocumentBatch(
             docId, 0L, 1000L, chunkIds, List.of(1L, 2L, 3L, 4L)

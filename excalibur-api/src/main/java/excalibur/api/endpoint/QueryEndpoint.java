@@ -1,19 +1,22 @@
 package excalibur.api.endpoint;
 
+import excalibur.api.protocol.RequestBody;
+
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import excalibur.query.*;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.executor.QueryRegistry;
 import excalibur.query.pipeline.QueryPipeline;
+import excalibur.api.protocol.JsonText;
+import excalibur.api.protocol.ResponseBody;
+import excalibur.api.security.ApiSecurityConfig;
 import io.excalibur.config.Config;
 import io.excalibur.core.logging.StructuredLoggingHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
@@ -25,10 +28,16 @@ import java.util.concurrent.*;
  * search with timeout and cancellation support.</p>
  *
  * <h2>Request Format</h2>
+ *
+ * <p>Clients submit raw query text. The server embeds it using the same model
+ * configured for ingestion (see {@code excalibur.llm.embedding-model}). This is
+ * the only supported input: a client-supplied vector cannot be validated against
+ * the server's ingestion embedding space, so accepting one would silently produce
+ * wrong results if the client used a different model.</p>
+ *
  * <pre>{@code
  * {
  *   "query": "search query text",
- *   "vector": [0.1, 0.2, ...],
  *   "top_k": 10,
  *   "threshold": 0.5,
  *   "timeout_ms": 5000,
@@ -41,7 +50,7 @@ import java.util.concurrent.*;
  * <pre>{@code
  * {
  *   "results": [
- *     {"document_id": 123, "score": 0.95, "payload": "..."}
+ *     {"document_id": "my-docs:guide.md:chunk:2", "score": 0.950000, "segment_id": 3}
  *   ],
  *   "coverage": {
  *     "total_segments": 1024,
@@ -82,12 +91,27 @@ public class QueryEndpoint implements HttpHandler {
     /**
      * Maximum request body size in bytes.
      */
-    private static final int MAX_REQUEST_SIZE = 1024 * 1024; // 1MB
 
     private final QueryPipeline queryPipeline;
     private final ExecutorService executorService;
     private final Config config;
     private final QueryRegistry queryRegistry;
+
+    /**
+     * Bounds on client-supplied request values. {@code top_k} sizes priority queues
+     * and result arrays inside the pipeline, and {@code timeout_ms} decides how long
+     * one request may hold server resources, so both are bounded at the boundary
+     * rather than wherever they happen to be consumed.
+     */
+    private final ApiSecurityConfig limits;
+
+    /**
+     * Optional embedding client for server-side embedding generation.
+     * When configured, clients can submit raw query text and the server
+     * generates the embedding using the same model that was used for ingestion.
+     * When null, clients must submit a pre-computed vector.
+     */
+    private final excalibur.llm.embedding.EmbeddingClient embeddingClient;
 
     /**
      * Creates a new QueryEndpoint.
@@ -138,10 +162,50 @@ public class QueryEndpoint implements HttpHandler {
      * @param queryRegistry The query registry for cancellation support (may be null)
      */
     public QueryEndpoint(QueryPipeline queryPipeline, Config config, ExecutorService executorService, QueryRegistry queryRegistry) {
+        this(queryPipeline, config, executorService, queryRegistry, null);
+    }
+
+    /**
+     * Creates a new QueryEndpoint with full configuration including server-side
+     * embedding generation.
+     *
+     * <p>When {@code embeddingClient} is non-null, clients may submit a raw
+     * {@code query} text field and the server will generate the embedding vector
+     * using the configured embedding model. This ensures the query embedding is
+     * consistent with the ingestion embedding.</p>
+     *
+     * @param queryPipeline The query pipeline for executing queries
+     * @param config The configuration for default values (may be null)
+     * @param executorService The executor service for async operations (may be null)
+     * @param queryRegistry The query registry for cancellation support (may be null)
+     * @param embeddingClient Optional embedding client for server-side embedding generation (may be null)
+     */
+    public QueryEndpoint(QueryPipeline queryPipeline, Config config, ExecutorService executorService,
+                         QueryRegistry queryRegistry, excalibur.llm.embedding.EmbeddingClient embeddingClient) {
+        this(queryPipeline, config, executorService, queryRegistry, embeddingClient,
+            ApiSecurityConfig.defaults());
+    }
+
+    /**
+     * Creates a new QueryEndpoint with explicit request bounds.
+     *
+     * @param queryPipeline The query pipeline for executing queries
+     * @param config The configuration for default values (may be null)
+     * @param executorService The executor service for async operations (may be null)
+     * @param queryRegistry The query registry for cancellation support (may be null)
+     * @param embeddingClient Optional embedding client for server-side embedding generation
+     * @param limits Bounds applied to client-supplied request values
+     * @throws NullPointerException if queryPipeline or limits is null
+     */
+    public QueryEndpoint(QueryPipeline queryPipeline, Config config, ExecutorService executorService,
+                         QueryRegistry queryRegistry, excalibur.llm.embedding.EmbeddingClient embeddingClient,
+                         ApiSecurityConfig limits) {
         this.queryPipeline = Objects.requireNonNull(queryPipeline, "QueryPipeline cannot be null");
         this.config = config;
         this.executorService = executorService != null ? executorService : Executors.newVirtualThreadPerTaskExecutor();
         this.queryRegistry = queryRegistry;
+        this.embeddingClient = embeddingClient;
+        this.limits = Objects.requireNonNull(limits, "limits cannot be null");
         // Initialize default timeout from config visibility settings, fallback to 30 seconds
         this.defaultTimeoutMs = config != null
             ? config.visibility().getQueryTimeoutMs()
@@ -168,12 +232,14 @@ public class QueryEndpoint implements HttpHandler {
                 .build()) {
 
             try {
-                // Parse request body
+                // Parse and validate the request body. No network call happens here:
+                // embedding is a blocking call and must be paid for out of the
+                // request's own timeout budget, not before the clock starts.
                 String requestBody = readRequestBody(exchange);
-                QueryRequest request = parseRequest(requestBody, correlationId);
+                ParsedQuery parsed = parseRequest(requestBody);
 
                 LOGGER.debug("Processing query: topK={}, timeout={}ms",
-                    request.topK(), request.timeoutMs());
+                    parsed.topK(), parsed.timeoutMs());
 
                 // Create cancellation token
                 CancellationToken token = new CancellationToken();
@@ -183,14 +249,22 @@ public class QueryEndpoint implements HttpHandler {
                     queryRegistry.register(queryId, token, correlationId);
                 }
 
-                // Execute query with timeout
-                CompletableFuture<QueryResponse> future = queryPipeline.execute(request, token);
-
-                // Wait for completion
                 QueryResponse response;
                 try {
-                    response = future.get(request.timeoutMs(), TimeUnit.MILLISECONDS);
-                    // Add queryId to response
+                    long deadlineNanos = startTime + TimeUnit.MILLISECONDS.toNanos(parsed.timeoutMs());
+
+                    float[] vector = embedWithinBudget(parsed.query(), correlationId, deadlineNanos);
+                    if (vector == null) {
+                        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+                        LOGGER.warn("Query embedding timed out after {}ms", durationMs);
+                        sendResponse(exchange, 200, buildTimeoutResponse(queryId, durationMs));
+                        return;
+                    }
+
+                    QueryRequest request = parsed.toRequest(vector, correlationId);
+                    CompletableFuture<QueryResponse> future = queryPipeline.execute(request, token);
+
+                    response = future.get(remainingMillis(deadlineNanos), TimeUnit.MILLISECONDS);
                     response = response.withQueryId(queryId);
                 } catch (TimeoutException e) {
                     // Cancel the token to propagate cancellation
@@ -202,10 +276,21 @@ public class QueryEndpoint implements HttpHandler {
                     long durationMs = (System.nanoTime() - startTime) / 1_000_000;
                     LOGGER.info("Query cancelled after {}ms", durationMs);
                     response = buildCancelledResponse(queryId, durationMs);
+                } catch (InterruptedException e) {
+                    // Restore the flag: swallowing it leaves the carrier thread unable
+                    // to observe the shutdown that interrupted it.
+                    Thread.currentThread().interrupt();
+                    token.cancel("Query interrupted");
+                    LOGGER.warn("Query interrupted");
+                    sendError(exchange, 503, "Query interrupted");
+                    return;
                 } catch (ExecutionException e) {
-                    long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-                    LOGGER.error("Query failed: {}", e.getCause().getMessage());
-                    response = buildErrorResponse(queryId, durationMs, e.getCause().getMessage());
+                    // A failed query is a failure. Reporting it as 200 with an empty
+                    // result list is indistinguishable from "nothing matched".
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    LOGGER.error("Query failed: {}", cause.getMessage(), cause);
+                    sendError(exchange, 500, "Query execution failed");
+                    return;
                 } finally {
                     // Unregister query when complete
                     if (queryRegistry != null) {
@@ -220,6 +305,13 @@ public class QueryEndpoint implements HttpHandler {
                 LOGGER.warn("Invalid request: {}", e.getMessage());
                 sendError(exchange, 400, "Bad Request: " + e.getMessage());
 
+            } catch (IllegalStateException e) {
+                // The server cannot embed queries (no embedding client configured).
+                // That is a deployment gap, not a client error and not an internal
+                // fault, so it is reported as such instead of a bare 500.
+                LOGGER.error("Query endpoint is not ready: {}", e.getMessage());
+                sendError(exchange, 503, "Query service is not available");
+
             } catch (Exception e) {
                 LOGGER.error("Internal error: {}", e.getMessage(), e);
                 sendError(exchange, 500, "Internal Server Error");
@@ -232,74 +324,84 @@ public class QueryEndpoint implements HttpHandler {
      * Reads the request body from the HTTP exchange.
      */
     private String readRequestBody(HttpExchange exchange) throws IOException {
-        try (InputStream is = exchange.getRequestBody()) {
-            byte[] bytes = is.readNBytes(MAX_REQUEST_SIZE + 1);
-            if (bytes.length > MAX_REQUEST_SIZE) {
-                throw new IllegalArgumentException("Request body too large (max " + MAX_REQUEST_SIZE + " bytes)");
-            }
-            return new String(bytes, StandardCharsets.UTF_8);
-        }
+        return RequestBody.read(exchange);
     }
 
     /**
-     * Parses the JSON request body into a QueryRequest.
+     * Parses and validates the JSON request body.
      *
-     * <p>This is a minimal JSON parser - production code would use
-     * a proper JSON library.</p>
-     *
-     * <p><strong>Domain Correctness:</strong> Validates that:</p>
+     * <p><strong>Domain Correctness:</strong> validates that:</p>
      * <ul>
-     *   <li>Vector is non-null and non-empty</li>
-     *   <li>All vector values are finite (not NaN or Infinity)</li>
-     *   <li>topK is positive</li>
-     *   <li>threshold is in [0.0, 1.0]</li>
-     *   <li>timeoutMs is positive</li>
+     *   <li>{@code query} is present and non-empty - the server embeds it with the
+     *       same model ingestion used, so a client-supplied vector is not accepted</li>
+     *   <li>{@code top_k} is positive and within the configured maximum</li>
+     *   <li>{@code threshold} and {@code llm_threshold} are in [0.0, 1.0]</li>
+     *   <li>{@code timeout_ms} is positive and within the configured maximum</li>
+     *   <li>{@code oversampling_factor} is at least 1</li>
+     *   <li>{@code recall_target} is in [0.0, 1.0]</li>
      * </ul>
+     *
+     * @param json The request body
+     * @return The validated request fields
+     * @throws IllegalArgumentException if any field is missing or out of range
+     * @throws IllegalStateException if the server cannot embed query text
      */
-    private QueryRequest parseRequest(String json, String correlationId) {
-        // Simple JSON parsing (in production, use a proper JSON parser)
-        String query = extractString(json, "query");
-        float[] vector = extractFloatArray(json, "vector");
+    private ParsedQuery parseRequest(String json) {
+        String query = JsonText.string(json, "query");
 
         // Use config default for top_k if config is provided, otherwise fallback to 10
         int defaultTopK = config != null ? config.query().getDefaultTopK() : 10;
-        int topK = extractInt(json, "top_k", defaultTopK);
+        int topK = JsonText.integer(json, "top_k", defaultTopK);
 
-        float threshold = extractFloat(json, "threshold", 0.0f);
-        long timeoutMs = extractLong(json, "timeout_ms", defaultTimeoutMs);
+        float threshold = JsonText.floatValue(json, "threshold", 0.0f);
+        long timeoutMs = JsonText.longValue(json, "timeout_ms", defaultTimeoutMs);
 
         // Use config default for include_partial_segments if config is provided
         boolean defaultIncludePartial = config != null
             ? config.query().isIncludePartialSegments()
             : true;
-        boolean includePartial = extractBoolean(json, "include_partial_segments", defaultIncludePartial);
+        boolean includePartial = JsonText.booleanValue(json, "include_partial_segments", defaultIncludePartial);
 
-        boolean enableLlmScoring = extractBoolean(json, "enable_llm_scoring", true);
+        boolean enableLlmScoring = JsonText.booleanValue(json, "enable_llm_scoring", true);
 
         // Use config default for llm_threshold if config is provided
         float defaultLlmThreshold = config != null
             ? (float) config.llm().getRelevancyThreshold()
             : 0.3f;
-        float llmThreshold = extractFloat(json, "llm_threshold", defaultLlmThreshold);
+        float llmThreshold = JsonText.floatValue(json, "llm_threshold", defaultLlmThreshold);
 
         // Parse oversampling_factor with default from QueryOptions
-        int oversamplingFactor = extractInt(json, "oversampling_factor", QueryOptions.DEFAULT_OVERSAMPLING_FACTOR);
+        int oversamplingFactor = JsonText.integer(json, "oversampling_factor",
+            QueryOptions.DEFAULT_OVERSAMPLING_FACTOR);
 
         // Use config default for recall_target if config is provided
         double defaultRecallTarget = config != null ? config.query().getRecallTarget() : 0.95;
-        double recallTarget = extractDouble(json, "recall_target", defaultRecallTarget);
+        double recallTarget = JsonText.doubleValue(json, "recall_target", defaultRecallTarget);
 
-        // Domain correctness validation
-        if (vector == null || vector.length == 0) {
-            throw new IllegalArgumentException("Field 'vector' is required and must be non-empty");
+        // 'query' text is required. The server embeds it using the SAME model
+        // that ingestion uses, guaranteeing the query vector lives in the same
+        // embedding space as the indexed vectors. Accepting a pre-computed vector
+        // from clients is NOT supported: the client cannot guarantee their vector
+        // matches the server's ingestion embedding model, and a mismatch produces
+        // silently wrong results. Embedding is a server invariant.
+        if (query == null || query.isEmpty()) {
+            throw new IllegalArgumentException("Field 'query' is required and must be non-empty");
+        }
+        if (embeddingClient == null) {
+            throw new IllegalStateException(
+                "Server is not configured for text queries: no embedding client is available. " +
+                "Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) so the server can embed queries " +
+                "with the same model that ingestion uses.");
         }
 
-        // Validate all vector values are finite
-        validateVectorValues(vector);
-
-        // Validate topK
+        // Validate topK. This value sizes priority queues and result buffers inside
+        // the pipeline, so an unbounded value is an allocation the caller controls.
         if (topK <= 0) {
             throw new IllegalArgumentException("Field 'top_k' must be positive: " + topK);
+        }
+        if (topK > limits.maxTopK()) {
+            throw new IllegalArgumentException(
+                "Field 'top_k' must be at most " + limits.maxTopK() + ": " + topK);
         }
 
         // Validate threshold
@@ -310,6 +412,10 @@ public class QueryEndpoint implements HttpHandler {
         // Validate timeoutMs
         if (timeoutMs <= 0) {
             throw new IllegalArgumentException("Field 'timeout_ms' must be positive: " + timeoutMs);
+        }
+        if (timeoutMs > limits.maxQueryTimeoutMs()) {
+            throw new IllegalArgumentException(
+                "Field 'timeout_ms' must be at most " + limits.maxQueryTimeoutMs() + ": " + timeoutMs);
         }
 
         // Validate llmThreshold
@@ -327,19 +433,51 @@ public class QueryEndpoint implements HttpHandler {
             throw new IllegalArgumentException("Field 'recall_target' must be in range [0.0, 1.0]: " + recallTarget);
         }
 
-        return QueryRequest.builder()
-            .queryText(query)
-            .queryVector(vector)
-            .topK(topK)
-            .recallTarget(recallTarget)
-            .threshold(threshold)
-            .timeoutMs(timeoutMs)
-            .includePartialSegments(includePartial)
-            .enableLlmScoring(enableLlmScoring)
-            .llmThreshold(llmThreshold)
-            .oversamplingFactor(oversamplingFactor)
-            .correlationId(correlationId)
-            .build();
+        return new ParsedQuery(query, topK, recallTarget, threshold, timeoutMs,
+            includePartial, enableLlmScoring, llmThreshold, oversamplingFactor);
+    }
+
+    /**
+     * Generates the query embedding without exceeding the request's deadline.
+     *
+     * <p>Embedding is an outbound network call. Running it on the handler thread
+     * before the timeout starts lets a slow or hanging embedding provider pin the
+     * request for as long as its own client timeout allows, no matter what the
+     * caller asked for.</p>
+     *
+     * @param query         The query text
+     * @param correlationId Correlation ID for the embedding call
+     * @param deadlineNanos {@link System#nanoTime()} value the request must finish by
+     * @return The embedding vector, or null when the deadline passed first
+     * @throws InterruptedException if the calling thread is interrupted
+     * @throws ExecutionException if embedding failed
+     */
+    private float[] embedWithinBudget(String query, String correlationId, long deadlineNanos)
+            throws InterruptedException, ExecutionException {
+        Future<float[]> pending = executorService.submit(() -> embeddingClient.embed(query, correlationId));
+        float[] vector;
+        try {
+            vector = pending.get(remainingMillis(deadlineNanos), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            pending.cancel(true);
+            return null;
+        }
+        if (vector == null || vector.length == 0) {
+            throw new IllegalStateException("Embedding generation returned an empty vector for query text");
+        }
+        validateVectorValues(vector);
+        return vector;
+    }
+
+    /**
+     * Returns the milliseconds left before a deadline, never less than one.
+     *
+     * @param deadlineNanos {@link System#nanoTime()} value of the deadline
+     * @return Remaining budget in milliseconds
+     */
+    private static long remainingMillis(long deadlineNanos) {
+        long remaining = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+        return Math.max(1L, remaining);
     }
 
     /**
@@ -349,15 +487,17 @@ public class QueryEndpoint implements HttpHandler {
      * meaningful distance computation. NaN and Infinity values produce undefined
      * results in similarity calculations.</p>
      *
+     * <p>The vector always comes from the server's own embedding client, so a
+     * non-finite component is a server-side fault and is reported as one.</p>
+     *
      * @param vector The vector to validate
-     * @throws IllegalArgumentException if any value is NaN or Infinity
+     * @throws IllegalStateException if any value is NaN or Infinity
      */
     private void validateVectorValues(float[] vector) {
         for (int i = 0; i < vector.length; i++) {
             if (!Float.isFinite(vector[i])) {
-                throw new IllegalArgumentException(
-                    "Vector contains non-finite value at index " + i + ": " + vector[i] +
-                    ". All vector values must be finite (not NaN or Infinity).");
+                throw new IllegalStateException(
+                    "Embedding contains non-finite value at index " + i + ": " + vector[i]);
             }
         }
     }
@@ -370,26 +510,18 @@ public class QueryEndpoint implements HttpHandler {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, statusCode, bytes);
     }
 
     /**
      * Sends an error response.
      */
     private void sendError(HttpExchange exchange, int statusCode, String message) throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", escapeJson(message));
+        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, statusCode, bytes);
     }
 
     /**
@@ -401,46 +533,59 @@ public class QueryEndpoint implements HttpHandler {
 
         // Query ID (for cancellation support)
         if (response.queryId() != null) {
-            sb.append(String.format("\"query_id\": \"%s\", ", escapeJson(response.queryId())));
+            sb.append("\"query_id\": \"").append(JsonText.escape(response.queryId())).append("\", ");
         }
 
-        // Results
+        // Results. document_id carries the document's own identifier - the string the
+        // ingestion pipeline assigned - not the HNSW node ID, which is an internal
+        // handle that compaction renumbers and that no client can look anything up by.
         sb.append("\"results\": [");
         for (int i = 0; i < response.results().size(); i++) {
-            if (i > 0) sb.append(",");
+            if (i > 0) {
+                sb.append(",");
+            }
             QueryResultItem item = response.results().get(i);
-            sb.append(String.format(
-                "{\"document_id\": %d, \"score\": %.6f}",
-                item.documentId(), item.score()
-            ));
+            sb.append("{\"document_id\": \"").append(JsonText.escape(documentIdOf(item)))
+                .append("\", \"score\": ").append(JsonText.number(item.score(), 6))
+                .append(", \"segment_id\": ").append(item.segmentId())
+                .append("}");
         }
         sb.append("], ");
 
         // Coverage
         IndexCoverage coverage = response.coverage();
         sb.append("\"coverage\": {");
-        sb.append(String.format(
-            "\"total_segments\": %d, ", coverage.totalSegments()));
-        sb.append(String.format(
-            "\"active_segments\": %d, ", coverage.activeSegments()));
-        sb.append(String.format(
-            "\"indexing_segments\": %d, ", coverage.indexingSegments()));
-        sb.append(String.format(
-            "\"warming_segments\": %d, ", coverage.warmingSegments()));
-        sb.append(String.format(
-            "\"estimated_corpus_coverage\": %.4f, ", coverage.estimatedCorpusCoverage()));
-        sb.append(String.format(
-            "\"tail_scan_entries\": %d, ", coverage.tailScanEntries()));
-        sb.append(String.format(
-            "\"degraded\": %s", coverage.degraded()));
+        sb.append("\"total_segments\": ").append(coverage.totalSegments()).append(", ");
+        sb.append("\"active_segments\": ").append(coverage.activeSegments()).append(", ");
+        sb.append("\"indexing_segments\": ").append(coverage.indexingSegments()).append(", ");
+        sb.append("\"warming_segments\": ").append(coverage.warmingSegments()).append(", ");
+        sb.append("\"estimated_corpus_coverage\": ")
+            .append(JsonText.number(coverage.estimatedCorpusCoverage(), 4)).append(", ");
+        sb.append("\"tail_scan_entries\": ").append(coverage.tailScanEntries()).append(", ");
+        sb.append("\"degraded\": ").append(coverage.degraded());
         sb.append("}, ");
 
         // Query metadata
-        sb.append(String.format("\"timed_out\": %s, ", response.timedOut()));
-        sb.append(String.format("\"query_time_ms\": %d", response.queryTimeMs()));
+        sb.append("\"timed_out\": ").append(response.timedOut()).append(", ");
+        sb.append("\"query_time_ms\": ").append(response.queryTimeMs());
 
         sb.append("}");
         return sb.toString();
+    }
+
+    /**
+     * Returns the identifier a client can use to fetch the document again.
+     *
+     * @param item The result item
+     * @return The string document ID when the pipeline knows one, otherwise the
+     *         numeric ID rendered as a string
+     */
+    private static String documentIdOf(QueryResultItem item) {
+        String documentIdStr = item.documentIdStr();
+        if (documentIdStr != null && !documentIdStr.isEmpty()) {
+            return documentIdStr;
+        }
+        return Long.toString(item.documentId());
     }
 
     /**
@@ -484,172 +629,47 @@ public class QueryEndpoint implements HttpHandler {
     }
 
     /**
-     * Builds an error response.
+     * The validated fields of one query request.
+     *
+     * <p>Holds everything the caller supplied, already range-checked, but not the
+     * embedding: that is produced later, inside the request's timeout budget.</p>
+     *
+     * @param query               Raw query text
+     * @param topK                Number of results requested
+     * @param recallTarget        Target recall
+     * @param threshold           Minimum score
+     * @param timeoutMs           Request budget in milliseconds
+     * @param includePartial      Whether partially indexed segments may contribute
+     * @param enableLlmScoring    Whether Stage 5 LLM scoring runs
+     * @param llmThreshold        Minimum LLM relevancy score
+     * @param oversamplingFactor  Candidate oversampling factor
      */
-    private QueryResponse buildErrorResponse(String queryId, long durationMs, String errorMessage) {
-        IndexCoverage coverage = IndexCoverage.builder()
-            .degraded(true)
-            .estimatedCorpusCoverage(0.0)
-            .computeCoverage()
-            .build();
+    private record ParsedQuery(String query, int topK, double recallTarget, float threshold,
+                               long timeoutMs, boolean includePartial, boolean enableLlmScoring,
+                               float llmThreshold, int oversamplingFactor) {
 
-        return new QueryResponse(
-            queryId,
-            Collections.emptyList(),
-            coverage,
-            durationMs,
-            false,
-            false
-        );
-    }
-
-    // ==================== Minimal JSON Parsing Utilities ====================
-
-    private String extractString(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return null;
-
-        start = json.indexOf("\"", start + pattern.length() + 1);
-        if (start < 0) return null;
-
-        int end = json.indexOf("\"", start + 1);
-        if (end < 0) return null;
-
-        return unescapeJson(json.substring(start + 1, end));
-    }
-
-    private float[] extractFloatArray(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return null;
-
-        start = json.indexOf("[", start);
-        if (start < 0) return null;
-
-        int end = json.indexOf("]", start);
-        if (end < 0) return null;
-
-        String arrayContent = json.substring(start + 1, end).trim();
-        if (arrayContent.isEmpty()) return new float[0];
-
-        String[] parts = arrayContent.split(",");
-        float[] result = new float[parts.length];
-        for (int i = 0; i < parts.length; i++) {
-            result[i] = Float.parseFloat(parts[i].trim());
+        /**
+         * Builds the pipeline request once the embedding is available.
+         *
+         * @param vector        The query embedding
+         * @param correlationId Correlation ID for logging
+         * @return The pipeline request
+         */
+        QueryRequest toRequest(float[] vector, String correlationId) {
+            return QueryRequest.builder()
+                .queryText(query)
+                .queryVector(vector)
+                .topK(topK)
+                .recallTarget(recallTarget)
+                .threshold(threshold)
+                .timeoutMs(timeoutMs)
+                .includePartialSegments(includePartial)
+                .enableLlmScoring(enableLlmScoring)
+                .llmThreshold(llmThreshold)
+                .oversamplingFactor(oversamplingFactor)
+                .correlationId(correlationId)
+                .build();
         }
-        return result;
-    }
-
-    private int extractInt(String json, String field, int defaultValue) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return defaultValue;
-
-        start += pattern.length();
-        while (start < json.length() && (json.charAt(start) == ':' || Character.isWhitespace(json.charAt(start)))) {
-            start++;
-        }
-
-        int end = start;
-        while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) {
-            end++;
-        }
-
-        if (end == start) return defaultValue;
-        return Integer.parseInt(json.substring(start, end));
-    }
-
-    private long extractLong(String json, String field, long defaultValue) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return defaultValue;
-
-        start += pattern.length();
-        while (start < json.length() && (json.charAt(start) == ':' || Character.isWhitespace(json.charAt(start)))) {
-            start++;
-        }
-
-        int end = start;
-        while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) {
-            end++;
-        }
-
-        if (end == start) return defaultValue;
-        return Long.parseLong(json.substring(start, end));
-    }
-
-    private float extractFloat(String json, String field, float defaultValue) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return defaultValue;
-
-        start += pattern.length();
-        while (start < json.length() && (json.charAt(start) == ':' || Character.isWhitespace(json.charAt(start)))) {
-            start++;
-        }
-
-        int end = start;
-        while (end < json.length() && (Character.isDigit(json.charAt(end)) ||
-            json.charAt(end) == '-' || json.charAt(end) == '.' || json.charAt(end) == 'e' || json.charAt(end) == 'E')) {
-            end++;
-        }
-
-        if (end == start) return defaultValue;
-        return Float.parseFloat(json.substring(start, end));
-    }
-
-    private double extractDouble(String json, String field, double defaultValue) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return defaultValue;
-
-        start += pattern.length();
-        while (start < json.length() && (json.charAt(start) == ':' || Character.isWhitespace(json.charAt(start)))) {
-            start++;
-        }
-
-        int end = start;
-        while (end < json.length() && (Character.isDigit(json.charAt(end)) ||
-            json.charAt(end) == '-' || json.charAt(end) == '.' || json.charAt(end) == 'e' || json.charAt(end) == 'E')) {
-            end++;
-        }
-
-        if (end == start) return defaultValue;
-        return Double.parseDouble(json.substring(start, end));
-    }
-
-    private boolean extractBoolean(String json, String field, boolean defaultValue) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) return defaultValue;
-
-        start += pattern.length();
-        while (start < json.length() && (json.charAt(start) == ':' || Character.isWhitespace(json.charAt(start)))) {
-            start++;
-        }
-
-        if (json.startsWith("true", start)) return true;
-        if (json.startsWith("false", start)) return false;
-        return defaultValue;
-    }
-
-    private String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t");
-    }
-
-    private String unescapeJson(String s) {
-        if (s == null) return null;
-        return s.replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t");
     }
 
     /**
@@ -667,3 +687,4 @@ public class QueryEndpoint implements HttpHandler {
         }
     }
 }
+

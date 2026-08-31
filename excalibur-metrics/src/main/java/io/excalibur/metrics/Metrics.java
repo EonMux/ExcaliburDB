@@ -5,7 +5,6 @@ import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -199,8 +198,9 @@ public final class Metrics {
     private static final AtomicLong queriesExecuted = new AtomicLong(0);
 
     // Ingestion rate tracking
-    private static final AtomicLong ingestionStartTimestamp = new AtomicLong(System.currentTimeMillis());
+    private static final Object ingestionRateLock = new Object();
     private static volatile long lastRateCalculationTimestamp = System.currentTimeMillis();
+    private static volatile long entriesIngestedAtLastRateCalculation = 0;
     private static volatile double currentIngestionRate = 0.0;
     private static volatile double peakIngestionRate = 0.0;
 
@@ -215,12 +215,27 @@ public final class Metrics {
      * Records an ingestion entry.
      */
     public static void recordIngestEntry() {
-        entriesIngested.incrementAndGet();
+        recordIngestEntries(1);
+    }
+
+    /**
+     * Records a batch of ingested entries.
+     *
+     * <p>One call per document rather than per chunk, so the ingest path pays for a single
+     * notification however many chunks a document produced.</p>
+     *
+     * @param count How many entries were ingested; non-positive is ignored
+     */
+    public static void recordIngestEntries(long count) {
+        if (count <= 0) {
+            return;
+        }
+        long total = entriesIngested.addAndGet(count);
         // Emit notification for ingestion throughput tracking
         ingestionThroughputMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.INGESTION_THROUGHPUT,
-            "Entry ingested: total=" + entriesIngested.get(),
-            entriesIngested.get()
+            "Entries ingested: total=" + total,
+            total
         );
     }
 
@@ -263,17 +278,26 @@ public final class Metrics {
      * Updates the ingestion rate calculation.
      * Should be called periodically to track throughput over time.
      *
-     * <p>Domain correctness: Rate is calculated as entries/second based on
-     * time elapsed since last calculation. Values are non-negative.</p>
+     * <p>Domain correctness: Rate is the number of entries ingested since the
+     * previous call divided by the time elapsed since that call, so it reflects
+     * current throughput rather than a lifetime average and drops to zero while
+     * ingestion is idle. Peak rate is the maximum of those interval rates.
+     * Values are non-negative.</p>
      */
     public static void updateIngestionRate() {
-        long now = System.currentTimeMillis();
-        long elapsed = now - lastRateCalculationTimestamp;
-        if (elapsed > 0) {
-            currentIngestionRate = (entriesIngested.get() * 1000.0) / (now - ingestionStartTimestamp.get());
+        synchronized (ingestionRateLock) {
+            long now = System.currentTimeMillis();
+            long elapsed = now - lastRateCalculationTimestamp;
+            if (elapsed <= 0) {
+                return;
+            }
+            long entries = entriesIngested.get();
+            long ingestedInInterval = entries - entriesIngestedAtLastRateCalculation;
+            currentIngestionRate = (ingestedInInterval * 1000.0) / elapsed;
             if (currentIngestionRate > peakIngestionRate) {
                 peakIngestionRate = currentIngestionRate;
             }
+            entriesIngestedAtLastRateCalculation = entries;
             lastRateCalculationTimestamp = now;
         }
     }
@@ -282,8 +306,27 @@ public final class Metrics {
     // System Health
     // ============================================
 
+    /** Health score at or above which the system counts as healthy and ready. */
+    private static final double HEALTHY_SCORE_THRESHOLD = 0.5;
+
     private static final AtomicReference<Double> healthScore = new AtomicReference<>(0.5);
-    private static final AtomicBoolean isHealthy = new AtomicBoolean(true);
+
+    /**
+     * Clamps a rate or score into [0.0, 1.0], mapping NaN to 0.0.
+     *
+     * <p>{@code Math.max}/{@code Math.min} alone let NaN through, and a NaN published as a
+     * health score or a coverage figure is rejected downstream by the stats endpoint rather
+     * than read as "unknown".</p>
+     *
+     * @param value Raw value
+     * @return Value clamped to the valid domain
+     */
+    private static double clampToUnitInterval(double value) {
+        if (Double.isNaN(value)) {
+            return 0.0;
+        }
+        return Math.max(0.0, Math.min(1.0, value));
+    }
 
     /**
      * Gets the system health score (0.0-1.0).
@@ -298,49 +341,46 @@ public final class Metrics {
      * @param score Health score between 0.0 and 1.0
      */
     public static void setHealthScore(double score) {
-        if (score < 0.0) score = 0.0;
-        if (score > 1.0) score = 1.0;
-        healthScore.set(score);
+        double clamped = clampToUnitInterval(score);
+        healthScore.set(clamped);
         // Emit notification
         systemHealthMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.SYSTEM_HEALTH,
-            "System health score changed: " + score,
-            score
+            "System health score changed: " + clamped,
+            clamped
         );
     }
 
     /**
      * Gets whether the system is healthy.
+     *
+     * <p>Derived from the health score rather than stored separately: a flag with its own
+     * storage can be left behind by a score update, and then the {@code isHealthy} and
+     * {@code ready} attributes of the same MBean contradict each other.</p>
+     *
+     * @return true when the health score is at or above the healthy threshold
      */
     public static boolean isHealthy() {
-        return isHealthy.get();
-    }
-
-    /**
-     * Sets the system health status.
-     *
-     * @param healthy true if system is healthy
-     */
-    public static void setHealthy(boolean healthy) {
-        isHealthy.set(healthy);
+        return getHealthScore() >= HEALTHY_SCORE_THRESHOLD;
     }
 
     /**
      * Updates health based on latency threshold.
      *
+     * <p>The score is {@code 1.0 - latencyMs / thresholdMs} clamped to
+     * [0.0, 1.0], so a query at the latency budget scores 0.0 and an instant
+     * one scores 1.0. {@link #isHealthy()} follows it in both directions.</p>
+     *
      * @param latencyMs Query latency in ms
-     * @param thresholdMs Latency threshold in ms
+     * @param thresholdMs Latency threshold in ms, must be positive
+     * @throws IllegalArgumentException if thresholdMs is not positive
      */
     public static void updateHealth(long latencyMs, long thresholdMs) {
-        double latencyRatio = (double) latencyMs / thresholdMs;
-        double newScore = Math.max(0.0, 1.0 - latencyRatio);
-
-        synchronized (healthScore) {
-            if (newScore < healthScore.get() - 0.01) {
-                isHealthy.set(newScore < 0.5);
-            }
-            healthScore.set(newScore);
+        if (thresholdMs <= 0) {
+            throw new IllegalArgumentException("thresholdMs must be positive, got: " + thresholdMs);
         }
+        double latencyRatio = (double) latencyMs / thresholdMs;
+        healthScore.set(clampToUnitInterval(1.0 - latencyRatio));
     }
 
     // ============================================
@@ -437,6 +477,8 @@ public final class Metrics {
      */
     public static void recordEpoch(long epoch) {
         currentEpoch.set(epoch);
+        // Keep the shared histogram's epoch in step so FP rate samples are stamped correctly
+        FixedBucketHistogram.getInstance().setEpoch(epoch);
         // Emit notification
         visibilityEpochMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.VISIBILITY_EPOCH,
@@ -464,9 +506,7 @@ public final class Metrics {
      * @param coverage Coverage value between 0.0 and 1.0
      */
     public static void setEstimatedCoverage(double coverage) {
-        if (coverage < 0.0) coverage = 0.0;
-        if (coverage > 1.0) coverage = 1.0;
-        estimatedCoverage.set(coverage);
+        estimatedCoverage.set(clampToUnitInterval(coverage));
     }
 
     // ============================================
@@ -492,6 +532,12 @@ public final class Metrics {
     private static final AtomicLong maxTailScanEntries = new AtomicLong(0);
 
     /**
+     * Total number of scanned entries that carried a valid vector.
+     * This accumulates the vectorEntriesFound values from all scans.
+     */
+    private static final AtomicLong totalVectorEntriesFound = new AtomicLong(0);
+
+    /**
      * Records metrics from a tail scan operation.
      *
      * <p>This method should be called by TailScanner.performTailScan() after
@@ -500,6 +546,7 @@ public final class Metrics {
      *   <li>Total number of tail scan operations performed</li>
      *   <li>Total entries scanned across all operations</li>
      *   <li>Maximum entries scanned in a single operation</li>
+     *   <li>Total entries carrying a valid vector across all operations</li>
      * </ul>
      *
      * <p><strong>Domain correctness:</strong> Values should be non-negative.
@@ -516,6 +563,9 @@ public final class Metrics {
 
         // Add to the total entries scanned
         totalTailScanned.addAndGet(entriesScanned);
+
+        // Add to the total entries that carried a valid vector
+        totalVectorEntriesFound.addAndGet(vectorEntriesFound);
 
         // Update max using CAS loop for thread safety without locks
         long currentMax = maxTailScanEntries.get();
@@ -562,11 +612,56 @@ public final class Metrics {
         return totalTailScanCount.get();
     }
 
+    /**
+     * Gets the total number of scanned entries that carried a valid vector.
+     *
+     * <p>Together with {@link #getTotalTailScanned()} this gives the vector hit
+     * ratio of tail scanning.</p>
+     *
+     * @return Total entries with a valid vector across all tail scans
+     */
+    public static long getTotalVectorEntriesFound() {
+        return totalVectorEntriesFound.get();
+    }
+
     // ============================================
     // HNSW Queue Depth
     // ============================================
 
     private static final AtomicLong hnswQueueDepth = new AtomicLong(0);
+
+    /**
+     * Default HNSW integration queue depth limit. Matches the default of
+     * {@code excalibur.shard.hnsw-integration-queue-depth-limit}.
+     */
+    private static final long DEFAULT_HNSW_QUEUE_LIMIT = 100_000;
+
+    private static final AtomicLong hnswQueueLimit = new AtomicLong(DEFAULT_HNSW_QUEUE_LIMIT);
+
+    /**
+     * Gets the HNSW integration queue depth limit that the queue MBeans
+     * evaluate depth against.
+     *
+     * @return Configured queue depth limit
+     */
+    public static long getHnswQueueLimit() {
+        return hnswQueueLimit.get();
+    }
+
+    /**
+     * Sets the HNSW integration queue depth limit.
+     * Callers should pass {@code excalibur.shard.hnsw-integration-queue-depth-limit}
+     * so JMX verdicts match the limit that actually applies backpressure.
+     *
+     * @param limit Queue depth limit, must be positive
+     * @throws IllegalArgumentException if limit is not positive
+     */
+    public static void setHnswQueueLimit(long limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("HNSW queue limit must be positive, got: " + limit);
+        }
+        hnswQueueLimit.set(limit);
+    }
 
     /**
      * Gets the current HNSW queue depth.
@@ -610,16 +705,15 @@ public final class Metrics {
      */
     public static void recordCuckooFpRate(double fpRate) {
         // Clamp to valid range [0.0, 1.0]
-        if (fpRate < 0.0) fpRate = 0.0;
-        if (fpRate > 1.0) fpRate = 1.0;
+        double clamped = clampToUnitInterval(fpRate);
 
-        FixedBucketHistogram.getInstance().recordFpRate(fpRate);
+        FixedBucketHistogram.getInstance().recordFpRate(clamped, getCurrentEpoch());
 
         // Emit notification for JMX listeners
         cuckooFpRateMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.CUCKOO_FP_RATE,
-            "Cuckoo FP rate recorded: " + fpRate,
-            fpRate
+            "Cuckoo FP rate recorded: " + clamped,
+            clamped
         );
     }
 
@@ -630,6 +724,9 @@ public final class Metrics {
      * @return Percentage of limit
      */
     public static double getHnswQueueDepthPercent(long limit) {
+        if (limit <= 0) {
+            return 0.0;
+        }
         long depth = getHnswQueueDepth();
         double percent = (double) depth / limit * 100.0;
         return Math.max(0.0, Math.min(100.0, percent));
@@ -770,6 +867,7 @@ public final class Metrics {
     public static class QueryLatencyMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
+            this,
             "QueryLatency",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY }
         );
@@ -935,6 +1033,7 @@ public final class Metrics {
     public static class SystemHealthMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
+            this,
             "SystemHealth",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.SYSTEM_HEALTH }
         );
@@ -942,7 +1041,8 @@ public final class Metrics {
         private static final MBeanAttributeInfo[] ATTRIBUTES = {
             new MBeanAttributeInfo("health", "double", "System health score (0.0-1.0)", true, false, false),
             new MBeanAttributeInfo("isHealthy", "boolean", "Whether system is healthy", true, false, false),
-            new MBeanAttributeInfo("ready", "boolean", "Whether system is ready (health >= 0.5)", true, false, false)
+            new MBeanAttributeInfo("ready", "boolean", "Whether system is ready (health >= 0.5)", true, false, false),
+            new MBeanAttributeInfo("coverage", "double", "Estimated corpus coverage (0.0-1.0)", true, false, false)
         };
 
         /**
@@ -988,7 +1088,7 @@ public final class Metrics {
          * @return Set of attribute names
          */
         public Set<String> getAttributes() {
-            return Set.of("health", "isHealthy", "ready");
+            return Set.of("health", "isHealthy", "ready", "coverage");
         }
 
         // ============================================
@@ -1003,7 +1103,9 @@ public final class Metrics {
                 case "isHealthy":
                     return Metrics.isHealthy();
                 case "ready":
-                    return Metrics.getHealthScore() >= 0.5;
+                    return Metrics.getHealthScore() >= HEALTHY_SCORE_THRESHOLD;
+                case "coverage":
+                    return Metrics.getEstimatedCoverage();
                 default:
                     throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
@@ -1080,9 +1182,8 @@ public final class Metrics {
      */
     public static class IngestionQueueMBean implements DynamicMBean, NotificationEmitter {
 
-        private static final long DEFAULT_LIMIT = 1000000;
-
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
+            this,
             "IngestionQueue",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.INGESTION_QUEUE }
         );
@@ -1152,13 +1253,13 @@ public final class Metrics {
                 case "depth":
                     return Metrics.getHnswQueueDepth();
                 case "percent":
-                    return Metrics.getHnswQueueDepthPercent(DEFAULT_LIMIT);
+                    return Metrics.getHnswQueueDepthPercent(Metrics.getHnswQueueLimit());
                 case "isUnderControl":
-                    return Metrics.isHnswUnderControl(DEFAULT_LIMIT);
+                    return Metrics.isHnswUnderControl(Metrics.getHnswQueueLimit());
                 case "isCritical":
-                    return Metrics.isHnswCritical(DEFAULT_LIMIT);
+                    return Metrics.isHnswCritical(Metrics.getHnswQueueLimit());
                 case "isFull":
-                    return Metrics.isHnswFull(DEFAULT_LIMIT);
+                    return Metrics.isHnswFull(Metrics.getHnswQueueLimit());
                 default:
                     throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
@@ -1232,6 +1333,7 @@ public final class Metrics {
     public static class VisibilityEpochMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
+            this,
             "VisibilityEpoch",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.VISIBILITY_EPOCH }
         );
@@ -1372,6 +1474,7 @@ public final class Metrics {
     public static class CuckooFpRateMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
+            this,
             "CuckooFpRate",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.CUCKOO_FP_RATE }
         );
@@ -1450,7 +1553,7 @@ public final class Metrics {
                 case "maxFpRate":
                     return hist.getMaxFpRate();
                 case "currentEpoch":
-                    return hist.getFpRateEpoch();
+                    return hist.getCurrentEpoch();
                 default:
                     throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
@@ -1523,9 +1626,8 @@ public final class Metrics {
      */
     public static class HnswQueueDepthMBean implements DynamicMBean, NotificationEmitter {
 
-        private static final long DEFAULT_LIMIT = 100000;
-
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
+            this,
             "HnswQueueDepth",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.HNSW_QUEUE_DEPTH }
         );
@@ -1538,7 +1640,8 @@ public final class Metrics {
             new MBeanAttributeInfo("isFull", "boolean", "Whether queue is full (> 100%)", true, false, false),
             new MBeanAttributeInfo("averageTailScan", "long", "Average tail scan entries", true, false, false),
             new MBeanAttributeInfo("maxTailScan", "long", "Maximum tail scan entries", true, false, false),
-            new MBeanAttributeInfo("totalTailScanned", "long", "Total tail scan entries", true, false, false)
+            new MBeanAttributeInfo("totalTailScanned", "long", "Total tail scan entries", true, false, false),
+            new MBeanAttributeInfo("totalVectorEntriesFound", "long", "Total tail scan entries with a valid vector", true, false, false)
         };
 
         /**
@@ -1584,7 +1687,7 @@ public final class Metrics {
          * @return Set of attribute names
          */
         public Set<String> getAttributes() {
-            return Set.of("depth", "percent", "isUnderControl", "isCritical", "isFull", "averageTailScan", "maxTailScan", "totalTailScanned");
+            return Set.of("depth", "percent", "isUnderControl", "isCritical", "isFull", "averageTailScan", "maxTailScan", "totalTailScanned", "totalVectorEntriesFound");
         }
 
         // ============================================
@@ -1597,19 +1700,21 @@ public final class Metrics {
                 case "depth":
                     return Metrics.getHnswQueueDepth();
                 case "percent":
-                    return Metrics.getHnswQueueDepthPercent(DEFAULT_LIMIT);
+                    return Metrics.getHnswQueueDepthPercent(Metrics.getHnswQueueLimit());
                 case "isUnderControl":
-                    return Metrics.isHnswUnderControl(DEFAULT_LIMIT);
+                    return Metrics.isHnswUnderControl(Metrics.getHnswQueueLimit());
                 case "isCritical":
-                    return Metrics.isHnswCritical(DEFAULT_LIMIT);
+                    return Metrics.isHnswCritical(Metrics.getHnswQueueLimit());
                 case "isFull":
-                    return Metrics.isHnswFull(DEFAULT_LIMIT);
+                    return Metrics.isHnswFull(Metrics.getHnswQueueLimit());
                 case "averageTailScan":
                     return Metrics.getAverageTailScanEntries();
                 case "maxTailScan":
                     return Metrics.getMaxTailScanEntries();
                 case "totalTailScanned":
                     return Metrics.getTotalTailScanned();
+                case "totalVectorEntriesFound":
+                    return Metrics.getTotalVectorEntriesFound();
                 default:
                     throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
@@ -1692,6 +1797,7 @@ public final class Metrics {
     public static class IngestionThroughputMBean implements DynamicMBean, NotificationEmitter {
 
         private final MBeanNotificationBroadcaster broadcaster = new MBeanNotificationBroadcaster(
+            this,
             "IngestionThroughput",
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.INGESTION_THROUGHPUT }
         );

@@ -11,6 +11,9 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Objects;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * Panama FFM-based implementation of the Segment interface.
  *
@@ -33,6 +36,8 @@ import java.util.Objects;
  */
 public final class PanamaSegment implements Segment {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(PanamaSegment.class);
+
     // ValueLayouts for primitive access (big-endian for consistency)
     private static final ValueLayout.OfByte BYTE_LAYOUT = ValueLayout.JAVA_BYTE;
     private static final ValueLayout.OfInt INT_LAYOUT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
@@ -44,7 +49,7 @@ public final class PanamaSegment implements Segment {
     private final Arena arena;
     private final FileChannel channel;
     private final Path path;
-    private volatile boolean closed = false;
+    private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
      * Creates a PanamaSegment wrapping an existing native MemorySegment.
@@ -76,13 +81,17 @@ public final class PanamaSegment implements Segment {
             StandardOpenOption.READ,
             StandardOpenOption.WRITE,
             StandardOpenOption.CREATE);
+        Arena arena = null;
         try {
-            Arena arena = Arena.ofShared();
+            arena = Arena.ofShared();
             MemorySegment nativeSegment = channel.map(FileChannel.MapMode.READ_WRITE, 0, size, arena);
             return new PanamaSegment(nativeSegment, arena, channel, path);
         } catch (Throwable t) {
-            channel.close();
-            throw new IOException("Failed to map file: " + path, t);
+            // Cleanup must never replace the real cause of the mapping failure.
+            IOException failure = new IOException("Failed to map file: " + path, t);
+            closeSuppressing(arena, failure);
+            closeSuppressing(channel, failure);
+            throw failure;
         }
     }
 
@@ -291,7 +300,13 @@ public final class PanamaSegment implements Segment {
     @Override
     public void force() {
         checkOpen();
-        nativeSegment.force();
+        // Only a mapped segment has anything to msync; MemorySegment.force() throws
+        // UnsupportedOperationException for anything else. The ByteBuffer implementation makes
+        // exactly this check and no-ops, so without it the two backends disagree on a method
+        // the interface defines for both.
+        if (nativeSegment.isMapped()) {
+            nativeSegment.force();
+        }
     }
 
     // ==================== File Channel Access ====================
@@ -310,16 +325,20 @@ public final class PanamaSegment implements Segment {
 
     @Override
     public void close() {
-        if (closed) {
-            return;
+        if (!closed.compareAndSet(false, true)) {
+            return; // Already closed by another thread
         }
-        closed = true;
 
-        if (nativeSegment != null) {
+        // A segment with no file behind it has nothing to flush, and calling force() on one
+        // threw into the catch below - so every correct close of an anonymous native segment
+        // logged an error claiming data might not be durable, naming a null path.
+        if (nativeSegment != null && nativeSegment.isMapped()) {
             try {
                 nativeSegment.force();
             } catch (Throwable t) {
-                // Ignore
+                // Last durability point for this mapping - never fail silently.
+                LOGGER.error("Final flush (msync) failed while closing segment {}"
+                    + " - data written through this mapping may not be durable", path, t);
             }
         }
 
@@ -327,7 +346,7 @@ public final class PanamaSegment implements Segment {
             try {
                 arena.close();
             } catch (Throwable t) {
-                // Ignore
+                LOGGER.warn("Failed to close Arena for segment {}", path, t);
             }
         }
 
@@ -335,14 +354,29 @@ public final class PanamaSegment implements Segment {
             try {
                 channel.close();
             } catch (Throwable t) {
-                // Ignore
+                LOGGER.warn("Failed to close FileChannel for segment {}", path, t);
             }
+        }
+    }
+
+    /**
+     * Closes a resource during failure cleanup, attaching any failure as a suppressed
+     * exception on the primary failure rather than replacing it.
+     */
+    private static void closeSuppressing(AutoCloseable resource, IOException primary) {
+        if (resource == null) {
+            return;
+        }
+        try {
+            resource.close();
+        } catch (Throwable t) {
+            primary.addSuppressed(t);
         }
     }
 
     @Override
     public boolean isClosed() {
-        return closed;
+        return closed.get();
     }
 
     // ==================== VarHandle Support ====================
@@ -406,7 +440,7 @@ public final class PanamaSegment implements Segment {
     // ==================== Helper Methods ====================
 
     private void checkOpen() {
-        if (closed) {
+        if (closed.get()) {
             throw new IllegalStateException("Segment is closed");
         }
     }
@@ -426,7 +460,7 @@ public final class PanamaSegment implements Segment {
 
     @Override
     public String toString() {
-        return "PanamaSegment{size=" + (closed ? "closed" : nativeSegment.byteSize()) +
+        return "PanamaSegment{size=" + (closed.get() ? "closed" : nativeSegment.byteSize()) +
                ", path=" + path + "}";
     }
 }

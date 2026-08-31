@@ -242,6 +242,59 @@ class FailureCategorizerTest {
     }
 
     @Nested
+    @DisplayName("Case-insensitive category selection")
+    class CaseInsensitiveCategoryTests {
+
+        @Test
+        @DisplayName("capitalized circuit breaker message keeps the Circuit Breaker category")
+        void capitalizedCircuitBreakerMessage() {
+            FailureCategory result = FailureCategorizer.categorize(
+                "queryPipelineTest",
+                "Circuit Breaker state should be OPEN"
+            );
+
+            assertThat(result.getSeverity()).isEqualTo(FailureSeverity.MAJOR);
+            assertThat(result.getCategory()).isEqualTo("Circuit Breaker");
+            assertThat(result.getRemediationSteps())
+                .anyMatch(step -> step.contains("cooldown timer"));
+        }
+
+        @Test
+        @DisplayName("capitalized latency message keeps the Timeout category")
+        void capitalizedTimeoutMessage() {
+            FailureCategory result = FailureCategorizer.categorize(
+                "queryPipelineTest",
+                "Latency exceeded the configured budget"
+            );
+
+            assertThat(result.getCategory()).isEqualTo("Timeout");
+        }
+
+        @Test
+        @DisplayName("capitalized resource leak message keeps the Resource Leak category")
+        void capitalizedResourceLeakMessage() {
+            FailureCategory result = FailureCategorizer.categorize(
+                "arenaLifecycleTest",
+                "Resource leak detected: arenas were never closed"
+            );
+
+            assertThat(result.getCategory()).isEqualTo("Resource Leak");
+        }
+
+        @Test
+        @DisplayName("capitalized infrastructure message keeps the Test Infrastructure category")
+        void capitalizedInfrastructureMessage() {
+            FailureCategory result = FailureCategorizer.categorize(
+                "harnessTest",
+                "Test Infrastructure could not create the scratch directory"
+            );
+
+            assertThat(result.getSeverity()).isEqualTo(FailureSeverity.MINOR);
+            assertThat(result.getCategory()).isEqualTo("Test Infrastructure");
+        }
+    }
+
+    @Nested
     @DisplayName("Unknown Failures")
     class UnknownFailureTests {
 

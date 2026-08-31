@@ -1,12 +1,18 @@
 package excalibur.bench.metric;
 
-import java.io.BufferedReader;
-import java.io.FileReader;
+import org.openjdk.jmh.annotations.Mode;
+import org.openjdk.jmh.results.RunResult;
+import org.openjdk.jmh.results.Result;
+import org.openjdk.jmh.runner.options.TimeValue;
+import org.openjdk.jmh.util.Statistics;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.Locale;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -69,9 +75,6 @@ public final class BenchmarkResultCapture {
     );
 
     // Pattern for percentile output
-    private static final Pattern PERCENTILE_PATTERN = Pattern.compile(
-        "p(\\d+)\\s*:\\s*([\\d.]+)\\s*(\\S+)?"
-    );
 
     /**
      * Parses JMH console output and extracts benchmark results.
@@ -178,11 +181,9 @@ public final class BenchmarkResultCapture {
             }
         }
 
-        // Get target from registry
-        BenchmarkTargetRegistry.TargetConfig targetConfig =
-            BenchmarkTargetRegistry.getTarget(benchmarkName);
-
-        // Determine if higher is better based on units
+        // Determine if higher is better from the measured unit. The registry must not
+        // override this: its direction belongs to the target's own unit, which may be a
+        // different dimension entirely.
         boolean higherIsBetter = isHigherBetter(units, mode);
 
         // Build result
@@ -196,18 +197,40 @@ public final class BenchmarkResultCapture {
             .primaryScoreUnit(units)
             .higherIsBetter(higherIsBetter);
 
-        // Add target if defined
-        if (targetConfig != null) {
-            builder.target(targetConfig.targetValue())
-                   .higherIsBetter(targetConfig.higherIsBetter());
-        }
-
-        // Add throughput metric
-        if (units.contains("ops/sec") || units.contains("op/s")) {
-            builder.addMetric(BenchmarkMetric.throughput(score, error));
-        }
+        attachThroughputMetric(builder, score, error, units);
+        attachRegisteredTargets(builder, benchmarkName);
 
         return builder.build();
+    }
+
+    /**
+     * Attaches a throughput metric when the measurement really is a throughput.
+     *
+     * <p>The check goes through {@link MetricUnits} rather than substring matching:
+     * JMH writes {@code ops/s}, which contains neither "ops/sec" nor "op/s".</p>
+     */
+    private static void attachThroughputMetric(
+            BenchmarkResult.Builder builder, double score, double error, String units) {
+        if (MetricUnits.dimensionOf(units) != MetricUnits.Dimension.THROUGHPUT) {
+            return;
+        }
+        double opsPerSec = MetricUnits.convert(score, units, MetricUnits.OPS_PER_SEC);
+        if (!Double.isFinite(opsPerSec) || opsPerSec <= 0) {
+            return;
+        }
+        double errorOpsPerSec = Double.isFinite(error)
+            ? MetricUnits.convert(Math.max(error, 0.0), units, MetricUnits.OPS_PER_SEC)
+            : 0.0;
+        builder.addMetric(BenchmarkMetric.throughput(opsPerSec, errorOpsPerSec));
+    }
+
+    /**
+     * Attaches every target the registry defines for this benchmark.
+     */
+    private static void attachRegisteredTargets(BenchmarkResult.Builder builder, String benchmarkName) {
+        for (BenchmarkTargetRegistry.TargetConfig target : BenchmarkTargetRegistry.getTargets(benchmarkName)) {
+            builder.addTarget(target);
+        }
     }
 
     /**
@@ -231,53 +254,130 @@ public final class BenchmarkResultCapture {
     public static List<BenchmarkResult> parseJsonContent(String jsonContent) {
         List<BenchmarkResult> results = new ArrayList<>();
 
-        // Simple JSON parsing without external dependencies
-        // JMH JSON format is an array of benchmark result objects
-
-        // Find all benchmark objects
-        int idx = 0;
-        while (idx < jsonContent.length()) {
-            int objStart = jsonContent.indexOf("{", idx);
-            if (objStart < 0) break;
-
-            int objEnd = findMatchingBrace(jsonContent, objStart);
-            if (objEnd < 0) break;
-
-            String objContent = jsonContent.substring(objStart, objEnd + 1);
-            BenchmarkResult result = parseJsonObject(objContent);
-            if (result != null) {
-                results.add(result);
+        // This tool's report lists every result twice: grouped under "categories" and again
+        // flat under "results". Sweeping the whole document would return each one twice, and a
+        // comparison against a doubled baseline is not a comparison. When the canonical flat
+        // list is there, it is the whole answer.
+        int flatList = topLevelIndexOf(jsonContent, "results");
+        if (flatList >= 0) {
+            int open = jsonContent.indexOf('[', flatList);
+            int close = open < 0 ? -1 : findMatchingBracket(jsonContent, open);
+            if (close > open) {
+                collectResults(jsonContent, open + 1, close, results);
+                return results;
             }
-
-            idx = objEnd + 1;
         }
 
+        collectResults(jsonContent, 0, jsonContent.length(), results);
         return results;
+    }
+
+    /**
+     * The index of the {@code ]} closing the array opened at {@code openPos}.
+     *
+     * @param s       The document
+     * @param openPos Index of the opening bracket
+     * @return The matching bracket's index, or -1
+     */
+    private static int findMatchingBracket(String s, int openPos) {
+        int depth = 0;
+        boolean inString = false;
+        boolean escaped = false;
+
+        for (int i = openPos; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (c == '\\' && inString) {
+                escaped = true;
+                continue;
+            }
+            if (c == '"') {
+                inString = !inString;
+                continue;
+            }
+            if (inString) {
+                continue;
+            }
+            if (c == '[') {
+                depth++;
+            } else if (c == ']') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Collects every benchmark object in a region, at whatever depth it sits.
+     *
+     * <p>JMH writes a flat array of result objects; this tool's own report nests them inside
+     * {@code categories}. Scanning only the outermost objects therefore matched the whole report
+     * as a single object, found the first nested {@code "benchmark"} string inside it, and
+     * skipped past everything else -- one result recovered from a file holding dozens.
+     *
+     * <p>An object that is not itself a result is descended into rather than discarded, which is
+     * what makes both shapes work without the parser having to know which it is reading.
+     */
+    private static void collectResults(String json, int from, int to, List<BenchmarkResult> out) {
+        int idx = from;
+        while (idx < to) {
+            int objStart = json.indexOf('{', idx);
+            if (objStart < 0 || objStart >= to) {
+                return;
+            }
+            int objEnd = findMatchingBrace(json, objStart);
+            if (objEnd < 0 || objEnd >= to) {
+                return;
+            }
+
+            BenchmarkResult result = parseJsonObject(json.substring(objStart, objEnd + 1));
+            if (result != null) {
+                out.add(result);
+            } else {
+                collectResults(json, objStart + 1, objEnd, out);
+            }
+            idx = objEnd + 1;
+        }
     }
 
     /**
      * Parses a single JSON object representing a benchmark result.
      */
     private static BenchmarkResult parseJsonObject(String json) {
+        // Top level only. Searching the whole substring made an enclosing report look like a
+        // result, because one of the results nested inside it has a "benchmark" key.
+        if (topLevelIndexOf(json, "benchmark") < 0) {
+            return null;
+        }
         String benchmark = extractJsonString(json, "benchmark");
         if (benchmark == null) return null;
 
         String mode = extractJsonString(json, "mode");
         if (mode == null) mode = "thrpt";
 
-        // Extract primaryMetric
-        int metricStart = json.indexOf("\"primaryMetric\"");
-        if (metricStart < 0) return null;
+        // Two shapes reach this parser. JMH writes "primaryMetric": {score, scoreError,
+        // scoreUnit}; this tool's own reports write "score": {value, error, unit}. It used to
+        // read only the first, so loading a baseline this tool had itself written produced zero
+        // results -- and a comparison against zero baselines reports every benchmark as NEW
+        // rather than regressed, so the regression gate passed whatever the numbers did.
+        String metricJson = objectFieldOf(json, "primaryMetric");
+        boolean jmh = metricJson != null;
+        if (!jmh) {
+            metricJson = objectFieldOf(json, "score");
+        }
+        if (metricJson == null) {
+            return null;
+        }
 
-        int metricObjStart = json.indexOf("{", metricStart);
-        int metricObjEnd = findMatchingBrace(json, metricObjStart);
-        if (metricObjEnd < 0) return null;
-
-        String metricJson = json.substring(metricObjStart, metricObjEnd + 1);
-
-        double score = extractJsonDouble(metricJson, "score");
-        double error = extractJsonDouble(metricJson, "scoreError");
-        String units = extractJsonString(metricJson, "scoreUnit");
+        double score = extractJsonDouble(metricJson, jmh ? "score" : "value");
+        double error = extractJsonDouble(metricJson, jmh ? "scoreError" : "error");
+        String units = extractJsonString(metricJson, jmh ? "scoreUnit" : "unit");
         if (units == null) units = "ops/sec";
 
         // Extract parameters
@@ -293,11 +393,7 @@ public final class BenchmarkResultCapture {
             }
         }
 
-        // Get target from registry
-        BenchmarkTargetRegistry.TargetConfig targetConfig =
-            BenchmarkTargetRegistry.getTarget(benchmark);
-
-        // Determine if higher is better based on units
+        // Determine if higher is better from the measured unit (never from the target).
         boolean higherIsBetter = isHigherBetter(units, mode);
 
         // Build result
@@ -311,17 +407,75 @@ public final class BenchmarkResultCapture {
             .primaryScoreUnit(units)
             .higherIsBetter(higherIsBetter);
 
-        if (targetConfig != null) {
-            builder.target(targetConfig.targetValue())
-                   .higherIsBetter(targetConfig.higherIsBetter());
-        }
-
-        // Add throughput metric
-        if (units.contains("ops/sec") || units.contains("op/s")) {
-            builder.addMetric(BenchmarkMetric.throughput(score, error));
-        }
+        attachThroughputMetric(builder, score, error, units);
+        attachRegisteredTargets(builder, benchmark);
 
         return builder.build();
+    }
+
+    /**
+     * The text of a named object field, or null when the field is absent or malformed.
+     *
+     * @param json  The enclosing object
+     * @param field The field name
+     * @return The field's object text, braces included
+     */
+    private static String objectFieldOf(String json, String field) {
+        int at = topLevelIndexOf(json, field);
+        if (at < 0) {
+            return null;
+        }
+        int open = json.indexOf("{", at);
+        if (open < 0) {
+            return null;
+        }
+        int close = findMatchingBrace(json, open);
+        if (close < 0) {
+            return null;
+        }
+        return json.substring(open, close + 1);
+    }
+
+    /**
+     * The position of a key in an object, ignoring keys of any object or array nested inside it.
+     *
+     * @param json An object, braces included
+     * @param key  The key name, without quotes
+     * @return The index of the key's opening quote, or -1
+     */
+    private static int topLevelIndexOf(String json, String key) {
+        String quoted = "\"" + key + "\"";
+        int depth = 0;
+        boolean inString = false;
+        boolean escaped = false;
+
+        for (int i = 0; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (c == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (c == '"') {
+                if (!inString && depth == 1 && json.startsWith(quoted, i)) {
+                    return i;
+                }
+                inString = !inString;
+                continue;
+            }
+            if (inString) {
+                continue;
+            }
+            if (c == '{' || c == '[') {
+                depth++;
+            } else if (c == '}' || c == ']') {
+                depth--;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -482,22 +636,28 @@ public final class BenchmarkResultCapture {
     }
 
     /**
-     * Determines if higher values are better based on units and mode.
+     * Determines if higher values are better, from the unit first and the mode second.
+     *
+     * <p>The unit is authoritative because it names the physical dimension. The JMH mode
+     * is only consulted for units {@link MetricUnits} does not recognise.</p>
      */
     private static boolean isHigherBetter(String units, String mode) {
-        String unitsLower = units.toLowerCase();
-        String modeLower = mode.toLowerCase();
+        MetricUnits.Dimension dimension = MetricUnits.dimensionOf(units);
+        if (dimension != MetricUnits.Dimension.UNKNOWN
+                && dimension != MetricUnits.Dimension.DIMENSIONLESS) {
+            return MetricUnits.higherIsBetter(units);
+        }
+
+        String unitsLower = units.toLowerCase(java.util.Locale.ROOT);
+        String modeLower = mode.toLowerCase(java.util.Locale.ROOT);
 
         // Throughput mode: higher is better
-        if (modeLower.contains("thrpt") || unitsLower.contains("ops/sec") ||
-            unitsLower.contains("op/s") || unitsLower.contains("throughput")) {
+        if (modeLower.contains("thrpt") || unitsLower.contains("throughput")) {
             return true;
         }
 
         // Average time or sample time: lower is better
-        if (modeLower.contains("avgt") || modeLower.contains("sample") ||
-            unitsLower.contains("ms") || unitsLower.contains("ns") ||
-            unitsLower.contains("s/op") || unitsLower.contains("ms/op")) {
+        if (modeLower.contains("avgt") || modeLower.contains("sample")) {
             return false;
         }
 
@@ -527,6 +687,113 @@ public final class BenchmarkResultCapture {
     }
 
     /**
+     * Converts the results JMH itself returned into structured benchmark results.
+     *
+     * <p>This is the authoritative capture path. {@code new Runner(options).run()} hands
+     * back every measurement it made, so nothing has to be scraped back out of stdout -
+     * the previous approach depended on redirecting {@code System.out}, which the forked
+     * benchmark JVM does not write to at all.</p>
+     *
+     * <p>For sampling modes the primary result's sample distribution is preserved as
+     * p0/p50/p90/p99 metrics in milliseconds, which is what the latency targets in
+     * {@link BenchmarkTargetRegistry} are keyed on.</p>
+     *
+     * @param runResults the results returned by JMH
+     * @return structured results, one per benchmark
+     */
+    public static List<BenchmarkResult> fromRunResults(Collection<RunResult> runResults) {
+        List<BenchmarkResult> results = new ArrayList<>();
+        for (RunResult runResult : runResults) {
+            results.add(fromRunResult(runResult));
+        }
+        return results;
+    }
+
+    /**
+     * Converts a single JMH {@link RunResult}.
+     *
+     * @param runResult the JMH result
+     * @return the structured benchmark result
+     */
+    public static BenchmarkResult fromRunResult(RunResult runResult) {
+        Result<?> primary = runResult.getPrimaryResult();
+        String benchmarkName = runResult.getParams().getBenchmark();
+        String mode = runResult.getParams().getMode().shortLabel();
+        String units = primary.getScoreUnit();
+        double score = primary.getScore();
+        double error = primary.getScoreError();
+        if (Double.isNaN(error)) {
+            error = 0.0;
+        }
+
+        Map<String, String> params = new HashMap<>();
+        for (String key : runResult.getParams().getParamsKeys()) {
+            params.put(key, runResult.getParams().getParam(key));
+        }
+
+        BenchmarkResult.Builder builder = BenchmarkResult.builder()
+            .benchmarkName(benchmarkName)
+            .mode(mode)
+            .timestamp(Instant.now())
+            .parameters(params)
+            .primaryScore(score)
+            .primaryScoreError(error)
+            .primaryScoreUnit(units)
+            .higherIsBetter(isHigherBetter(units, mode))
+            .iterations(runResult.getParams().getMeasurement().getCount())
+            .forks(runResult.getParams().getForks())
+            .durationMs(estimatedDurationMs(runResult));
+
+        attachThroughputMetric(builder, score, error, units);
+        attachPercentileMetrics(builder, runResult, units);
+        attachRegisteredTargets(builder, benchmarkName);
+
+        return builder.build();
+    }
+
+    /**
+     * Attaches p0/p50/p90/p99 metrics, in milliseconds, when JMH collected a
+     * sample distribution for this benchmark.
+     */
+    private static void attachPercentileMetrics(
+            BenchmarkResult.Builder builder, RunResult runResult, String units) {
+        if (runResult.getParams().getMode() != Mode.SampleTime) {
+            // Only sampling modes record a per-operation distribution. For other modes
+            // the statistics describe per-iteration scores, which are not latencies.
+            return;
+        }
+        if (MetricUnits.dimensionOf(units) != MetricUnits.Dimension.TIME_PER_OP) {
+            return;
+        }
+        Statistics statistics = runResult.getPrimaryResult().getStatistics();
+        if (statistics == null || statistics.getN() < 2) {
+            return;
+        }
+        for (int percentile : new int[]{0, 50, 90, 99}) {
+            double raw = statistics.getPercentile(percentile);
+            if (!Double.isFinite(raw)) {
+                return;
+            }
+            builder.addMetric(new BenchmarkMetric(
+                "p" + percentile,
+                MetricUnits.convert(raw, units, "ms"),
+                "ms",
+                0.0,
+                statistics.getN()));
+        }
+    }
+
+    private static long estimatedDurationMs(RunResult runResult) {
+        TimeValue warmupTime = runResult.getParams().getWarmup().getTime();
+        TimeValue measurementTime = runResult.getParams().getMeasurement().getTime();
+        long warmupMs = warmupTime.convertTo(java.util.concurrent.TimeUnit.MILLISECONDS)
+            * runResult.getParams().getWarmup().getCount();
+        long measurementMs = measurementTime.convertTo(java.util.concurrent.TimeUnit.MILLISECONDS)
+            * runResult.getParams().getMeasurement().getCount();
+        return (warmupMs + measurementMs) * Math.max(1, runResult.getParams().getForks());
+    }
+
+    /**
      * Creates a BenchmarkResultSet from parsed results.
      *
      * @param name name for the result set
@@ -541,44 +808,6 @@ public final class BenchmarkResultCapture {
             .build();
     }
 
-    /**
-     * Captures latency percentiles from JMH sample time output.
-     *
-     * <p>JMH sample time mode outputs percentiles in the format:
-     * p0.00: 123.456 ns
-     * p50.00: 234.567 ns
-     * p99.00: 345.678 ns
-     * </p>
-     *
-     * @param lines JMH output lines
-     * @return map of percentile name to value in milliseconds
-     */
-    public static Map<String, Double> extractPercentiles(List<String> lines) {
-        Map<String, Double> percentiles = new HashMap<>();
-
-        for (String line : lines) {
-            Matcher matcher = PERCENTILE_PATTERN.matcher(line);
-            if (matcher.find()) {
-                String percentile = "p" + matcher.group(1);
-                double value = parseDouble(matcher.group(2));
-                String unit = matcher.group(3);
-
-                // Convert to milliseconds if needed
-                if (unit != null && unit.toLowerCase().contains("ns")) {
-                    value = value / 1_000_000.0;
-                } else if (unit != null && unit.toLowerCase().contains("us")) {
-                    value = value / 1_000.0;
-                } else if (unit != null && unit.toLowerCase().contains("s") &&
-                           !unit.toLowerCase().contains("ms")) {
-                    value = value * 1_000.0;
-                }
-
-                percentiles.put(percentile, value);
-            }
-        }
-
-        return percentiles;
-    }
 
     private BenchmarkResultCapture() {
         // Utility class

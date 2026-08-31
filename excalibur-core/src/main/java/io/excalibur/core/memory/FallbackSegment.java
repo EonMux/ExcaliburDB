@@ -8,6 +8,9 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * ByteBuffer-based fallback implementation of Segment for environments without Panama FFM.
  *
@@ -33,11 +36,13 @@ import java.nio.file.StandardOpenOption;
  */
 public final class FallbackSegment implements Segment {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(FallbackSegment.class);
+
     private final Path path;
     private final ByteBuffer buffer;
     private final FileChannel channel;
     private final long size;
-    private volatile boolean closed = false;
+    private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
      * Creates a FallbackSegment from a file mapping.
@@ -57,8 +62,14 @@ public final class FallbackSegment implements Segment {
             buffer.order(ByteOrder.BIG_ENDIAN);
             return new FallbackSegment(path, buffer, channel, size);
         } catch (Throwable t) {
-            channel.close();
-            throw new IOException("Failed to map file: " + path, t);
+            // Cleanup must never replace the real cause of the mapping failure.
+            IOException failure = new IOException("Failed to map file: " + path, t);
+            try {
+                channel.close();
+            } catch (Throwable ct) {
+                failure.addSuppressed(ct);
+            }
+            throw failure;
         }
     }
 
@@ -119,8 +130,10 @@ public final class FallbackSegment implements Segment {
         checkBounds(offset, length);
         byte[] result = new byte[length];
         synchronized (this) {
+            int oldPos = buffer.position();
             buffer.position((int) offset);
             buffer.get(result, 0, length);
+            buffer.position(oldPos);
         }
         return result;
     }
@@ -315,16 +328,17 @@ public final class FallbackSegment implements Segment {
 
     @Override
     public void close() {
-        if (closed) {
-            return;
+        if (!closed.compareAndSet(false, true)) {
+            return; // Already closed by another thread
         }
-        closed = true;
 
-        if (buffer != null && buffer instanceof MappedByteBuffer) {
+        if (buffer instanceof MappedByteBuffer mapped) {
             try {
-                ((MappedByteBuffer) buffer).force();
+                mapped.force();
             } catch (Throwable t) {
-                // Ignore
+                // Last durability point for this mapping - never fail silently.
+                LOGGER.error("Final flush (msync) failed while closing segment {}"
+                    + " - data written through this mapping may not be durable", path, t);
             }
         }
 
@@ -332,14 +346,14 @@ public final class FallbackSegment implements Segment {
             try {
                 channel.close();
             } catch (Throwable t) {
-                // Ignore
+                LOGGER.warn("Failed to close FileChannel for segment {}", path, t);
             }
         }
     }
 
     @Override
     public boolean isClosed() {
-        return closed;
+        return closed.get();
     }
 
     // ==================== Legacy Compatibility ====================
@@ -356,7 +370,7 @@ public final class FallbackSegment implements Segment {
     // ==================== Helper Methods ====================
 
     private void checkOpen() {
-        if (closed) {
+        if (closed.get()) {
             throw new IllegalStateException("Segment is closed");
         }
     }
@@ -376,7 +390,7 @@ public final class FallbackSegment implements Segment {
 
     @Override
     public String toString() {
-        return "FallbackSegment{size=" + (closed ? "closed" : size) +
+        return "FallbackSegment{size=" + (closed.get() ? "closed" : size) +
                ", path=" + path + "}";
     }
 }

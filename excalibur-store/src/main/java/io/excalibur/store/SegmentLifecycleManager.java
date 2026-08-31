@@ -78,9 +78,21 @@ public class SegmentLifecycleManager implements AutoCloseable {
     private final int minEntriesForCompaction;
     private final long epochLagThreshold;
 
+    /**
+     * Wall-clock grace period applied to tombstoned segments when no visibility epoch
+     * source is available.
+     */
+    private static final long LEGACY_RECLAMATION_GRACE_MS = TimeUnit.MINUTES.toMillis(5);
+
     // Callbacks for external integration (e.g., HNSW, Cuckoo filter)
     private volatile CompactionCallback compactionCallback;
     private volatile ReclamationCallback reclamationCallback;
+
+    /**
+     * Source of the current visibility epoch, injected by the owning engine.
+     * When null the scheduled reclamation check falls back to a wall-clock grace period.
+     */
+    private volatile java.util.function.LongSupplier currentEpochSupplier;
 
     /**
      * Callback interface for compaction operations.
@@ -361,7 +373,7 @@ public class SegmentLifecycleManager implements AutoCloseable {
      * <ul>
      *   <li>It is in ACTIVE state</li>
      *   <li>It has at least {@link #minEntriesForCompaction} entries</li>
-     *   <li>The tombstone ratio exceeds {@link #tombstoneThreshold}</li>
+     *   <li>Its tombstone ratio reaches {@link #tombstoneThreshold}</li>
      * </ul></p>
      */
     private void checkForCompactionCandidates() {
@@ -395,23 +407,14 @@ public class SegmentLifecycleManager implements AutoCloseable {
      * @return true if the segment should be compacted
      */
     private boolean shouldCompact(SegmentCatalog.SegmentMetadata metadata) {
-        int entryCount = metadata.getEntryCount();
-        if (entryCount < minEntriesForCompaction) {
+        if (metadata.getEntryCount() < minEntriesForCompaction) {
             return false;
         }
 
-        // For now, use lastCompactionTime as a proxy for tombstone ratio
-        // In a full implementation, we would track actual tombstone count
-        long timeSinceCompaction = System.currentTimeMillis() - metadata.getLastCompactionTime();
-
-        // If never compacted and has entries, consider it
-        if (metadata.getLastCompactionTime() == 0 && entryCount >= minEntriesForCompaction) {
-            return true;
-        }
-
-        // If last compaction was more than 1 hour ago, consider it
-        // This is a simplified heuristic; real implementation would check actual tombstone ratio
-        return timeSinceCompaction > TimeUnit.HOURS.toMillis(1);
+        // Compaction is only worth doing when there are tombstoned records to remove.
+        // Scheduling on elapsed time alone re-compacts every segment on every tick,
+        // rewriting whole segments that hold no tombstones at all.
+        return metadata.tombstoneRatio() >= tombstoneThreshold;
     }
 
     /**
@@ -437,7 +440,11 @@ public class SegmentLifecycleManager implements AutoCloseable {
 
             long tombstoneEpoch = metadata.getTombstoneEpoch();
             if (tombstoneEpoch < 0) {
-                // No epoch recorded, skip (shouldn't happen in normal operation)
+                // Tombstoned before epoch tracking: fall back to the wall-clock grace
+                // period rather than either purging immediately or never purging.
+                if (isPastGracePeriod(metadata)) {
+                    attemptPurge(segmentId, tombstoneEpoch);
+                }
                 continue;
             }
 
@@ -465,29 +472,58 @@ public class SegmentLifecycleManager implements AutoCloseable {
     }
 
     /**
-     * Checks for reclamation candidates using the catalog's internal epoch tracking.
+     * Checks for reclamation candidates on the scheduled tick.
+     *
+     * <p>When an epoch source has been wired via
+     * {@link #setCurrentEpochSupplier(java.util.function.LongSupplier)}, this defers to
+     * the epoch-based check. Without one, it falls back to a time-based grace period -
+     * applied to <em>every</em> tombstoned segment, not only the ones that are missing
+     * a tombstone epoch. Purging only the untagged ones is backwards: it reclaims
+     * exactly the segments whose safety cannot be established and never reclaims the
+     * ones that were properly tagged.</p>
      */
     private void checkForReclamationCandidates() {
-        // Get all tombstoned segments and check their epochs
-        List<Long> tombstonedSegments = catalog.getSegmentsByState(LifecycleState.TOMBSTONED);
+        java.util.function.LongSupplier epochSource = this.currentEpochSupplier;
+        if (epochSource != null) {
+            checkForReclamationCandidates(epochSource.getAsLong());
+            return;
+        }
 
+        List<Long> tombstonedSegments = catalog.getSegmentsByState(LifecycleState.TOMBSTONED);
         for (Long segmentId : tombstonedSegments) {
             SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
             if (metadata == null) {
                 continue;
             }
-
-            long tombstoneEpoch = metadata.getTombstoneEpoch();
-            if (tombstoneEpoch < 0) {
-                // No epoch recorded - this segment was tombstoned before epoch tracking
-                // Use a default lag check based on time
-                long timeSinceCreation = System.currentTimeMillis() - metadata.getCreationTime();
-                if (timeSinceCreation > TimeUnit.MINUTES.toMillis(5)) {
-                    // Safe to purge after 5 minutes for legacy tombstoned segments
-                    attemptPurge(segmentId, tombstoneEpoch);
-                }
+            if (isPastGracePeriod(metadata)) {
+                attemptPurge(segmentId, metadata.getTombstoneEpoch());
             }
         }
+    }
+
+    /**
+     * Returns whether a tombstoned segment is past the wall-clock grace period.
+     *
+     * @param metadata The segment metadata
+     * @return true if the segment may be purged without epoch information
+     */
+    private boolean isPastGracePeriod(SegmentCatalog.SegmentMetadata metadata) {
+        long reference = metadata.getLastActiveTime() > 0
+            ? metadata.getLastActiveTime()
+            : metadata.getCreationTime();
+        return System.currentTimeMillis() - reference > LEGACY_RECLAMATION_GRACE_MS;
+    }
+
+    /**
+     * Sets the source of the current visibility epoch used for reclamation checks.
+     *
+     * <p>Without it, the scheduled reclamation check can only apply a wall-clock grace
+     * period, which cannot guarantee that no in-flight query still sees the segment.</p>
+     *
+     * @param supplier Supplier of the current visibility epoch, or null to unset
+     */
+    public void setCurrentEpochSupplier(java.util.function.LongSupplier supplier) {
+        this.currentEpochSupplier = supplier;
     }
 
     /**

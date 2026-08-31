@@ -81,6 +81,16 @@ public final class L2Distance implements DistanceFunction {
         return INSTANCE;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>L2 is a true distance: 0.0 means identical, so smaller values are closer.</p>
+     */
+    @Override
+    public Ordering ordering() {
+        return Ordering.SMALLER_IS_CLOSER;
+    }
+
     @Override
     public String name() {
         return "l2";

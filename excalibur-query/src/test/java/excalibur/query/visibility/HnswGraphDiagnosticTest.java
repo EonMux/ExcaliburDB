@@ -4,7 +4,6 @@ import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
 import io.excalibur.vector.hnsw.HnswGraph;
-import io.excalibur.store.log.WriteLog;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -77,7 +76,7 @@ class HnswGraphDiagnosticTest {
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
             HnswGraphDiagnostic.GraphDiagnosticResult result =
-                HnswGraphDiagnostic.runFullDiagnostic(graph, null, 0);
+                HnswGraphDiagnostic.runFullDiagnostic(graph, 0);
 
             assertThat(result.nodeCount()).isEqualTo(0);
             assertThat(result.activeNodeCount()).isEqualTo(0);
@@ -106,7 +105,7 @@ class HnswGraphDiagnosticTest {
             graph.setLastIntegratedOffset(1);
 
             HnswGraphDiagnostic.GraphDiagnosticResult result =
-                HnswGraphDiagnostic.runFullDiagnostic(graph, null, 1);
+                HnswGraphDiagnostic.runFullDiagnostic(graph, 1);
 
             assertThat(result.nodeCount()).isEqualTo(1);
             assertThat(result.activeNodeCount()).isEqualTo(1);
@@ -137,7 +136,7 @@ class HnswGraphDiagnosticTest {
             graph.setLastIntegratedOffset(numVectors);
 
             HnswGraphDiagnostic.GraphDiagnosticResult result =
-                HnswGraphDiagnostic.runFullDiagnostic(graph, null, numVectors);
+                HnswGraphDiagnostic.runFullDiagnostic(graph, numVectors);
 
             assertThat(result.nodeCount()).isEqualTo(numVectors);
             assertThat(result.activeNodeCount()).isEqualTo(numVectors);
@@ -176,7 +175,7 @@ class HnswGraphDiagnosticTest {
             graph.setLastIntegratedOffset(numVectors / 2);
 
             HnswGraphDiagnostic.GraphDiagnosticResult result =
-                HnswGraphDiagnostic.runFullDiagnostic(graph, null, numVectors);
+                HnswGraphDiagnostic.runFullDiagnostic(graph, numVectors);
 
             assertThat(result.nodeCount()).isEqualTo(numVectors);
             assertThat(result.lastIntegratedOffset()).isEqualTo(numVectors / 2);
@@ -337,7 +336,7 @@ class HnswGraphDiagnosticTest {
             graph.setLastIntegratedOffset(10);
 
             HnswGraphDiagnostic.GraphDiagnosticResult result =
-                HnswGraphDiagnostic.runFullDiagnostic(graph, null, 10);
+                HnswGraphDiagnostic.runFullDiagnostic(graph, 10);
 
             String report = HnswGraphDiagnostic.formatReport(result);
 
@@ -370,7 +369,7 @@ class HnswGraphDiagnosticTest {
             graph.setLastIntegratedOffset(numVectors);
 
             HnswGraphDiagnostic.GraphDiagnosticResult result =
-                HnswGraphDiagnostic.runFullDiagnostic(graph, null, numVectors);
+                HnswGraphDiagnostic.runFullDiagnostic(graph, numVectors);
 
             String summary = result.summary();
 

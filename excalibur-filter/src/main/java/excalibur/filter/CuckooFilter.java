@@ -7,8 +7,10 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.StampedLock;
 
 /**
  * A Cuckoo Filter implementation supporting O(1) insert, lookup, and delete operations.
@@ -77,8 +79,16 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <h2>Thread Safety</h2>
  * <ul>
- *   <li>Reads: Lock-free, atomic bucket reads</li>
- *   <li>Writes: Striped locks by bucket index modulo 64</li>
+ *   <li>Reads: optimistic and lock-free while no displacement is running. A bucket is read
+ *       byte by byte, so a read is not atomic on its own; correctness comes from the
+ *       displacement barrier below, not from the width of the read.</li>
+ *   <li>Writes: striped locks by bucket index modulo 64, taken in stripe order.</li>
+ *   <li>Displacement barrier: a cuckoo displacement chain moves a victim out of one bucket
+ *       before re-homing it in the next iteration, so mid-chain the victim is in neither of
+ *       its two buckets. {@link #displace} therefore runs under the exclusive side of a
+ *       {@link StampedLock}; readers validate an optimistic stamp and retry under the shared
+ *       side if a displacement overlapped them. This is what makes the no-false-negatives
+ *       guarantee hold for concurrent readers.</li>
  * </ul>
  *
  * <h2>Insertion Graceful Failure Guarantee (CRITICAL)</h2>
@@ -157,6 +167,22 @@ public class CuckooFilter {
     // Striped locks for write operations (64 stripes)
     private final ReentrantLock[] locks;
 
+    // Guards the window in which a displaced victim is in neither of its buckets.
+    // Held exclusively for a whole displacement chain; readers use optimistic stamps.
+    private final StampedLock displacementBarrier = new StampedLock();
+
+    // Victim-slot selection state, seeded from the filter seed. Cuckoo hashing needs an
+    // unpredictable kick to break displacement cycles, but it does not need a per-run
+    // random one: deriving it from the seed keeps chains reproducible for a given seed.
+    // Only ever touched from displaceExclusive, which runs under the exclusive side of
+    // the displacement barrier, so no further synchronization is needed.
+    private long victimSelectionState;
+
+    // Arena owning the off-heap bucket storage, or null when the segment was supplied
+    // by the caller. Automatic arenas release their memory once the filter becomes
+    // unreachable, which is the only ownership model a class without close() can honour.
+    private final Arena arena;
+
     /**
      * Creates a new CuckooFilter with the specified capacity.
      *
@@ -168,7 +194,8 @@ public class CuckooFilter {
     }
 
     /**
-     * Creates a new CuckooFilter with the specified capacity and fingerprint bits.
+     * Creates a new CuckooFilter with the specified capacity and fingerprint bits,
+     * using a randomly generated hash seed.
      *
      * @param capacity        Expected number of entries
      * @param fingerprintBits Number of bits per fingerprint (8-16)
@@ -176,6 +203,26 @@ public class CuckooFilter {
      * @throws IllegalArgumentException if fingerprintBits is not in range [8, 16]
      */
     public static CuckooFilter create(long capacity, int fingerprintBits) {
+        return create(capacity, fingerprintBits, ThreadLocalRandom.current().nextLong());
+    }
+
+    /**
+     * Creates a new CuckooFilter with an explicit hash seed.
+     *
+     * <p>The seed selects the fingerprint and bucket assignment of every item, and also seeds
+     * victim-slot selection, so it fixes the displacement chains too. Two filters created with
+     * the same seed and given the same sequence of single-threaded operations therefore end
+     * up byte-identical, which is what makes a statistical assertion about false positives
+     * reproducible instead of a coin flip. Production code should use
+     * {@link #create(long, int)} so that each filter gets an independent hash family.</p>
+     *
+     * @param capacity        Expected number of entries
+     * @param fingerprintBits Number of bits per fingerprint (8-16)
+     * @param seed            Hash seed
+     * @return A new CuckooFilter instance
+     * @throws IllegalArgumentException if fingerprintBits is not in range [8, 16]
+     */
+    public static CuckooFilter create(long capacity, int fingerprintBits, long seed) {
         if (fingerprintBits < 8 || fingerprintBits > 16) {
             throw new IllegalArgumentException(
                 "fingerprintBits must be in range [8, 16], got: " + fingerprintBits);
@@ -197,12 +244,13 @@ public class CuckooFilter {
         // Total size: header + buckets (cache-line aligned storage)
         long totalSize = HEADER_SIZE + numBuckets * bytesPerBucket;
 
-        // Allocate memory segment
-        Arena arena = Arena.ofShared();
+        // Allocate memory segment.
+        // An automatic arena is used deliberately: a CuckooFilter has no owner that could
+        // close an explicit arena (filters are handed to HierarchicalCuckooFilter and
+        // dropped on unregister), and Arena.ofShared() memory is never reclaimed by the
+        // collector, so every discarded filter would leak its whole bucket region.
+        Arena arena = Arena.ofAuto();
         MemorySegment segment = arena.allocate(totalSize);
-
-        // Generate random seed
-        long seed = System.nanoTime() ^ (System.currentTimeMillis() << 32);
 
         // Initialize header (EXACT SPECIFICATION - no padding, no count)
         segment.set(ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_MAGIC, MAGIC);
@@ -211,7 +259,7 @@ public class CuckooFilter {
         segment.set(ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_NUM_BUCKETS, numBuckets);
         segment.set(ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_SEED, seed);
 
-        return new CuckooFilter(segment);
+        return new CuckooFilter(segment, arena);
     }
 
     /**
@@ -221,6 +269,18 @@ public class CuckooFilter {
      * @throws IllegalArgumentException if the segment is invalid or corrupted
      */
     public CuckooFilter(MemorySegment segment) {
+        this(segment, null);
+    }
+
+    /**
+     * Creates a CuckooFilter over a segment, recording the arena that backs it.
+     *
+     * @param segment The memory segment containing the filter data
+     * @param arena   The arena the segment was allocated from, or null when caller-supplied
+     * @throws IllegalArgumentException if the segment is invalid or corrupted
+     */
+    private CuckooFilter(MemorySegment segment, Arena arena) {
+        this.arena = arena;
         if (segment == null) {
             throw new IllegalArgumentException("MemorySegment cannot be null");
         }
@@ -254,6 +314,7 @@ public class CuckooFilter {
         // Read from aligned offsets (with padding for 8-byte alignment)
         this.numBuckets = segment.get(ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_NUM_BUCKETS);
         this.seed = segment.get(ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_SEED);
+        this.victimSelectionState = this.seed;
 
         // Calculate derived values
         this.fingerprintMask = (1 << fingerprintBits) - 1;
@@ -261,8 +322,11 @@ public class CuckooFilter {
         this.maxDisplacements = DEFAULT_MAX_DISPLACEMENTS;
         this.bucketDataOffset = HEADER_SIZE;
 
-        // Calculate bytes per bucket: (4 * fingerprintBits + 7) / 8
-        this.bytesPerBucket = (FINGERPRINTS_PER_BUCKET * fingerprintBits + 7) / 8;
+        // Use the same aligned stride that create() uses for allocation.
+        // The packed size would be (4 * fingerprintBits + 7) / 8 but the allocator
+        // uses ALIGNED_BYTES_PER_BUCKET for cache-line alignment. Using the packed
+        // size here would address the wrong bucket offsets as bucket index grows.
+        this.bytesPerBucket = ALIGNED_BYTES_PER_BUCKET;
 
         // Validate segment size
         long expectedSize = HEADER_SIZE + numBuckets * bytesPerBucket;
@@ -338,30 +402,65 @@ public class CuckooFilter {
         long bucket1 = computeBucket1(hash);
         long bucket2 = computeBucket2(bucket1, fingerprint);
 
-        // Try to insert into bucket1
-        acquireLock(bucket1);
+        // Fast path: an empty slot in either bucket. Held under the shared side of the
+        // displacement barrier so a concurrent rollback cannot overwrite the slot this
+        // insert just claimed. The barrier is released before displacing, because the
+        // exclusive side cannot be acquired while this thread holds the shared side.
+        long barrierStamp = displacementBarrier.readLock();
         try {
-            if (tryInsert(bucket1, fingerprint)) {
-                incrementCount();
-                return true;
+            acquireLock(bucket1);
+            try {
+                if (tryInsert(bucket1, fingerprint)) {
+                    incrementCount();
+                    return true;
+                }
+            } finally {
+                releaseLock(bucket1);
             }
-        } finally {
-            releaseLock(bucket1);
-        }
 
-        // Try to insert into bucket2
-        acquireLock(bucket2);
-        try {
-            if (tryInsert(bucket2, fingerprint)) {
-                incrementCount();
-                return true;
+            acquireLock(bucket2);
+            try {
+                if (tryInsert(bucket2, fingerprint)) {
+                    incrementCount();
+                    return true;
+                }
+            } finally {
+                releaseLock(bucket2);
             }
         } finally {
-            releaseLock(bucket2);
+            displacementBarrier.unlockRead(barrierStamp);
         }
 
         // Need to displace - use cuckoo hashing
-        return displace(bucket1, bucket2, fingerprint);
+        return displace(bucket1, fingerprint);
+    }
+
+    /**
+     * Inserts an item only if the filter does not already report it.
+     *
+     * <p>A Cuckoo filter is a multiset: inserting the same item twice occupies two slots.
+     * That is the wrong shape for membership, where the question is only whether a key is
+     * present. It is also self-limiting - an item's fingerprint can only live in its two
+     * candidate buckets, so the same item can be inserted at most {@code 2 * bucketSize}
+     * times before insertion fails outright - and it breaks deletion, which removes one
+     * slot per call and so cannot undo a variable number of insertions.
+     *
+     * <p>The presence check is the filter's own, so a false positive can skip an insertion
+     * the filter would otherwise have recorded. Lookups still answer "present" for that
+     * item, so the skip is invisible until the colliding item is deleted; callers that
+     * delete individual items rather than discarding the whole filter should weigh that
+     * against the capacity a multiset costs them.
+     *
+     * <p>Not atomic: two threads inserting the same absent item can both observe it absent
+     * and both insert, which costs a duplicate slot but leaves the filter correct.
+     *
+     * @param item The item to insert
+     * @return {@code true} if the filter holds the item afterwards, {@code false} if it was
+     *         absent and could not be inserted because the filter is full
+     * @throws NullPointerException if item is null
+     */
+    public boolean insertIfAbsent(byte[] item) {
+        return contains(item) || insert(item);
     }
 
     /**
@@ -383,9 +482,24 @@ public class CuckooFilter {
         long bucket1 = computeBucket1(hash);
         long bucket2 = computeBucket2(bucket1, fingerprint);
 
-        // Check both buckets (lock-free read)
-        return containsFingerprint(bucket1, fingerprint) ||
-               containsFingerprint(bucket2, fingerprint);
+        // Optimistic read: mid-chain a displaced victim is in neither of its buckets, so a
+        // read that overlapped a displacement can miss an item that is definitely present.
+        // The stamp detects exactly that overlap; the retry runs under the shared side of the
+        // barrier, which no displacement can be inside of.
+        long stamp = displacementBarrier.tryOptimisticRead();
+        boolean found = containsFingerprint(bucket1, fingerprint) ||
+                        containsFingerprint(bucket2, fingerprint);
+        if (displacementBarrier.validate(stamp)) {
+            return found;
+        }
+
+        stamp = displacementBarrier.readLock();
+        try {
+            return containsFingerprint(bucket1, fingerprint) ||
+                   containsFingerprint(bucket2, fingerprint);
+        } finally {
+            displacementBarrier.unlockRead(stamp);
+        }
     }
 
     /**
@@ -409,26 +523,32 @@ public class CuckooFilter {
         long bucket1 = computeBucket1(hash);
         long bucket2 = computeBucket2(bucket1, fingerprint);
 
-        // Try to delete from bucket1
-        acquireLock(bucket1);
+        // Shared side of the displacement barrier: an item being displaced is momentarily in
+        // neither bucket, and a delete that landed in that window would silently leave the
+        // entry in the filter.
+        long barrierStamp = displacementBarrier.readLock();
         try {
-            if (tryDelete(bucket1, fingerprint)) {
-                decrementCount();
-                return true;
+            acquireLock(bucket1);
+            try {
+                if (tryDelete(bucket1, fingerprint)) {
+                    decrementCount();
+                    return true;
+                }
+            } finally {
+                releaseLock(bucket1);
             }
-        } finally {
-            releaseLock(bucket1);
-        }
 
-        // Try to delete from bucket2
-        acquireLock(bucket2);
-        try {
-            if (tryDelete(bucket2, fingerprint)) {
-                decrementCount();
-                return true;
+            acquireLock(bucket2);
+            try {
+                if (tryDelete(bucket2, fingerprint)) {
+                    decrementCount();
+                    return true;
+                }
+            } finally {
+                releaseLock(bucket2);
             }
         } finally {
-            releaseLock(bucket2);
+            displacementBarrier.unlockRead(barrierStamp);
         }
 
         return false;
@@ -509,6 +629,19 @@ public class CuckooFilter {
      */
     public int fingerprintBits() {
         return fingerprintBits;
+    }
+
+    /**
+     * Gets the hash seed this filter was built with.
+     *
+     * <p>Passing it back to {@link #create(long, int, long)} reproduces the same fingerprint
+     * and bucket assignment, which is how a failure observed on a randomly seeded filter is
+     * replayed.</p>
+     *
+     * @return The hash seed
+     */
+    public long seed() {
+        return seed;
     }
 
     /**
@@ -628,7 +761,7 @@ public class CuckooFilter {
 
         // Read bytes as big-endian
         int value = 0;
-        int bytesToRead = Math.min(3, (int) (segment.byteSize() - offset));
+        int bytesToRead = windowBytes(byteOffset, offset);
         for (int i = 0; i < bytesToRead; i++) {
             byte b = segment.get(ValueLayout.JAVA_BYTE, offset + i);
             value = (value << 8) | (b & 0xFF);
@@ -664,7 +797,7 @@ public class CuckooFilter {
 
         // Read the affected bytes (up to 3)
         int value = 0;
-        int bytesToRead = Math.min(3, (int) (segment.byteSize() - offset));
+        int bytesToRead = windowBytes(byteOffset, offset);
         for (int i = 0; i < bytesToRead; i++) {
             byte b = segment.get(ValueLayout.JAVA_BYTE, offset + i);
             value = (value << 8) | (b & 0xFF);
@@ -686,6 +819,24 @@ public class CuckooFilter {
             byte b = (byte) (value >>> (16 - i * 8));
             segment.set(ValueLayout.JAVA_BYTE, offset + i, b);
         }
+    }
+
+    /**
+     * Size of the read-modify-write window for a slot, in bytes.
+     *
+     * <p>The window is clamped to the bucket. With 16-bit fingerprints slot 3 starts at byte 6
+     * of the 8-byte bucket, so an unclamped 3-byte window would reach byte 0 of the NEXT
+     * bucket - and the write-back rewrites every byte it read, clobbering that neighbour's
+     * slot 0. Neighbouring buckets sit on different lock stripes, so nothing serialises the
+     * two writers.</p>
+     *
+     * @param byteOffset Offset of the window within the bucket
+     * @param offset     Absolute offset of the window within the segment
+     * @return Number of bytes the window may span (1 to 3)
+     */
+    private int windowBytes(int byteOffset, long offset) {
+        long available = Math.min(bytesPerBucket - byteOffset, segment.byteSize() - offset);
+        return (int) Math.min(3L, available);
     }
 
     /**
@@ -730,47 +881,47 @@ public class CuckooFilter {
     }
 
     /**
-     * Checks if a fingerprint exists in a bucket using lock-free atomic reads.
+     * Checks if a fingerprint exists in a bucket, without taking a lock.
      *
      * <h3>Lock-Free Implementation</h3>
-     * <p>This method reads the entire bucket atomically using VarHandle-based
-     * volatile reads via {@link SegmentVarHandle#readLong(MemorySegment, long)}.
-     * This provides acquire semantics for thread-safe concurrent access.</p>
+     * <p>The bucket is read through {@link SegmentVarHandle}, which assembles the value from
+     * byte-wide volatile reads. That gives visibility (the reader sees writes published by
+     * another thread) but NOT single-copy atomicity: a bucket read can observe a mix of bytes
+     * from before and after a concurrent write.</p>
      *
-     * <h3>Atomicity Strategy</h3>
-     * <p>Since packed storage uses 6 or 7-byte buckets, offsets may not be 8-byte aligned.
-     * We use {@link SegmentVarHandle} which provides volatile (acquire) semantics for
-     * MemorySegment access, ensuring no torn reads in concurrent scenarios.</p>
+     * <h3>Why a mixed read is safe here</h3>
+     * <p>Writers only ever change one slot's bits at a time under the bucket's stripe lock, so
+     * a mixed read can misreport the slot being written - never one of the other three. The
+     * only way an item can vanish from both of its buckets is a displacement chain, and that
+     * is excluded by the barrier {@link #contains(byte[])} validates against.</p>
      *
      * @param bucketIndex  The bucket index
      * @param fingerprint The fingerprint to find
      * @return true if found, false otherwise
      */
     private boolean containsFingerprint(long bucketIndex, int fingerprint) {
-        // Read the entire bucket atomically using VarHandle-based volatile read
-        // For packed storage, we read up to 8 bytes starting at bucket offset
+        // Reads the bucket's bytes. NOT atomic: buckets are packed at fingerprintBits each and
+        // sit at arbitrary byte offsets, and SegmentVarHandle.readLongUnaligned guarantees only
+        // per-byte atomicity there. Correctness comes from the displacement barrier in contains(),
+        // which is what detects a read that overlapped a displacement. Do not remove that barrier
+        // on the strength of the word "volatile" below.
         long bucketOffset = getBucketOffset(bucketIndex);
 
         // Calculate how many bytes we can safely read
         long remainingBytes = segment.byteSize() - bucketOffset;
         int bytesToRead = (int) Math.min(8, remainingBytes);
 
-        // Read bytes using VarHandle-based atomic volatile read
         long bucketValue;
         if (bytesToRead >= 8) {
-            // Use SegmentVarHandle for atomic unaligned volatile read with acquire semantics
-            // This ensures thread-safe concurrent access without locks, even for unaligned offsets
             bucketValue = SegmentVarHandle.readLongUnaligned(segment, bucketOffset, 8);
         } else if (bytesToRead > 0) {
-            // Partial read (last bucket near end of segment) - read available bytes
-            // Use unaligned read for volatile semantics
+            // Last bucket near the end of the segment: read only what is there.
             bucketValue = SegmentVarHandle.readLongUnaligned(segment, bucketOffset, bytesToRead);
         } else {
             // Edge case: no bytes to read
             return false;
         }
 
-        // Extract and compare each fingerprint from the atomic read
         for (int slot = 0; slot < FINGERPRINTS_PER_BUCKET; slot++) {
             int slotFp = extractFingerprintFromLong(bucketValue, slot);
             if (slotFp == fingerprint) {
@@ -781,7 +932,7 @@ public class CuckooFilter {
     }
 
     /**
-     * Extracts a fingerprint from an atomically-read bucket value.
+     * Extracts a fingerprint from a bucket value read by {@link #containsFingerprint}.
      *
      * <p>Bit layout within the 8-byte value (for packed fingerprints, big-endian):</p>
      * <pre>
@@ -790,7 +941,7 @@ public class CuckooFilter {
      * - For 12-bit fingerprints (48 bits = 6 bytes per bucket):
      *   Bits 63-16: high 48 bits may contain next bucket data
      *   FP0: bits 15-4 (12 bits), FP1: bits 3-0 + bits 63-56 (crosses boundary)
-     *   Actually, for atomicity, we treat the 8-byte read as containing:
+     *   The 8-byte window is treated as containing:
      *   FP0: bits 63-52, FP1: bits 51-40, FP2: bits 39-28, FP3: bits 27-16
      *   (high 16 bits are padding/next bucket)
      *
@@ -801,7 +952,7 @@ public class CuckooFilter {
      * General formula: shift = 64 - (slot + 1) * fingerprintBits
      * </pre>
      *
-     * @param bucketValue The 8-byte bucket value read atomically (big-endian)
+     * @param bucketValue The 8-byte bucket window (big-endian)
      * @param slot        The slot within the bucket (0-3)
      * @return The fingerprint value (0 if empty)
      */
@@ -853,13 +1004,35 @@ public class CuckooFilter {
      * are restored to their original positions. This guarantees that no existing
      * item is lost due to a failed insertion attempt.
      *
-     * @param bucket1     First bucket index for the item
-     * @param bucket2     Second bucket index for the item
+     * <h3>Reader Visibility</h3>
+     * <p>Between two iterations the victim is held only in a local variable, so it is in
+     * neither of its buckets. The whole chain therefore runs under the exclusive side of the
+     * displacement barrier, and readers either validate an optimistic stamp taken outside the
+     * chain or retry under the shared side. When the barrier is released the filter is either
+     * fully updated or fully rolled back - never mid-chain.
+     *
+     * @param bucket1     First bucket index for the item; the chain starts here
      * @param fingerprint Fingerprint to insert
      * @return {@code true} if successful, {@code false} if filter is full
      *         (maxDisplacements exceeded - graceful failure with full rollback)
      */
-    private boolean displace(long bucket1, long bucket2, int fingerprint) {
+    private boolean displace(long bucket1, int fingerprint) {
+        long barrierStamp = displacementBarrier.writeLock();
+        try {
+            return displaceExclusive(bucket1, fingerprint);
+        } finally {
+            displacementBarrier.unlockWrite(barrierStamp);
+        }
+    }
+
+    /**
+     * Runs the displacement chain. The caller must hold the exclusive displacement barrier.
+     *
+     * @param bucket1     Bucket the chain starts from
+     * @param fingerprint Fingerprint to insert
+     * @return {@code true} if successful, {@code false} after a full rollback
+     */
+    private boolean displaceExclusive(long bucket1, int fingerprint) {
         // Track displacement path for rollback if needed
         // Each entry: [bucketIndex, slot, originalFingerprint]
         long[] pathBuckets = new long[maxDisplacements];
@@ -875,13 +1048,16 @@ public class CuckooFilter {
             // This is crucial: each fingerprint has its own pair of buckets
             long altBucket = computeBucket2(currentBucket, currentFingerprint);
 
-            // Lock both buckets to prevent deadlock
-            long first = Math.min(currentBucket, altBucket);
-            long second = Math.max(currentBucket, altBucket);
+            // Order the two acquisitions by LOCK STRIPE, not by bucket index. Stripes are
+            // bucketIndex % 64, so bucket order and stripe order disagree as soon as there
+            // are more than 64 buckets, and ordering by bucket index lets two threads take
+            // the same pair of stripes in opposite orders (ABBA deadlock).
+            ReentrantLock firstLock = locks[Math.min(stripeOf(currentBucket), stripeOf(altBucket))];
+            ReentrantLock secondLock = locks[Math.max(stripeOf(currentBucket), stripeOf(altBucket))];
 
-            acquireLock(first);
+            firstLock.lock();
             try {
-                acquireLock(second);
+                secondLock.lock(); // Reentrant when both buckets share a stripe
                 try {
                     // First, try to find an empty slot in current bucket
                     for (int slot = 0; slot < FINGERPRINTS_PER_BUCKET; slot++) {
@@ -893,7 +1069,7 @@ public class CuckooFilter {
                     }
 
                     // No empty slot - need to displace a victim
-                    int victimSlot = (int) (System.nanoTime() % FINGERPRINTS_PER_BUCKET);
+                    int victimSlot = nextVictimSlot();
                     int victimFingerprint = readFingerprint(currentBucket, victimSlot);
 
                     if (victimFingerprint == 0) {
@@ -918,10 +1094,10 @@ public class CuckooFilter {
                     currentFingerprint = victimFingerprint;
 
                 } finally {
-                    releaseLock(second);
+                    secondLock.unlock();
                 }
             } finally {
-                releaseLock(first);
+                firstLock.unlock();
             }
         }
 
@@ -946,12 +1122,39 @@ public class CuckooFilter {
     }
 
     /**
+     * Picks the slot whose fingerprint is kicked out next.
+     *
+     * <p>Advances a SplitMix64 state seeded from the filter seed. The caller must hold the
+     * exclusive displacement barrier, which serialises every chain and publishes the state
+     * update to the next chain.</p>
+     *
+     * @return A slot index in [0, FINGERPRINTS_PER_BUCKET)
+     */
+    private int nextVictimSlot() {
+        long z = (victimSelectionState += 0x9E3779B97F4A7C15L);
+        z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+        z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+        z = z ^ (z >>> 31);
+        return (int) ((z >>> 1) % FINGERPRINTS_PER_BUCKET);
+    }
+
+    /**
+     * Maps a bucket to its lock stripe.
+     *
+     * @param bucketIndex The bucket index
+     * @return The stripe index in [0, 64)
+     */
+    private static int stripeOf(long bucketIndex) {
+        return (int) (bucketIndex % 64);
+    }
+
+    /**
      * Acquires the striped lock for a bucket.
      *
      * @param bucketIndex The bucket index
      */
     private void acquireLock(long bucketIndex) {
-        locks[(int) (bucketIndex % 64)].lock();
+        locks[stripeOf(bucketIndex)].lock();
     }
 
     /**
@@ -960,7 +1163,7 @@ public class CuckooFilter {
      * @param bucketIndex The bucket index
      */
     private void releaseLock(long bucketIndex) {
-        locks[(int) (bucketIndex % 64)].unlock();
+        locks[stripeOf(bucketIndex)].unlock();
     }
 
     /**

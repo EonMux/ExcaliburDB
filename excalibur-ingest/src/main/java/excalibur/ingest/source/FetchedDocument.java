@@ -1,5 +1,8 @@
 package excalibur.ingest.source;
 
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.Objects;
 
 /**
@@ -23,6 +26,7 @@ public final class FetchedDocument {
     private final String documentId;
     private final byte[] content;
     private final String contentType;
+    private final Charset charset;
     private final long lastModifiedMillis;
 
     /**
@@ -35,6 +39,27 @@ public final class FetchedDocument {
      * @throws IllegalArgumentException if documentId is null or empty, or content is null
      */
     public FetchedDocument(String documentId, byte[] content, String contentType, long lastModifiedMillis) {
+        this(documentId, content, contentType, StandardCharsets.UTF_8, lastModifiedMillis);
+    }
+
+    /**
+     * Creates a new FetchedDocument with the encoding its bytes are in.
+     *
+     * <p>The source knows the encoding - an HTTP {@code Content-Type} names it, a file may carry
+     * a byte-order mark - and nothing downstream can recover it once the bytes are separated from
+     * it. Decoding as UTF-8 regardless does not fail on a windows-1252 page: it substitutes
+     * U+FFFD for every non-ASCII byte, so the terms indexed and the embeddings computed from them
+     * are silently wrong and the document cannot be found by its own words.</p>
+     *
+     * @param documentId        Unique identifier for this document (non-null, non-empty)
+     * @param content           Raw byte content of the document (defensively copied)
+     * @param contentType       MIME type (e.g., "text/plain", "text/html")
+     * @param charset           The encoding {@code content} is in; UTF-8 when null
+     * @param lastModifiedMillis Last modification timestamp in epoch millis (0 if unknown)
+     * @throws IllegalArgumentException if documentId is null or empty, or content is null
+     */
+    public FetchedDocument(String documentId, byte[] content, String contentType,
+                           Charset charset, long lastModifiedMillis) {
         if (documentId == null || documentId.isEmpty()) {
             throw new IllegalArgumentException("Document ID must be non-null and non-empty");
         }
@@ -44,6 +69,7 @@ public final class FetchedDocument {
         this.documentId = documentId;
         this.content = content.clone();
         this.contentType = contentType != null ? contentType : "application/octet-stream";
+        this.charset = charset != null ? charset : StandardCharsets.UTF_8;
         this.lastModifiedMillis = Math.max(0, lastModifiedMillis);
     }
 
@@ -98,6 +124,27 @@ public final class FetchedDocument {
     }
 
     /**
+     * Returns the encoding the content bytes are in.
+     *
+     * @return The charset (never null; UTF-8 when the source did not declare one)
+     */
+    public Charset getCharset() {
+        return charset;
+    }
+
+    /**
+     * Returns the content decoded with the encoding the source declared.
+     *
+     * <p>The one place the bytes become text, so no consumer has to assume an encoding the
+     * source already told us.</p>
+     *
+     * @return The decoded text
+     */
+    public String getText() {
+        return new String(content, charset);
+    }
+
+    /**
      * Returns the last modification timestamp.
      *
      * @return Epoch milliseconds since 1970-01-01T00:00:00Z, or 0 if unknown
@@ -126,7 +173,7 @@ public final class FetchedDocument {
         if (contentType == null) {
             return false;
         }
-        String lower = contentType.toLowerCase();
+        String lower = contentType.toLowerCase(Locale.ROOT);
         return lower.startsWith("text/") ||
                lower.equals("application/json") ||
                lower.equals("application/xml") ||
@@ -143,12 +190,13 @@ public final class FetchedDocument {
         return lastModifiedMillis == that.lastModifiedMillis &&
                Objects.equals(documentId, that.documentId) &&
                Objects.equals(contentType, that.contentType) &&
+               Objects.equals(charset, that.charset) &&
                java.util.Arrays.equals(content, that.content);
     }
 
     @Override
     public int hashCode() {
-        int result = Objects.hash(documentId, contentType, lastModifiedMillis);
+        int result = Objects.hash(documentId, contentType, charset, lastModifiedMillis);
         result = 31 * result + java.util.Arrays.hashCode(content);
         return result;
     }
@@ -159,6 +207,7 @@ public final class FetchedDocument {
                "documentId='" + documentId + '\'' +
                ", contentLength=" + content.length +
                ", contentType='" + contentType + '\'' +
+               ", charset=" + charset +
                ", lastModifiedMillis=" + lastModifiedMillis +
                '}';
     }

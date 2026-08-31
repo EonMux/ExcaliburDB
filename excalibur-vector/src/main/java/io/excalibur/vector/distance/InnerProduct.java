@@ -109,6 +109,17 @@ public final class InnerProduct implements DistanceFunction {
         return INSTANCE;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Inner product is a similarity: larger values indicate more similar
+     * vectors, so larger values are closer.</p>
+     */
+    @Override
+    public Ordering ordering() {
+        return Ordering.LARGER_IS_CLOSER;
+    }
+
     @Override
     public String name() {
         return "inner_product";

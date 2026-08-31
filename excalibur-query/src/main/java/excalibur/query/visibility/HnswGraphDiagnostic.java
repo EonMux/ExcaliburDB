@@ -1,6 +1,5 @@
 package excalibur.query.visibility;
 
-import io.excalibur.store.log.WriteLog;
 import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.HnswInvariantVerifier;
 import io.excalibur.vector.hnsw.HnswSearchResult;
@@ -30,7 +29,7 @@ import java.util.Set;
  * <pre>{@code
  * // Run full diagnostic
  * GraphDiagnosticResult result = HnswGraphDiagnostic.runFullDiagnostic(
- *     graph, writeLog, writeLogHead
+ *     graph, writeLogHead
  * );
  *
  * // Check for issues
@@ -239,13 +238,11 @@ public final class HnswGraphDiagnostic {
      * </ol>
      *
      * @param graph The HNSW graph to diagnose
-     * @param writeLog The write log (may be null for basic checks)
      * @param writeLogHead Current write log head position
      * @return Diagnostic result with issues list
      */
     public static GraphDiagnosticResult runFullDiagnostic(
             HnswGraph graph,
-            WriteLog writeLog,
             long writeLogHead) {
 
         List<GraphDiagnosticIssue> issues = new ArrayList<>();
@@ -341,19 +338,35 @@ public final class HnswGraphDiagnostic {
             HnswInvariantVerifier.verifyAllInvariants(graph);
 
         if (!invariantResult.isValid()) {
+            // Count the violations first, then report each kind once. Reporting inside the
+            // loop emitted one issue per violation, each quoting the running count, so a
+            // graph with N unidirectional edges produced N issues claiming 1, 2, ... N.
             int unidirectionalEdges = 0;
+            List<String> otherViolations = new ArrayList<>();
+
             for (String violation : invariantResult.violations()) {
                 if (violation.contains("unidirectional")) {
                     unidirectionalEdges++;
+                } else {
+                    otherViolations.add(violation);
                 }
-                // Only add as warning since some unidirectional edges can occur during concurrent updates
-                if (unidirectionalEdges > 0) {
-                    issues.add(GraphDiagnosticIssue.warning(
-                        "UNIDIRECTIONAL_EDGES",
-                        "Found " + unidirectionalEdges + " unidirectional edges",
-                        "This may be temporary during concurrent updates. If persistent, check edge management."
-                    ));
-                }
+            }
+
+            // Only a warning: some unidirectional edges can occur during concurrent updates
+            if (unidirectionalEdges > 0) {
+                issues.add(GraphDiagnosticIssue.warning(
+                    "UNIDIRECTIONAL_EDGES",
+                    "Found " + unidirectionalEdges + " unidirectional edges",
+                    "This may be temporary during concurrent updates. If persistent, check edge management."
+                ));
+            }
+
+            for (String violation : otherViolations) {
+                issues.add(GraphDiagnosticIssue.warning(
+                    "INVARIANT_VIOLATION",
+                    "Graph invariant violated: " + violation,
+                    "Inspect the graph's insertion and pruning paths."
+                ));
             }
         }
 

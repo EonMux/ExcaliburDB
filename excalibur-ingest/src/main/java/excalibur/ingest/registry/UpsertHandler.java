@@ -10,10 +10,11 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.locks.Lock;
-import java.util.function.Consumer;
+import java.util.Set;
 
 /**
  * Handles document upsert operations including tombstoning old versions and
@@ -27,29 +28,35 @@ import java.util.function.Consumer;
  *   <li><strong>New documents:</strong> Chunk, embed, and insert (delegated to ingestion pipeline)</li>
  * </ul>
  *
- * <h2>Cuckoo Filter Hierarchy Deletion (CRITICAL)</h2>
- * <p>When a document is tombstoned (changed or deleted), its chunk entries are immediately
- * removed from all levels of the Cuckoo filter hierarchy:
+ * <h2>Why Tombstoning Does Not Touch the Cuckoo Filter Hierarchy</h2>
+ * <p>The filter hierarchy is a <em>term</em> index, not a chunk index:
+ * {@code DocumentBatchPublisher.insertIntoFilters} extracts terms from each chunk's text and
+ * inserts one entry per term. Removing a document's entries from it is unsound in two separate
+ * ways, so this handler deliberately does not attempt it.</p>
  * <ol>
- *   <li>Segment filter (leaf level) - exact location of the chunk</li>
- *   <li>Cluster filter (intermediate level) - topic/cluster group</li>
- *   <li>Corpus filter (root level) - entire corpus membership</li>
+ *   <li><strong>Chunk ids were never inserted.</strong> A Cuckoo filter delete searches the two
+ *       candidate buckets for a matching fingerprint and clears the first slot that matches,
+ *       with no key comparison. Deleting a key that was never inserted therefore evicts an
+ *       unrelated term whose fingerprint happens to collide, at every level of the hierarchy.</li>
+ *   <li><strong>Terms are shared.</strong> Even deleting the correct term keys would be wrong:
+ *       a term is almost always present in other live documents of the same segment, and the
+ *       filter has no reference counts.</li>
  * </ol>
- * <p>This ensures that queries issued after the tombstone epoch tick will not consider 
- * the entry as a candidate. Deletion is immediate and propagation is synchronous to 
- * prevent stale false positives.</p>
+ * <p>An entry left behind is a false positive, which costs one extra segment scan that finds
+ * nothing. An entry wrongly removed is a false negative, and the query pipeline treats filter
+ * negatives as ground truth - it prunes the segment and returns no results for that term, for
+ * every document, permanently. The storage tombstone is the source of truth; segment filters are
+ * rebuilt when the segment is compacted.</p>
  *
  * <h2>Thread Safety</h2>
- * <p>This class is thread-safe. All operations that modify storage or filters are performed
- * atomically. The handler uses write locks to ensure consistency during tombstone operations.</p>
+ * <p>This class is thread-safe. All operations that modify storage are performed atomically.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Chunk IDs are converted to UTF-8 bytes for storage operations</li>
  *   <li>Tombstone operations are idempotent (safe to call multiple times)</li>
- *   <li>Cuckoo filter deletions are exact (no false negatives from deletions)</li>
  *   <li>Errors during tombstoning are collected and reported, not thrown</li>
- *   <li>Hierarchical deletion removes from ALL levels: segment → cluster → corpus</li>
+ *   <li>Re-indexing tombstones only the chunk ids the new version did not overwrite</li>
  * </ul>
  *
  * @see ChangeSet
@@ -230,6 +237,70 @@ public class UpsertHandler {
     }
 
     /**
+     * Tombstones only the documents that disappeared from the source.
+     *
+     * <p>Re-indexing must not use {@link #processChanges(ChangeSet)}, because that also removes
+     * the previous version of every <em>changed</em> document before its replacement has been
+     * fetched and embedded. If the replacement then fails - the embedding endpoint is down, the
+     * circuit breaker is open, the fetch throws - the document is left absent in both its old and
+     * its new form, with nothing to restore it. Deletions have no such replacement, so they are
+     * safe to process up front; changed documents are handled by
+     * {@link #tombstoneObsoleteChunks(List, Collection)} after their new version is published.</p>
+     *
+     * @param changeSet The change set whose deletions should be processed
+     * @return Result containing counts of successful operations and any errors
+     * @throws NullPointerException if changeSet is null
+     */
+    public UpsertResult processDeletions(ChangeSet changeSet) {
+        Objects.requireNonNull(changeSet, "changeSet must not be null");
+
+        UpsertResult.Builder result = UpsertResult.builder();
+        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
+            processDeletedDocument(deleted, result);
+        }
+        return result.build();
+    }
+
+    /**
+     * Tombstones the chunks of a document's previous version that its new version did not
+     * overwrite.
+     *
+     * <p>Chunk ids are deterministic ({@code sourceId:documentId:chunk:index}), so re-indexing a
+     * document overwrites chunk 0..n-1 in place. Only the surplus tail - present when the new
+     * version produced fewer chunks than the old one - has to be removed. Tombstoning the whole
+     * old id list after the write would delete the new version's own chunks.</p>
+     *
+     * @param oldChunkIds The chunk ids recorded for the previous version (must not be null)
+     * @param newChunkIds The chunk ids just published for the new version (must not be null)
+     * @return The number of obsolete chunks tombstoned
+     * @throws NullPointerException if either argument is null
+     */
+    public int tombstoneObsoleteChunks(List<String> oldChunkIds, Collection<String> newChunkIds) {
+        Objects.requireNonNull(oldChunkIds, "oldChunkIds must not be null");
+        Objects.requireNonNull(newChunkIds, "newChunkIds must not be null");
+
+        if (storageAdapter == null || oldChunkIds.isEmpty()) {
+            return 0;
+        }
+
+        Set<String> retained = new HashSet<>(newChunkIds);
+        int tombstoned = 0;
+        for (String chunkId : oldChunkIds) {
+            if (retained.contains(chunkId)) {
+                continue;
+            }
+            try {
+                if (storageAdapter.delete(toBytes(chunkId))) {
+                    tombstoned++;
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Failed to tombstone obsolete chunk {}: {}", chunkId, e.getMessage());
+            }
+        }
+        return tombstoned;
+    }
+
+    /**
      * Processes a ChangeSet with segment-aware deletion from the Cuckoo filter hierarchy.
      *
      * <p>This method is preferred when using a hierarchical Cuckoo filter because it
@@ -264,10 +335,32 @@ public class UpsertHandler {
     }
 
     /**
+     * Tombstones only the deleted documents in a change set, with segment context.
+     *
+     * <p>The segment-aware sibling of {@link #processDeletions(ChangeSet)}; see that method for
+     * why re-indexing must not tombstone changed documents up front.</p>
+     *
+     * @param changeSet The change set whose deletions should be processed
+     * @param segmentId The segment the document's chunks were written to
+     * @return Result containing counts of successful operations and any errors
+     * @throws NullPointerException if changeSet or segmentId is null
+     */
+    public UpsertResult processDeletionsWithSegment(ChangeSet changeSet, String segmentId) {
+        Objects.requireNonNull(changeSet, "changeSet must not be null");
+        Objects.requireNonNull(segmentId, "segmentId must not be null");
+
+        UpsertResult.Builder result = UpsertResult.builder();
+        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
+            processDeletedDocumentWithSegment(deleted, segmentId, result);
+        }
+        return result.build();
+    }
+
+    /**
      * Tombstones chunks for a single changed document.
      *
-     * <p>The old chunks are tombstoned and removed from the Cuckoo filter.
-     * The metadata remains in the registry for update after re-indexing.</p>
+     * <p>The old chunks are tombstoned in storage. The metadata remains in the registry for
+     * update after re-indexing.</p>
      *
      * @param changed The changed document information
      * @param resultBuilder The result builder to record operations
@@ -277,43 +370,30 @@ public class UpsertHandler {
         String documentId = changed.getDocumentId();
         DocumentMetadata oldMetadata = changed.getOldMetadata();
         
-        for (String chunkId : oldMetadata.getChunkIds()) {
-            boolean storageDeleted = false;
-            boolean filterDeleted = false;
-            
-            // Tombstone in storage
-            if (storageAdapter != null) {
-                try {
-                    storageDeleted = storageAdapter.delete(toBytes(chunkId));
-                } catch (Exception e) {
-                    resultBuilder.addError("storage", chunkId, e.getMessage());
-                }
-            }
-            
-            // Remove from Cuckoo filter
-            if (cuckooFilter != null) {
-                try {
-                    filterDeleted = cuckooFilter.delete(toBytes(chunkId));
-                } catch (Exception e) {
-                    resultBuilder.addError("filter", chunkId, e.getMessage());
-                }
-            }
+        tombstoneChunks(oldMetadata.getChunkIds(), resultBuilder);
+        resultBuilder.incrementDocumentsChanged();
+    }
 
-            // Remove from Hierarchical Cuckoo filter (searches all segments)
-            if (!filterDeleted && hierarchicalFilter != null) {
-                try {
-                    filterDeleted = hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId));
-                } catch (Exception e) {
-                    resultBuilder.addError("hierarchical-filter", chunkId, e.getMessage());
-                }
-            }
-
-            if (storageDeleted || filterDeleted) {
-                resultBuilder.incrementChunksTombstoned();
-            }
+    /**
+     * Tombstones every chunk id in storage, recording one error per failure.
+     *
+     * <p>The Cuckoo filter hierarchy is deliberately left untouched; see the class javadoc.</p>
+     */
+    private void tombstoneChunks(List<String> chunkIds, UpsertResult.Builder resultBuilder) {
+        if (storageAdapter == null) {
+            return;
         }
 
-        resultBuilder.incrementDocumentsChanged();
+        for (String chunkId : chunkIds) {
+            try {
+                if (storageAdapter.delete(toBytes(chunkId))) {
+                    resultBuilder.incrementChunksTombstoned();
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Failed to tombstone chunk {}: {}", chunkId, e.getMessage());
+                resultBuilder.addError("storage", chunkId, e.getMessage());
+            }
+        }
     }
 
     /**
@@ -330,41 +410,7 @@ public class UpsertHandler {
         String sourceId = metadata.getSourceId();
         String documentId = metadata.getDocumentId();
         
-        for (String chunkId : metadata.getChunkIds()) {
-            boolean storageDeleted = false;
-            boolean filterDeleted = false;
-            
-            // Tombstone in storage
-            if (storageAdapter != null) {
-                try {
-                    storageDeleted = storageAdapter.delete(toBytes(chunkId));
-                } catch (Exception e) {
-                    resultBuilder.addError("storage", chunkId, e.getMessage());
-                }
-            }
-            
-            // Remove from Cuckoo filter
-            if (cuckooFilter != null) {
-                try {
-                    filterDeleted = cuckooFilter.delete(toBytes(chunkId));
-                } catch (Exception e) {
-                    resultBuilder.addError("filter", chunkId, e.getMessage());
-                }
-            }
-
-            // Remove from Hierarchical Cuckoo filter (searches all segments)
-            if (!filterDeleted && hierarchicalFilter != null) {
-                try {
-                    filterDeleted = hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId));
-                } catch (Exception e) {
-                    resultBuilder.addError("hierarchical-filter", chunkId, e.getMessage());
-                }
-            }
-
-            if (storageDeleted || filterDeleted) {
-                resultBuilder.incrementChunksTombstoned();
-            }
-        }
+        tombstoneChunks(metadata.getChunkIds(), resultBuilder);
 
         // Remove from registry
         registry.remove(sourceId, documentId);
@@ -391,28 +437,9 @@ public class UpsertHandler {
         DocumentMetadata oldMetadata = changed.getOldMetadata();
 
         for (String chunkId : oldMetadata.getChunkIds()) {
-            boolean storageDeleted = false;
-            boolean filterDeleted = false;
-
-            // Tombstone in storage
-            if (storageAdapter != null) {
-                try {
-                    storageDeleted = storageAdapter.delete(toBytes(chunkId));
-                } catch (Exception e) {
-                    resultBuilder.addError("storage", chunkId, e.getMessage());
-                }
-            }
-
-            // Remove from Cuckoo filter hierarchy (ALL levels)
-            filterDeleted = deleteFromFilterHierarchy(chunkId, segmentId);
-
-            // Remove from LSH index if available
             removeEntryFromLshIndex(chunkId, segmentId, resultBuilder);
-
-            if (storageDeleted || filterDeleted) {
-                resultBuilder.incrementChunksTombstoned();
-            }
         }
+        tombstoneChunks(oldMetadata.getChunkIds(), resultBuilder);
 
         resultBuilder.incrementDocumentsChanged();
     }
@@ -434,70 +461,13 @@ public class UpsertHandler {
         String documentId = metadata.getDocumentId();
         
         for (String chunkId : metadata.getChunkIds()) {
-            boolean storageDeleted = false;
-            boolean filterDeleted = false;
-            
-            // Tombstone in storage
-            if (storageAdapter != null) {
-                try {
-                    storageDeleted = storageAdapter.delete(toBytes(chunkId));
-                } catch (Exception e) {
-                    resultBuilder.addError("storage", chunkId, e.getMessage());
-                }
-            }
-            
-            // Remove from Cuckoo filter hierarchy (ALL levels)
-            filterDeleted = deleteFromFilterHierarchy(chunkId, segmentId);
-            
-            if (storageDeleted || filterDeleted) {
-                resultBuilder.incrementChunksTombstoned();
-            }
+            removeEntryFromLshIndex(chunkId, segmentId, resultBuilder);
         }
-        
+        tombstoneChunks(metadata.getChunkIds(), resultBuilder);
+
         // Remove from registry
         registry.remove(sourceId, documentId);
         resultBuilder.incrementDocumentsDeleted();
-    }
-
-    /**
-     * Deletes a chunk from the Cuckoo filter hierarchy immediately.
-     *
-     * <p><strong>CRITICAL:</strong> This method removes the entry from ALL levels:
-     * <ol>
-     *   <li>Segment filter (leaf level)</li>
-     *   <li>Cluster filter (intermediate level)</li>
-     *   <li>Corpus filter (root level)</li>
-     * </ol>
-     *
-     * <p>This ensures queries issued after deletion will not have stale false positives
-     * from the deleted entry.</p>
-     *
-     * @param chunkId The chunk ID to delete
-     * @param segmentId The segment ID where the chunk was stored
-     * @return true if deleted from at least one filter level
-     */
-    private boolean deleteFromFilterHierarchy(String chunkId, String segmentId) {
-        boolean deleted = false;
-        
-        // Prefer hierarchical filter if available
-        if (hierarchicalFilter != null) {
-            try {
-                deleted = hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId), segmentId);
-            } catch (Exception e) {
-                // Log but continue - storage tombstone is the source of truth
-            }
-        }
-        
-        // Fall back to flat filter if hierarchical deletion failed or not available
-        if (!deleted && cuckooFilter != null) {
-            try {
-                deleted = cuckooFilter.delete(toBytes(chunkId));
-            } catch (Exception e) {
-                // Log but continue
-            }
-        }
-        
-        return deleted;
     }
 
     /**
@@ -507,28 +477,12 @@ public class UpsertHandler {
      * of the normal change detection flow.</p>
      *
      * @param chunkId The chunk ID to tombstone
-     * @return true if tombstoning succeeded in either storage or filter
+     * @return true if the chunk was present in storage and removed
      */
     public boolean tombstoneChunk(String chunkId) {
         Objects.requireNonNull(chunkId, "chunkId must not be null");
 
-        boolean storageDeleted = false;
-        boolean filterDeleted = false;
-
-        if (storageAdapter != null) {
-            storageDeleted = storageAdapter.delete(toBytes(chunkId));
-        }
-
-        if (cuckooFilter != null) {
-            filterDeleted = cuckooFilter.delete(toBytes(chunkId));
-        }
-
-        // Remove from Hierarchical Cuckoo filter (searches all segments)
-        if (!filterDeleted && hierarchicalFilter != null) {
-            filterDeleted = hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId));
-        }
-
-        return storageDeleted || filterDeleted;
+        return storageAdapter != null && storageAdapter.delete(toBytes(chunkId));
     }
 
     /**
@@ -553,61 +507,30 @@ public class UpsertHandler {
     }
 
     /**
-     * Removes a chunk from the Cuckoo filter only (without storage tombstone).
+     * Tombstones a single chunk by ID, also removing it from the segment's LSH index.
      *
-     * <p>This is useful when the chunk has already been tombstoned in storage
-     * but the filter entry was missed.</p>
-     *
-     * @param chunkId The chunk ID to remove from filter
-     * @return true if removed from filter
-     */
-    public boolean removeFromFilter(String chunkId) {
-        Objects.requireNonNull(chunkId, "chunkId must not be null");
-
-        if (hierarchicalFilter != null) {
-            return hierarchicalFilter.deleteFromHierarchy(toBytes(chunkId));
-        }
-
-        if (cuckooFilter != null) {
-            return cuckooFilter.delete(toBytes(chunkId));
-        }
-
-        return false;
-    }
-
-    /**
-     * Tombstones a single chunk by ID with segment-aware hierarchical deletion.
-     *
-     * <p><strong>CRITICAL:</strong> This method deletes from ALL levels of the Cuckoo filter
-     * hierarchy immediately: segment filter → cluster filter → corpus filter.</p>
+     * <p>The Cuckoo filter hierarchy is deliberately left untouched; see the class javadoc.</p>
      *
      * @param chunkId The chunk ID to tombstone
-     * @param segmentId The segment ID for hierarchical filter deletion
-     * @return true if tombstoning succeeded in either storage or filter
+     * @param segmentId The segment the chunk was written to
+     * @return true if the chunk was present in storage and removed
      * @throws NullPointerException if chunkId or segmentId is null
      */
     public boolean tombstoneChunk(String chunkId, String segmentId) {
         Objects.requireNonNull(chunkId, "chunkId must not be null");
         Objects.requireNonNull(segmentId, "segmentId must not be null");
-        
-        boolean storageDeleted = false;
-        if (storageAdapter != null) {
-            storageDeleted = storageAdapter.delete(toBytes(chunkId));
-        }
-        
-        boolean filterDeleted = deleteFromFilterHierarchy(chunkId, segmentId);
-        
-        return storageDeleted || filterDeleted;
+
+        UpsertResult.Builder discarded = UpsertResult.builder();
+        removeEntryFromLshIndex(chunkId, segmentId, discarded);
+
+        return storageAdapter != null && storageAdapter.delete(toBytes(chunkId));
     }
 
     /**
-     * Tombstones multiple chunks in batch with segment-aware hierarchical deletion.
-     *
-     * <p><strong>CRITICAL:</strong> This method deletes from ALL levels of the Cuckoo filter
-     * hierarchy immediately for each chunk.</p>
+     * Tombstones multiple chunks in batch, also removing them from the segment's LSH index.
      *
      * @param chunkIds The chunk IDs to tombstone
-     * @param segmentId The segment ID for hierarchical filter deletion
+     * @param segmentId The segment the chunks were written to
      * @return Count of successfully tombstoned chunks
      * @throws NullPointerException if chunkIds or segmentId is null
      */
@@ -622,27 +545,6 @@ public class UpsertHandler {
             }
         }
         return successCount;
-    }
-
-    /**
-     * Removes a chunk from the Cuckoo filter hierarchy immediately (without storage tombstone).
-     *
-     * <p><strong>CRITICAL:</strong> This method deletes from ALL levels of the hierarchy:
-     * segment filter → cluster filter → corpus filter.</p>
-     *
-     * <p>Use this when the chunk has already been tombstoned in storage but the
-     * filter entries were missed at some hierarchy level.</p>
-     *
-     * @param chunkId The chunk ID to remove from filter
-     * @param segmentId The segment ID for hierarchical deletion
-     * @return true if removed from at least one filter level
-     * @throws NullPointerException if chunkId or segmentId is null
-     */
-    public boolean removeFromFilterHierarchy(String chunkId, String segmentId) {
-        Objects.requireNonNull(chunkId, "chunkId must not be null");
-        Objects.requireNonNull(segmentId, "segmentId must not be null");
-        
-        return deleteFromFilterHierarchy(chunkId, segmentId);
     }
 
     /**

@@ -50,6 +50,77 @@ class DocumentReindexerTest {
     }
 
     @Nested
+    @DisplayName("Change detection after a partial failure")
+    class PartialFailureTests {
+
+        private static final String SOURCE = "test-source";
+        private static final String DOCUMENT = "partial-doc";
+
+        private FetchedDocument documentOf(String content) {
+            return new FetchedDocument(DOCUMENT, content.getBytes(StandardCharsets.UTF_8),
+                "text/plain", System.currentTimeMillis());
+        }
+
+        @Test
+        @DisplayName("a document whose chunks partly failed is not recorded as indexed")
+        void partialFailureLeavesTheDocumentChanged() {
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+
+            FetchedDocument fetched = documentOf("This is a test document. ".repeat(400));
+            // Enough text for several chunks; the embedder gives up after the second.
+            llmClient.setFailAfterCalls(2);
+
+            DocumentReindexer.DocumentResult result =
+                reindexer.reindexDocument(SOURCE, DOCUMENT, fetched);
+
+            assertTrue(result.getTotalChunks() > 2, "the document must chunk more than twice");
+            assertTrue(result.getFailedChunks() > 0);
+            // The registry entry is what change detection compares against. Recording the new
+            // content hash beside an incomplete chunk list makes the document read as unchanged
+            // for good, so the chunks that failed are never retried.
+            assertFalse(registry.contains(SOURCE, DOCUMENT),
+                "a partially indexed document must not be recorded as indexed");
+        }
+
+        @Test
+        @DisplayName("a document whose chunks all failed leaves the previous entry intact")
+        void totalFailureKeepsThePreviousEntry() {
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+
+            FetchedDocument first = documentOf("Original content. ".repeat(100));
+            reindexer.reindexDocument(SOURCE, DOCUMENT, first);
+            DocumentMetadata indexed = registry.get(SOURCE, DOCUMENT);
+            assertNotNull(indexed);
+
+            llmClient.setFailMode(true);
+            FetchedDocument second = documentOf("Replacement content. ".repeat(100));
+            DocumentReindexer.DocumentResult result =
+                reindexer.reindexDocument(SOURCE, DOCUMENT, second);
+
+            assertEquals(0, result.getSuccessfulChunks());
+            assertEquals(indexed.getContentHash(), registry.get(SOURCE, DOCUMENT).getContentHash(),
+                "the failed run must not replace the hash the next run compares against");
+            assertTrue(registry.get(SOURCE, DOCUMENT).getChunkCount() > 0,
+                "the entry must keep naming the chunks that are actually in storage");
+        }
+
+        @Test
+        @DisplayName("a fully successful document is still recorded")
+        void completeSuccessIsRecorded() {
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+
+            DocumentReindexer.DocumentResult result = reindexer.reindexDocument(
+                SOURCE, DOCUMENT, documentOf("Complete content. ".repeat(100)));
+
+            assertEquals(0, result.getFailedChunks());
+            assertTrue(registry.contains(SOURCE, DOCUMENT));
+        }
+    }
+
+    @Nested
     @DisplayName("Single Document Re-indexing")
     class SingleDocumentTests {
 
@@ -145,8 +216,11 @@ class DocumentReindexerTest {
             DocumentMetadata metadata = registry.get("test-source", "doc-chunks");
             assertNotNull(metadata);
             
+            // Chunk ids are source-qualified: excalibur-shard strips the ":chunk:N" suffix to
+            // recover the document key the visibility tracker was registered under, so the
+            // source id has to be part of the key the reindexer writes.
             for (int i = 0; i < metadata.getChunkCount(); i++) {
-                String expectedChunkId = "doc-chunks:chunk:" + i;
+                String expectedChunkId = "test-source:doc-chunks:chunk:" + i;
                 assertTrue(metadata.getChunkIds().contains(expectedChunkId),
                     "Should contain chunk ID: " + expectedChunkId);
             }
@@ -444,17 +518,27 @@ class DocumentReindexerTest {
     @DisplayName("Cuckoo Filter Integration")
     class CuckooFilterTests {
 
+        /**
+         * Re-indexing must not delete anything from the Cuckoo filter.
+         *
+         * <p>The filter holds one entry per <em>term</em>, never a chunk id, and a Cuckoo delete
+         * clears the first slot whose fingerprint matches without comparing keys. Deleting a
+         * chunk id therefore evicts whichever term collides with it, and the query pipeline
+         * treats a filter negative as ground truth - it would prune the segment for that term
+         * permanently, for every document. A surviving entry is only a false positive, which
+         * costs one scan that finds nothing.</p>
+         */
         @Test
-        @DisplayName("Should remove old chunks from Cuckoo filter on change")
-        void testCuckooFilterDeletion() throws SourceException {
+        @DisplayName("Should leave the term filter untouched when a document changes")
+        void testCuckooFilterUntouchedOnChange() throws SourceException {
             DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient, 
                 upsertHandler, registry, storageWriter);
-            
-            String oldChunkId = "old-doc:chunk:0";
-            byte[] oldChunkBytes = oldChunkId.getBytes(StandardCharsets.UTF_8);
-            cuckooFilter.insert(oldChunkBytes);
-            assertTrue(cuckooFilter.contains(oldChunkBytes));
-            
+
+            byte[] termBytes = "content".getBytes(StandardCharsets.UTF_8);
+            cuckooFilter.insert(termBytes);
+            assertTrue(cuckooFilter.contains(termBytes));
+
+            String oldChunkId = "test-source:old-doc:chunk:0";
             DocumentMetadata oldMetadata = DocumentMetadata.builder()
                 .sourceId("test-source")
                 .documentId("old-doc")
@@ -468,9 +552,41 @@ class DocumentReindexerTest {
             source.addDocument("old-doc", "Updated content. ".repeat(50));
             
             reindexer.reindexAll(source);
-            
-            assertFalse(cuckooFilter.contains(oldChunkBytes),
-                "Old chunk should be removed from Cuckoo filter");
+
+            assertTrue(cuckooFilter.contains(termBytes),
+                "A term shared with live documents must survive a re-index");
+        }
+
+        @Test
+        @DisplayName("Should tombstone the surplus chunks of the previous version")
+        void testSurplusChunksTombstoned() throws SourceException {
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+
+            // A previous version with far more chunks than the new one will produce.
+            DocumentMetadata.Builder oldMetadata = DocumentMetadata.builder()
+                .sourceId("test-source")
+                .documentId("old-doc")
+                .contentHash(111L)
+                .contentLength(100);
+            for (int i = 0; i < 20; i++) {
+                oldMetadata.addChunkId("test-source:old-doc:chunk:" + i);
+            }
+            registry.register(oldMetadata.build());
+
+            MockSource source = new MockSource("test-source");
+            source.addDocument("old-doc", "Short.");
+
+            reindexer.reindexAll(source);
+
+            DocumentMetadata current = registry.get("test-source", "old-doc");
+            assertNotNull(current);
+            assertTrue(current.getChunkCount() < 20,
+                "The new version should be shorter than the one it replaces");
+            for (int i = current.getChunkCount(); i < 20; i++) {
+                assertTrue(storageWriter.isDeleted("test-source:old-doc:chunk:" + i),
+                    "Surplus chunk " + i + " of the previous version should be tombstoned");
+            }
         }
     }
 
@@ -534,6 +650,7 @@ class DocumentReindexerTest {
         private final int dimension;
         private int embeddingCallCount = 0;
         private boolean failMode = false;
+        private int failAfterCalls = -1;
 
         MockLLMClient(int dimension) {
             super(LLMClientConfig.builder()
@@ -553,6 +670,14 @@ class DocumentReindexerTest {
             this.failMode = fail;
         }
 
+        /**
+         * Succeeds for the first {@code calls} embeddings and fails after that, so a document
+         * can be made to chunk partially - the case a whole-run failure switch cannot produce.
+         */
+        void setFailAfterCalls(int calls) {
+            this.failAfterCalls = calls;
+        }
+
         int getEmbeddingCallCount() {
             return embeddingCallCount;
         }
@@ -560,6 +685,10 @@ class DocumentReindexerTest {
         @Override
         public float[] generateEmbedding(String text, String correlationId) {
             embeddingCallCount++;
+            if (failAfterCalls >= 0 && embeddingCallCount > failAfterCalls) {
+                throw new LLMException("Mock embedding failure after " + failAfterCalls + " calls",
+                    LLMException.ErrorType.NETWORK);
+            }
             if (failMode) {
                 throw new LLMException("Mock embedding failure",
                     LLMException.ErrorType.NETWORK);
@@ -577,8 +706,16 @@ class DocumentReindexerTest {
                                                        UpsertHandler.StorageAdapter {
         private final Map<String, String> chunks = new ConcurrentHashMap<>();
         private final Map<String, float[]> embeddings = new ConcurrentHashMap<>();
+        private final Set<String> deletedKeys = ConcurrentHashMap.newKeySet();
         private int writeCount = 0;
         private boolean failMode = false;
+
+        /**
+         * Records every key a tombstone was issued for, whether or not it was present.
+         */
+        boolean isDeleted(String chunkId) {
+            return deletedKeys.contains(chunkId);
+        }
 
         void setFailMode(boolean fail) {
             this.failMode = fail;
@@ -606,6 +743,7 @@ class DocumentReindexerTest {
         @Override
         public boolean delete(byte[] key) {
             String chunkId = new String(key, StandardCharsets.UTF_8);
+            deletedKeys.add(chunkId);
             return chunks.remove(chunkId) != null;
         }
     }

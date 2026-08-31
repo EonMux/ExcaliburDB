@@ -8,12 +8,19 @@ import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import io.excalibur.store.format.SegmentEntry;
+import io.excalibur.core.text.TermExtractor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -110,6 +117,12 @@ public class CuckooMaintenanceWorker {
      */
     private static final int DEFAULT_HIERARCHY_BATCH_SIZE = 100;
 
+    /**
+     * Largest embedding dimension accepted when decoding a stored chunk value.
+     * Guards against treating an unrelated value's leading bytes as a length.
+     */
+    private static final int MAX_VECTOR_DIMENSION = 65536;
+
     // ==================== Instance Fields ====================
 
     private final SegmentCatalog catalog;
@@ -117,6 +130,12 @@ public class CuckooMaintenanceWorker {
     private final MaintenanceListener listener;
     private final CopyOnWriteArrayList<FilterEntry> pendingDeletions;
     private final CopyOnWriteArrayList<SegmentFilter> segmentFilters;
+
+    /**
+     * Segments whose filter entries have already been removed.
+     * A Cuckoo delete is not idempotent, so each tombstoned segment is cleaned once.
+     */
+    private final Set<Long> cleanedTombstonedSegments;
 
     /**
      * Hierarchical Cuckoo filter for corpus → cluster → segment deletion propagation.
@@ -189,6 +208,7 @@ public class CuckooMaintenanceWorker {
         this.listener = listener;
         this.pendingDeletions = new CopyOnWriteArrayList<>();
         this.segmentFilters = new CopyOnWriteArrayList<>();
+        this.cleanedTombstonedSegments = ConcurrentHashMap.newKeySet();
         this.running = new AtomicBoolean(false);
         this.stopped = new AtomicBoolean(false);
         this.totalDeletions = new AtomicLong(0);
@@ -470,9 +490,16 @@ public class CuckooMaintenanceWorker {
     /**
      * Processes tombstoned segments and deletes their filter entries.
      *
-     * <p>This method iterates through all tombstoned segments, collects their keys,
-     * and deletes them from the Cuckoo filter hierarchy. This ensures no stale
-     * false positives from tombstoned entries.</p>
+     * <p>Each tombstoned segment is cleaned <strong>once</strong>: the catalog keeps a
+     * segment in TOMBSTONED until it is purged, so without the processed set below the
+     * same segment would be re-scanned and re-deleted on every cycle for the rest of the
+     * process's life.</p>
+     *
+     * <p>What is deleted are the same items that were inserted. The hierarchy is
+     * populated with extracted terms (the ingestion pipeline inserts
+     * {@code TermExtractor.extractTerms} of each chunk's text and the query pipeline looks
+     * the same terms up), not with storage keys, so the terms are re-derived from each
+     * live entry's chunk text.</p>
      *
      * @return Number of deletions performed
      */
@@ -481,56 +508,139 @@ public class CuckooMaintenanceWorker {
 
         List<Long> tombstoned = catalog.getSegmentsByState(LifecycleState.TOMBSTONED);
         for (Long segmentId : tombstoned) {
-            // Find the filter for this segment
-            SegmentFilter segmentFilter = findSegmentFilter(segmentId);
-
-            int segmentDeletions = 0;
-
-            // Get the actual Segment to iterate entries
-            Segment segment = storageEngine.getSegment(segmentId);
-            if (segment != null) {
-                try (Segment.EntryIterator iter = segment.liveEntries()) {
-                    List<byte[]> keysToDelete = new ArrayList<>();
-                    while (iter.hasNext()) {
-                        SegmentEntry entry = iter.next();
-                        keysToDelete.add(entry.key());
-                    }
-
-                    if (!keysToDelete.isEmpty()) {
-                        // Delete from hierarchical filter if available
-                        if (hierarchicalFilter != null) {
-                            segmentDeletions = hierarchicalFilter.deleteFromHierarchy(
-                                keysToDelete, String.valueOf(segmentId));
-                            LOGGER.debug("Deleted {} entries from hierarchical filter for segment {}",
-                                segmentDeletions, segmentId);
-                        } else if (segmentFilter != null) {
-                            // Fallback: delete from segment filter only
-                            for (byte[] key : keysToDelete) {
-                                if (segmentFilter.filter.delete(key)) {
-                                    segmentDeletions++;
-                                }
-                            }
-                            LOGGER.debug("Deleted {} entries from segment filter for segment {}",
-                                segmentDeletions, segmentId);
-                        }
-                    }
-                } catch (Exception e) {
-                    LOGGER.warn("Error iterating segment {} for filter cleanup: {}",
-                        segmentId, e.getMessage());
-                }
+            if (!cleanedTombstonedSegments.add(segmentId)) {
+                continue; // Already cleaned; a Cuckoo delete is not idempotent.
             }
+
+            int segmentDeletions = cleanTombstonedSegment(segmentId);
 
             // Unregister the filter after cleanup
             unregisterFilter(segmentId);
             tombstonedSegmentsProcessed.incrementAndGet();
             totalDeletions += segmentDeletions;
 
-            LOGGER.info("Processed tombstoned segment {} - {} entries deleted from filter",
+            LOGGER.info("Processed tombstoned segment {} - {} terms deleted from filter",
                 segmentId, segmentDeletions);
             listener.onSegmentFilterCleaned(segmentId);
         }
 
         return totalDeletions;
+    }
+
+    /**
+     * Removes one tombstoned segment's terms from the filters.
+     *
+     * @param segmentId The tombstoned segment
+     * @return Number of terms removed
+     */
+    private int cleanTombstonedSegment(long segmentId) {
+        Segment segment = storageEngine.getSegment(segmentId);
+        if (segment == null) {
+            return 0;
+        }
+
+        try {
+            List<byte[]> termsToDelete = collectSegmentTerms(segment);
+            if (termsToDelete.isEmpty()) {
+                return 0;
+            }
+
+            if (hierarchicalFilter != null) {
+                // deleteFromHierarchy removes a term from the cluster and corpus filters
+                // only when this segment's own filter held it, and returns the count of
+                // such terms. A term still held by another segment's filter stays in the
+                // shared levels, which is what keeps live segments queryable.
+                int deleted = hierarchicalFilter.deleteFromHierarchy(
+                    termsToDelete, String.valueOf(segmentId));
+                LOGGER.debug("Deleted {} of {} terms from hierarchical filter for segment {}",
+                    deleted, termsToDelete.size(), segmentId);
+                return deleted;
+            }
+
+            SegmentFilter segmentFilter = findSegmentFilter(segmentId);
+            if (segmentFilter == null) {
+                return 0;
+            }
+
+            int deleted = 0;
+            for (byte[] term : termsToDelete) {
+                if (segmentFilter.filter.delete(term)) {
+                    deleted++;
+                }
+            }
+            LOGGER.debug("Deleted {} terms from segment filter for segment {}", deleted, segmentId);
+            return deleted;
+
+        } catch (Exception e) {
+            LOGGER.warn("Error iterating segment {} for filter cleanup: {}",
+                segmentId, e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Collects the distinct filter terms a segment contributed.
+     *
+     * <p>Terms are re-derived from each entry's chunk text with the same
+     * {@link TermExtractor} the ingestion pipeline used to insert them. Deleting anything
+     * else - a storage key, for instance - would be a delete of an item that was never
+     * inserted, and a Cuckoo delete removes the first slot whose fingerprint matches, so
+     * it would evict a colliding live term instead.</p>
+     *
+     * @param segment The segment to scan
+     * @return Distinct term bytes, empty if the segment holds no decodable chunk text
+     */
+    private List<byte[]> collectSegmentTerms(Segment segment) {
+        Set<String> terms = new HashSet<>();
+        try (Segment.EntryIterator iter = segment.liveEntries()) {
+            while (iter.hasNext()) {
+                SegmentEntry entry = iter.next();
+                String text = decodeChunkText(entry.value());
+                if (text != null && !text.isEmpty()) {
+                    terms.addAll(TermExtractor.extractTerms(text));
+                }
+            }
+        }
+
+        List<byte[]> termBytes = new ArrayList<>(terms.size());
+        for (String term : terms) {
+            termBytes.add(term.getBytes(StandardCharsets.UTF_8));
+        }
+        return termBytes;
+    }
+
+    /**
+     * Decodes the chunk text from a stored entry value.
+     *
+     * <p>Value format (little-endian), as written by the ingestion pipeline:
+     * {@code [dimension:4][vector:dimension*4][text:remaining bytes]}.</p>
+     *
+     * @param value The stored value
+     * @return The chunk text, or null if the value carries none
+     */
+    private String decodeChunkText(byte[] value) {
+        if (value == null || value.length < Integer.BYTES) {
+            return null;
+        }
+
+        try {
+            ByteBuffer buffer = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);
+            int dimension = buffer.getInt();
+            if (dimension <= 0 || dimension > MAX_VECTOR_DIMENSION) {
+                return null;
+            }
+
+            int textOffset = Integer.BYTES + dimension * Float.BYTES;
+            if (textOffset >= value.length) {
+                return null; // Vector-only value, no text to extract terms from
+            }
+
+            return new String(value, textOffset, value.length - textOffset,
+                StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            LOGGER.trace("Could not decode chunk text from entry value: {}", e.getMessage());
+            return null;
+        }
     }
 
     /**

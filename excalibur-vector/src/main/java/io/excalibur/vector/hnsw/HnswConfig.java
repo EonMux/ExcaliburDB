@@ -92,6 +92,16 @@ public final class HnswConfig {
     public static final int MIN_CONNECTIONS = 2;
 
     /**
+     * Maximum accepted value for {@code efSearch} and {@code efConstruction}.
+     *
+     * <p>Matches the ceiling that {@code io.excalibur.config.ConfigValidation}
+     * documents and accepts for {@code shard.default-ef-search}. A lower ceiling
+     * here would let a configuration pass startup validation and then fail when the
+     * first segment builds its graph.</p>
+     */
+    public static final int MAX_EF = 1024;
+
+    /**
      * Maximum number of connections per node at layers > 0.
      */
     private final int maxConnections;
@@ -269,16 +279,16 @@ public final class HnswConfig {
     }
 
     private static void validateEfConstruction(int efConstruction) {
-        if (efConstruction < 1 || efConstruction > 1000) {
+        if (efConstruction < 1 || efConstruction > MAX_EF) {
             throw new IllegalArgumentException(
-                "efConstruction must be in range [1, 1000], got: " + efConstruction);
+                "efConstruction must be in range [1, " + MAX_EF + "], got: " + efConstruction);
         }
     }
 
     private static void validateEfSearch(int efSearch) {
-        if (efSearch < 1 || efSearch > 1000) {
+        if (efSearch < 1 || efSearch > MAX_EF) {
             throw new IllegalArgumentException(
-                "efSearch must be in range [1, 1000], got: " + efSearch);
+                "efSearch must be in range [1, " + MAX_EF + "], got: " + efSearch);
         }
     }
 

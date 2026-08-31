@@ -8,7 +8,7 @@ import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.hnsw.HnswConfig;
 import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.HnswSearchResult;
-import excalibur.query.executor.QueryExecutor;
+import excalibur.query.executor.SegmentQueryTask;
 import excalibur.query.executor.TailScanner;
 import excalibur.ingest.buffer.DocumentChunkBuffer;
 
@@ -79,7 +79,7 @@ class TailScanIntegrationTest {
     @Test
     void testHasTailEntries() throws IOException {
         // Create write log
-        WriteLog writeLog = new WriteLog(writeLogPath, arena);
+        WriteLog writeLog = new WriteLog(writeLogPath);
 
         // Initially, no tail entries
         TailScanner scanner = new TailScanner();
@@ -101,23 +101,26 @@ class TailScanIntegrationTest {
     }
 
     /**
-     * Test: Verify that QueryExecutor correctly detects need for tail scan.
+     * Whether the live query path sees a tail, asked the way that path asks it.
+     *
+     * <p>Exercised against {@link TailScanner} and {@link SegmentQueryTask} - the classes the
+     * served query actually runs through. The same algorithm existed a second time in a class
+     * nothing constructed, so a fix applied there passed its tests and changed nothing.</p>
      */
     @Test
     void testNeedsTailScan() throws IOException {
-        // Create segment with write log
         Segment segment = new Segment(segmentPath, 1024 * 1024, arena);
-        WriteLog writeLog = new WriteLog(writeLogPath, arena);
+        WriteLog writeLog = new WriteLog(writeLogPath);
         segment.attachWriteLog(writeLog);
 
-        // Create HNSW graph
         HnswConfig config = new HnswConfig(16, 32, 200, 200, 1.0 / Math.log(16), dimension);
         HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-        QueryExecutor executor = new QueryExecutor();
+        TailScanner scanner = new TailScanner();
 
         // Initially, no tail scan needed (empty write log)
-        assertThat(executor.needsTailScan(segment, graph)).isFalse();
+        assertThat(scanner.hasTailEntries(graph.getLastIntegratedOffset(), writeLog.writeOffset()))
+            .isFalse();
 
         // Add entry to write log (not integrated into graph)
         float[] vector = createRandomVector(dimension);
@@ -125,75 +128,31 @@ class TailScanIntegrationTest {
         writeLog.appendPut("key1".getBytes(), vectorBytes);
 
         // Now tail scan is needed
-        assertThat(executor.needsTailScan(segment, graph)).isTrue();
+        assertThat(scanner.hasTailEntries(graph.getLastIntegratedOffset(), writeLog.writeOffset()))
+            .isTrue();
 
         // Simulate integration by updating the offset
         graph.setLastIntegratedOffset(writeLog.writeOffset());
 
         // After integration, no tail scan needed
-        assertThat(executor.needsTailScan(segment, graph)).isFalse();
+        assertThat(scanner.hasTailEntries(graph.getLastIntegratedOffset(), writeLog.writeOffset()))
+            .isFalse();
 
         graph.close();
         segment.close();
         writeLog.close();
     }
 
-    /**
-     * Test: Verify that tail scan returns results for un-integrated entries.
-     */
-    @Test
-    void testTailScanReturnsResults() throws IOException {
-        // Create write log with entries
-        WriteLog writeLog = new WriteLog(writeLogPath, arena);
-
-        // Add several vectors to the write log
-        List<float[]> vectors = new ArrayList<>();
-        for (int i = 0; i < 10; i++) {
-            float[] vector = createRandomVector(dimension);
-            vectors.add(vector);
-            byte[] vectorBytes = encodeVector(vector);
-            writeLog.appendPut(("key" + i).getBytes(), vectorBytes);
-        }
-
-        long writeLogHead = writeLog.writeOffset();
-
-        // Perform tail scan with first vector as query
-        TailScanner scanner = new TailScanner();
-        List<HnswSearchResult> results = scanner.performTailScan(
-            vectors.get(0),
-            writeLog,
-            0,  // Start from beginning
-            writeLogHead,
-            5,  // Top 5 results
-            distanceFunction
-        );
-
-        // Should return results (exact count depends on distance function)
-        // Note: Results may be empty if write log reading isn't fully implemented
-        // This test validates the API contract
-        assertThat(results).isNotNull();
-        assertThat(results.size()).isLessThanOrEqualTo(5);
-
-        // Results should be sorted by distance
-        for (int i = 1; i < results.size(); i++) {
-            assertThat(results.get(i).distance())
-                .isGreaterThanOrEqualTo(results.get(i - 1).distance());
-        }
-
-        writeLog.close();
-    }
 
     /**
-     * Test: Verify QueryExecutor merges HNSW and tail scan results.
+     * Test: the live segment query merges HNSW results with the un-integrated tail.
      */
     @Test
-    void testQueryExecutorMergesResults() throws IOException {
-        // Create segment with write log
+    void testSegmentQueryMergesResults() throws Exception {
         Segment segment = new Segment(segmentPath, 1024 * 1024, arena);
-        WriteLog writeLog = new WriteLog(writeLogPath, arena);
+        WriteLog writeLog = new WriteLog(writeLogPath);
         segment.attachWriteLog(writeLog);
 
-        // Create HNSW graph
         HnswConfig config = new HnswConfig(16, 32, 200, 200, 1.0 / Math.log(16), dimension);
         HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
@@ -205,35 +164,27 @@ class TailScanIntegrationTest {
             graph.insert(vector);
         }
 
-        // Update graph's integrated offset
-        graph.setLastIntegratedOffset(0); // Nothing integrated yet for test
+        // Nothing integrated yet, so the whole write log is tail
+        graph.setLastIntegratedOffset(0);
 
         // Add more vectors to write log (not in graph)
-        List<float[]> tailVectors = new ArrayList<>();
         for (int i = 0; i < 5; i++) {
-            float[] vector = createRandomVector(dimension);
-            tailVectors.add(vector);
-            byte[] vectorBytes = encodeVector(vector);
+            byte[] vectorBytes = encodeVector(createRandomVector(dimension));
             writeLog.appendPut(("tailKey" + i).getBytes(), vectorBytes);
         }
 
-        // Create query executor
-        QueryExecutor executor = new QueryExecutor();
+        SegmentQueryTask task = new SegmentQueryTask(
+            1L, segment, graph, graphVectors.get(0), 10, 1, distanceFunction);
 
-        // Query using a graph vector
-        List<HnswSearchResult> results = executor.search(
-            graphVectors.get(0),
-            10,
-            segment,
-            graph,
-            distanceFunction
-        );
+        SegmentQueryTask.SegmentQueryResult outcome = task.call();
 
-        // Should return results (HNSW results at minimum)
-        assertThat(results).isNotNull();
-        assertThat(results.size()).isGreaterThan(0);
+        assertThat(outcome.success()).isTrue();
+        assertThat(outcome.results()).isNotEmpty();
+        assertThat(outcome.tailScanEntries())
+            .as("the un-integrated entries are scanned, not ignored")
+            .isPositive();
 
-        // Results should be sorted by distance
+        List<HnswSearchResult> results = outcome.results();
         for (int i = 1; i < results.size(); i++) {
             assertThat(results.get(i).distance())
                 .isGreaterThanOrEqualTo(results.get(i - 1).distance());
@@ -245,37 +196,32 @@ class TailScanIntegrationTest {
     }
 
     /**
-     * Test: Verify tail scan statistics are correct.
+     * Test: the tail the live path would scan grows with the write log.
      */
     @Test
     void testTailScanStats() throws IOException {
-        // Create segment with write log
         Segment segment = new Segment(segmentPath, 1024 * 1024, arena);
-        WriteLog writeLog = new WriteLog(writeLogPath, arena);
+        WriteLog writeLog = new WriteLog(writeLogPath);
         segment.attachWriteLog(writeLog);
 
-        // Create HNSW graph
         HnswConfig config = new HnswConfig(16, 32, 200, 200, 1.0 / Math.log(16), dimension);
         HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-        QueryExecutor executor = new QueryExecutor();
+        TailScanner scanner = new TailScanner();
 
         // Initially no tail
-        QueryExecutor.TailScanStats stats = executor.getTailScanStats(segment, graph);
-        assertThat(stats.needsTailScan()).isFalse();
-        assertThat(stats.tailSizeBytes()).isEqualTo(0);
+        assertThat(scanner.hasTailEntries(graph.getLastIntegratedOffset(), writeLog.writeOffset()))
+            .isFalse();
+        assertThat(writeLog.writeOffset() - graph.getLastIntegratedOffset()).isZero();
 
         // Add entry to write log
-        float[] vector = createRandomVector(dimension);
-        byte[] vectorBytes = encodeVector(vector);
+        byte[] vectorBytes = encodeVector(createRandomVector(dimension));
         writeLog.appendPut("key1".getBytes(), vectorBytes);
 
         // Now tail exists
-        stats = executor.getTailScanStats(segment, graph);
-        assertThat(stats.needsTailScan()).isTrue();
-        assertThat(stats.tailSizeBytes()).isGreaterThan(0);
-        assertThat(stats.writeLogHead()).isGreaterThan(0);
-        assertThat(stats.lastIntegratedOffset()).isEqualTo(0);
+        assertThat(scanner.hasTailEntries(graph.getLastIntegratedOffset(), writeLog.writeOffset()))
+            .isTrue();
+        assertThat(writeLog.writeOffset() - graph.getLastIntegratedOffset()).isPositive();
 
         graph.close();
         segment.close();
@@ -295,7 +241,7 @@ class TailScanIntegrationTest {
         // Create segment with write log
         Path segmentPath2 = tempDir.resolve("test-segment2");
         Segment segmentWithLog = new Segment(segmentPath2, 1024 * 1024, arena);
-        WriteLog writeLog = new WriteLog(writeLogPath, arena);
+        WriteLog writeLog = new WriteLog(writeLogPath);
         segmentWithLog.attachWriteLog(writeLog);
 
         // Initially zero
@@ -437,7 +383,7 @@ class TailScanIntegrationTest {
      */
     @Test
     void testTailScannerHandlesTextInValue() throws IOException {
-        WriteLog writeLog = new WriteLog(writeLogPath, arena);
+        WriteLog writeLog = new WriteLog(writeLogPath);
 
         // Create vector with text (production format)
         float[] vector = createRandomVector(dimension);
@@ -461,9 +407,11 @@ class TailScanIntegrationTest {
 
         // Should find the entry despite text being in the value
         assertThat(results).isNotEmpty();
-        // For CosineSimilarity, identical vectors return similarity = 1.0
-        // The distance field stores the similarity value (larger = more similar)
-        assertThat(results.get(0).distance()).isGreaterThan(0.999f);
+        // HnswSearchResult.distance() is a monotone dissimilarity for every metric: smaller is
+        // always closer. CosineSimilarity is LARGER_IS_CLOSER, so its similarity is negated on the
+        // way in -- identical vectors give similarity 1.0 and therefore distance() == -1.0, the
+        // most-negative value the metric can produce.
+        assertThat(results.get(0).distance()).isLessThan(-0.999f);
 
         writeLog.close();
     }

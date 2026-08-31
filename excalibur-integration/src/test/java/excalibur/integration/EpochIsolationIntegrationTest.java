@@ -21,7 +21,7 @@ import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.store.WriteLog;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfig;
@@ -112,7 +112,7 @@ class EpochIsolationIntegrationTest {
         // Create storage infrastructure
         Path dataDir = tempDir.resolve("data");
         Files.createDirectories(dataDir);
-        storageEngine = new TestStorageEngine(dataDir);
+        storageEngine = new TestStorageEngine(dataDir, arena);
 
         // Create visibility tracker
         visibilityTracker = new TestVisibilityTracker();
@@ -129,7 +129,9 @@ class EpochIsolationIntegrationTest {
             visibilityTracker,
             documentRegistry,
             null,
-            writeLog::sync,
+            // io.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
+            // durability barrier is already satisfied before the adapter runs.
+            () -> { },
             new ReentrantLock()
         );
     }
@@ -190,14 +192,20 @@ class EpochIsolationIntegrationTest {
             int chunksPerDocument = 5;
             int numReaderThreads = 4;
 
-            // Track document visibility by epoch
-            ConcurrentHashMap<String, Long> documentVisibleEpochs = new ConcurrentHashMap<>();
+            // The system under test: the production visibility tracker. Readers ask IT
+            // whether a document and each of its chunks are visible, so a tracker that
+            // published chunks one at a time would be caught. Comparing a map the writer
+            // filled against itself could not catch anything.
+            DocumentVisibilityTracker tracker = new DocumentVisibilityTracker();
+
+            // Published documents, in commit order, with the chunk ids the writer committed
+            List<String> publishedDocuments = Collections.synchronizedList(new ArrayList<>());
             ConcurrentHashMap<String, List<String>> documentChunkIds = new ConcurrentHashMap<>();
-            ConcurrentHashMap<String, Long> chunkVisibleEpochs = new ConcurrentHashMap<>();
 
             AtomicInteger tornReadCount = new AtomicInteger(0);
             AtomicInteger totalReads = new AtomicInteger(0);
             AtomicInteger totalChecks = new AtomicInteger(0);
+            List<Throwable> workerFailures = Collections.synchronizedList(new ArrayList<>());
 
             ExecutorService executor = Executors.newFixedThreadPool(numReaderThreads + 1);
             CountDownLatch startLatch = new CountDownLatch(1);
@@ -218,31 +226,24 @@ class EpochIsolationIntegrationTest {
                         // Insert vector into graph
                         float[] vector = createRandomVector(dimension);
                         graph.insert(vector);
-                        graph.setLastIntegratedOffset(writeLog.writeHead());
+                        graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                        writeLog.sync();
                         long epoch = visibilityTracker.advanceEpoch();
 
-                        // Record document visibility epoch
-                        documentVisibleEpochs.put(documentId, epoch);
-                        List<String> chunkIdList = new ArrayList<>();
-                        for (String chunkId : batch.getChunkIdsList()) {
-                            chunkIdList.add(chunkId);
-                            // CRITICAL: All chunks get the SAME visibility epoch
-                            chunkVisibleEpochs.put(chunkId, epoch);
-                        }
-                        documentChunkIds.put(documentId, chunkIdList);
-
-                        // Register with document visibility tracker
-                        documentVisibilityTracker.registerDocument(documentId, chunksPerDocument, epoch);
+                        // Publish the document atomically, then announce it to the readers
+                        tracker.registerAtomicDocument(batch, epoch);
+                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIdsList()));
+                        publishedDocuments.add(documentId);
 
                         Thread.sleep(2);
                     }
-
+                } catch (Exception e) {
+                    workerFailures.add(e);
+                } finally {
+                    // Both must happen even when the writer failed, or the readers spin and
+                    // the await below burns its full timeout before anything is asserted.
                     writersFinished.set(true);
                     writerDone.countDown();
-                } catch (Exception e) {
-                    e.printStackTrace();
                 }
             };
 
@@ -254,46 +255,42 @@ class EpochIsolationIntegrationTest {
                     while (!writersFinished.get()) {
                         long queryEpoch = visibilityTracker.captureEpoch();
 
-                        for (Map.Entry<String, Long> entry : documentVisibleEpochs.entrySet()) {
-                            String documentId = entry.getKey();
-                            long visibleEpoch = entry.getValue();
+                        for (String documentId : List.copyOf(publishedDocuments)) {
+                            // Ask the tracker, not the test's own bookkeeping
+                            if (!tracker.isDocumentFullyVisible(documentId, queryEpoch)) {
+                                continue;
+                            }
+                            totalReads.incrementAndGet();
 
-                            if (visibleEpoch <= 0) continue;
+                            List<String> chunkIds = documentChunkIds.get(documentId);
+                            if (chunkIds == null) {
+                                continue;
+                            }
+                            totalChecks.incrementAndGet();
 
-                            // Check if document is visible at this query epoch
-                            if (queryEpoch >= visibleEpoch) {
-                                totalReads.incrementAndGet();
-
-                                List<String> chunkIds = documentChunkIds.get(documentId);
-                                if (chunkIds == null) continue;
-
-                                totalChecks.incrementAndGet();
-
-                                // TORN READ DETECTION: Check each chunk's visibility
-                                int visibleChunks = 0;
-                                for (String chunkId : chunkIds) {
-                                    Long chunkEpoch = chunkVisibleEpochs.get(chunkId);
-                                    if (chunkEpoch != null && queryEpoch >= chunkEpoch) {
-                                        visibleChunks++;
-                                    }
+                            // TORN READ DETECTION: a visible document must have every chunk
+                            // visible at the same epoch
+                            int visibleChunks = 0;
+                            for (String chunkId : chunkIds) {
+                                if (tracker.isChunkVisible(chunkId, queryEpoch)) {
+                                    visibleChunks++;
                                 }
+                            }
 
-                                // If document is visible but not all chunks are visible, this is a torn read
-                                if (visibleChunks != chunksPerDocument) {
-                                    tornReadCount.incrementAndGet();
-                                    System.err.println("TORN READ DETECTED: document=" + documentId +
-                                        " expectedChunks=" + chunksPerDocument +
-                                        " visibleChunks=" + visibleChunks +
-                                        " documentEpoch=" + visibleEpoch +
-                                        " queryEpoch=" + queryEpoch);
-                                }
+                            if (visibleChunks != chunksPerDocument) {
+                                tornReadCount.incrementAndGet();
+                                System.err.println("TORN READ DETECTED: document=" + documentId +
+                                    " expectedChunks=" + chunksPerDocument +
+                                    " visibleChunks=" + visibleChunks +
+                                    " commitEpoch=" + tracker.getCommitEpoch(documentId) +
+                                    " queryEpoch=" + queryEpoch);
                             }
                         }
 
                         Thread.sleep(1);
                     }
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    workerFailures.add(e);
                 }
             };
 
@@ -303,13 +300,20 @@ class EpochIsolationIntegrationTest {
             }
 
             startLatch.countDown();
-            writerDone.await(60, TimeUnit.SECONDS);
+            boolean writerCompleted = writerDone.await(60, TimeUnit.SECONDS);
 
             executor.shutdown();
             executor.awaitTermination(10, TimeUnit.SECONDS);
 
             System.out.println("Torn read test completed: " + tornReadCount.get() + " torn reads out of " +
                 totalReads.get() + " total reads (" + totalChecks.get() + " chunk checks)");
+
+            assertThat(writerCompleted)
+                .as("The writer must finish within the timeout")
+                .isTrue();
+            assertThat(workerFailures)
+                .as("No writer or reader thread may fail: " + workerFailures)
+                .isEmpty();
 
             // CRITICAL: Must have 0 torn reads
             assertThat(tornReadCount.get())
@@ -320,6 +324,9 @@ class EpochIsolationIntegrationTest {
             assertThat(totalReads.get())
                 .as("Test should have performed actual reads")
                 .isGreaterThan(0);
+            assertThat(tracker.getDocumentCount())
+                .as("Every document must have been published")
+                .isEqualTo(numDocuments);
 
             graph.close();
         }
@@ -329,6 +336,13 @@ class EpochIsolationIntegrationTest {
          *
          * <p><strong>Domain Correctness:</strong> All chunks of a document
          * must have the exact same visibility epoch.</p>
+         *
+         * <p>The per-chunk epoch is read back out of the production
+         * {@link DocumentVisibilityTracker} rather than out of a map this test filled: the
+         * property under test is what the tracker publishes, so asserting on the test's own
+         * bookkeeping would hold however the tracker behaved. The boundary is checked from
+         * both sides - nothing visible one epoch before the commit, everything visible at
+         * it - which is what "identical epoch" means operationally.</p>
          */
         @Test
         @DisplayName("chunk visibility epochs are identical for a document")
@@ -336,30 +350,67 @@ class EpochIsolationIntegrationTest {
             int numDocuments = 20;
             int chunksPerDocument = 7;
 
+            DocumentVisibilityTracker tracker = new DocumentVisibilityTracker();
+
             for (int d = 0; d < numDocuments; d++) {
                 String documentId = "doc-epoch-identical-" + d;
                 List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
                 chunkBuffer.bufferChunks(chunks);
                 AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
 
-                writeLog.sync();
                 long epoch = visibilityTracker.advanceEpoch();
+                tracker.registerAtomicDocument(batch, epoch);
 
-                // Record all chunk epochs
-                Set<Long> epochsForDocument = new HashSet<>();
-                for (String chunkId : batch.getChunkIdsList()) {
-                    epochsForDocument.add(epoch);
+                List<String> chunkIds = batch.getChunkIdsList();
+                assertThat(chunkIds)
+                    .as("The batch must carry every chunk of " + documentId)
+                    .hasSize(chunksPerDocument);
+
+                // The epoch the tracker itself reports for the document
+                long commitEpoch = tracker.getCommitEpoch(documentId);
+                assertThat(commitEpoch)
+                    .as("Document " + documentId + " must be registered at the epoch it committed at")
+                    .isEqualTo(epoch);
+
+                // Derive each chunk's visibility epoch from the tracker: the lowest epoch at
+                // which the tracker reports it visible.
+                Set<Long> chunkVisibilityEpochs = new HashSet<>();
+                for (String chunkId : chunkIds) {
+                    assertThat(tracker.isChunkVisible(chunkId, commitEpoch - 1))
+                        .as("Chunk " + chunkId + " must not be visible before the commit epoch")
+                        .isFalse();
+                    assertThat(tracker.isChunkVisible(chunkId, commitEpoch))
+                        .as("Chunk " + chunkId + " must be visible at the commit epoch")
+                        .isTrue();
+                    chunkVisibilityEpochs.add(firstVisibleEpoch(tracker, chunkId, commitEpoch));
                 }
 
-                // All chunks must have the same epoch
-                assertThat(epochsForDocument)
+                assertThat(chunkVisibilityEpochs)
                     .as("All chunks of document " + documentId + " must have the same visibility epoch")
-                    .hasSize(1);
-
-                documentVisibilityTracker.registerDocument(documentId, chunksPerDocument, epoch);
+                    .containsExactly(commitEpoch);
             }
 
+            assertThat(tracker.getDocumentCount()).isEqualTo(numDocuments);
+
             System.out.println("Verified identical epoch for all chunks across " + numDocuments + " documents");
+        }
+
+        /**
+         * Returns the lowest epoch at which the tracker reports {@code chunkId} visible.
+         *
+         * @param tracker    The tracker being interrogated
+         * @param chunkId    The chunk to probe
+         * @param upperBound An epoch the chunk is known to be visible at
+         */
+        private long firstVisibleEpoch(DocumentVisibilityTracker tracker, String chunkId, long upperBound) {
+            long lowest = upperBound;
+            for (long epoch = upperBound - 1; epoch >= 0; epoch--) {
+                if (!tracker.isChunkVisible(chunkId, epoch)) {
+                    break;
+                }
+                lowest = epoch;
+            }
+            return lowest;
         }
     }
 
@@ -405,7 +456,7 @@ class EpochIsolationIntegrationTest {
                 for (int c = 0; c < chunks.size(); c++) {
                     TextChunk chunk = chunks.get(c);
                     String chunkId = documentId + ":" + c;
-                    long offset = writeLog.writeHead();
+                    long offset = writeLog.writeOffset();
                     batchBuffer.addChunk(chunkId, chunk, offset);
                 }
 
@@ -425,9 +476,8 @@ class EpochIsolationIntegrationTest {
                 // Insert vector
                 float[] vector = createRandomVector(dimension);
                 graph.insert(vector);
-                graph.setLastIntegratedOffset(writeLog.writeHead());
+                graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                writeLog.sync();
                 long epoch = visibilityTracker.advanceEpoch();
 
                 documentVisibilityTracker.registerDocument(documentId, chunksPerDocument, epoch);
@@ -534,9 +584,8 @@ class EpochIsolationIntegrationTest {
 
                         float[] vector = createRandomVector(dimension);
                         graph.insert(vector);
-                        graph.setLastIntegratedOffset(writeLog.writeHead());
+                        graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                        writeLog.sync();
                         long epoch = visibilityTracker.advanceEpoch();
 
                         documentVisibilityTracker.registerDocument(documentId, chunksPerDocument, epoch);
@@ -702,9 +751,8 @@ class EpochIsolationIntegrationTest {
 
                                 float[] vector = createRandomVector(dimension);
                                 graph.insert(vector);
-                                graph.setLastIntegratedOffset(writeLog.writeHead());
+                                graph.setLastIntegratedOffset(writeLog.writeOffset());
 
-                                writeLog.sync();
                                 long epoch = visibilityTracker.advanceEpoch();
                                 documentVisibilityTracker.registerDocument(documentId, 3, epoch);
 
@@ -1093,10 +1141,13 @@ class EpochIsolationIntegrationTest {
         private final Arena arena;
         private int segmentCounter = 0;
 
-        TestStorageEngine(Path dataDir) throws IOException {
-            super(dataDir, Arena.ofShared());
+        TestStorageEngine(Path dataDir, Arena arena) throws IOException {
+            // The caller's arena backs both the engine's mapped catalog and the segments
+            // created here. Allocating fresh shared arenas would leak them: a shared arena
+            // is released only by an explicit close(), never by the collector.
+            super(dataDir, arena);
             this.dataDir = dataDir;
-            this.arena = Arena.ofShared();
+            this.arena = arena;
             this.catalog = new TestSegmentCatalog();
         }
 
@@ -1130,6 +1181,9 @@ class EpochIsolationIntegrationTest {
             }
             segments.clear();
             catalog.clear();
+            // The base engine owns the mapped catalog and the split worker; skipping it
+            // leaves both alive for the lifetime of the test fork.
+            super.close();
         }
     }
 
@@ -1262,6 +1316,13 @@ class EpochIsolationIntegrationTest {
      * Test DocumentVisibilityTracker implementation.
      */
     private static class TestDocumentVisibilityTracker implements DocumentVisibilityChecker {
+        @Override
+        public long currentEpoch() {
+            // A test double with no epoch of its own. Unbounded keeps these tests asserting the
+            // completeness behaviour they were written for, rather than an epoch bound.
+            return Long.MAX_VALUE;
+        }
+
         private final ConcurrentHashMap<String, Long> documentCommitEpochs = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<String, Integer> documentChunkCounts = new ConcurrentHashMap<>();
 

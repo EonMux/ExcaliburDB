@@ -213,15 +213,25 @@ public final class CancellationToken {
     public void addListener(Runnable listener) {
         Objects.requireNonNull(listener, "Listener cannot be null");
 
-        if (cancelled) {
-            // Already cancelled - run immediately
-            listener.run();
-        } else {
-            cancellationListeners.add(listener);
-            // Check again in case of race
+        // Synchronize on the same monitor used by cancel() so that the decision
+        // "is cancelled already?" is atomic with "was this listener observable
+        // to notifyListeners()?". Without this, a concurrent cancel() can both
+        // iterate a CopyOnWriteArrayList snapshot that contains the listener
+        // AND have remove() succeed here (CoW remove does not interfere with
+        // in-flight snapshot iteration), causing double notification.
+        boolean runImmediately;
+        synchronized (this) {
             if (cancelled) {
-                listener.run();
+                runImmediately = true;
+            } else {
+                cancellationListeners.add(listener);
+                runImmediately = false;
             }
+        }
+        if (runImmediately) {
+            // Run outside the monitor to avoid holding the cancel() lock
+            // while executing arbitrary listener code.
+            listener.run();
         }
     }
 

@@ -27,9 +27,17 @@ import java.nio.ByteOrder;
  * lock-free atomic updates.</p>
  *
  * <h2>Memory Ordering</h2>
- * <p>Volatile operations provide acquire/release semantics. Plain operations
- * provide relaxed semantics suitable for performance-critical paths where
- * ordering is not required.</p>
+ * <p>Every {@code get*}/{@code put*} pair is a volatile access: reads have acquire
+ * semantics and writes have release semantics. Compare-and-set and get-and-add are
+ * fully atomic.</p>
+ *
+ * <h2>Alignment</h2>
+ * <p>Volatile and atomic accesses are only defined at naturally aligned offsets, so every
+ * operation wider than a byte requires the accessed address to be a multiple of its
+ * width; a misaligned offset is rejected by the FFM API with
+ * {@link IllegalArgumentException}. For deliberately unaligned packed data use
+ * {@link io.excalibur.core.util.SegmentVarHandle#readLongUnaligned}, which documents the
+ * weaker guarantee it provides.</p>
  *
  * <h2>Implementation Note</h2>
  * <p>In Java 21's FFM API, VarHandles from ValueLayout have only 1 coordinate (MemorySegment).
@@ -54,16 +62,6 @@ public class AtomicOps {
         .withOrder(ByteOrder.BIG_ENDIAN).varHandle();
     private static final VarHandle DOUBLE_HANDLE = ValueLayout.JAVA_DOUBLE
         .withOrder(ByteOrder.BIG_ENDIAN).varHandle();
-
-    // Layouts for direct MemorySegment access
-    private static final ValueLayout.OfInt INT_LAYOUT = ValueLayout.JAVA_INT
-        .withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfLong LONG_LAYOUT = ValueLayout.JAVA_LONG
-        .withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfFloat FLOAT_LAYOUT = ValueLayout.JAVA_FLOAT
-        .withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfDouble DOUBLE_LAYOUT = ValueLayout.JAVA_DOUBLE
-        .withOrder(ByteOrder.BIG_ENDIAN);
 
     // Static initialization
     static {
@@ -397,7 +395,7 @@ public class AtomicOps {
      */
     public static byte getByte(MemorySegment segment, long offset) {
         checkSegment(segment, offset, 1);
-        return segment.get(ValueLayout.JAVA_BYTE, offset);
+        return (byte) BYTE_HANDLE.getVolatile(segment.asSlice(offset, 1));
     }
 
     /**
@@ -410,7 +408,7 @@ public class AtomicOps {
      */
     public static void putByte(MemorySegment segment, long offset, byte value) {
         checkSegment(segment, offset, 1);
-        segment.set(ValueLayout.JAVA_BYTE, offset, value);
+        BYTE_HANDLE.setVolatile(segment.asSlice(offset, 1), value);
     }
 
     /**
@@ -423,7 +421,7 @@ public class AtomicOps {
      */
     public static int getInt(MemorySegment segment, long offset) {
         checkSegment(segment, offset, 4);
-        return segment.get(INT_LAYOUT, offset);
+        return (int) INT_HANDLE.getVolatile(segment.asSlice(offset, 4));
     }
 
     /**
@@ -436,7 +434,7 @@ public class AtomicOps {
      */
     public static void putInt(MemorySegment segment, long offset, int value) {
         checkSegment(segment, offset, 4);
-        segment.set(INT_LAYOUT, offset, value);
+        INT_HANDLE.setVolatile(segment.asSlice(offset, 4), value);
     }
 
     /**
@@ -494,7 +492,7 @@ public class AtomicOps {
      */
     public static long getLong(MemorySegment segment, long offset) {
         checkSegment(segment, offset, 8);
-        return segment.get(LONG_LAYOUT, offset);
+        return (long) LONG_HANDLE.getVolatile(segment.asSlice(offset, 8));
     }
 
     /**
@@ -507,7 +505,7 @@ public class AtomicOps {
      */
     public static void putLong(MemorySegment segment, long offset, long value) {
         checkSegment(segment, offset, 8);
-        segment.set(LONG_LAYOUT, offset, value);
+        LONG_HANDLE.setVolatile(segment.asSlice(offset, 8), value);
     }
 
     /**
@@ -565,7 +563,7 @@ public class AtomicOps {
      */
     public static float getFloat(MemorySegment segment, long offset) {
         checkSegment(segment, offset, 4);
-        return segment.get(FLOAT_LAYOUT, offset);
+        return (float) FLOAT_HANDLE.getVolatile(segment.asSlice(offset, 4));
     }
 
     /**
@@ -578,7 +576,7 @@ public class AtomicOps {
      */
     public static void putFloat(MemorySegment segment, long offset, float value) {
         checkSegment(segment, offset, 4);
-        segment.set(FLOAT_LAYOUT, offset, value);
+        FLOAT_HANDLE.setVolatile(segment.asSlice(offset, 4), value);
     }
 
     /**
@@ -611,7 +609,7 @@ public class AtomicOps {
      */
     public static double getDouble(MemorySegment segment, long offset) {
         checkSegment(segment, offset, 8);
-        return segment.get(DOUBLE_LAYOUT, offset);
+        return (double) DOUBLE_HANDLE.getVolatile(segment.asSlice(offset, 8));
     }
 
     /**
@@ -624,7 +622,7 @@ public class AtomicOps {
      */
     public static void putDouble(MemorySegment segment, long offset, double value) {
         checkSegment(segment, offset, 8);
-        segment.set(DOUBLE_LAYOUT, offset, value);
+        DOUBLE_HANDLE.setVolatile(segment.asSlice(offset, 8), value);
     }
 
     /**

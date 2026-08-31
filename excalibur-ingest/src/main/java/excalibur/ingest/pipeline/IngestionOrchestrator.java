@@ -1,10 +1,13 @@
 package excalibur.ingest.pipeline;
 
+import io.excalibur.core.text.ChunkIdentifiers;
 import excalibur.ingest.buffer.AtomicDocumentBatch;
 import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.processor.TermFrequencyTracker;
+import excalibur.ingest.registry.DocumentMetadata;
+import excalibur.ingest.registry.DocumentRegistry;
 import excalibur.ingest.source.FetchedDocument;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
@@ -15,8 +18,8 @@ import excalibur.llm.embedding.EmbeddingClient;
 import excalibur.shard.IndexOrchestrator;
 import io.excalibur.core.logging.StructuredLoggingHelper;
 import io.excalibur.llm.LLMException;
+import io.excalibur.store.Segment;
 import io.excalibur.store.StorageEngine;
-import io.excalibur.store.log.WriteLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,13 +27,12 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
@@ -44,8 +46,25 @@ import java.util.stream.Stream;
  *   <li>Chunking text into semantic units</li>
  *   <li>Generating embeddings via LLM client</li>
  *   <li>Writing to storage engine</li>
- *   <li>Updating ingestion status</li>
+ *   <li>Publishing the document at a visibility epoch</li>
  * </ol>
+ *
+ * <h2>Document Atomicity</h2>
+ * <p>A document is published as a unit. Every chunk is embedded and written before the
+ * visibility epoch is advanced, and the document is registered with the
+ * {@link DocumentVisibilityTracker} under its {@code sourceId:documentId} key - the same key
+ * excalibur-shard derives from the storage key and excalibur-query's atomicity filter asks
+ * about. A document whose chunks could not all be embedded or written is rolled back and never
+ * registered, so a query can never observe half of it.</p>
+ *
+ * <p>An optional {@link DocumentChunkBuffer} additionally mirrors the document into a
+ * write-ahead log as one contiguous batch, which records the offset range on the published
+ * batch. Publication does not depend on it.</p>
+ *
+ * <h2>Source Ownership</h2>
+ * <p>The orchestrator does <strong>not</strong> own the {@link Source} it is handed and never
+ * closes it. The same instance is held by the API layer's source registry and reused by the
+ * reindexer; closing it here would break every later crawl.</p>
  *
  * <h2>Thread Safety</h2>
  * <p><strong>This class is fully thread-safe.</strong></p>
@@ -113,8 +132,15 @@ public class IngestionOrchestrator {
     private final IndexOrchestrator indexOrchestrator;
     private final StatusRegistry statusRegistry;
     private final LshIngestionService lshIngestionService; // optional, nullable
-    private final DocumentChunkBuffer documentChunkBuffer; // optional, nullable - for atomic batching
-    private final DocumentVisibilityTracker visibilityTracker; // optional, nullable - for visibility epoch
+    private final DocumentChunkBuffer documentChunkBuffer; // optional, nullable - WAL offset mirror
+    private final DocumentVisibilityTracker visibilityTracker; // optional, nullable - visibility epoch
+
+    /**
+     * Registry that records what was ingested so a later reindex can detect changes and
+     * tombstone the previous version. Derived from the visibility tracker, which owns it.
+     * Null when no visibility tracker is configured.
+     */
+    private final DocumentRegistry documentRegistry;
 
     /**
      * Term frequency tracker for selectivity estimation during queries.
@@ -129,7 +155,17 @@ public class IngestionOrchestrator {
      */
     private final int documentTimeoutMs;
 
+    /**
+     * Where published documents are reported so the graph can be built from them.
+     *
+     * <p>Optional and settable after construction: the graph stack is opened by the API layer,
+     * which is built after this orchestrator, and a deployment that indexes text without
+     * extracting facts never sets one.</p>
+     */
+    private volatile excalibur.ingest.graph.GraphIngestSink graphSink;
+
     private final Set<String> activeIngestions;
+    private final Map<String, Thread> ingestionThreads;
     private final AtomicBoolean shutdown;
 
     /**
@@ -137,6 +173,30 @@ public class IngestionOrchestrator {
      * Used when no config is provided. Matches Config.Ingest.DEFAULT_DOCUMENT_TIMEOUT_MS.
      */
     public static final int DEFAULT_DOCUMENT_TIMEOUT_MS = 2000;
+
+    /**
+     * Upper bound on the byte size of a single fetched document.
+     *
+     * <p>A source can report an arbitrary file size (FilesystemSource allows up to 2GB), and a
+     * document is held several times over while it is processed: the fetched byte array, its
+     * defensive copy, the decoded String, and one substring per chunk. Every chunk also costs
+     * one embedding call. Documents above this bound are skipped with a recorded error rather
+     * than being allowed to exhaust the heap. Matches DocumentReindexer's limit.</p>
+     */
+    public static final int MAX_DOCUMENT_CONTENT_BYTES = 100 * 1024 * 1024;
+
+    /**
+     * Upper bound on the number of chunks accepted from a single document.
+     *
+     * <p>Each chunk is one embedding request and one storage write; a document is only published
+     * once all of them succeed. This bounds the work a single document can schedule.</p>
+     */
+    public static final int MAX_CHUNKS_PER_DOCUMENT = 10_000;
+
+    /**
+     * How long {@link #shutdown()} waits for in-flight ingestion threads to unwind.
+     */
+    private static final long SHUTDOWN_AWAIT_MILLIS = 10_000;
 
     /**
      * Creates a new IngestionOrchestrator with required dependencies.
@@ -194,9 +254,9 @@ public class IngestionOrchestrator {
      *   <li>Queries never see partially-ingested documents</li>
      * </ul>
      *
-     * <p><strong>Important:</strong> When using atomic batching, the documentChunkBuffer
-     * should be backed by a WriteLog that syncs appropriately. The storageEngine is still
-     * used for LSH index population.</p>
+     * <p><strong>Important:</strong> the documentChunkBuffer must own the write log it appends
+     * to, so that one document's chunks land at contiguous offsets. The storageEngine remains
+     * the source of truth and is still used for LSH index population.</p>
      *
      * @param textChunker Text chunker for splitting documents
      * @param embeddingClient Embedding client for generating embeddings
@@ -204,8 +264,8 @@ public class IngestionOrchestrator {
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
      * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
-     * @param documentChunkBuffer Buffer for atomic document batching (may be null for non-atomic mode)
-     * @param visibilityTracker Tracker for document visibility epochs (may be null for non-atomic mode)
+     * @param documentChunkBuffer Buffer mirroring documents into a write log (may be null)
+     * @param visibilityTracker Tracker for document visibility epochs (may be null)
      * @throws NullPointerException if required parameters are null
      */
     public IngestionOrchestrator(TextChunker textChunker,
@@ -231,8 +291,8 @@ public class IngestionOrchestrator {
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
      * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
-     * @param documentChunkBuffer Buffer for atomic document batching (may be null for non-atomic mode)
-     * @param visibilityTracker Tracker for document visibility epochs (may be null for non-atomic mode)
+     * @param documentChunkBuffer Buffer mirroring documents into a write log (may be null)
+     * @param visibilityTracker Tracker for document visibility epochs (may be null)
      * @param termFrequencyTracker Tracker for term frequencies in segment sketches (may be null to disable selectivity estimation)
      * @param documentTimeoutMs Timeout for awaiting backpressure release in milliseconds
      * @throws NullPointerException if required parameters are null
@@ -255,16 +315,56 @@ public class IngestionOrchestrator {
         this.lshIngestionService = lshIngestionService; // may be null
         this.documentChunkBuffer = documentChunkBuffer; // may be null
         this.visibilityTracker = visibilityTracker; // may be null
+        this.documentRegistry = visibilityTracker != null ? visibilityTracker.getRegistry() : null;
         this.termFrequencyTracker = termFrequencyTracker; // may be null
         this.documentTimeoutMs = documentTimeoutMs > 0 ? documentTimeoutMs : DEFAULT_DOCUMENT_TIMEOUT_MS;
         this.activeIngestions = ConcurrentHashMap.newKeySet();
+        this.ingestionThreads = new ConcurrentHashMap<>();
         this.shutdown = new AtomicBoolean(false);
 
-        LOGGER.info("IngestionOrchestrator initialized with LSH={}, atomicBatching={}, termFrequencyTracking={}, documentTimeoutMs={}",
+        LOGGER.info("IngestionOrchestrator initialized with LSH={}, visibilityPublishing={}, walMirror={}, termFrequencyTracking={}, documentTimeoutMs={}",
             (lshIngestionService != null ? "enabled" : "disabled"),
-            (documentChunkBuffer != null && visibilityTracker != null ? "enabled" : "disabled"),
+            (visibilityTracker != null ? "enabled" : "disabled"),
+            (documentChunkBuffer != null ? "enabled" : "disabled"),
             (termFrequencyTracker != null ? "enabled" : "disabled"),
             this.documentTimeoutMs);
+    }
+
+    /**
+     * Sets where published documents are reported so a graph can be built from them.
+     *
+     * <p>Set after construction because the graph stack belongs to the API layer, which is
+     * assembled after this orchestrator. Null disables it, which is the state of any deployment
+     * that indexes text and does not extract facts.</p>
+     *
+     * @param graphSink The sink, or null for none
+     */
+    public void setGraphSink(excalibur.ingest.graph.GraphIngestSink graphSink) {
+        this.graphSink = graphSink;
+        LOGGER.info("Graph ingest sink {}", graphSink == null ? "disabled" : "enabled");
+    }
+
+    /**
+     * Tells the graph about a document that is now published.
+     *
+     * <p>After publication, deliberately. A fact staged for a document whose write then failed
+     * would be a fact about something the corpus does not contain, and nothing later would
+     * retract it. Never throws: the document is already published and counted by the time this
+     * runs, so failing here would report a loss that did not happen.</p>
+     *
+     * @param documentKey The source-qualified document key
+     * @param doc         The fetched document, decoded with the encoding its source declared
+     */
+    private void reportToGraph(String documentKey, FetchedDocument doc) {
+        excalibur.ingest.graph.GraphIngestSink sink = this.graphSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            sink.onDocumentPublished(documentKey, doc.getText());
+        } catch (RuntimeException e) {
+            LOGGER.warn("Graph sink failed for {}: {}", documentKey, e.toString());
+        }
     }
 
     /**
@@ -284,13 +384,19 @@ public class IngestionOrchestrator {
 
         String sourceId = source.getSourceId();
 
-        // Check if already ingesting
+        // Refuse before claiming the slot, so a shutdown concurrent with this call cannot be
+        // overtaken by a newly started ingestion.
+        if (shutdown.get()) {
+            LOGGER.warn("Cannot start ingestion: orchestrator is shutting down");
+            return;
+        }
+
         if (!activeIngestions.add(sourceId)) {
             LOGGER.debug("Ingestion already active for source: {}", sourceId);
             return;
         }
 
-        // Check if shutdown
+        // Re-check: shutdown() may have flipped the flag between the test above and the claim.
         if (shutdown.get()) {
             LOGGER.warn("Cannot start ingestion: orchestrator is shutting down");
             activeIngestions.remove(sourceId);
@@ -299,14 +405,16 @@ public class IngestionOrchestrator {
 
         LOGGER.info("Starting background ingestion for source: {}", sourceId);
 
-        // Spawn virtual thread for background ingestion
-        Thread.ofVirtual().name("ingestion-" + sourceId).start(() -> {
+        Thread worker = Thread.ofVirtual().name("ingestion-" + sourceId).unstarted(() -> {
             try {
                 runIngestion(source);
             } finally {
+                ingestionThreads.remove(sourceId);
                 activeIngestions.remove(sourceId);
             }
         });
+        ingestionThreads.put(sourceId, worker);
+        worker.start();
     }
 
     /**
@@ -322,283 +430,385 @@ public class IngestionOrchestrator {
         try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
                 .withSourceId(sourceId)
                 .build()) {
+            try {
+                ingestSource(source, sourceId, status);
+            } catch (SourceException e) {
+                String error = "Crawl failed: " + e.getMessage();
+                LOGGER.error("{}", error, e);
+                status.setError(error);
+            } catch (Exception e) {
+                String error = "Ingestion failed: " + e.getMessage();
+                LOGGER.error("{}", error, e);
+                status.setError(error);
+            }
+        }
+        // The Source is owned by whoever registered it; it is deliberately not closed here.
+    }
 
-            long totalIngested = 0;
-            long totalPending = 0;
+    /**
+     * Crawls a source and ingests every document it yields.
+     */
+    private void ingestSource(Source source, String sourceId, IngestionStatus status) throws SourceException {
+        status.update("crawling", 0.0, 0, 0);
+        StructuredLoggingHelper.setStage("crawling");
+        LOGGER.info("Phase 1: Starting crawl");
+
+        List<String> documentIds;
+        try (Stream<String> crawlStream = source.crawl()) {
+            documentIds = crawlStream.toList();
+        }
+
+        long totalPending = documentIds.size();
+        LOGGER.info("Discovered {} documents", totalPending);
+
+        if (totalPending == 0) {
+            status.update("idle", 1.0, 0, 0);
+            LOGGER.info("No documents to ingest");
+            return;
+        }
+
+        StructuredLoggingHelper.setStage("embedding");
+        status.update("embedding", 0.0, 0, totalPending);
+
+        long totalIngested = 0;
+        int processedDocs = 0;
+        Set<Segment> touchedSegments = new LinkedHashSet<>();
+
+        for (String documentId : documentIds) {
+            if (shutdown.get() || Thread.currentThread().isInterrupted()) {
+                LOGGER.info("Ingestion interrupted by shutdown");
+                status.setError("Ingestion interrupted");
+                return;
+            }
+
+            awaitBackpressureRelease();
 
             try {
-                // Phase 1: Crawling
-                status.update("crawling", 0.0, 0, 0);
-                StructuredLoggingHelper.setStage("crawling");
-                LOGGER.info("Phase 1: Starting crawl");
-
-                List<String> documentIds;
-                try (Stream<String> crawlStream = source.crawl()) {
-                    documentIds = crawlStream.toList();
-                }
-
-                totalPending = documentIds.size();
-                LOGGER.info("Discovered {} documents", totalPending);
-
-                if (totalPending == 0) {
-                    status.update("idle", 1.0, 0, 0);
-                    LOGGER.info("No documents to ingest");
-                    return;
-                }
-
-                // Estimate total chunks for progress tracking
-                long estimatedTotalChunks = totalPending * 3; // Assume ~3 chunks per doc
-
-                // Phase 2: Processing documents
-                StructuredLoggingHelper.setStage("embedding");
-                status.update("embedding", 0.0, 0, totalPending);
-
-                int processedDocs = 0;
-                int processedChunks = 0;
-
-                for (String documentId : documentIds) {
-                    if (shutdown.get()) {
-                        LOGGER.info("Ingestion interrupted by shutdown");
-                        status.setError("Ingestion interrupted");
-                        return;
-                    }
-
-                    // Check backpressure BEFORE processing each document (Phase 5 requirement)
-                    // When HNSW integration queue exceeds limit, throttle embedding stage
-                    if (indexOrchestrator.isBackpressured()) {
-                        LOGGER.info("Backpressure detected, waiting for HNSW queue to drain");
-                        boolean released = indexOrchestrator.awaitBackpressureRelease(documentTimeoutMs);
-                        if (!released) {
-                            LOGGER.warn("Backpressure timeout after {}ms, continuing ingestion", documentTimeoutMs);
-                        }
-                    }
-
-                    try {
-                        // Set document ID in MDC for per-document logging
-                        StructuredLoggingHelper.setDocumentId(documentId);
-
-                        // Fetch document
-                        FetchedDocument doc = source.fetch(documentId);
-                        String content = new String(doc.getContent(), StandardCharsets.UTF_8);
-
-                        // Chunk the content
-                        List<TextChunk> chunks = textChunker.chunk(documentId, content);
-
-                        // Track term frequencies for selectivity estimation
-                        // This populates the Count-Min Sketch on segments for query optimization
-                        if (termFrequencyTracker != null && !chunks.isEmpty()) {
-                            for (int i = 0; i < chunks.size(); i++) {
-                                TextChunk chunk = chunks.get(i);
-                                String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
-                                byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
-                                long keyHash = io.excalibur.store.hash.XxHash64.hash(keyBytes);
-                                int segmentIndex = (int) (keyHash & (storageEngine.getSegmentCount() - 1));
-
-                                io.excalibur.store.Segment segment = storageEngine.getSegment((long) segmentIndex);
-                                if (segment != null) {
-                                    termFrequencyTracker.trackText(segment, chunk.getText());
-                                }
-                            }
-                        }
-
-                        // Check if atomic batching is enabled
-                        boolean useAtomicBatching = documentChunkBuffer != null && visibilityTracker != null;
-
-                        if (useAtomicBatching) {
-                            // === ATOMIC BATCHING MODE ===
-                            // Buffer all chunks and commit atomically with visibility epoch
-
-                            Map<Integer, float[]> embeddings = new HashMap<>();
-                            boolean allEmbeddingsGenerated = true;
-
-                            // Generate all embeddings first
-                            for (int i = 0; i < chunks.size(); i++) {
-                                TextChunk chunk = chunks.get(i);
-                                try {
-                                    float[] embedding = embeddingClient.embed(chunk.getText());
-                                embeddings.put(i, embedding);
-                            } catch (LLMException e) {
-                                LOGGER.warn("Failed to embed chunk {} of {}: {}",
-                                    i, documentId, e.getMessage());
-                                allEmbeddingsGenerated = false;
-                                break;
-                            }
-                        }
-
-                        if (!allEmbeddingsGenerated || chunks.isEmpty()) {
-                            // Skip this document if any embedding failed
-                            processedDocs++;
-                            continue;
-                        }
-
-                        // Buffer all chunks for the document
-                        for (TextChunk chunk : chunks) {
-                            documentChunkBuffer.bufferChunk(chunk);
-                        }
-
-                        try {
-                            // Commit atomically with embeddings
-                            AtomicDocumentBatch batch = documentChunkBuffer.commitDocumentWithEmbeddings(
-                                documentId, embeddings);
-
-                            // Sync the write log for durability
-                            WriteLog writeLog = documentChunkBuffer.getWriteLog();
-                            if (writeLog != null) {
-                                writeLog.sync();
-                            }
-
-                            // Advance epoch and register with visibility tracker
-                            long epoch = visibilityTracker.advanceEpoch();
-                            visibilityTracker.registerAtomicDocument(batch, epoch);
-
-                            LOGGER.debug("Document committed atomically with {} chunks at epoch {}",
-                                batch.getChunkCount(), epoch);
-
-                            // Insert into LSH index for each chunk
-                            if (lshIngestionService != null) {
-                                for (int i = 0; i < chunks.size(); i++) {
-                                    try {
-                                        TextChunk chunk = chunks.get(i);
-                                        float[] embedding = embeddings.get(i);
-                                        String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
-                                        byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
-
-                                        long keyHash = io.excalibur.store.hash.XxHash64.hash(keyBytes);
-                                        int segmentIndex = (int) (keyHash & (storageEngine.getSegmentCount() - 1));
-
-                                        io.excalibur.store.Segment segment = storageEngine.getSegment((long) segmentIndex);
-                                        if (segment != null) {
-                                            long entryId = chunkId.hashCode() & 0xFFFFFFFFL;
-                                            lshIngestionService.insertVector(segment, embedding, entryId);
-                                        }
-                                    } catch (Exception lshError) {
-                                        LOGGER.warn("Failed to insert vector into LSH index for chunk {}: {}",
-                                            i, lshError.getMessage());
-                                    }
-                                }
-                            }
-
-                            totalIngested += chunks.size();
-                            processedChunks += chunks.size();
-
-                        } catch (IOException e) {
-                            LOGGER.error("Failed to commit document atomically: {}", e.getMessage());
-                            // Abort the document on failure
-                            documentChunkBuffer.abortDocument(documentId);
-                        }
-
-                    } else {
-                        // === NON-ATOMIC MODE (LEGACY) ===
-                        // Process each chunk individually without atomic batching
-
-                        for (int i = 0; i < chunks.size(); i++) {
-                            TextChunk chunk = chunks.get(i);
-
-                            try {
-                                // Generate embedding
-                                float[] embedding = embeddingClient.embed(chunk.getText());
-
-                                // Create chunk ID
-                                String chunkId = sourceId + ":" + documentId + ":chunk:" + i;
-
-                                // Encode embedding with text using little-endian format
-                                // Format: [dimension:4 bytes LE][vector:dim*4 bytes LE][text:variable UTF-8]
-                                // This format is compatible with HnswIntegrationWorker.extractVector()
-                                byte[] valueBytes = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(
-                                    chunk.getText(), embedding);
-                                byte[] keyBytes = chunkId.getBytes(StandardCharsets.UTF_8);
-                                storageEngine.put(keyBytes, valueBytes);
-
-                                // Insert into LSH index for vector similarity search
-                                if (lshIngestionService != null) {
-                                    try {
-                                        // Calculate segment index using same hash as StorageEngine
-                                        long keyHash = io.excalibur.store.hash.XxHash64.hash(keyBytes);
-                                        int segmentIndex = (int) (keyHash & (storageEngine.getSegmentCount() - 1));
-
-                                        // Get the segment and insert vector into its LSH index
-                                        io.excalibur.store.Segment segment = storageEngine.getSegment((long) segmentIndex);
-                                        if (segment != null) {
-                                            // Use stable hash of chunkId as entry ID for LSH lookups
-                                            long entryId = chunkId.hashCode() & 0xFFFFFFFFL;
-                                            lshIngestionService.insertVector(segment, embedding, entryId);
-                                        }
-                                    } catch (Exception lshError) {
-                                        // Log warning but don't fail ingestion - LSH is for pre-filtering optimization
-                                        LOGGER.warn("Failed to insert vector into LSH index for chunk {}: {}",
-                                            i, lshError.getMessage());
-                                    }
-                                }
-
-                                totalIngested++;
-                                processedChunks++;
-
-                                // Update progress
-                                double progress = (double) processedChunks / estimatedTotalChunks;
-                                status.update("embedding", Math.min(1.0, progress), totalIngested,
-                                    totalPending - processedDocs);
-
-                            } catch (LLMException e) {
-                                LOGGER.warn("Failed to embed chunk {} of {}: {}",
-                                    i, documentId, e.getMessage());
-                                // Continue with next chunk
-                            }
-                        }
-                    }
-
-                    processedDocs++;
-
-                } catch (DocumentNotFoundException e) {
-                    LOGGER.warn("Document not found: {}", documentId);
-                } catch (SourceException e) {
-                    LOGGER.warn("Failed to fetch document {}: {}", documentId, e.getMessage());
-                } catch (Exception e) {
-                    LOGGER.warn("Unexpected error processing document {}: {}", documentId, e.getMessage());
-                } finally {
-                    // Clear document ID from MDC after processing each document
-                    StructuredLoggingHelper.clearDocumentId();
-                }
-
-                // Update progress after each document
-                double progress = (double) processedDocs / totalPending;
-                status.update("embedding", progress, totalIngested, totalPending - processedDocs);
+                StructuredLoggingHelper.setDocumentId(documentId);
+                totalIngested += ingestDocument(source, sourceId, documentId, touchedSegments);
+            } catch (DocumentNotFoundException e) {
+                LOGGER.warn("Document not found: {}", documentId);
+            } catch (SourceException e) {
+                LOGGER.warn("Failed to fetch document {}: {}", documentId, e.getMessage());
+            } catch (Exception e) {
+                LOGGER.warn("Unexpected error processing document {}: {}", documentId, e.getMessage(), e);
+            } finally {
+                StructuredLoggingHelper.clearDocumentId();
             }
 
-            // Phase 3: Indexing (wait for HNSW integration)
-            StructuredLoggingHelper.setStage("indexing");
-            status.update("indexing", 0.9, totalIngested, 0);
+            processedDocs++;
+            status.update("embedding", (double) processedDocs / totalPending,
+                totalIngested, totalPending - processedDocs);
+        }
 
-            // Wait for backpressure to clear before marking complete
-            if (indexOrchestrator.isBackpressured()) {
-                LOGGER.info("Waiting for HNSW integration queue to drain (timeout={}ms)", documentTimeoutMs);
-                indexOrchestrator.awaitBackpressureRelease(documentTimeoutMs);
-            }
+        flushLshIndexes(touchedSegments);
 
-            // Complete
-            StructuredLoggingHelper.setStage("idle");
-            status.update("idle", 1.0, totalIngested, 0);
-            LOGGER.info("Ingestion complete: {} chunks from {} documents", totalIngested, processedDocs);
+        StructuredLoggingHelper.setStage("indexing");
+        status.update("indexing", 0.9, totalIngested, 0);
+        awaitBackpressureRelease();
 
-        } catch (SourceException e) {
-            String error = "Crawl failed: " + e.getMessage();
-            LOGGER.error("{}", error, e);
-            status.setError(error);
+        StructuredLoggingHelper.setStage("idle");
+        status.update("idle", 1.0, totalIngested, 0);
+        LOGGER.info("Ingestion complete: {} chunks from {} documents", totalIngested, processedDocs);
+    }
 
+    /**
+     * Ingests one document as an atomic unit.
+     *
+     * <p>Every chunk is embedded and written before the document is published. A failure at any
+     * step rolls back the chunks already written and leaves the document unregistered, so no
+     * query can observe a fragment of it.</p>
+     *
+     * @return The number of chunks published (0 if the document was skipped)
+     */
+    private int ingestDocument(Source source, String sourceId, String documentId,
+                               Set<Segment> touchedSegments) throws SourceException {
+        FetchedDocument doc = source.fetch(documentId);
+
+        if (doc.getContentLength() > MAX_DOCUMENT_CONTENT_BYTES) {
+            LOGGER.warn("Skipping document {}: {} bytes exceeds the {} byte ingest limit",
+                documentId, doc.getContentLength(), MAX_DOCUMENT_CONTENT_BYTES);
+            return 0;
+        }
+
+        String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
+        // Decoded with the encoding the source declared, not with an assumed UTF-8: decoding a
+        // windows-1252 or UTF-16 document as UTF-8 substitutes U+FFFD silently, and the terms
+        // indexed from it are then not the terms it contains.
+        List<TextChunk> chunks = textChunker.chunk(documentKey, doc.getText());
+
+        if (chunks.isEmpty()) {
+            LOGGER.debug("Document {} produced no chunks", documentId);
+            return 0;
+        }
+        if (chunks.size() > MAX_CHUNKS_PER_DOCUMENT) {
+            LOGGER.warn("Skipping document {}: {} chunks exceeds the per-document limit of {}",
+                documentId, chunks.size(), MAX_CHUNKS_PER_DOCUMENT);
+            return 0;
+        }
+
+        Map<Integer, float[]> embeddings = embedAll(chunks, documentId);
+        if (embeddings == null) {
+            return 0;
+        }
+
+        List<String> writtenKeys = new ArrayList<>(chunks.size());
+        try {
+            // Marked in flight before the first chunk reaches storage. This is what the
+            // atomicity filter excludes on: a chunk written but not yet published is reachable
+            // by a tail scan, and without the marker the filter has no way to tell that from a
+            // document it simply has not heard of, so it either shows half a document or drops
+            // whole ones. Publishing clears it; so does rollback.
+            beginIngestion(documentKey, chunks);
+            writeChunks(documentKey, chunks, embeddings, writtenKeys);
+            AtomicDocumentBatch batch = mirrorToWriteLog(documentKey, chunks, embeddings);
+            publishDocument(sourceId, documentId, documentKey, doc, chunks, batch);
         } catch (Exception e) {
-            String error = "Ingestion failed: " + e.getMessage();
-            LOGGER.error("{}", error, e);
-            status.setError(error);
+            rollbackChunks(documentKey, writtenKeys, e);
+            return 0;
+        }
 
-        } finally {
-            // Ensure source is closed
+        indexVectors(documentKey, chunks, embeddings, touchedSegments);
+        trackTermFrequencies(documentKey, chunks);
+        reportToGraph(documentKey, doc);
+        return chunks.size();
+    }
+
+    /**
+     * Generates embeddings for every chunk.
+     *
+     * @return The embeddings keyed by chunk index, or null if any chunk failed
+     */
+    private Map<Integer, float[]> embedAll(List<TextChunk> chunks, String documentId) {
+        Map<Integer, float[]> embeddings = new HashMap<>(chunks.size());
+        for (TextChunk chunk : chunks) {
             try {
-                source.close();
-            } catch (IOException e) {
-                LOGGER.debug("Error closing source: {}", e.getMessage());
+                embeddings.put(chunk.getChunkIndex(), embeddingClient.embed(chunk.getText()));
+            } catch (LLMException e) {
+                LOGGER.warn("Skipping document {}: failed to embed chunk {}: {}",
+                    documentId, chunk.getChunkIndex(), e.getMessage());
+                return null;
             }
         }
+        return embeddings;
+    }
+
+    /**
+     * Marks a document in flight, with the chunk ids it is about to write.
+     *
+     * <p>No-op without a visibility tracker: the atomicity guarantee is the tracker's, and a
+     * deployment without one has already opted out of it.
+     */
+    private void beginIngestion(String documentKey, List<TextChunk> chunks) {
+        if (visibilityTracker == null) {
+            return;
         }
-        // MDC context is automatically cleared when ctx.close() is called
+        visibilityTracker.beginIngestion(documentKey, chunks.size());
+        for (TextChunk chunk : chunks) {
+            visibilityTracker.addPendingChunk(documentKey,
+                ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex()));
+        }
+    }
+
+    /**
+     * Writes every chunk to the storage engine, recording the keys written so a later failure
+     * can undo them.
+     */
+    private void writeChunks(String documentKey, List<TextChunk> chunks,
+                             Map<Integer, float[]> embeddings, List<String> writtenKeys) {
+        for (TextChunk chunk : chunks) {
+            String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
+            byte[] value = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(
+                chunk.getText(), embeddings.get(chunk.getChunkIndex()));
+            storageEngine.put(chunkId.getBytes(StandardCharsets.UTF_8), value);
+            writtenKeys.add(chunkId);
+        }
+    }
+
+    /**
+     * Mirrors the document into the chunk buffer's write log as one contiguous batch.
+     *
+     * <p>The write log fsyncs each append before it returns, so the batch is already durable
+     * when this method hands it back and the document may be published straight away.</p>
+     *
+     * @return The batch with its write log offset range, or null when no buffer is configured
+     * @throws IOException if the write log append fails
+     */
+    private AtomicDocumentBatch mirrorToWriteLog(String documentKey, List<TextChunk> chunks,
+                                                 Map<Integer, float[]> embeddings) throws IOException {
+        if (documentChunkBuffer == null) {
+            return null;
+        }
+        for (TextChunk chunk : chunks) {
+            documentChunkBuffer.bufferChunk(chunk);
+        }
+        return documentChunkBuffer.commitDocumentWithEmbeddings(documentKey, embeddings);
+    }
+
+    /**
+     * Advances the visibility epoch and registers the document so queries can see it.
+     *
+     * <p>Registration uses the {@code sourceId:documentId} key, which is what excalibur-shard
+     * derives from the storage key and what excalibur-query's atomicity filter looks up. It also
+     * records the document in the {@link DocumentRegistry} so a later reindex can detect the
+     * change and tombstone exactly these chunk ids.</p>
+     */
+    private void publishDocument(String sourceId, String documentId, String documentKey,
+                                 FetchedDocument doc, List<TextChunk> chunks,
+                                 AtomicDocumentBatch batch) {
+        byte[] content = doc.getContent();
+        List<String> chunkIds = new ArrayList<>(chunks.size());
+        for (TextChunk chunk : chunks) {
+            chunkIds.add(ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex()));
+        }
+
+        DocumentMetadata metadata = DocumentMetadata.builder()
+            .sourceId(sourceId)
+            .documentId(documentId)
+            .lastModifiedMillis(doc.getLastModifiedMillis())
+            .contentHash(DocumentRegistry.computeContentHash(content))
+            .contentLength(content.length)
+            .chunkIds(chunkIds)
+            .indexTimeMillis(System.currentTimeMillis())
+            .build();
+
+        if (visibilityTracker != null) {
+            long epoch = visibilityTracker.advanceEpoch();
+            if (batch != null) {
+                visibilityTracker.registerAtomicDocument(batch, epoch);
+            } else {
+                visibilityTracker.registerFromMetadata(metadata, epoch);
+            }
+            LOGGER.debug("Document {} published at epoch {} with {} chunks",
+                documentKey, epoch, chunkIds.size());
+        }
+
+        if (documentRegistry != null) {
+            documentRegistry.register(metadata);
+        }
+    }
+
+    /**
+     * Removes chunks written for a document that failed to publish, and discards anything the
+     * chunk buffer is still holding for it.
+     */
+    private void rollbackChunks(String documentKey, List<String> writtenKeys, Exception cause) {
+        LOGGER.error("Rolling back document {} after publication failure: {}",
+            documentKey, cause.getMessage(), cause);
+
+        if (documentChunkBuffer != null) {
+            documentChunkBuffer.abortDocument(documentKey);
+        }
+
+        // Clear the in-flight marker. A document left pending is invisible to every query
+        // for the life of the process, and never released.
+        if (visibilityTracker != null) {
+            visibilityTracker.abortIngestion(documentKey);
+        }
+
+        for (String chunkId : writtenKeys) {
+            try {
+                storageEngine.delete(chunkId.getBytes(StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                LOGGER.warn("Failed to roll back chunk {}: {}", chunkId, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Inserts each chunk's vector into the LSH index of the segment the chunk actually landed in.
+     *
+     * <p>The segment is resolved after the writes, because a write may have split the segment
+     * the key would previously have routed to.</p>
+     */
+    private void indexVectors(String documentKey, List<TextChunk> chunks,
+                              Map<Integer, float[]> embeddings, Set<Segment> touchedSegments) {
+        if (lshIngestionService == null) {
+            return;
+        }
+
+        for (TextChunk chunk : chunks) {
+            String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
+            try {
+                Segment segment = segmentFor(chunkId);
+                if (segment == null) {
+                    continue;
+                }
+                long entryId = chunkId.hashCode() & 0xFFFFFFFFL;
+                if (lshIngestionService.insertVector(segment, embeddings.get(chunk.getChunkIndex()), entryId)) {
+                    touchedSegments.add(segment);
+                }
+            } catch (Exception e) {
+                // LSH is a pre-filtering optimisation; a failure must not fail the document.
+                LOGGER.warn("Failed to insert vector into LSH index for chunk {}: {}",
+                    chunkId, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Records the document's terms in the Count-Min Sketch of each chunk's segment, so the query
+     * planner can estimate selectivity.
+     */
+    private void trackTermFrequencies(String documentKey, List<TextChunk> chunks) {
+        if (termFrequencyTracker == null) {
+            return;
+        }
+
+        for (TextChunk chunk : chunks) {
+            String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
+            try {
+                Segment segment = segmentFor(chunkId);
+                if (segment != null) {
+                    termFrequencyTracker.trackText(segment, chunk.getText());
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Failed to track term frequencies for chunk {}: {}", chunkId, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Resolves the segment a key routes to, using the same arithmetic as
+     * {@code StorageEngine.put} so the LSH index and the sketch land on the segment that
+     * actually holds the entry.
+     */
+    private Segment segmentFor(String chunkId) {
+        int segmentCount = storageEngine.getSegmentCount();
+        if (segmentCount <= 0) {
+            return null;
+        }
+        long keyHash = io.excalibur.store.hash.XxHash64.hash(chunkId.getBytes(StandardCharsets.UTF_8));
+        return storageEngine.getSegment(keyHash & (segmentCount - 1));
+    }
+
+    /**
+     * Forces every LSH index written during this run to its backing files.
+     *
+     * <p>Without this the buckets built during ingestion live only in the index's page cache
+     * until the segment is closed, so a crash mid-run loses the pre-filter for everything
+     * ingested since the last flush while the query pipeline still believes it has one.</p>
+     */
+    private void flushLshIndexes(Set<Segment> touchedSegments) {
+        if (lshIngestionService == null) {
+            return;
+        }
+        for (Segment segment : touchedSegments) {
+            lshIngestionService.flush(segment);
+        }
+    }
+
+    /**
+     * Throttles the embedding stage while the HNSW integration queue is over its limit.
+     */
+    private void awaitBackpressureRelease() {
+        if (!indexOrchestrator.isBackpressured()) {
+            return;
+        }
+        LOGGER.info("Backpressure detected, waiting for HNSW queue to drain");
+        if (!indexOrchestrator.awaitBackpressureRelease(documentTimeoutMs)) {
+            LOGGER.warn("Backpressure timeout after {}ms, continuing ingestion", documentTimeoutMs);
+        }
     }
 
     /**
@@ -621,11 +831,45 @@ public class IngestionOrchestrator {
     }
 
     /**
-     * Shuts down the orchestrator, interrupting any active ingestions.
+     * Shuts down the orchestrator, interrupting active ingestions and waiting for them to finish.
+     *
+     * <p>This <strong>must</strong> be called - and must return - before the StorageEngine and
+     * its Arena are closed. An ingestion thread still inside {@code storageEngine.put} writes
+     * into a memory-mapped region; closing the Arena underneath it is undefined behaviour, not
+     * a caught exception.</p>
+     *
+     * @return true if all ingestion threads finished within the shutdown timeout
      */
-    public void shutdown() {
+    public boolean shutdown() {
         LOGGER.info("Shutting down IngestionOrchestrator with {} active ingestions",
             activeIngestions.size());
         shutdown.set(true);
+
+        for (Thread worker : ingestionThreads.values()) {
+            worker.interrupt();
+        }
+
+        long deadline = System.nanoTime() + SHUTDOWN_AWAIT_MILLIS * 1_000_000L;
+        boolean clean = true;
+        for (Thread worker : ingestionThreads.values()) {
+            long remainingMillis = (deadline - System.nanoTime()) / 1_000_000L;
+            if (remainingMillis <= 0) {
+                clean = false;
+                break;
+            }
+            try {
+                worker.join(remainingMillis);
+                clean &= !worker.isAlive();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        if (!clean) {
+            LOGGER.warn("Ingestion threads still running after {}ms shutdown timeout: {}",
+                SHUTDOWN_AWAIT_MILLIS, activeIngestions);
+        }
+        return clean;
     }
 }

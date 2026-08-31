@@ -86,7 +86,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should attach WriteLog to segment")
         void testAttachWriteLog() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             assertNotNull(segment.writeLog(), "WriteLog should be attached");
@@ -102,11 +102,11 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should reject double attachment")
         void testDoubleAttachment() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             Path logFile2 = tempDir.resolve("test-segment-2.wal");
-            WriteLog writeLog2 = new WriteLog(logFile2, arena);
+            WriteLog writeLog2 = new WriteLog(logFile2);
 
             assertThrows(IllegalStateException.class, () -> segment.attachWriteLog(writeLog2));
 
@@ -123,7 +123,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should append to WAL when put() is called with WAL attached")
         void testPutAppendsToWal() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key".getBytes();
@@ -159,7 +159,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should append to WAL for update operations")
         void testUpdateAppendsToWal() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key".getBytes();
@@ -178,7 +178,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should append correct entry format to WAL")
         void testWalEntryFormat() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key".getBytes();
@@ -208,7 +208,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should append to WAL when delete() is called with WAL attached")
         void testDeleteAppendsToWal() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key".getBytes();
@@ -243,7 +243,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should NOT append to WAL when key not found for delete")
         void testDeleteNotFoundNoWalAppend() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "nonexistent".getBytes();
@@ -257,7 +257,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should append DELETE entry to WAL with correct format")
         void testDeleteEntryFormat() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key".getBytes();
@@ -287,7 +287,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should append to WAL when putWithoutLock() is called with WAL attached")
         void testPutWithoutLockAppendsToWal() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key".getBytes();
@@ -313,7 +313,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("Should append to WAL when deleteWithoutLock() is called with WAL attached")
         void testDeleteWithoutLockAppendsToWal() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key".getBytes();
@@ -344,7 +344,7 @@ class WriteLogIntegrationTest {
         @DisplayName("Should recover data from WAL after crash")
         void testCrashRecovery() throws IOException {
             // Setup with WAL
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key1 = "key1".getBytes();
@@ -367,7 +367,7 @@ class WriteLogIntegrationTest {
             // Reopen and recover
             arena = Arena.ofConfined(); // New arena
             segment = new Segment(segmentFile, 10 * 1024 * 1024, arena);
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             // Recover from WAL
@@ -387,7 +387,7 @@ class WriteLogIntegrationTest {
         @DisplayName("Should recover DELETE operations from WAL")
         void testCrashRecoveryWithDeletes() throws IOException {
             // Setup with WAL
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key1 = "key1".getBytes();
@@ -404,7 +404,7 @@ class WriteLogIntegrationTest {
             // Reopen and recover
             arena = Arena.ofConfined();
             segment = new Segment(segmentFile, 10 * 1024 * 1024, arena);
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             segment.recoverFromLog();
@@ -418,7 +418,7 @@ class WriteLogIntegrationTest {
         @DisplayName("Should recover update operations from WAL")
         void testCrashRecoveryWithUpdates() throws IOException {
             // Setup with WAL
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "key".getBytes();
@@ -436,7 +436,7 @@ class WriteLogIntegrationTest {
             // Reopen and recover
             arena = Arena.ofConfined();
             segment = new Segment(segmentFile, 10 * 1024 * 1024, arena);
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             segment.recoverFromLog();
@@ -452,7 +452,7 @@ class WriteLogIntegrationTest {
         @DisplayName("Should recover multiple operations in LSN order")
         void testRecoveryLsnOrder() throws IOException {
             // Setup with WAL
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             // Multiple operations
@@ -483,7 +483,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("WAL should be appended before segment is modified")
         void testWalAppendBeforeModification() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key".getBytes();
@@ -529,7 +529,7 @@ class WriteLogIntegrationTest {
                 Path concurrentLogFile = tempDir.resolve("concurrent-segment.wal");
 
                 Segment concurrentSegment = new Segment(concurrentSegmentFile, 10 * 1024 * 1024, sharedArena);
-                WriteLog concurrentWriteLog = new WriteLog(concurrentLogFile, sharedArena);
+                WriteLog concurrentWriteLog = new WriteLog(concurrentLogFile);
                 concurrentSegment.attachWriteLog(concurrentWriteLog);
 
                 int numThreads = 4;
@@ -581,7 +581,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("LSNs should be monotonically increasing")
         void testLsnMonotonicity() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             // Multiple operations
@@ -607,7 +607,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("WAL timestamps should be positive")
         void testTimestampsPositive() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             segment.put("key".getBytes(), "value".getBytes());
@@ -620,7 +620,7 @@ class WriteLogIntegrationTest {
         @Test
         @DisplayName("WAL should maintain key-value integrity")
         void testKeyValueIntegrity() throws IOException {
-            writeLog = new WriteLog(logFile, arena);
+            writeLog = new WriteLog(logFile);
             segment.attachWriteLog(writeLog);
 
             byte[] key = "test-key-with-special-chars-\0-".getBytes();

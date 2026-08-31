@@ -251,8 +251,10 @@ class CompactionWorkerTest {
 
         worker.requestCompaction(segment);
 
-        // Wait for compaction to complete
-        boolean completed = compactionLatch.await(5, TimeUnit.SECONDS);
+        // A liveness guard, not a latency budget: a compaction rewrites a whole segment, and on a
+        // machine running every module's tests at once five seconds is a measurement of the load
+        // rather than of whether compaction works.
+        boolean completed = compactionLatch.await(30, TimeUnit.SECONDS);
         assertThat(completed).isTrue();
 
         // Verify compaction happened
@@ -412,7 +414,7 @@ class CompactionWorkerTest {
 
         // Wait for both to complete
         readThread.join(5000);
-        boolean compactionDone = compactionComplete.await(5, TimeUnit.SECONDS);
+        boolean compactionDone = compactionComplete.await(30, TimeUnit.SECONDS);
 
         assertThat(readSucceeded.get()).isTrue();
         assertThat(compactionDone).isTrue();
@@ -433,6 +435,42 @@ class CompactionWorkerTest {
     }
 
     // ==================== Helper Methods ====================
+
+    @Test
+    void compaction_leavesLiveDataAtTheCanonicalSegmentName() throws IOException, InterruptedException {
+        CountDownLatch compactionLatch = new CountDownLatch(1);
+        CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> compactionLatch.countDown());
+
+        Path segmentPath = tempDir.resolve("segment_0.dat");
+        Path walPath = tempDir.resolve("segment_0.wal");
+        Segment segment = new Segment(segmentPath, 1024 * 1024, arena);
+        testSegments.add(segment);
+        segment.attachWriteLog(new WriteLog(walPath));
+
+        byte[] key = "keep-me".getBytes();
+        segment.put(key, "keep-value".getBytes());
+        segment.put("drop-me".getBytes(), "drop-value".getBytes());
+        segment.delete("drop-me".getBytes());
+
+        worker.requestCompaction(segment);
+        assertThat(compactionLatch.await(30, TimeUnit.SECONDS)).isTrue();
+
+        // The canonical name must still be the live segment: it is the only name
+        // SegmentDiscovery matches on the next start.
+        assertThat(Files.exists(segmentPath))
+            .as("segment_0.dat must hold the compacted data after the swap")
+            .isTrue();
+        assertThat(Files.exists(walPath)).as("segment_0.wal must exist").isTrue();
+
+        try (var files = Files.list(tempDir)) {
+            assertThat(files.map(path -> path.getFileName().toString()))
+                .as("no scratch or double-extension file may survive a successful compaction")
+                .noneMatch(name -> name.endsWith(".compact") || name.endsWith(".dat.dat")
+                    || name.endsWith(".dat.wal"));
+        }
+
+        worker.stop();
+    }
 
     private Segment createTestSegment(String name) throws IOException {
         Path segmentPath = tempDir.resolve(name + ".dat");

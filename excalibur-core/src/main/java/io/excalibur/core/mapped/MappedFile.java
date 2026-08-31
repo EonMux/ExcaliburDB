@@ -14,6 +14,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * Memory-mapped I/O abstraction using Panama FFM (MemorySegment, Arena).
  * Provides efficient file-backed memory regions with thread-safe access.
@@ -66,6 +69,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class MappedFile implements AutoCloseable {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(MappedFile.class);
+
     private static final int PAGE_SIZE = 4096;
 
     private static final OpenOption[] READ_WRITE_OPTIONS = {
@@ -92,6 +97,7 @@ public class MappedFile implements AutoCloseable {
 
     private volatile MemorySegment segment;
     private volatile boolean closed = false;
+    private volatile Throwable flushFailure;
     private volatile long mappedSize;
     private final boolean readOnly;
 
@@ -132,8 +138,10 @@ public class MappedFile implements AutoCloseable {
         this.path = path;
         this.readOnly = readOnly;
 
-        // Align size to page boundary
-        long alignedSize = alignToPage(size);
+        // Align size to a page boundary on the writable path only. A read-only mapping
+        // cannot extend the file (FileChannel refuses to grow a non-writable channel), so
+        // it must map exactly what the file already contains.
+        long alignedSize = readOnly ? size : alignToPage(size);
         this.mappedSize = alignedSize;
 
         // Create parent directories if needed (only for read-write)
@@ -148,29 +156,57 @@ public class MappedFile implements AutoCloseable {
         OpenOption[] options = readOnly ? READ_ONLY_OPTIONS : READ_WRITE_OPTIONS;
         this.channel = FileChannel.open(path, options);
 
+        Arena arena = null;
+        MemorySegment mapped;
         try {
-            // Resize file if needed (only for read-write)
+            // Extend file if needed (only for read-write)
+            // Note: FileChannel.truncate() only shrinks files, it does not extend them.
+            // To grow the file, write a byte at the last position.
             if (!readOnly && channel.size() < alignedSize) {
-                channel.truncate(alignedSize);
+                channel.write(java.nio.ByteBuffer.allocate(1), alignedSize - 1);
             }
 
             // Create shared arena for thread-safe access from any thread
-            Arena arena = Arena.ofShared();
-            this.arenaRef = new AtomicReference<>(arena);
+            arena = Arena.ofShared();
 
             // Map the file into memory using Panama FFM
             FileChannel.MapMode mapMode = readOnly ?
                 FileChannel.MapMode.READ_ONLY : FileChannel.MapMode.READ_WRITE;
-            this.segment = channel.map(mapMode, 0, alignedSize, arena);
+            mapped = channel.map(mapMode, 0, alignedSize, arena);
 
         } catch (Throwable t) {
-            channel.close();
-            throw new IOException("Failed to create MappedFile: " + path, t);
+            // Cleanup must never replace the real cause: attach cleanup failures as suppressed.
+            IOException failure = new IOException("Failed to create MappedFile: " + path, t);
+            closeSuppressing(arena, failure);
+            closeSuppressing(channel, failure);
+            throw failure;
+        }
+
+        this.arenaRef = new AtomicReference<>(arena);
+        this.segment = mapped;
+    }
+
+    /**
+     * Closes a resource during constructor cleanup, attaching any failure as a suppressed
+     * exception on the primary failure rather than replacing it.
+     */
+    private static void closeSuppressing(AutoCloseable resource, IOException primary) {
+        if (resource == null) {
+            return;
+        }
+        try {
+            resource.close();
+        } catch (Throwable t) {
+            primary.addSuppressed(t);
         }
     }
 
     /**
      * Opens an existing file as a memory-mapped region in read-only mode.
+     *
+     * <p>The mapping covers exactly the current length of the file; unlike the writable
+     * factories the length is not rounded up to a page boundary, because a read-only
+     * channel cannot be grown to match.</p>
      *
      * @param path Path to the existing file
      * @return New MappedFile wrapping the region
@@ -194,8 +230,11 @@ public class MappedFile implements AutoCloseable {
     }
 
     /**
-     * Creates a new file as a memory-mapped region.
-     * If the file already exists, it will be overwritten.
+     * Creates a new file as a memory-mapped region, or opens an existing one.
+     *
+     * <p>Existing content is preserved. If the file is shorter than {@code size} it is
+     * grown to the page-aligned size; if it is longer, the extra bytes are left on disk
+     * untouched and simply fall outside this mapping.</p>
      *
      * @param path Path for the new file
      * @param size Size of the region to allocate
@@ -319,7 +358,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            MemorySegment currentSegment = segment;
+            MemorySegment currentSegment = activeSegment();
             MemorySegment.copy(currentSegment, BYTE_LAYOUT, offset, buffer, bufferOffset, length);
             bytesRead.addAndGet(length);
             readCount.incrementAndGet();
@@ -343,7 +382,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            return segment.get(BYTE_LAYOUT, offset);
+            return activeSegment().get(BYTE_LAYOUT, offset);
         } finally {
             lock.readLock().unlock();
         }
@@ -363,7 +402,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            return segment.get(INT_LAYOUT, offset);
+            return activeSegment().get(INT_LAYOUT, offset);
         } finally {
             lock.readLock().unlock();
         }
@@ -383,7 +422,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            return segment.get(LONG_LAYOUT, offset);
+            return activeSegment().get(LONG_LAYOUT, offset);
         } finally {
             lock.readLock().unlock();
         }
@@ -403,7 +442,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            return segment.get(FLOAT_LAYOUT, offset);
+            return activeSegment().get(FLOAT_LAYOUT, offset);
         } finally {
             lock.readLock().unlock();
         }
@@ -423,7 +462,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            return segment.get(DOUBLE_LAYOUT, offset);
+            return activeSegment().get(DOUBLE_LAYOUT, offset);
         } finally {
             lock.readLock().unlock();
         }
@@ -444,10 +483,11 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            int length = segment.get(INT_LAYOUT, offset);
+            MemorySegment currentSegment = activeSegment();
+            int length = currentSegment.get(INT_LAYOUT, offset);
             checkBounds(offset + 4, length);
             byte[] bytes = new byte[length];
-            MemorySegment.copy(segment, BYTE_LAYOUT, offset + 4, bytes, 0, length);
+            MemorySegment.copy(currentSegment, BYTE_LAYOUT, offset + 4, bytes, 0, length);
             bytesRead.addAndGet(4 + length);
             return new String(bytes, StandardCharsets.UTF_8);
         } finally {
@@ -471,7 +511,7 @@ public class MappedFile implements AutoCloseable {
         lock.readLock().lock();
         try {
             byte[] bytes = new byte[length];
-            MemorySegment.copy(segment, BYTE_LAYOUT, offset, bytes, 0, length);
+            MemorySegment.copy(activeSegment(), BYTE_LAYOUT, offset, bytes, 0, length);
             bytesRead.addAndGet(length);
             return new String(bytes, StandardCharsets.UTF_8);
         } finally {
@@ -495,9 +535,10 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
+            MemorySegment currentSegment = activeSegment();
             float[] result = new float[count];
             for (int i = 0; i < count; i++) {
-                result[i] = segment.get(FLOAT_LAYOUT, offset + (long) i * 4L);
+                result[i] = currentSegment.get(FLOAT_LAYOUT, offset + (long) i * 4L);
             }
             bytesRead.addAndGet(byteLength);
             return result;
@@ -552,7 +593,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            MemorySegment.copy(buffer, bufferOffset, segment, BYTE_LAYOUT, offset, length);
+            MemorySegment.copy(buffer, bufferOffset, activeSegment(), BYTE_LAYOUT, offset, length);
             bytesWritten.addAndGet(length);
             writeCount.incrementAndGet();
             return length;
@@ -576,7 +617,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            segment.set(BYTE_LAYOUT, offset, value);
+            activeSegment().set(BYTE_LAYOUT, offset, value);
             bytesWritten.addAndGet(1);
         } finally {
             lock.writeLock().unlock();
@@ -598,7 +639,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            segment.set(INT_LAYOUT, offset, value);
+            activeSegment().set(INT_LAYOUT, offset, value);
             bytesWritten.addAndGet(4);
         } finally {
             lock.writeLock().unlock();
@@ -620,7 +661,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            segment.set(LONG_LAYOUT, offset, value);
+            activeSegment().set(LONG_LAYOUT, offset, value);
             bytesWritten.addAndGet(8);
         } finally {
             lock.writeLock().unlock();
@@ -642,7 +683,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            segment.set(FLOAT_LAYOUT, offset, value);
+            activeSegment().set(FLOAT_LAYOUT, offset, value);
             bytesWritten.addAndGet(4);
         } finally {
             lock.writeLock().unlock();
@@ -664,7 +705,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            segment.set(DOUBLE_LAYOUT, offset, value);
+            activeSegment().set(DOUBLE_LAYOUT, offset, value);
             bytesWritten.addAndGet(8);
         } finally {
             lock.writeLock().unlock();
@@ -690,8 +731,9 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
+            MemorySegment currentSegment = activeSegment();
             for (int i = 0; i < values.length; i++) {
-                segment.set(FLOAT_LAYOUT, offset + (long) i * 4L, values[i]);
+                currentSegment.set(FLOAT_LAYOUT, offset + (long) i * 4L, values[i]);
             }
             bytesWritten.addAndGet(byteLength);
             writeCount.incrementAndGet();
@@ -722,8 +764,9 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            segment.set(INT_LAYOUT, offset, bytes.length);
-            MemorySegment.copy(bytes, 0, segment, BYTE_LAYOUT, offset + 4, bytes.length);
+            MemorySegment currentSegment = activeSegment();
+            currentSegment.set(INT_LAYOUT, offset, bytes.length);
+            MemorySegment.copy(bytes, 0, currentSegment, BYTE_LAYOUT, offset + 4, bytes.length);
             bytesWritten.addAndGet(4 + bytes.length);
             return 4 + bytes.length;
         } finally {
@@ -753,7 +796,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            MemorySegment.copy(bytes, 0, segment, BYTE_LAYOUT, offset, bytes.length);
+            MemorySegment.copy(bytes, 0, activeSegment(), BYTE_LAYOUT, offset, bytes.length);
             bytesWritten.addAndGet(bytes.length);
             return bytes.length;
         } finally {
@@ -778,7 +821,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.readLock().lock();
         try {
-            return segment.asSlice(offset, length);
+            return activeSegment().asSlice(offset, length);
         } finally {
             lock.readLock().unlock();
         }
@@ -805,8 +848,12 @@ public class MappedFile implements AutoCloseable {
      * @throws IllegalStateException if MappedFile is closed
      */
     public MemorySegment segment() {
-        checkOpen();
-        return segment;
+        lock.readLock().lock();
+        try {
+            return activeSegment();
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**
@@ -816,8 +863,17 @@ public class MappedFile implements AutoCloseable {
      * @throws IllegalStateException if MappedFile is closed
      */
     public Arena arena() {
-        checkOpen();
-        return arenaRef.get();
+        lock.readLock().lock();
+        try {
+            checkOpen();
+            Arena arena = arenaRef.get();
+            if (arena == null) {
+                throw new IllegalStateException("MappedFile is closed: " + path);
+            }
+            return arena;
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**
@@ -848,7 +904,9 @@ public class MappedFile implements AutoCloseable {
         lock.writeLock().lock();
         try {
             long newSize = this.mappedSize + alignToPage(extensionSize);
-            remap(newSize);
+            remap(newSize, false);
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Throwable t) {
             throw new IOException("Failed to extend MappedFile: " + path, t);
         } finally {
@@ -887,7 +945,9 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            remap(alignedSize);
+            remap(alignedSize, true);
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Throwable t) {
             throw new IOException("Failed to truncate MappedFile: " + path, t);
         } finally {
@@ -898,35 +958,49 @@ public class MappedFile implements AutoCloseable {
     /**
      * Internal method to remap the file to a new size.
      * Must be called while holding the write lock.
+     *
+     * @param alignedSize Page-aligned size of the new mapping
+     * @param allowShrink Whether the file on disk may be shortened to match. Only
+     *                    {@link #truncate(long)} may shrink; the grow path must not,
+     *                    because the file can legitimately be longer than the current
+     *                    mapping (a file reopened with a smaller nominal size), and
+     *                    shortening it there would destroy persisted data.
      */
-    private void remap(long alignedSize) throws IOException {
+    private void remap(long alignedSize, boolean allowShrink) throws IOException {
         // Flush existing data
-        segment.force();
+        activeSegment().force();
 
-        // Get the current arena and close it (this unmaps the old segment)
-        Arena oldArena = arenaRef.getAndSet(null);
+        // Create new arena and mapping BEFORE closing the old one.
+        // This avoids a window where arenaRef is null (and a resource leak if map() throws).
+        if (channel.size() < alignedSize) {
+            // Extend file by writing a byte at the last position.
+            // Note: FileChannel.truncate() only shrinks, it does not extend.
+            channel.write(java.nio.ByteBuffer.allocate(1), alignedSize - 1);
+        } else if (allowShrink && channel.size() > alignedSize) {
+            channel.truncate(alignedSize);
+        }
 
-        // Resize the file
-        channel.truncate(alignedSize);
-
-        // Create new shared arena and mapping
         Arena newArena = Arena.ofShared();
-        MemorySegment newSegment = channel.map(FileChannel.MapMode.READ_WRITE, 0, alignedSize, newArena);
+        try {
+            MemorySegment newSegment = channel.map(FileChannel.MapMode.READ_WRITE, 0, alignedSize, newArena);
 
-        // Update arena reference
-        arenaRef.set(newArena);
+            // Swap in the new arena and segment atomically
+            Arena oldArena = arenaRef.getAndSet(newArena);
+            this.segment = newSegment;
+            this.mappedSize = alignedSize;
 
-        // Update segment and size - these are volatile for visibility
-        this.segment = newSegment;
-        this.mappedSize = alignedSize;
-
-        // Now close the old arena (after all references are updated)
-        if (oldArena != null) {
-            try {
-                oldArena.close();
-            } catch (Throwable t) {
-                // Log but don't fail - the new mapping is already in place
+            // Now close the old arena (after all references are updated)
+            if (oldArena != null) {
+                try {
+                    oldArena.close();
+                } catch (Throwable t) {
+                    // Don't fail - the new mapping is already in place
+                    LOGGER.warn("Failed to close superseded Arena for MappedFile {}", path, t);
+                }
             }
+        } catch (Throwable t) {
+            newArena.close();
+            throw new IOException("Failed to remap: " + path, t);
         }
     }
 
@@ -940,7 +1014,7 @@ public class MappedFile implements AutoCloseable {
 
         lock.writeLock().lock();
         try {
-            segment.force();
+            activeSegment().force();
         } finally {
             lock.writeLock().unlock();
         }
@@ -962,6 +1036,10 @@ public class MappedFile implements AutoCloseable {
      * <p>Thread safety: This operation acquires the write lock, ensuring all
      * pending operations complete before closing. Once closed, the volatile
      * closed flag ensures all threads see the closed state.</p>
+     *
+     * <p>The final flush is best-effort: {@code close()} cannot throw a checked
+     * exception, so a failed msync is logged at ERROR and reported via
+     * {@link #closeFlushFailure()}.</p>
      */
     @Override
     public void close() {
@@ -972,12 +1050,17 @@ public class MappedFile implements AutoCloseable {
             }
             closed = true;
 
-            // Flush before closing
-            if (segment != null) {
+            // Flush before closing. This is the last durability point for the mapping,
+            // so a failure here must not be silent: it means data the caller believes is
+            // persisted is not.
+            MemorySegment current = segment;
+            if (current != null) {
                 try {
-                    segment.force();
+                    current.force();
                 } catch (Throwable t) {
-                    // Ignore - we're closing anyway
+                    flushFailure = t;
+                    LOGGER.error("Final flush (msync) failed while closing MappedFile {}"
+                        + " - data written through this mapping may not be durable", path, t);
                 }
             }
 
@@ -987,7 +1070,7 @@ public class MappedFile implements AutoCloseable {
                 try {
                     arena.close();
                 } catch (Throwable t) {
-                    // Ignore
+                    LOGGER.warn("Failed to close Arena for MappedFile {}", path, t);
                 }
             }
 
@@ -996,11 +1079,13 @@ public class MappedFile implements AutoCloseable {
                 try {
                     channel.close();
                 } catch (IOException e) {
-                    // Ignore
+                    LOGGER.warn("Failed to close FileChannel for MappedFile {}", path, e);
                 }
             }
 
-            segment = null;
+            // The segment reference is deliberately retained. Readers that raced past the
+            // pre-lock checkOpen() re-validate through activeSegment() while holding the
+            // lock and must observe IllegalStateException, not NullPointerException.
         } finally {
             lock.writeLock().unlock();
         }
@@ -1013,6 +1098,19 @@ public class MappedFile implements AutoCloseable {
      */
     public boolean isClosed() {
         return closed;
+    }
+
+    /**
+     * Returns the failure raised by the final flush performed during {@link #close()}.
+     *
+     * <p>{@code close()} cannot throw a checked exception, so a failed msync is recorded
+     * here (and logged at ERROR) instead of being discarded. Callers that depend on the
+     * mapping being durable should check this after closing.</p>
+     *
+     * @return The flush failure, or null if the final flush succeeded or has not run
+     */
+    public Throwable closeFlushFailure() {
+        return flushFailure;
     }
 
     /**
@@ -1062,6 +1160,24 @@ public class MappedFile implements AutoCloseable {
         if (closed) {
             throw new IllegalStateException("MappedFile is closed: " + path);
         }
+    }
+
+    /**
+     * Returns the live memory segment after re-validating the open state.
+     *
+     * <p>Must be called while holding the read or write lock. {@code close()} takes the
+     * write lock, so re-checking here closes the window between the pre-lock
+     * {@link #checkOpen()} fast path and the actual memory access.</p>
+     *
+     * @return The mapped segment
+     * @throws IllegalStateException if MappedFile is closed
+     */
+    private MemorySegment activeSegment() {
+        MemorySegment current = segment;
+        if (closed || current == null) {
+            throw new IllegalStateException("MappedFile is closed: " + path);
+        }
+        return current;
     }
 
     /**

@@ -65,7 +65,7 @@ public class StateMachine {
     /**
      * Transition counter.
      */
-    private volatile int transitionCount = 0;
+    private final java.util.concurrent.atomic.AtomicInteger transitionCount = new java.util.concurrent.atomic.AtomicInteger(0);
 
     /**
      * Creates a new state machine with default validator.
@@ -122,23 +122,29 @@ public class StateMachine {
             throw new IllegalArgumentException("Desired state cannot be null");
         }
 
-        LifecycleState previousState = get();
+        // Use CAS loop to ensure atomic read-validate-write.
+        // A plain get() + set() has a TOCTOU race where another thread
+        // could change the state between validation and the set.
+        while (true) {
+            LifecycleState previousState = get();
 
-        if (!validator.validate(previousState, desiredState)) {
-            throw new IllegalStateException(
-                String.format("Invalid state transition: %s → %s",
-                    previousState, desiredState)
-            );
+            if (!validator.validate(previousState, desiredState)) {
+                throw new IllegalStateException(
+                    String.format("Invalid state transition: %s → %s",
+                        previousState, desiredState)
+                );
+            }
+
+            // Use the LifecycleState's built-in validation for additional safety
+            LifecycleState.validateTransition(previousState, desiredState);
+
+            // Atomically update the state only if it hasn't changed
+            if (stateRef.compareAndSet(previousState, desiredState)) {
+                transitionCount.incrementAndGet();
+                return previousState;
+            }
+            // State changed concurrently - retry with fresh read
         }
-
-        // Use the LifecycleState's built-in validation for additional safety
-        LifecycleState.validateTransition(previousState, desiredState);
-
-        // Atomically update the state
-        stateRef.set(desiredState);
-        transitionCount++;
-
-        return previousState;
     }
 
     /**
@@ -162,7 +168,7 @@ public class StateMachine {
             }
 
             if (stateRef.compareAndSet(expectedState, desiredState)) {
-                transitionCount++;
+                transitionCount.incrementAndGet();
                 return true;
             }
 
@@ -211,7 +217,7 @@ public class StateMachine {
         if (initialState == null) {
             throw new IllegalArgumentException("Initial state cannot be null");
         }
-        transitionCount = 0;
+        transitionCount.set(0);
         stateRef.set(initialState);
     }
 
@@ -220,7 +226,7 @@ public class StateMachine {
      * @return number of transitions performed
      */
     public int getTransitionCount() {
-        return transitionCount;
+        return transitionCount.get();
     }
 
     /**

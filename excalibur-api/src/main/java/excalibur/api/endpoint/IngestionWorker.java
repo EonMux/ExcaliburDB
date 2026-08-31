@@ -6,7 +6,6 @@ import io.excalibur.core.logging.StructuredLoggingHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
@@ -170,15 +169,10 @@ public class IngestionWorker implements Runnable {
                 String error = "Ingestion failed: " + e.getMessage();
                 status.setError(error);
                 LOGGER.error("{}", error, e);
-
-            } finally {
-                // Ensure source is closed
-                try {
-                    source.close();
-                } catch (IOException e) {
-                    LOGGER.debug("Error closing source: {}", e.getMessage());
-                }
             }
+            // The Source is owned by the registry that published it and is reused by
+            // every later reindex of the same source. Closing it here is what leaves
+            // the registry handing out an already-closed crawler.
         }
         // MDC context is automatically cleared when ctx.close() is called
     }

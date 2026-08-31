@@ -40,12 +40,18 @@ class HttpSourceTest {
         server.createContext("/missing.html", new NotFoundHandler());
         server.createContext("/large.html", new LargeContentHandler());
         server.createContext("/api/data.json", new ApiHandler());
+        server.createContext("/redirect-in-policy.html", new RedirectHandler("/page1.html"));
+        server.createContext("/redirect-off-host.html", new RedirectHandler(null));
+        server.createContext("/redirect-excluded.html", new RedirectHandler("/api/data.json"));
+        server.createContext("/echo-headers.html", new EchoHeadersHandler());
+        server.createContext("/hub/", new HubHandler());
         
         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         server.setExecutor(executor);
         server.start();
         
         source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
             .sourceId("test-http-source")
             .baseUrl(baseUrl)
             .maxDepth(1)
@@ -71,6 +77,7 @@ class HttpSourceTest {
         @DisplayName("rejects null sourceId")
         void rejectsNullSourceId() {
             assertThatThrownBy(() -> HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId(null)
                 .baseUrl("http://example.com")
                 .build())
@@ -81,6 +88,7 @@ class HttpSourceTest {
         @DisplayName("rejects empty sourceId")
         void rejectsEmptySourceId() {
             assertThatThrownBy(() -> HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("")
                 .baseUrl("http://example.com")
                 .build())
@@ -93,6 +101,7 @@ class HttpSourceTest {
             String longId = "x".repeat(257);
 
             assertThatThrownBy(() -> HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId(longId)
                 .baseUrl("http://example.com")
                 .build())
@@ -104,6 +113,7 @@ class HttpSourceTest {
         @DisplayName("rejects null baseUrl")
         void rejectsNullBaseUrl() {
             assertThatThrownBy(() -> HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test")
                 .baseUrl((URI) null)
                 .build())
@@ -114,6 +124,7 @@ class HttpSourceTest {
         @DisplayName("rejects non-HTTP URL")
         void rejectsNonHttpUrl() {
             assertThatThrownBy(() -> HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test")
                 .baseUrl("ftp://example.com/files")
                 .build())
@@ -125,6 +136,7 @@ class HttpSourceTest {
         @DisplayName("rejects URL without host")
         void rejectsUrlWithoutHost() {
             assertThatThrownBy(() -> HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test")
                 .baseUrl("http:///path")
                 .build())
@@ -136,6 +148,7 @@ class HttpSourceTest {
         @DisplayName("accepts HTTPS URL")
         void acceptsHttpsUrl() {
             HttpSource httpsSource = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test-https")
                 .baseUrl("https://example.com/docs")
                 .build();
@@ -148,6 +161,7 @@ class HttpSourceTest {
         @DisplayName("accepts string baseUrl")
         void acceptsStringBaseUrl() {
             HttpSource stringSource = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test-string")
                 .baseUrl("http://example.com/docs")
                 .build();
@@ -198,6 +212,7 @@ class HttpSourceTest {
         @DisplayName("fetch returns correct content type for JSON")
         void fetch_returnsCorrectContentType() throws SourceException, DocumentNotFoundException {
             HttpSource jsonSource = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("json-test")
                 .baseUrl(baseUrl)
                 .includedContentTypes("application/json")
@@ -246,6 +261,7 @@ class HttpSourceTest {
         void fetch_respectsMaxResponseSize() {
             source.close();
             source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test-small-max")
                 .baseUrl(baseUrl)
                 .maxResponseSize(100)
@@ -256,6 +272,45 @@ class HttpSourceTest {
             assertThatThrownBy(() -> source.fetch(baseUrl + "/large.html"))
                 .isInstanceOf(SourceException.class)
                 .hasMessageContaining("too large");
+        }
+    }
+
+    @Nested
+    @DisplayName("Redirect Policy")
+    class RedirectPolicyTest {
+
+        @Test
+        @DisplayName("follows a redirect that stays inside the source policy")
+        void followsInPolicyRedirect() throws SourceException, DocumentNotFoundException {
+            FetchedDocument doc = source.fetch(baseUrl + "/redirect-in-policy.html");
+
+            assertThat(new String(doc.getContent())).contains("Page 1");
+        }
+
+        @Test
+        @DisplayName("refuses a redirect to a host outside allowedDomains")
+        void refusesOffHostRedirect() {
+            assertThatThrownBy(() -> source.fetch(baseUrl + "/redirect-off-host.html"))
+                .isInstanceOf(SourceException.class)
+                .hasMessageContaining("outside the source policy");
+        }
+
+        @Test
+        @DisplayName("refuses a redirect into an excluded path")
+        void refusesRedirectIntoExcludedPath() {
+            source.close();
+            source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
+                .sourceId("test-redirect-excluded")
+                .baseUrl(baseUrl)
+                .excludedPathPatterns("/api")
+                .maxDepth(1)
+                .timeoutSeconds(5)
+                .build();
+
+            assertThatThrownBy(() -> source.fetch(baseUrl + "/redirect-excluded.html"))
+                .isInstanceOf(SourceException.class)
+                .hasMessageContaining("outside the source policy");
         }
     }
 
@@ -290,6 +345,7 @@ class HttpSourceTest {
         void crawl_discoversLinkedPages() throws SourceException {
             source.close();
             source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test-crawl")
                 .baseUrl(baseUrl)
                 .maxDepth(2)
@@ -307,6 +363,7 @@ class HttpSourceTest {
         void crawl_respectsMaxDepth() throws SourceException {
             source.close();
             source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test-depth")
                 .baseUrl(baseUrl)
                 .maxDepth(0)
@@ -321,6 +378,49 @@ class HttpSourceTest {
     }
 
     @Nested
+    @DisplayName("Crawl Budget")
+    class CrawlBudgetTest {
+
+        @Test
+        @DisplayName("stops the walk once maxDocuments is reached")
+        void respectsMaxDocuments() throws SourceException {
+            source.close();
+            source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
+                .sourceId("test-budget")
+                .baseUrl(baseUrl + "/hub/")
+                .maxDepth(2)
+                .maxDocuments(3)
+                .timeoutSeconds(5)
+                .excludedPathPatterns()
+                .build();
+
+            var docs = source.crawl().toList();
+
+            assertThat(docs).hasSize(3);
+        }
+
+        @Test
+        @DisplayName("yields every reachable document when the budget is generous")
+        void yieldsAllWithinBudget() throws SourceException {
+            source.close();
+            source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
+                .sourceId("test-budget-large")
+                .baseUrl(baseUrl + "/hub/")
+                .maxDepth(2)
+                .maxDocuments(1000)
+                .timeoutSeconds(5)
+                .excludedPathPatterns()
+                .build();
+
+            var docs = source.crawl().toList();
+
+            assertThat(docs).hasSize(HubHandler.LEAF_COUNT);
+        }
+    }
+
+    @Nested
     @DisplayName("URL Filtering")
     class UrlFilteringTest {
 
@@ -329,6 +429,7 @@ class HttpSourceTest {
         void excludesMatchingPaths() throws SourceException {
             source.close();
             source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test-exclude")
                 .baseUrl(baseUrl)
                 .maxDepth(1)
@@ -346,6 +447,7 @@ class HttpSourceTest {
         void includesOnlyMatchingPaths() throws SourceException {
             source.close();
             source = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("test-include")
                 .baseUrl(baseUrl)
                 .maxDepth(1)
@@ -365,6 +467,7 @@ class HttpSourceTest {
         @DisplayName("allows multiple domains when configured")
         void allowsMultipleDomains() {
             HttpSource multiSource = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("multi-domain")
                 .baseUrl(baseUrl)
                 .allowedDomains("localhost", "example.com")
@@ -472,6 +575,7 @@ class HttpSourceTest {
         @DisplayName("accepts custom request headers")
         void acceptsCustomHeaders() {
             HttpSource customSource = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("custom-headers")
                 .baseUrl(baseUrl)
                 .addRequestHeader("X-Custom-Header", "custom-value")
@@ -483,9 +587,63 @@ class HttpSourceTest {
         }
 
         @Test
+        @DisplayName("sends configured headers on fetch")
+        void sendsCustomHeadersOnFetch() throws SourceException, DocumentNotFoundException {
+            HttpSource customSource = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
+                .sourceId("custom-headers-fetch")
+                .baseUrl(baseUrl)
+                .addRequestHeader("X-Custom-Header", "custom-value")
+                .timeoutSeconds(5)
+                .build();
+
+            FetchedDocument doc = customSource.fetch(baseUrl + "/echo-headers.html");
+
+            // com.sun.net.httpserver normalizes header names, so compare case-insensitively.
+            assertThat(new String(doc.getContent()))
+                .containsIgnoringCase("X-Custom-Header=custom-value");
+            customSource.close();
+        }
+
+        @Test
+        @DisplayName("crawls a site that requires a configured header")
+        void crawlsWithCustomHeaders() throws SourceException {
+            HttpSource customSource = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
+                .sourceId("custom-headers-crawl")
+                .baseUrl(baseUrl)
+                .addRequestHeader("Authorization", "Bearer token123")
+                .maxDepth(2)
+                .timeoutSeconds(5)
+                .excludedPathPatterns("/api")
+                .build();
+
+            // The old implementation mutated the built request's immutable header map here and
+            // aborted the whole crawl with UnsupportedOperationException.
+            var docs = customSource.crawl().toList();
+
+            assertThat(docs).isNotEmpty();
+            customSource.close();
+        }
+
+        @Test
+        @DisplayName("rejects a header the HTTP client will not send")
+        void rejectsRestrictedHeader() {
+            assertThatThrownBy(() -> HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
+                .sourceId("restricted-header")
+                .baseUrl(baseUrl)
+                .addRequestHeader("Host", "evil.example")
+                .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Host");
+        }
+
+        @Test
         @DisplayName("accepts custom user agent")
         void acceptsCustomUserAgent() {
             HttpSource customSource = HttpSource.builder()
+            .allowPrivateAddresses(true)  // crawls a local mock server
                 .sourceId("custom-ua")
                 .baseUrl(baseUrl)
                 .userAgent("CustomBot/2.0")
@@ -558,6 +716,77 @@ class HttpSourceTest {
             exchange.sendResponseHeaders(200, response.length);
             exchange.getResponseBody().write(response);
             exchange.getResponseBody().close();
+        }
+    }
+
+    /**
+     * Answers 301 with a Location under the same host, or - when the target is null - one
+     * pointing at a host that is not in allowedDomains.
+     */
+    private static class RedirectHandler implements HttpHandler {
+        private final String targetPath;
+
+        RedirectHandler(String targetPath) {
+            this.targetPath = targetPath;
+        }
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String host = exchange.getLocalAddress().getPort() + "";
+            String location = targetPath != null
+                ? "http://localhost:" + host + targetPath
+                : "http://127.0.0.1:" + host + "/page1.html";
+
+            exchange.getResponseHeaders().set("Location", location);
+            exchange.sendResponseHeaders(301, -1);
+            exchange.getResponseBody().close();
+        }
+    }
+
+    /**
+     * Echoes the request headers back as the body, so a test can prove they reached the wire.
+     */
+    private static class EchoHeadersHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            StringBuilder body = new StringBuilder();
+            exchange.getRequestHeaders().forEach((name, values) ->
+                values.forEach(value -> body.append(name).append('=').append(value).append('\n')));
+
+            byte[] response = body.toString().getBytes();
+            exchange.getResponseHeaders().set("Content-Type", "text/plain");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.getResponseBody().close();
+        }
+    }
+
+    /**
+     * Serves the whole {@code /hub/} subtree: the hub page links to {@link #LEAF_COUNT} leaves
+     * under the same base path, so a crawl has more to find than a small budget allows.
+     */
+    private static class HubHandler implements HttpHandler {
+        static final int LEAF_COUNT = 12;
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String path = exchange.getRequestURI().getPath();
+            String html = path.endsWith("/hub/") ? hubPage()
+                : "<!DOCTYPE html><html><body>leaf</body></html>";
+
+            byte[] response = html.getBytes();
+            exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.getResponseBody().close();
+        }
+
+        private static String hubPage() {
+            StringBuilder html = new StringBuilder("<!DOCTYPE html><html><body>");
+            for (int i = 0; i < LEAF_COUNT; i++) {
+                html.append("<a href=\"/hub/leaf-").append(i).append(".html\">leaf ").append(i).append("</a>");
+            }
+            return html.append("</body></html>").toString();
         }
     }
 

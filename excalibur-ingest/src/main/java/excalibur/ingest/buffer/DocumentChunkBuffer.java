@@ -1,13 +1,13 @@
 package excalibur.ingest.buffer;
 
+import io.excalibur.core.text.ChunkIdentifiers;
 import excalibur.ingest.processor.TextChunk;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.core.codec.ChunkPayloadCodec;
+import io.excalibur.store.WriteLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -35,11 +35,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * </ul>
  *
  * <h2>Write Log Contract</h2>
- * <p>Chunks are written to the write log with the following format:</p>
+ * <p>Chunks are appended to {@link io.excalibur.store.WriteLog} - the single write-ahead log
+ * the storage engine, compaction, the tail scan and the HNSW integration worker all agree on -
+ * as {@code PUT} entries keyed by chunk id:</p>
  * <pre>
- *   key: documentId:chunkIndex
- *   value: chunk text content
+ *   key:   sourceId:documentId:chunk:index
+ *   value: [dimension:4][vector:dim*4][text:variable] (little-endian), or the raw chunk text
+ *          when the document is committed without embeddings
  * </pre>
+ * <p>Every append fsyncs before it returns, so a committed batch is durable by the time
+ * {@link #commitDocument(String)} hands it back and the caller may publish it immediately.</p>
  *
  * <h2>Offset Range Tracking</h2>
  * <p>When a document is committed, the buffer returns an {@link AtomicDocumentBatch}
@@ -72,8 +77,6 @@ import java.util.concurrent.locks.ReentrantLock;
 public class DocumentChunkBuffer {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(DocumentChunkBuffer.class);
-
-    private static final String CHUNK_ID_SEPARATOR = ":";
 
     private final WriteLog writeLog;
     private final int maxChunksPerDocument;
@@ -128,9 +131,8 @@ public class DocumentChunkBuffer {
         Objects.requireNonNull(chunk, "chunk must not be null");
 
         String documentId = chunk.getDocumentId();
-        DocumentBuffer buffer = documentBuffers.computeIfAbsent(documentId, k -> new DocumentBuffer());
+        DocumentBuffer buffer = acquireBuffer(documentId);
 
-        buffer.lock.lock();
         try {
             if (buffer.chunks.size() >= maxChunksPerDocument) {
                 throw new IllegalStateException(
@@ -141,6 +143,29 @@ public class DocumentChunkBuffer {
             buffer.chunks.add(chunk);
             LOGGER.trace("Buffered chunk {} for document {}", chunk.getChunkIndex(), documentId);
         } finally {
+            buffer.lock.unlock();
+        }
+    }
+
+    /**
+     * Resolves the buffer for a document and returns it with its lock already held.
+     *
+     * <p>Resolving the map entry and locking it cannot be two independent steps: a commit or an
+     * abort running in between removes the entry, and the caller would then append to a buffer
+     * nothing will ever read. The loop re-checks that the entry it locked is still the one the
+     * map publishes and retries otherwise, so a chunk is either added to the live buffer or the
+     * caller creates a fresh one.</p>
+     *
+     * @param documentId The document whose buffer is wanted
+     * @return The live buffer for the document, with {@code buffer.lock} held by this thread
+     */
+    private DocumentBuffer acquireBuffer(String documentId) {
+        while (true) {
+            DocumentBuffer buffer = documentBuffers.computeIfAbsent(documentId, k -> new DocumentBuffer());
+            buffer.lock.lock();
+            if (documentBuffers.get(documentId) == buffer) {
+                return buffer;
+            }
             buffer.lock.unlock();
         }
     }
@@ -163,9 +188,8 @@ public class DocumentChunkBuffer {
         }
 
         String documentId = chunks.get(0).getDocumentId();
-        DocumentBuffer buffer = documentBuffers.computeIfAbsent(documentId, k -> new DocumentBuffer());
+        DocumentBuffer buffer = acquireBuffer(documentId);
 
-        buffer.lock.lock();
         try {
             if (buffer.chunks.size() + chunks.size() > maxChunksPerDocument) {
                 throw new IllegalStateException(
@@ -214,42 +238,24 @@ public class DocumentChunkBuffer {
     public AtomicDocumentBatch commitDocument(String documentId) throws IOException {
         Objects.requireNonNull(documentId, "documentId must not be null");
 
-        DocumentBuffer buffer = documentBuffers.get(documentId);
-        if (buffer == null || buffer.chunks.isEmpty()) {
-            throw new IllegalStateException("No chunks buffered for document: " + documentId);
-        }
-
         commitLock.lock();
         try {
-            buffer.lock.lock();
+            DocumentBuffer buffer = lockExistingBuffer(documentId);
+            if (buffer == null) {
+                throw new IllegalStateException("No chunks buffered for document: " + documentId);
+            }
             try {
-                List<WriteLog.BatchEntry> batchEntries = new ArrayList<>(buffer.chunks.size());
-                List<String> chunkIds = new ArrayList<>(buffer.chunks.size());
-
-                for (TextChunk chunk : buffer.chunks) {
-                    String chunkId = makeChunkId(documentId, chunk.getChunkIndex());
-                    byte[] key = chunkId.getBytes(StandardCharsets.UTF_8);
-                    byte[] value = chunk.getText().getBytes(StandardCharsets.UTF_8);
-
-                    batchEntries.add(WriteLog.BatchEntry.put(key, value));
-                    chunkIds.add(chunkId);
+                if (buffer.chunks.isEmpty()) {
+                    throw new IllegalStateException("No chunks buffered for document: " + documentId);
                 }
 
-                WriteLog.BatchAppendResult result = writeLog.appendBatch(batchEntries);
-
-                AtomicDocumentBatch batch = new AtomicDocumentBatch(
-                    documentId,
-                    result.startOffset(),
-                    result.endOffset(),
-                    Collections.unmodifiableList(chunkIds),
-                    result.entryIds()
-                );
+                AtomicDocumentBatch batch = appendRun(documentId, buffer.chunks, null);
 
                 buffer.chunks.clear();
                 documentBuffers.remove(documentId);
 
                 LOGGER.debug("Committed document {} atomically with {} chunks at contiguous offsets [{}, {})",
-                    documentId, chunkIds.size(), result.startOffset(), result.endOffset());
+                    documentId, batch.getChunkCount(), batch.getStartOffset(), batch.getEndOffset());
 
                 return batch;
             } finally {
@@ -285,49 +291,24 @@ public class DocumentChunkBuffer {
         Objects.requireNonNull(documentId, "documentId must not be null");
         Objects.requireNonNull(embeddings, "embeddings must not be null");
 
-        DocumentBuffer buffer = documentBuffers.get(documentId);
-        if (buffer == null || buffer.chunks.isEmpty()) {
-            throw new IllegalStateException("No chunks buffered for document: " + documentId);
-        }
-
         commitLock.lock();
         try {
-            buffer.lock.lock();
+            DocumentBuffer buffer = lockExistingBuffer(documentId);
+            if (buffer == null) {
+                throw new IllegalStateException("No chunks buffered for document: " + documentId);
+            }
             try {
-                List<WriteLog.BatchEntry> batchEntries = new ArrayList<>(buffer.chunks.size());
-                List<String> chunkIds = new ArrayList<>(buffer.chunks.size());
-
-                for (TextChunk chunk : buffer.chunks) {
-                    int chunkIndex = chunk.getChunkIndex();
-                    float[] embedding = embeddings.get(chunkIndex);
-                    if (embedding == null) {
-                        throw new IllegalStateException(
-                            "Missing embedding for chunk " + chunkIndex + " of document " + documentId);
-                    }
-
-                    String chunkId = makeChunkId(documentId, chunkIndex);
-                    byte[] key = chunkId.getBytes(StandardCharsets.UTF_8);
-                    byte[] value = encodeChunkWithEmbedding(chunk.getText(), embedding);
-
-                    batchEntries.add(WriteLog.BatchEntry.put(key, value));
-                    chunkIds.add(chunkId);
+                if (buffer.chunks.isEmpty()) {
+                    throw new IllegalStateException("No chunks buffered for document: " + documentId);
                 }
 
-                WriteLog.BatchAppendResult result = writeLog.appendBatch(batchEntries);
-
-                AtomicDocumentBatch batch = new AtomicDocumentBatch(
-                    documentId,
-                    result.startOffset(),
-                    result.endOffset(),
-                    Collections.unmodifiableList(chunkIds),
-                    result.entryIds()
-                );
+                AtomicDocumentBatch batch = appendRun(documentId, buffer.chunks, embeddings);
 
                 buffer.chunks.clear();
                 documentBuffers.remove(documentId);
 
                 LOGGER.debug("Committed document {} atomically with {} chunks and embeddings at contiguous offsets [{}, {})",
-                    documentId, chunkIds.size(), result.startOffset(), result.endOffset());
+                    documentId, batch.getChunkCount(), batch.getStartOffset(), batch.getEndOffset());
 
                 return batch;
             } finally {
@@ -336,6 +317,74 @@ public class DocumentChunkBuffer {
         } finally {
             commitLock.unlock();
         }
+    }
+
+    /**
+     * Appends one document's chunks to the write log as a contiguous run.
+     *
+     * <p>The write log serializes and fsyncs individual appends; it has no batch primitive.
+     * Holding {@link #commitLock} across the whole run is therefore what makes the offsets
+     * contiguous, and it is why a buffer must own the log it is given rather than share it with
+     * another appender.</p>
+     *
+     * <p>Every value is encoded before the first append. A missing embedding discovered halfway
+     * through would otherwise leave the document half-written, with the failed commit reporting
+     * nothing to roll back.</p>
+     *
+     * @param documentId The document key the chunks belong to
+     * @param chunks     The buffered chunks, in document order
+     * @param embeddings Chunk index to embedding, or null to store the chunk text alone
+     * @return The batch describing the appended run
+     * @throws IllegalStateException if an embedding is required but absent
+     * @throws IOException           if an append fails
+     */
+    private AtomicDocumentBatch appendRun(String documentId, List<TextChunk> chunks,
+                                          Map<Integer, float[]> embeddings) throws IOException {
+        List<String> chunkIds = new ArrayList<>(chunks.size());
+        List<byte[]> values = new ArrayList<>(chunks.size());
+
+        for (TextChunk chunk : chunks) {
+            chunkIds.add(makeChunkId(documentId, chunk.getChunkIndex()));
+            values.add(encodeValue(documentId, chunk, embeddings));
+        }
+
+        List<Long> entryIds = new ArrayList<>(chunks.size());
+        long startOffset = writeLog.writeOffset();
+        for (int i = 0; i < chunkIds.size(); i++) {
+            byte[] key = chunkIds.get(i).getBytes(StandardCharsets.UTF_8);
+            entryIds.add(writeLog.appendPut(key, values.get(i)));
+        }
+        long endOffset = writeLog.writeOffset();
+
+        return new AtomicDocumentBatch(
+            documentId,
+            startOffset,
+            endOffset,
+            Collections.unmodifiableList(chunkIds),
+            Collections.unmodifiableList(entryIds));
+    }
+
+    /**
+     * Encodes the log value for one chunk.
+     *
+     * @param documentId The owning document, for the error message
+     * @param chunk      The chunk to encode
+     * @param embeddings Chunk index to embedding, or null to store the chunk text alone
+     * @return The value bytes
+     * @throws IllegalStateException if embeddings were supplied but this chunk has none
+     */
+    private static byte[] encodeValue(String documentId, TextChunk chunk,
+                                      Map<Integer, float[]> embeddings) {
+        if (embeddings == null) {
+            return chunk.getText().getBytes(StandardCharsets.UTF_8);
+        }
+
+        float[] embedding = embeddings.get(chunk.getChunkIndex());
+        if (embedding == null) {
+            throw new IllegalStateException(
+                "Missing embedding for chunk " + chunk.getChunkIndex() + " of document " + documentId);
+        }
+        return encodeChunkWithTextAndEmbedding(chunk.getText(), embedding);
     }
 
     /**
@@ -351,18 +400,41 @@ public class DocumentChunkBuffer {
     public int abortDocument(String documentId) {
         Objects.requireNonNull(documentId, "documentId must not be null");
 
-        DocumentBuffer buffer = documentBuffers.remove(documentId);
+        DocumentBuffer buffer = lockExistingBuffer(documentId);
         if (buffer == null) {
             return 0;
         }
 
-        buffer.lock.lock();
         try {
+            documentBuffers.remove(documentId, buffer);
             int discarded = buffer.chunks.size();
             buffer.chunks.clear();
             LOGGER.debug("Aborted document {} with {} buffered chunks", documentId, discarded);
             return discarded;
         } finally {
+            buffer.lock.unlock();
+        }
+    }
+
+    /**
+     * Locks the buffer currently mapped for a document, or returns null if there is none.
+     *
+     * <p>Like {@link #acquireBuffer(String)} this re-checks the map after taking the lock, so the
+     * caller never operates on a buffer that a concurrent commit or abort has already retired.</p>
+     *
+     * @param documentId The document whose buffer is wanted
+     * @return The live buffer with its lock held, or null if the document has no buffer
+     */
+    private DocumentBuffer lockExistingBuffer(String documentId) {
+        while (true) {
+            DocumentBuffer buffer = documentBuffers.get(documentId);
+            if (buffer == null) {
+                return null;
+            }
+            buffer.lock.lock();
+            if (documentBuffers.get(documentId) == buffer) {
+                return buffer;
+            }
             buffer.lock.unlock();
         }
     }
@@ -458,39 +530,13 @@ public class DocumentChunkBuffer {
 
     /**
      * Creates a chunk ID from document ID and chunk index.
+     *
+     * <p>Uses the module-wide convention so that the ids recorded on an
+     * {@link AtomicDocumentBatch} are byte-for-byte the storage keys the chunks were written
+     * under, and so the owning document can be recovered from any of them.</p>
      */
     private static String makeChunkId(String documentId, int chunkIndex) {
-        return documentId + CHUNK_ID_SEPARATOR + chunkIndex;
-    }
-
-    /**
-     * Encodes chunk text with embedding into a byte array.
-     *
-     * <p>Format (LITTLE-ENDIAN): [4 bytes: dimension][dimension * 4 bytes: embedding floats][text bytes]</p>
-     *
-     * <p><strong>Byte Order:</strong> This method uses LITTLE_ENDIAN byte order for both
-     * the dimension integer and the embedding floats. This matches the TailScanner's
-     * expected format and ensures consistency between ingestion and query pipelines.</p>
-     *
-     * @param text The chunk text to encode
-     * @param embedding The embedding vector
-     * @return Encoded byte array
-     */
-    private static byte[] encodeChunkWithEmbedding(String text, float[] embedding) {
-        byte[] textBytes = text.getBytes(StandardCharsets.UTF_8);
-
-        // Use ByteBuffer with LITTLE_ENDIAN to match TailScanner format
-        // Format: [dimension:4][vector:dim*4][text:variable]
-        ByteBuffer buffer = ByteBuffer.allocate(4 + embedding.length * Float.BYTES + textBytes.length)
-            .order(ByteOrder.LITTLE_ENDIAN);
-
-        buffer.putInt(embedding.length);  // dimension as little-endian
-        for (float f : embedding) {
-            buffer.putFloat(f);  // floats as little-endian
-        }
-        buffer.put(textBytes);
-
-        return buffer.array();
+        return ChunkIdentifiers.chunkIdForDocumentKey(documentId, chunkIndex);
     }
 
     /**
@@ -506,34 +552,7 @@ public class DocumentChunkBuffer {
      * @return The embedding vector, or null if decoding fails or dimension mismatches
      */
     public static float[] decodeEmbedding(byte[] value, int expectedDimension) {
-        if (value == null || value.length < 4) {
-            return null;
-        }
-
-        try {
-            ByteBuffer buffer = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);
-            int dimension = buffer.getInt();
-
-            // Validate dimension
-            if (dimension != expectedDimension) {
-                return null;
-            }
-
-            int expectedBytes = 4 + dimension * Float.BYTES;
-            if (value.length < expectedBytes) {
-                return null;
-            }
-
-            float[] embedding = new float[dimension];
-            for (int i = 0; i < dimension; i++) {
-                embedding[i] = buffer.getFloat();
-            }
-
-            return embedding;
-
-        } catch (Exception e) {
-            return null;
-        }
+        return ChunkPayloadCodec.embeddingOf(value, expectedDimension);
     }
 
     /**
@@ -548,28 +567,7 @@ public class DocumentChunkBuffer {
      * @return The chunk text, or null if decoding fails
      */
     public static String decodeText(byte[] value) {
-        if (value == null || value.length < 4) {
-            return null;
-        }
-
-        try {
-            ByteBuffer buffer = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);
-            int dimension = buffer.getInt();
-
-            int vectorEndOffset = 4 + dimension * Float.BYTES;
-            if (value.length < vectorEndOffset) {
-                return null;
-            }
-
-            // Extract text bytes (everything after the vector)
-            byte[] textBytes = new byte[value.length - vectorEndOffset];
-            System.arraycopy(value, vectorEndOffset, textBytes, 0, textBytes.length);
-
-            return new String(textBytes, StandardCharsets.UTF_8);
-
-        } catch (Exception e) {
-            return null;
-        }
+        return ChunkPayloadCodec.textOf(value);
     }
 
     /**
@@ -580,17 +578,19 @@ public class DocumentChunkBuffer {
      * @return The total encoded size in bytes
      */
     public static int getEncodedSize(int textLength, int dimension) {
-        return 4 + dimension * Float.BYTES + textLength;
+        return ChunkPayloadCodec.HEADER_BYTES + dimension * Float.BYTES + textLength;
     }
 
     /**
      * Encodes chunk text with embedding into a byte array.
      *
-     * <p>This is a public version of the encoding method for use by tests and
-     * other components that need to encode data in the same format as the
-     * ingestion pipeline.</p>
+     * <p>This is the single encoder used by every ingest write path, and is the exact inverse of
+     * {@link #decodeEmbedding(byte[], int)} and {@link #decodeText(byte[])}.</p>
      *
      * <p>Format (LITTLE-ENDIAN): [dimension:4][vector:dim*4][text:variable]</p>
+     *
+     * <p><strong>Byte Order:</strong> LITTLE_ENDIAN for both the dimension integer and the
+     * embedding floats, matching the format the TailScanner and HnswIntegrationWorker read.</p>
      *
      * @param text The chunk text to encode
      * @param embedding The embedding vector
@@ -598,22 +598,7 @@ public class DocumentChunkBuffer {
      * @throws NullPointerException if text or embedding is null
      */
     public static byte[] encodeChunkWithTextAndEmbedding(String text, float[] embedding) {
-        Objects.requireNonNull(text, "text must not be null");
-        Objects.requireNonNull(embedding, "embedding must not be null");
-
-        byte[] textBytes = text.getBytes(StandardCharsets.UTF_8);
-
-        // Use ByteBuffer with LITTLE_ENDIAN to match TailScanner format
-        ByteBuffer buffer = ByteBuffer.allocate(4 + embedding.length * Float.BYTES + textBytes.length)
-            .order(ByteOrder.LITTLE_ENDIAN);
-
-        buffer.putInt(embedding.length);
-        for (float f : embedding) {
-            buffer.putFloat(f);
-        }
-        buffer.put(textBytes);
-
-        return buffer.array();
+        return ChunkPayloadCodec.encode(text, embedding);
     }
 
     /**
@@ -629,17 +614,7 @@ public class DocumentChunkBuffer {
      * @throws NullPointerException if embedding is null
      */
     public static byte[] encodeVectorOnly(float[] embedding) {
-        Objects.requireNonNull(embedding, "embedding must not be null");
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + embedding.length * Float.BYTES)
-            .order(ByteOrder.LITTLE_ENDIAN);
-
-        buffer.putInt(embedding.length);
-        for (float f : embedding) {
-            buffer.putFloat(f);
-        }
-
-        return buffer.array();
+        return ChunkPayloadCodec.encode(embedding);
     }
 
     /**

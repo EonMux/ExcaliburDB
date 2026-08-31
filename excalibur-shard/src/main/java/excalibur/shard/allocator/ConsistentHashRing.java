@@ -482,7 +482,9 @@ public class ConsistentHashRing {
      */
     private long hashKey(String key) {
         byte[] bytes = key.getBytes(StandardCharsets.UTF_8);
-        return XxHash64.hash(bytes);
+        // Mask with Long.MAX_VALUE to ensure non-negative hash values,
+        // consistent with the documented range [0, Long.MAX_VALUE]
+        return XxHash64.hash(bytes) & Long.MAX_VALUE;
     }
 
     /**
@@ -492,7 +494,9 @@ public class ConsistentHashRing {
      * @return Hash value in range [0, Long.MAX_VALUE]
      */
     private long hashSegmentId(long segmentId) {
-        return XxHash64.hash(segmentId);
+        // Mask with Long.MAX_VALUE to ensure non-negative hash values,
+        // consistent with the documented range [0, Long.MAX_VALUE]
+        return XxHash64.hash(segmentId) & Long.MAX_VALUE;
     }
 
     // ==================== Inner Classes ====================

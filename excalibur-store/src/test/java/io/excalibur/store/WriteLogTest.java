@@ -9,7 +9,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
-import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -26,24 +25,19 @@ class WriteLogTest {
     @TempDir
     Path tempDir;
 
-    private Arena arena;
     private Path logFile;
     private WriteLog writeLog;
 
     @BeforeEach
     void setUp() throws IOException {
-        arena = Arena.ofConfined();
         logFile = tempDir.resolve("test.wal");
-        writeLog = new WriteLog(logFile, arena);
+        writeLog = new WriteLog(logFile);
     }
 
     @AfterEach
     void tearDown() throws IOException {
         if (writeLog != null && !writeLog.isClosed()) {
             writeLog.close();
-        }
-        if (arena != null) {
-            arena.close();
         }
     }
 
@@ -62,24 +56,16 @@ class WriteLogTest {
         @Test
         @DisplayName("Should reject null path")
         void shouldRejectNullPath() {
-            assertThatThrownBy(() -> new WriteLog(null, arena))
+            assertThatThrownBy(() -> new WriteLog(null))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("Log file path cannot be null");
-        }
-
-        @Test
-        @DisplayName("Should reject null arena")
-        void shouldRejectNullArena() {
-            assertThatThrownBy(() -> new WriteLog(logFile, null))
-                .isInstanceOf(NullPointerException.class)
-                .hasMessageContaining("Arena cannot be null");
         }
 
         @Test
         @DisplayName("Should create parent directories if needed")
         void shouldCreateParentDirectories() throws IOException {
             Path nestedPath = tempDir.resolve("nested/dir/test.wal");
-            WriteLog nestedLog = new WriteLog(nestedPath, arena);
+            WriteLog nestedLog = new WriteLog(nestedPath);
 
             assertThat(Files.exists(nestedPath)).isTrue();
             nestedLog.close();
@@ -93,14 +79,12 @@ class WriteLogTest {
             writeLog.close();
 
             // Reopen the same log
-            Arena newArena = Arena.ofConfined();
-            WriteLog reopenedLog = new WriteLog(logFile, newArena);
+            WriteLog reopenedLog = new WriteLog(logFile);
 
             // Should have scanned the existing entry
             assertThat(reopenedLog.nextLsn()).isGreaterThan(0);
 
             reopenedLog.close();
-            newArena.close();
         }
     }
 

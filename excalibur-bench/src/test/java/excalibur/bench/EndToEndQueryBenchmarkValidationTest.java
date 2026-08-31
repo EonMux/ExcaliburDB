@@ -28,7 +28,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -55,10 +54,18 @@ class EndToEndQueryBenchmarkValidationTest {
 
     // Optimized sizes for faster test execution while maintaining validity
     private static final int SEGMENT_COUNT = 2;
-    private static final int VECTORS_PER_SEGMENT = 200;
+    private static final int VECTORS_PER_SEGMENT = 100;
     private static final int DIMENSION = 64;
     private static final int TOP_K = 10;
-    private static final int QUERY_COUNT = 50;
+    private static final int QUERY_COUNT = 25;
+
+    /**
+     * Minimum fraction of the brute-force top-k the pipeline must recover.
+     *
+     * <p>Below 1.0 because the pipeline searches an approximate index, but high enough
+     * that a broken merge, an inverted comparator or a dropped segment fails.</p>
+     */
+    private static final double MIN_PIPELINE_RECALL = 0.8;
 
     @TempDir
     Path tempDir;
@@ -73,6 +80,15 @@ class EndToEndQueryBenchmarkValidationTest {
 
     private float[][] queryVectors;
 
+    /** The vectors indexed into each segment's graph, indexed by [segment][nodeId]. */
+    private float[][][] segmentVectors;
+
+    /** The node ids the graphs assigned, indexed by [segment][insertion order]. */
+    private long[][] segmentNodeIds;
+
+    /** The ids the segments actually took, in the same order as {@link #graphs}. */
+    private List<Long> segmentIds;
+
     @BeforeEach
     void setUp() throws IOException {
         arena = Arena.ofShared();
@@ -83,6 +99,9 @@ class EndToEndQueryBenchmarkValidationTest {
 
         Random random = new Random(42);
 
+        segmentVectors = new float[SEGMENT_COUNT][VECTORS_PER_SEGMENT][];
+        segmentNodeIds = new long[SEGMENT_COUNT][VECTORS_PER_SEGMENT];
+
         // Create HNSW graphs for each segment
         for (int s = 0; s < SEGMENT_COUNT; s++) {
             HnswConfig config = HnswConfig.create(DIMENSION);
@@ -91,14 +110,16 @@ class EndToEndQueryBenchmarkValidationTest {
             HnswGraph graph = new HnswGraph(graphFile, config, distanceFunction, VECTORS_PER_SEGMENT * 2);
             graphs.add(graph);
 
-            // Populate with normalized vectors
+            // Populate with normalized vectors, retaining them so the expected ranking
+            // can be derived by brute force independently of the query pipeline.
             for (int v = 0; v < VECTORS_PER_SEGMENT; v++) {
                 float[] vector = new float[DIMENSION];
                 for (int d = 0; d < DIMENSION; d++) {
                     vector[d] = (float) random.nextGaussian();
                 }
                 normalizeVector(vector);
-                graph.insert(vector);
+                segmentVectors[s][v] = vector;
+                segmentNodeIds[s][v] = graph.insert(vector);
             }
         }
 
@@ -113,13 +134,18 @@ class EndToEndQueryBenchmarkValidationTest {
             queryVectors[i] = vector;
         }
 
-        // Create mock infrastructure for QueryPipeline
-        visibilityTracker = new ValidationVisibilityTracker(SEGMENT_COUNT);
+        // Create the storage engine first: Segment assigns itself a process-wide unique
+        // id, so the catalog, the visibility tracker and the graph provider must all be
+        // keyed on the ids the segments actually took. Keying them on 0..n-1 made every
+        // test after the first one in a JVM resolve zero queryable segments and return
+        // an empty result set, which is what the previous assertions quietly excused.
         storageEngine = new ValidationStorageEngine(SEGMENT_COUNT, tempDir, arena);
+        segmentIds = storageEngine.segmentIds();
+        visibilityTracker = new ValidationVisibilityTracker(segmentIds);
 
         QueryPipeline.HnswGraphProvider graphProvider = segmentId -> {
-            int idx = (int) (segmentId % graphs.size());
-            return graphs.get(idx);
+            int idx = segmentIds.indexOf(segmentId);
+            return idx < 0 ? null : graphs.get(idx);
         };
 
         queryPipeline = new QueryPipeline(
@@ -139,6 +165,7 @@ class EndToEndQueryBenchmarkValidationTest {
             storageEngine.closeSegments();
             storageEngine = null;
         }
+        segmentIds = null;
 
         for (HnswGraph graph : graphs) {
             try {
@@ -154,98 +181,114 @@ class EndToEndQueryBenchmarkValidationTest {
     }
 
     @Test
-    @DisplayName("Query should return results sorted by score when results exist")
-    void testResultsAreSorted() {
-        // First, verify we can get results from direct HNSW search
-        List<QueryResultItem> allResults = new ArrayList<>();
-        for (HnswGraph graph : graphs) {
-            var hnswResults = graph.search(queryVectors[0], TOP_K);
-            for (var r : hnswResults) {
-                // Convert HNSW result to QueryResultItem
-                // Cosine similarity is 1 - distance for normalized vectors
-                float score = 1.0f - (float) r.distance();
-                allResults.add(new QueryResultItem(r.nodeId(), score));
-            }
-        }
+    @DisplayName("Pipeline returns the true nearest neighbours, ranked best first")
+    void pipelineReturnsResultsRankedAgainstBruteForceGroundTruth() {
+        float[] query = queryVectors[0];
 
-        // Sort and take top-k
-        allResults.sort((a, b) -> Float.compare(b.score(), a.score()));
-        if (allResults.size() > TOP_K) {
-            allResults = new ArrayList<>(allResults.subList(0, TOP_K));
-        }
+        // Expectation derived independently of the pipeline: the exact top-k by cosine
+        // similarity over the vectors that were indexed, computed by brute force here.
+        List<SegmentNode> expectedTopK = bruteForceTopK(query, TOP_K);
+        assertThat(expectedTopK).hasSize(TOP_K);
 
-        // Domain correctness: Results should be sorted by score (descending for similarity)
-        if (allResults.size() > 1) {
-            for (int i = 1; i < allResults.size(); i++) {
-                assertThat(allResults.get(i - 1).score())
-                    .as("Results should be sorted by score (descending for similarity)")
-                    .isGreaterThanOrEqualTo(allResults.get(i).score());
-            }
-        }
+        QueryResponse response = executeQuery(query, null);
 
-        // Also verify QueryPipeline returns valid structure (may be empty due to mock infrastructure)
-        QueryRequest request = QueryRequest.builder()
-            .queryText("validation query")
-            .queryVector(queryVectors[0])
-            .topK(TOP_K)
-            .timeoutMs(5000)
-            .includePartialSegments(true)
-            .enableLlmScoring(false)
-            .build();
+        assertThat(response).as("Response should not be null").isNotNull();
+        assertThat(response.coverage()).as("Coverage should not be null").isNotNull();
 
-        CancellationToken token = new CancellationToken();
-        QueryResponse response = queryPipeline.executeSync(request, token);
-
-        // Domain correctness: Response should always have valid structure
-        assertThat(response)
-            .as("Response should not be null")
-            .isNotNull();
-
+        // The pipeline must actually return the matches that exist. An empty result set
+        // over a populated, fully visible index is a failure, not something to excuse.
         assertThat(response.results())
-            .as("Results list should not be null")
-            .isNotNull();
+            .as("query over %d visible vectors must return results",
+                SEGMENT_COUNT * VECTORS_PER_SEGMENT)
+            .isNotEmpty();
 
-        assertThat(response.coverage())
-            .as("Coverage should not be null")
-            .isNotNull();
+        // Ordering is asserted on what the PIPELINE produced, not on a list the test
+        // sorted itself.
+        assertThat(response.results())
+            .as("results must be ranked best-first by score")
+            .isSortedAccordingTo(Comparator.comparing(QueryResultItem::score).reversed());
+
+        Set<SegmentNode> expected = new LinkedHashSet<>(expectedTopK);
+        Set<SegmentNode> actual = new LinkedHashSet<>();
+        for (QueryResultItem item : response.results()) {
+            actual.add(new SegmentNode(item.segmentId(), item.nodeId()));
+        }
+
+        SegmentNode best = new SegmentNode(
+            response.results().get(0).segmentId(), response.results().get(0).nodeId());
+        assertThat(expectedTopK.subList(0, 3))
+            .as("the highest-scoring result must be one of the three true nearest neighbours")
+            .contains(best);
+
+        long overlap = actual.stream().filter(expected::contains).count();
+        double recall = (double) overlap / expectedTopK.size();
+        System.out.printf("Pipeline recall@%d against brute force: %.2f%% (%d of %d)%n",
+            TOP_K, recall * 100, overlap, expectedTopK.size());
+
+        assertThat(recall)
+            .as("pipeline must recover at least %.0f%% of the true top-%d (got %.2f%%)",
+                MIN_PIPELINE_RECALL * 100, TOP_K, recall * 100)
+            .isGreaterThanOrEqualTo(MIN_PIPELINE_RECALL);
     }
 
     @Test
-    @DisplayName("Query latency should be measurable and non-negative")
-    void testLatencyIsMeasurable() {
-        List<Long> latencies = new ArrayList<>();
+    @DisplayName("Scores decrease monotonically and are finite")
+    void scoresAreFiniteAndMonotonic() {
+        QueryResponse response = executeQuery(queryVectors[1], null);
 
+        assertThat(response.results()).isNotEmpty();
+        for (QueryResultItem item : response.results()) {
+            assertThat(Float.isFinite(item.score()))
+                .as("score for node %d must be finite, got %s", item.nodeId(), item.score())
+                .isTrue();
+        }
+        assertThat(response.results())
+            .isSortedAccordingTo(Comparator.comparing(QueryResultItem::score).reversed());
+    }
+
+    @Test
+    @DisplayName("Query latency stays within the documented p99 budget")
+    void latencyIsWithinTheDocumentedBudget() {
+        // Warm up so the measurement reflects steady-state cost rather than class
+        // loading and JIT.
         for (int i = 0; i < 10; i++) {
-            QueryRequest request = QueryRequest.builder()
-                .queryText("latency test query")
-                .queryVector(queryVectors[i % queryVectors.length])
-                .topK(TOP_K)
-                .timeoutMs(5000)
-                .includePartialSegments(true)
-                .enableLlmScoring(false)
-                .build();
+            executeQuery(queryVectors[i % queryVectors.length], null);
+        }
 
-            CancellationToken token = new CancellationToken();
+        int iterations = 40;
+        List<Double> latenciesMs = new ArrayList<>(iterations);
 
+        for (int i = 0; i < iterations; i++) {
             long startTime = System.nanoTime();
-            QueryResponse response = queryPipeline.executeSync(request, token);
+            QueryResponse response = executeQuery(queryVectors[i % queryVectors.length], null);
             long endTime = System.nanoTime();
 
-            long latencyMs = TimeUnit.NANOSECONDS.toMillis(endTime - startTime);
-            latencies.add(latencyMs);
+            latenciesMs.add((endTime - startTime) / 1_000_000.0);
 
-            // Domain correctness: Latency must be non-negative
-            assertThat(latencyMs)
-                .as("Latency must be non-negative")
-                .isGreaterThanOrEqualTo(0L);
-
-            // Domain correctness: Response queryTimeMs should match measured time reasonably
+            // The pipeline's own accounting must be consistent with a real measurement.
             assertThat(response.queryTimeMs())
                 .as("Response queryTimeMs should be non-negative")
                 .isGreaterThanOrEqualTo(0L);
         }
 
-        System.out.println("Latency samples (ms): " + latencies);
+        double p50 = calculatePercentileD(latenciesMs, 50);
+        double p99 = calculatePercentileD(latenciesMs, 99);
+
+        System.out.printf("End-to-end latency over %d queries: p50 %.3f ms, p99 %.3f ms%n",
+            iterations, p50, p99);
+
+        // Assert against the budget the project actually documents. "latency >= 0" is
+        // unconditionally true for two nanoTime reads on one thread and could not
+        // detect a 400x tail-latency regression.
+        assertThat(p99)
+            .as("p99 query latency must stay within the %.1f ms budget (got %.3f ms)",
+                EndToEndQueryBenchmarkRunner.TARGET_P99_MS, p99)
+            .isLessThanOrEqualTo(EndToEndQueryBenchmarkRunner.TARGET_P99_MS);
+
+        assertThat(p50)
+            .as("p50 query latency must stay within the %.1f ms budget (got %.3f ms)",
+                EndToEndQueryBenchmarkRunner.TARGET_P50_MS, p50)
+            .isLessThanOrEqualTo(EndToEndQueryBenchmarkRunner.TARGET_P50_MS);
     }
 
     @Test
@@ -325,68 +368,49 @@ class EndToEndQueryBenchmarkValidationTest {
     }
 
     @Test
-    @DisplayName("Coverage metadata should accurately reflect segments searched")
-    void testCoverageMetadata() {
-        QueryRequest request = QueryRequest.builder()
-            .queryText("coverage test query")
-            .queryVector(queryVectors[0])
-            .topK(TOP_K)
-            .timeoutMs(5000)
-            .includePartialSegments(true)
-            .enableLlmScoring(false)
-            .build();
-
-        CancellationToken token = new CancellationToken();
-        QueryResponse response = queryPipeline.executeSync(request, token);
+    @DisplayName("Coverage metadata reports the whole visible index as searched")
+    void coverageMetadataReflectsTheSegmentsActuallySearched() {
+        QueryResponse response = executeQuery(queryVectors[0], null);
 
         IndexCoverage coverage = response.coverage();
 
-        // Domain correctness: Coverage values should be sensible (non-negative)
+        // Every segment in this fixture is ACTIVE and visible, so the expectation is
+        // exact rather than "non-negative": full coverage, nothing degraded.
         assertThat(coverage.totalSegments())
-            .as("Total segments should be non-negative")
-            .isGreaterThanOrEqualTo(0L);
+            .as("all %d segments are in the catalog", SEGMENT_COUNT)
+            .isEqualTo(SEGMENT_COUNT);
 
         assertThat(coverage.activeSegments())
-            .as("Active segments should be non-negative")
-            .isGreaterThanOrEqualTo(0L);
+            .as("all %d segments are ACTIVE", SEGMENT_COUNT)
+            .isEqualTo(SEGMENT_COUNT);
 
         assertThat(coverage.estimatedCorpusCoverage())
-            .as("Coverage should be in range [0.0, 1.0]")
-            .isBetween(0.0, 1.0);
+            .as("a fully ACTIVE, fully visible index is complete coverage")
+            .isEqualTo(1.0);
 
-        // Verify coverage object is properly constructed
         assertThat(coverage.degraded())
-            .as("Degraded flag should be a boolean value")
-            .isNotNull();
+            .as("no segment is missing or unqueryable, so the result is not degraded")
+            .isFalse();
     }
 
     @Test
-    @DisplayName("Query should handle empty results gracefully")
-    void testEmptyResultsHandling() {
-        // Use a very high threshold to potentially get empty results
-        QueryRequest request = QueryRequest.builder()
-            .queryText("empty test query")
-            .queryVector(queryVectors[0])
-            .topK(TOP_K)
-            .timeoutMs(5000)
-            .threshold(1.0f) // Very high threshold
-            .includePartialSegments(true)
-            .enableLlmScoring(false)
-            .build();
+    @DisplayName("A threshold above every achievable score returns no results")
+    void thresholdAboveEveryScoreFiltersEverything() {
+        // Sanity: the same query without a threshold does return matches, so an empty
+        // result below is caused by the threshold and not by a broken fixture.
+        assertThat(executeQuery(queryVectors[0], null).results()).isNotEmpty();
 
-        CancellationToken token = new CancellationToken();
-        QueryResponse response = queryPipeline.executeSync(request, token);
+        QueryResponse response = executeQuery(queryVectors[0], 1.0f);
 
-        // Domain correctness: Response should be valid even with no results
-        assertThat(response)
-            .as("Response should not be null")
-            .isNotNull();
+        assertThat(response).as("Response should not be null").isNotNull();
+        assertThat(response.coverage()).as("Coverage should not be null").isNotNull();
 
-        assertThat(response.coverage())
-            .as("Coverage should not be null")
-            .isNotNull();
+        // Scores are normalized similarities in [0, 1] and no query vector is present
+        // verbatim in the index, so nothing can reach a score of 1.0.
+        assertThat(response.results())
+            .as("no indexed vector can score at or above 1.0 against a query not in the index")
+            .isEmpty();
 
-        // Query time should still be measured
         assertThat(response.queryTimeMs())
             .as("Query time should be non-negative")
             .isGreaterThanOrEqualTo(0L);
@@ -427,10 +451,11 @@ class EndToEndQueryBenchmarkValidationTest {
                         double latencyMs = (endTime - startTime) / 1_000_000.0;
                         allLatenciesMs.add(latencyMs);
 
-                        // Validate response
+                        // Every query in this fixture searches a fully visible,
+                        // populated index, so an empty result set is a failure.
                         assertThat(response.results())
-                            .as("Results should not be null")
-                            .isNotNull();
+                            .as("concurrent query must return results")
+                            .isNotEmpty();
 
                     } catch (Throwable e) {
                         errors.add(e);
@@ -484,6 +509,74 @@ class EndToEndQueryBenchmarkValidationTest {
     // ==================== Helper Methods ====================
 
     /**
+     * Identifies one indexed vector by the segment and node it lives in.
+     *
+     * @param segmentId the segment the vector was indexed into
+     * @param nodeId the graph node id assigned to it
+     */
+    private record SegmentNode(long segmentId, long nodeId) {
+    }
+
+    /**
+     * Runs one query through the pipeline.
+     *
+     * @param queryVector the query vector
+     * @param threshold optional score threshold, or null for none
+     * @return the pipeline response
+     */
+    private QueryResponse executeQuery(float[] queryVector, Float threshold) {
+        QueryRequest.Builder builder = QueryRequest.builder()
+            .queryText("validation query")
+            .queryVector(queryVector)
+            .topK(TOP_K)
+            .timeoutMs(5000)
+            .includePartialSegments(true)
+            .enableLlmScoring(false);
+        if (threshold != null) {
+            builder.threshold(threshold);
+        }
+        return queryPipeline.executeSync(builder.build(), new CancellationToken());
+    }
+
+    /**
+     * Computes the exact top-k nearest neighbours by brute force.
+     *
+     * <p>This is the independent expectation the pipeline is judged against. All
+     * vectors are unit length, so the cosine similarity is the dot product and the
+     * ranking follows from it directly, without reusing the distance function or any
+     * other production code path under test.</p>
+     *
+     * @param query the query vector, unit length
+     * @param k how many neighbours to return
+     * @return the k nearest (segment, node) pairs, nearest first
+     */
+    private List<SegmentNode> bruteForceTopK(float[] query, int k) {
+        record Scored(SegmentNode node, double similarity) {
+        }
+
+        List<Scored> scored = new ArrayList<>();
+        for (int segment = 0; segment < SEGMENT_COUNT; segment++) {
+            for (int v = 0; v < VECTORS_PER_SEGMENT; v++) {
+                double dot = 0.0;
+                float[] vector = segmentVectors[segment][v];
+                for (int d = 0; d < DIMENSION; d++) {
+                    dot += (double) query[d] * vector[d];
+                }
+                scored.add(new Scored(
+                    new SegmentNode(segmentIds.get(segment), segmentNodeIds[segment][v]), dot));
+            }
+        }
+
+        scored.sort(Comparator.comparingDouble(Scored::similarity).reversed());
+
+        List<SegmentNode> topK = new ArrayList<>(k);
+        for (int i = 0; i < Math.min(k, scored.size()); i++) {
+            topK.add(scored.get(i).node());
+        }
+        return topK;
+    }
+
+    /**
      * Normalizes a vector to unit length.
      */
     private void normalizeVector(float[] vector) {
@@ -497,23 +590,6 @@ class EndToEndQueryBenchmarkValidationTest {
                 vector[i] /= norm;
             }
         }
-    }
-
-    /**
-     * Calculates a percentile from a list of values.
-     */
-    private double calculatePercentile(List<Long> values, int percentile) {
-        if (values.isEmpty()) {
-            return 0.0;
-        }
-
-        List<Long> sorted = new ArrayList<>(values);
-        Collections.sort(sorted);
-
-        int index = (int) Math.ceil(percentile / 100.0 * sorted.size()) - 1;
-        index = Math.max(0, Math.min(index, sorted.size() - 1));
-
-        return sorted.get(index);
     }
 
     /**
@@ -543,17 +619,29 @@ class EndToEndQueryBenchmarkValidationTest {
         private final ValidationSegmentCatalog catalog;
         private final Map<Long, Segment> segments = new ConcurrentHashMap<>();
         private final List<Path> segmentFiles = new ArrayList<>();
+        private final List<Long> segmentIds = new ArrayList<>();
 
         ValidationStorageEngine(int segmentCount, Path tempDir, Arena arena) throws IOException {
             super(tempDir, arena);
-            this.catalog = new ValidationSegmentCatalog(segmentCount);
 
             for (int i = 0; i < segmentCount; i++) {
                 Path segmentPath = Files.createTempFile(tempDir, "segment_" + i + "_", ".dat");
                 segmentFiles.add(segmentPath);
                 Segment segment = new Segment(segmentPath, 1024 * 1024, arena);
-                segments.put((long) i, segment);
+                // Segment allocates its own id from a process-wide counter; index the
+                // map by that id so getSegment(id) and catalog.get(id) agree.
+                segments.put(segment.segmentId(), segment);
+                segmentIds.add(segment.segmentId());
             }
+
+            this.catalog = new ValidationSegmentCatalog(segmentIds);
+        }
+
+        /**
+         * The ids the segments actually took, in creation order.
+         */
+        List<Long> segmentIds() {
+            return List.copyOf(segmentIds);
         }
 
         @Override
@@ -575,6 +663,7 @@ class EndToEndQueryBenchmarkValidationTest {
                 }
             }
             segments.clear();
+            segmentIds.clear();
             for (Path file : segmentFiles) {
                 try {
                     Files.deleteIfExists(file);
@@ -590,34 +679,34 @@ class EndToEndQueryBenchmarkValidationTest {
      * Minimal SegmentCatalog for validation testing.
      */
     private static class ValidationSegmentCatalog extends SegmentCatalog {
-        private final int segmentCount;
+        private final List<Long> segmentIds;
         private final Map<Long, ValidationSegmentMetadata> metadataCache = new ConcurrentHashMap<>();
 
-        ValidationSegmentCatalog(int segmentCount) {
-            this.segmentCount = segmentCount;
+        ValidationSegmentCatalog(List<Long> segmentIds) {
+            this.segmentIds = List.copyOf(segmentIds);
         }
 
         @Override
         public SegmentMetadata get(long segmentId) {
-            if (segmentId >= 0 && segmentId < segmentCount) {
-                return metadataCache.computeIfAbsent(segmentId,
-                    id -> new ValidationSegmentMetadata(id, LifecycleState.ACTIVE));
+            if (!segmentIds.contains(segmentId)) {
+                return null;
             }
-            return null;
+            return metadataCache.computeIfAbsent(segmentId,
+                id -> new ValidationSegmentMetadata(id, LifecycleState.ACTIVE));
         }
 
         @Override
         public Map<Long, SegmentMetadata> getAll() {
             Map<Long, SegmentMetadata> result = new HashMap<>();
-            for (long i = 0; i < segmentCount; i++) {
-                result.put(i, get(i));
+            for (long segmentId : segmentIds) {
+                result.put(segmentId, get(segmentId));
             }
             return result;
         }
 
         @Override
         public int size() {
-            return segmentCount;
+            return segmentIds.size();
         }
     }
 
@@ -652,12 +741,12 @@ class EndToEndQueryBenchmarkValidationTest {
      * Minimal VisibilityTracker for validation testing.
      */
     private static class ValidationVisibilityTracker extends VisibilityTracker {
-        private final int segmentCount;
+        private final Set<Long> visibleSegmentIds;
         private final AtomicLong epochCounter = new AtomicLong(1);
 
-        ValidationVisibilityTracker(int segmentCount) {
-            super(new ValidationSegmentCatalog(segmentCount));
-            this.segmentCount = segmentCount;
+        ValidationVisibilityTracker(List<Long> segmentIds) {
+            super(new ValidationSegmentCatalog(segmentIds));
+            this.visibleSegmentIds = Set.copyOf(segmentIds);
         }
 
         @Override
@@ -667,11 +756,7 @@ class EndToEndQueryBenchmarkValidationTest {
 
         @Override
         public Set<Long> visibleSegments(long queryEpoch) {
-            Set<Long> visible = new HashSet<>();
-            for (long i = 0; i < segmentCount; i++) {
-                visible.add(i);
-            }
-            return Collections.unmodifiableSet(visible);
+            return visibleSegmentIds;
         }
 
         @Override

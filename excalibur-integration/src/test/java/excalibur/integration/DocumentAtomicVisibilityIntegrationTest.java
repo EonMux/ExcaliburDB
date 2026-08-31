@@ -8,7 +8,7 @@ import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
 import io.excalibur.store.VisibilityTracker;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.store.WriteLog;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -82,7 +82,9 @@ class DocumentAtomicVisibilityIntegrationTest {
             visibilityTracker,
             documentRegistry,
             (excalibur.filter.CuckooFilter) null,
-            writeLog::sync,
+            // io.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
+            // durability barrier is already satisfied before the adapter runs.
+            () -> { },
             new ReentrantLock()
         );
     }
@@ -172,7 +174,7 @@ class DocumentAtomicVisibilityIntegrationTest {
         for (int i = 0; i < chunks.size(); i++) {
             TextChunk chunk = chunks.get(i);
             String chunkId = documentId + ":" + i;
-            long offset = writeLog.writeHead();
+            long offset = writeLog.writeOffset();
             batchBuffer.addChunk(chunkId, chunk, offset);
         }
         
@@ -215,7 +217,6 @@ class DocumentAtomicVisibilityIntegrationTest {
         
         AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
         
-        writeLog.sync();
         long visibilityEpoch = visibilityTracker.advanceEpoch();
         
         Set<Long> visibleEpochs = new HashSet<>();
@@ -277,21 +278,26 @@ class DocumentAtomicVisibilityIntegrationTest {
                     chunkBuffer.bufferChunks(chunks);
 
                     AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
-                    writeLog.sync();
 
                     long epoch = visibilityTracker.advanceEpoch();
 
-                    // Store document metadata for torn read detection
-                    documentVisibleEpochs.put(documentId, new AtomicLong(epoch));
-                    documentChunkCounts.put(documentId, batch.getChunkCount());
-                    documentChunkIds.put(documentId, new ArrayList<>(batch.getChunkIdsList()));
-
-                    // Simulate atomic visibility: all chunks become visible at the same epoch
-                    // In a real system, this is guaranteed by the visibility tracker
-                    // KEY: All chunks of this document get the SAME visibility epoch
+                    // Publish this test's own bookkeeping in dependency order: every chunk first,
+                    // then the metadata, and the document's epoch last.
+                    //
+                    // The reader keys off documentVisibleEpochs and then looks up each chunk. If
+                    // the document were published first, a reader interleaving here would see a
+                    // document whose chunks this loop had not yet recorded and report a torn read
+                    // — tearing in the test's four ConcurrentHashMaps, not in the visibility
+                    // tracker the test exists to check. Publishing last means anything the reader
+                    // can see is already complete.
+                    //
+                    // All chunks of a document share one epoch; that is the property under test.
                     for (String chunkId : batch.getChunkIdsList()) {
                         chunkVisibleEpochs.put(chunkId, epoch);
                     }
+                    documentChunkCounts.put(documentId, batch.getChunkCount());
+                    documentChunkIds.put(documentId, new ArrayList<>(batch.getChunkIdsList()));
+                    documentVisibleEpochs.put(documentId, new AtomicLong(epoch));
 
                     // Small delay to allow readers to catch concurrent visibility changes
                     Thread.sleep(2);
@@ -413,7 +419,6 @@ class DocumentAtomicVisibilityIntegrationTest {
             List<TextChunk> chunks = createChunks(documentId, 3);
             chunkBuffer.bufferChunks(chunks);
             chunkBuffer.commitDocument(documentId);
-            writeLog.sync();
             
             long epoch = visibilityTracker.advanceEpoch();
             documentEpochs.put(documentId, epoch);
@@ -433,7 +438,6 @@ class DocumentAtomicVisibilityIntegrationTest {
             List<TextChunk> chunks = createChunks(documentId, 3);
             chunkBuffer.bufferChunks(chunks);
             chunkBuffer.commitDocument(documentId);
-            writeLog.sync();
             visibilityTracker.advanceEpoch();
         }
         
@@ -465,7 +469,7 @@ class DocumentAtomicVisibilityIntegrationTest {
         for (int i = 0; i < chunks.size(); i++) {
             TextChunk chunk = chunks.get(i);
             String chunkId = documentId + ":" + i;
-            long offset = writeLog.writeHead();
+            long offset = writeLog.writeOffset();
             batchBuffer.addChunk(chunkId, chunk, offset);
         }
         
@@ -510,7 +514,7 @@ class DocumentAtomicVisibilityIntegrationTest {
         for (int i = 0; i < chunks.size(); i++) {
             TextChunk chunk = chunks.get(i);
             String chunkId = documentId + ":" + i;
-            batchBuffer.addChunk(chunkId, chunk, writeLog.writeHead());
+            batchBuffer.addChunk(chunkId, chunk, writeLog.writeOffset());
         }
         
         batchBuffer.seal();
@@ -550,7 +554,7 @@ class DocumentAtomicVisibilityIntegrationTest {
             for (int i = 0; i < chunks.size(); i++) {
                 TextChunk chunk = chunks.get(i);
                 String chunkId = documentId + ":" + i;
-                buffer.addChunk(chunkId, chunk, writeLog.writeHead());
+                buffer.addChunk(chunkId, chunk, writeLog.writeOffset());
             }
             buffer.seal();
             buffers.add(buffer);
@@ -590,7 +594,6 @@ class DocumentAtomicVisibilityIntegrationTest {
             List<TextChunk> chunks = createChunks(documentId, 1);
             chunkBuffer.bufferChunks(chunks);
             chunkBuffer.commitDocument(documentId);
-            writeLog.sync();
             
             long newEpoch = visibilityTracker.advanceEpoch();
             

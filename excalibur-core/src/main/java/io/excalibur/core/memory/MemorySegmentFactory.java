@@ -8,6 +8,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
@@ -146,13 +147,15 @@ public final class MemorySegmentFactory {
             return false;
         }
 
-        // Try to actually allocate native memory to verify permissions
-        try {
-            Arena testArena = Arena.ofConfined();
+        // Try to actually allocate native memory to verify permissions.
+        // Only conditions that genuinely mean "Panama is not usable here" are caught:
+        // an OutOfMemoryError or an unrelated Error is a transient/environmental failure,
+        // not a capability verdict, and must not permanently pin the whole process into
+        // fallback mode (which disables segment splitting for the rest of its lifetime).
+        try (Arena testArena = Arena.ofConfined()) {
             MemorySegment testSegment = testArena.allocate(8, 8);
             testSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, 0, 0x1234567890ABCDEFL);
             long value = testSegment.get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
-            testArena.close();
 
             if (value != 0x1234567890ABCDEFL) {
                 if (enableLog) {
@@ -160,9 +163,10 @@ public final class MemorySegmentFactory {
                 }
                 return false;
             }
-        } catch (Throwable t) {
+        } catch (UnsupportedOperationException | IllegalCallerException
+                 | SecurityException | LinkageError t) {
             if (enableLog) {
-                LOGGER.info("Panama FFM unavailable: native memory access denied - {}", t.getMessage());
+                LOGGER.warn("Panama FFM unavailable: native memory access denied", t);
             }
             return false;
         }
@@ -221,9 +225,15 @@ public final class MemorySegmentFactory {
             MemorySegment nativeSegment = arena.allocate(size, 8);
             return PanamaSegment.wrapWithArena(nativeSegment, arena);
         } else {
-            // Fallback uses direct ByteBuffer for better performance
+            // Fallback uses direct ByteBuffer for better performance.
+            // ByteBuffer capacity is an int, so the documented upper bound is enforced
+            // here rather than silently truncating and reporting the untruncated size.
+            if (size > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException(
+                    "Size too large for fallback allocation (max " + Integer.MAX_VALUE + "): " + size);
+            }
             ByteBuffer buffer = ByteBuffer.allocateDirect((int) size);
-            return new FallbackSegment(buffer, size);
+            return new FallbackSegment(buffer, buffer.capacity());
         }
     }
 
@@ -280,6 +290,10 @@ public final class MemorySegmentFactory {
      * <p>This method creates a read/write Segment view of the ByteBuffer.
      * Changes to the buffer are reflected in the segment and vice versa.</p>
      *
+     * <p>The view covers {@code [position, limit)} of the buffer and always uses
+     * big-endian byte order, matching {@link MemorySegment#ofBuffer} and the module-wide
+     * wire format, so the same call produces the same result under both implementations.</p>
+     *
      * @param buffer The ByteBuffer to wrap
      * @return A new Segment backed by the buffer
      * @throws NullPointerException if buffer is null
@@ -293,7 +307,11 @@ public final class MemorySegmentFactory {
             MemorySegment nativeSegment = MemorySegment.ofBuffer(buffer);
             return PanamaSegment.wrap(nativeSegment);
         } else {
-            return new FallbackSegment(buffer, buffer.capacity());
+            // Match MemorySegment.ofBuffer(): base at position, size == remaining,
+            // and force BIG_ENDIAN as every other accessor in this module does.
+            ByteBuffer view = buffer.slice();
+            view.order(ByteOrder.BIG_ENDIAN);
+            return new FallbackSegment(view, view.capacity());
         }
     }
 

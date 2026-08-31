@@ -3,6 +3,7 @@ package excalibur.query.pipeline;
 import excalibur.query.QueryResultItem;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswGraph;
+import io.excalibur.vector.hnsw.HnswSearchResult;
 import io.excalibur.vector.hnsw.HnswGraph.NodeView;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -101,6 +102,7 @@ class VectorRerankerTest {
     void testRerankSingleCandidate() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         NodeView nodeView = mock(NodeView.class);
@@ -112,10 +114,10 @@ class VectorRerankerTest {
         float expectedNormalizedScore = 1.0f / (1.0f + exactDistance); // = 0.8333333f
 
         // Setup mocks
-        when(graph.readNode(1L)).thenReturn(nodeView);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(nodeView);
         when(nodeView.isTombstoned()).thenReturn(false);
         when(nodeView.vector()).thenReturn(storedVector);
-        when(distanceFunction.compute(queryVector, storedVector)).thenReturn(exactDistance);
+        when(distanceFunction.distance(queryVector, storedVector)).thenReturn(exactDistance);
 
         // Create candidate with approximate distance (different from exact)
         List<QueryResultItem> candidates = List.of(
@@ -133,7 +135,7 @@ class VectorRerankerTest {
         assertThat(result.get(0).nodeId()).isEqualTo(1L);
         // Score should be normalized to [0, 1] range where higher is better
         assertThat(result.get(0).score()).isCloseTo(expectedNormalizedScore, within(0.001f));
-        verify(distanceFunction).compute(queryVector, storedVector);
+        verify(distanceFunction).distance(queryVector, storedVector);
     }
 
     @Test
@@ -141,6 +143,7 @@ class VectorRerankerTest {
     void testRerankSortsByExactDistance() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
@@ -154,9 +157,9 @@ class VectorRerankerTest {
         float[] vec2 = new float[]{0.5f, 0.0f, 0.0f};  // Distance 0.5
         float[] vec3 = new float[]{0.7f, 0.0f, 0.0f};  // Distance 0.3
 
-        when(graph.readNode(1L)).thenReturn(node1);
-        when(graph.readNode(2L)).thenReturn(node2);
-        when(graph.readNode(3L)).thenReturn(node3);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node1);
+        when(graph.readNode(2L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node2);
+        when(graph.readNode(3L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node3);
 
         when(node1.isTombstoned()).thenReturn(false);
         when(node2.isTombstoned()).thenReturn(false);
@@ -166,9 +169,9 @@ class VectorRerankerTest {
         when(node2.vector()).thenReturn(vec2);
         when(node3.vector()).thenReturn(vec3);
 
-        when(distanceFunction.compute(queryVector, vec1)).thenReturn(0.1f);
-        when(distanceFunction.compute(queryVector, vec2)).thenReturn(0.5f);
-        when(distanceFunction.compute(queryVector, vec3)).thenReturn(0.3f);
+        when(distanceFunction.distance(queryVector, vec1)).thenReturn(0.1f);
+        when(distanceFunction.distance(queryVector, vec2)).thenReturn(0.5f);
+        when(distanceFunction.distance(queryVector, vec3)).thenReturn(0.3f);
 
         // Create candidates with approximate distances (in wrong order)
         List<QueryResultItem> candidates = Arrays.asList(
@@ -202,6 +205,7 @@ class VectorRerankerTest {
     void testRerankLimitsToTopK() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
@@ -214,9 +218,9 @@ class VectorRerankerTest {
         float[] vec2 = new float[]{0.5f, 0.0f, 0.0f};
         float[] vec3 = new float[]{0.7f, 0.0f, 0.0f};
 
-        when(graph.readNode(1L)).thenReturn(node1);
-        when(graph.readNode(2L)).thenReturn(node2);
-        when(graph.readNode(3L)).thenReturn(node3);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node1);
+        when(graph.readNode(2L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node2);
+        when(graph.readNode(3L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node3);
 
         when(node1.isTombstoned()).thenReturn(false);
         when(node2.isTombstoned()).thenReturn(false);
@@ -226,9 +230,9 @@ class VectorRerankerTest {
         when(node2.vector()).thenReturn(vec2);
         when(node3.vector()).thenReturn(vec3);
 
-        when(distanceFunction.compute(queryVector, vec1)).thenReturn(0.1f);
-        when(distanceFunction.compute(queryVector, vec2)).thenReturn(0.5f);
-        when(distanceFunction.compute(queryVector, vec3)).thenReturn(0.3f);
+        when(distanceFunction.distance(queryVector, vec1)).thenReturn(0.1f);
+        when(distanceFunction.distance(queryVector, vec2)).thenReturn(0.5f);
+        when(distanceFunction.distance(queryVector, vec3)).thenReturn(0.3f);
 
         List<QueryResultItem> candidates = Arrays.asList(
             new QueryResultItem(1L, 0.1f, null, 100L, 1L),
@@ -255,6 +259,7 @@ class VectorRerankerTest {
     void testRerankSkipsMissingNodes() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
@@ -263,12 +268,12 @@ class VectorRerankerTest {
         float[] vec2 = new float[]{0.5f, 0.0f, 0.0f};
 
         // Node 1 is missing
-        when(graph.readNode(1L)).thenReturn(null);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(null);
         // Node 2 exists
-        when(graph.readNode(2L)).thenReturn(node2);
+        when(graph.readNode(2L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node2);
         when(node2.isTombstoned()).thenReturn(false);
         when(node2.vector()).thenReturn(vec2);
-        when(distanceFunction.compute(queryVector, vec2)).thenReturn(0.5f);
+        when(distanceFunction.distance(queryVector, vec2)).thenReturn(0.5f);
 
         List<QueryResultItem> candidates = Arrays.asList(
             new QueryResultItem(1L, 0.1f, null, 100L, 1L),
@@ -291,6 +296,7 @@ class VectorRerankerTest {
     void testRerankSkipsTombstonedNodes() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
@@ -300,13 +306,13 @@ class VectorRerankerTest {
         float[] vec2 = new float[]{0.5f, 0.0f, 0.0f};
 
         // Node 1 is tombstoned
-        when(graph.readNode(1L)).thenReturn(node1);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node1);
         when(node1.isTombstoned()).thenReturn(true);
         // Node 2 is active
-        when(graph.readNode(2L)).thenReturn(node2);
+        when(graph.readNode(2L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node2);
         when(node2.isTombstoned()).thenReturn(false);
         when(node2.vector()).thenReturn(vec2);
-        when(distanceFunction.compute(queryVector, vec2)).thenReturn(0.5f);
+        when(distanceFunction.distance(queryVector, vec2)).thenReturn(0.5f);
 
         List<QueryResultItem> candidates = Arrays.asList(
             new QueryResultItem(1L, 0.1f, null, 100L, 1L),
@@ -329,6 +335,7 @@ class VectorRerankerTest {
     void testRerankSkipsNullVectors() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
@@ -337,14 +344,14 @@ class VectorRerankerTest {
         NodeView node2 = mock(NodeView.class);
         float[] vec2 = new float[]{0.5f, 0.0f, 0.0f};
 
-        when(graph.readNode(1L)).thenReturn(node1);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node1);
         when(node1.isTombstoned()).thenReturn(false);
         when(node1.vector()).thenReturn(null);  // Null vector
 
-        when(graph.readNode(2L)).thenReturn(node2);
+        when(graph.readNode(2L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node2);
         when(node2.isTombstoned()).thenReturn(false);
         when(node2.vector()).thenReturn(vec2);
-        when(distanceFunction.compute(queryVector, vec2)).thenReturn(0.5f);
+        when(distanceFunction.distance(queryVector, vec2)).thenReturn(0.5f);
 
         List<QueryResultItem> candidates = Arrays.asList(
             new QueryResultItem(1L, 0.1f, null, 100L, 1L),
@@ -367,6 +374,7 @@ class VectorRerankerTest {
     void testRerankSkipsEmptyVectors() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
@@ -375,14 +383,14 @@ class VectorRerankerTest {
         NodeView node2 = mock(NodeView.class);
         float[] vec2 = new float[]{0.5f, 0.0f, 0.0f};
 
-        when(graph.readNode(1L)).thenReturn(node1);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node1);
         when(node1.isTombstoned()).thenReturn(false);
         when(node1.vector()).thenReturn(new float[0]);  // Empty vector
 
-        when(graph.readNode(2L)).thenReturn(node2);
+        when(graph.readNode(2L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node2);
         when(node2.isTombstoned()).thenReturn(false);
         when(node2.vector()).thenReturn(vec2);
-        when(distanceFunction.compute(queryVector, vec2)).thenReturn(0.5f);
+        when(distanceFunction.distance(queryVector, vec2)).thenReturn(0.5f);
 
         List<QueryResultItem> candidates = Arrays.asList(
             new QueryResultItem(1L, 0.1f, null, 100L, 1L),
@@ -403,10 +411,11 @@ class VectorRerankerTest {
     // ==================== Tail Scan Result Tests ====================
 
     @Test
-    @DisplayName("Rerank normalizes tail scan results to [0, 1] score range")
-    void testRerankNormalizesTailScanResults() {
+    @DisplayName("Rerank passes tail scan results through on the scale they arrived on")
+    void testRerankPassesTailScanResultsThrough() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
@@ -418,18 +427,20 @@ class VectorRerankerTest {
         NodeView node1 = mock(NodeView.class);
         float[] vec1 = new float[]{0.9f, 0.0f, 0.0f};
 
-        when(graph.readNode(1L)).thenReturn(node1);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node1);
         when(node1.isTombstoned()).thenReturn(false);
         when(node1.vector()).thenReturn(vec1);
-        when(distanceFunction.compute(queryVector, vec1)).thenReturn(0.1f);
+        when(distanceFunction.distance(queryVector, vec1)).thenReturn(0.1f);
 
-        // Tail scan result has raw L2 distance 0.3, should be normalized to 1/(1+0.3) ≈ 0.769
-        float tailRawDistance = 0.3f;
-        float expectedTailNormalizedScore = 1.0f / (1.0f + tailRawDistance);  // ≈ 0.769
+        // Candidates arrive from the aggregator already normalized to [0,1], higher is
+        // better. A tail-scan hit has no node in the graph, so there is nothing to
+        // re-measure; normalizing it a second time would map [0,1] into [0.5,1.0] under
+        // cosine and float every tail hit above genuine graph matches.
+        float tailNormalizedScore = 0.3f;
 
         List<QueryResultItem> candidates = Arrays.asList(
             new QueryResultItem(1L, 0.5f, null, 100L, 1L),       // HNSW result
-            new QueryResultItem(2L, tailRawDistance, null, 100L, tailScanNodeId)  // Tail scan result
+            new QueryResultItem(2L, tailNormalizedScore, null, 100L, tailScanNodeId)
         );
 
         List<QueryResultItem> result = reranker.rerank(
@@ -440,16 +451,17 @@ class VectorRerankerTest {
         );
 
         assertThat(result).hasSize(2);
-        // Tail scan result should now have normalized score in [0, 1] range
         QueryResultItem tailResult = result.stream()
             .filter(r -> r.nodeId() == tailScanNodeId)
             .findFirst()
             .orElse(null);
         assertThat(tailResult).isNotNull();
-        // Score should be normalized to [0, 1] range
-        assertThat(tailResult.score()).isCloseTo(expectedTailNormalizedScore, within(0.001f));
-        assertThat(tailResult.score()).isGreaterThanOrEqualTo(0.0f);
-        assertThat(tailResult.score()).isLessThanOrEqualTo(1.0f);
+        assertThat(tailResult.score()).isEqualTo(tailNormalizedScore);
+
+        // The graph hit is re-measured exactly and outranks the tail hit
+        assertThat(result.get(0).nodeId()).isEqualTo(1L);
+        assertThat(result.get(0).score()).isCloseTo(1.0f / 1.1f, within(0.001f));
+        assertThat(result.get(1).nodeId()).isEqualTo(tailScanNodeId);
     }
 
     // ==================== Null Argument Tests ====================
@@ -515,6 +527,7 @@ class VectorRerankerTest {
     void testRerankExactL2Distances() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 2.0f, 3.0f};
@@ -526,10 +539,10 @@ class VectorRerankerTest {
         float expectedNormalizedScore = 1.0f / (1.0f + rawL2Distance);
 
         NodeView node = mock(NodeView.class);
-        when(graph.readNode(1L)).thenReturn(node);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node);
         when(node.isTombstoned()).thenReturn(false);
         when(node.vector()).thenReturn(storedVector);
-        when(distanceFunction.compute(queryVector, storedVector)).thenReturn(rawL2Distance);
+        when(distanceFunction.distance(queryVector, storedVector)).thenReturn(rawL2Distance);
 
         List<QueryResultItem> candidates = List.of(
             new QueryResultItem(1L, 0.5f, null, 100L, 1L)  // Approximate distance
@@ -552,6 +565,7 @@ class VectorRerankerTest {
     void testRerankPreservesMetadata() {
         DistanceFunction distanceFunction = mock(DistanceFunction.class);
         when(distanceFunction.name()).thenReturn("l2");  // Required by DistanceValidator
+        when(distanceFunction.ordering()).thenReturn(DistanceFunction.Ordering.SMALLER_IS_CLOSER);
         VectorReranker reranker = new VectorReranker(distanceFunction);
         HnswGraph graph = mock(HnswGraph.class);
         float[] queryVector = new float[]{1.0f, 0.0f, 0.0f};
@@ -562,10 +576,10 @@ class VectorRerankerTest {
         float expectedNormalizedScore = 1.0f / (1.0f + rawDistance); // = 0.8333...
 
         NodeView node = mock(NodeView.class);
-        when(graph.readNode(1L)).thenReturn(node);
+        when(graph.readNode(1L, HnswSearchResult.GENERATION_UNKNOWN)).thenReturn(node);
         when(node.isTombstoned()).thenReturn(false);
         when(node.vector()).thenReturn(storedVector);
-        when(distanceFunction.compute(queryVector, storedVector)).thenReturn(rawDistance);
+        when(distanceFunction.distance(queryVector, storedVector)).thenReturn(rawDistance);
 
         byte[] payload = new byte[]{1, 2, 3};
         List<QueryResultItem> candidates = List.of(

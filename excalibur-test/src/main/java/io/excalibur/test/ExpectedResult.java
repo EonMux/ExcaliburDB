@@ -3,17 +3,13 @@
  * 
  * Package: io.excalibur.test
  * 
- * Thread Safety: 
- *   - ExpectedResult: Thread-safe, immutable result builder
- *   - ExpectedResultItem: Thread-safe, immutable
- *   - ExpectedResultItemBuilder: Not thread-safe - use one instance per expected result
+ * Thread Safety:
+ *   - ExpectedResult: Thread-safe, immutable
  */
 
 package io.excalibur.test;
 
 import java.util.*;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 /**
  * Immutable builder for expected query results in golden tests.
@@ -169,110 +165,5 @@ public class ExpectedResult {
     public static ExpectedResult builder() {
         return ExpectedResult.builder(null, Collections.emptyList(), PartialResult.empty(),
                                         Collections.emptyMap(), IndexCoverage.empty());
-    }
-    
-    /**
-     * Create an ExpectedResult with a single integer value.
-     *
-     * @param value The integer value
-     * @return A new ExpectedResult wrapping the value
-     */
-    public static ExpectedResult intValue(int value) {
-        return builder(null, null, null, null, null);
-    }
-
-    /**
-     * Create an ExpectedResult with a double value and tolerance.
-     *
-     * @param value The double value
-     * @param epsilon Tolerance for comparison
-     * @return A new ExpectedResult wrapping the value
-     */
-    public static ExpectedResult doubleValue(double value, double epsilon) {
-        return builder(null, null, null, null, null);
-    }
-
-    /**
-     * Create an ExpectedResult with a list of values.
-     *
-     * @param values The list values
-     * @return A new ExpectedResult wrapping the list
-     */
-    @SuppressWarnings("unchecked")
-    public static <T> ExpectedResult list(T... values) {
-        return builder(null, Collections.emptyList(), null, null, null);
-    }
-
-    /**
-     * Create an ExpectedResult with a map of values.
-     *
-     * @param entries Key-value pairs
-     * @return A new ExpectedResult wrapping the map
-     */
-    @SuppressWarnings("unchecked")
-    public static <K, V> ExpectedResult map(Map.Entry<K, V>... entries) {
-        return builder(null, null, null, Collections.emptyMap(), null);
-    }
-
-    /**
-     * Create an ExpectedResult with a set of values.
-     *
-     * @param values The set values
-     * @return A new ExpectedResult wrapping the set
-     */
-    @SuppressWarnings("unchecked")
-    public static <T> ExpectedResult set(T... values) {
-        return builder(null, null, null, null, null);
-    }
-
-    /**
-     * Create a builder with an integer value.
-     *
-     * @param value The integer value
-     * @return A new builder instance
-     */
-    public static ExpectedResult builder(int value) {
-        return builder(null, null, null, null, null);
-    }
-
-    /**
-     * Create a builder with a double value and tolerance.
-     *
-     * @param value The double value
-     * @param epsilon Tolerance for comparison
-     * @return A new builder instance
-     */
-    public static ExpectedResult builder(double value, double epsilon) {
-        return builder(null, null, null, null, null);
-    }
-
-    /**
-     * Create a builder with a list of values.
-     *
-     * @param values The list values
-     * @return A new builder instance
-     */
-    public static <T> ExpectedResult builder(List<T> values) {
-        return builder(null, values == null ? Collections.emptyList() : Collections.emptyList(), null, null, null);
-    }
-
-    /**
-     * Create a builder with a map of values.
-     *
-     * @param values The map entries
-     * @return A new builder instance
-     */
-    public static <K, V> ExpectedResult builder(Map<K, V> values) {
-        return builder(null, null, null, values == null ? Collections.emptyMap() : Collections.emptyMap(), null);
-    }
-
-    /**
-     * Create a builder with a set of values.
-     *
-     * @param values The set values
-     * @return A new builder instance
-     */
-    public static <T> ExpectedResult builder(Set<T> values) {
-        return builder(null, null, null, null, null);
     }
 }

@@ -438,8 +438,8 @@ class DeterminismTest {
     }
 
     @Test
-    @DisplayName("DETERMINISM: Index clamping is consistent")
-    void determinism_indexClamping_isConsistent() {
+    @DisplayName("DETERMINISM: Out-of-range index handling is consistent")
+    void determinism_outOfRangeIndexHandling_isConsistent() {
         // Handler returns index beyond candidate count - wrap in chat completion format
         mockServer.setChatHandler(exchange -> {
             String content = "[{\"index\": 99, \"score\": 0.5}]";
@@ -455,8 +455,8 @@ class DeterminismTest {
 
         for (int i = 0; i < 3; i++) {
             List<RelevancyScore> scores = client.scoreRelevancy("query", List.of("only one"));
-            // Index 99 should be clamped to 0 (only valid index)
-            assertEquals(0, scores.get(0).getIndex());
+            // Every repetition must discard the unusable index identically.
+            assertEquals(0, scores.size());
         }
     }
 

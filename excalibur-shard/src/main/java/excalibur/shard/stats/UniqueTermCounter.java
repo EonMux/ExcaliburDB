@@ -226,6 +226,12 @@ public class UniqueTermCounter {
     /**
      * Deserializes a UniqueTermCounter from a byte array.
      *
+     * <p>The bytes are copied into a native segment first. A {@code byte[]}-backed
+     * {@link MemorySegment} supports 1-byte alignment only, while the HyperLogLog header
+     * is read with the aligned {@code JAVA_INT} and {@code JAVA_LONG} layouts, so decoding
+     * straight out of the array throws {@code IllegalArgumentException: Misaligned
+     * access}.</p>
+     *
      * @param bytes The byte array to deserialize from
      * @return A new UniqueTermCounter instance
      * @throws IllegalArgumentException if the bytes are invalid
@@ -233,9 +239,13 @@ public class UniqueTermCounter {
      */
     public static UniqueTermCounter deserialize(byte[] bytes) {
         Objects.requireNonNull(bytes, "Bytes cannot be null");
-        MemorySegment segment = MemorySegment.ofArray(bytes);
-        HyperLogLog hll = HyperLogLog.fromMemorySegment(segment);
-        return new UniqueTermCounter(hll);
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment segment = arena.allocate(bytes.length);
+            MemorySegment.copy(bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.length);
+            HyperLogLog hll = HyperLogLog.fromMemorySegment(segment);
+            return new UniqueTermCounter(hll);
+        }
     }
 
     /**

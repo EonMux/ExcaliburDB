@@ -37,7 +37,7 @@ class DocumentAtomicityFilterTest {
     @Test
     void testIsDocumentVisible_visibleDocument() {
         tracker.registerAtomicDocument(
-            createBatch("1", 0L, 100L, "1:0"),
+            createBatch("1", 0L, 100L, "1:chunk:0"),
             5L
         );
 
@@ -47,7 +47,7 @@ class DocumentAtomicityFilterTest {
     @Test
     void testIsDocumentVisible_notYetVisible() {
         tracker.registerAtomicDocument(
-            createBatch("1", 0L, 100L, "1:0"),
+            createBatch("1", 0L, 100L, "1:chunk:0"),
             10L
         );
 
@@ -62,39 +62,39 @@ class DocumentAtomicityFilterTest {
     @Test
     void testIsChunkVisible_filtersByVisibility() {
         tracker.registerAtomicDocument(
-            createBatch("doc1", 0L, 100L, "doc1:0", "doc1:1", "doc1:2"),
+            createBatch("doc1", 0L, 100L, "doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"),
             5L
         );
 
-        assertTrue(checker.isChunkVisible("doc1:0", 10L));
-        assertTrue(checker.isChunkVisible("doc1:1", 10L));
-        assertTrue(checker.isChunkVisible("doc1:2", 10L));
-        assertFalse(checker.isChunkVisible("doc2:0", 10L));
+        assertTrue(checker.isChunkVisible("doc1:chunk:0", 10L));
+        assertTrue(checker.isChunkVisible("doc1:chunk:1", 10L));
+        assertTrue(checker.isChunkVisible("doc1:chunk:2", 10L));
+        assertFalse(checker.isChunkVisible("doc2:chunk:0", 10L));
     }
 
     @Test
     void testFilterPartialDocuments_filtersByVisibility() {
         tracker.registerAtomicDocument(
-            createBatch("doc1", 0L, 100L, "doc1:0", "doc1:1", "doc1:2"),
+            createBatch("doc1", 0L, 100L, "doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"),
             5L
         );
 
-        List<String> chunks = Arrays.asList("doc1:0", "doc1:1", "doc1:2", "doc2:0");
+        List<String> chunks = Arrays.asList("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2", "doc2:chunk:0");
 
         List<String> filtered = checker.filterPartialDocuments(chunks, 10L);
 
         assertEquals(3, filtered.size());
-        assertTrue(filtered.contains("doc1:0"));
-        assertTrue(filtered.contains("doc1:1"));
-        assertTrue(filtered.contains("doc1:2"));
-        assertFalse(filtered.contains("doc2:0"));
+        assertTrue(filtered.contains("doc1:chunk:0"));
+        assertTrue(filtered.contains("doc1:chunk:1"));
+        assertTrue(filtered.contains("doc1:chunk:2"));
+        assertFalse(filtered.contains("doc2:chunk:0"));
     }
 
     @Test
     void testGetVisibleDocuments() {
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:0"), 5L);
-        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:0"), 10L);
-        tracker.registerAtomicDocument(createBatch("3", 200L, 300L, "3:0"), 15L);
+        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0"), 5L);
+        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:chunk:0"), 10L);
+        tracker.registerAtomicDocument(createBatch("3", 200L, 300L, "3:chunk:0"), 15L);
 
         assertEquals(1, checker.getVisibleDocuments(5L).size());
         assertEquals(2, checker.getVisibleDocuments(10L).size());
@@ -103,7 +103,7 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testGetCommitEpoch() {
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:0"), 10L);
+        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0"), 10L);
 
         assertEquals(10L, checker.getCommitEpoch("1"));
         assertEquals(-1L, checker.getCommitEpoch("999"));
@@ -111,7 +111,7 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testGetChunkCount() {
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:0", "1:1"), 5L);
+        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0", "1:chunk:1"), 5L);
 
         assertEquals(2, checker.getChunkCount("1"));
         assertEquals(0, checker.getChunkCount("999"));
@@ -121,23 +121,23 @@ class DocumentAtomicityFilterTest {
     void testGetDocumentCount() {
         assertEquals(0, checker.getDocumentCount());
         
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:0"), 5L);
+        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0"), 5L);
         assertEquals(1, checker.getDocumentCount());
         
-        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:0"), 10L);
+        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:chunk:0"), 10L);
         assertEquals(2, checker.getDocumentCount());
     }
 
     @Test
     void testEpochIsolation() {
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:0"), 5L);
-        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:0"), 10L);
+        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0"), 5L);
+        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:chunk:0"), 10L);
 
-        List<String> chunks = Arrays.asList("1:0", "2:0");
+        List<String> chunks = Arrays.asList("1:chunk:0", "2:chunk:0");
 
         List<String> atEpoch5 = checker.filterPartialDocuments(chunks, 5L);
         assertEquals(1, atEpoch5.size());
-        assertTrue(atEpoch5.contains("1:0"));
+        assertTrue(atEpoch5.contains("1:chunk:0"));
 
         List<String> atEpoch10 = checker.filterPartialDocuments(chunks, 10L);
         assertEquals(2, atEpoch10.size());
@@ -146,13 +146,13 @@ class DocumentAtomicityFilterTest {
     @Test
     void testNoPartialDocumentsVisible() {
         tracker.registerAtomicDocument(
-            createBatch("1", 0L, 100L, "1:0", "1:1", "1:2"),
+            createBatch("1", 0L, 100L, "1:chunk:0", "1:chunk:1", "1:chunk:2"),
             5L
         );
 
         long commitEpoch = checker.getCommitEpoch("1");
 
-        List<String> chunks = Arrays.asList("1:0", "1:1", "1:2");
+        List<String> chunks = Arrays.asList("1:chunk:0", "1:chunk:1", "1:chunk:2");
 
         List<String> atCommit = checker.filterPartialDocuments(chunks, commitEpoch);
         assertEquals(3, atCommit.size());
@@ -176,6 +176,13 @@ class DocumentAtomicityFilterTest {
      * Adapter to use DocumentVisibilityTracker as DocumentVisibilityChecker.
      */
     private static class TrackerAdapter implements DocumentVisibilityChecker {
+        @Override
+        public long currentEpoch() {
+            // A test double with no epoch of its own. Unbounded keeps these tests asserting the
+            // completeness behaviour they were written for, rather than an epoch bound.
+            return Long.MAX_VALUE;
+        }
+
         private final DocumentVisibilityTracker tracker;
 
         TrackerAdapter(DocumentVisibilityTracker tracker) {

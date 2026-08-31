@@ -51,6 +51,9 @@ public final class ResponseSanitizer {
      */
     private static final Pattern JSON_ARRAY_PATTERN = Pattern.compile("\\[[\\s\\S]*?\\]");
 
+    /** The key that marks a bracket pair as the score array rather than incidental prose. */
+    private static final Pattern SCORE_KEY = Pattern.compile("\"score\"\\s*:");
+
     /**
      * Pattern to match markdown code fences with optional language specifier.
      * Matches: ```json, ```JSON, ``` or just ``` followed by content and closing ```
@@ -163,10 +166,13 @@ public final class ResponseSanitizer {
     }
 
     /**
-     * Extracts the first JSON array from the content using regex matching.
+     * Extracts the JSON array from the content using regex matching.
      *
-     * <p>Uses non-greedy matching to find the shortest complete array structure.
-     * This prevents over-matching when there are multiple potential endpoints.</p>
+     * <p>Non-greedy, so it finds the shortest complete array structure rather than swallowing
+     * everything up to the last bracket in the response. Among the candidates it prefers the
+     * first one that actually carries a {@code "score"} key: a model that prefaces its answer
+     * with "Scores [0-1 scale]:" puts a bracket pair ahead of the real array, and returning
+     * that one produced something that looked like a JSON array and parsed to nothing.</p>
      *
      * @param content Content to search (must not be null)
      * @return Extracted JSON array string, or null if not found
@@ -174,11 +180,18 @@ public final class ResponseSanitizer {
     private String extractJsonArray(String content) {
         Matcher matcher = JSON_ARRAY_PATTERN.matcher(content);
 
-        if (matcher.find()) {
-            return matcher.group();
+        String first = null;
+        while (matcher.find()) {
+            String candidate = matcher.group();
+            if (first == null) {
+                first = candidate;
+            }
+            if (SCORE_KEY.matcher(candidate).find()) {
+                return candidate;
+            }
         }
 
-        return null;
+        return first;
     }
 
     /**

@@ -4,9 +4,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.*;
@@ -468,6 +473,127 @@ class LshHashTableTest {
             assertThat(hashFunction).isNotNull();
             assertThat(hashFunction.numBits()).isEqualTo(NUM_BITS);
             assertThat(hashFunction.dimensions()).isEqualTo(DIMENSIONS);
+        }
+    }
+
+    @Nested
+    @DisplayName("Bucket Directory Growth Tests")
+    class BucketDirectoryGrowthTests {
+
+        /** Mirrors LshHashTable.INITIAL_BUCKET_CAPACITY. */
+        private static final int INITIAL_CAPACITY = 1024;
+
+        @Test
+        @DisplayName("Should keep every entry queryable after the directory grows")
+        @Timeout(120)
+        void shouldPreserveEntriesAcrossDirectoryGrowth() throws IOException {
+            // Growth triggers at 70% of the 1024 initial slots, so this forces several
+            // doublings and therefore several relocations of the entry-storage region.
+            int entries = 3000;
+
+            for (int i = 0; i < entries; i++) {
+                table.insert(createRandomVector(DIMENSIONS, i), i);
+            }
+
+            assertThat(table.entryCount()).isEqualTo(entries);
+
+            for (int i = 0; i < entries; i++) {
+                assertThat(table.queryExact(createRandomVector(DIMENSIONS, i)))
+                    .as("entry %d must survive the directory growth", i)
+                    .contains((long) i);
+            }
+        }
+
+        @Test
+        @DisplayName("Should allocate entries behind the grown directory after clear()")
+        @Timeout(120)
+        void shouldAllocateBehindGrownDirectoryAfterClear() throws IOException {
+            for (int i = 0; i < 2000; i++) {
+                table.insert(createRandomVector(DIMENSIONS, i), i);
+            }
+
+            table.clear();
+
+            for (int i = 0; i < 200; i++) {
+                table.insert(createRandomVector(DIMENSIONS, i), i);
+            }
+
+            assertThat(table.entryCount()).isEqualTo(200);
+            for (int i = 0; i < 200; i++) {
+                assertThat(table.queryExact(createRandomVector(DIMENSIONS, i)))
+                    .as("entry %d must be readable after clear()", i)
+                    .contains((long) i);
+            }
+        }
+
+        @Test
+        @DisplayName("Should keep one bucket per hash when an earlier slot was emptied")
+        void shouldNotSplitBucketAcrossEmptiedSlot() throws IOException {
+            float[][] colliding = findSlotCollidingVectors();
+            float[] first = colliding[0];
+            float[] second = colliding[1];
+
+            table.insert(first, 1L);   // Claims the shared directory slot
+            table.insert(second, 2L);  // Probes past it into the next slot
+            table.delete(1L);          // Leaves the shared slot with a hash but no entries
+
+            // Must reuse the bucket entry 2 already lives in, not claim the emptied slot.
+            table.insert(second, 3L);
+
+            assertThat(table.queryExact(second)).containsExactlyInAnyOrder(2L, 3L);
+        }
+
+        /**
+         * Finds two vectors whose hashes differ but map to the same initial directory slot.
+         */
+        private float[][] findSlotCollidingVectors() {
+            Map<Long, float[]> bySlot = new HashMap<>();
+            Map<Long, Long> hashBySlot = new HashMap<>();
+
+            for (int seed = 0; seed < 20000; seed++) {
+                float[] vector = createRandomVector(DIMENSIONS, seed);
+                long hash = table.hashFunction().hash(vector);
+                long slot = (hash & 0x7FFFFFFFFFFFFFFFL) % INITIAL_CAPACITY;
+
+                Long previousHash = hashBySlot.get(slot);
+                if (previousHash == null) {
+                    hashBySlot.put(slot, hash);
+                    bySlot.put(slot, vector);
+                } else if (previousHash != hash) {
+                    return new float[][] { bySlot.get(slot), vector };
+                }
+            }
+
+            throw new AssertionError("No two hashes shared a directory slot");
+        }
+    }
+
+    @Nested
+    @DisplayName("Persistence Tests")
+    class PersistenceTests {
+
+        @Test
+        @DisplayName("Should reopen a persisted table using the seed stored in its header")
+        void shouldReopenWithStoredSeed(@TempDir Path directory) throws IOException {
+            Path path = directory.resolve("table.dat");
+
+            try (LshHashTable persisted = new LshHashTable(path, DIMENSIONS, NUM_BITS, SEED)) {
+                for (int i = 0; i < 50; i++) {
+                    persisted.insert(createRandomVector(DIMENSIONS, i), i);
+                }
+                persisted.flush();
+            }
+
+            // A different seed is requested on purpose: the persisted buckets were built with
+            // SEED, so the stored seed must win or every query would come back empty.
+            try (LshHashTable reopened = new LshHashTable(path, DIMENSIONS, NUM_BITS, SEED + 1)) {
+                assertThat(reopened.entryCount()).isEqualTo(50);
+                for (int i = 0; i < 50; i++) {
+                    assertThat(reopened.queryExact(createRandomVector(DIMENSIONS, i)))
+                        .as("entry %d must survive a reopen", i)
+                        .contains((long) i);
+                }
+            }
         }
     }
 

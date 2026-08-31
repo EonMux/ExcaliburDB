@@ -4,8 +4,6 @@ plugins {
     application
 }
 
-group = "com.excaliburdb"
-version = "1.0.0-SNAPSHOT"
 
 application {
     mainClass.set("excalibur.bench.BenchmarkRunner")
@@ -70,6 +68,33 @@ tasks.test {
     jvmArgs("--enable-preview")
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     jvmArgs("--add-modules=jdk.incubator.vector")
+}
+
+// Runs the throughput and FP-rate gates that the root build excludes from `test` via
+// excludeTags("slow", "benchmark"). Without this task those tests never execute at all,
+// so the targets they assert are never enforced anywhere.
+tasks.register<Test>("benchmarkTest") {
+    group = "verification"
+    description = "Runs the tag-excluded benchmark gate tests (slow: takes minutes)"
+    testClassesDirs = sourceSets["test"].output.classesDirs
+    classpath = sourceSets["test"].runtimeClasspath
+    useJUnitPlatform {
+        // The root build applies excludeTags("slow", "benchmark") to every Test task.
+        // Exclusion beats inclusion, so it has to be cleared here or this task would
+        // select nothing at all - which is how these gates came to never run.
+        excludeTags = LinkedHashSet()
+        includeTags("slow", "benchmark")
+    }
+    testLogging {
+        events("passed", "skipped", "failed")
+        showStandardStreams = true
+    }
+    jvmArgs("--enable-preview")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    jvmArgs("--add-modules=jdk.incubator.vector")
+    jvmArgs("-Xmx2g")
+    // Benchmarks measure a moving system; never reuse a previous run's verdict.
+    outputs.upToDateWhen { false }
 }
 
 // Task to run the JMH benchmark for Segment

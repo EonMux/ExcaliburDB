@@ -22,11 +22,11 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class IngestEndpointTest {
 
-    private IngestEndpoint.InMemorySourceRegistry registry;
+    private InMemorySourceRegistry registry;
 
     @BeforeEach
     void setUp() {
-        registry = new IngestEndpoint.InMemorySourceRegistry();
+        registry = new InMemorySourceRegistry();
     }
 
     @Test

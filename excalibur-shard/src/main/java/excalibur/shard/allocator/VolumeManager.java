@@ -268,7 +268,10 @@ public class VolumeManager {
      * @throws IllegalStateException if no volumes are registered
      */
     public Path assignSegmentToVolume(long segmentId) {
-        lock.readLock().lock();
+        // Use write lock since this method mutates segmentToVolume and volumeToSegments
+        // via recordAssignment(). A read lock would allow concurrent check-then-act races
+        // where the same segment could be assigned and recorded twice.
+        lock.writeLock().lock();
         try {
             // Check for existing assignment
             Path existingAssignment = segmentToVolume.get(segmentId);
@@ -287,7 +290,7 @@ public class VolumeManager {
 
             return assignedVolume;
         } finally {
-            lock.readLock().unlock();
+            lock.writeLock().unlock();
         }
     }
 

@@ -6,8 +6,9 @@ import io.excalibur.store.Segment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -119,9 +120,16 @@ public class LshIngestionService {
     /**
      * Initializes an LSH index for a segment.
      *
-     * <p>This method creates a new LSH index with the configured parameters
-     * and attaches it to the segment. If the segment already has an LSH index,
-     * this method is a no-op.</p>
+     * <p>The index is backed by files in a directory beside the segment's data file, so the
+     * buckets built during ingestion are still there after a restart. An in-memory index would be
+     * backed by {@code deleteOnExit} temporary files, which makes every restart silently start
+     * from an empty pre-filter while the query pipeline still believes it has one.</p>
+     *
+     * <p>The seed is derived from the segment id rather than left to the {@link LshConfig}
+     * default of {@code System.nanoTime()}: a per-process random seed produces different
+     * hyperplanes on every start, which would make the persisted buckets meaningless.</p>
+     *
+     * <p>If the segment already has an LSH index, this method is a no-op.</p>
      *
      * @param segment The segment to initialize with an LSH index
      * @throws NullPointerException if segment is null
@@ -142,19 +150,80 @@ public class LshIngestionService {
                 return;
             }
 
-            LshConfig config = LshConfig.builder(vectorDimensions)
-                .numHashTables(numHashTables)
-                .numHashFunctions(numHashFunctions)
-                .numProbes(numProbes)
-                .build();
+            LshConfig config = configForSegment(segment);
+            Path directory = lshDirectory(segment);
 
-            LshIndex lshIndex = new LshIndex(config);
+            LshIndex lshIndex;
+            if (directory != null) {
+                lshIndex = LshIndex.open(config, directory);
+            } else {
+                // A segment with no backing path (in-memory fixtures) has nowhere to persist to.
+                lshIndex = new LshIndex(config);
+            }
             segment.attachLshIndex(lshIndex);
 
-            LOGGER.debug("Initialized LSH index for segment {} with dimensions {}",
-                segment.segmentId(), vectorDimensions);
+            LOGGER.debug("Initialized LSH index for segment {} with dimensions {} at {}",
+                segment.segmentId(), vectorDimensions, directory);
+        } catch (IOException e) {
+            LOGGER.warn("Failed to open persistent LSH index for segment {}: {}",
+                segment.segmentId(), e.getMessage());
         } finally {
             initializationLock.unlock();
+        }
+    }
+
+    /**
+     * Builds the LSH configuration for one segment, seeded from its id so the hyperplanes are
+     * reproducible across restarts.
+     */
+    private LshConfig configForSegment(Segment segment) {
+        return LshConfig.builder(vectorDimensions)
+            .numHashTables(numHashTables)
+            .numHashFunctions(numHashFunctions)
+            .numProbes(numProbes)
+            .seed(segment.segmentId())
+            .build();
+    }
+
+    /**
+     * Resolves the directory holding a segment's LSH tables: a sibling of the segment data file
+     * named after it, so the two are moved, compacted and removed together.
+     *
+     * @return The directory, or null if the segment has no backing file
+     */
+    private static Path lshDirectory(Segment segment) {
+        Path dataPath = segment.path();
+        if (dataPath == null) {
+            return null;
+        }
+        Path parent = dataPath.getParent();
+        String name = dataPath.getFileName().toString();
+        int extension = name.lastIndexOf('.');
+        String base = extension > 0 ? name.substring(0, extension) : name;
+        Path directory = Path.of(base + ".lsh");
+        return parent != null ? parent.resolve(directory) : directory;
+    }
+
+    /**
+     * Forces a segment's LSH index to its backing files.
+     *
+     * <p>A no-op for a segment with no index, or one backed by temporary files.</p>
+     *
+     * @param segment The segment whose index should be flushed
+     * @throws NullPointerException if segment is null
+     */
+    public void flush(Segment segment) {
+        Objects.requireNonNull(segment, "segment must not be null");
+
+        LshIndex lshIndex = segment.lshIndex();
+        if (lshIndex == null || lshIndex.isClosed()) {
+            return;
+        }
+        try {
+            lshIndex.flush();
+        } catch (Exception e) {
+            LOGGER.warn("Failed to flush LSH index for segment {}: {}",
+                segment.segmentId(), e.getMessage());
         }
     }
 

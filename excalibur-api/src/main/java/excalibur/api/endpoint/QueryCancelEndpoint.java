@@ -1,5 +1,7 @@
 package excalibur.api.endpoint;
 
+import excalibur.api.protocol.JsonText;
+import excalibur.api.protocol.ResponseBody;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import excalibur.query.executor.QueryRegistry;
@@ -7,7 +9,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -112,7 +113,7 @@ public class QueryCancelEndpoint implements HttpHandler {
                 LOGGER.debug("Query already cancelled: {}", queryId);
                 sendJson(exchange, 200, String.format(
                     "{\"cancelled\": false, \"query_id\": \"%s\", \"message\": \"Query was already cancelled\"}",
-                    escapeJson(queryId)
+                    JsonText.escape(queryId)
                 ));
                 return;
             }
@@ -124,14 +125,14 @@ public class QueryCancelEndpoint implements HttpHandler {
                 LOGGER.info("Query cancelled successfully: {}", queryId);
                 sendJson(exchange, 200, String.format(
                     "{\"cancelled\": true, \"query_id\": \"%s\"}",
-                    escapeJson(queryId)
+                    JsonText.escape(queryId)
                 ));
             } else {
                 // Race condition - query completed between check and cancel
                 LOGGER.debug("Query completed before cancellation: {}", queryId);
                 sendJson(exchange, 200, String.format(
                     "{\"cancelled\": false, \"query_id\": \"%s\", \"message\": \"Query completed before cancellation\"}",
-                    escapeJson(queryId)
+                    JsonText.escape(queryId)
                 ));
             }
 
@@ -180,30 +181,15 @@ public class QueryCancelEndpoint implements HttpHandler {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(statusCode, bytes.length);
-
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
+        ResponseBody.send(exchange, statusCode, bytes);
     }
 
     /**
      * Sends an error response.
      */
     private void sendError(HttpExchange exchange, int statusCode, String message) throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", escapeJson(message));
+        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
         sendJson(exchange, statusCode, json);
     }
 
-    /**
-     * Escapes special characters for JSON strings.
-     */
-    private String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t");
-    }
 }

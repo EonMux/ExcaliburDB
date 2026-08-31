@@ -11,7 +11,9 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -70,6 +72,11 @@ public final class LlmRelevancyScorer implements LlmScorer {
      *   <li>Filters out results below the threshold</li>
      * </ol>
      *
+     * <p>Scoring is only meaningful for results that actually carry text. A result with an
+     * empty payload keeps its incoming vector score and is never dropped by the threshold;
+     * if no result carries text at all, the input list is returned unchanged rather than
+     * asking the LLM to rank a list of empty strings.</p>
+     *
      * <h3>Domain Correctness</h3>
      * <ul>
      *   <li>Threshold: should be in [0.0, 1.0], values outside are clamped</li>
@@ -107,6 +114,17 @@ public final class LlmRelevancyScorer implements LlmScorer {
         // Extract candidate text from result payloads
         List<String> candidates = extractCandidates(results);
 
+        // Relevancy scoring compares the query against candidate TEXT. If no candidate
+        // carries any - which is the case whenever the pipeline has not attached payloads -
+        // the LLM would be asked to rank a list of empty strings, and the scores it
+        // returned would then re-rank and threshold-filter real results on the strength of
+        // nothing. Keep the vector ranking instead.
+        if (candidates.stream().allMatch(String::isBlank)) {
+            LOGGER.warn("Skipping LLM relevancy scoring: none of the {} candidates carry text. " +
+                "Returning the vector ranking unchanged.", results.size());
+            return List.copyOf(results);
+        }
+
         // Call LLM for relevancy scoring with circuit breaker protection
         // This ensures failures are tracked and the circuit opens after consecutive failures
         List<RelevancyScore> scores;
@@ -117,29 +135,45 @@ public final class LlmRelevancyScorer implements LlmScorer {
             throw e;
         }
 
-        // Validate response size matches input
-        if (scores.size() != results.size()) {
-            LOGGER.warn("LLM returned {} scores for {} candidates, using available scores",
-                scores.size(), results.size());
+        // Index the response so the walk below can go over the candidates rather than over the
+        // scores. A model that answers about fewer candidates than it was asked about is not
+        // unusual: the batching layer caps how many prompts one query may send, and the parser
+        // keeps only the score objects it recognised.
+        Map<Integer, RelevancyScore> scoreByIndex = new HashMap<>();
+        for (RelevancyScore rs : scores) {
+            if (rs.getIndex() < 0 || rs.getIndex() >= results.size()) {
+                LOGGER.warn("LLM returned invalid index {}, skipping", rs.getIndex());
+                continue;
+            }
+            scoreByIndex.put(rs.getIndex(), rs);
         }
 
-        // Map scores back to results and filter by threshold
-        List<QueryResultItem> scoredResults = new ArrayList<>();
-        for (RelevancyScore rs : scores) {
-            int index = rs.getIndex();
+        if (scoreByIndex.size() != results.size()) {
+            LOGGER.warn("LLM scored {} of {} candidates; the rest keep their vector ranking",
+                scoreByIndex.size(), results.size());
+        }
 
-            // Validate index is in bounds
-            if (index < 0 || index >= results.size()) {
-                LOGGER.warn("LLM returned invalid index {}, skipping", index);
+        // Every candidate, not every score. Iterating the scores dropped whatever the model did
+        // not mention - silently, and without any threshold decision having been made about it.
+        // A model that answered nothing at all emptied a result set that vector search had
+        // filled, and the query still reported itself complete.
+        List<QueryResultItem> scoredResults = new ArrayList<>();
+        for (int index = 0; index < results.size(); index++) {
+            QueryResultItem original = results.get(index);
+            RelevancyScore rs = scoreByIndex.get(index);
+
+            // A candidate with no text was never scored on its merits, and one the model did not
+            // answer about was not judged at all. Neither is evidence of irrelevance, so both
+            // keep the vector score that put them in the candidate set.
+            if (rs == null || candidates.get(index).isBlank()) {
+                scoredResults.add(original);
                 continue;
             }
 
             // Check if score meets threshold
             if (rs.getScore() >= clampedThreshold) {
-                QueryResultItem original = results.get(index);
                 // Create new result with LLM relevancy score
-                QueryResultItem scored = original.withScore((float) rs.getScore());
-                scoredResults.add(scored);
+                scoredResults.add(original.withScore((float) rs.getScore()));
             }
         }
 

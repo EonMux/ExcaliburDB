@@ -12,12 +12,30 @@ import java.util.Objects;
  * (closest first).</p>
  *
  * <h2>Distance Interpretation</h2>
- * <p>The distance value depends on the distance function used:</p>
+ * <p>Results produced by {@link HnswGraph} carry the value of
+ * {@link io.excalibur.vector.distance.DistanceFunction#distance(float[], float[])}:
+ * a monotone dissimilarity where <strong>smaller always means closer</strong>,
+ * whatever the underlying metric. For similarity metrics (cosine, inner product)
+ * this is the negated similarity, so the value stays inside the metric's documented
+ * range:</p>
  * <ul>
- *   <li><strong>Cosine similarity:</strong> Range [-1, 1], where 1 is most similar</li>
+ *   <li><strong>Cosine:</strong> Range [-1, 1], where -1 is most similar</li>
  *   <li><strong>L2 distance:</strong> Range [0, ∞), where 0 is most similar</li>
- *   <li><strong>Inner product:</strong> Range (-∞, ∞), higher is more similar</li>
+ *   <li><strong>Inner product:</strong> Range (-∞, ∞), where lower is more similar</li>
  * </ul>
+ *
+ * <p>To turn it back into a presentable score, use
+ * {@link io.excalibur.vector.distance.DistanceValidator#validateClampAndNormalizeOrderedDistance(float,
+ * io.excalibur.vector.distance.DistanceFunction)}. Passing it to the raw
+ * {@code validateClampAndNormalize} overload would invert the ranking for
+ * similarity metrics.</p>
+ *
+ * <h2>Generation</h2>
+ * <p>Node IDs are only meaningful within the graph generation that produced them:
+ * compaction renumbers them. {@link #generation()} records the
+ * {@link HnswGraph#generation()} the result was produced in, so a caller that
+ * re-reads the node later can pass it to {@link HnswGraph#readNode(long, long)}
+ * and have a stale ID rejected instead of silently resolving to another vector.</p>
  *
  * <h2>Domain Correctness</h2>
  * <p>Distance values are validated at construction time:</p>
@@ -35,34 +53,57 @@ import java.util.Objects;
  */
 public final class HnswSearchResult {
 
+    /**
+     * Generation value meaning "this result is not bound to a graph generation",
+     * used for results that did not come from an {@link HnswGraph} (for example
+     * write-log tail scans).
+     */
+    public static final long GENERATION_UNKNOWN = -1L;
+
     private final long nodeId;
     private final float distance;
     private final String documentId;
+    private final long generation;
 
     /**
-     * Creates a new search result.
+     * Creates a new search result that is not bound to a graph generation.
      *
      * @param nodeId The ID of the node found
-     * @param distance The distance/similarity to the query vector
+     * @param distance The dissimilarity to the query vector (smaller is closer)
      */
     public HnswSearchResult(long nodeId, float distance) {
         this(nodeId, distance, null);
     }
 
     /**
-     * Creates a new search result with document ID.
+     * Creates a new search result with document ID, not bound to a graph generation.
      *
      * @param nodeId The ID of the node found
-     * @param distance The distance/similarity to the query vector
+     * @param distance The dissimilarity to the query vector (smaller is closer)
      * @param documentId The document ID this node belongs to (may be null)
      */
     public HnswSearchResult(long nodeId, float distance, String documentId) {
+        this(nodeId, distance, documentId, GENERATION_UNKNOWN);
+    }
+
+    /**
+     * Creates a new search result bound to the graph generation that produced it.
+     *
+     * @param nodeId The ID of the node found
+     * @param distance The dissimilarity to the query vector (smaller is closer)
+     * @param documentId The document ID this node belongs to (may be null)
+     * @param generation The {@link HnswGraph#generation()} the node ID belongs to,
+     *                   or {@link #GENERATION_UNKNOWN}
+     * @since 1.3
+     */
+    public HnswSearchResult(long nodeId, float distance, String documentId, long generation) {
         this.nodeId = nodeId;
         // Store the distance as-is; validation/clamping is the responsibility
         // of the distance function implementations
         // NaN is valid (indicates invalid input), Infinity is valid (overflow)
         this.distance = distance;
         this.documentId = documentId;
+        this.generation = generation;
     }
 
     /**
@@ -127,19 +168,26 @@ public final class HnswSearchResult {
     }
 
     /**
-     * Returns the distance to the query vector.
+     * Returns the dissimilarity between this node and the query vector.
      *
-     * <p>The interpretation of this value depends on the distance function:</p>
-     * <ul>
-     *   <li>For L2 distance: smaller values are more similar</li>
-     *   <li>For cosine similarity: larger values (closer to 1) are more similar</li>
-     *   <li>For inner product: larger values are more similar</li>
-     * </ul>
+     * <p><strong>Smaller is always closer</strong>, for every distance function -
+     * see the class javadoc for how each metric maps onto this scale.</p>
      *
-     * @return The distance/similarity value
+     * @return The dissimilarity value (smaller is closer)
      */
     public float distance() {
         return distance;
+    }
+
+    /**
+     * Returns the graph generation this node ID belongs to.
+     *
+     * @return The generation, or {@link #GENERATION_UNKNOWN} if the result is not
+     *         bound to a graph generation
+     * @since 1.3
+     */
+    public long generation() {
+        return generation;
     }
 
     /**
@@ -151,7 +199,7 @@ public final class HnswSearchResult {
      * @return A new HnswSearchResult with the updated distance
      */
     public HnswSearchResult withDistance(float newDistance) {
-        return new HnswSearchResult(nodeId, newDistance, documentId);
+        return new HnswSearchResult(nodeId, newDistance, documentId, generation);
     }
 
     /**
@@ -161,7 +209,7 @@ public final class HnswSearchResult {
      * @return A new HnswSearchResult with the updated document ID
      */
     public HnswSearchResult withDocumentId(String newDocumentId) {
-        return new HnswSearchResult(nodeId, distance, newDocumentId);
+        return new HnswSearchResult(nodeId, distance, newDocumentId, generation);
     }
 
     @Override

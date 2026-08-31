@@ -14,6 +14,8 @@ import java.nio.file.Path;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
+import excalibur.bench.metric.ThroughputValidator;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -23,7 +25,14 @@ import static org.junit.jupiter.api.Assertions.*;
  * approximate throughput to verify the ≥1B lookups/sec target is achievable.</p>
  *
  * <h2>Target</h2>
- * <p>≥1,000,000,000 ops/sec (1 billion lookups per second)</p>
+ * <p>The PROJECT GOAL states 1,000,000,000 ops/sec. That figure is aspirational for
+ * single-threaded Java; the gate these tests enforce is
+ * {@link ThroughputValidator#TARGET_POINT_LOOKUP}, the realistic target the benchmark
+ * registry is written against. The measured throughput is printed against both so the
+ * distance from the aspiration stays visible.</p>
+ *
+ * <p>These tests are tagged {@code benchmark} and excluded from ordinary builds because
+ * they take tens of seconds. Run them with {@code ./gradlew :excalibur-bench:benchmarkTest}.</p>
  *
  * @author ExcaliburDB
  */
@@ -151,6 +160,7 @@ class PointLookupThroughputTest {
             }
 
             assertEquals(MEASUREMENT_ITERATIONS, found, "All lookups should succeed");
+            assertThroughputMeetsTarget(opsPerSec, "lock-free point lookup");
         } finally {
             segment.readLock().unlock();
         }
@@ -188,6 +198,7 @@ class PointLookupThroughputTest {
         System.out.println("  Latency: " + String.format("%.2f", latencyNs) + " ns/op");
 
         assertEquals(iterations, found, "All lookups should succeed");
+        assertThroughputMeetsTarget(opsPerSec, "point lookup with lock acquisition");
     }
 
     @Test
@@ -247,6 +258,7 @@ class PointLookupThroughputTest {
         }
 
         assertEquals(totalIterations, found, "All lookups should succeed");
+        assertThroughputMeetsTarget(opsPerSec, "batched point lookup");
     }
 
     @Test
@@ -297,6 +309,25 @@ class PointLookupThroughputTest {
         System.out.println("  Latency: " + String.format("%.2f", latencyNs) + " ns/op");
 
         assertEquals(totalIterations, found, "All lookups should succeed");
+        assertThroughputMeetsTarget(opsPerSec, "batch API point lookup");
+    }
+
+    /**
+     * Fails the test when measured throughput falls short of the registered target.
+     *
+     * <p>Without this the class measured a number, printed it, and asserted only that
+     * the lookups returned the right values - so a throughput collapse could not fail
+     * anything.</p>
+     *
+     * @param opsPerSec the measured throughput
+     * @param what a label for the measurement
+     */
+    private static void assertThroughputMeetsTarget(double opsPerSec, String what) {
+        assertTrue(opsPerSec >= ThroughputValidator.TARGET_POINT_LOOKUP,
+            String.format("%s throughput must be at least %s, got %s",
+                what,
+                formatOpsPerSec(ThroughputValidator.TARGET_POINT_LOOKUP),
+                formatOpsPerSec(opsPerSec)));
     }
 
     private static String formatOpsPerSec(double ops) {

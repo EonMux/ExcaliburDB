@@ -12,6 +12,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -70,8 +73,16 @@ public class MockLLMServer implements AutoCloseable {
     // Maximum delay allowed (30 seconds) - prevents tests from hanging indefinitely
     private static final long MAX_DELAY_MS = 30_000L;
 
+    // Longest a non-responding handler may hold its worker thread before releasing it.
+    // Bounded so the pool always drains; tests that exercise client-side timeouts use
+    // client timeouts far shorter than this.
+    private static final long TIMEOUT_HANDLER_PARK_MS = 10_000L;
+
+    private static final AtomicInteger THREAD_SEQ = new AtomicInteger();
+
     // Server instance
     private final HttpServer server;
+    private final ExecutorService executor;
     private final int port;
 
     // Request tracking (thread-safe)
@@ -100,7 +111,17 @@ public class MockLLMServer implements AutoCloseable {
 
     private MockLLMServer() throws IOException {
         this.server = HttpServer.create(new InetSocketAddress(0), 0);
-        this.server.setExecutor(null); // Use default executor
+        // A dedicated daemon-thread pool, never the default executor. The default runs handlers
+        // inline on the server's non-daemon dispatcher thread, so a handler that blocks (see
+        // timeoutHandler) parks that thread permanently, stop() cannot reclaim it, and the JVM
+        // never exits. Daemon threads also let concurrent requests overlap, which the default
+        // single-threaded dispatch cannot do.
+        this.executor = Executors.newCachedThreadPool(runnable -> {
+            Thread thread = new Thread(runnable, "mock-llm-server-" + THREAD_SEQ.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        });
+        this.server.setExecutor(executor);
         this.port = server.getAddress().getPort();
 
         // Set default handlers that return success
@@ -138,6 +159,15 @@ public class MockLLMServer implements AutoCloseable {
      */
     public void stop() {
         server.stop(1);
+        // The server does not own the executor it was given, so shut it down here. Handlers still
+        // parked (timeoutHandler) are interrupted rather than waited for; their threads are daemons
+        // and cannot keep the JVM alive either way.
+        executor.shutdownNow();
+        try {
+            executor.awaitTermination(2, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override
@@ -621,23 +651,24 @@ public class MockLLMServer implements AutoCloseable {
     /**
      * Creates a handler that never responds (for timeout testing).
      *
-     * <p>Uses Object.wait() to block indefinitely until interrupted, which
-     * happens when the client times out and closes the connection. This is
-     * faster than Thread.sleep() because it responds immediately to interruption.</p>
+     * <p>The handler parks its worker thread for a bounded interval and then returns without
+     * writing a response, so the client observes a read timeout. The park is bounded because
+     * nothing wakes this thread otherwise: closing the client socket does not interrupt a thread
+     * blocked in {@link Object#wait()}, and no other code notifies the exchange. An unbounded wait
+     * here leaks a server worker per test.</p>
      *
-     * @return HTTP handler that never sends a response
+     * @return HTTP handler that sends no response
      */
     public HttpHandler timeoutHandler() {
         return exchange -> {
-            // Use wait() on a lock object - blocks until interrupted when client closes connection
             synchronized (exchange) {
                 try {
-                    exchange.wait(); // Blocks until interrupted
+                    exchange.wait(TIMEOUT_HANDLER_PARK_MS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
             }
-            // Never respond - connection will be closed by client timeout
+            // Deliberately no response: the client is expected to time out first.
         };
     }
 

@@ -136,6 +136,44 @@ class FixedBucketHistogramTest {
     }
 
     @Test
+    @DisplayName("FP rate samples are stamped with the epoch they were taken in")
+    void testFpRateEpochStamping() {
+        histogram.setEpoch(11L);
+        histogram.recordFpRate(0.001);
+        assertEquals(11L, histogram.getFpRateEpoch(),
+            "a sample must carry the epoch the histogram was told about");
+
+        histogram.recordFpRate(0.002, 12L);
+        assertEquals(12L, histogram.getFpRateEpoch(), "an explicit epoch stamps the sample");
+        assertEquals(12L, histogram.getCurrentEpoch(),
+            "an explicit epoch also advances the histogram's own epoch");
+    }
+
+    @Test
+    @DisplayName("Recorded FP rates carry the visibility epoch, not zero")
+    void testCuckooFpRateCarriesVisibilityEpoch() {
+        long epoch = Metrics.getCurrentEpoch() + 500L;
+        Metrics.recordEpoch(epoch);
+        Metrics.recordCuckooFpRate(0.0005);
+
+        assertEquals(epoch, FixedBucketHistogram.getInstance().getFpRateEpoch(),
+            "the FP rate epoch must track the epoch the tick scheduler advances");
+    }
+
+    @Test
+    @DisplayName("reset() discards latencies and FP rate samples")
+    void testReset() {
+        histogram.record(25);
+        histogram.recordFpRate(0.01);
+
+        histogram.reset();
+
+        assertEquals(0, histogram.getTotalCount(), "latencies are discarded");
+        assertEquals(0, histogram.getFpRateCount(), "FP rate samples are discarded");
+        assertEquals(0.0, histogram.getAverageFpRate(), "average FP rate returns to zero");
+    }
+
+    @Test
     @DisplayName("Synchronized access is thread-safe")
     void testThreadSafety() throws InterruptedException {
         Thread[] threads = new Thread[10];

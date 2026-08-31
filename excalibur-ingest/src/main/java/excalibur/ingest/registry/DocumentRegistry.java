@@ -1,6 +1,8 @@
 package excalibur.ingest.registry;
 
 import io.excalibur.store.hash.XxHash64;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -8,8 +10,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -55,7 +59,20 @@ import java.util.stream.Collectors;
  */
 public final class DocumentRegistry {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(DocumentRegistry.class);
+
     private static final String KEY_SEPARATOR = ":";
+
+    /** Separates the fields of one persisted record. */
+    private static final char FIELD_SEPARATOR_CHAR = '|';
+    private static final String FIELD_SEPARATOR = String.valueOf(FIELD_SEPARATOR_CHAR);
+
+    /** Separates the chunk ids inside the last field of a record. */
+    private static final char CHUNK_SEPARATOR_CHAR = ',';
+    private static final String CHUNK_SEPARATOR = String.valueOf(CHUNK_SEPARATOR_CHAR);
+
+    /** Introduces an escape sequence in a persisted field. */
+    private static final char ESCAPE_CHAR = '\\';
 
     private final ConcurrentHashMap<String, DocumentMetadata> documents;
     private final Path persistencePath;
@@ -79,6 +96,19 @@ public final class DocumentRegistry {
         
         if (persistencePath != null && Files.exists(persistencePath)) {
             loadFromFile(persistencePath);
+        }
+    }
+
+    /**
+     * Thrown when a persisted registry exists but cannot be read.
+     *
+     * <p>An unreadable registry is not an empty registry: starting empty makes every previously
+     * indexed document look new, so a re-crawl duplicates the whole corpus and tombstones none of
+     * the old chunks. Failing here is the only way the caller can tell the two apart.</p>
+     */
+    public static final class RegistryLoadException extends RuntimeException {
+        RegistryLoadException(Path path, IOException cause) {
+            super("Failed to load document registry from " + path, cause);
         }
     }
 
@@ -303,74 +333,175 @@ public final class DocumentRegistry {
      * Loads the registry from a file.
      *
      * @param path The path to load from
-     * @throws NullPointerException if path is null
+     * @throws RegistryLoadException if the file exists but cannot be read
      */
     private void loadFromFile(Path path) {
+        int skipped = 0;
         try (BufferedReader reader = Files.newBufferedReader(path)) {
             String line;
             while ((line = reader.readLine()) != null) {
                 DocumentMetadata metadata = parseMetadata(line);
-                if (metadata != null) {
-                    documents.put(makeKey(metadata.getSourceId(), metadata.getDocumentId()), metadata);
+                if (metadata == null) {
+                    skipped++;
+                    continue;
                 }
+                documents.put(makeKey(metadata.getSourceId(), metadata.getDocumentId()), metadata);
             }
         } catch (IOException e) {
-            // If loading fails, start with empty registry
+            throw new RegistryLoadException(path, e);
+        }
+
+        if (skipped > 0) {
+            LOGGER.warn("Skipped {} unparseable record(s) while loading document registry from {}",
+                skipped, path);
         }
     }
 
     /**
      * Formats metadata for persistence.
      *
-     * <p>Format: sourceId|documentId|lastModifiedMillis|contentHash|contentLength|indexTimeMillis|chunkId1,chunkId2,...</p>
+     * <p>Format: {@code sourceId|documentId|lastModifiedMillis|contentHash|contentLength|indexTimeMillis|chunkId1,chunkId2,...}
+     * with every free-text field escaped.</p>
+     *
+     * <p>Escaping is not optional here: document ids are filesystem paths and absolute URLs, and
+     * chunk ids are built from them, so all three delimiters - {@code |}, {@code ,} and the
+     * record-terminating newline - occur naturally in them. Written raw, one such id shifts every
+     * later field of its record, and an embedded newline lets a document id forge a second record
+     * on reload.</p>
      */
     private String formatMetadata(DocumentMetadata metadata) {
-        String chunkIds = String.join(",", metadata.getChunkIds());
-        return String.format("%s|%s|%d|%d|%d|%d|%s",
-            metadata.getSourceId(),
-            metadata.getDocumentId(),
-            metadata.getLastModifiedMillis(),
-            metadata.getContentHash(),
-            metadata.getContentLength(),
-            metadata.getIndexTimeMillis(),
-            chunkIds
+        StringBuilder chunkIds = new StringBuilder();
+        for (String chunkId : metadata.getChunkIds()) {
+            if (chunkIds.length() > 0) {
+                chunkIds.append(CHUNK_SEPARATOR);
+            }
+            chunkIds.append(escape(chunkId));
+        }
+
+        return String.join(FIELD_SEPARATOR,
+            escape(metadata.getSourceId()),
+            escape(metadata.getDocumentId()),
+            Long.toString(metadata.getLastModifiedMillis()),
+            Long.toString(metadata.getContentHash()),
+            Long.toString(metadata.getContentLength()),
+            Long.toString(metadata.getIndexTimeMillis()),
+            chunkIds.toString()
         );
     }
 
     /**
      * Parses metadata from a persisted line.
+     *
+     * @return The metadata, or null if the line is malformed
      */
     private DocumentMetadata parseMetadata(String line) {
         if (line == null || line.isEmpty()) {
             return null;
         }
-        
-        String[] parts = line.split("\\|", 7);
-        if (parts.length < 6) {
+
+        List<String> parts = splitEscaped(line, FIELD_SEPARATOR_CHAR);
+        if (parts.size() < 6) {
             return null;
         }
-        
+
         try {
             DocumentMetadata.Builder builder = DocumentMetadata.builder()
-                .sourceId(parts[0])
-                .documentId(parts[1])
-                .lastModifiedMillis(Long.parseLong(parts[2]))
-                .contentHash(Long.parseLong(parts[3]))
-                .contentLength(Long.parseLong(parts[4]))
-                .indexTimeMillis(Long.parseLong(parts[5]));
-            
-            if (parts.length > 6 && !parts[6].isEmpty()) {
-                for (String chunkId : parts[6].split(",")) {
+                .sourceId(unescape(parts.get(0)))
+                .documentId(unescape(parts.get(1)))
+                .lastModifiedMillis(Long.parseLong(parts.get(2)))
+                .contentHash(Long.parseLong(parts.get(3)))
+                .contentLength(Long.parseLong(parts.get(4)))
+                .indexTimeMillis(Long.parseLong(parts.get(5)));
+
+            if (parts.size() > 6 && !parts.get(6).isEmpty()) {
+                for (String chunkId : splitEscaped(parts.get(6), CHUNK_SEPARATOR_CHAR)) {
                     if (!chunkId.isEmpty()) {
-                        builder.addChunkId(chunkId);
+                        builder.addChunkId(unescape(chunkId));
                     }
                 }
             }
-            
+
             return builder.build();
-        } catch (NumberFormatException e) {
+        } catch (IllegalArgumentException e) {
+            // NumberFormatException for a corrupt numeric field, or a builder rejection for a
+            // record whose identifiers did not survive the round trip.
             return null;
         }
+    }
+
+    /**
+     * Escapes the characters that carry structure in the persisted format.
+     *
+     * <p>{@code \\} first, so unescaping is unambiguous.</p>
+     */
+    private static String escape(String value) {
+        StringBuilder escaped = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case ESCAPE_CHAR -> escaped.append(ESCAPE_CHAR).append(ESCAPE_CHAR);
+                case FIELD_SEPARATOR_CHAR -> escaped.append(ESCAPE_CHAR).append('p');
+                case CHUNK_SEPARATOR_CHAR -> escaped.append(ESCAPE_CHAR).append('c');
+                case '\n' -> escaped.append(ESCAPE_CHAR).append('n');
+                case '\r' -> escaped.append(ESCAPE_CHAR).append('r');
+                default -> escaped.append(c);
+            }
+        }
+        return escaped.toString();
+    }
+
+    /**
+     * Reverses {@link #escape(String)}.
+     */
+    private static String unescape(String value) {
+        if (value.indexOf(ESCAPE_CHAR) < 0) {
+            return value;
+        }
+
+        StringBuilder plain = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != ESCAPE_CHAR || i + 1 >= value.length()) {
+                plain.append(c);
+                continue;
+            }
+            char next = value.charAt(++i);
+            switch (next) {
+                case ESCAPE_CHAR -> plain.append(ESCAPE_CHAR);
+                case 'p' -> plain.append(FIELD_SEPARATOR_CHAR);
+                case 'c' -> plain.append(CHUNK_SEPARATOR_CHAR);
+                case 'n' -> plain.append('\n');
+                case 'r' -> plain.append('\r');
+                default -> plain.append(ESCAPE_CHAR).append(next);
+            }
+        }
+        return plain.toString();
+    }
+
+    /**
+     * Splits on a delimiter, ignoring delimiters that were escaped.
+     *
+     * <p>A plain {@code String.split} would cut inside an escaped id and silently corrupt the
+     * record it belongs to.</p>
+     */
+    private static List<String> splitEscaped(String value, char delimiter) {
+        List<String> parts = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == ESCAPE_CHAR && i + 1 < value.length()) {
+                current.append(c).append(value.charAt(++i));
+            } else if (c == delimiter) {
+                parts.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        parts.add(current.toString());
+
+        return parts;
     }
 
     /**

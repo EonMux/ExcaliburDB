@@ -1,7 +1,7 @@
 package excalibur.ingest.buffer;
 
 import excalibur.ingest.processor.TextChunk;
-import io.excalibur.store.log.WriteLog;
+import io.excalibur.store.WriteLog;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -152,7 +152,7 @@ class DocumentChunkBufferTest {
         assertEquals(1, batch.getChunkCount());
         assertTrue(batch.getStartOffset() >= 0);
         assertTrue(batch.getEndOffset() > batch.getStartOffset());
-        assertEquals("doc1:0", batch.getFirstChunkId());
+        assertEquals("doc1:chunk:0", batch.getFirstChunkId());
         
         // Buffer should be cleared after commit
         assertEquals(0, buffer.getBufferedChunkCount("doc1"));
@@ -169,9 +169,9 @@ class DocumentChunkBufferTest {
         
         assertNotNull(batch);
         assertEquals(3, batch.getChunkCount());
-        assertEquals("doc1:0", batch.getChunkIdList().get(0));
-        assertEquals("doc1:1", batch.getChunkIdList().get(1));
-        assertEquals("doc1:2", batch.getChunkIdList().get(2));
+        assertEquals("doc1:chunk:0", batch.getChunkIdList().get(0));
+        assertEquals("doc1:chunk:1", batch.getChunkIdList().get(1));
+        assertEquals("doc1:chunk:2", batch.getChunkIdList().get(2));
         
         // Verify contiguous offsets
         assertTrue(batch.getEndOffset() > batch.getStartOffset());
@@ -183,7 +183,7 @@ class DocumentChunkBufferTest {
         buffer.bufferChunk(createChunk("doc1", 0, "content1"));
         buffer.bufferChunk(createChunk("doc2", 0, "content2"));
         
-        long initialHead = writeLog.writeHead();
+        long initialHead = writeLog.writeOffset();
         
         AtomicDocumentBatch batch1 = buffer.commitDocument("doc1");
         
@@ -572,16 +572,19 @@ class DocumentChunkBufferTest {
     }
 
     /**
-     * Test decodeText handles vector-only encoding (no text).
+     * Test decodeText reports the absence of text on a vector-only encoding.
+     *
+     * <p>Null, not the empty string. The two readers of this layout disagreed on it -- the
+     * query side already returned null and treated it as "nothing to score", while this one
+     * returned "" -- and a caller distinguishing them would have got a different answer
+     * depending on which decoder it happened to call.
      */
     @Test
     void testDecodeText_vectorOnly() {
         float[] vector = {1.0f, 2.0f};
         byte[] encoded = DocumentChunkBuffer.encodeVectorOnly(vector);
 
-        // Should return empty string when no text is present
-        String text = DocumentChunkBuffer.decodeText(encoded);
-        assertEquals("", text);
+        assertNull(DocumentChunkBuffer.decodeText(encoded));
     }
 
     /**

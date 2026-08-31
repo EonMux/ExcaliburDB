@@ -119,7 +119,13 @@ public final class FPRateValidator {
                 name, fpRate * 100));
         }
 
-        return new ValidationResult(true, errors.toString(), warnings.toString(), fpRate, true);
+        // The value is in range, so the result is valid; whether it meets the ≤0.1%
+        // specification is a separate question and must be answered honestly here.
+        // Reporting meetsTarget=true for any in-range value made a 90% FP rate look
+        // like a filter within spec.
+        boolean meetsSpec = fpRate <= MAX_FP_RATE + EPSILON;
+
+        return new ValidationResult(true, errors.toString(), warnings.toString(), fpRate, meetsSpec);
     }
 
     /**
@@ -321,7 +327,7 @@ public final class FPRateValidator {
      * @return a human-readable summary string
      */
     public static String formatSummary(double fpRate) {
-        ValidationResult validation = validate(fpRate);
+        ValidationResult validation = validateWithSpec(fpRate);
 
         StringBuilder sb = new StringBuilder();
         sb.append("FP Rate Validation:\n");
@@ -329,12 +335,16 @@ public final class FPRateValidator {
         sb.append(String.format("  spec target: %.4f%% (≤0.1%%)\n", MAX_FP_RATE * 100));
 
         if (validation.valid()) {
-            sb.append("  status: VALID");
+            sb.append("  status: VALID - meets spec");
             if (!validation.warnings().isEmpty()) {
                 sb.append(" (with warnings)");
             }
         } else {
-            sb.append("  status: INVALID");
+            sb.append("  status: INVALID - fails spec");
+        }
+
+        if (!validation.errors().isEmpty()) {
+            sb.append(String.format("\n  errors: %s", validation.errors().trim()));
         }
 
         if (!validation.warnings().isEmpty()) {

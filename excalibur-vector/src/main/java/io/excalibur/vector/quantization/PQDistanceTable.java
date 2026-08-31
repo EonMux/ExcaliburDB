@@ -1,5 +1,7 @@
 package io.excalibur.vector.quantization;
 
+import io.excalibur.vector.distance.DistanceFunction;
+
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -43,10 +45,16 @@ import java.util.Objects;
 public final class PQDistanceTable {
 
     /**
-     * Precomputed distances: distances[subspace][centroid] = squared distance
-     * from query sub-vector to centroid
+     * Precomputed per-subspace terms: {@code distances[subspace][centroid]}.
+     *
+     * <p>Always smaller-is-closer, whatever the metric. {@link AsymmetricDistance#buildTable}
+     * negates the larger-is-closer metrics so that a summed lookup is a dissimilarity on the
+     * same scale an exact distance would be on.</p>
      */
     private final float[][] distances;
+
+    /** The metric this table was built for. */
+    private final DistanceFunction distanceFunction;
 
     /**
      * Reference to the ProductQuantizer that created this table.
@@ -69,6 +77,23 @@ public final class PQDistanceTable {
      * @throws IllegalArgumentException if query dimension doesn't match
      */
     PQDistanceTable(float[] query, ProductQuantizer pq) {
+        this(query, pq, null);
+    }
+
+    /**
+     * Creates a table for a specific metric.
+     *
+     * <p>The metric is not optional in practice. A table built for squared L2 and consulted by
+     * a cosine graph ranks by a different geometry than the graph was built with and produces
+     * values on a range the caller's normalisation never sees - which is silent: the search
+     * returns results, just the wrong ones.
+     *
+     * @param query  The query vector
+     * @param pq     The product quantizer
+     * @param distFn The metric; null means squared L2
+     * @throws IllegalArgumentException if query dimension does not match
+     */
+    PQDistanceTable(float[] query, ProductQuantizer pq, DistanceFunction distFn) {
         Objects.requireNonNull(query, "Query cannot be null");
         Objects.requireNonNull(pq, "ProductQuantizer cannot be null");
 
@@ -82,34 +107,13 @@ public final class PQDistanceTable {
 
         this.pq = pq;
         this.query = query.clone(); // Defensive copy
-        this.distances = new float[pq.numSubspaces()][pq.numCentroids()];
-
-        // Precompute all distances
-        computeDistances();
+        this.distanceFunction = distFn;
+        this.distances = AsymmetricDistance.buildTable(this.query, pq.getCodebooks(), distFn);
     }
 
-    /**
-     * Precomputes distances from query sub-vectors to all centroids.
-     */
-    private void computeDistances() {
-        int numSubspaces = pq.numSubspaces();
-        int numCentroids = pq.numCentroids();
-        int subvectorDim = pq.subvectorDim();
-        float[][][] codebooks = pq.getCodebooks();
-
-        for (int s = 0; s < numSubspaces; s++) {
-            int startOffset = s * subvectorDim;
-
-            for (int c = 0; c < numCentroids; c++) {
-                // Compute squared L2 distance from query sub-vector to centroid
-                double dist = 0.0;
-                for (int d = 0; d < subvectorDim; d++) {
-                    double diff = (double) query[startOffset + d] - (double) codebooks[s][c][d];
-                    dist += diff * diff;
-                }
-                distances[s][c] = (float) dist;
-            }
-        }
+    /** The metric this table was built for, or null for squared L2. */
+    public DistanceFunction distanceFunction() {
+        return distanceFunction;
     }
 
     /**
@@ -120,12 +124,13 @@ public final class PQDistanceTable {
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>Result is always non-negative (sum of squared distances)</li>
-     *   <li>Result approximates the true L2 squared distance</li>
+     *   <li>Smaller is nearer, whatever the metric</li>
+     *   <li>Result approximates the true distance under {@link #distanceFunction()}; for a
+     *       larger-is-closer metric it is the negated similarity, which is negative</li>
      * </ul>
      *
      * @param codes PQ codes for the database vector (length must match numSubspaces)
-     * @return Approximate squared L2 distance
+     * @return Approximate dissimilarity, smaller being nearer
      * @throws IllegalArgumentException if codes are invalid
      */
     public float lookup(byte[] codes) {

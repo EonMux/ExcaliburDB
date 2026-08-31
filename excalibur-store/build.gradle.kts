@@ -3,14 +3,7 @@ plugins {
     `java-library`
 }
 
-group = "com.excaliburdb"
-version = "1.0.0-SNAPSHOT"
 
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
-    }
-}
 
 tasks.withType<JavaCompile> {
     options.compilerArgs.add("--enable-preview")

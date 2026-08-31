@@ -13,13 +13,17 @@
 
     Environment Variables:
     - EXCALIBUR_LOG_LEVEL: Root log level (default: INFO)
-    - EXCALIBUR_LOG_JSON: Set to "false" for human-readable output (default: true)
+
+    Output is JSON. A human-readable switch used to be documented here and wired to nothing:
+    logback selects an appender conditionally only with Janino, which this build does not carry,
+    so the variable was read into a property no logger referenced and the dev appenders were
+    constructed on every boot without ever writing a line. Pipe the JSON through a formatter for
+    local reading, or add the dependency and make the switch real.
 -->
 <configuration scan="true" scanPeriod="30 seconds">
 
     <!-- Read log level from environment variable, default to INFO -->
     <property name="LOG_LEVEL" value="${EXCALIBUR_LOG_LEVEL:-INFO}" />
-    <property name="LOG_JSON" value="${EXCALIBUR_LOG_JSON:-true}" />
 
     <!-- Console appender with JSON format for production -->
     <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
@@ -59,13 +63,6 @@
         </encoder>
     </appender>
 
-    <!-- Console appender with human-readable format for development -->
-    <appender name="DEV_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>%d{yyyy-MM-dd'T'HH:mm:ss.SSSZ} [%thread] %-5level %logger{36} [%X{correlationId}] - %msg%n</pattern>
-        </encoder>
-    </appender>
-
     <!-- Async appender wrapper for better performance -->
     <appender name="ASYNC_JSON" class="ch.qos.logback.classic.AsyncAppender">
         <queueSize>512</queueSize>
@@ -74,19 +71,11 @@
         <appender-ref ref="JSON_CONSOLE" />
     </appender>
 
-    <appender name="ASYNC_DEV" class="ch.qos.logback.classic.AsyncAppender">
-        <queueSize>512</queueSize>
-        <discardingThreshold>0</discardingThreshold>
-        <includeCallerData>false</includeCallerData>
-        <appender-ref ref="DEV_CONSOLE" />
-    </appender>
-
     <!-- Reduce noise from third-party libraries -->
     <logger name="org.slf4j" level="WARN" />
     <logger name="ch.qos.logback" level="WARN" />
 
-    <!-- Root logger configuration - uses JSON by default -->
-    <!-- To switch to dev mode, set environment variable: EXCALIBUR_LOG_JSON=false -->
+    <!-- Root logger configuration -->
     <root level="${LOG_LEVEL}">
         <appender-ref ref="ASYNC_JSON" />
     </root>

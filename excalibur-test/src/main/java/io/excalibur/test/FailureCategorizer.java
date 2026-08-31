@@ -14,6 +14,7 @@
 
 package io.excalibur.test;
 
+import java.util.Locale;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -345,7 +346,7 @@ public final class FailureCategorizer {
     // ==================== Category Determination ====================
 
     private static String determineCriticalCategory(String errorMessage) {
-        String lower = errorMessage.toLowerCase();
+        String lower = errorMessage.toLowerCase(Locale.ROOT);
 
         // Check most specific patterns first to avoid false matches
         if (lower.contains("duplicate")) {
@@ -382,36 +383,44 @@ public final class FailureCategorizer {
     }
 
     private static String determineMajorCategory(String errorMessage) {
-        if (errorMessage.contains("circuit") || errorMessage.contains("breaker")) {
+        // The MAJOR_PATTERNS that route here are all CASE_INSENSITIVE, so the keyword
+        // lookup must be too or a capitalized message falls through to the default.
+        String lower = errorMessage.toLowerCase(Locale.ROOT);
+
+        if (lower.contains("circuit") || lower.contains("breaker")) {
             return "Circuit Breaker";
         }
-        if (errorMessage.contains("timeout") || errorMessage.contains("latency") || errorMessage.contains("exceeded")) {
+        if (lower.contains("timeout") || lower.contains("latency") || lower.contains("exceeded")) {
             return "Timeout";
         }
-        if (errorMessage.contains("Concurrent") || errorMessage.contains("race") || errorMessage.contains("concurrent")) {
+        if (lower.contains("concurrent") || lower.contains("race")) {
             return "Concurrency";
         }
-        if (errorMessage.contains("Memory") || errorMessage.contains("leak") || errorMessage.contains("OutOfMemory")) {
+        if (lower.contains("memory") || lower.contains("leak")) {
             return "Resource Leak";
         }
-        if (errorMessage.contains("throughput") || errorMessage.contains("performance") || errorMessage.contains("below target")) {
+        if (lower.contains("throughput") || lower.contains("performance") || lower.contains("below target")) {
             return "Performance";
         }
         return "Reliability";
     }
 
     private static String determineMinorCategory(String errorMessage) {
-        if (errorMessage.contains("false positive") || errorMessage.contains("fp rate") || errorMessage.contains("slightly above")) {
+        // The MINOR_PATTERNS that route here are all CASE_INSENSITIVE, so the keyword
+        // lookup must be too or a capitalized message falls through to the default.
+        String lower = errorMessage.toLowerCase(Locale.ROOT);
+
+        if (lower.contains("false positive") || lower.contains("fp rate") || lower.contains("slightly above")) {
             return "False Positive Rate";
         }
-        if (errorMessage.contains("cleanup") || errorMessage.contains("temp") || errorMessage.contains("infrastructure")) {
+        if (lower.contains("cleanup") || lower.contains("temp") || lower.contains("infrastructure")) {
             return "Test Infrastructure";
         }
         return "Cleanup";
     }
 
     private static String determineDomainViolation(String errorMessage) {
-        String lower = errorMessage.toLowerCase();
+        String lower = errorMessage.toLowerCase(Locale.ROOT);
 
         // Coverage violations
         if (lower.contains("coverage") && (lower.contains("range") || lower.contains("0.0") || lower.contains("1.0"))) {

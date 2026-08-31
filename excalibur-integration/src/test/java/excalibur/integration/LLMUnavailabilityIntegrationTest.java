@@ -97,6 +97,27 @@ class LLMUnavailabilityIntegrationTest {
 
     // Circuit breaker configuration
     private static final int FAILURE_THRESHOLD = 3;
+
+    /**
+     * Number of queries the kill test issues, and how many of them the mock LLM answers
+     * before it starts returning 503. The remainder must be exactly enough consecutive
+     * failures to trip {@link #FAILURE_THRESHOLD}.
+     */
+    private static final int SUCCESSFUL_LLM_CALLS = 2;
+    private static final int QUERY_COUNT = SUCCESSFUL_LLM_CALLS + FAILURE_THRESHOLD;
+
+    /**
+     * Upper bound on the candidates Stage 5 can send: Stage 4 oversamples to twice topK.
+     * The mock scores every index up to this, so no candidate is dropped for want of a
+     * score.
+     */
+    private static final int MAX_LLM_CANDIDATES = 10;
+
+    /**
+     * The highest failure threshold {@code CircuitBreaker} accepts. Tests that want every
+     * query to genuinely attempt the LLM call use it so the circuit never trips first.
+     */
+    private static final int MAX_FAILURE_THRESHOLD = 100;
     private static final Duration COOLDOWN_PERIOD = Duration.ofMillis(500); // Short for testing
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
 
@@ -301,11 +322,8 @@ class LLMUnavailabilityIntegrationTest {
             Path graphPath = tempDir.resolve("test-no-llm.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Insert vectors
-            for (int i = 0; i < 100; i++) {
-                float[] vector = createRandomVector(dimension);
-                graph.insert(vector);
-            }
+            // Index documents whose stored value carries text, as ingestion does
+            indexDocumentsWithText(segment, graph, 100);
 
             // Register segment with visibility tracker
             TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
@@ -372,10 +390,7 @@ class LLMUnavailabilityIntegrationTest {
             Path graphPath = tempDir.resolve("test-timeout.graph");
             HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Insert vectors
-            for (int i = 0; i < 50; i++) {
-                graph.insert(createRandomVector(dimension));
-            }
+            indexDocumentsWithText(segment, graph, 50);
 
             // Create query pipeline
             QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
@@ -420,54 +435,68 @@ class LLMUnavailabilityIntegrationTest {
         /**
          * Test: System remains responsive under LLM failure conditions.
          *
-         * <p>Domain correctness: Even with LLM failures, the system must
-         * continue to accept and process queries with vector-only search.</p>
+         * <p>Domain correctness: with LLM scoring requested and the endpoint dead, every
+         * query must still complete, still return its vector ranking, and report
+         * {@code degraded=true} so the client knows the ranking is vector-only.</p>
+         *
+         * <p>The LLM must actually be reached for this to mean anything, so the fixture
+         * indexes documents whose stored value carries text and the test asserts the mock
+         * endpoint saw requests.</p>
          */
         @Test
         @DisplayName("system remains responsive with LLM failures")
         void systemRemainsResponsiveWithLlmFailures() throws IOException {
-            // Create storage engine with real segment
-            Path storageDir = tempDir.resolve("storage-responsive");
-            Files.createDirectories(storageDir);
-            TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
-            Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
+            AtomicInteger llmRequests = new AtomicInteger(0);
+            HttpServer mockServer = startFailingLlmServer(llmRequests);
 
-            // Create HNSW graph
-            HnswConfig config = HnswConfig.create(dimension);
-            Path graphPath = tempDir.resolve("test-responsive.graph");
-            HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
+            try {
+                // Create storage engine with real segment
+                Path storageDir = tempDir.resolve("storage-responsive");
+                Files.createDirectories(storageDir);
+                TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
+                Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
 
-            // Insert vectors
-            for (int i = 0; i < 100; i++) {
-                graph.insert(createRandomVector(dimension));
-            }
+                // Create HNSW graph
+                HnswConfig config = HnswConfig.create(dimension);
+                Path graphPath = tempDir.resolve("test-responsive.graph");
+                HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Register segment with visibility tracker
-            TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
-            visibilityTracker.addVisibleSegment(segment.segmentId());
+                indexDocumentsWithText(segment, graph, 100);
 
-            // Create query pipeline
-            QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
-            QueryPipeline pipeline = new QueryPipeline(
-                storageEngine,
-                visibilityTracker,
-                graphProvider,
-                distanceFunction
-            );
+                // Register segment with visibility tracker
+                TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
+                visibilityTracker.addVisibleSegment(segment.segmentId());
 
-            // Execute multiple queries
-            int successfulQueries = 0;
-            int totalQueries = 10;
+                // Create query pipeline with a scorer pointed at the dead endpoint. The
+                // breaker is given a high threshold so every query really attempts the call.
+                CircuitBreaker breaker = new CircuitBreaker(
+                    MAX_FAILURE_THRESHOLD, Duration.ofMillis(100), "responsive-test-llm");
+                LlmRelevancyScorer scorer = new LlmRelevancyScorer(llmClientFor(
+                    mockServer.getAddress().getPort(), breaker));
 
-            for (int q = 0; q < totalQueries; q++) {
-                try {
+                QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
+                QueryPipeline pipeline = new QueryPipeline(
+                    storageEngine,
+                    visibilityTracker,
+                    graphProvider,
+                    distanceFunction,
+                    scorer,
+                    0.5
+                );
+
+                // Execute multiple queries
+                int successfulQueries = 0;
+                int degradedQueries = 0;
+                int totalQueries = 10;
+
+                for (int q = 0; q < totalQueries; q++) {
                     QueryRequest request = QueryRequest.builder()
                         .queryText("query " + q)
                         .queryVector(createRandomVector(dimension))
                         .topK(5)
                         .timeoutMs(5000)
                         .includePartialSegments(true)
-                        .enableLlmScoring(false)
+                        .enableLlmScoring(true)
                         .correlationId(UUID.randomUUID().toString())
                         .build();
 
@@ -477,103 +506,139 @@ class LLMUnavailabilityIntegrationTest {
                     if (!response.isEmpty()) {
                         successfulQueries++;
                     }
-                } catch (Exception e) {
-                    // Query failed, but shouldn't throw
-                    System.out.println("Query " + q + " failed: " + e.getMessage());
+                    if (response.coverage().degraded()) {
+                        degradedQueries++;
+                    }
                 }
+
+                // Every query falls back to the vector ranking rather than failing
+                assertThat(successfulQueries)
+                    .as("Every query must still return its vector ranking when the LLM is dead")
+                    .isEqualTo(totalQueries);
+                assertThat(degradedQueries)
+                    .as("Every LLM fallback must be reported as degraded")
+                    .isEqualTo(totalQueries);
+                assertThat(llmRequests.get())
+                    .as("The LLM must actually be called - otherwise this test proves nothing")
+                    .isEqualTo(totalQueries);
+
+                graph.close();
+                storageEngine.close();
+
+                System.out.println("All " + totalQueries + " queries degraded gracefully over "
+                    + llmRequests.get() + " failed LLM calls");
+            } finally {
+                mockServer.stop(0);
             }
-
-            // All queries should succeed (vector-only)
-            assertThat(successfulQueries).isEqualTo(totalQueries);
-
-            graph.close();
-            storageEngine.close();
-
-            System.out.println("All " + totalQueries + " queries completed successfully");
         }
 
         /**
          * Test: Concurrent queries handle LLM unavailability gracefully.
+         *
+         * <p>Every concurrent query requests LLM scoring against a dead endpoint, so each
+         * one has to fall back to its vector ranking on its own thread without throwing and
+         * without returning an empty result set.</p>
          */
         @Test
         @DisplayName("concurrent queries handle LLM unavailability")
         void concurrentQueriesHandleLlmUnavailability() throws Exception {
-            // Create storage engine with real segment
-            Path storageDir = tempDir.resolve("storage-concurrent");
-            Files.createDirectories(storageDir);
-            TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
-            Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
+            AtomicInteger llmRequests = new AtomicInteger(0);
+            HttpServer mockServer = startFailingLlmServer(llmRequests);
 
-            // Create HNSW graph
-            HnswConfig config = HnswConfig.create(dimension);
-            Path graphPath = tempDir.resolve("test-concurrent.graph");
-            HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
+            try {
+                // Create storage engine with real segment
+                Path storageDir = tempDir.resolve("storage-concurrent");
+                Files.createDirectories(storageDir);
+                TestStorageEngine storageEngine = new TestStorageEngine(storageDir, arena);
+                Segment segment = storageEngine.createSegment(LifecycleState.ACTIVE);
 
-            // Insert vectors
-            for (int i = 0; i < 200; i++) {
-                graph.insert(createRandomVector(dimension));
-            }
+                // Create HNSW graph
+                HnswConfig config = HnswConfig.create(dimension);
+                Path graphPath = tempDir.resolve("test-concurrent.graph");
+                HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-            // Register segment with visibility tracker
-            TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
-            visibilityTracker.addVisibleSegment(segment.segmentId());
+                indexDocumentsWithText(segment, graph, 200);
 
-            // Create query pipeline
-            QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
-            QueryPipeline pipeline = new QueryPipeline(
-                storageEngine,
-                visibilityTracker,
-                graphProvider,
-                distanceFunction
-            );
+                // Register segment with visibility tracker
+                TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
+                visibilityTracker.addVisibleSegment(segment.segmentId());
 
-            // Execute concurrent queries
-            int numQueries = 20;
-            ExecutorService executor = Executors.newFixedThreadPool(4);
-            AtomicInteger successCount = new AtomicInteger(0);
-            AtomicInteger failureCount = new AtomicInteger(0);
+                // Create query pipeline with a scorer pointed at the dead endpoint
+                CircuitBreaker breaker = new CircuitBreaker(
+                    MAX_FAILURE_THRESHOLD, Duration.ofMillis(100), "concurrent-test-llm");
+                LlmRelevancyScorer scorer = new LlmRelevancyScorer(llmClientFor(
+                    mockServer.getAddress().getPort(), breaker));
 
-            List<java.util.concurrent.CompletableFuture<Void>> futures = new ArrayList<>();
-            for (int q = 0; q < numQueries; q++) {
-                final int queryNum = q;
-                futures.add(java.util.concurrent.CompletableFuture.runAsync(() -> {
-                    try {
-                        QueryRequest request = QueryRequest.builder()
-                            .queryText("concurrent query " + queryNum)
-                            .queryVector(createRandomVector(dimension))
-                            .topK(5)
-                            .timeoutMs(5000)
-                            .includePartialSegments(true)
-                            .enableLlmScoring(false)
-                            .correlationId(UUID.randomUUID().toString())
-                            .build();
+                QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
+                QueryPipeline pipeline = new QueryPipeline(
+                    storageEngine,
+                    visibilityTracker,
+                    graphProvider,
+                    distanceFunction,
+                    scorer,
+                    0.5
+                );
 
-                        CancellationToken token = new CancellationToken();
-                        QueryResponse response = pipeline.executeSync(request, token);
+                // Execute concurrent queries
+                int numQueries = 20;
+                ExecutorService executor = Executors.newFixedThreadPool(4);
+                AtomicInteger successCount = new AtomicInteger(0);
+                AtomicInteger failureCount = new AtomicInteger(0);
+                List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
 
-                        if (!response.isEmpty()) {
-                            successCount.incrementAndGet();
+                List<java.util.concurrent.CompletableFuture<Void>> futures = new ArrayList<>();
+                for (int q = 0; q < numQueries; q++) {
+                    final int queryNum = q;
+                    futures.add(java.util.concurrent.CompletableFuture.runAsync(() -> {
+                        try {
+                            QueryRequest request = QueryRequest.builder()
+                                .queryText("concurrent query " + queryNum)
+                                .queryVector(createRandomVector(dimension))
+                                .topK(5)
+                                .timeoutMs(5000)
+                                .includePartialSegments(true)
+                                .enableLlmScoring(true)
+                                .correlationId(UUID.randomUUID().toString())
+                                .build();
+
+                            CancellationToken token = new CancellationToken();
+                            QueryResponse response = pipeline.executeSync(request, token);
+
+                            if (!response.isEmpty()) {
+                                successCount.incrementAndGet();
+                            }
+                        } catch (Exception e) {
+                            failures.add(e);
+                            failureCount.incrementAndGet();
                         }
-                    } catch (Exception e) {
-                        failureCount.incrementAndGet();
-                    }
-                }, executor));
+                    }, executor));
+                }
+
+                // Wait for all queries
+                java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0]))
+                    .get(30, TimeUnit.SECONDS);
+
+                executor.shutdown();
+
+                // All queries should succeed
+                assertThat(failureCount.get())
+                    .as("No query may throw when the LLM is unavailable. Failures: " + failures)
+                    .isEqualTo(0);
+                assertThat(successCount.get())
+                    .as("Every query must still return its vector ranking")
+                    .isEqualTo(numQueries);
+                assertThat(llmRequests.get())
+                    .as("The LLM must actually be called - otherwise this test proves nothing")
+                    .isEqualTo(numQueries);
+
+                graph.close();
+                storageEngine.close();
+
+                System.out.println("All " + numQueries + " concurrent queries fell back over "
+                    + llmRequests.get() + " failed LLM calls");
+            } finally {
+                mockServer.stop(0);
             }
-
-            // Wait for all queries
-            java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0]))
-                .get(30, TimeUnit.SECONDS);
-
-            executor.shutdown();
-
-            // All queries should succeed
-            assertThat(successCount.get()).isEqualTo(numQueries);
-            assertThat(failureCount.get()).isEqualTo(0);
-
-            graph.close();
-            storageEngine.close();
-
-            System.out.println("All " + numQueries + " concurrent queries completed successfully");
         }
     }
 
@@ -617,8 +682,8 @@ class LLMUnavailabilityIntegrationTest {
             mockServer.createContext("/v1/chat/completions", exchange -> {
                 int count = requestCount.incrementAndGet();
 
-                if (shouldFail.get() || count > 2) {
-                    // After 2 successful requests, or when explicitly told to fail
+                if (shouldFail.get() || count > SUCCESSFUL_LLM_CALLS) {
+                    // After the first few successful requests, or when explicitly told to fail
                     shouldFail.set(true); // Lock in failure mode
                     String response = "{\"error\": \"Service unavailable - endpoint killed\"}";
                     exchange.getResponseHeaders().set("Content-Type", "application/json");
@@ -627,10 +692,8 @@ class LLMUnavailabilityIntegrationTest {
                         os.write(response.getBytes(StandardCharsets.UTF_8));
                     }
                 } else {
-                    // First few requests succeed
-                    String relevancyJson = "[{\"index\": 0, \"score\": 0.85}]";
-                    String response = "{\"choices\":[{\"message\":{\"content\":\"" +
-                        relevancyJson.replace("\"", "\\\"") + "\"}}]}";
+                    // First few requests succeed, scoring every candidate the pipeline sent
+                    String response = relevancyResponse(MAX_LLM_CANDIDATES);
                     exchange.getResponseHeaders().set("Content-Type", "application/json");
                     exchange.sendResponseHeaders(200, response.getBytes(StandardCharsets.UTF_8).length);
                     try (OutputStream os = exchange.getResponseBody()) {
@@ -653,25 +716,21 @@ class LLMUnavailabilityIntegrationTest {
                 Path graphPath = tempDir.resolve("test-kill.graph");
                 HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 10000);
 
-                // Insert vectors
-                for (int i = 0; i < 100; i++) {
-                    graph.insert(createRandomVector(dimension));
-                }
+                // Index documents whose stored value carries text. Without it every LLM
+                // candidate is blank, the scorer declines to call the endpoint at all, and
+                // nothing this test asserts can happen.
+                indexDocumentsWithText(segment, graph, 100);
 
                 // Register segment with visibility tracker
                 TestVisibilityTracker visibilityTracker = new TestVisibilityTracker();
                 visibilityTracker.addVisibleSegment(segment.segmentId());
 
-                // Create LLM client with circuit breaker (low threshold for testing)
-                CircuitBreaker breaker = new CircuitBreaker(3, Duration.ofMillis(100), "kill-test-llm");
-                LLMClientConfig llmConfig = LLMClientConfig.builder()
-                    .baseUrl("http://localhost:" + port)
-                    .apiKey("test-key")
-                    .timeout(Duration.ofSeconds(2))
-                    .maxRetries(0)
-                    .build();
-                LLMHttpClient llmClient = new LLMHttpClient(llmConfig, breaker);
-                LlmRelevancyScorer scorer = new LlmRelevancyScorer(llmClient);
+                // Create LLM client with circuit breaker (low threshold for testing).
+                // The cooldown is long enough that the circuit is still observably OPEN
+                // when the loop finishes.
+                CircuitBreaker breaker = new CircuitBreaker(
+                    FAILURE_THRESHOLD, Duration.ofSeconds(30), "kill-test-llm");
+                LlmRelevancyScorer scorer = new LlmRelevancyScorer(llmClientFor(port, breaker));
 
                 // Create query pipeline WITH LLM scorer
                 QueryPipeline.HnswGraphProvider graphProvider = segmentId -> graph;
@@ -684,7 +743,7 @@ class LLMUnavailabilityIntegrationTest {
 
                 // Execute multiple queries - first ones succeed, then server "dies"
                 List<QueryResponse> responses = new ArrayList<>();
-                for (int q = 0; q < 5; q++) {
+                for (int q = 0; q < QUERY_COUNT; q++) {
                     QueryRequest request = QueryRequest.builder()
                         .queryText("test query " + q)
                         .queryVector(createRandomVector(dimension))
@@ -706,23 +765,35 @@ class LLMUnavailabilityIntegrationTest {
 
                 // CRITICAL ASSERTIONS:
 
+                // 0. The LLM must genuinely have been called. Every other assertion here is
+                // vacuous if Stage 5 skipped scoring, which is exactly what happens when
+                // results reach it without any text attached.
+                assertThat(requestCount.get())
+                    .as("Stage 5 must reach the LLM endpoint for every query until the "
+                        + "circuit opens")
+                    .isEqualTo(SUCCESSFUL_LLM_CALLS + FAILURE_THRESHOLD);
+
                 // 1. All queries must complete without throwing (graceful degradation)
-                assertThat(responses).hasSize(5);
+                assertThat(responses).hasSize(QUERY_COUNT);
 
-                // 2. Circuit breaker should have opened due to consecutive failures
-                // After 3 failures (threshold=3), circuit should be OPEN
+                // 2. Circuit breaker must have opened after FAILURE_THRESHOLD failures
                 assertThat(breaker.getState())
-                    .as("Circuit breaker should be OPEN after %d consecutive failures", 3)
-                    .isIn(CircuitBreakerState.OPEN, CircuitBreakerState.HALF_OPEN);
+                    .as("Circuit breaker should be OPEN after %d consecutive failures",
+                        FAILURE_THRESHOLD)
+                    .isEqualTo(CircuitBreakerState.OPEN);
 
-                // 3. At least some responses should indicate degraded state
-                // (those that encountered LLM failure and fell back to vector-only)
+                // 3. Every query issued after the endpoint died must report degraded, and
+                // the ones the LLM actually scored must not.
+                for (int q = 0; q < QUERY_COUNT; q++) {
+                    boolean llmSucceeded = q < SUCCESSFUL_LLM_CALLS;
+                    assertThat(responses.get(q).coverage().degraded())
+                        .as("Query %d: degraded must mirror whether the LLM answered", q)
+                        .isEqualTo(!llmSucceeded);
+                }
+
                 long degradedCount = responses.stream()
                     .filter(r -> r.coverage().degraded())
                     .count();
-                assertThat(degradedCount)
-                    .as("At least some responses should be degraded due to LLM fallback")
-                    .isGreaterThan(0);
 
                 // 4. All responses should have results (vector-only fallback worked)
                 for (QueryResponse response : responses) {
@@ -858,6 +929,101 @@ class LLMUnavailabilityIntegrationTest {
     }
 
     // ==================== Helper Methods ====================
+
+    /**
+     * Encodes one ingested chunk the way the ingestion pipeline stores it:
+     * {@code [dimension:4][embedding:dim*4][text]}, little-endian.
+     *
+     * <p>The trailing text is the only thing relevancy scoring can score, so a fixture that
+     * writes vectors alone leaves every LLM candidate blank and the LLM is never called.</p>
+     */
+    private static byte[] encodeChunk(float[] vector, String text) {
+        byte[] textBytes = text.getBytes(StandardCharsets.UTF_8);
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer
+            .allocate(Integer.BYTES + vector.length * Float.BYTES + textBytes.length)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        buffer.putInt(vector.length);
+        for (float component : vector) {
+            buffer.putFloat(component);
+        }
+        buffer.put(textBytes);
+        return buffer.array();
+    }
+
+    /**
+     * Indexes {@code count} single-chunk documents into a segment and its graph.
+     *
+     * <p>The chunk is written to storage under the ingestion pipeline's key format
+     * ({@code sourceId:documentId:chunk:index}) and the graph node is registered under the
+     * owning document key, exactly as {@code HnswIntegrationWorker} does. That is what lets
+     * the query pipeline resolve a result back to its text before Stage 5.</p>
+     *
+     * @param segment The segment to write the chunks into
+     * @param graph   The graph to insert the embeddings into
+     * @param count   The number of documents to index
+     */
+    private void indexDocumentsWithText(Segment segment, HnswGraph graph, int count) {
+        for (int i = 0; i < count; i++) {
+            String documentKey = "source1:doc" + i;
+            float[] vector = createRandomVector(dimension);
+            String text = "Document " + i + " describes subject " + (i % 7)
+                + " and mentions test query terms.";
+
+            segment.put((documentKey + ":chunk:0").getBytes(StandardCharsets.UTF_8),
+                encodeChunk(vector, text));
+
+            long nodeId = graph.insert(vector);
+            graph.registerDocumentId(nodeId, documentKey);
+        }
+    }
+
+    /**
+     * Builds an LLM client pointed at a mock endpoint, with a circuit breaker.
+     */
+    private static LLMHttpClient llmClientFor(int port, CircuitBreaker breaker) {
+        LLMClientConfig llmConfig = LLMClientConfig.builder()
+            .baseUrl("http://localhost:" + port)
+            .apiKey("test-key")
+            .timeout(Duration.ofSeconds(2))
+            .maxRetries(0)
+            .build();
+        return new LLMHttpClient(llmConfig, breaker);
+    }
+
+    /**
+     * Starts a mock LLM endpoint that always answers 503.
+     */
+    private static HttpServer startFailingLlmServer(AtomicInteger requestCount) throws IOException {
+        HttpServer server = HttpServer.create(new InetSocketAddress(0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            requestCount.incrementAndGet();
+            byte[] body = "{\"error\": \"Service unavailable\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(503, body.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(body);
+            }
+        });
+        server.start();
+        return server;
+    }
+
+    /**
+     * Builds an OpenAI-shaped chat completion carrying a relevancy score for each of the
+     * first {@code candidateCount} candidate indexes.
+     */
+    private static String relevancyResponse(int candidateCount) {
+        StringBuilder scores = new StringBuilder("[");
+        for (int i = 0; i < candidateCount; i++) {
+            if (i > 0) {
+                scores.append(", ");
+            }
+            scores.append("{\"index\": ").append(i).append(", \"score\": 0.85}");
+        }
+        scores.append("]");
+        return "{\"choices\":[{\"message\":{\"content\":\""
+            + scores.toString().replace("\"", "\\\"") + "\"}}]}";
+    }
 
     private float[] createRandomVector(int dimension) {
         float[] vector = new float[dimension];

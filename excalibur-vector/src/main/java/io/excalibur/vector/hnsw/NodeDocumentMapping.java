@@ -95,6 +95,22 @@ public class NodeDocumentMapping {
     private static final int HEADER_SIZE = 24;
 
     /**
+     * Byte offset of the entry-count field within the header.
+     */
+    private static final int OFFSET_ENTRY_COUNT = 16;
+
+    /**
+     * Size of the fixed part of an entry: nodeId(8) + docIdLen(4).
+     */
+    private static final int ENTRY_HEADER_SIZE = 12;
+
+    /**
+     * Upper bound on a document ID's UTF-8 length. A truncated or corrupt file can
+     * otherwise present an arbitrary length and drive an unbounded allocation.
+     */
+    private static final int MAX_DOCUMENT_ID_BYTES = 64 * 1024;
+
+    /**
      * The path to the mapping file (may be null for in-memory only).
      */
     private final Path mappingPath;
@@ -246,6 +262,15 @@ public class NodeDocumentMapping {
      *
      * @return Mapping count
      */
+    /**
+     * Whether this mapping is backed by a file.
+     *
+     * @return true when {@link #persist()} and {@link #load()} are available
+     */
+    public boolean isPersistent() {
+        return persistent;
+    }
+
     public int size() {
         return nodeToDocument.size();
     }
@@ -370,8 +395,13 @@ public class NodeDocumentMapping {
             nodeToDocument.clear();
 
             try (FileChannel channel = FileChannel.open(mappingPath, StandardOpenOption.READ)) {
+                long fileSize = channel.size();
+                if (fileSize < HEADER_SIZE) {
+                    throw new IOException("Truncated mapping file (no header): " + mappingPath);
+                }
+
                 ByteBuffer headerBuffer = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
-                channel.read(headerBuffer);
+                readFully(channel, headerBuffer, "mapping header");
                 headerBuffer.flip();
 
                 long magic = headerBuffer.getLong();
@@ -387,17 +417,34 @@ public class NodeDocumentMapping {
                 headerBuffer.getInt(); // Skip reserved
                 long entryCount = headerBuffer.getLong();
 
+                // An entry is at least ENTRY_HEADER_SIZE bytes, so a count larger
+                // than the file can hold means the header is corrupt. Reject it
+                // before allocating anything sized from the file's own claims.
+                long maxPossibleEntries = (fileSize - HEADER_SIZE) / ENTRY_HEADER_SIZE;
+                if (entryCount < 0 || entryCount > maxPossibleEntries) {
+                    throw new IOException("Corrupt mapping file " + mappingPath + ": entryCount=" +
+                        entryCount + " exceeds the " + maxPossibleEntries + " entries the file can hold");
+                }
+
                 // Read entries
                 for (long i = 0; i < entryCount; i++) {
-                    ByteBuffer entryHeader = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-                    channel.read(entryHeader);
+                    ByteBuffer entryHeader = ByteBuffer.allocate(ENTRY_HEADER_SIZE)
+                        .order(ByteOrder.LITTLE_ENDIAN);
+                    readFully(channel, entryHeader, "mapping entry " + i);
                     entryHeader.flip();
 
                     long nodeId = entryHeader.getLong();
                     int docIdLen = entryHeader.getInt();
 
+                    long remaining = fileSize - channel.position();
+                    if (docIdLen < 0 || docIdLen > MAX_DOCUMENT_ID_BYTES || docIdLen > remaining) {
+                        throw new IOException("Corrupt mapping file " + mappingPath + ": entry " + i +
+                            " declares a document ID of " + docIdLen + " bytes (" + remaining +
+                            " bytes left, maximum " + MAX_DOCUMENT_ID_BYTES + ")");
+                    }
+
                     ByteBuffer docIdBuffer = ByteBuffer.allocate(docIdLen);
-                    channel.read(docIdBuffer);
+                    readFully(channel, docIdBuffer, "document ID of entry " + i);
                     String documentId = new String(docIdBuffer.array(), StandardCharsets.UTF_8);
 
                     nodeToDocument.put(nodeId, documentId);
@@ -428,28 +475,114 @@ public class NodeDocumentMapping {
             return; // Silently ignore for in-memory mode
         }
 
-        persistenceLock.readLock().lock();
+        java.util.Objects.requireNonNull(documentId, "documentId cannot be null");
+
+        // The write lock is required: the append also rewrites the header's entry
+        // count, which load() uses to decide how many entries to read.
+        persistenceLock.writeLock().lock();
         try {
             try (FileChannel channel = FileChannel.open(mappingPath,
                     StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE,
-                    StandardOpenOption.APPEND)) {
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE)) {
 
-                ByteBuffer buffer = ByteBuffer.allocate(8 + 4 + documentId.getBytes(StandardCharsets.UTF_8).length)
-                    .order(ByteOrder.LITTLE_ENDIAN);
+                long entryCount = readOrInitializeHeader(channel);
 
-                buffer.putLong(nodeId);
                 byte[] docIdBytes = documentId.getBytes(StandardCharsets.UTF_8);
+                if (docIdBytes.length > MAX_DOCUMENT_ID_BYTES) {
+                    throw new IOException("Document ID exceeds " + MAX_DOCUMENT_ID_BYTES +
+                        " bytes: " + docIdBytes.length);
+                }
+
+                ByteBuffer buffer = ByteBuffer.allocate(ENTRY_HEADER_SIZE + docIdBytes.length)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+                buffer.putLong(nodeId);
                 buffer.putInt(docIdBytes.length);
                 buffer.put(docIdBytes);
                 buffer.flip();
+                writeFully(channel, buffer, channel.size());
 
-                channel.write(buffer);
+                // Publish the new entry by bumping the count last: an interrupted
+                // append then leaves trailing bytes that load() simply ignores.
+                ByteBuffer countBuffer = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+                countBuffer.putLong(entryCount + 1);
+                countBuffer.flip();
+                writeFully(channel, countBuffer, OFFSET_ENTRY_COUNT);
 
                 LOGGER.trace("Appended mapping: nodeId={} -> documentId={}", nodeId, documentId);
             }
         } finally {
-            persistenceLock.readLock().unlock();
+            persistenceLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Reads the mapping file header, writing a fresh one if the file is new.
+     *
+     * @param channel The open mapping file channel
+     * @return The entry count currently recorded in the header
+     * @throws IOException if the existing header is not a valid mapping header
+     */
+    private static long readOrInitializeHeader(FileChannel channel) throws IOException {
+        if (channel.size() < HEADER_SIZE) {
+            ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+            header.putLong(MAGIC);
+            header.putInt(VERSION);
+            header.putInt(0); // Reserved
+            header.putLong(0L); // Entry count
+            header.flip();
+            writeFully(channel, header, 0);
+            return 0L;
+        }
+
+        ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+        readFully(channel, header, 0, "mapping header");
+        header.flip();
+        if (header.getLong() != MAGIC) {
+            throw new IOException("Invalid mapping file: bad magic number");
+        }
+        int version = header.getInt();
+        if (version != VERSION) {
+            throw new IOException("Unsupported mapping file version: " + version);
+        }
+        header.getInt(); // Reserved
+        return header.getLong();
+    }
+
+    /**
+     * Reads exactly {@code buffer.remaining()} bytes from the channel's current
+     * position, failing on a short read instead of silently decoding zeros.
+     */
+    private static void readFully(FileChannel channel, ByteBuffer buffer, String what) throws IOException {
+        while (buffer.hasRemaining()) {
+            if (channel.read(buffer) < 0) {
+                throw new IOException("Truncated mapping file while reading " + what);
+            }
+        }
+    }
+
+    /**
+     * Reads exactly {@code buffer.remaining()} bytes from an absolute position.
+     */
+    private static void readFully(FileChannel channel, ByteBuffer buffer, long position, String what)
+            throws IOException {
+        long at = position;
+        while (buffer.hasRemaining()) {
+            int read = channel.read(buffer, at);
+            if (read < 0) {
+                throw new IOException("Truncated mapping file while reading " + what);
+            }
+            at += read;
+        }
+    }
+
+    /**
+     * Writes the whole buffer at an absolute position.
+     */
+    private static void writeFully(FileChannel channel, ByteBuffer buffer, long position) throws IOException {
+        long at = position;
+        while (buffer.hasRemaining()) {
+            at += channel.write(buffer, at);
         }
     }
 
