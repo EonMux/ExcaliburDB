@@ -12,7 +12,6 @@ import excalibur.ingest.source.FetchedDocument;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
 import excalibur.ingest.source.DocumentNotFoundException;
-import excalibur.ingest.lsh.LshIngestionService;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.llm.embedding.EmbeddingClient;
 import excalibur.shard.IndexOrchestrator;
@@ -90,6 +89,15 @@ public class IngestionOrchestrator {
     private static final Logger LOGGER = LoggerFactory.getLogger(IngestionOrchestrator.class);
 
     /**
+     * Chunks sent to the embedding endpoint in one request.
+     *
+     * <p>Sixteen 512-token chunks is roughly 8k tokens, which sits inside a typical server's
+     * physical batch, keeps a failed request cheap to retry, and keeps the request body small
+     * enough to be unremarkable.</p>
+     */
+    static final int EMBED_BATCH_SIZE = 16;
+
+    /**
      * Interface for status registry callbacks.
      * Decouples the orchestrator from the API layer's status registry.
      */
@@ -131,7 +139,6 @@ public class IngestionOrchestrator {
     private final StorageEngine storageEngine;
     private final IndexOrchestrator indexOrchestrator;
     private final StatusRegistry statusRegistry;
-    private final LshIngestionService lshIngestionService; // optional, nullable
     private final DocumentChunkBuffer documentChunkBuffer; // optional, nullable - WAL offset mirror
     private final DocumentVisibilityTracker visibilityTracker; // optional, nullable - visibility epoch
 
@@ -163,6 +170,14 @@ public class IngestionOrchestrator {
      * extracting facts never sets one.</p>
      */
     private volatile excalibur.ingest.graph.GraphIngestSink graphSink;
+
+    /**
+     * BM25 index over the chunks this orchestrator writes, or null when the node keeps none.
+     *
+     * <p>Written inside the same try that writes the chunks, so a document that fails and rolls
+     * back does not leave its text searchable under a key nothing resolves.</p>
+     */
+    private volatile excalibur.ingest.lexical.ChunkIndex lexicalIndex;
 
     private final Set<String> activeIngestions;
     private final Map<String, Thread> ingestionThreads;
@@ -213,33 +228,8 @@ public class IngestionOrchestrator {
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry) {
-        this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry, null, null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
-    }
-
-
-    /**
-     * Creates a new IngestionOrchestrator with LSH ingestion support.
-     *
-     * <p>This constructor enables LSH index population during ingestion. When provided,
-     * vectors are inserted into their segment's LSH index for efficient
-     * approximate nearest neighbor pre-filtering during queries.</p>
-     *
-     * @param textChunker Text chunker for splitting documents
-     * @param embeddingClient Embedding client for generating embeddings
-     * @param storageEngine Storage engine for persisting entries
-     * @param indexOrchestrator Index orchestrator for coordinating indexing
-     * @param statusRegistry Status registry for tracking progress
-     * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
-     * @throws NullPointerException if required parameters are null
-     */
-    public IngestionOrchestrator(TextChunker textChunker,
-                                  EmbeddingClient embeddingClient,
-                                  StorageEngine storageEngine,
-                                  IndexOrchestrator indexOrchestrator,
-                                  StatusRegistry statusRegistry,
-                                  LshIngestionService lshIngestionService) {
         this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
-             lshIngestionService, null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+             null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
     /**
@@ -256,14 +246,13 @@ public class IngestionOrchestrator {
      *
      * <p><strong>Important:</strong> the documentChunkBuffer must own the write log it appends
      * to, so that one document's chunks land at contiguous offsets. The storageEngine remains
-     * the source of truth and is still used for LSH index population.</p>
+     * the source of truth.</p>
      *
      * @param textChunker Text chunker for splitting documents
      * @param embeddingClient Embedding client for generating embeddings
      * @param storageEngine Storage engine for persisting entries
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
-     * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
      * @param documentChunkBuffer Buffer mirroring documents into a write log (may be null)
      * @param visibilityTracker Tracker for document visibility epochs (may be null)
      * @throws NullPointerException if required parameters are null
@@ -273,11 +262,10 @@ public class IngestionOrchestrator {
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry,
-                                  LshIngestionService lshIngestionService,
                                   DocumentChunkBuffer documentChunkBuffer,
                                   DocumentVisibilityTracker visibilityTracker) {
         this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
-             lshIngestionService, documentChunkBuffer, visibilityTracker, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+             documentChunkBuffer, visibilityTracker, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
     /**
@@ -290,7 +278,6 @@ public class IngestionOrchestrator {
      * @param storageEngine Storage engine for persisting entries
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
-     * @param lshIngestionService LSH ingestion service (may be null for no LSH integration)
      * @param documentChunkBuffer Buffer mirroring documents into a write log (may be null)
      * @param visibilityTracker Tracker for document visibility epochs (may be null)
      * @param termFrequencyTracker Tracker for term frequencies in segment sketches (may be null to disable selectivity estimation)
@@ -302,17 +289,19 @@ public class IngestionOrchestrator {
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry,
-                                  LshIngestionService lshIngestionService,
                                   DocumentChunkBuffer documentChunkBuffer,
                                   DocumentVisibilityTracker visibilityTracker,
                                   TermFrequencyTracker termFrequencyTracker,
                                   int documentTimeoutMs) {
         this.textChunker = Objects.requireNonNull(textChunker, "TextChunker cannot be null");
-        this.embeddingClient = Objects.requireNonNull(embeddingClient, "EmbeddingClient cannot be null");
+        // Nullable, deliberately. A null client is lexical-only ingestion: chunks are written,
+        // term-indexed and published with no vector, which is what lets Lucene and the graph
+        // serve retrieval without a corpus-wide embedding pass first. Vector search is then
+        // simply a signal this deployment does not have.
+        this.embeddingClient = embeddingClient;
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.indexOrchestrator = Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
         this.statusRegistry = Objects.requireNonNull(statusRegistry, "StatusRegistry cannot be null");
-        this.lshIngestionService = lshIngestionService; // may be null
         this.documentChunkBuffer = documentChunkBuffer; // may be null
         this.visibilityTracker = visibilityTracker; // may be null
         this.documentRegistry = visibilityTracker != null ? visibilityTracker.getRegistry() : null;
@@ -322,8 +311,7 @@ public class IngestionOrchestrator {
         this.ingestionThreads = new ConcurrentHashMap<>();
         this.shutdown = new AtomicBoolean(false);
 
-        LOGGER.info("IngestionOrchestrator initialized with LSH={}, visibilityPublishing={}, walMirror={}, termFrequencyTracking={}, documentTimeoutMs={}",
-            (lshIngestionService != null ? "enabled" : "disabled"),
+        LOGGER.info("IngestionOrchestrator initialized with visibilityPublishing={}, walMirror={}, termFrequencyTracking={}, documentTimeoutMs={}",
             (visibilityTracker != null ? "enabled" : "disabled"),
             (documentChunkBuffer != null ? "enabled" : "disabled"),
             (termFrequencyTracker != null ? "enabled" : "disabled"),
@@ -339,6 +327,17 @@ public class IngestionOrchestrator {
      *
      * @param graphSink The sink, or null for none
      */
+    /**
+     * Points ingestion at a lexical index, so stored chunks are also BM25-searchable.
+     *
+     * @param lexicalIndex The index, or null to keep none
+     */
+    public void setLexicalIndex(excalibur.ingest.lexical.ChunkIndex lexicalIndex) {
+        this.lexicalIndex = lexicalIndex;
+        LOGGER.info("Lexical index {}", lexicalIndex == null
+            ? "disabled" : "enabled (" + lexicalIndex.engine() + " engine)");
+    }
+
     public void setGraphSink(excalibur.ingest.graph.GraphIngestSink graphSink) {
         this.graphSink = graphSink;
         LOGGER.info("Graph ingest sink {}", graphSink == null ? "disabled" : "enabled");
@@ -472,12 +471,15 @@ public class IngestionOrchestrator {
 
         long totalIngested = 0;
         int processedDocs = 0;
-        Set<Segment> touchedSegments = new LinkedHashSet<>();
 
         for (String documentId : documentIds) {
             if (shutdown.get() || Thread.currentThread().isInterrupted()) {
-                LOGGER.info("Ingestion interrupted by shutdown");
-                status.setError("Ingestion interrupted");
+                // Either the node is stopping or this source alone was stopped. Checked per
+                // document rather than per chunk: a document is written whole or not at all, and
+                // abandoning one halfway is the state the rollback exists to avoid.
+                LOGGER.info("Ingestion of {} stopped after {} of {} documents",
+                    sourceId, processedDocs, totalPending);
+                status.setError("Ingestion stopped");
                 return;
             }
 
@@ -485,7 +487,7 @@ public class IngestionOrchestrator {
 
             try {
                 StructuredLoggingHelper.setDocumentId(documentId);
-                totalIngested += ingestDocument(source, sourceId, documentId, touchedSegments);
+                totalIngested += ingestDocument(source, sourceId, documentId);
             } catch (DocumentNotFoundException e) {
                 LOGGER.warn("Document not found: {}", documentId);
             } catch (SourceException e) {
@@ -501,13 +503,18 @@ public class IngestionOrchestrator {
                 totalIngested, totalPending - processedDocs);
         }
 
-        flushLshIndexes(touchedSegments);
-
         StructuredLoggingHelper.setStage("indexing");
         status.update("indexing", 0.9, totalIngested, 0);
         awaitBackpressureRelease();
 
         StructuredLoggingHelper.setStage("idle");
+        // Lucene writes are invisible to search until a reader is reopened. Doing it once per
+        // run rather than per document keeps the cost off the write path, at the price of a
+        // source's chunks becoming searchable together at the end of its run.
+        refreshLexicalIndex();
+        compactLexicalIndex();
+        persistRegistry();
+
         status.update("idle", 1.0, totalIngested, 0);
         LOGGER.info("Ingestion complete: {} chunks from {} documents", totalIngested, processedDocs);
     }
@@ -521,8 +528,8 @@ public class IngestionOrchestrator {
      *
      * @return The number of chunks published (0 if the document was skipped)
      */
-    private int ingestDocument(Source source, String sourceId, String documentId,
-                               Set<Segment> touchedSegments) throws SourceException {
+    private int ingestDocument(Source source, String sourceId, String documentId)
+            throws SourceException {
         FetchedDocument doc = source.fetch(documentId);
 
         if (doc.getContentLength() > MAX_DOCUMENT_CONTENT_BYTES) {
@@ -547,9 +554,14 @@ public class IngestionOrchestrator {
             return 0;
         }
 
-        Map<Integer, float[]> embeddings = embedAll(chunks, documentId);
-        if (embeddings == null) {
-            return 0;
+        // Null means this node embeds nothing at all; a null return from embedAll means this
+        // document could not be embedded and must not be published in part.
+        Map<Integer, float[]> embeddings = null;
+        if (embeddingClient != null) {
+            embeddings = embedAll(chunks, documentId);
+            if (embeddings == null) {
+                return 0;
+            }
         }
 
         List<String> writtenKeys = new ArrayList<>(chunks.size());
@@ -568,25 +580,54 @@ public class IngestionOrchestrator {
             return 0;
         }
 
-        indexVectors(documentKey, chunks, embeddings, touchedSegments);
         trackTermFrequencies(documentKey, chunks);
         reportToGraph(documentKey, doc);
         return chunks.size();
     }
 
     /**
-     * Generates embeddings for every chunk.
+     * Generates embeddings for every chunk, a batch of {@link #EMBED_BATCH_SIZE} at a time.
+     *
+     * <p>One request per chunk was one HTTP round trip, one queue wait and one scheduler pass
+     * per 512 tokens of work. Measured against a local GPU server, request overhead rather than
+     * the model was the ceiling: three different sub-1B models landed within 6% of each other,
+     * which is the signature of a bottleneck outside the weights. Batching amortises that
+     * overhead over a whole document, and it is also what makes a document's chunks visible to
+     * the embedding endpoint as a unit, which is the precondition for any context-aware
+     * embedding model to be able to see across chunk boundaries at all.</p>
+     *
+     * <p>Bounded rather than one request per document: a document may hold up to
+     * {@code MAX_CHUNKS_PER_DOCUMENT} chunks, and a single request carrying all of them would be
+     * a multi-megabyte body whose failure costs the whole document.</p>
      *
      * @return The embeddings keyed by chunk index, or null if any chunk failed
      */
     private Map<Integer, float[]> embedAll(List<TextChunk> chunks, String documentId) {
         Map<Integer, float[]> embeddings = new HashMap<>(chunks.size());
-        for (TextChunk chunk : chunks) {
+        for (int start = 0; start < chunks.size(); start += EMBED_BATCH_SIZE) {
+            List<TextChunk> batch =
+                chunks.subList(start, Math.min(start + EMBED_BATCH_SIZE, chunks.size()));
+            List<String> texts = new ArrayList<>(batch.size());
+            for (TextChunk chunk : batch) {
+                texts.add(chunk.getText());
+            }
             try {
-                embeddings.put(chunk.getChunkIndex(), embeddingClient.embed(chunk.getText()));
+                List<float[]> vectors = embeddingClient.embedBatch(texts);
+                if (vectors.size() != batch.size()) {
+                    // The client already checks this, so reaching here means the contract moved.
+                    // Pairing vectors with the wrong chunks is undetectable downstream, so the
+                    // document is abandoned rather than written from a guess.
+                    LOGGER.warn("Skipping document {}: embedding endpoint returned {} vectors "
+                        + "for {} chunks", documentId, vectors.size(), batch.size());
+                    return null;
+                }
+                for (int i = 0; i < batch.size(); i++) {
+                    embeddings.put(batch.get(i).getChunkIndex(), vectors.get(i));
+                }
             } catch (LLMException e) {
-                LOGGER.warn("Skipping document {}: failed to embed chunk {}: {}",
-                    documentId, chunk.getChunkIndex(), e.getMessage());
+                LOGGER.warn("Skipping document {}: failed to embed chunks {}-{}: {}",
+                    documentId, batch.get(0).getChunkIndex(),
+                    batch.get(batch.size() - 1).getChunkIndex(), e.getMessage());
                 return null;
             }
         }
@@ -618,9 +659,12 @@ public class IngestionOrchestrator {
                              Map<Integer, float[]> embeddings, List<String> writtenKeys) {
         for (TextChunk chunk : chunks) {
             String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
-            byte[] value = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(
-                chunk.getText(), embeddings.get(chunk.getChunkIndex()));
+            float[] vector = embeddings == null ? null : embeddings.get(chunk.getChunkIndex());
+            byte[] value = vector == null
+                ? io.excalibur.core.codec.ChunkPayloadCodec.encodeTextOnly(chunk.getText())
+                : DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(chunk.getText(), vector);
             storageEngine.put(chunkId.getBytes(StandardCharsets.UTF_8), value);
+            indexLexically(chunkId, chunk.getText());
             writtenKeys.add(chunkId);
         }
     }
@@ -713,36 +757,60 @@ public class IngestionOrchestrator {
                 LOGGER.warn("Failed to roll back chunk {}: {}", chunkId, e.getMessage());
             }
         }
+        unindexLexically(writtenKeys);
     }
 
     /**
-     * Inserts each chunk's vector into the LSH index of the segment the chunk actually landed in.
+     * Takes rolled-back chunks back out of the lexical index.
      *
-     * <p>The segment is resolved after the writes, because a write may have split the segment
-     * the key would previously have routed to.</p>
+     * <p>Storage no longer has them, so a search that still returned them would report hits whose
+     * text nothing can resolve - a chunk id pointing at a document that was never published. The
+     * chunks were indexed as they were written, so undoing the write has to undo that too.</p>
      */
-    private void indexVectors(String documentKey, List<TextChunk> chunks,
-                              Map<Integer, float[]> embeddings, Set<Segment> touchedSegments) {
-        if (lshIngestionService == null) {
+    private void unindexLexically(List<String> chunkIds) {
+        excalibur.ingest.lexical.ChunkIndex target = this.lexicalIndex;
+        if (target == null || chunkIds.isEmpty()) {
             return;
         }
+        try {
+            target.erase(new java.util.LinkedHashSet<>(chunkIds));
+        } catch (IOException e) {
+            LOGGER.warn("Rolled-back chunks of a failed document remain lexically searchable: {}",
+                e.getMessage());
+        }
+    }
 
-        for (TextChunk chunk : chunks) {
-            String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
-            try {
-                Segment segment = segmentFor(chunkId);
-                if (segment == null) {
-                    continue;
-                }
-                long entryId = chunkId.hashCode() & 0xFFFFFFFFL;
-                if (lshIngestionService.insertVector(segment, embeddings.get(chunk.getChunkIndex()), entryId)) {
-                    touchedSegments.add(segment);
-                }
-            } catch (Exception e) {
-                // LSH is a pre-filtering optimisation; a failure must not fail the document.
-                LOGGER.warn("Failed to insert vector into LSH index for chunk {}: {}",
-                    chunkId, e.getMessage());
+    /**
+     * Reclaims erased chunks if the index's policy says it is due.
+     *
+     * <p>Run at the end of an ingestion run rather than on a timer of its own: this is the moment
+     * the index has just changed, and a node that is not ingesting is not accumulating anything to
+     * reclaim. The usual outcome is that nothing is due, which costs a comparison of four
+     * numbers.</p>
+     */
+    private void compactLexicalIndex() {
+        excalibur.ingest.lexical.ChunkIndex target = this.lexicalIndex;
+        if (target == null) {
+            return;
+        }
+        try {
+            long started = System.currentTimeMillis();
+            io.excalibur.retrieval.lexical.native_.CompactionResult result =
+                target.compactIfDue(excalibur.ingest.lexical.StoredChunkText.of(storageEngine));
+            if (result.performed()) {
+                // The elapsed time is reported because queries wait on it: a compaction holds the
+                // index exclusively while it rewrites. Merges pick the smallest segments and stay
+                // brief; a compaction driven by an overdue erasure takes every segment holding a
+                // tombstone and can take much longer, which is the deadline being met rather than
+                // a fault, but is not something an operator should have to infer.
+                LOGGER.info("Lexical compaction: {} segment(s) rewritten to {}, {} chunk(s) "
+                    + "physically removed in {}ms ({})", result.segmentsRewritten(),
+                    result.segmentsProduced(), result.documentsRemoved(),
+                    System.currentTimeMillis() - started, result.reason());
             }
+        } catch (IOException e) {
+            LOGGER.warn("Lexical compaction did not run; erased chunks stay on disk "
+                + "until the next attempt: {}", e.getMessage());
         }
     }
 
@@ -783,18 +851,57 @@ public class IngestionOrchestrator {
     }
 
     /**
-     * Forces every LSH index written during this run to its backing files.
+     * Writes the registry, so this run's documents survive a restart.
      *
-     * <p>Without this the buckets built during ingestion live only in the index's page cache
-     * until the segment is closed, so a crash mid-run loses the pre-filter for everything
-     * ingested since the last flush while the query pipeline still believes it has one.</p>
+     * <p>The registry is what change detection compares against. Lost, every document this run
+     * indexed reads as new to the next re-crawl, which reingests it beside the chunks already
+     * there and tombstones none of them.</p>
+     *
+     * <p>No-op without a registry: a node that records nothing has nothing to write, and it has
+     * already opted out of change detection by not keeping one.</p>
      */
-    private void flushLshIndexes(Set<Segment> touchedSegments) {
-        if (lshIngestionService == null) {
+    private void persistRegistry() {
+        if (documentRegistry == null) {
             return;
         }
-        for (Segment segment : touchedSegments) {
-            lshIngestionService.flush(segment);
+        try {
+            documentRegistry.persist();
+        } catch (IOException e) {
+            LOGGER.warn("Document registry not persisted; a restart would make this run's "
+                + "documents look new to the next re-crawl: {}", e.getMessage());
+        }
+    }
+
+    /** Makes this run's lexical writes searchable. */
+    private void refreshLexicalIndex() {
+        excalibur.ingest.lexical.ChunkIndex target = this.lexicalIndex;
+        if (target == null) {
+            return;
+        }
+        try {
+            target.refresh();
+        } catch (IOException e) {
+            LOGGER.warn("Lexical index not refreshed; this run's chunks stay unsearchable "
+                + "until the next refresh: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Adds one chunk to the lexical index, if this node keeps one.
+     *
+     * <p>A failure here is logged and not rethrown. The chunk is already in storage and the
+     * document is still worth publishing: losing one chunk from BM25 costs recall on that chunk,
+     * while failing the document costs the document. The two are not the same size of loss.</p>
+     */
+    private void indexLexically(String chunkId, String text) {
+        excalibur.ingest.lexical.ChunkIndex target = this.lexicalIndex;
+        if (target == null) {
+            return;
+        }
+        try {
+            target.add(chunkId, text);
+        } catch (IOException e) {
+            LOGGER.warn("Chunk {} stored but not lexically indexed: {}", chunkId, e.getMessage());
         }
     }
 
@@ -828,6 +935,32 @@ public class IngestionOrchestrator {
      */
     public int getActiveIngestionCount() {
         return activeIngestions.size();
+    }
+
+    /**
+     * Stops the ingestion of one source, without touching the others.
+     *
+     * <p>What a deregistration needs. A source taken out of the registry while a run of it is in
+     * flight would go on writing documents nobody can reach it through - and, when the
+     * deregistration is part of erasing the source, would go on writing the documents being
+     * erased.</p>
+     *
+     * <p>Stops at the next document boundary rather than immediately: the run checks for it
+     * between documents, so what is already half-written is finished or rolled back rather than
+     * abandoned. Returns once the stop has been asked for, not once it has happened.</p>
+     *
+     * @param sourceId The source whose ingestion should stop
+     * @return true if a run was in flight and has been asked to stop
+     */
+    public boolean stopIngestion(String sourceId) {
+        Objects.requireNonNull(sourceId, "sourceId cannot be null");
+        Thread worker = ingestionThreads.get(sourceId);
+        if (worker == null) {
+            return false;
+        }
+        LOGGER.info("Stopping ingestion of source {}", sourceId);
+        worker.interrupt();
+        return true;
     }
 
     /**

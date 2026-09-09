@@ -292,10 +292,39 @@ public final class Config {
         public static final long MIN_REINDEX_INTERVAL_MS = 60000L;
         public static final long MAX_REINDEX_INTERVAL_MS = 86400000L;
 
+        /**
+         * Which engine indexes chunk text.
+         *
+         * <p>"native" is the engine's own inverted index, which stores postings and reads a
+         * chunk's text back from storage when it needs it. "lucene" keeps a second copy of every
+         * chunk's text in a Lucene index. They are alternatives, not layers: running both would
+         * write the corpus twice.</p>
+         */
+        public static final String LEXICAL_ENGINE_NATIVE = "native";
+
+        /** The Lucene-backed chunk index. */
+        public static final String LEXICAL_ENGINE_LUCENE = "lucene";
+
+        /** The default engine. */
+        public static final String DEFAULT_LEXICAL_ENGINE = LEXICAL_ENGINE_NATIVE;
+
+        /** Tombstoned fraction of the chunk index at which a compaction repays its rewrite. */
+        public static final double DEFAULT_LEXICAL_TOMBSTONE_RATIO = 0.2;
+
+        /** How long an erased chunk may remain on disk before cost stops being a consideration. */
+        public static final long DEFAULT_LEXICAL_MAX_LATENCY_SECONDS = 3600L;
+
+        /** Chunk index segments tolerated before the smallest are merged. */
+        public static final int DEFAULT_LEXICAL_MAX_SEGMENTS = 16;
+
         // All fields final for immutability
         private final int documentTimeoutMs;
         private final boolean documentAtomicity;
         private final long reindexIntervalMs;
+        private final String lexicalEngine;
+        private final double lexicalTombstoneRatio;
+        private final long lexicalMaxLatencySeconds;
+        private final int lexicalMaxSegments;
 
         /**
          * Creates an Ingest config from properties.
@@ -306,6 +335,57 @@ public final class Config {
             this.documentTimeoutMs = PropertyParser.parseInt(props, "excalibur.ingest.document-atomicity-timeout-ms", DEFAULT_DOCUMENT_TIMEOUT_MS);
             this.documentAtomicity = PropertyParser.parseBoolean(props, "excalibur.ingest.document-atomicity", DEFAULT_DOCUMENT_ATOMICITY);
             this.reindexIntervalMs = PropertyParser.parseLong(props, "excalibur.ingest.reindex-interval-ms", DEFAULT_REINDEX_INTERVAL_MS);
+            this.lexicalEngine = PropertyParser.parseString(props,
+                "excalibur.ingest.lexical-engine", DEFAULT_LEXICAL_ENGINE)
+                .trim().toLowerCase(java.util.Locale.ROOT);
+            if (!LEXICAL_ENGINE_NATIVE.equals(lexicalEngine)
+                    && !LEXICAL_ENGINE_LUCENE.equals(lexicalEngine)) {
+                // Refused at startup rather than fallen back from. An unrecognised engine name is
+                // an operator expecting one index and getting another, which they would only find
+                // out by noticing their queries answered from a corpus they did not build.
+                throw new IllegalArgumentException("excalibur.ingest.lexical-engine must be "
+                    + LEXICAL_ENGINE_NATIVE + " or " + LEXICAL_ENGINE_LUCENE
+                    + ", got: " + lexicalEngine);
+            }
+            this.lexicalTombstoneRatio = PropertyParser.parseDouble(props,
+                "excalibur.ingest.lexical-tombstone-ratio", DEFAULT_LEXICAL_TOMBSTONE_RATIO);
+            if (lexicalTombstoneRatio <= 0 || lexicalTombstoneRatio > 1) {
+                throw new IllegalArgumentException("excalibur.ingest.lexical-tombstone-ratio must "
+                    + "be in (0, 1], got: " + lexicalTombstoneRatio);
+            }
+            this.lexicalMaxLatencySeconds = PropertyParser.parseLong(props,
+                "excalibur.ingest.lexical-max-latency-seconds",
+                DEFAULT_LEXICAL_MAX_LATENCY_SECONDS);
+            if (lexicalMaxLatencySeconds <= 0) {
+                throw new IllegalArgumentException("excalibur.ingest.lexical-max-latency-seconds "
+                    + "must be positive, got: " + lexicalMaxLatencySeconds);
+            }
+            this.lexicalMaxSegments = PropertyParser.parseInt(props,
+                "excalibur.ingest.lexical-max-segments", DEFAULT_LEXICAL_MAX_SEGMENTS);
+            if (lexicalMaxSegments < 1) {
+                throw new IllegalArgumentException("excalibur.ingest.lexical-max-segments must be "
+                    + "at least 1, got: " + lexicalMaxSegments);
+            }
+        }
+
+        /** Which engine indexes chunk text: {@code native} or {@code lucene}. */
+        public String getLexicalEngine() {
+            return lexicalEngine;
+        }
+
+        /** Tombstoned fraction at which a chunk-index compaction repays its rewrite. */
+        public double getLexicalTombstoneRatio() {
+            return lexicalTombstoneRatio;
+        }
+
+        /** How long an erased chunk may remain on disk. */
+        public long getLexicalMaxLatencySeconds() {
+            return lexicalMaxLatencySeconds;
+        }
+
+        /** Chunk index segments tolerated before merging. */
+        public int getLexicalMaxSegments() {
+            return lexicalMaxSegments;
         }
 
         /**

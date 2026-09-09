@@ -7,7 +7,7 @@ package io.excalibur.store;
  * <ol>
  *   <li>{@link #BOOTSTRAPPING} — Allocated, no data. Invisible to queries.</li>
  *   <li>{@link #INDEXING} — Entries being written. Cuckoo filter and LSH incrementally populated.</li>
- *   <li>{@link #WARMING} — Batch complete. HNSW edges being optimized, PQ codebooks training.</li>
+ *   <li>{@link #WARMING} — Batch complete. PQ codebooks training.</li>
  *   <li>{@link #ACTIVE} — Fully indexed, fully optimized. Queryable.</li>
  *   <li>{@link #COMPACTING} — Tombstones being cleaned. Frozen snapshot serves queries.</li>
  *   <li>{@link #TOMBSTONED} — Invisible to new queries. Kept on disk until epoch-based reclamation.</li>
@@ -54,8 +54,9 @@ public enum LifecycleState {
     INDEXING(1),
     
     /**
-     * Batch complete. HNSW edges being optimized, PQ codebooks training.
-     * <p>Segments are queryable with pre-optimization structures.</p>
+     * Batch complete. PQ codebooks training.
+     * <p>Every entry is written and absorbed into the graph. Segments are queryable, and answer
+     * with the same structures an {@link #ACTIVE} segment does.</p>
      */
     WARMING(2),
     
@@ -185,6 +186,21 @@ public enum LifecycleState {
     public boolean isQueryable() {
         return this == INDEXING || this == WARMING || 
                this == ACTIVE || this == COMPACTING;
+    }
+
+    /**
+     * Checks if this segment holds only part of the data it will eventually hold.
+     *
+     * <p>A query that asks to be spared partially-indexed segments is asking to be spared partial
+     * answers. {@link #INDEXING} is the only queryable state where the segment's own contents are
+     * still moving as the query reads them; {@link #WARMING} has every entry in and is training a
+     * product quantizer no query path reads, and {@link #COMPACTING} serves a frozen snapshot.
+     * Both of those answer a query exactly as {@link #ACTIVE} does.</p>
+     *
+     * @return true if a query would see only part of this segment
+     */
+    public boolean isPartiallyIndexed() {
+        return this == INDEXING;
     }
 
     /**

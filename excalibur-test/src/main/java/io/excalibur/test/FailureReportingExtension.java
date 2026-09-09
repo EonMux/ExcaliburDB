@@ -214,9 +214,15 @@ public final class FailureReportingExtension
     private String extractErrorMessage(Throwable throwable) {
         StringBuilder sb = new StringBuilder();
 
-        // Main message
-        if (throwable.getMessage() != null) {
-            sb.append(throwable.getMessage());
+        // Main message, or the type when there is none. A bare NullPointerException carries no
+        // message at all, and it is one of the commonest ways a test dies; recording the empty
+        // string leaves the report - the only account of the failure anyone will read later -
+        // saying nothing whatsoever, and leaves the categoriser with nothing to match on.
+        String message = throwable.getMessage();
+        if (message != null && !message.isBlank()) {
+            sb.append(message);
+        } else {
+            sb.append(throwable.getClass().getSimpleName());
         }
 
         // Include assertion error details if present

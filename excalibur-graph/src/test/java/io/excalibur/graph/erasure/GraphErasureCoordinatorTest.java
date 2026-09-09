@@ -217,8 +217,8 @@ class GraphErasureCoordinatorTest {
                 }, CLOCK).compactIfDue(graph);
             }
 
-            assertThat(seen.get().totalEdges()).isEqualTo(3);
-            assertThat(seen.get().tombstonedEdges()).isEqualTo(2);
+            assertThat(seen.get().totalRecords()).isEqualTo(3);
+            assertThat(seen.get().tombstonedRecords()).isEqualTo(2);
             assertThat(seen.get().oldestOutstanding())
                 .as("the deadline closest to expiring, not the newest request")
                 .contains(earlier);

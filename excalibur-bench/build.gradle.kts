@@ -50,6 +50,7 @@ dependencies {
 
     // Phase 8 dependency for Ingestion (DocumentVisibilityChecker)
     implementation(project(":excalibur-ingest"))
+    implementation(project(":excalibur-retrieval"))
 }
 
 // Enable Panama FFM preview features
@@ -318,5 +319,21 @@ tasks.register<JavaExec>("runBenchmarksWithCapture") {
         baseArgs + listOf("--output", project.property("outputDir") as String)
     } else {
         baseArgs
+    }
+}
+
+// Scores the retrieval strategies over a real corpus. Deliberately not JMH: the thing being
+// measured is retrieval quality against judged queries, with latency beside it, not a microbenchmark.
+//
+// Measures the engine a node ships with unless the last argument says otherwise:
+//   -PevalArgs="<corpusDir> <indexDir> <qrels> 10 - - both"   ('-' skips a positional)
+tasks.register<JavaExec>("runRetrievalEvaluation") {
+    group = "verification"
+    description = "Indexes a corpus on the native (or lucene, or both) engine and scores the retrieval strategies over it, with the index size beside the quality"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("excalibur.bench.retrieval.CorpusEvaluationRunner")
+    jvmArgs = listOf("--enable-preview", "--enable-native-access=ALL-UNNAMED", "-Xmx6g")
+    if (project.hasProperty("evalArgs")) {
+        args = (project.property("evalArgs") as String).split(" ")
     }
 }

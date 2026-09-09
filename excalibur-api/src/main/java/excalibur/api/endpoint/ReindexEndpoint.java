@@ -585,11 +585,19 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             this.lastError = null;
         }
 
+        /**
+         * Records reported progress, holding the same bounds the ingest status does.
+         *
+         * <p>The two status objects describe the same kind of work to the same clients, so a
+         * count that is negative or a progress outside [0.0, 1.0] should be impossible in both
+         * rather than in whichever one happened to be written more carefully.</p>
+         */
         public void updateState(String newState, double progress, long processed, long total) {
             this.state = newState;
-            this.progress = progress;
-            this.entriesProcessed = processed;
-            this.entriesTotal = total;
+            this.progress = Double.isNaN(progress)
+                ? 0.0 : Math.max(0.0, Math.min(1.0, progress));
+            this.entriesProcessed = Math.max(0, processed);
+            this.entriesTotal = Math.max(0, total);
         }
 
         public void complete() {

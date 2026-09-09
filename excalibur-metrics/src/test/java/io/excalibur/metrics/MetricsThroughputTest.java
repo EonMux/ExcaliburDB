@@ -81,4 +81,31 @@ class MetricsThroughputTest {
             "a zero-length interval must not divide by zero");
         assertTrue(Double.isFinite(Metrics.getPeakIngestionRate()), "peak must stay finite");
     }
+
+    @Test
+    @DisplayName("Reading the rate does not consume the interval it measures")
+    void readingTheRateIsIdempotent() throws Exception {
+        Metrics.updateIngestionRate();
+        Thread.sleep(INTERVAL_MS);
+        for (int i = 0; i < 250; i++) {
+            Metrics.recordIngestEntry();
+        }
+        Metrics.updateIngestionRate();
+
+        double first = Metrics.sampledIngestionRate();
+        // Far enough apart that a re-sampling read would measure a fresh, empty interval, and
+        // far short of the sample window, so a sampling read must not start one.
+        Thread.sleep(5);
+        double second = Metrics.sampledIngestionRate();
+        Thread.sleep(5);
+        double third = Metrics.sampledIngestionRate();
+
+        // Reading used to re-sample, so the second read measured a window nothing was ingested in
+        // and reported zero: one observer's poll silently reset what every other observer saw.
+        assertEquals(first, second, 0.0,
+            "two reads inside one sample window must agree");
+        assertEquals(first, third, 0.0,
+            "and a third must not drift either");
+        assertTrue(first > 0.0, "the sampled rate still reflects the burst that just happened");
+    }
 }

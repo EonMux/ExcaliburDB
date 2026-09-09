@@ -11,14 +11,32 @@ excalibur.visibility.query-timeout-ms=30000
 
 # Ingest Configuration
 excalibur.ingest.document-atomicity-timeout-ms=2000
+# Whether a document's chunks become visible together. Leave it on: off, a query can match half
+# a document while the rest is still being written, which is a wrong answer rather than a slow one.
+excalibur.ingest.document-atomicity=true
+# How often a registered source is re-crawled on its own. One hour.
+excalibur.ingest.reindex-interval-ms=3600000
+
+# Membership Filter
+# Entries the hierarchical Cuckoo filter is sized for. SIZE THIS TO YOUR CORPUS. The filter is
+# what prunes segments that cannot hold a query's terms, and a filter with no room left cannot
+# record a new term -- a term it has no record of prunes every segment, so queries return nothing
+# for documents that are sitting in storage. Under-sizing fails silently and completely; the only
+# cost of over-sizing is memory.
+excalibur.filter.corpus-capacity=10000000
 
 # API Server Configuration
+# Port to listen on. EXCALIBUR_PORT in the environment overrides this; a value that is not a
+# port number fails startup rather than quietly falling back to 8080.
+excalibur.api.port=8080
 # The API binds to loopback by default. Binding any other address requires an explicit
 # excalibur.api.bind-address, excalibur.api.auth-token, AND TLS; without them the server
 # refuses to start rather than serving the network unauthenticated or in cleartext.
 excalibur.api.bind-address=127.0.0.1
 # Never set the auth token here. Supply it as the EXCALIBUR_API_AUTH_TOKEN environment
-# variable. Every endpoint except GET /health requires it as a bearer token.
+# variable. Setting it turns authentication on: every endpoint except GET /health then
+# requires it as a bearer token. Unset, the API is unauthenticated -- which is safe only
+# because the bind policy above will not let it listen anywhere but loopback without one.
 #excalibur.api.auth-token=
 # Per-client rate limits: separate budgets for reads and for mutating requests.
 excalibur.api.read-rate-per-second=50
@@ -34,6 +52,9 @@ excalibur.api.max-query-timeout-ms=60000
 # Setting a keystore turns TLS on. The keystore holds the server certificate and its
 # private key; PKCS12 is the default format and the one keytool writes by default.
 #excalibur.api.tls-keystore=/etc/excalibur/server.p12
+# TLS is on when a keystore is set. This overrides that: false serves plaintext despite a
+# configured keystore. Set it only where serving plaintext is what you mean.
+#excalibur.api.tls-enabled=true
 # Never set the keystore password here. Supply it as the
 # EXCALIBUR_API_TLS_KEYSTORE_PASSWORD environment variable.
 #excalibur.api.tls-keystore-password=
@@ -59,9 +80,10 @@ excalibur.api.max-query-timeout-ms=60000
 #excalibur.api.allow-plaintext=false
 
 # Graph-RAG Configuration
-# POST /v1/graph/query answers from a graph store this node reads but does not build. Leave
-# the path unset to look in <data dir>/graph; a node with no graph store starts normally and
-# does not register the route.
+# Where the graph store lives, one subdirectory per namespace. Leave unset to look under
+# <data dir>/graph. The route is registered either way: a node that has never built a graph
+# answers POST /v1/graph/query with 503 and says a build is what is missing, which is a
+# different statement from 404.
 #excalibur.graph.path=
 # Documents each retrieval signal contributes before fusion, and the token budget the
 # serialised subgraph must fit into.
@@ -114,6 +136,25 @@ excalibur.ingest.allowed-hosts=
 # Bound on concurrently registered ingestion sources.
 excalibur.ingest.max-sources=256
 
+# Chunk Lexical Index
+# Which engine indexes chunk text for BM25 retrieval. "native" is the engine's own inverted index:
+# it stores postings only and reads a chunk's text back from storage when compaction needs it, so
+# the corpus exists once. "lucene" keeps a second full copy of every chunk's text in a Lucene index.
+# These are alternatives, not layers -- only the configured one is written, and switching engines
+# leaves the other's directory behind without reading it, so the corpus has to be reingested.
+# An unrecognised value fails startup rather than falling back, since the difference is only
+# visible as queries answered from a corpus you did not build.
+excalibur.ingest.lexical-engine=native
+# When reclaiming erased chunks becomes worthwhile, for the native engine. The ratio amortises the
+# rewrite; the latency bound is what makes an erasure an obligation rather than a preference, since
+# a single erased chunk in a large corpus would otherwise never reach the ratio. Lucene ignores
+# both and merges on its own schedule.
+excalibur.ingest.lexical-tombstone-ratio=0.2
+excalibur.ingest.lexical-max-latency-seconds=3600
+# Segments tolerated before the smallest are merged. Every segment is a set of mappings and a
+# search that must visit it, so the count is bounded rather than left to grow with the corpus.
+excalibur.ingest.lexical-max-segments=16
+
 # Health Configuration
 excalibur.health.readiness-threshold=0.5
 excalibur.health.healthy-threshold=0.9
@@ -121,16 +162,25 @@ excalibur.health.max-latency-ms=5000
 
 # Query Configuration
 excalibur.query.top-k-default=100
+# Accepted and range-checked, but read by nothing: breadth comes from
+# excalibur.shard.default-ef-search, and a query's score floor comes from its own threshold field.
 excalibur.query.recall-target=0.95
+excalibur.query.threshold=0.3
 excalibur.query.include-partial-segments=true
 excalibur.query.vector-dimensions=1536
 excalibur.query.llm-timeout-ms=60000
 
 # LLM Configuration
+# The API root. The clients append the OpenAI paths themselves (/v1/embeddings,
+# /v1/chat/completions), so a trailing /v1 here is stripped rather than duplicated -- both
+# https://api.openai.com and https://api.openai.com/v1 work. Point it at any OpenAI-compatible
+# endpoint: Ollama (http://localhost:11434), vLLM, TGI, LiteLLM.
 excalibur.llm.base-url=https://api.openai.com/v1
 # Never set the api key here. Supply it as the EXCALIBUR_LLM_API_KEY environment variable,
 # so it cannot be committed or read out of the working directory.
 #excalibur.llm.api-key=
+# Legacy generic model name. Parsed and exposed on the config, but no component reads it;
+# embedding-model and chat-model below are what the clients actually use.
 excalibur.llm.model=text-embedding-ada-002
 excalibur.llm.chat-model=gpt-4o-mini
 excalibur.llm.embedding-model=text-embedding-3-small

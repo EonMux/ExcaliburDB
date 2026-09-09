@@ -10,11 +10,15 @@ import java.util.Objects;
  * query quality and detect degraded states.</p>
  *
  * <h2>Coverage Calculation</h2>
- * <p>Estimated corpus coverage is computed as:</p>
+ * <p>Estimated corpus coverage is the share of the live corpus this query was allowed to read:</p>
  * <pre>
- * coverage = (activeSegments + indexingSegments + warmingSegments + compactingSegments)
- *            / totalSegments
+ * queryable = activeSegments + indexingSegments + warmingSegments + compactingSegments
+ * coverage  = (queryable - segmentsExcluded) / (totalSegments - tombstonedSegments)
  * </pre>
+ * <p>{@code segmentsExcluded} is what separates this from a catalog census. A segment held back
+ * because the caller asked for complete segments only, or dropped because its graph was not
+ * available, is counted by the catalog and never searched; without subtracting it the response
+ * reports full coverage over an answer the query never saw.</p>
  *
  * <h2>Degraded State</h2>
  * <p>A query is considered "degraded" when:</p>
@@ -49,6 +53,7 @@ public final class IndexCoverage {
     private final long tailScanEntries;
     private final boolean degraded;
     private final int segmentsSearched;
+    private final int segmentsExcluded;
     private final int segmentsWithErrors;
     private final int segmentsTimedOut;
 
@@ -63,6 +68,7 @@ public final class IndexCoverage {
         this.tailScanEntries = builder.tailScanEntries;
         this.degraded = builder.degraded;
         this.segmentsSearched = builder.segmentsSearched;
+        this.segmentsExcluded = builder.segmentsExcluded;
         this.segmentsWithErrors = builder.segmentsWithErrors;
         this.segmentsTimedOut = builder.segmentsTimedOut;
     }
@@ -174,6 +180,20 @@ public final class IndexCoverage {
     }
 
     /**
+     * Returns the number of segments the query was not permitted to search.
+     *
+     * <p>These are segments the catalog counts as live corpus that this query never looked at:
+     * one held back because the caller asked for complete segments only, or one whose HNSW graph
+     * was not available. They are gaps in the answer, not errors, and nothing else on the
+     * response records them.</p>
+     *
+     * @return Segments excluded count
+     */
+    public int segmentsExcluded() {
+        return segmentsExcluded;
+    }
+
+    /**
      * Returns the number of segments that encountered errors during search.
      *
      * @return Segments with errors count
@@ -215,6 +235,7 @@ public final class IndexCoverage {
             tailScanEntries == that.tailScanEntries &&
             degraded == that.degraded &&
             segmentsSearched == that.segmentsSearched &&
+            segmentsExcluded == that.segmentsExcluded &&
             segmentsWithErrors == that.segmentsWithErrors &&
             segmentsTimedOut == that.segmentsTimedOut;
     }
@@ -224,18 +245,19 @@ public final class IndexCoverage {
         return Objects.hash(
             totalSegments, activeSegments, indexingSegments, warmingSegments,
             compactingSegments, tombstonedSegments, estimatedCorpusCoverage,
-            tailScanEntries, degraded, segmentsSearched, segmentsWithErrors,
-            segmentsTimedOut);
+            tailScanEntries, degraded, segmentsSearched, segmentsExcluded,
+            segmentsWithErrors, segmentsTimedOut);
     }
 
     @Override
     public String toString() {
         return String.format(
             "IndexCoverage{total=%d, active=%d, indexing=%d, warming=%d, compacting=%d, " +
-            "coverage=%.2f%%, tailScan=%d, degraded=%s, searched=%d, errors=%d, timeouts=%d}",
+            "coverage=%.2f%%, tailScan=%d, degraded=%s, searched=%d, excluded=%d, errors=%d, " +
+            "timeouts=%d}",
             totalSegments, activeSegments, indexingSegments, warmingSegments, compactingSegments,
             estimatedCorpusCoverage * 100, tailScanEntries, degraded,
-            segmentsSearched, segmentsWithErrors, segmentsTimedOut);
+            segmentsSearched, segmentsExcluded, segmentsWithErrors, segmentsTimedOut);
     }
 
     /**
@@ -252,6 +274,7 @@ public final class IndexCoverage {
         private long tailScanEntries = 0;
         private boolean degraded = false;
         private int segmentsSearched = 0;
+        private int segmentsExcluded = 0;
         private int segmentsWithErrors = 0;
         private int segmentsTimedOut = 0;
 
@@ -369,6 +392,17 @@ public final class IndexCoverage {
         }
 
         /**
+         * Sets the number of segments the query was not permitted to search.
+         */
+        public Builder segmentsExcluded(int segmentsExcluded) {
+            if (segmentsExcluded < 0) {
+                throw new IllegalArgumentException("segmentsExcluded cannot be negative: " + segmentsExcluded);
+            }
+            this.segmentsExcluded = segmentsExcluded;
+            return this;
+        }
+
+        /**
          * Sets the number of segments with errors.
          */
         public Builder segmentsWithErrors(int segmentsWithErrors) {
@@ -393,6 +427,10 @@ public final class IndexCoverage {
         /**
          * Computes coverage from segment counts and sets it.
          *
+         * <p>The numerator is what this query was allowed to read: the queryable segments the
+         * catalog holds, less the ones it was not permitted to search. Counting the catalog alone
+         * reports full coverage over a query that was shown nothing.</p>
+         *
          * <p>The computed coverage is clamped to [0.0, 1.0] to ensure
          * domain correctness regardless of input values.</p>
          *
@@ -403,7 +441,7 @@ public final class IndexCoverage {
             if (nonPurged <= 0) {
                 this.estimatedCorpusCoverage = 0.0;
             } else {
-                double raw = (double) queryable() / nonPurged;
+                double raw = (double) (queryable() - segmentsExcluded) / nonPurged;
                 // Clamp to [0.0, 1.0] - domain correctness guarantee
                 this.estimatedCorpusCoverage = Math.max(0.0, Math.min(1.0, raw));
             }
@@ -423,6 +461,24 @@ public final class IndexCoverage {
             return this;
         }
 
+        /**
+         * Adds a reason for degradation that the coverage numbers cannot see.
+         *
+         * <p>A stage can degrade a response without any segment being missing or failing - an LLM
+         * scorer that fell back to vector-only ranking is the case this exists for. Such a reason
+         * is ORed into the flag rather than assigned, so that adding one cannot erase a reason
+         * {@link #computeDegraded(double)} already found; {@link #degraded(boolean)} assigns, and
+         * is for a caller stating the whole verdict itself.</p>
+         *
+         * @param degraded true to mark the response degraded, false to leave the flag as it stands
+         * @return This builder
+         */
+        public Builder orDegraded(boolean degraded) {
+            this.degraded = this.degraded || degraded;
+            return this;
+        }
+
+        /** The segments the catalog counts as readable, before this query's own exclusions. */
         private long queryable() {
             return activeSegments + indexingSegments + warmingSegments + compactingSegments;
         }

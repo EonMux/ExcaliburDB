@@ -416,11 +416,29 @@ public class CompactionWorker {
         // Run compaction in a virtual thread
         Thread.startVirtualThread(() -> {
             try {
-                compactSegment(segment);
+                compactNow(segment);
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Manual compaction failed for segment: " + segment.path(), e);
             }
         });
+    }
+
+    /**
+     * Compacts a segment on the calling thread and returns once it is done.
+     *
+     * <p>The same work {@link #requestCompaction(Segment)} hands to a virtual thread, for callers
+     * that need the segment compacted before they continue rather than merely scheduled. The
+     * listener is notified before this returns.</p>
+     *
+     * @param segment The segment to compact
+     * @throws NullPointerException if segment is null
+     * @throws IOException if the compaction fails
+     */
+    public void compactNow(Segment segment) throws IOException {
+        if (segment == null) {
+            throw new NullPointerException("Segment cannot be null");
+        }
+        compactSegment(segment);
     }
 
     // ==================== Main Compaction Loop ====================
@@ -650,6 +668,10 @@ public class CompactionWorker {
         java.util.concurrent.locks.Lock writeLock = segment.writeLock();
         writeLock.lock();
         try {
+            if (!isCompactable(segment)) {
+                return;
+            }
+
             // The threshold the segment being replaced was created with, so a compaction
             // does not quietly reset the engine's configured load factor to the default.
             newSegment = new Segment(compactPath, capacity, arena, segment.loadFactorThreshold());
@@ -682,6 +704,40 @@ public class CompactionWorker {
         LOGGER.log(Level.INFO, "Compaction complete for {0}: {1} entries ({2} tombstones removed) " +
             "in {3}ms, reclaimed {4} bytes",
             new Object[] { oldPath, entriesCopied, oldTombstoneCount, duration, bytesToReclaim });
+    }
+
+    /**
+     * Whether a segment may still be compacted, checked under its write lock.
+     *
+     * <p>The checks before the lock are advisory: a split can begin, or another compaction can
+     * finish, between them and the copy. {@link Segment#beginSplit()} takes the very lock this
+     * runs under, so a split that has not started by now cannot start until this compaction has
+     * swapped and released - and one that has started already is caught here, before any file is
+     * written.</p>
+     *
+     * <p>Compacting through a split is the way this ends badly. The registry swap is what makes
+     * the compacted file the live one, and a split publishes children over the same directory
+     * entry; whichever loses, the compacted file has already replaced the canonical name and the
+     * original's write log has already been discarded. Refusing early costs one skipped
+     * compaction, and the segment - or its children - become candidates again immediately.</p>
+     *
+     * @param segment The segment being considered, with its write lock held
+     * @return true if the compaction may proceed
+     */
+    private static boolean isCompactable(Segment segment) {
+        if (segment.isClosed()) {
+            LOGGER.log(Level.FINE, "Skipping segment closed before compaction started: {0}",
+                segment.path());
+            return false;
+        }
+        if (segment.isSplitting() || segment.isSplitComplete()) {
+            LOGGER.log(Level.INFO,
+                "Skipping compaction of {0}: the segment is being split, and its children are "
+                    + "compacted on their own account",
+                segment.path());
+            return false;
+        }
+        return true;
     }
 
     /**

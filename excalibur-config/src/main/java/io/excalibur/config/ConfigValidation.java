@@ -86,6 +86,42 @@ public final class ConfigValidation {
         validateQuery(config.query());
         validateLlm(config.llm());
         validateShard(config.shard());
+        validateDimensionsAgree(config.query(), config.llm());
+    }
+
+    /**
+     * Requires the index and the embedding model to agree on how wide a vector is.
+     *
+     * <p>Two keys describe one number. {@code query.vector-dimensions} sizes the HNSW graphs and
+     * the segment layout; {@code llm.embeddings-dimensions} is what the embedding client requires
+     * back from the model. Each was range-checked on its own and the two were never compared, so
+     * changing embedding model and updating one of them left a node that started cleanly and then
+     * failed on contact - either every insert rejected by the graph, or every response rejected
+     * by the client. Both are per-document failures discovered long after startup, by which time
+     * the cause is several thousand log lines away.</p>
+     *
+     * <p>They are two keys rather than one because they answer to different things: the index
+     * width is a property of data already on disk, and the model width is a property of the
+     * endpoint. Which is exactly why a disagreement is worth refusing at startup rather than
+     * silently resolving in favour of one of them.</p>
+     *
+     * @param query The query configuration
+     * @param llm   The LLM configuration
+     * @throws IllegalStateException if the two disagree
+     */
+    private static void validateDimensionsAgree(Config.Query query, Config.Llm llm) {
+        int index = query.getVectorDimensions();
+        int model = llm.getEmbeddingsDimensions();
+        if (index != model) {
+            throw new IllegalStateException(
+                "query.vector-dimensions (" + index + ") and llm.embeddings-dimensions ("
+                    + model + ") must be equal: the first sizes the index, the second is what "
+                    + "the embedding model returns, and a vector of one width cannot be stored "
+                    + "in an index of the other. Set both to the width of '"
+                    + llm.getEmbeddingModel() + "'. Changing this on a node that has already "
+                    + "indexed anything requires a reindex, because the stored vectors are the "
+                    + "old width.");
+        }
     }
 
     /**

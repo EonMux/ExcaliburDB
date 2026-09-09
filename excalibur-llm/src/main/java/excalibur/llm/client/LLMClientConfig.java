@@ -132,6 +132,24 @@ public final class LLMClientConfig {
     }
 
     // Validation methods with domain correctness constraints
+    /**
+     * Normalises the API root every request path is built from.
+     *
+     * <p>The clients append the full OpenAI path themselves - {@code /v1/embeddings},
+     * {@code /v1/chat/completions} - so what belongs here is the host, without the version
+     * segment. Almost nothing else in the ecosystem is spelled that way: OpenAI documents
+     * {@code https://api.openai.com/v1}, and vLLM, LiteLLM and Azure all present a {@code /v1}
+     * base too, so that is what an operator will paste. Left alone it produced
+     * {@code /v1/v1/embeddings} and a 404 on every call, which looks like a broken API key rather
+     * than a broken URL.</p>
+     *
+     * <p>So both spellings are accepted and mean the same thing. A trailing {@code /v1} is
+     * removed rather than rejected: refusing it would be correct and useless, since the value is
+     * read at startup and the person who set it is not there to be told.</p>
+     *
+     * @param url The configured base URL
+     * @return The API root, with no trailing slash and no trailing version segment
+     */
     private static String validateBaseUrl(String url) {
         Objects.requireNonNull(url, "Base URL cannot be null");
         String trimmed = url.trim();
@@ -142,7 +160,18 @@ public final class LLMClientConfig {
             throw new IllegalArgumentException("Base URL must start with http:// or https://");
         }
         // Remove trailing slash for consistency
-        return trimmed.endsWith("/") ? trimmed.substring(0, trimmed.length() - 1) : trimmed;
+        while (trimmed.endsWith("/")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        }
+        // Remove the version segment the request paths already carry.
+        if (trimmed.endsWith("/v1")) {
+            trimmed = trimmed.substring(0, trimmed.length() - "/v1".length());
+        }
+        if (trimmed.isEmpty() || trimmed.equals("http://") || trimmed.equals("https://")) {
+            throw new IllegalArgumentException(
+                "Base URL must name a host, not just a scheme and version: " + url);
+        }
+        return trimmed;
     }
 
     private static String validateApiKey(String key) {

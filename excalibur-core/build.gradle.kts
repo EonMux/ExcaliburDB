@@ -61,16 +61,21 @@ publishing {
                 
                 licenses {
                     license {
-                        name.set("Apache License 2.0")
-                        url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                        // Matches the LICENSE file at the repository root. The two are the
+                        // project's licence stated twice; they must not be allowed to drift.
+                        name.set("Apache License, Version 2.0")
+                        url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                        distribution.set("repo")
                     }
                 }
                 
                 developers {
                     developer {
+                        // No email: the field is optional, and the address here was
+                        // "amir.eslampanah@example.com", which is a reserved example domain and
+                        // so was never reachable by anyone who read it off a published artifact.
                         id.set("aeslampanah")
                         name.set("Amir Eslampanah")
-                        email.set("amir.eslampanah@example.com")
                     }
                 }
                 

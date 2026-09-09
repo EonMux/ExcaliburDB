@@ -109,9 +109,14 @@ public final class QueryOptions {
     /**
      * Returns whether to include partially-indexed segments.
      *
-     * <p>Partially-indexed segments are those in INDEXING or WARMING states.
-     * When true, queries will search these segments using available structures
-     * (write log tail scan for un-integrated entries).</p>
+     * <p>A partially-indexed segment is one still taking entries - INDEXING. A warming segment
+     * has every entry in and a compacting one serves a frozen snapshot, so both answer a query
+     * as an active segment does and are searched either way.</p>
+     *
+     * <p>When true, queries also search the indexing segments, using the structures those have
+     * so far plus a write log tail scan for entries the graph has not absorbed. When false, each
+     * segment held back is counted on the response as an excluded segment and lowers the reported
+     * corpus coverage.</p>
      *
      * @return true to include partial segments
      */

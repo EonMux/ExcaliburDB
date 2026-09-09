@@ -309,6 +309,50 @@ class LLMClientConfigTest {
                 .build();
             assertEquals("https://api.example.com", config.getBaseUrl());
         }
+
+        // The clients append /v1/embeddings and /v1/chat/completions themselves, so a base URL
+        // that already ends in /v1 produced /v1/v1/... and a 404 on every call - which reads as a
+        // bad API key, not a bad URL. https://api.openai.com/v1 is how OpenAI documents its base
+        // and what every operator will paste, so it has to mean the same thing as the root.
+
+        @Test
+        @DisplayName("A base URL ending in /v1 means the same as one without it")
+        void stripsTheVersionSegment() {
+            assertEquals("https://api.openai.com",
+                LLMClientConfig.builder().baseUrl("https://api.openai.com/v1").build().getBaseUrl());
+            assertEquals("https://api.openai.com",
+                LLMClientConfig.builder().baseUrl("https://api.openai.com/v1/").build().getBaseUrl());
+            assertEquals("https://api.openai.com",
+                LLMClientConfig.builder().baseUrl("https://api.openai.com").build().getBaseUrl());
+        }
+
+        @Test
+        @DisplayName("A local endpoint with a port is normalised the same way")
+        void stripsTheVersionSegmentFromLocalEndpoints() {
+            // Ollama, vLLM and LiteLLM are all reached this way, and only some of them
+            // advertise the /v1 in their own documentation.
+            assertEquals("http://localhost:11434",
+                LLMClientConfig.builder().baseUrl("http://localhost:11434/v1").build().getBaseUrl());
+            assertEquals("http://127.0.0.1:8000",
+                LLMClientConfig.builder().baseUrl("http://127.0.0.1:8000/v1//").build().getBaseUrl());
+        }
+
+        @Test
+        @DisplayName("A /v1 inside the path is left alone")
+        void doesNotStripAnInteriorVersionSegment() {
+            // Azure and gateway deployments route through a prefix; only a trailing segment is
+            // the one the request paths would duplicate.
+            assertEquals("https://gw.example.com/v1/openai",
+                LLMClientConfig.builder()
+                    .baseUrl("https://gw.example.com/v1/openai").build().getBaseUrl());
+        }
+
+        @Test
+        @DisplayName("A URL that is only a scheme and a version is refused")
+        void refusesAUrlWithNoHostLeft() {
+            assertThrows(IllegalArgumentException.class,
+                () -> LLMClientConfig.builder().baseUrl("https:///v1").build());
+        }
     }
 
     @Nested
@@ -373,8 +417,10 @@ class LLMClientConfigTest {
 
             LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
 
-            // Verify all values are correctly mapped
-            assertEquals("https://api.custom.com/v1", clientConfig.getBaseUrl());
+            // Verify all values are correctly mapped. The base URL is normalised on the way
+            // through: the property said ".../v1" and the clients append "/v1/embeddings"
+            // themselves, so keeping the segment here is what produced "/v1/v1/embeddings".
+            assertEquals("https://api.custom.com", clientConfig.getBaseUrl());
             assertEquals("test-api-key", clientConfig.getApiKey());
             assertEquals("gpt-4", clientConfig.getChatModel());
             assertEquals("text-embedding-3-large", clientConfig.getEmbeddingModel());

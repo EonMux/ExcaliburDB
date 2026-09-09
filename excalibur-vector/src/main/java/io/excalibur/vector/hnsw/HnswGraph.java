@@ -913,30 +913,41 @@ public class HnswGraph implements AutoCloseable {
     /**
      * Searches for the k nearest neighbors to the query vector within a candidate set.
      *
-     * <p>This method performs HNSW search but only considers nodes whose IDs are in the
-     * provided candidate set. This is used for LSH pre-filtering where LSH identifies
-     * a subset of potentially relevant vectors, and this search narrows down to the
-     * actual nearest neighbors within that subset.</p>
+     * <p>A pre-filter names the nodes worth measuring, and this method answers with the nearest of
+     * them. The names are a scattering of ids drawn from wherever the filter's buckets happened to
+     * fall, not a connected region of the graph, so the graph's edges are used to <em>reach</em>
+     * named nodes and never to decide which of them may be returned. A walk permitted to step only
+     * from one named node to another is walking an edgeless subgraph, and comes back with whatever
+     * it started on.</p>
      *
      * <h3>Algorithm</h3>
-     * <ol>
-     *   <li>Find entry points from the candidate set at the highest layer</li>
-     *   <li>Greedy search at each layer, only considering candidate nodes</li>
-     *   <li>At layer 0, perform beam search restricted to candidate set</li>
-     *   <li>Return top-k results from the candidate set</li>
-     * </ol>
+     * <p>Two ways to answer, chosen by which does less work:</p>
+     * <ul>
+     *   <li><strong>Measure every named node</strong>, when the set is small. Exact, at one node
+     *       read per name.</li>
+     *   <li><strong>Walk the graph</strong> otherwise: the ordinary descent and layer-0 beam over
+     *       the whole graph, admitting only named nodes to the results.</li>
+     * </ul>
+     *
+     * <p>The line between them follows from what each costs. Measuring reads {@code |C|} nodes. A
+     * walk keeps exploring until it holds {@code ef} admitted results and admits a
+     * {@code |C| / nodeCount} fraction of what it visits, so it reads on the order of
+     * {@code ef * nodeCount / |C|}. Measuring is the cheaper of the two while
+     * {@code |C|² <= ef * nodeCount}, and it is also the exact one, so that is where the line
+     * sits.</p>
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>If candidateIds is null or empty, falls back to full graph search</li>
-     *   <li>Results are sorted by distance (closest first)</li>
+     *   <li>A null candidate set means "no restriction" and searches the whole graph; an empty one
+     *       means "nothing is admissible" and returns nothing</li>
      *   <li>Only nodes in the candidate set are returned</li>
-     *   <li>Tombstoned nodes are automatically skipped</li>
+     *   <li>Results are sorted by distance (closest first)</li>
+     *   <li>Tombstoned nodes, and ids naming no node, are skipped</li>
      * </ul>
      *
      * @param query Query vector
      * @param k Number of neighbors to return
-     * @param candidateIds Set of node IDs to search within (null or empty = full search)
+     * @param candidateIds Set of node IDs to search within (null = full search)
      * @return List of search results sorted by distance (closest first)
      * @throws IllegalStateException if graph is closed
      * @throws IllegalArgumentException if query is null or wrong dimension, or k <= 0
@@ -949,8 +960,6 @@ public class HnswGraph implements AutoCloseable {
             throw new IllegalArgumentException("k must be positive: " + k);
         }
 
-        // If candidate filter is null, fall back to full search
-        // If candidate filter is empty (explicitly no candidates), return empty
         if (candidateIds == null) {
             return search(query, k);
         }
@@ -964,214 +973,85 @@ public class HnswGraph implements AutoCloseable {
                 return new ArrayList<>();
             }
 
-            // Find an entry point from the candidate set
-            long entryFromCandidates = findEntryPointFromCandidates(candidateIds);
-            if (entryFromCandidates < 0) {
-                // No valid entry point in candidates, return empty
-                return new ArrayList<>();
+            // As in search(): the beam is trimmed to ef entries, so one narrower than k can never
+            // yield k results.
+            final int ef = Math.max(config.efSearch(), k * 2);
+
+            long named = candidateIds.size();
+            if (named * named <= (long) ef * nodeCount) {
+                return measureCandidates(query, k, candidateIds);
             }
-
-            final float[] queryVec = query;
-            final int efSearch = Math.max(config.efSearch(), k * 2);
-
-            // Start from the candidate entry point
-            NodeView current = readNode(entryFromCandidates);
-            if (current == null || current.isTombstoned()) {
-                return new ArrayList<>();
-            }
-
-            // Get the level of our entry point
-            int startLevel = current.level();
-
-            // Search through layers from start level down to layer 1
-            // Only consider nodes that are in the candidate set
-            for (int level = startLevel; level > 0; level--) {
-                NodeView closest = searchLayerSimpleWithFilter(queryVec, current, level, candidateIds);
-                if (closest != null) {
-                    current = closest;
-                }
-            }
-
-            // At layer 0, perform beam search restricted to candidates
-            PriorityQueue<HnswSearchResult> results = searchLayerBeamWithFilter(
-                queryVec, current, 0, efSearch, candidateIds);
-
-            // Extract results from the heap
-            List<HnswSearchResult> allResults = new ArrayList<>();
-            while (!results.isEmpty()) {
-                HnswSearchResult result = results.poll();
-                // Verify node is still valid and in candidate set
-                if (candidateIds.contains(result.nodeId())) {
-                    NodeView node = readNode(result.nodeId());
-                    if (node != null && !node.isTombstoned()) {
-                        allResults.add(result);
-                    }
-                }
-            }
-
-            // Sort by distance (closest first)
-            allResults.sort(Comparator.comparingDouble(HnswSearchResult::distance));
-
-            // Take top-k closest results
-            List<HnswSearchResult> topResults = new ArrayList<>();
-            for (int i = 0; i < Math.min(k, allResults.size()); i++) {
-                topResults.add(allResults.get(i));
-            }
-
-            return topResults;
+            return walkAdmitting(query, k, ef, candidateIds);
         } finally {
             lock.readLock().unlock();
         }
     }
 
     /**
-     * Finds an entry point from the candidate set.
+     * Answers a candidate-restricted search by measuring every named node.
      *
-     * <p>Prefers higher-level nodes as they provide better starting points for
-     * hierarchical search. Falls back to any valid candidate if no high-level
-     * nodes are found.</p>
-     *
-     * @param candidateIds Set of candidate node IDs
-     * @return A valid entry point ID, or -1 if none found
+     * <p>Exact, and independent of how the graph happens to link the names. Must be called with
+     * the read lock held.</p>
      */
-    private long findEntryPointFromCandidates(Set<Long> candidateIds) {
-        long bestCandidate = -1;
-        int bestLevel = -1;
-
-        for (Long nodeId : candidateIds) {
+    private List<HnswSearchResult> measureCandidates(float[] query, int k, Set<Long> candidateIds) {
+        List<HnswSearchResult> measured = new ArrayList<>(candidateIds.size());
+        for (long nodeId : candidateIds) {
             NodeView node = readNode(nodeId);
-            if (node != null && !node.isTombstoned()) {
-                if (node.level() > bestLevel) {
-                    bestLevel = node.level();
-                    bestCandidate = nodeId;
-                }
-                // If we haven't found any high-level node, take the first valid one
-                if (bestCandidate < 0) {
-                    bestCandidate = nodeId;
-                    bestLevel = node.level();
-                }
-            }
-        }
-
-        return bestCandidate;
-    }
-
-    /**
-     * Greedy search at a single layer, restricted to candidate set.
-     *
-     * <p>Only considers neighbors that are in the candidateIds set.</p>
-     */
-    private NodeView searchLayerSimpleWithFilter(float[] query, NodeView entry, int level, Set<Long> candidateIds) {
-        NodeView current = entry;
-        float currentDist = computeDistance(query, current.vector());
-        boolean improved = true;
-
-        while (improved) {
-            improved = false;
-            List<Long> neighbors = current.getActiveNeighbors(level);
-
-            for (long neighborId : neighbors) {
-                // Skip if not in candidate set
-                if (!candidateIds.contains(neighborId)) {
-                    continue;
-                }
-
-                NodeView neighbor = readNode(neighborId);
-                if (neighbor == null || neighbor.isTombstoned()) {
-                    continue;
-                }
-
-                float dist = computeDistance(query, neighbor.vector());
-                if (dist < currentDist) {
-                    currentDist = dist;
-                    current = neighbor;
-                    improved = true;
-                }
-            }
-        }
-
-        return current;
-    }
-
-    /**
-     * Beam search at a layer with candidate set filtering.
-     *
-     * <p>Only considers nodes that are in the candidateIds set during traversal.</p>
-     */
-    private PriorityQueue<HnswSearchResult> searchLayerBeamWithFilter(
-            float[] query, NodeView entry, int level, int ef, Set<Long> candidateIds) {
-
-        // Max-heap for results (furthest first so we can remove worst and peek at furthest)
-        PriorityQueue<HnswSearchResult> results = new PriorityQueue<>(
-            Comparator.comparingDouble(HnswSearchResult::distance).reversed()
-        );
-
-        // Min-heap for candidates (closest first so we process nearest first)
-        PriorityQueue<HnswSearchResult> candidates = new PriorityQueue<>(
-            Comparator.comparingDouble(HnswSearchResult::distance)
-        );
-
-        // Visited set
-        java.util.Set<Long> visited = new java.util.HashSet<>();
-
-        if (entry == null || entry.isTombstoned()) {
-            return results;
-        }
-
-        float entryDist = computeDistance(query, entry.vector());
-        HnswSearchResult entryResult = createSearchResult(entry.nodeId(), entryDist);
-        candidates.add(entryResult);
-        results.add(entryResult);
-        visited.add(entry.nodeId());
-
-        while (!candidates.isEmpty()) {
-            HnswSearchResult current = candidates.poll();
-            NodeView currentNode = readNode(current.nodeId());
-
-            if (currentNode == null || currentNode.isTombstoned()) {
+            if (node == null || node.isTombstoned()) {
                 continue;
             }
+            measured.add(createSearchResult(nodeId, computeDistance(query, node.vector())));
+        }
 
-            // If current is further than furthest in results, stop
-            if (!results.isEmpty() && current.distance() > results.peek().distance()) {
-                break;
+        measured.sort(Comparator.comparingDouble(HnswSearchResult::distance));
+        return new ArrayList<>(measured.subList(0, Math.min(k, measured.size())));
+    }
+
+    /**
+     * Answers a candidate-restricted search with the ordinary graph walk, admitting only named
+     * nodes to the results.
+     *
+     * <p>Traversal is unrestricted: a named node is reached through whatever unnamed nodes lie
+     * between it and the entry point, which is the only way a scattered set can be searched at
+     * all. Must be called with the read lock held.</p>
+     */
+    private List<HnswSearchResult> walkAdmitting(
+            float[] query, int k, int ef, Set<Long> candidateIds) {
+
+        NodeView current = readNode(entryPointId);
+        if (current == null || current.isTombstoned()) {
+            long active = findActiveNode();
+            if (active < 0) {
+                return new ArrayList<>();
             }
-
-            List<Long> neighbors = currentNode.getActiveNeighbors(level);
-
-            for (long neighborId : neighbors) {
-                // Skip if not in candidate set
-                if (!candidateIds.contains(neighborId)) {
-                    continue;
-                }
-
-                if (visited.contains(neighborId)) {
-                    continue;
-                }
-                visited.add(neighborId);
-
-                NodeView neighbor = readNode(neighborId);
-                if (neighbor == null || neighbor.isTombstoned()) {
-                    continue;
-                }
-
-                float dist = computeDistance(query, neighbor.vector());
-                HnswSearchResult result = createSearchResult(neighborId, dist);
-
-                // Add to candidates if closer than furthest result, or if results not full
-                if (results.size() < ef || dist < results.peek().distance()) {
-                    candidates.add(result);
-                    results.add(result);
-
-                    // Keep results bounded
-                    while (results.size() > ef) {
-                        results.poll();
-                    }
-                }
+            current = readNode(active);
+            if (current == null) {
+                return new ArrayList<>();
             }
         }
 
-        return results;
+        for (int level = maxLevel; level > 0; level--) {
+            NodeView closest = searchLayerSimple(query, current, level);
+            if (closest != null) {
+                current = closest;
+            }
+        }
+
+        PriorityQueue<HnswSearchResult> results =
+            searchLayerBeam(query, current, 0, ef, candidateIds);
+
+        List<HnswSearchResult> admitted = new ArrayList<>();
+        while (!results.isEmpty()) {
+            HnswSearchResult result = results.poll();
+            // The beam admitted only named nodes; this re-read is for one tombstoned since.
+            NodeView node = readNode(result.nodeId());
+            if (node != null && !node.isTombstoned()) {
+                admitted.add(result);
+            }
+        }
+
+        admitted.sort(Comparator.comparingDouble(HnswSearchResult::distance));
+        return new ArrayList<>(admitted.subList(0, Math.min(k, admitted.size())));
     }
 
     /**
@@ -1209,7 +1089,7 @@ public class HnswGraph implements AutoCloseable {
     }
 
     /**
-     * Beam search at a layer with candidate set.
+     * Beam search at a layer, admitting every node it reaches.
      *
      * <p>Tombstoned nodes are automatically skipped during traversal:
      * <ul>
@@ -1221,6 +1101,26 @@ public class HnswGraph implements AutoCloseable {
      */
     private PriorityQueue<HnswSearchResult> searchLayerBeam(
             float[] query, NodeView entry, int level, int ef) {
+        return searchLayerBeam(query, entry, level, ef, null);
+    }
+
+    /**
+     * Beam search at a layer, admitting only the named nodes to the results.
+     *
+     * <p>The walk itself is never restricted. Every neighbour is stepped through and measured, and
+     * the named set decides only which of them may be kept, so a node the caller asked for is
+     * reached through whatever unnamed nodes lie between it and the entry point. Restricting the
+     * walk instead would confine it to the subgraph induced on the named set, which for a set drawn
+     * from a pre-filter's buckets has almost no edges at all.</p>
+     *
+     * <p>Because a traversed node is no longer necessarily a kept one, the walk stops on the beam
+     * being both full and no longer improvable - not on the frontier passing the worst result,
+     * which for an unfilled beam would stop it before it had an answer.</p>
+     *
+     * @param admissible ids that may enter the results, or null to admit every node reached
+     */
+    private PriorityQueue<HnswSearchResult> searchLayerBeam(
+            float[] query, NodeView entry, int level, int ef, Set<Long> admissible) {
 
         // Max-heap for results (furthest first so we can remove worst and peek at furthest)
         PriorityQueue<HnswSearchResult> results = new PriorityQueue<>(
@@ -1242,7 +1142,9 @@ public class HnswGraph implements AutoCloseable {
         float entryDist = computeDistance(query, entry.vector());
         HnswSearchResult entryResult = createSearchResult(entry.nodeId(), entryDist);
         candidates.add(entryResult);
-        results.add(entryResult);
+        if (admissible == null || admissible.contains(entry.nodeId())) {
+            results.add(entryResult);
+        }
         visited.add(entry.nodeId());
 
         while (!candidates.isEmpty()) {
@@ -1253,9 +1155,9 @@ public class HnswGraph implements AutoCloseable {
                 continue;
             }
 
-            // If current is further than furthest in results, stop
+            // Nothing ahead of the frontier can improve a beam that is already full.
             // results.peek() returns furthest since it's a max-heap
-            if (!results.isEmpty() && current.distance() > results.peek().distance()) {
+            if (results.size() >= ef && current.distance() > results.peek().distance()) {
                 break;
             }
 
@@ -1277,14 +1179,17 @@ public class HnswGraph implements AutoCloseable {
                 float dist = computeDistance(query, neighbor.vector());
                 HnswSearchResult result = createSearchResult(neighborId, dist);
 
-                // Add to candidates if closer than furthest result, or if results not full
+                // Step through it while the beam is unfilled or it beats the worst kept result
                 if (results.size() < ef || dist < results.peek().distance()) {
                     candidates.add(result);
-                    results.add(result);
 
-                    // Keep results bounded
-                    while (results.size() > ef) {
-                        results.poll();
+                    if (admissible == null || admissible.contains(neighborId)) {
+                        results.add(result);
+
+                        // Keep results bounded
+                        while (results.size() > ef) {
+                            results.poll();
+                        }
                     }
                 }
             }

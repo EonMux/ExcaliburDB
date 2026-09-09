@@ -154,10 +154,11 @@ public class InMemorySourceRegistry implements SourceRegistry {
 
         // Create initial status entry if status registry is configured
         // This ensures /v1/ingest/status returns data even without orchestrator
+        IngestStatusEndpoint.IngestionStatus initialStatus = null;
         if (statusRegistry != null) {
-            IngestStatusEndpoint.IngestionStatus status = statusRegistry.getOrCreate(sourceId);
+            initialStatus = statusRegistry.getOrCreate(sourceId);
             // Initialize with idle state, will be updated by orchestrator if present
-            status.update("idle", 0.0, 0, 0);
+            initialStatus.update("idle", 0.0, 0, 0);
             LOGGER.debug("Created initial status entry for source: {}", sourceId);
         }
 
@@ -176,13 +177,16 @@ public class InMemorySourceRegistry implements SourceRegistry {
         if (ingestionOrchestrator != null) {
             // Full ingestion pipeline with orchestrator
             ingestionOrchestrator.startIngestion(source);
-        } else if (statusRegistry != null) {
-            // Stub mode: use IngestionWorker for status updates without full pipeline
-            IngestionWorker worker = new IngestionWorker(source, statusRegistry);
+        } else if (initialStatus != null) {
+            // No pipeline on this node. The source is still crawled, because whether the root
+            // resolves is a separate question from whether this node can index it, and the status
+            // has to say which of the two is wrong rather than report an ingestion that never ran.
+            // The probe is handed the entry created just above rather than the registry: a lookup
+            // on the probe's thread can land after a removal and re-create what removal cleared.
             Thread.ofVirtual()
-                .name("ingestion-worker-" + sourceId)
-                .start(worker);
-            LOGGER.debug("Started stub ingestion worker for source: {}", sourceId);
+                .name("source-probe-" + sourceId)
+                .start(new UnconfiguredSourceProbe(source, initialStatus));
+            LOGGER.debug("No ingestion pipeline configured; probing source: {}", sourceId);
         }
     }
 
@@ -196,13 +200,46 @@ public class InMemorySourceRegistry implements SourceRegistry {
         return sources.get(sourceId);
     }
 
+    /**
+     * Removes a source and undoes everything registering it started.
+     *
+     * <p>Symmetric with {@link #register(Source)} on purpose. That method starts three things
+     * besides the registry entry - an ingestion run, a status entry and a place in the reindex
+     * schedule - and a removal that left them behind would leave the node crawling a source no
+     * request can name, reporting it on {@code /v1/ingest/status} forever, and logging a
+     * source-not-found warning every scheduling interval for the life of the process.</p>
+     *
+     * <p>The order matters: ingestion is stopped before the source is closed, because a run still
+     * inside {@code source.fetch} holds the very thing being closed.</p>
+     *
+     * @param sourceId The source ID to remove
+     * @return true if the source was registered
+     */
     @Override
     public boolean remove(String sourceId) {
         Source removed = sources.remove(sourceId);
         if (removed == null) {
             return false;
         }
+
+        if (ingestionOrchestrator != null) {
+            ingestionOrchestrator.stopIngestion(sourceId);
+        }
+        if (reindexScheduler != null) {
+            try {
+                reindexScheduler.unregisterSource(Long.parseLong(sourceId));
+            } catch (NumberFormatException e) {
+                // Never registered with the scheduler either; register() logs that at the time.
+                LOGGER.debug("Source ID '{}' is not numeric, nothing to unregister", sourceId);
+            }
+        }
+        if (statusRegistry != null) {
+            statusRegistry.remove(sourceId);
+        }
+
         closeSource(sourceId, removed);
+        LOGGER.info("Removed source {}: ingestion stopped, status cleared, reindexing cancelled",
+            sourceId);
         return true;
     }
 

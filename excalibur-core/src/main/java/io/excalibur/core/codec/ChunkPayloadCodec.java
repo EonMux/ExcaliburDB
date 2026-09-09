@@ -11,10 +11,18 @@ import java.util.Objects;
  *
  * <h2>Layout</h2>
  * <pre>
- * [dimension : int32 little-endian]
- * [embedding : dimension * float32 little-endian]
+ * [dimension : int32 little-endian, 0 when the chunk carries no embedding]
+ * [embedding : dimension * float32 little-endian, absent when dimension is 0]
  * [text      : the remaining bytes, UTF-8, possibly empty]
  * </pre>
+ *
+ * <h2>Chunks with no embedding</h2>
+ * <p>A dimension of 0 is a chunk that was indexed lexically and never embedded. It is a normal
+ * value, not a damaged one: retrieval that goes through Lucene and the graph does not need a
+ * vector, and requiring one made a corpus-wide embedding pass the price of admission for any
+ * indexing at all. Readers get null from {@link #embeddingOf(byte[])} for such a chunk, which is
+ * the same answer they already had to handle for a value whose vector they cannot use, while
+ * {@link #textBytesOf(byte[])} returns the text as usual.</p>
  *
  * <h2>Why one class owns it</h2>
  * <p>This layout is written to disk by ingestion and by the reindexer, and read back by the tail
@@ -79,6 +87,23 @@ public final class ChunkPayloadCodec {
         return encode(embedding, new byte[0]);
     }
 
+    /**
+     * Encodes chunk text with no embedding.
+     *
+     * @param text The chunk text
+     * @return The stored value, declaring dimension 0
+     * @throws NullPointerException if the text is null
+     */
+    public static byte[] encodeTextOnly(String text) {
+        Objects.requireNonNull(text, "text must not be null");
+        byte[] textBytes = text.getBytes(StandardCharsets.UTF_8);
+        return ByteBuffer.allocate(HEADER_BYTES + textBytes.length)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(0)
+            .put(textBytes)
+            .array();
+    }
+
     private static byte[] encode(float[] embedding, byte[] textBytes) {
         Objects.requireNonNull(embedding, "embedding must not be null");
         if (embedding.length == 0) {
@@ -103,19 +128,20 @@ public final class ChunkPayloadCodec {
     /**
      * Returns the dimension the value declares, or -1 when the value does not carry a usable one.
      *
-     * <p>Usable means: the header is present, the dimension is positive and within
-     * {@link #MAX_DIMENSION}, and the value is long enough to hold that many floats. A caller
-     * that gets -1 has a value this codec did not write, or one that has been truncated.
+     * <p>Usable means: the header is present, the dimension is not negative and is within
+     * {@link #MAX_DIMENSION}, and the value is long enough to hold that many floats. Zero is
+     * usable and means the chunk carries text but no embedding. A caller that gets -1 has a
+     * value this codec did not write, or one that has been truncated.
      *
      * @param value The stored value (may be null)
-     * @return The dimension, or -1
+     * @return The dimension, 0 when the chunk has no embedding, or -1 when unreadable
      */
     public static int dimensionOf(byte[] value) {
         if (value == null || value.length < HEADER_BYTES) {
             return -1;
         }
         int dimension = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getInt();
-        if (dimension <= 0 || dimension > MAX_DIMENSION) {
+        if (dimension < 0 || dimension > MAX_DIMENSION) {
             return -1;
         }
         if (value.length < HEADER_BYTES + dimension * Float.BYTES) {
@@ -132,7 +158,9 @@ public final class ChunkPayloadCodec {
      */
     public static float[] embeddingOf(byte[] value) {
         int dimension = dimensionOf(value);
-        if (dimension < 0) {
+        if (dimension <= 0) {
+            // 0 is a chunk indexed without a vector; -1 is a value that cannot be read. Both
+            // mean the caller has no embedding to use here.
             return null;
         }
         ByteBuffer buffer = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);

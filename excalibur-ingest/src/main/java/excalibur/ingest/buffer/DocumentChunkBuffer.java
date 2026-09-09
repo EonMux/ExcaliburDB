@@ -289,7 +289,6 @@ public class DocumentChunkBuffer {
             String documentId,
             Map<Integer, float[]> embeddings) throws IOException {
         Objects.requireNonNull(documentId, "documentId must not be null");
-        Objects.requireNonNull(embeddings, "embeddings must not be null");
 
         commitLock.lock();
         try {
@@ -376,7 +375,11 @@ public class DocumentChunkBuffer {
     private static byte[] encodeValue(String documentId, TextChunk chunk,
                                       Map<Integer, float[]> embeddings) {
         if (embeddings == null) {
-            return chunk.getText().getBytes(StandardCharsets.UTF_8);
+            // Codec form with dimension 0, not bare UTF-8. The tail scanner and the relevancy
+            // scorer read every write-log value through ChunkPayloadCodec, so a value written
+            // without the header is not a chunk with no vector to them -- it is a value they
+            // cannot parse at all, and the text is lost rather than merely unembedded.
+            return ChunkPayloadCodec.encodeTextOnly(chunk.getText());
         }
 
         float[] embedding = embeddings.get(chunk.getChunkIndex());

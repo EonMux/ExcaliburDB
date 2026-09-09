@@ -199,6 +199,17 @@ public final class Metrics {
 
     // Ingestion rate tracking
     private static final Object ingestionRateLock = new Object();
+
+    /**
+     * The shortest window an observer can start a new rate sample over.
+     *
+     * <p>A rate is a measurement over an interval, so reading one has to name an interval. Letting
+     * every read start a fresh one made the metric depend on who was watching it: a console that
+     * polled twice in quick succession measured the second poll over a window in which nothing
+     * could have been ingested, and reported zero. Within one window every observer sees the same
+     * sample.</p>
+     */
+    private static final long RATE_SAMPLE_WINDOW_MS = 1000;
     private static volatile long lastRateCalculationTimestamp = System.currentTimeMillis();
     private static volatile long entriesIngestedAtLastRateCalculation = 0;
     private static volatile double currentIngestionRate = 0.0;
@@ -299,6 +310,25 @@ public final class Metrics {
             }
             entriesIngestedAtLastRateCalculation = entries;
             lastRateCalculationTimestamp = now;
+        }
+    }
+
+    /**
+     * Returns the ingestion rate for observers, re-sampling at most once per sample window.
+     *
+     * <p>This is what the JMX attribute reads. Unlike {@link #updateIngestionRate()} it is safe to
+     * call from any number of observers at any frequency: reading the rate does not consume the
+     * interval it was measured over, so two reads in the same window agree, and one console's
+     * polling cannot zero the value another console is watching.</p>
+     *
+     * @return The current ingestion rate in entries per second
+     */
+    public static double sampledIngestionRate() {
+        synchronized (ingestionRateLock) {
+            if (System.currentTimeMillis() - lastRateCalculationTimestamp >= RATE_SAMPLE_WINDOW_MS) {
+                updateIngestionRate();
+            }
+            return currentIngestionRate;
         }
     }
 
@@ -1839,9 +1869,8 @@ public final class Metrics {
                 case "queriesExecuted":
                     return Metrics.getQueriesExecuted();
                 case "ingestionRate":
-                    // Update rate before reading
-                    Metrics.updateIngestionRate();
-                    return Metrics.getIngestionRate();
+                    // Sampled, not recomputed: a read must not consume the interval it measures.
+                    return Metrics.sampledIngestionRate();
                 case "peakIngestionRate":
                     return Metrics.getPeakIngestionRate();
                 default:

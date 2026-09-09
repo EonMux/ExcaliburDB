@@ -371,4 +371,102 @@ class IndexCoverageTest {
             assertThat(coverage.estimatedCorpusCoverage()).isEqualTo(0.5);
         }
     }
+
+    @Nested
+    @DisplayName("Segments the query was not permitted to search")
+    class ExcludedSegments {
+
+        @Test
+        @DisplayName("are taken out of the coverage numerator")
+        void exclusionsLowerCoverage() {
+            // The catalog census says both segments are part of the live corpus. One of them was
+            // withheld from this query, so half the corpus was searched, not all of it.
+            IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(2)
+                .activeSegments(1)
+                .indexingSegments(1)
+                .segmentsExcluded(1)
+                .computeCoverage()
+                .build();
+
+            assertThat(coverage.estimatedCorpusCoverage()).isEqualTo(0.5);
+        }
+
+        @Test
+        @DisplayName("report zero coverage when they are the whole corpus")
+        void everySegmentExcludedIsNoCoverage() {
+            // The blackout a rolling reindex opens: the old segments are tombstoned and the new
+            // one has not reached ACTIVE, so a query that asked for complete segments only is
+            // shown nothing. Reporting full coverage over that makes an empty answer look
+            // authoritative.
+            IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(2)
+                .warmingSegments(1)
+                .tombstonedSegments(1)
+                .segmentsExcluded(1)
+                .computeCoverage()
+                .computeDegraded(0.5)
+                .build();
+
+            assertThat(coverage.estimatedCorpusCoverage()).isEqualTo(0.0);
+            assertThat(coverage.degraded())
+                .as("a query shown none of the corpus is degraded, whatever the catalog holds")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("are counted so a client can tell why coverage is short")
+        void theCountIsReported() {
+            // Short coverage has three unrelated causes - a segment errored, a segment timed out,
+            // or the query was never allowed to look at it. Only the last is the client's own
+            // doing, and the ratio alone cannot tell them apart.
+            IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(4)
+                .activeSegments(4)
+                .segmentsExcluded(3)
+                .computeCoverage()
+                .build();
+
+            assertThat(coverage.segmentsExcluded()).isEqualTo(3);
+            assertThat(coverage.estimatedCorpusCoverage()).isEqualTo(0.25);
+        }
+
+        @Test
+        @DisplayName("clamp at zero rather than reporting negative coverage")
+        void moreExclusionsThanQueryableClampsToZero() {
+            IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(4)
+                .activeSegments(2)
+                .segmentsExcluded(3)
+                .computeCoverage()
+                .build();
+
+            assertThat(coverage.estimatedCorpusCoverage()).isEqualTo(0.0);
+        }
+
+        @Test
+        @DisplayName("leave the census alone when there are none")
+        void noExclusionsLeavesTheCensusIntact() {
+            IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(100)
+                .activeSegments(60)
+                .indexingSegments(10)
+                .warmingSegments(5)
+                .compactingSegments(5)
+                .tombstonedSegments(20)
+                .computeCoverage()
+                .build();
+
+            assertThat(coverage.estimatedCorpusCoverage()).isEqualTo(1.0);
+            assertThat(coverage.segmentsExcluded()).isZero();
+        }
+
+        @Test
+        @DisplayName("cannot be negative")
+        void rejectsNegativeSegmentsExcluded() {
+            assertThatThrownBy(() -> IndexCoverage.builder().segmentsExcluded(-1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("negative");
+        }
+    }
 }

@@ -11,12 +11,21 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Nested;
 
+import excalibur.ingest.lexical.ChunkIndex;
+import excalibur.ingest.lexical.ChunkIndexStats;
+import io.excalibur.retrieval.expand.QueryExpander;
+import io.excalibur.retrieval.lexical.native_.CompactionResult;
+import io.excalibur.retrieval.rank.Ranker;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.util.Optional;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -98,6 +107,146 @@ class StatsEndpointTest {
         void acceptsRequiredDependencies() {
             assertThatCode(() -> new StatsEndpoint(indexOrchestrator, storageEngine))
                 .doesNotThrowAnyException();
+        }
+    }
+
+    /**
+     * A chunk index that reports whatever a test wants it to.
+     *
+     * <p>Only {@link #stats()} is exercised here: what the endpoint has to get right is reporting
+     * an index's own account of itself, not indexing.</p>
+     */
+    private record ReportingIndex(ChunkIndexStats reported) implements ChunkIndex {
+
+        @Override
+        public void add(String chunkId, String text) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void refresh() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public int erase(Set<String> chunkIds) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public String chunkIdOf(long id) {
+            return null;
+        }
+
+        @Override
+        public long indexedCount() {
+            return reported.indexed();
+        }
+
+        @Override
+        public CompactionResult compactIfDue(java.util.function.Function<String, String> textOf) {
+            return CompactionResult.declined("test");
+        }
+
+        @Override
+        public CompactionResult compactNow(java.util.function.Function<String, String> textOf) {
+            return CompactionResult.declined("test");
+        }
+
+        @Override
+        public Ranker ranker(QueryExpander expander) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public String engine() {
+            return reported.engine();
+        }
+
+        @Override
+        public ChunkIndexStats stats() {
+            if (reported == null) {
+                throw new IllegalStateException("index unavailable");
+            }
+            return reported;
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    @Nested
+    @DisplayName("Lexical index reporting")
+    class LexicalReporting {
+
+        private String responseOf(ChunkIndex index) throws IOException {
+            StatsEndpoint endpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
+            endpoint.withLexicalIndex(index);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+            return baos.toString(StandardCharsets.UTF_8);
+        }
+
+        @Test
+        @DisplayName("a node with no lexical index reports no lexical block")
+        void absentIndexIsAbsentFromTheResponse() throws IOException {
+            // Not a block of zeroes: an index reporting nothing and no index at all are different
+            // states, and a caller charting the erasure backlog needs to tell them apart.
+            assertThat(responseOf(null)).doesNotContain("\"lexical\"");
+        }
+
+        @Test
+        @DisplayName("the index's counts are reported")
+        void countsAreReported() throws IOException {
+            String response = responseOf(new ReportingIndex(new ChunkIndexStats(
+                "native", 15_000_000L, 12, 14_980_000L, 20_000L, 3,
+                Optional.of(Instant.now().minusSeconds(412)), false)));
+
+            assertThat(response).contains("\"lexical\": {");
+            assertThat(response).contains("\"engine\": \"native\"");
+            assertThat(response).contains("\"indexed\": 15000000");
+            assertThat(response).contains("\"segments\": 12");
+            assertThat(response).contains("\"liveChunks\": 14980000");
+            assertThat(response).contains("\"erasedChunks\": 20000");
+            assertThat(response).contains("\"erasureRequests\": 3");
+            assertThat(response).contains("\"compactionDue\": false");
+        }
+
+        @Test
+        @DisplayName("an outstanding erasure is reported by how long it has been waiting")
+        void erasureAgeIsReported() throws IOException {
+            // The number an operator compares against the configured latency bound. An instant
+            // would leave them doing the subtraction against a clock that is not theirs.
+            String response = responseOf(new ReportingIndex(new ChunkIndexStats(
+                "native", 10L, 1, 9L, 1L, 1,
+                Optional.of(Instant.now().minusSeconds(600)), true)));
+
+            assertThat(response).containsPattern("\"oldestErasureAgeMs\": 6[0-9]{5}");
+            assertThat(response).contains("\"compactionDue\": true");
+        }
+
+        @Test
+        @DisplayName("a node owing nothing reports no age at all")
+        void nothingOwedIsNull() throws IOException {
+            String response = responseOf(new ReportingIndex(new ChunkIndexStats(
+                "native", 10L, 1, 10L, 0L, 0, Optional.empty(), false)));
+
+            assertThat(response).contains("\"oldestErasureAgeMs\": null");
+            assertThat(response).contains("\"erasedRatio\": 0.0000");
+        }
+
+        @Test
+        @DisplayName("an index that cannot answer does not take the rest of the report with it")
+        void aFailingIndexIsOmitted() throws IOException {
+            String response = responseOf(new ReportingIndex(null));
+
+            assertThat(response).doesNotContain("\"lexical\"");
+            assertThat(response).contains("\"segments\":");
+            assertThat(response).contains("\"coverage\":");
         }
     }
 
@@ -412,40 +561,44 @@ class StatsEndpointTest {
 
             // Coverage validation
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, Double.NaN))
+                segments, entries, volumes, hnsw, cuckoo, visibility, Double.NaN, null))
                 .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, -0.1))
+                segments, entries, volumes, hnsw, cuckoo, visibility, -0.1, null))
                 .isInstanceOf(IllegalArgumentException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 1.1))
+                segments, entries, volumes, hnsw, cuckoo, visibility, 1.1, null))
                 .isInstanceOf(IllegalArgumentException.class);
             assertThatCode(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 0.0))
+                segments, entries, volumes, hnsw, cuckoo, visibility, 0.0, null))
                 .doesNotThrowAnyException();
             assertThatCode(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 1.0))
+                segments, entries, volumes, hnsw, cuckoo, visibility, 1.0, null))
                 .doesNotThrowAnyException();
 
             // Null validation
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                null, entries, volumes, hnsw, cuckoo, visibility, 0.5))
+                null, entries, volumes, hnsw, cuckoo, visibility, 0.5, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, null, volumes, hnsw, cuckoo, visibility, 0.5))
+                segments, null, volumes, hnsw, cuckoo, visibility, 0.5, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, null, hnsw, cuckoo, visibility, 0.5))
+                segments, entries, null, hnsw, cuckoo, visibility, 0.5, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, null, cuckoo, visibility, 0.5))
+                segments, entries, volumes, null, cuckoo, visibility, 0.5, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, null, visibility, 0.5))
+                segments, entries, volumes, hnsw, null, visibility, 0.5, null))
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, null, 0.5))
+                segments, entries, volumes, hnsw, cuckoo, null, 0.5, null))
                 .isInstanceOf(NullPointerException.class);
+            assertThatCode(() -> new StatsEndpoint.SystemStats(
+                segments, entries, volumes, hnsw, cuckoo, visibility, 0.5, null))
+                .as("a node that keeps no lexical index reports no lexical block")
+                .doesNotThrowAnyException();
         }
     }
 

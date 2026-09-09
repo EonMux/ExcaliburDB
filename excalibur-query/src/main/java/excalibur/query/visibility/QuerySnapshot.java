@@ -10,7 +10,9 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -86,6 +88,12 @@ public final class QuerySnapshot {
      * Cached list of resolved segments (lazy initialization).
      */
     private volatile List<Segment> cachedSegments;
+
+    /**
+     * The resolved segments paired with the IDs they were resolved from.
+     * Immutable after construction.
+     */
+    private volatile Map<Long, Segment> cachedSegmentsById;
 
     /**
      * Snapshot statistics (lazy initialization).
@@ -219,23 +227,47 @@ public final class QuerySnapshot {
             return cachedSegments;
         }
 
+        cachedSegments = List.copyOf(resolveVisibleSegmentsById().values());
+        return cachedSegments;
+    }
+
+    /**
+     * Resolves the visible segments, each paired with the ID it was resolved from.
+     *
+     * <p>The ID is the directory index the storage engine routes by, and it is the ID every
+     * other component keys a segment on: the catalog, the visibility tracker, the term filter
+     * hierarchy and the graph provider. It is not {@link Segment#segmentId()}, which counts
+     * every segment instance a process has ever constructed and coincides with the directory
+     * index only until the first compaction or split creates one out of order.</p>
+     *
+     * <p>Callers that need both the segment and an ID to look it up by must take the pair from
+     * here rather than asking the segment for an ID of its own, because the two answers differ
+     * without either side being able to tell.</p>
+     *
+     * @return Immutable map of directory index to segment, in visibility order
+     */
+    public Map<Long, Segment> resolveVisibleSegmentsById() {
+        if (cachedSegmentsById != null) {
+            return cachedSegmentsById;
+        }
+
         synchronized (this) {
-            if (cachedSegments != null) {
-                return cachedSegments;
+            if (cachedSegmentsById != null) {
+                return cachedSegmentsById;
             }
 
-            List<Segment> segments = new ArrayList<>(visibleSegmentIds.size());
+            Map<Long, Segment> resolved = new LinkedHashMap<>(visibleSegmentIds.size());
             for (Long segmentId : visibleSegmentIds) {
                 Segment segment = storageEngine.getSegment(segmentId);
                 if (segment != null && !segment.isClosed()) {
-                    segments.add(segment);
+                    resolved.put(segmentId, segment);
                 }
             }
 
-            cachedSegments = Collections.unmodifiableList(segments);
+            cachedSegmentsById = Collections.unmodifiableMap(resolved);
 
-            LOGGER.trace("Resolved {} segments for epoch {}", segments.size(), epoch);
-            return cachedSegments;
+            LOGGER.trace("Resolved {} segments for epoch {}", resolved.size(), epoch);
+            return cachedSegmentsById;
         }
     }
 

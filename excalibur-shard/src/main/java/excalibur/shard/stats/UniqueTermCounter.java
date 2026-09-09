@@ -82,8 +82,9 @@ public class UniqueTermCounter {
      */
     public UniqueTermCounter(int precision) {
         this.hll = new HyperLogLog(precision);
-        LOGGER.debug("Created UniqueTermCounter with precision={} ({} registers, ~{:.2f}% error)",
-            precision, hll.numRegisters(), HyperLogLog.standardError(precision));
+        LOGGER.debug("Created UniqueTermCounter with precision={} ({} registers, ~{}% error)",
+            precision, hll.numRegisters(),
+            String.format("%.2f", HyperLogLog.standardError(precision)));
     }
 
     /**

@@ -2592,6 +2592,24 @@ public class Segment implements AutoCloseable {
     }
 
     /**
+     * Gives up ownership of the attached LSH index without closing it.
+     *
+     * <p>For handing a pre-filter to a replacement segment across a compaction. The pre-filter is
+     * keyed by HNSW node id, and compaction carries the graph over unchanged, so the ids the
+     * index holds still name the same vectors in the replacement. {@link #close()} closes
+     * whatever is still attached, so a swap that attached the same index to the replacement and
+     * then let the old segment close would leave the replacement holding a closed index - one
+     * mapped file per hash table, released underneath a live query path.</p>
+     *
+     * @return the LSH index that was attached, or null if there was none
+     */
+    public excalibur.filter.lsh.LshIndex detachLshIndex() {
+        excalibur.filter.lsh.LshIndex detached = this.lshIndex;
+        this.lshIndex = null;
+        return detached;
+    }
+
+    /**
      * Attaches a Count-Min Sketch for term frequency estimation.
      *
      * <p>The Count-Min Sketch is used by the query planner to estimate
@@ -2668,15 +2686,6 @@ public class Segment implements AutoCloseable {
     }
 
     /**
-     * Returns the HNSW graph attached to this segment.
-     *
-     * <p>The HNSW graph enables efficient approximate nearest neighbor
-     * search over vectors stored in this segment. Returns null if no
-     * graph has been attached.</p>
-     *
-     * @return The HNSW graph, or null if none is attached
-     */
-    /**
      * Gives up ownership of the attached HNSW graph without closing it.
      *
      * <p>For handing a graph to a replacement segment. {@link #close()} closes whatever is still
@@ -2692,6 +2701,15 @@ public class Segment implements AutoCloseable {
         return detached;
     }
 
+    /**
+     * Returns the HNSW graph attached to this segment.
+     *
+     * <p>The HNSW graph enables efficient approximate nearest neighbor
+     * search over vectors stored in this segment. Returns null if no
+     * graph has been attached.</p>
+     *
+     * @return The HNSW graph, or null if none is attached
+     */
     public io.excalibur.vector.hnsw.HnswGraph hnswGraph() {
         return hnswGraph;
     }

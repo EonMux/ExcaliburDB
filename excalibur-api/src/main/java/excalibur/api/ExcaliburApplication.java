@@ -6,6 +6,7 @@ import excalibur.api.bootstrap.ReindexerFactory;
 import excalibur.api.bootstrap.ShutdownSequence;
 import excalibur.api.security.ApiSecurityConfig;
 import excalibur.api.server.ExcaliburDBServer;
+import excalibur.api.server.ListenPort;
 import excalibur.filter.HierarchicalCuckooFilter;
 import excalibur.ingest.lsh.LshIngestionService;
 import excalibur.ingest.pipeline.DocumentReindexer;
@@ -82,11 +83,6 @@ public final class ExcaliburApplication {
     public static final String DEFAULT_CONFIG_PATH = "excalibur.properties";
 
     /**
-     * Default server port.
-     */
-    public static final int DEFAULT_PORT = 8080;
-
-    /**
      * Default data directory for storage.
      */
     public static final String DEFAULT_DATA_DIR = "data";
@@ -100,6 +96,15 @@ public final class ExcaliburApplication {
     private final Arena arena;
     private final StorageEngine storageEngine;
     private final IndexOrchestrator indexOrchestrator;
+
+    /**
+     * The chunk index, once the ingestion pipeline has opened one.
+     *
+     * <p>Held so shutdown can close it. Closing publishes whatever is still buffered, which is the
+     * difference between a clean stop and one that leaves the tail of a run in storage and out of
+     * every query.</p>
+     */
+    private volatile excalibur.ingest.lexical.ChunkIndex chunkIndex;
     /**
      * The graph-RAG stack, or null where no graph store is on disk.
      *
@@ -150,6 +155,9 @@ public final class ExcaliburApplication {
     private final MetricsRegistry metricsRegistry;
 
     private volatile boolean shutdownRequested = false;
+
+    /** Where segments, indexes and the lexical index live. */
+    private Path dataDirectory;
 
     /**
      * Main entry point.
@@ -233,6 +241,7 @@ public final class ExcaliburApplication {
 
         // Initialize data directory
         Path dataDir = initializeDataDirectory();
+        this.dataDirectory = dataDir;
 
         // Build the storage stack: arena, storage engine with its HNSW initializer
         // installed before start(), volume manager, index orchestrator and the
@@ -248,8 +257,13 @@ public final class ExcaliburApplication {
         // because it needs the index orchestrator's visibility tracker: publishing a document
         // on the same counter the query pipeline captures from is what lets the atomicity
         // filter bound by the query's snapshot instead of only checking completeness.
+        // Persisted, because the registry is what says which documents this node holds and under
+        // which chunk ids. Lost on restart, every document reads as new to change detection - so a
+        // re-crawl reingests the whole corpus and tombstones none of the old chunks - and
+        // POST /v1/erasure can no longer name the chunks of anything ingested before the restart.
         this.documentVisibilityTracker = new DocumentVisibilityTracker(
-            new DocumentRegistry(), indexOrchestrator.getVisibilityTracker());
+            excalibur.api.bootstrap.DocumentRegistryFactory.open(dataDir),
+            indexOrchestrator.getVisibilityTracker());
         this.documentVisibilityChecker =
             new DocumentVisibilityTrackerAdapter(documentVisibilityTracker);
         LOGGER.info("Document visibility tracker initialized on the node epoch clock");
@@ -313,21 +327,15 @@ public final class ExcaliburApplication {
     /**
      * Determines the server port from configuration or defaults.
      *
+     * <p>Read off the effective properties for the same reason the security policy is: they are
+     * the file and the environment already merged by one parser, so the port cannot end up
+     * disagreeing with the rest of the configuration about which value won.</p>
+     *
      * @return Server port
+     * @throws IllegalArgumentException if a configured port is not usable
      */
     private int determinePort() {
-        // Check for port in environment variable first (common in cloud deployments)
-        String portEnv = System.getenv("EXCALIBUR_PORT");
-        if (portEnv != null && !portEnv.isEmpty()) {
-            try {
-                return Integer.parseInt(portEnv);
-            } catch (NumberFormatException e) {
-                LOGGER.warn("Invalid EXCALIBUR_PORT value: {}. Using default.", portEnv);
-            }
-        }
-
-        // Use default port
-        return DEFAULT_PORT;
+        return ListenPort.resolve(config.getEffectiveProperties(), System.getenv());
     }
 
     /**
@@ -428,6 +436,8 @@ public final class ExcaliburApplication {
      *   <li>Chunks are written through the storage engine's hash routing, so a
      *       reindexed chunk stays reachable by key</li>
      *   <li>Superseded chunks are tombstoned through the same routed delete</li>
+     *   <li>The lexical index is kept in step: reindexed chunks are indexed and retired
+     *       ones erased, so BM25 cannot answer with a document the corpus no longer has</li>
      *   <li>Rolling replacement is enabled when a volume manager and a segment catalog
      *       are available</li>
      * </ul>
@@ -451,7 +461,8 @@ public final class ExcaliburApplication {
             volumeManager,
             indexOrchestrator,
             hierarchicalFilter,
-            documentVisibilityTracker.getRegistry()
+            documentVisibilityTracker.getRegistry(),
+            chunkIndex
         );
 
         server.withReindexer(reindexer);
@@ -461,8 +472,8 @@ public final class ExcaliburApplication {
     /**
      * Creates the HTTP server.
      *
-     * <p>This method also wires the ingestion pipeline with LSH support, enabling
-     * the /v1/ingest endpoint to trigger full document processing with LSH indexing.</p>
+     * <p>This method also wires the ingestion pipeline, enabling the /v1/ingest endpoint to
+     * trigger full document processing.</p>
      *
      * @return Initialized HTTP server
      */
@@ -482,9 +493,18 @@ public final class ExcaliburApplication {
         // One resolution of the security policy for the whole process
         srv.withSecurity(apiSecurity);
 
-        // Wire the ingestion pipeline with LSH support
         // This enables /v1/ingest to trigger full document processing: chunking, embedding, storage
         configureIngestionPipeline(srv);
+
+        // Erasure, wired after the pipeline because it removes what the pipeline wrote and needs
+        // the chunk index the pipeline opened. Registered whether or not there is one: a node with
+        // no lexical index still has content in storage that someone can ask to have removed.
+        srv.withDocumentErasure(new excalibur.ingest.erasure.DocumentErasureService(
+            documentVisibilityTracker.getRegistry(),
+            excalibur.api.bootstrap.StorageChunkWriter.tombstoneAdapter(storageEngine),
+            this.chunkIndex,
+            excalibur.ingest.lexical.StoredChunkText.of(storageEngine),
+            documentVisibilityTracker));
 
         // Both graph routes, whether or not a graph exists yet: a node that has ingested and not
         // built needs the build route, and one that builds later must start answering without a
@@ -552,7 +572,7 @@ public final class ExcaliburApplication {
      * <ul>
      *   <li>{@link TextChunker} - Splits documents into overlapping chunks</li>
      *   <li>{@link EmbeddingClient} - Generates vector embeddings via LLM API</li>
-     *   <li>{@link LshIngestionService} - Inserts vectors into segment LSH indices</li>
+     *   <li>{@link LshIngestionService} - The vector pre-filter, written as HNSW integration assigns node ids</li>
      *   <li>{@link IngestionOrchestrator} - Orchestrates the complete ingestion pipeline</li>
      * </ul>
      *
@@ -574,40 +594,95 @@ public final class ExcaliburApplication {
 
             // Check if LLM API key is configured before creating embedding client
             // This is required for generating embeddings during ingestion
+            // No API key is lexical-only ingestion, not "no ingestion". Documents are chunked,
+            // written and term-indexed, and retrieval serves them through Lucene and the graph.
+            // Only the vector signal is missing, which is one signal of several rather than the
+            // precondition for having an index at all -- requiring it meant a corpus-wide
+            // embedding pass before a single document could be searched.
             String llmApiKey = config.llm().getApiKey();
-            if (llmApiKey == null || llmApiKey.isEmpty()) {
-                LOGGER.warn("LLM API key not configured - ingestion will run in stub mode. " +
-                    "Set excalibur.llm.api-key in config or EXCALIBUR_LLM_API_KEY environment variable.");
-                return;
+            boolean embeddingsAvailable = llmApiKey != null && !llmApiKey.isEmpty();
+
+            LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
+            EmbeddingClient embeddingClient = null;
+            if (embeddingsAvailable) {
+                embeddingClient = new EmbeddingClient(llmClientConfig);
+                LOGGER.info("EmbeddingClient created: baseUrl={}, model={}, dimensions={}",
+                    config.llm().getBaseUrl(), config.llm().getEmbeddingModel(),
+                    llmClientConfig.getEmbeddingDimension());
+            } else {
+                LOGGER.warn("LLM API key not configured - ingesting lexically. Documents are "
+                    + "chunked, stored and term-indexed, and are retrievable through Lucene and "
+                    + "the graph; no vectors are produced, so POST /v1/query (vector search) "
+                    + "stays unavailable. Set excalibur.llm.api-key, or EXCALIBUR_LLM_API_KEY, "
+                    + "to add the vector signal.");
             }
 
-            // Create EmbeddingClient from LLM configuration
-            // Uses base URL, API key, and embedding model from config
-            LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
-            EmbeddingClient embeddingClient = new EmbeddingClient(llmClientConfig);
-            LOGGER.info("EmbeddingClient created: baseUrl={}, model={}, dimensions={}",
-                config.llm().getBaseUrl(), config.llm().getEmbeddingModel(),
-                llmClientConfig.getEmbeddingDimension());
-
-            // Create LshIngestionService for inserting vectors into segment LSH indices
+            // The vector pre-filter. It is written by HNSW integration rather than by ingestion,
+            // because it is keyed by the node ids that integration assigns.
             // Uses vector dimensions from query config (should match embedding dimensions)
             int vectorDimensions = config.query().getVectorDimensions();
             if (vectorDimensions <= 0) {
                 vectorDimensions = llmClientConfig.getEmbeddingDimension();
             }
-            LshIngestionService lshIngestionService = new LshIngestionService(vectorDimensions);
-            LOGGER.info("LshIngestionService created with dimensions={}", vectorDimensions);
+            // A BM25 index over the chunks this node stores. Built regardless of whether
+            // embeddings are configured: it is the retrieval path that does not require the
+            // corpus to be permuted into vectors first.
+            excalibur.ingest.lexical.ChunkIndex chunkIndex = null;
+            try {
+                chunkIndex = excalibur.api.bootstrap.ChunkIndexFactory.open(config, dataDirectory,
+                    () -> indexOrchestrator.getVisibilityTracker().currentEpoch());
+                this.chunkIndex = chunkIndex;
+                LOGGER.info("Chunk lexical index opened on the {} engine", chunkIndex.engine());
+            } catch (IOException e) {
+                LOGGER.warn("Chunk lexical index unavailable, BM25 retrieval disabled: {}",
+                    e.getMessage());
+            }
+
+            // LSH places vectors; with none to place it is dead weight on every write.
+            LshIngestionService lshIngestionService =
+                embeddingsAvailable ? new LshIngestionService(vectorDimensions) : null;
+            LOGGER.info("LshIngestionService: {}",
+                lshIngestionService == null ? "disabled (lexical-only ingestion)"
+                                            : "dimensions=" + vectorDimensions);
 
             // Wire the ingestion pipeline
-            // This enables /v1/ingest to trigger full document processing with LSH indexing
             server.withIngestionPipeline(textChunker, embeddingClient, lshIngestionService, documentVisibilityTracker);
-            LOGGER.info("Ingestion pipeline configured with LSH support and document atomicity");
+            LOGGER.info("Ingestion pipeline configured with document atomicity");
 
-            configureGraphIngest(server, llmClientConfig);
+            if (chunkIndex != null) {
+                excalibur.ingest.pipeline.IngestionOrchestrator orchestrator =
+                    server.getIngestionOrchestrator();
+                if (orchestrator != null) {
+                    orchestrator.setLexicalIndex(chunkIndex);
+                }
+                // Query expansion is what carries the semantics when the corpus is not embedded.
+                // It needs a chat model; without one this degrades to plain BM25, which is a
+                // weaker search and still a working one.
+                io.excalibur.retrieval.expand.QueryExpander expander =
+                    io.excalibur.retrieval.expand.QueryExpander.identity();
+                if (embeddingsAvailable) {
+                    expander = new io.excalibur.retrieval.expand.LlmQueryExpander(
+                        new io.excalibur.llm.client.LLMHttpClient(llmClientConfig));
+                    LOGGER.info("Query expansion enabled with chat model {}",
+                        config.llm().getChatModel());
+                } else {
+                    LOGGER.info("No chat model configured; retrieval is plain BM25 without "
+                        + "query expansion");
+                }
+                server.withLexicalQueryService(new excalibur.api.retrieval.LexicalQueryService(
+                    chunkIndex, expander, java.util.List.of()));
+                server.withChunkIndex(chunkIndex);
+            }
+
+            if (embeddingsAvailable) {
+                configureGraphIngest(server, llmClientConfig);
+            }
 
         } catch (Exception e) {
-            LOGGER.warn("Failed to configure ingestion pipeline: {}. Ingestion will operate in stub mode.", e.getMessage());
-            // Continue without ingestion pipeline - endpoint will operate in stub mode
+            LOGGER.warn("Failed to configure ingestion pipeline: {}. Sources can be registered "
+                + "and crawled, but nothing will be indexed.", e.getMessage(), e);
+            // Continue without the pipeline: registration is bookkeeping and does not need one,
+            // and /v1/ingest/status reports every source as unconfigured rather than as ingested.
         }
     }
 
@@ -704,6 +779,17 @@ public final class ExcaliburApplication {
             .add("stop HTTP server and drain in-flight requests",
                 () -> server.stop(SHUTDOWN_TIMEOUT_SECONDS))
             .add("stop index orchestrator", indexOrchestrator::close)
+            // After ingestion has stopped and before storage closes: closing it publishes what
+            // was still buffered, and it is storage that those chunks were written to first.
+            // A lambda, not a bound method reference: the arguments are evaluated before
+            // addIfPresent gets to check for null, so `chunkIndex::close` would fail here on
+            // exactly the shutdown where no index was ever opened.
+            .addIfPresent("close chunk lexical index", chunkIndex, () -> chunkIndex.close())
+            // After ingestion has stopped, so what is written is the final state rather than a
+            // snapshot something was still adding to. Every operation that changes the registry
+            // writes it too; this is what catches a node stopped between them.
+            .add("persist document registry",
+                () -> documentVisibilityTracker.getRegistry().persist())
             .addIfPresent("close graph tenants", graphTenants, graphTenants::close)
             .add("close storage engine", storageEngine::close)
             .addIfPresent("release memory-mapped segments", arena, arena::close)

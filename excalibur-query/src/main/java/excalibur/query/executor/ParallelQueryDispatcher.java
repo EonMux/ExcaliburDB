@@ -120,11 +120,14 @@ public class ParallelQueryDispatcher {
         long startTime = System.nanoTime();
 
         // Get queryable segments
-        List<SegmentInfo> queryableSegments = getQueryableSegments(options.includePartialSegments());
+        SegmentSelection selection = getQueryableSegments(options.includePartialSegments());
+        List<SegmentInfo> queryableSegments = selection.searchable();
 
         if (queryableSegments.isEmpty()) {
             LOGGER.debug("No queryable segments available");
             IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(catalog.size())
+                .segmentsExcluded(selection.excluded())
                 .computeCoverage()
                 .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
                 .build();
@@ -223,7 +226,7 @@ public class ParallelQueryDispatcher {
         List<QueryResultItem> mergedResults = aggregator.mergeAndRank(segmentResults);
 
         // Build coverage
-        IndexCoverage coverage = buildCoverage(segmentResults, segmentsTimedOut);
+        IndexCoverage coverage = buildCoverage(segmentResults, segmentsTimedOut, selection.excluded());
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 
@@ -234,16 +237,23 @@ public class ParallelQueryDispatcher {
     }
 
     /**
-     * Gets all segments that are queryable.
+     * Gets all segments that are queryable, with a count of the ones held back.
      *
-     * <p>Queryable segments are in INDEXING, WARMING, ACTIVE, or COMPACTING states.
-     * If includePartial is false, only ACTIVE segments are included.</p>
+     * <p>Queryable segments are in INDEXING, WARMING, ACTIVE, or COMPACTING states. When
+     * {@code includePartial} is false the partially-indexed ones are dropped - that is INDEXING
+     * alone, since a warming segment has every entry in and a compacting one serves a frozen
+     * snapshot, and both answer a query exactly as an active segment does.</p>
+     *
+     * <p>A segment the catalog counts as live corpus and this query does not read is a gap in the
+     * answer. It is counted here so the response can say so; a dropped segment is not an error
+     * anywhere else, and coverage taken from the catalog alone cannot see it.</p>
      *
      * @param includePartial Whether to include partially-indexed segments
-     * @return List of queryable segment info
+     * @return The segments to search and the number withheld from this query
      */
-    private List<SegmentInfo> getQueryableSegments(boolean includePartial) {
+    private SegmentSelection getQueryableSegments(boolean includePartial) {
         List<SegmentInfo> queryable = new ArrayList<>();
+        int excluded = 0;
 
         for (Map.Entry<Long, Segment> entry : segments.entrySet()) {
             long segmentId = entry.getKey();
@@ -262,8 +272,9 @@ public class ParallelQueryDispatcher {
                 continue;
             }
 
-            // If not including partial, only ACTIVE segments
-            if (!includePartial && state != LifecycleState.ACTIVE) {
+            // If not including partial, hold back the segments still taking entries
+            if (!includePartial && state.isPartiallyIndexed()) {
+                excluded++;
                 continue;
             }
 
@@ -271,21 +282,35 @@ public class ParallelQueryDispatcher {
             HnswGraph graph = graphProvider.getGraph(segmentId);
             if (graph == null) {
                 LOGGER.trace("No graph available for segment {}", segmentId);
+                excluded++;
                 continue;
             }
 
             queryable.add(new SegmentInfo(segmentId, segment, graph));
         }
 
-        return queryable;
+        return new SegmentSelection(queryable, excluded);
     }
 
     /**
+     * The segments a query may search, and how many of the live corpus it may not.
+     *
+     * @param searchable The segments to fan out to
+     * @param excluded How many queryable segments were withheld from this query
+     */
+    private record SegmentSelection(List<SegmentInfo> searchable, int excluded) {}
+
+    /**
      * Builds index coverage from segment results.
+     *
+     * @param segmentResults One result per segment the query fanned out to
+     * @param segmentsTimedOut How many of those did not answer in time
+     * @param segmentsExcluded How many queryable segments the query never reached
      */
     private IndexCoverage buildCoverage(
             List<SegmentQueryTask.SegmentQueryResult> segmentResults,
-            int segmentsTimedOut) {
+            int segmentsTimedOut,
+            int segmentsExcluded) {
 
         long totalSegments = catalog.size();
         long activeSegments = 0;
@@ -328,6 +353,7 @@ public class ParallelQueryDispatcher {
             .tombstonedSegments(tombstonedSegments)
             .tailScanEntries(totalTailScanEntries)
             .segmentsSearched(segmentsSearched)
+            .segmentsExcluded(segmentsExcluded)
             .segmentsWithErrors(segmentsWithErrors)
             .segmentsTimedOut(segmentsTimedOut)
             .computeCoverage()
@@ -360,17 +386,20 @@ public class ParallelQueryDispatcher {
      * for pipelines that need access to per-segment results for subsequent stages
      * (e.g., reranking, LLM scoring).</p>
      *
+     * <p>Every queryable segment is searched whole. Narrowing one to a pre-filter's candidates is
+     * {@link #dispatchToSpecificSegments(List, float[], QueryOptions, DistanceFunction)}, which
+     * takes the set per segment: HNSW node ids are dense and start at zero in every graph, so a
+     * set built against one segment names entirely different vectors in the next.</p>
+     *
      * @param queryVector The query vector
      * @param options Query options
      * @param distanceFunction The distance function
-     * @param lshCandidates Optional LSH pre-filtered candidate node IDs to constrain HNSW search
      * @return DispatchResult with raw segment results, merged results, and coverage
      */
     public DispatchResult dispatchRaw(
             float[] queryVector,
             QueryOptions options,
-            DistanceFunction distanceFunction,
-            Set<Long> lshCandidates) {
+            DistanceFunction distanceFunction) {
 
         Objects.requireNonNull(queryVector, "Query vector cannot be null");
         Objects.requireNonNull(options, "Query options cannot be null");
@@ -379,11 +408,14 @@ public class ParallelQueryDispatcher {
         long startTime = System.nanoTime();
 
         // Get queryable segments
-        List<SegmentInfo> queryableSegments = getQueryableSegments(options.includePartialSegments());
+        SegmentSelection selection = getQueryableSegments(options.includePartialSegments());
+        List<SegmentInfo> queryableSegments = selection.searchable();
 
         if (queryableSegments.isEmpty()) {
             LOGGER.debug("No queryable segments available");
             IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(catalog.size())
+                .segmentsExcluded(selection.excluded())
                 .computeCoverage()
                 .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
                 .build();
@@ -397,22 +429,17 @@ public class ParallelQueryDispatcher {
 
         LOGGER.trace("Dispatching query to {} segments", queryableSegments.size());
 
-        // Create tasks for each segment, passing through LSH candidates if provided.
-        // The candidate set (node IDs) is passed to every segment — HnswGraph.search
-        // filters its traversal to only visit nodes whose IDs appear in this set, and
-        // returns empty for a segment whose nodes don't intersect the filter.
-        // Passing null means "full search" (no pre-filtering).
         List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks = new ArrayList<>();
         for (SegmentInfo info : queryableSegments) {
             SegmentQueryTask task = new SegmentQueryTask(
-                info.segmentId,
-                info.segment,
-                info.graph,
+                info.segmentId(),
+                info.segment(),
+                info.graph(),
                 queryVector,
                 options.topK(),
                 options.oversamplingFactor(),
                 distanceFunction,
-                lshCandidates
+                info.lshCandidates()
             );
             tasks.add(task);
         }
@@ -427,6 +454,8 @@ public class ParallelQueryDispatcher {
             Thread.currentThread().interrupt();
             LOGGER.warn("Query dispatch interrupted");
             IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(catalog.size())
+                .segmentsExcluded(selection.excluded())
                 .degraded(true)
                 .computeCoverage()
                 .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
@@ -502,7 +531,7 @@ public class ParallelQueryDispatcher {
         List<QueryResultItem> mergedResults = aggregator.mergeAndRank(segmentResults);
 
         // Build coverage
-        IndexCoverage coverage = buildCoverage(segmentResults, segmentsTimedOut);
+        IndexCoverage coverage = buildCoverage(segmentResults, segmentsTimedOut, selection.excluded());
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 
@@ -638,7 +667,9 @@ public class ParallelQueryDispatcher {
      * this method accepts specific segments to search rather than determining
      * queryable segments automatically.</p>
      *
-     * @param segmentsToSearch List of segment IDs, segments, and graphs to search
+     * @param segmentsToSearch The segments to search, each with the graph to search it in and the
+     *                         node ids a pre-filter narrowed it to, or a null set for a whole-graph
+     *                         search
      * @param queryVector The query vector
      * @param options Query options
      * @param distanceFunction The distance function
@@ -683,7 +714,8 @@ public class ParallelQueryDispatcher {
                 queryVector,
                 options.topK(),
                 options.oversamplingFactor(),
-                distanceFunction
+                distanceFunction,
+                info.lshCandidates()
             );
             tasks.add(task);
         }
@@ -791,7 +823,7 @@ public class ParallelQueryDispatcher {
     /**
      * Builds index coverage from segment results for specific segment searches.
      *
-     * <p>Unlike {@link #buildCoverage(List, int)}, this method doesn't count
+     * <p>Unlike {@link #buildCoverage(List, int, int)}, this method doesn't count
      * segments by lifecycle state since we're only searching specific segments.</p>
      */
     private IndexCoverage buildCoverageForSpecificSegments(
@@ -825,7 +857,8 @@ public class ParallelQueryDispatcher {
     }
 
     /**
-     * Creates a SegmentInfo for use with {@link #dispatchToSpecificSegments}.
+     * Creates a SegmentInfo for use with {@link #dispatchToSpecificSegments}, searching the whole
+     * graph.
      *
      * @param segmentId The segment ID
      * @param segment The segment instance
@@ -833,15 +866,50 @@ public class ParallelQueryDispatcher {
      * @return A new SegmentInfo instance
      */
     public static SegmentInfo createSegmentInfo(long segmentId, Segment segment, HnswGraph graph) {
-        return new SegmentInfo(segmentId, segment, graph);
+        return new SegmentInfo(segmentId, segment, graph, null);
     }
 
     /**
-     * Internal class holding segment information for querying.
+     * Creates a SegmentInfo carrying the node ids a pre-filter narrowed this segment to.
      *
-     * <p><strong>Note:</strong> This class is now public to allow
-     * {@link excalibur.query.pipeline.QueryPipeline} to create instances
-     * for dispatching to specific segments.</p>
+     * @param segmentId The segment ID
+     * @param segment The segment instance
+     * @param graph The HNSW graph for the segment
+     * @param lshCandidates The node ids the pre-filter named for this segment, or null when no
+     *                      pre-filter ran and the whole graph is to be searched
+     * @return A new SegmentInfo instance
      */
-    public record SegmentInfo(long segmentId, Segment segment, HnswGraph graph) {}
+    public static SegmentInfo createSegmentInfo(long segmentId, Segment segment, HnswGraph graph,
+                                                Set<Long> lshCandidates) {
+        return new SegmentInfo(segmentId, segment, graph, lshCandidates);
+    }
+
+    /**
+     * A segment to search, and the node ids a pre-filter has already narrowed it to.
+     *
+     * <p>{@code lshCandidates} is what the LSH stage decided about this particular segment, and it
+     * has to be carried per segment rather than shared: each segment has its own index, its own
+     * probe, and its own node id space. A null set means no pre-filter ran and the whole graph is
+     * to be walked; that is the only reading of "no candidates" that can be acted on, since an
+     * empty set is the pre-filter's way of saying the segment holds nothing worth visiting.</p>
+     *
+     * @param segmentId The routing index the storage engine holds the segment at
+     * @param segment The segment to search
+     * @param graph The segment's HNSW graph
+     * @param lshCandidates The node ids the pre-filter named, or null when it did not run
+     */
+    public record SegmentInfo(long segmentId, Segment segment, HnswGraph graph,
+                              Set<Long> lshCandidates) {
+
+        /**
+         * A segment to search in full, with no pre-filter narrowing it.
+         *
+         * @param segmentId The routing index the storage engine holds the segment at
+         * @param segment The segment to search
+         * @param graph The segment's HNSW graph
+         */
+        public SegmentInfo(long segmentId, Segment segment, HnswGraph graph) {
+            this(segmentId, segment, graph, null);
+        }
+    }
 }

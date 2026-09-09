@@ -33,6 +33,10 @@ import java.util.*;
  * ingestion sources (filesystem or HTTP). Sources are registered and
  * ingestion runs in the background.</p>
  *
+ * <p>The same path answers {@code DELETE} through
+ * {@link SourceDeregisterEndpoint}, which stops crawling a source and keeps
+ * what it indexed. One resource, two verbs.</p>
+ *
  * <h2>Request Format</h2>
  * <pre>{@code
  * {

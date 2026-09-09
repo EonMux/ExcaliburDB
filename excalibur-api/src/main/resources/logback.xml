@@ -22,6 +22,22 @@
 -->
 <configuration scan="true" scanPeriod="30 seconds">
 
+    <!--
+        Flush the appenders before the JVM goes away.
+
+        The root appender below is asynchronous: a logging call hands the event to a queue and
+        returns, and a worker thread writes it. That is the right trade for a server under load and
+        the wrong one at the moment the server is dying, because System.exit() after a fatal
+        startup error tears the JVM down while the error is still sitting in the queue. The
+        symptom is a process that exits 1 having printed nothing at all. An unparseable
+        EXCALIBUR_PORT did exactly that, while the bind-policy refusal on the next line of the same
+        constructor happened to win the race and print.
+
+        This hook stops the context on shutdown, which drains the queue first, so whichever error
+        killed the process is the last thing written.
+    -->
+    <shutdownHook class="ch.qos.logback.core.hook.DefaultShutdownHook"/>
+
     <!-- Read log level from environment variable, default to INFO -->
     <property name="LOG_LEVEL" value="${EXCALIBUR_LOG_LEVEL:-INFO}" />
 

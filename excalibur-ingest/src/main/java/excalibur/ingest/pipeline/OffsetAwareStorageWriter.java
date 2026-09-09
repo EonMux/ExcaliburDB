@@ -98,6 +98,24 @@ public interface OffsetAwareStorageWriter {
      * @param segmentId The target segment ID for all writes
      * @return A new OffsetAwareStorageWriter that writes to the specified segment
      */
+    /**
+     * Whether writes targeted at a segment can actually reach it.
+     *
+     * <p>A segment ID is not on its own a promise that a segment exists to receive writes: the
+     * catalog can mint metadata for one the storage engine has no routing slot for, and every
+     * write aimed at it then fails one chunk at a time. Callers that are about to do expensive
+     * work per chunk - fetching, chunking and embedding - should ask first, so the answer costs
+     * one lookup rather than one embedding call per chunk of every document in the source.</p>
+     *
+     * <p>The default is {@code true}, for writers that do not route by segment at all.</p>
+     *
+     * @param segmentId The segment writes would be targeted at
+     * @return true if a write to that segment can succeed
+     */
+    default boolean canWriteTo(long segmentId) {
+        return true;
+    }
+
     default OffsetAwareStorageWriter forSegment(long segmentId) {
         final OffsetAwareStorageWriter delegate = this;
         return new OffsetAwareStorageWriter() {
@@ -116,6 +134,13 @@ public interface OffsetAwareStorageWriter {
             public OffsetAwareStorageWriter forSegment(long newSegmentId) {
                 // Create a new binding for the new segment
                 return delegate.forSegment(newSegmentId);
+            }
+
+            @Override
+            public boolean canWriteTo(long ignoredSegmentId) {
+                // Every write through this view goes to the bound segment, whatever it is asked
+                // about, so that is the only segment whose reachability means anything here.
+                return delegate.canWriteTo(segmentId);
             }
         };
     }

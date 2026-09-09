@@ -48,6 +48,12 @@ public record CoreComponents(Arena arena,
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CoreComponents.class);
 
+    /** Property sizing the membership filter against the expected corpus. */
+    public static final String KEY_CORPUS_CAPACITY = "excalibur.filter.corpus-capacity";
+
+    /** Entries the membership filter is sized for when nothing says otherwise. */
+    public static final long DEFAULT_CORPUS_CAPACITY = 10_000_000L;
+
     /**
      * Builds and starts the storage stack.
      *
@@ -61,6 +67,12 @@ public record CoreComponents(Arena arena,
         Objects.requireNonNull(dataDir, "dataDir cannot be null");
         Objects.requireNonNull(hnswConfigFactory, "hnswConfigFactory cannot be null");
 
+        // Resolved before anything is allocated. Every other misconfiguration in this server
+        // fails before the resource it would govern exists -- the port before the socket, the
+        // keystore before the listener -- and a capacity rejected halfway through leaves an open
+        // Arena and a started storage engine behind with nothing left holding them.
+        long corpusCapacity = corpusCapacity(config);
+
         boolean panamaAvailable = MemorySegmentFactory.isPanamaAvailable();
         Arena arena = panamaAvailable ? Arena.ofShared() : null;
         LOGGER.info("Using {} memory implementation",
@@ -69,7 +81,8 @@ public record CoreComponents(Arena arena,
         StorageEngine storageEngine = createStorageEngine(config, dataDir, arena, hnswConfigFactory);
         VolumeManager volumeManager = createVolumeManager(storageEngine);
         IndexOrchestrator indexOrchestrator = createIndexOrchestrator(config, storageEngine, volumeManager);
-        HierarchicalCuckooFilter hierarchicalFilter = createHierarchicalCuckooFilter();
+        HierarchicalCuckooFilter hierarchicalFilter =
+            createHierarchicalCuckooFilter(corpusCapacity);
         indexOrchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
 
         wireCompactionCallback(storageEngine, indexOrchestrator);
@@ -172,20 +185,18 @@ public record CoreComponents(Arena arena,
      *
      * <h3>Domain Constraints</h3>
      * <ul>
-     *   <li>Corpus capacity: 10 million entries (configurable via excalibur.filter.corpus-capacity)</li>
+     *   <li>Corpus capacity: {@value #DEFAULT_CORPUS_CAPACITY} entries, or
+     *       {@code excalibur.filter.corpus-capacity}</li>
      *   <li>Fingerprint bits: 13 (provides ~0.1% false positive rate)</li>
      *   <li>Cluster capacity: the corpus capacity, because every segment shares one cluster</li>
      *   <li>Segment capacity: 10,000 entries per segment</li>
      * </ul>
      *
+     * @param corpusCapacity Entries the corpus level is sized for, already validated
      * @return Initialized hierarchical Cuckoo filter
      */
-    private static HierarchicalCuckooFilter createHierarchicalCuckooFilter() {
+    private static HierarchicalCuckooFilter createHierarchicalCuckooFilter(long corpusCapacity) {
         LOGGER.info("Initializing hierarchical Cuckoo filter...");
-
-        // Use configurable corpus capacity or default to 10 million entries
-        // This should be sized based on expected corpus size for optimal false positive rate
-        long corpusCapacity = getLongProperty("excalibur.filter.corpus-capacity", 10_000_000L);
 
         // Default parameters tuned for ~0.1% false positive rate
         int fingerprintBits = 13;
@@ -213,22 +224,36 @@ public record CoreComponents(Arena arena,
     }
 
     /**
-     * Gets a long property from system properties or returns the default.
+     * Resolves the expected corpus size the membership filter is sized against.
      *
-     * @param key The property key
-     * @param defaultValue The default value if property is not set
-     * @return The property value or default
+     * <p>Read off the effective properties, so the file and the {@code EXCALIBUR_*} environment
+     * override reach it the way they reach every other key. It was previously read from
+     * {@link System#getProperty}, which no other setting in this server uses: the key looked
+     * ordinary, appeared in the same namespace as the rest, and responded to neither of the two
+     * channels the documentation describes. A deployment that raised it in
+     * {@code excalibur.properties} got the default silently.</p>
+     *
+     * @param config The application configuration
+     * @return The configured capacity, or {@link #DEFAULT_CORPUS_CAPACITY}
+     * @throws IllegalArgumentException if a value is configured and is not a positive number
      */
-    private static long getLongProperty(String key, long defaultValue) {
-        String value = System.getProperty(key);
-        if (value != null && !value.isEmpty()) {
-            try {
-                return Long.parseLong(value.trim());
-            } catch (NumberFormatException e) {
-                LOGGER.warn("Invalid value for property {}: '{}', using default: {}", key, value, defaultValue);
-            }
+    private static long corpusCapacity(Config config) {
+        String value = config.getEffectiveProperties().get(KEY_CORPUS_CAPACITY);
+        if (value == null || value.isBlank()) {
+            return DEFAULT_CORPUS_CAPACITY;
         }
-        return defaultValue;
+        long parsed;
+        try {
+            parsed = Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(KEY_CORPUS_CAPACITY
+                + " must be a positive number of entries; got: " + value, e);
+        }
+        if (parsed <= 0) {
+            throw new IllegalArgumentException(KEY_CORPUS_CAPACITY
+                + " must be positive; got: " + parsed);
+        }
+        return parsed;
     }
 
     /**

@@ -91,6 +91,14 @@ public class LLMHttpClient {
     /** Chat completions endpoint path */
     private static final String CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
 
+    /**
+     * Token ceiling for {@link #complete}, which is used for short constrained generations.
+     *
+     * <p>Generous enough for a list of search formulations and small enough that a model which
+     * starts writing prose is cut off rather than billed for it.</p>
+     */
+    private static final int COMPLETION_MAX_TOKENS = 512;
+
     /** Default request timeout in milliseconds */
     private static final long DEFAULT_TIMEOUT_MS = 30_000L;
 
@@ -449,11 +457,21 @@ public class LLMHttpClient {
             throw new IllegalArgumentException("input must not be null or blank");
         }
 
+        // chat_template_kwargs.enable_thinking=false, and a token ceiling.
+        //
+        // Reasoning models spend their budget thinking before they answer, which is the wrong
+        // trade for the short constrained generations this method is used for. Measured against
+        // a Qwen3 27B endpoint on a query-expansion prompt: 4.78s and an empty answer with
+        // thinking on, 2.02s and a complete one with it off, because every token of an 8-token
+        // budget went to reasoning. Servers that do not recognise the field ignore it, so this
+        // is safe against endpoints that never had a thinking mode.
         String requestBody = "{\"model\":\"" + JsonWriter.escapeString(config.getChatModel())
             + "\",\"messages\":["
             + "{\"role\":\"system\",\"content\":\"" + JsonWriter.escapeString(instruction) + "\"},"
             + "{\"role\":\"user\",\"content\":\"" + JsonWriter.escapeString(input) + "\"}"
-            + "],\"temperature\":0.0}";
+            + "],\"temperature\":0.0"
+            + ",\"max_tokens\":" + COMPLETION_MAX_TOKENS
+            + ",\"chat_template_kwargs\":{\"enable_thinking\":false}}";
 
         HttpResponse<String> response = executeRequest(
             config.getBaseUrl() + CHAT_COMPLETIONS_PATH, requestBody, correlationId);

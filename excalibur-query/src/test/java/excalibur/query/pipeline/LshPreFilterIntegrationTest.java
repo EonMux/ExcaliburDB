@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -25,11 +26,14 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Integration test for LSH pre-filtering with HNSW vector search.
+ * What a candidate set is worth once something honours it.
  *
- * <p>This test verifies that the LSH pre-filtering feature correctly constrains
- * HNSW search to only consider candidate node IDs from the LSH index, providing
- * the promised 10x-100x top_k candidate reduction.</p>
+ * <p>These drive {@link HnswGraph#search(float[], int, Set)} directly with a set the LSH index
+ * produced, which is the mechanism rather than its use: they say that the answer stays inside the
+ * set, agrees with an unrestricted search when the set holds everything, and is the nearest of the
+ * set rather than whichever members the graph happened to link together. That the query pipeline
+ * actually hands stage 3 such a set - rather than computing one and dropping it - is a separate
+ * question, and {@link LshCandidateHandoffTest} is where it is asked.</p>
  *
  * <h2>Test Scenarios</h2>
  * <ul>
@@ -324,51 +328,41 @@ class LshPreFilterIntegrationTest {
 
     @Test
     void testRecallWithLshPreFiltering() throws IOException {
-        // Test that LSH pre-filtering produces valid results
-        // Note: LSH is an approximate method, so exact recall is not guaranteed
-        // The key verification is that filtered search returns valid results from candidates
+        // Recall measured against the answer the query actually asks for: the nearest members of
+        // the candidate set. Anything less means the pre-filter named a match the search then
+        // failed to return, which is a miss no caller can see.
         int numQueries = 10;
-        int successfulQueries = 0;
+        int queriesMeasured = 0;
 
         Random random = new Random(777);
 
         for (int q = 0; q < numQueries; q++) {
             float[] queryVector = generateRandomNormalizedVector(random, DIMENSIONS);
 
-            // Get LSH candidates
             Set<Long> lshCandidates = lshIndex.query(queryVector);
-
-            // Get filtered results
-            List<HnswSearchResult> filteredResults = graph.search(queryVector, TOP_K, lshCandidates);
-
-            // Verify results are valid (from candidate set and sorted)
-            if (!filteredResults.isEmpty()) {
-                // Verify all results are from candidate set
-                for (HnswSearchResult result : filteredResults) {
-                    assertTrue(lshCandidates.contains(result.nodeId()),
-                        "Result should be from LSH candidate set");
-                }
-                successfulQueries++;
+            if (lshCandidates.isEmpty()) {
+                continue;
             }
+
+            List<Long> nearestInCandidates = lshCandidates.stream()
+                .sorted(Comparator.comparingDouble(
+                    id -> distanceFunction.distance(queryVector, vectors.get(nodeIds.indexOf(id)))))
+                .limit(TOP_K)
+                .toList();
+
+            List<Long> found = graph.search(queryVector, TOP_K, lshCandidates).stream()
+                .map(HnswSearchResult::nodeId)
+                .toList();
+
+            assertEquals(nearestInCandidates, found,
+                "Filtered search must return the nearest members of the candidate set");
+            queriesMeasured++;
         }
 
-        // At least some queries should return results
-        assertTrue(successfulQueries > 0,
-            "At least some queries should return results via LSH pre-filtering");
-
-        System.out.println("Successful queries with results: " + successfulQueries + " / " + numQueries);
+        assertTrue(queriesMeasured > 0,
+            "LSH must name candidates for some query, or nothing is measured");
     }
 
-    /**
-     * Generates a random normalized vector.
-     *
-     * <p>Normalization ensures the vector has unit length, which is required
-     * for meaningful cosine similarity calculations.</p>
-     *
-     * @param random Random number generator
-     * @param dimensions Vector dimensions
-     * @return Normalized vector
-     */
     private float[] generateRandomNormalizedVector(Random random, int dimensions) {
         float[] vector = new float[dimensions];
 

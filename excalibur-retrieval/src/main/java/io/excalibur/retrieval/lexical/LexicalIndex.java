@@ -83,8 +83,23 @@ public final class LexicalIndex implements AutoCloseable {
      */
     public static final String FIELD_DOC_ID = "doc_id";
 
+    /**
+     * Field holding the caller's own identifier for the document.
+     *
+     * <p>The engine keys documents by a long, which is what the whole ranking and fusion stack
+     * is built on. A corpus chunk's real name is a string ({@code source:document:chunk:n}), and
+     * the long is derived from it by hashing, which is not invertible. Storing the original here
+     * is what lets a hit be reported as the identifier a caller can actually look something up
+     * by, and what lets a hash collision be seen rather than silently serve one chunk's text
+     * under another chunk's name.</p>
+     */
+    public static final String FIELD_EXTERNAL_KEY = "external_key";
+
     /** The only stored field {@link #textOf(long)} needs. */
     private static final Set<String> TEXT_ONLY = Set.of(FIELD_TEXT);
+
+    /** The only stored field {@link #externalKeyOf(long)} needs. */
+    private static final Set<String> KEY_ONLY = Set.of(FIELD_EXTERNAL_KEY);
 
     private final Directory directory;
     private final Analyzer analyzer;
@@ -135,10 +150,25 @@ public final class LexicalIndex implements AutoCloseable {
      * not leave the previous version in the index competing with it.
      */
     public void put(long documentId, String text) throws IOException {
+        put(documentId, text, null);
+    }
+
+    /**
+     * Adds or replaces a document, recording the caller's own identifier for it.
+     *
+     * @param documentId  The engine's id, which ranking and fusion use
+     * @param text        The text to index and store
+     * @param externalKey The caller's identifier, or null when the engine id is the only one
+     * @throws IOException if the write fails
+     */
+    public void put(long documentId, String text, String externalKey) throws IOException {
         if (text == null) {
             throw new IllegalArgumentException("text must not be null for document " + documentId);
         }
         Document document = new Document();
+        if (externalKey != null) {
+            document.add(new StoredField(FIELD_EXTERNAL_KEY, externalKey));
+        }
         // Stored as well as indexed. Without the stored copy nothing downstream can read a
         // document's text back out, and rerank has nothing to send the model.
         document.add(new TextField(FIELD_TEXT, text, Field.Store.YES));
@@ -149,6 +179,28 @@ public final class LexicalIndex implements AutoCloseable {
         writer.updateDocument(new Term(FIELD_DOC_ID, Long.toString(documentId)), document);
     }
 
+    /**
+     * Returns the caller's identifier for a document, or null when it stored none.
+     *
+     * @param documentId The engine's id
+     * @return The external key, or null
+     * @throws IOException if the read fails
+     */
+    public String externalKeyOf(long documentId) throws IOException {
+        IndexSearcher current = searcher();
+        if (current == null) {
+            return null;
+        }
+        TopDocs hits = current.search(
+            new org.apache.lucene.search.TermQuery(
+                new Term(FIELD_DOC_ID, Long.toString(documentId))), 1);
+        if (hits.scoreDocs.length == 0) {
+            return null;
+        }
+        Document stored = current.storedFields().document(hits.scoreDocs[0].doc, KEY_ONLY);
+        return stored == null ? null : stored.get(FIELD_EXTERNAL_KEY);
+    }
+
     /** Removes a document. */
     public void delete(long documentId) throws IOException {
         writer.deleteDocuments(new Term(FIELD_DOC_ID, Long.toString(documentId)));
@@ -157,6 +209,24 @@ public final class LexicalIndex implements AutoCloseable {
     /** Flushes pending writes to disk without making them searchable. */
     public void commit() throws IOException {
         writer.commit();
+    }
+
+    /**
+     * Rewrites every segment holding a deleted document, so the deleted text leaves disk.
+     *
+     * <p>Lucene's ordinary merges reclaim deletions on their own schedule, which is the right
+     * default and the wrong answer for a caller who has to be able to say the data is gone. This
+     * is that caller's escape hatch, and it is expensive by nature: a segment is rewritten whole
+     * to remove one document from it.</p>
+     *
+     * @return How many documents were deleted before the merge, which is what it reclaimed
+     */
+    public int forceMergeDeletes() throws IOException {
+        DirectoryReader current = reader.get();
+        int pending = current == null ? 0 : current.numDeletedDocs();
+        writer.forceMergeDeletes(true);
+        writer.commit();
+        return pending;
     }
 
     /**

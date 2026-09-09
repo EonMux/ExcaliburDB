@@ -10,6 +10,11 @@ import java.util.Optional;
  * <p>Pluggable because the right trigger is a deployment's decision, not the store's. A system
  * under a legal erasure obligation and one merely reclaiming space want different behaviour from
  * the same data, and hard-coding either makes the other impossible.
+ *
+ * <p>Stated in records rather than in any one store's unit, because the decision does not depend
+ * on what a record is. A graph counts edges and a lexical index counts documents, and both ask the
+ * same question of the same three numbers; naming the unit here would have forced one of them to
+ * describe its data as the other's.
  */
 @FunctionalInterface
 public interface CompactionPolicy {
@@ -20,22 +25,22 @@ public interface CompactionPolicy {
     /**
      * What compaction has to decide on.
      *
-     * @param totalEdges       edges in the store, tombstoned or not
-     * @param tombstonedEdges  edges marked for removal but still present
+     * @param totalRecords      records in the store, tombstoned or not
+     * @param tombstonedRecords records marked for removal but still present
      * @param oldestOutstanding when the longest-waiting erasure request arrived, if any
-     * @param segmentCount     how many segments the store is spread over
+     * @param segmentCount      how many segments the store is spread over
      */
-    record CompactionStats(long totalEdges, long tombstonedEdges,
+    record CompactionStats(long totalRecords, long tombstonedRecords,
                            Optional<Instant> oldestOutstanding, int segmentCount) {
 
         public CompactionStats {
-            if (totalEdges < 0 || tombstonedEdges < 0) {
-                throw new IllegalArgumentException("edge counts must not be negative");
+            if (totalRecords < 0 || tombstonedRecords < 0) {
+                throw new IllegalArgumentException("record counts must not be negative");
             }
-            if (tombstonedEdges > totalEdges) {
+            if (tombstonedRecords > totalRecords) {
                 throw new IllegalArgumentException(
-                    "tombstonedEdges (" + tombstonedEdges + ") cannot exceed totalEdges ("
-                        + totalEdges + ")");
+                    "tombstonedRecords (" + tombstonedRecords + ") cannot exceed totalRecords ("
+                        + totalRecords + ")");
             }
             if (oldestOutstanding == null) {
                 throw new IllegalArgumentException("oldestOutstanding must not be null");
@@ -47,7 +52,7 @@ public interface CompactionPolicy {
 
         /** Fraction of the store that is tombstoned. */
         public double tombstoneRatio() {
-            return totalEdges == 0 ? 0.0 : tombstonedEdges / (double) totalEdges;
+            return totalRecords == 0 ? 0.0 : tombstonedRecords / (double) totalRecords;
         }
     }
 
@@ -56,10 +61,10 @@ public interface CompactionPolicy {
      *
      * <p>Three, because each catches a case the others miss:
      * <ul>
-     *   <li><b>Tombstone ratio.</b> Reclaims space and stops queries paying to skip dead edges.
+     *   <li><b>Tombstone ratio.</b> Reclaims space and stops queries paying to skip dead records.
      *       Alone, it never fires for a small erasure — which is exactly the case that matters
      *       most.</li>
-     *   <li><b>Oldest outstanding request.</b> The obligation, not the volume. One edge under a
+     *   <li><b>Oldest outstanding request.</b> The obligation, not the volume. One record under a
      *       deletion request has a deadline, and this is the only condition that respects it.</li>
      *   <li><b>Segment count.</b> Every segment is a set of mappings and a search that must visit
      *       it; unbounded growth degrades every query and eventually exhausts the mapping

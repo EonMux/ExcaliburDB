@@ -415,11 +415,17 @@ class TailScannerTest {
     }
 
     /**
-     * Test configuration key is defined.
+     * The limit a query actually applies.
+     *
+     * <p>There used to be a test here asserting that a {@code CONFIG_BACKPRESSURE_ENTRY_LIMIT}
+     * constant held the string {@code "excalibur.tail-scan.backpressure-entry-limit"}, which was
+     * true and meant nothing: no code read that key, so the test reported a configuration knob as
+     * present while setting it did nothing. What is worth pinning is that the scanner a query
+     * builds is bounded, and by what.</p>
      */
     @Test
-    void testConfigKey() {
-        assertThat(TailScanner.CONFIG_BACKPRESSURE_ENTRY_LIMIT)
-            .isEqualTo("excalibur.tail-scan.backpressure-entry-limit");
+    void scannerBuiltByAQueryUsesTheDefaultLimit() {
+        assertThat(new TailScanner().getBackpressureEntryLimit())
+            .isEqualTo(TailScanner.DEFAULT_BACKPRESSURE_ENTRY_LIMIT);
     }
 }

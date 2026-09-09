@@ -270,7 +270,7 @@ public final class GraphErasureCoordinator {
     }
 
     private static String describe(CompactionStats stats) {
-        return stats.tombstonedEdges() + " of " + stats.totalEdges() + " edge(s) tombstoned, "
+        return stats.tombstonedRecords() + " of " + stats.totalRecords() + " edge(s) tombstoned, "
             + stats.segmentCount() + " segment(s), oldest request "
             + stats.oldestOutstanding().map(Instant::toString).orElse("none");
     }

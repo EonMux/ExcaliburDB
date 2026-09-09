@@ -169,9 +169,16 @@ class ChunkPayloadCodecTest {
         }
 
         @Test
-        @DisplayName("zero is not a dimension")
+        @DisplayName("zero is a chunk with no embedding, not a corrupt header")
         void zeroDimension() {
-            assertThat(ChunkPayloadCodec.dimensionOf(headerOf(0, 64))).isEqualTo(-1);
+            // This previously asserted -1. Zero now means the chunk was indexed lexically and
+            // never embedded, which is a value ingestion writes deliberately; a reader still
+            // gets null for the vector, so nothing that consumed -1 as "no usable embedding"
+            // behaves differently. Negative and oversized headers remain refused, which is what
+            // the rest of this class covers.
+            byte[] value = headerOf(0, 64);
+            assertThat(ChunkPayloadCodec.dimensionOf(value)).isZero();
+            assertThat(ChunkPayloadCodec.embeddingOf(value)).isNull();
         }
 
         @Test
@@ -264,6 +271,70 @@ class ChunkPayloadCodecTest {
         void nonPositiveBudget() {
             assertThatThrownBy(() -> ChunkPayloadCodec.truncateUtf8(new byte[4], 0))
                 .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("Chunks stored without an embedding")
+    class TextOnly {
+
+        // Retrieval through Lucene and the graph needs the text, not a vector. Making a vector
+        // mandatory in the stored form is what forced a corpus-wide embedding pass before
+        // anything could be indexed at all.
+
+        @Test
+        @DisplayName("text survives a round trip with no vector")
+        void roundTripsText() {
+            byte[] v = ChunkPayloadCodec.encodeTextOnly("out of memory: the OOM killer fired");
+
+            assertThat(ChunkPayloadCodec.dimensionOf(v))
+                .as("0 declares a chunk that was never embedded")
+                .isZero();
+            assertThat(ChunkPayloadCodec.textOf(v)).isEqualTo("out of memory: the OOM killer fired");
+            assertThat(ChunkPayloadCodec.embeddingOf(v))
+                .as("no vector to hand back")
+                .isNull();
+        }
+
+        @Test
+        @DisplayName("a dimension-checked read declines it rather than returning a wrong-width vector")
+        void dimensionCheckedReadDeclines() {
+            byte[] v = ChunkPayloadCodec.encodeTextOnly("some text");
+            assertThat(ChunkPayloadCodec.embeddingOf(v, 768)).isNull();
+        }
+
+        @Test
+        @DisplayName("empty text is still readable")
+        void emptyTextIsRepresentable() {
+            byte[] v = ChunkPayloadCodec.encodeTextOnly("");
+            assertThat(ChunkPayloadCodec.dimensionOf(v)).isZero();
+            assertThat(ChunkPayloadCodec.embeddingOf(v)).isNull();
+        }
+
+        @Test
+        @DisplayName("a corrupt header is still refused, and is distinguishable from no vector")
+        void corruptionIsStillRejected() {
+            // The point of admitting 0 is that it must not widen what else gets believed.
+            byte[] negative = new byte[] {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 1, 2};
+            assertThat(ChunkPayloadCodec.dimensionOf(negative)).isEqualTo(-1);
+            assertThat(ChunkPayloadCodec.embeddingOf(negative)).isNull();
+            assertThat(ChunkPayloadCodec.textBytesOf(negative)).isNull();
+
+            byte[] truncated = new byte[] {8, 0, 0, 0, 1, 2, 3};
+            assertThat(ChunkPayloadCodec.dimensionOf(truncated))
+                .as("declares 8 floats it does not contain")
+                .isEqualTo(-1);
+        }
+
+        @Test
+        @DisplayName("an embedded chunk is unaffected")
+        void embeddedChunksStillWork() {
+            float[] vec = {0.5f, -0.25f, 1.0f};
+            byte[] v = ChunkPayloadCodec.encode("with a vector", vec);
+
+            assertThat(ChunkPayloadCodec.dimensionOf(v)).isEqualTo(3);
+            assertThat(ChunkPayloadCodec.embeddingOf(v)).containsExactly(vec);
+            assertThat(ChunkPayloadCodec.textOf(v)).isEqualTo("with a vector");
         }
     }
 }

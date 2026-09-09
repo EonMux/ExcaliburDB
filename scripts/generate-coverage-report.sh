@@ -70,8 +70,18 @@ echo -e "${YELLOW}Cleaning previous reports...${NC}"
 rm -rf "$REPORT_DIR"
 mkdir -p "$REPORT_DIR"
 
-# Target modules for Phase 1-4
-MODULES=("excalibur-core" "excalibur-store" "excalibur-filter" "excalibur-vector")
+# Every module, read from settings.gradle.kts rather than listed here. The previous hard-coded
+# list held four of eighteen, so this script printed a completed coverage run over less than a
+# quarter of the codebase -- a number that reads as the project's and is not.
+readarray -t MODULES < <(
+    sed -n '/^include(/,/^)/p' "$(dirname "$0")/../settings.gradle.kts" \
+        | grep -oE '"[^"]+"' | tr -d '"' | sort
+)
+
+if [ ${#MODULES[@]} -eq 0 ]; then
+    echo "ERROR: no modules found in settings.gradle.kts" >&2
+    exit 1
+fi
 
 echo -e "${YELLOW}Generating coverage reports for modules:${NC}"
 for module in "${MODULES[@]}"; do
@@ -331,7 +341,7 @@ if [ ! -f "$SUMMARY_FILE" ]; then
 </html>
 HTMLEOF
     echo -e "${GREEN}✓ Summary report: $SUMMARY_FILE${NC}"
-}
+fi
 
 echo ""
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"

@@ -37,10 +37,18 @@ public interface SourceRegistry extends AutoCloseable {
     Source get(String sourceId);
 
     /**
-     * Removes a source.
+     * Removes a source, undoing everything {@link #register(Source)} started.
+     *
+     * <p>Registration starts more than a map entry: an ingestion run, a status entry and a place
+     * in the re-crawl schedule. An implementation that removed only the entry would leave the node
+     * crawling a source no request can name and reporting one that no longer exists, so a removal
+     * must stop all three and close the source it owns.</p>
+     *
+     * <p>What it must <em>not</em> touch is the documents the source contributed. Stopping a crawl
+     * and erasing what it produced are different operations, and only one of them is reversible.</p>
      *
      * @param sourceId The source ID to remove
-     * @return true if removed
+     * @return true if a source was registered under that id
      */
     boolean remove(String sourceId);
 

@@ -1,6 +1,8 @@
 package excalibur.api.bootstrap;
 
 import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.ingest.lexical.ChunkIndex;
+import excalibur.ingest.lexical.StoredChunkText;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.pipeline.OffsetAwareStorageWriter;
@@ -25,6 +27,10 @@ import java.util.Objects;
  * own correctness requirements: superseded chunks must actually be tombstoned, and
  * chunks must land in the segment their key routes to (or, during rolling
  * replacement, in the new segment the caller nominated).</p>
+ *
+ * <p>The lexical index is part of that. A reindex is the one operation that removes content a
+ * query could still be matching, so a reindexer that wrote to storage alone would leave deleted
+ * documents answering BM25 queries under identifiers whose chunks are gone.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Stateless; the components it returns carry their own thread-safety guarantees.</p>
@@ -51,6 +57,7 @@ public final class ReindexerFactory {
      * @param indexOrchestrator  Orchestrator supplying the visibility tracker
      * @param hierarchicalFilter Filter that must see both inserts and tombstones
      * @param registry           Document registry shared with the ingestion pipeline
+     * @param chunkIndex         Lexical index to keep in step with storage, or null for none
      * @return A configured reindexer
      * @throws NullPointerException if any required argument is null
      */
@@ -59,7 +66,8 @@ public final class ReindexerFactory {
                                            VolumeManager volumeManager,
                                            IndexOrchestrator indexOrchestrator,
                                            HierarchicalCuckooFilter hierarchicalFilter,
-                                           DocumentRegistry registry) {
+                                           DocumentRegistry registry,
+                                           ChunkIndex chunkIndex) {
         Objects.requireNonNull(config, "config cannot be null");
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
         Objects.requireNonNull(indexOrchestrator, "indexOrchestrator cannot be null");
@@ -88,9 +96,10 @@ public final class ReindexerFactory {
         );
 
         boolean rollingReplacement = volumeManager != null && storageEngine.getCatalog() != null;
+        DocumentReindexer reindexer;
         if (rollingReplacement) {
             LOGGER.info("DocumentReindexer configured with rolling replacement support");
-            return new DocumentReindexer(
+            reindexer = new DocumentReindexer(
                 chunker,
                 llmClient,
                 upsertHandler,
@@ -101,16 +110,23 @@ public final class ReindexerFactory {
                 storageEngine.getLifecycleManager(),
                 indexOrchestrator.getVisibilityTracker()
             );
+        } else {
+            LOGGER.info("DocumentReindexer configured with atomic publication (no rolling replacement)");
+            reindexer = new DocumentReindexer(
+                chunker,
+                llmClient,
+                upsertHandler,
+                registry,
+                offsetWriter,
+                batchPublisher
+            );
         }
 
-        LOGGER.info("DocumentReindexer configured with atomic publication (no rolling replacement)");
-        return new DocumentReindexer(
-            chunker,
-            llmClient,
-            upsertHandler,
-            registry,
-            offsetWriter,
-            batchPublisher
-        );
+        if (chunkIndex != null) {
+            // The text supplier reads through the same storage engine the reindexer writes to,
+            // so what compaction rebuilds a segment from is what a query would have resolved.
+            reindexer.setLexicalIndex(chunkIndex, StoredChunkText.of(storageEngine));
+        }
+        return reindexer;
     }
 }

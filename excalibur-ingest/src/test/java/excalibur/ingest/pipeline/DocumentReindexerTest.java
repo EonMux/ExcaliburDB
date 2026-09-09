@@ -11,12 +11,19 @@ import excalibur.filter.CuckooFilter;
 import excalibur.llm.client.LLMClientConfig;
 import io.excalibur.llm.client.LLMHttpClient;
 import io.excalibur.llm.LLMException;
+import excalibur.ingest.lexical.ChunkIndexStats;
+import excalibur.ingest.lexical.NativeChunkIndex;
+import io.excalibur.retrieval.expand.QueryExpander;
+import io.excalibur.retrieval.lexical.native_.CompactionPlanner;
+import io.excalibur.retrieval.rank.RetrievalQuery;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
@@ -590,6 +597,175 @@ class DocumentReindexerTest {
         }
     }
 
+    @Nested
+    @DisplayName("Keeping the lexical index in step")
+    class LexicalIndexTests {
+
+        @TempDir
+        Path indexDir;
+
+        /**
+         * The node's epoch clock, which the test advances itself.
+         *
+         * <p>A run publishes at the epoch after the one it read, so a query at the epoch the run
+         * started at will not see it - which is the visibility rule working, not a missing write.
+         * A real node's tick advances this; here the test does.</p>
+         */
+        private final java.util.concurrent.atomic.AtomicLong epoch =
+            new java.util.concurrent.atomic.AtomicLong(100);
+
+        private NativeChunkIndex openIndex() throws Exception {
+            // readerLagEpochs of zero and a policy that always fires, so a test can watch an
+            // erasure reach disk without waiting out a latency bound.
+            return NativeChunkIndex.open(indexDir, epoch::get, 0,
+                new CompactionPlanner((stats, now) -> true, 0.2, Duration.ofHours(1), 16, 8));
+        }
+
+        /** Runs a reindex and lets the node's clock move on, as a tick would. */
+        private DocumentReindexer.ReindexResult reindex(DocumentReindexer reindexer,
+                                                        MockSource source) throws SourceException {
+            DocumentReindexer.ReindexResult result = reindexer.reindexAll(source);
+            epoch.incrementAndGet();
+            return result;
+        }
+
+        private DocumentReindexer reindexerWith(NativeChunkIndex index) {
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+            reindexer.setLexicalIndex(index, storageWriter::textOf);
+            return reindexer;
+        }
+
+        private int hits(NativeChunkIndex index, String term) {
+            return index.ranker(QueryExpander.identity())
+                .rank(RetrievalQuery.ofText(term), 100).documents().size();
+        }
+
+        @Test
+        @DisplayName("a reindexed document becomes lexically searchable")
+        void reindexedDocumentsAreIndexed() throws Exception {
+            try (NativeChunkIndex index = openIndex()) {
+                DocumentReindexer reindexer = reindexerWith(index);
+                MockSource source = new MockSource("test-source");
+                source.addDocument("doc-1", "kubernetes scheduler preemption. ".repeat(20));
+
+                reindex(reindexer, source);
+
+                assertTrue(hits(index, "preemption") > 0,
+                    "A reindex that writes to storage alone leaves the new content unsearchable");
+            }
+        }
+
+        @Test
+        @DisplayName("a deleted document stops answering queries")
+        void deletedDocumentsAreErased() throws Exception {
+            try (NativeChunkIndex index = openIndex()) {
+                DocumentReindexer reindexer = reindexerWith(index);
+                MockSource source = new MockSource("test-source");
+                source.addDocument("doc-gone", "confidential incident postmortem. ".repeat(20));
+                source.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
+                reindex(reindexer, source);
+                assertTrue(hits(index, "postmortem") > 0, "precondition: it was indexed");
+
+                MockSource without = new MockSource("test-source");
+                without.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
+                reindex(reindexer, without);
+
+                assertEquals(0, hits(index, "postmortem"),
+                    "A document removed from its source must stop being findable");
+                assertTrue(hits(index, "capacity") > 0,
+                    "and the documents that remain must not be taken with it");
+            }
+        }
+
+        @Test
+        @DisplayName("a deleted document's text leaves the index's own files")
+        void deletedDocumentsAreReclaimed() throws Exception {
+            try (NativeChunkIndex index = openIndex()) {
+                DocumentReindexer reindexer = reindexerWith(index);
+                MockSource source = new MockSource("test-source");
+                source.addDocument("doc-gone", "confidential incident postmortem. ".repeat(20));
+                source.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
+                reindex(reindexer, source);
+
+                MockSource without = new MockSource("test-source");
+                without.addDocument("doc-stays", "routine capacity planning. ".repeat(20));
+                reindex(reindexer, without);
+
+                ChunkIndexStats stats = index.stats();
+                assertEquals(0, stats.erasureRequests(),
+                    "The erasure the reindex accepted should have been discharged by its own "
+                        + "compaction, not left for whatever ingests next");
+                assertEquals(0, stats.erasedDocuments());
+            }
+        }
+
+        @Test
+        @DisplayName("the surplus chunks of a shortened document are erased too")
+        void surplusChunksAreErased() throws Exception {
+            try (NativeChunkIndex index = openIndex()) {
+                DocumentReindexer reindexer = reindexerWith(index);
+                MockSource source = new MockSource("test-source");
+                source.addDocument("doc-1", "distinctive tail marker. ".repeat(400));
+                reindex(reindexer, source);
+                int before = hits(index, "distinctive");
+                assertTrue(before > 1, "precondition: the first version spans several chunks");
+
+                MockSource shorter = new MockSource("test-source");
+                shorter.addDocument("doc-1", "distinctive tail marker.");
+                reindex(reindexer, shorter);
+
+                assertEquals(1, hits(index, "distinctive"),
+                    "The chunks a shortened document no longer has must not go on matching");
+            }
+        }
+
+        @Test
+        @DisplayName("a reindexed chunk replaces rather than joins its previous version")
+        void rewrittenChunksReplace() throws Exception {
+            try (NativeChunkIndex index = openIndex()) {
+                DocumentReindexer reindexer = reindexerWith(index);
+                MockSource first = new MockSource("test-source");
+                first.addDocument("doc-1", "the certificate chain is untrusted.");
+                reindex(reindexer, first);
+
+                MockSource second = new MockSource("test-source");
+                second.addDocument("doc-1", "the certificate chain is now trusted.");
+                reindex(reindexer, second);
+
+                assertEquals(1, hits(index, "certificate"),
+                    "One chunk identifier is one chunk, however many times it is written");
+                assertEquals(0, hits(index, "untrusted"),
+                    "and the version it used to hold must stop matching");
+            }
+        }
+
+        @Test
+        @DisplayName("an index cannot be wired without a way to reclaim what it erases")
+        void aTextSupplierIsRequired() throws Exception {
+            try (NativeChunkIndex index = openIndex()) {
+                DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                    upsertHandler, registry, storageWriter);
+
+                assertThrows(IllegalArgumentException.class,
+                    () -> reindexer.setLexicalIndex(index, null));
+            }
+        }
+
+        @Test
+        @DisplayName("a reindexer with no index reindexes exactly as before")
+        void noIndexIsNotAFailure() throws SourceException {
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+            reindexer.setLexicalIndex(null, null);
+
+            MockSource source = new MockSource("test-source");
+            source.addDocument("doc-1", "ordinary content. ".repeat(20));
+
+            assertEquals(1, reindexer.reindexAll(source).getDocumentsIndexed());
+        }
+    }
+
     private static class MockSource implements Source {
         private final String sourceId;
         private final Map<String, String> documents = new HashMap<>();
@@ -723,6 +899,11 @@ class DocumentReindexerTest {
 
         int getWriteCount() {
             return writeCount;
+        }
+
+        /** The text a chunk currently holds, or null once it has been tombstoned. */
+        String textOf(String chunkId) {
+            return chunks.get(chunkId);
         }
 
         Map<String, float[]> getEmbeddings() {

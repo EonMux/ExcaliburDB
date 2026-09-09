@@ -1955,9 +1955,15 @@ public class SegmentCatalog {
 
         @Override
         public String toString() {
+            // The counts are atomics, so they have to be read rather than formatted as numbers;
+            // %d on the holder throws, and a toString that throws takes out the diagnostic that
+            // was reaching for it - in the error paths where it is the only thing to go on. The
+            // state reported is the lifecycle one, which is what callers reason about; entryState
+            // is an internal flag about a single entry and read as a lifecycle state it is wrong
+            // rather than merely unhelpful.
             return String.format(
-                "SegmentMetadata{id=%d, state=%d, entries=%d, size=%d}",
-                segmentId, entryState, entryCount, entryCount);
+                "SegmentMetadata{id=%d, state=%s, entries=%d, tombstones=%d, source=%s}",
+                segmentId, lifecycleState, entryCount.get(), tombstoneCount.get(), sourceId);
         }
     }
 

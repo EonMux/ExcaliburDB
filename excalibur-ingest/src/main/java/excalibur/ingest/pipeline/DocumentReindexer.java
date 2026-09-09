@@ -1,6 +1,7 @@
 package excalibur.ingest.pipeline;
 
 import io.excalibur.core.text.ChunkIdentifiers;
+import excalibur.ingest.lexical.ChunkIndex;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.registry.ChangeDetector;
@@ -20,15 +21,20 @@ import io.excalibur.store.VisibilityTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 /**
  * Coordinates re-indexing of changed documents: re-chunking, re-embedding via Phase 7,
@@ -103,6 +109,25 @@ public class DocumentReindexer {
     private final SegmentCatalog segmentCatalog;
     private final SegmentLifecycleManager lifecycleManager;
     private final VisibilityTracker visibilityTracker;
+
+    /**
+     * The lexical index a reindex has to keep in step, or null when this node keeps none.
+     *
+     * <p>A reindex is the one operation that removes content a query could still be matching:
+     * a deleted document's chunks, and the tail chunks a shortened document no longer has. Left
+     * out of this index they stay searchable under identifiers whose storage entries are gone, so
+     * BM25 goes on returning documents the corpus no longer contains.</p>
+     */
+    private volatile ChunkIndex lexicalIndex;
+
+    /**
+     * Reads a surviving chunk's text back out of storage for the lexical index's compaction.
+     *
+     * <p>The index stores postings and not text, so reclaiming an erased chunk means rewriting the
+     * segments around it from the text storage still holds. A reindexer that could erase but not
+     * compact would meet the visibility half of the promise and never the disk half.</p>
+     */
+    private volatile Function<String, String> storedText;
 
     /**
      * Functional interface for writing chunks to storage.
@@ -248,6 +273,142 @@ public class DocumentReindexer {
     }
 
     /**
+     * Wires the lexical index a reindex must keep in step with storage.
+     *
+     * <p>Optional: a node with no lexical index reindexes exactly as before. When one is present,
+     * every chunk this reindexer writes is indexed and every chunk it retires is erased, so the
+     * two never disagree about what the corpus contains.</p>
+     *
+     * @param lexicalIndex The index, or null to keep none
+     * @param storedText   Reads a chunk's text back from storage, which is what the index's
+     *                     compaction rebuilds surviving segments from. May be null, in which case
+     *                     erased chunks stay on disk until something that can supply text compacts
+     * @throws IllegalArgumentException if an index is given without a way to read text back
+     */
+    public void setLexicalIndex(ChunkIndex lexicalIndex, Function<String, String> storedText) {
+        if (lexicalIndex != null && storedText == null) {
+            throw new IllegalArgumentException(
+                "A lexical index needs a text supplier: without one its erased chunks can never "
+                    + "be reclaimed, which is the half of erasure that is a promise");
+        }
+        this.lexicalIndex = lexicalIndex;
+        this.storedText = storedText;
+        LOG.info("Reindex lexical index {}", lexicalIndex == null
+            ? "disabled" : "enabled (" + lexicalIndex.engine() + " engine)");
+    }
+
+    /**
+     * Indexes a published document's chunks.
+     *
+     * <p>Called once the document is published rather than as each chunk is written: a reindex
+     * that fails partway leaves the previous version in place, and indexing the fragments it did
+     * write would make half of the new version searchable beside all of the old one.</p>
+     */
+    private void indexLexically(List<String> chunkIds, List<TextChunk> chunks) {
+        ChunkIndex target = this.lexicalIndex;
+        if (target == null || chunkIds.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < chunkIds.size() && i < chunks.size(); i++) {
+            try {
+                target.add(chunkIds.get(i), chunks.get(i).getText());
+            } catch (IOException e) {
+                // The chunk is in storage and the document is published; losing one chunk from
+                // BM25 costs recall on that chunk, where failing here would cost the document.
+                LOG.warn("Chunk {} reindexed but not lexically indexed: {}",
+                    chunkIds.get(i), e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Takes retired chunks out of the lexical index.
+     *
+     * <p>Storage has tombstoned them, so a search still returning them would report hits whose
+     * text nothing can resolve - and for a deleted document, would go on answering with content
+     * its owner asked to have removed.</p>
+     *
+     * @return How many the index found and removed
+     */
+    private int unindexLexically(Collection<String> chunkIds) {
+        ChunkIndex target = this.lexicalIndex;
+        if (target == null || chunkIds.isEmpty()) {
+            return 0;
+        }
+        try {
+            return target.erase(new LinkedHashSet<>(chunkIds));
+        } catch (IOException e) {
+            LOG.warn("{} retired chunk(s) remain lexically searchable: {}",
+                chunkIds.size(), e.getMessage());
+            return 0;
+        }
+    }
+
+    /** The chunk ids of every document this change set says has been deleted outright. */
+    private static Set<String> deletedChunkIds(ChangeSet changeSet) {
+        Set<String> ids = new LinkedHashSet<>();
+        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
+            ids.addAll(deleted.getChunkIds());
+        }
+        return ids;
+    }
+
+    /**
+     * Writes the registry, so what this reindex changed survives a restart.
+     *
+     * <p>A reindex is the operation whose whole input is the registry's previous contents: it
+     * compares what a source lists now against what was recorded last time. Not writing the result
+     * would make the next run repeat this one.</p>
+     */
+    private void persistRegistry() {
+        try {
+            registry.persist();
+        } catch (IOException e) {
+            LOG.warn("Document registry not persisted; the next reindex would repeat this one: {}",
+                e.getMessage());
+        }
+    }
+
+    /**
+     * Publishes this run's lexical writes and reclaims what it erased, if that is now due.
+     *
+     * <p>Both at the end of the run for the same reason the ingestion pipeline does it there: a
+     * refresh is what makes a batch searchable at one instant, and a run that has just erased
+     * documents is the moment there is something to reclaim.</p>
+     */
+    private void settleLexicalIndex() {
+        ChunkIndex target = this.lexicalIndex;
+        if (target == null) {
+            return;
+        }
+        try {
+            target.refresh();
+        } catch (IOException e) {
+            LOG.warn("Lexical index not refreshed; this reindex stays unsearchable until the "
+                + "next refresh: {}", e.getMessage());
+            return;
+        }
+        Function<String, String> text = this.storedText;
+        if (text == null) {
+            return;
+        }
+        try {
+            long started = System.currentTimeMillis();
+            io.excalibur.retrieval.lexical.native_.CompactionResult result =
+                target.compactIfDue(text);
+            if (result.performed()) {
+                LOG.info("Lexical compaction after reindex: {} segment(s) rewritten to {}, {} "
+                    + "chunk(s) physically removed in {}ms ({})", result.segmentsRewritten(),
+                    result.segmentsProduced(), result.documentsRemoved(),
+                    System.currentTimeMillis() - started, result.reason());
+            }
+        } catch (IOException e) {
+            LOG.warn("Lexical compaction did not run; erased chunks stay on disk until the next "
+                + "attempt: {}", e.getMessage());
+        }
+    }
+
+    /**
      * Returns true if this reindexer is configured with atomic batch publication.
      *
      * @return true if atomic publication is enabled
@@ -284,10 +445,27 @@ public class DocumentReindexer {
      *   <li>Tombstones old segments for the same source</li>
      * </ol>
      *
-     * <p><strong>Zero-Downtime Guarantee:</strong> Old segments remain queryable
-     * throughout the entire reindexing process. New segments become queryable
-     * only after they contain data. Old segments are tombstoned only after
-     * new segments are fully ACTIVE.</p>
+     * <p><strong>Zero-Downtime:</strong> Old segments stay queryable for the whole run and are
+     * tombstoned once the new segment reaches WARMING, not ACTIVE - the WARMING to ACTIVE
+     * transition is made asynchronously by the warming phase worker after PQ training, and this
+     * method does not wait for it. WARMING is a queryable state, so a query still reaches the new
+     * data; a query that opts out of partial segments does not, and sees neither the old segments
+     * nor the new one until training finishes.</p>
+     *
+     * <p><strong>Requires a writable target, and a hash-routed engine never offers one.</strong>
+     * The segment created here is a catalog entry, and the catalog draws IDs from a counter it
+     * advances past every ID it issues - the indices a split registers included - so a created
+     * entry always names an index the engine holds no segment of its own at. Before the first
+     * split that index is past the routing directory and resolves to nothing; after one it
+     * resolves to a buddy pointer, and filling it would write this source's data into a segment
+     * routing unrelated keys and then retire the source's real segments in favour of it. Neither
+     * is a target, so the steps above do not currently run on this engine.</p>
+     *
+     * <p>That is detected before any document is fetched, and the run falls back to re-indexing
+     * through the routing directory: the documents are re-indexed, the created entry is
+     * tombstoned, no segment is replaced and the returned segment ID is {@code -1}. Rolling
+     * replacement becomes reachable when the engine can hand out a segment that is not a routing
+     * target, which it cannot today.</p>
      *
      * <p><strong>Prerequisites:</strong> This method requires rolling replacement
      * support to be enabled (see
@@ -327,6 +505,7 @@ public class DocumentReindexer {
         }
 
         long newSegmentId = newSegment.getSegmentId();
+
         List<Long> oldSegmentIds = new ArrayList<>();
 
         try {
@@ -344,6 +523,23 @@ public class DocumentReindexer {
             // Step 3: Transition new segment to INDEXING (makes it queryable)
             segmentCatalog.beginIndexing(newSegmentId);
             LOG.info("Segment {} transitioned from BOOTSTRAPPING to INDEXING", newSegmentId);
+
+            // The catalog mints IDs from its own counter, which continues past the storage
+            // engine's routing width, so a created segment routinely names no segment the engine
+            // can write to. Discovering that one chunk at a time costs a crawl, a chunking pass
+            // and an embedding call for every chunk of every document in the source before the
+            // first write is even attempted, and the run then ends having written nothing. Ask
+            // once, and re-index the way the engine supports rather than an expensive way it
+            // does not. Checked after the segment is INDEXING because that is the state it has
+            // to be in to be discarded.
+            if (!offsetAwareWriter.canWriteTo(newSegmentId)) {
+                LOG.warn("Segment {} created for source {} is not a write target for the storage "
+                    + "engine; re-indexing through the routing directory instead of replacing "
+                    + "segments. No old segment is retired.", newSegmentId, sourceId);
+                segmentCatalog.tombstone(newSegmentId, visibilityTracker.currentEpoch());
+                ReindexResult basicResult = reindexAll(source);
+                return new RollingReindexResult(basicResult, -1, List.of());
+            }
 
             // Step 4: Create segment-targeted writers for the new segment
             // This is CRITICAL: all reindexed data must go to the NEW segment, not the old one
@@ -519,7 +715,9 @@ public class DocumentReindexer {
         ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId);
 
         // Only removals are safe to apply before the replacement content exists; see
-        // UpsertHandler.processDeletions.
+        // UpsertHandler.processDeletions. The lexical index is erased first: a document that has
+        // been deleted should stop being findable before its bytes go, not after.
+        unindexLexically(deletedChunkIds(changeSet));
         UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processDeletions(changeSet);
         resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
         int chunksTombstoned = tombstoneResult.getChunksTombstoned();
@@ -560,6 +758,8 @@ public class DocumentReindexer {
         }
 
         resultBuilder.chunksTombstoned(chunksTombstoned);
+        settleLexicalIndex();
+        persistRegistry();
         ReindexResult result = resultBuilder.build();
         LOG.info("Re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
                 sourceId, result.getDocumentsIndexed(), result.getChunksCreated(), result.getErrorCount());
@@ -612,7 +812,9 @@ public class DocumentReindexer {
         ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId);
 
         // Only removals are safe to apply before the replacement content exists; see
-        // UpsertHandler.processDeletions.
+        // UpsertHandler.processDeletions. The lexical index is erased first: a document that has
+        // been deleted should stop being findable before its bytes go, not after.
+        unindexLexically(deletedChunkIds(changeSet));
         UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processDeletions(changeSet);
         resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
         int chunksTombstoned = tombstoneResult.getChunksTombstoned();
@@ -657,6 +859,8 @@ public class DocumentReindexer {
         }
 
         resultBuilder.chunksTombstoned(chunksTombstoned);
+        settleLexicalIndex();
+        persistRegistry();
         ReindexResult result = resultBuilder.build();
         LOG.info("Segment-targeted re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
                 sourceId, result.getDocumentsIndexed(), result.getChunksCreated(), result.getErrorCount());
@@ -684,6 +888,9 @@ public class DocumentReindexer {
                 changed.getDocumentId());
             return 0;
         }
+        List<String> obsolete = new ArrayList<>(changed.getOldMetadata().getChunkIds());
+        obsolete.removeAll(docResult.getChunkIds());
+        unindexLexically(obsolete);
         return upsertHandler.tombstoneObsoleteChunks(
             changed.getOldMetadata().getChunkIds(), docResult.getChunkIds());
     }
@@ -804,6 +1011,7 @@ public class DocumentReindexer {
             LOG.info("Document {} published atomically to target segment at epoch {}: {} chunks ({} successful, {} failed) in {}ms",
                 documentId, result.epoch(), chunks.size(), successCount.get(), failureCount.get(), elapsed);
 
+            indexLexically(chunkIds, chunks);
             return new DocumentResult(documentId, chunks.size(), successCount.get(),
                 failureCount.get(), elapsed, errorMsg, chunkIds);
 
@@ -977,6 +1185,7 @@ public class DocumentReindexer {
             LOG.info("Document {} published atomically at epoch {}: {} chunks ({} successful, {} failed) in {}ms",
                 documentId, result.epoch(), chunks.size(), successCount.get(), failureCount.get(), elapsed);
 
+            indexLexically(chunkIds, chunks);
             return new DocumentResult(documentId, chunks.size(), successCount.get(),
                 failureCount.get(), elapsed, errorMsg, chunkIds);
 
@@ -1073,6 +1282,7 @@ public class DocumentReindexer {
         LOG.debug("Re-indexed document {}: {} chunks ({} successful, {} failed) in {}ms",
             documentId, chunks.size(), successCount.get(), failureCount.get(), elapsed);
 
+        indexLexically(chunkIds, chunks);
         return new DocumentResult(documentId, chunks.size(), successCount.get(),
             failureCount.get(), elapsed, errorMsg, chunkIds);
     }

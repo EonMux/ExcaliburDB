@@ -23,4 +23,7 @@ dependencies {
     implementation(project(":excalibur-metrics"))
     implementation(project(":excalibur-shard"))
     implementation(project(":excalibur-llm"))
+    // Lucene BM25 over ingested chunks. Retrieval owns the Lucene wrapper; ingestion
+    // writes into it as documents are stored.
+    api(project(":excalibur-retrieval"))
 }

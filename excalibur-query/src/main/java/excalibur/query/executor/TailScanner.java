@@ -98,16 +98,17 @@ public class TailScanner {
     private static final Logger LOGGER = LoggerFactory.getLogger(TailScanner.class);
 
     /**
-     * Default backpressure limit for tail scan entry count.
+     * Backpressure limit for tail scan entry count.
      * When the number of entries scanned exceeds this limit, scanning stops.
      * This bounds tail scan latency to ensure acceptable query response times.
+     *
+     * <p>This is the limit every query uses: {@code SegmentQueryTask} constructs the scanner
+     * with {@link #TailScanner()}, so only a caller that supplies its own value through
+     * {@link #TailScanner(int)} gets anything else. There is deliberately no configuration key
+     * for it any more - one was declared here and read by nothing, which meant setting it in
+     * {@code excalibur.properties} changed the limit a query actually applied not at all.</p>
      */
     public static final int DEFAULT_BACKPRESSURE_ENTRY_LIMIT = 100_000;
-
-    /**
-     * Configuration key for the backpressure entry limit.
-     */
-    public static final String CONFIG_BACKPRESSURE_ENTRY_LIMIT = "excalibur.tail-scan.backpressure-entry-limit";
 
     /**
      * Maximum number of bytes the scan may skip while resynchronising after an entry

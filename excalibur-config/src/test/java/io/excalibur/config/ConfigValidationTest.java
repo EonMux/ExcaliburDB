@@ -739,4 +739,60 @@ class ConfigValidationTest {
                 .doesNotThrowAnyException();
         }
     }
+
+    @Nested
+    @DisplayName("Index and embedding width")
+    class DimensionAgreement {
+
+        // Two keys describe one number. They were validated separately and never compared, so
+        // switching embedding model and updating one of them produced a node that started
+        // cleanly and then failed on every document.
+
+        @Test
+        @DisplayName("a node whose index and model disagree does not start")
+        void mismatchIsRefused() {
+            Map<String, String> props = new HashMap<>(baseProps);
+            props.put("excalibur.query.vector-dimensions", "1536");
+            props.put("excalibur.llm.embeddings-dimensions", "768");
+
+            assertThatThrownBy(() -> ConfigValidation.validate(new Config(props)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("query.vector-dimensions")
+                .hasMessageContaining("llm.embeddings-dimensions")
+                .hasMessageContaining("reindex");
+        }
+
+        @Test
+        @DisplayName("the mismatch is caught whichever side is changed")
+        void mismatchIsSymmetric() {
+            Map<String, String> props = new HashMap<>(baseProps);
+            props.put("excalibur.query.vector-dimensions", "768");
+            props.put("excalibur.llm.embeddings-dimensions", "1536");
+
+            assertThatThrownBy(() -> ConfigValidation.validate(new Config(props)))
+                .isInstanceOf(IllegalStateException.class);
+        }
+
+        @Test
+        @DisplayName("a matching non-default width is accepted")
+        void agreementIsAccepted() {
+            // 768 is what most open-weight embedding models return, so changing model is
+            // expected to work as long as both keys are moved together.
+            Map<String, String> props = new HashMap<>(baseProps);
+            props.put("excalibur.query.vector-dimensions", "768");
+            props.put("excalibur.llm.embeddings-dimensions", "768");
+
+            assertThatCode(() -> ConfigValidation.validate(new Config(props)))
+                .doesNotThrowAnyException();
+        }
+
+        @Test
+        @DisplayName("the defaults agree with each other")
+        void defaultsAgree() {
+            // Both default to 1536. If one default were ever moved without the other, every
+            // node using defaults would refuse to start.
+            assertThatCode(() -> ConfigValidation.validate(new Config(new HashMap<>())))
+                .doesNotThrowAnyException();
+        }
+    }
 }

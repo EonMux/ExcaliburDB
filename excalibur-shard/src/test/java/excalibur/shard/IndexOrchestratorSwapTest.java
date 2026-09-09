@@ -113,6 +113,90 @@ class IndexOrchestratorSwapTest {
     }
 
     @Test
+    @DisplayName("Compaction carries the vector pre-filter to the replacement, still open")
+    void compactionCarriesTheVectorPrefilter() throws Exception {
+        Segment original = storageEngine.getSegment(0L);
+        excalibur.filter.lsh.LshIndex prefilter = excalibur.filter.lsh.LshIndex.create(DIMENSION);
+        original.attachLshIndex(prefilter);
+        orchestrator.registerSegment(0L, original, null, null, null);
+
+        Segment replacement = compact(original);
+
+        // The pre-filter is keyed by HNSW node id and compaction does not renumber nodes, so it
+        // describes the replacement exactly as well as it described the original. Dropped here
+        // instead, a segment loses its pre-filter on its first compaction and never gets it back.
+        assertThat(replacement.getLshIndex()).isSameAs(prefilter);
+
+        // The old segment closes as soon as the swap returns, and it closes whatever is still
+        // attached to it - so carrying the reference across without detaching it first would hand
+        // the replacement an index whose mapped files have been released.
+        assertThat(prefilter.isClosed())
+            .as("the replacement must not be left holding a closed pre-filter")
+            .isFalse();
+
+        prefilter.close();
+    }
+
+    @Test
+    @DisplayName("A swap the registry refuses does not strand the indexes on the replacement")
+    void aRefusedSwapReturnsTheAttachments() throws Exception {
+        Segment original = storageEngine.getSegment(0L);
+        HnswGraph graph = new HnswGraph(tempDir.resolve("segment_0.hnsw"),
+            HnswConfig.create(DIMENSION), CosineSimilarity.getInstance(), 100);
+        TailOffsetTracker tracker = new TailOffsetTracker(graph);
+        excalibur.filter.lsh.LshIndex prefilter = excalibur.filter.lsh.LshIndex.create(DIMENSION);
+        original.attachHnswGraph(graph);
+        original.attachTailOffsetTracker(tracker);
+        original.attachLshIndex(prefilter);
+        orchestrator.registerSegment(0L, original, graph, null, tracker);
+
+        // Put a different segment in the directory slot the orchestrator still associates with
+        // the original. This is the state a split reaches by publishing its children while a
+        // compaction of the parent is in flight, and it is what makes replaceSegment refuse:
+        // the segment it is asked to replace is no longer the one the registry holds.
+        Segment decoy = new Segment(tempDir.resolve("decoy.dat"), 1024 * 1024, arena);
+        assertThat(storageEngine.replaceSegment(0L, original, decoy)).isTrue();
+
+        orchestrator.getCompactionWorker().compactNow(original);
+
+        // The replacement is never installed and never closed, so anything left attached to it
+        // is a mapping nothing will ever release - one file per LSH hash table, plus the graph.
+        // Handing them back to the segment that owned them puts them under a close that happens.
+        assertThat(prefilter.isClosed())
+            .as("a pre-filter left on an uninstalled replacement is a mapping nobody closes")
+            .isTrue();
+
+        decoy.close();
+    }
+
+    @Test
+    @DisplayName("A segment the orchestrator has drifted on is swapped at the directory's index")
+    void aDriftedRegistrationSwapsAtTheDirectoryIndex() throws Exception {
+        Segment original = storageEngine.getSegment(0L);
+        original.put("alpha".getBytes(StandardCharsets.UTF_8), "one".getBytes(StandardCharsets.UTF_8));
+
+        // The orchestrator remembers this segment under an index the directory does not use for
+        // it. That drift is what makes replaceSegment refuse: it compares the segment it holds at
+        // the index it is given, and index 7 holds nothing at all.
+        orchestrator.registerSegment(7L, original, null, null, null);
+
+        Segment replacement = compact(original);
+
+        // Swapped at 0, where the directory actually holds it, rather than refused at 7.
+        assertThat(storageEngine.getSegment(0L))
+            .as("the directory must now route index 0 to the compacted segment")
+            .isSameAs(replacement);
+        assertThat(original.isClosed())
+            .as("the original is retired only because the swap succeeded")
+            .isTrue();
+
+        // A refused swap used to leave the directory routing to a segment the worker then closed.
+        assertThat(storageEngine.getSegment(0L).isClosed())
+            .as("the directory must never be left routing to a closed segment")
+            .isFalse();
+    }
+
+    @Test
     @DisplayName("Reconciliation registers directory segments and retires departed ones")
     void reconciliationConvergesOnTheStorageDirectory() {
         assertThat(orchestrator.getRegisteredSegmentCount()).isZero();

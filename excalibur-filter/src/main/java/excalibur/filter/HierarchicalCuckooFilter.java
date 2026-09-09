@@ -364,6 +364,20 @@ public class HierarchicalCuckooFilter {
     }
 
     /**
+     * The entries the corpus level was sized to hold.
+     *
+     * <p>Exposed because this level is what decides whether a term is looked for at all: once it
+     * is full it cannot record a new term, and a term it has no record of prunes every segment.
+     * The result is an empty answer for documents that are sitting in storage, which is
+     * indistinguishable from "nothing matched" unless the sizing can be read back.</p>
+     *
+     * @return The corpus-level capacity, at least the value the filter was constructed with
+     */
+    public long corpusCapacity() {
+        return corpusFilter.capacity();
+    }
+
+    /**
      * Checks if an item might be present in a specific segment.
      *
      * <p>This checks the full hierarchy: corpus → cluster → segment.</p>
@@ -469,6 +483,14 @@ public class HierarchicalCuckooFilter {
      * deleting an item that was never inserted evicts some other item that happens to share
      * a fingerprint - and at the corpus level that other item can belong to any segment.
      * A miss at the leaf proves the item was never inserted for this segment.</p>
+     *
+     * <p>That guard has a cost, and it is the reason a shared level can hold an entry no
+     * segment needs. Every level hashes independently, so two items whose fingerprints
+     * collide in the segment filter share one entry there and hold two here. Deleting the
+     * first removes the shared segment entry; deleting the second finds nothing at the leaf
+     * and stops, leaving its cluster and corpus entries behind for good. The rate is the
+     * fingerprint collision rate, and the error is the harmless one: a candidate segment
+     * that turns out to hold nothing, never a document that cannot be found.</p>
      *
      * @param item The item to delete
      * @param segmentId The segment ID where the item was stored

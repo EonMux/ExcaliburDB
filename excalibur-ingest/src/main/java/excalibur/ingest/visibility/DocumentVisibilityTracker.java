@@ -7,7 +7,9 @@ import excalibur.ingest.registry.DocumentRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +42,13 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>Write log offset range - [startOffset, endOffset) for atomicity verification</li>
  * </ul>
  *
+ * <h2>Retention</h2>
+ * <p>Published documents are remembered for a bounded window
+ * ({@value #DEFAULT_RETAINED_DOCUMENTS} by default) rather than for the life of the process. Past
+ * it the oldest commit epochs are forgotten, which returns those documents to the same state a
+ * restart leaves every previously written document in: unknown to this tracker, and passed through
+ * by the atomicity filter rather than hidden. Documents still in flight are never forgotten.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p><strong>This class is fully thread-safe.</strong></p>
  * <ul>
@@ -62,6 +71,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>Chunk IDs are non-null and non-empty</li>
  *   <li>Offset range satisfies startOffset &lt; endOffset</li>
  *   <li>A document is only visible after all chunks are registered</li>
+ *   <li>Tracking is bounded: the oldest published documents are forgotten, never the newest</li>
  * </ul>
  *
  * @author ExcaliburDB
@@ -71,11 +81,23 @@ public class DocumentVisibilityTracker {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(DocumentVisibilityTracker.class);
 
+    /**
+     * How many published documents are remembered before the oldest are forgotten.
+     *
+     * <p>Chosen to cover far more than any plausible set of in-flight queries while keeping the
+     * map's footprint bounded: a node that has published millions of documents holds entries for
+     * the most recent hundred thousand, not for all of them.</p>
+     */
+    public static final int DEFAULT_RETAINED_DOCUMENTS = 100_000;
+
+
     private final DocumentRegistry documentRegistry;
     private final Map<String, DocumentVisibility> documentVisibility;
     private final VisibilityEpochClock clock;
     private final boolean nodeClock;
     private final Map<String, Set<String>> pendingChunks;
+    private final int retainedDocuments;
+    private final Object evictionLock = new Object();
 
     /**
      * Creates a new DocumentVisibilityTracker with an in-memory document registry.
@@ -137,15 +159,48 @@ public class DocumentVisibilityTracker {
 
     private DocumentVisibilityTracker(DocumentRegistry documentRegistry,
                                       VisibilityEpochClock clock, boolean nodeClock) {
+        this(documentRegistry, clock, nodeClock, DEFAULT_RETAINED_DOCUMENTS);
+    }
+
+    private DocumentVisibilityTracker(DocumentRegistry documentRegistry,
+                                      VisibilityEpochClock clock, boolean nodeClock,
+                                      int retainedDocuments) {
         this.documentRegistry =
             Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.nodeClock = nodeClock;
+        if (retainedDocuments <= 0) {
+            throw new IllegalArgumentException(
+                "retainedDocuments must be positive: " + retainedDocuments);
+        }
+        this.retainedDocuments = retainedDocuments;
         this.documentVisibility = new ConcurrentHashMap<>();
         this.pendingChunks = new ConcurrentHashMap<>();
 
-        LOGGER.info("DocumentVisibilityTracker initialized on {} clock",
-            nodeClock ? "the node" : "a private");
+        LOGGER.info("DocumentVisibilityTracker initialized on {} clock, retaining {} documents",
+            nodeClock ? "the node" : "a private", retainedDocuments);
+    }
+
+    /**
+     * Creates a tracker on a private clock that remembers a given number of documents.
+     *
+     * <p>Provided for tests and for callers that want a smaller window than the default; the
+     * bound is the point, so there is no way to ask for an unbounded one.</p>
+     *
+     * @param retainedDocuments How many published documents to remember (must be positive)
+     * @throws IllegalArgumentException if retainedDocuments is not positive
+     */
+    public DocumentVisibilityTracker(int retainedDocuments) {
+        this(new DocumentRegistry(), privateClock(0), false, retainedDocuments);
+    }
+
+    /**
+     * Returns how many published documents this tracker remembers before forgetting the oldest.
+     *
+     * @return The retention limit
+     */
+    public int retainedDocumentLimit() {
+        return retainedDocuments;
     }
 
     /**
@@ -221,6 +276,7 @@ public class DocumentVisibilityTracker {
 
         documentVisibility.put(documentId, visibility);
         pendingChunks.remove(documentId);
+        forgetOldestBeyondRetention();
 
         LOGGER.debug("Document {} registered as atomic at epoch {} with {} chunks",
             documentId, commitEpoch, chunkIds.size());
@@ -254,6 +310,7 @@ public class DocumentVisibilityTracker {
         // begun with beginIngestion and finished through this path stays pending forever:
         // invisible to every query, and never released.
         pendingChunks.remove(key);
+        forgetOldestBeyondRetention();
 
         LOGGER.debug("Document {} recovered from metadata at epoch {} with {} chunks",
             key, commitEpoch, chunkIds.size());
@@ -494,6 +551,57 @@ public class DocumentVisibilityTracker {
         documentVisibility.clear();
         pendingChunks.clear();
         LOGGER.debug("DocumentVisibilityTracker cleared");
+    }
+
+    /**
+     * Forgets the oldest published documents once the retention limit is passed.
+     *
+     * <h2>Why this is safe</h2>
+     * <p>The atomicity filter passes a document it has never heard of straight through rather than
+     * hiding it, because this map is built in memory as documents are ingested and everything
+     * written by a previous process is unknown after a restart. Forgetting an entry therefore puts
+     * that document in exactly the state a restart would leave it in, and both states give the
+     * same answer for a document that is already fully visible.</p>
+     *
+     * <p>What must not be forgotten is a document some live query should still be excluded from
+     * seeing, and those are the ones committed most recently. Eviction takes the lowest commit
+     * epochs first, so entries leave in the order their answers stop being in dispute.</p>
+     *
+     * <p>In-flight documents live in {@code pendingChunks} and are never touched here: forgetting
+     * one would publish it half-written, which is the single thing this class exists to prevent.</p>
+     */
+    private void forgetOldestBeyondRetention() {
+        if (documentVisibility.size() <= retainedDocuments) {
+            return;
+        }
+
+        synchronized (evictionLock) {
+            int size = documentVisibility.size();
+            if (size <= retainedDocuments) {
+                return;
+            }
+
+            // Evict down to nine tenths of the limit rather than exactly to it, so that a steady
+            // publish rate pays for this sort once per tenth of the window instead of once per
+            // document.
+            int target = Math.max(1, retainedDocuments - retainedDocuments / 10);
+            int excess = size - target;
+
+            List<Map.Entry<String, DocumentVisibility>> oldestFirst =
+                new ArrayList<>(documentVisibility.entrySet());
+            oldestFirst.sort(Comparator.comparingLong(entry -> entry.getValue().commitEpoch()));
+
+            int removed = 0;
+            for (int i = 0; i < oldestFirst.size() && removed < excess; i++) {
+                Map.Entry<String, DocumentVisibility> entry = oldestFirst.get(i);
+                if (documentVisibility.remove(entry.getKey(), entry.getValue())) {
+                    removed++;
+                }
+            }
+
+            LOGGER.debug("Visibility tracking forgot {} of {} documents, retaining {}",
+                removed, size, documentVisibility.size());
+        }
     }
 
     /**

@@ -111,16 +111,6 @@ public class QueryPipeline {
     private static final long EMPTY_RESULT_DIAGNOSTIC_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
 
     /**
-     * Minimum fraction of a segment's entries an LSH index must cover before its verdict
-     * is treated as authoritative.
-     *
-     * <p>An index that has seen far fewer entries than the segment holds - because it is
-     * still being populated, or was built after the segment - cannot rule a segment out:
-     * an empty candidate set from such an index means "no information", not "no matches".</p>
-     */
-    private static final double LSH_AUTHORITATIVE_COVERAGE = 0.5;
-
-    /**
      * Epoch handed to the document atomicity filter, meaning "no epoch bound".
      *
      * <p>The pipeline's own epoch ({@code PipelineContext.epoch}) comes from the shard's
@@ -674,30 +664,48 @@ public class QueryPipeline {
         SegmentCatalog catalog = storageEngine.getCatalog();
         List<SegmentCandidate> candidates = new ArrayList<>();
 
-        for (Segment segment : snapshot.resolveVisibleSegments()) {
-            long segmentId = segment.segmentId();
+        // A segment the catalog counts as live corpus and this query does not read is a gap in
+        // the answer, not an error: nothing throws, nothing is logged as a failure, and coverage
+        // taken from the catalog alone reports it as searched. Counting the gaps is what lets the
+        // response say how much of the corpus the query actually reached.
+        int segmentsExcluded = 0;
+
+        // The ID comes from the snapshot, not from the segment. Segment.segmentId() counts every
+        // segment instance the process has constructed; the catalog, the visibility tracker, the
+        // term filter hierarchy and the graph provider are all keyed by the directory index the
+        // engine routes by. The two agree while segments are created in directory order and part
+        // company the moment one is created out of it - which is what a compaction and a split
+        // both do. Past that point the catalog lookup below misses, the segment is dropped from
+        // stage 0, and it is absent from every query result with nothing logged as an error.
+        for (Map.Entry<Long, Segment> visible : snapshot.resolveVisibleSegmentsById().entrySet()) {
+            long segmentId = visible.getKey();
+            Segment segment = visible.getValue();
             SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
             if (metadata == null) continue;
 
             LifecycleState state = metadata.getLifecycleState();
             if (!state.isQueryable()) continue;
 
-            // Filter by partial segment policy
-            if (!request.includePartialSegments() && state != LifecycleState.ACTIVE) {
+            // Hold back the segments still taking entries when the caller asked for complete ones
+            if (!request.includePartialSegments() && state.isPartiallyIndexed()) {
+                segmentsExcluded++;
                 continue;
             }
 
             HnswGraph graph = graphProvider.getGraph(segmentId);
-            if (graph != null) {
-                LshIndex lshIndex = segment.lshIndex();
-                candidates.add(new SegmentCandidate(segmentId, segment, graph, state, lshIndex));
+            if (graph == null) {
+                segmentsExcluded++;
+                continue;
             }
+
+            LshIndex lshIndex = segment.lshIndex();
+            candidates.add(new SegmentCandidate(segmentId, segment, graph, state, lshIndex));
         }
 
-        LOGGER.debug("Stage 0: Captured epoch {} with {} queryable segments",
-            snapshot.epoch(), candidates.size());
+        LOGGER.debug("Stage 0: Captured epoch {} with {} queryable segments, {} excluded",
+            snapshot.epoch(), candidates.size(), segmentsExcluded);
 
-        return new PipelineContext(request, token, snapshot.epoch(), candidates);
+        return new PipelineContext(request, token, snapshot.epoch(), candidates, segmentsExcluded);
     }
 
     /**
@@ -1023,7 +1031,6 @@ public class QueryPipeline {
         LOGGER.trace("Stage 2: Running LSH pre-filter");
 
         float[] queryVector = context.request.queryVectorUnsafe();
-        int targetCandidates = context.request.topK() * 50; // 50x oversampling
 
         List<SegmentCandidate> passed = new ArrayList<>();
         int segmentsWithLsh = 0;
@@ -1042,21 +1049,31 @@ public class QueryPipeline {
 
             segmentsWithLsh++;
             try {
+                PrefilterCoverage.Standing standing = prefilterStanding(candidate, lsh);
+                if (standing == PrefilterCoverage.Standing.UNKNOWN) {
+                    // The index has missed nodes the graph holds, so neither of its answers can
+                    // be acted on: the nodes it missed are the ones it cannot name. Treat it
+                    // exactly like a missing index and search the segment whole.
+                    LOGGER.debug("Segment {} LSH index holds {} entries for {} graph nodes; "
+                        + "its answer is not authoritative, passing through",
+                        candidate.segmentId(), lsh.entryCount(), graphNodeCount(candidate));
+                    passed.add(candidate);
+                    continue;
+                }
+
                 Set<Long> lshCandidates = lsh.query(queryVector);
                 if (!lshCandidates.isEmpty()) {
                     totalLshCandidates += lshCandidates.size();
                     passed.add(candidate.withLshCandidates(lshCandidates));
-                } else if (isLshAuthoritative(candidate, lsh)) {
+                } else if (standing == PrefilterCoverage.Standing.COVERS_SEGMENT) {
                     // The index covers this segment and found nothing: a real exclusion
                     segmentsFiltered++;
                     LOGGER.trace("Segment {} filtered out by LSH (no candidates)", candidate.segmentId());
                 } else {
-                    // The index has seen little or none of this segment, so an empty
-                    // candidate set says nothing about it. Treat it exactly like a
-                    // missing index and pass the segment through.
-                    LOGGER.debug("Segment {} LSH index covers {} of {} entries; " +
-                        "empty result is not authoritative, passing through",
-                        candidate.segmentId(), lsh.entryCount(), segmentEntryCount(candidate));
+                    // The index covers the graph but the graph is behind the log, so the segment
+                    // still has an unindexed tail to scan. Nothing to narrow the search to.
+                    LOGGER.trace("Segment {} has no LSH candidates but an unindexed tail; "
+                        + "passing through", candidate.segmentId());
                     passed.add(candidate);
                 }
             } catch (Exception e) {
@@ -1074,45 +1091,49 @@ public class QueryPipeline {
     }
 
     /**
-     * Decides whether an empty LSH result may be used to exclude a segment.
+     * Measures how far a segment's pre-filter may be believed.
      *
-     * <p>An LSH index only speaks for the entries it has actually indexed. One that is
-     * empty, or that holds far fewer entries than the segment does, has no basis for
-     * ruling the segment out; treating its empty answer as authoritative would silently
-     * drop every match the segment holds.</p>
+     * <p>Reads the four quantities {@link PrefilterCoverage} compares - what the index holds, what
+     * the graph holds, and how far the graph has absorbed the write log - and treats any of them
+     * being unreadable as a reason to believe none of it. The rule itself is documented there.</p>
      *
      * @param candidate The segment candidate
      * @param lsh The segment's LSH index
-     * @return true if the index covers enough of the segment for an empty result to mean
-     *         "no matches" rather than "unknown"
+     * @return The standing of this pre-filter's answer for this segment
      */
-    private boolean isLshAuthoritative(SegmentCandidate candidate, LshIndex lsh) {
-        long indexed = lsh.entryCount();
-        if (indexed <= 0) {
-            return false;
+    private PrefilterCoverage.Standing prefilterStanding(SegmentCandidate candidate, LshIndex lsh) {
+        HnswGraph graph = candidate.graph();
+        Segment segment = candidate.segment();
+        if (graph == null || segment == null) {
+            // Nothing to measure the index against, so it speaks for nothing.
+            return PrefilterCoverage.Standing.UNKNOWN;
         }
 
-        long segmentEntries = segmentEntryCount(candidate);
-        if (segmentEntries <= 0) {
-            // Entry count unavailable: a populated index is the best evidence we have
-            return true;
+        try {
+            return PrefilterCoverage.standing(
+                lsh.entryCount(),
+                graph.nodeCount(),
+                graph.getLastIntegratedOffset(),
+                segment.getWriteLogHead());
+        } catch (Exception e) {
+            LOGGER.trace("Could not measure pre-filter coverage for segment {}: {}",
+                candidate.segmentId(), e.getMessage());
+            return PrefilterCoverage.Standing.UNKNOWN;
         }
-
-        return indexed >= segmentEntries * LSH_AUTHORITATIVE_COVERAGE;
     }
 
     /**
-     * Returns the number of entries a candidate's segment holds, or -1 if unknown.
+     * Returns the number of nodes a candidate's graph holds, for logging, or -1 if unknown.
      */
-    private long segmentEntryCount(SegmentCandidate candidate) {
-        Segment segment = candidate.segment();
-        if (segment == null) {
+    private long graphNodeCount(SegmentCandidate candidate) {
+        HnswGraph graph = candidate.graph();
+        if (graph == null) {
             return -1;
         }
         try {
-            return segment.entryCount();
+            return graph.nodeCount();
         } catch (Exception e) {
-            LOGGER.trace("Could not read entry count for segment {}: {}",
+            LOGGER.trace("Could not read node count for segment {}: {}",
                 candidate.segmentId(), e.getMessage());
             return -1;
         }
@@ -1161,14 +1182,19 @@ public class QueryPipeline {
             .includePartialSegments(context.request.includePartialSegments())
             .build();
 
-        // Convert SegmentCandidates to SegmentInfo for the dispatcher
+        // Convert SegmentCandidates to SegmentInfo for the dispatcher, carrying across what
+        // stage 2 decided about each segment. A candidate set that reached here is non-empty and
+        // names nodes of this segment's graph, so the search is confined to it; a segment stage 2
+        // left alone - no index, an unreadable one, or one whose emptiness proved nothing - is
+        // handed a null set and searched whole.
         List<ParallelQueryDispatcher.SegmentInfo> segmentsToSearch = new ArrayList<>();
         for (SegmentCandidate candidate : context.candidates) {
             if (candidate.isValid()) {
                 segmentsToSearch.add(ParallelQueryDispatcher.createSegmentInfo(
                     candidate.segmentId(),
                     candidate.segment(),
-                    candidate.graph()
+                    candidate.graph(),
+                    candidate.hasLshCandidates() ? candidate.lshCandidates() : null
                 ));
             }
         }
@@ -1244,9 +1270,10 @@ public class QueryPipeline {
     /**
      * Stage 4: Full Vector Rerank.
      *
-     * <p>Exact distance computation on full-precision vectors for top candidates.
-     * This stage computes exact distances for candidates from Stage 3, which may
-     * have used Product Quantization (PQ) for approximate distance computation.</p>
+     * <p>Re-measurement of the top candidates against the query, on the full-precision vectors
+     * the graph holds now. Stage 3 measured them exactly too, so the number is the same for a
+     * node that has not moved; the second look is what drops one tombstoned since, or whose id a
+     * compaction has since given to another node.</p>
      *
      * <h3>Reranking Process</h3>
      * <ol>
@@ -1259,9 +1286,10 @@ public class QueryPipeline {
      *
      * <h3>Why Reranking is Critical</h3>
      * <ul>
-     *   <li><strong>PQ correction:</strong> Stage 3 may use PQ for approximate distance - reranking ensures exact distances</li>
+     *   <li><strong>Freshness:</strong> each candidate is re-read under the generation it was
+     *       found at, so nodes tombstoned or displaced by compaction between the stages drop out</li>
      *   <li><strong>Tail scan integration:</strong> Results from HNSW and tail scan are merged with consistent exact distance computation</li>
-     *   <li><strong>Quality guarantee:</strong> Final ranking reflects true similarity, not approximations</li>
+     *   <li><strong>One ordering:</strong> the oversampled candidates from every segment are ranked together before the top-k cut</li>
      * </ul>
      *
      * <p><strong>Document Atomicity:</strong> After merging results, this stage
@@ -1638,17 +1666,10 @@ public class QueryPipeline {
             }
         }
 
-        // Build coverage with degraded flag that includes LLM fallback status
-        // Domain correctness: degraded must be true when:
-        // 1. Coverage is below threshold, OR
-        // 2. Segment errors occurred, OR
-        // 3. Segment timeouts occurred, OR
-        // 4. LLM scoring was requested but fell back to vector-only
-        //
-        // computeDegraded() handles conditions 1-3, we add condition 4 via context.llmFallback
-        boolean baseDegradedFromCompute = estimatedCorpusCoverageWouldBeDegraded(
-            activeSegments, indexingSegments, warmingSegments, compactingSegments,
-            totalSegments, tombstonedSegments, segmentsWithErrors, coverageThreshold);
+        // A response is degraded when coverage is below the threshold, when a segment errored or
+        // timed out - all three of which computeDegraded reads off the numbers below - or when LLM
+        // scoring was asked for and fell back to vector-only ranking, which is the one reason no
+        // count records, so it is ORed in afterwards.
         IndexCoverage coverage = IndexCoverage.builder()
             .totalSegments(totalSegments)
             .activeSegments(activeSegments)
@@ -1658,11 +1679,12 @@ public class QueryPipeline {
             .tombstonedSegments(tombstonedSegments)
             .tailScanEntries(context.totalTailScanEntries)
             .segmentsSearched(segmentsSearched)
+            .segmentsExcluded(context.segmentsExcluded)
             .segmentsWithErrors(segmentsWithErrors)
             .segmentsTimedOut(context.segmentsTimedOut)
             .computeCoverage()
             .computeDegraded(coverageThreshold)
-            .degraded(context.llmFallback || baseDegradedFromCompute)
+            .orDegraded(context.llmFallback)
             .build();
 
         QueryResponse response = new QueryResponse(
@@ -1690,39 +1712,6 @@ public class QueryPipeline {
         }
 
         return response;
-    }
-
-    /**
-     * Computes whether the degraded flag would be true based on coverage and error conditions.
-     *
-     * <p>This mirrors the logic in IndexCoverage.Builder.computeDegraded() but allows
-     * us to combine it with additional conditions like LLM fallback.</p>
-     *
-     * @param activeSegments Active segment count
-     * @param indexingSegments Indexing segment count
-     * @param warmingSegments Warming segment count
-     * @param compactingSegments Compacting segment count
-     * @param totalSegments Total segment count
-     * @param tombstonedSegments Tombstoned segment count
-     * @param segmentsWithErrors Segments with errors count
-     * @param threshold Coverage threshold
-     * @return true if degraded conditions are met
-     */
-    private boolean estimatedCorpusCoverageWouldBeDegraded(
-            long activeSegments, long indexingSegments, long warmingSegments, long compactingSegments,
-            long totalSegments, long tombstonedSegments, int segmentsWithErrors, double threshold) {
-        // Compute estimated corpus coverage (same logic as IndexCoverage.Builder.computeCoverage())
-        long nonPurged = totalSegments - tombstonedSegments;
-        double estimatedCorpusCoverage;
-        if (nonPurged <= 0) {
-            estimatedCorpusCoverage = 0.0;
-        } else {
-            long queryable = activeSegments + indexingSegments + warmingSegments + compactingSegments;
-            estimatedCorpusCoverage = Math.max(0.0, Math.min(1.0, (double) queryable / nonPurged));
-        }
-
-        // Check degraded conditions (same logic as IndexCoverage.Builder.computeDegraded())
-        return estimatedCorpusCoverage < threshold || segmentsWithErrors > 0;
     }
 
     /**
@@ -1891,6 +1880,8 @@ public class QueryPipeline {
         final List<QueryResultItem> mergedResults;
         final long totalTailScanEntries;
         final int segmentsTimedOut;
+        /** Queryable segments stage 0 was not permitted to hand on. */
+        final int segmentsExcluded;
         final boolean llmScored;
         final boolean llmFallback;
 
@@ -1903,6 +1894,7 @@ public class QueryPipeline {
                 List<QueryResultItem> mergedResults,
                 long totalTailScanEntries,
                 int segmentsTimedOut,
+                int segmentsExcluded,
                 boolean llmScored,
                 boolean llmFallback) {
             this.request = request;
@@ -1913,39 +1905,46 @@ public class QueryPipeline {
             this.mergedResults = mergedResults;
             this.totalTailScanEntries = totalTailScanEntries;
             this.segmentsTimedOut = segmentsTimedOut;
+            this.segmentsExcluded = segmentsExcluded;
             this.llmScored = llmScored;
             this.llmFallback = llmFallback;
         }
 
-        PipelineContext(QueryRequest request, CancellationToken token, long epoch, List<SegmentCandidate> candidates) {
+        PipelineContext(QueryRequest request, CancellationToken token, long epoch,
+                List<SegmentCandidate> candidates, int segmentsExcluded) {
             this(request, token, epoch, candidates, Collections.emptyList(),
-                Collections.emptyList(), 0, 0, false, false);
+                Collections.emptyList(), 0, 0, segmentsExcluded, false, false);
         }
 
         PipelineContext withCandidates(List<SegmentCandidate> candidates) {
             return new PipelineContext(request, token, epoch, candidates,
-                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut, llmScored, llmFallback);
+                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut,
+                segmentsExcluded, llmScored, llmFallback);
         }
 
         PipelineContext withSegmentResults(
                 List<SegmentQueryTask.SegmentQueryResult> results, long tailScanEntries, int timedOut) {
             return new PipelineContext(request, token, epoch, candidates,
-                results, mergedResults, tailScanEntries, timedOut, llmScored, llmFallback);
+                results, mergedResults, tailScanEntries, timedOut,
+                segmentsExcluded, llmScored, llmFallback);
         }
 
         PipelineContext withMergedResults(List<QueryResultItem> results) {
             return new PipelineContext(request, token, epoch, candidates,
-                segmentResults, results, totalTailScanEntries, segmentsTimedOut, llmScored, llmFallback);
+                segmentResults, results, totalTailScanEntries, segmentsTimedOut,
+                segmentsExcluded, llmScored, llmFallback);
         }
 
         PipelineContext withLlmScored(boolean scored) {
             return new PipelineContext(request, token, epoch, candidates,
-                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut, scored, llmFallback);
+                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut,
+                segmentsExcluded, scored, llmFallback);
         }
 
         PipelineContext withLlmFallback(boolean fallback) {
             return new PipelineContext(request, token, epoch, candidates,
-                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut, llmScored, fallback);
+                segmentResults, mergedResults, totalTailScanEntries, segmentsTimedOut,
+                segmentsExcluded, llmScored, fallback);
         }
     }
 }

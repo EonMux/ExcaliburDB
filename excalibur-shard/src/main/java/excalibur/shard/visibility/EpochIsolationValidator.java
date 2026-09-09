@@ -151,8 +151,15 @@ public final class EpochIsolationValidator {
         ConcurrentSkipListMap<Long, Long> checkpoints =
             segmentCheckpoints.computeIfAbsent(segmentId, k -> new ConcurrentSkipListMap<>());
 
-        Map.Entry<Long, Long> newest = checkpoints.lastEntry();
-        if (newest != null && newest.getValue().longValue() == visibleEpoch) {
+        // Coalesce against the checkpoint that would already cover this range, not against the
+        // highest one. Both are the same entry on the normal path, where each batch starts at the
+        // graph's next node id and so registers in increasing order. They differ when a range
+        // arrives below one already recorded, and comparing against the highest then drops the
+        // new checkpoint entirely: every node between its first id and the next recorded
+        // checkpoint is left uncovered, which resolves to "visible at every epoch". That is the
+        // torn read this class exists to prevent, arrived at by skipping a write.
+        Map.Entry<Long, Long> covering = checkpoints.floorEntry(firstNodeId);
+        if (covering != null && covering.getValue().longValue() == visibleEpoch) {
             // Consecutive batches at the same epoch are one contiguous range.
             return;
         }
@@ -212,7 +219,16 @@ public final class EpochIsolationValidator {
             throw new IllegalArgumentException("visibleEpoch must be non-negative: " + visibleEpoch);
         }
 
-        for (Long nodeId : nodeIds) {
+        // Ascending, because a checkpoint only coalesces into the range below it. A Set makes no
+        // promise about iteration order and Set.of randomises it per JVM, so the same call could
+        // record one checkpoint for a contiguous batch on one run and one per node on the next.
+        // Every node ends up covered either way - this is not a correctness fix - but the memory
+        // this class uses, and the checkpoint count it reports, would otherwise depend on a hash
+        // seed rather than on what was registered.
+        List<Long> ascending = new ArrayList<>(nodeIds);
+        Collections.sort(ascending);
+
+        for (Long nodeId : ascending) {
             registerNodeRange(UNSCOPED, nodeId, visibleEpoch);
         }
         LOGGER.trace("Registered {} nodes with visibility epoch {}", nodeIds.size(), visibleEpoch);

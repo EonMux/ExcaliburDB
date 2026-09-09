@@ -1,6 +1,5 @@
 package excalibur.ingest.pipeline;
 
-import excalibur.ingest.lsh.LshIngestionService;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
@@ -83,13 +82,7 @@ public class DocumentBatchPublisher {
      * Optional LSH ingestion service for vector indexing.
      * When set, vectors will be inserted into segment LSH indices during publication.
      */
-    private final LshIngestionService lshIngestionService;
 
-    /**
-     * Optional segment provider for LSH indexing.
-     * When set with lshIngestionService, provides segments for vector insertion.
-     */
-    private final SegmentProvider segmentProvider;
 
     /**
      * Default backpressure timeout in milliseconds (30 seconds).
@@ -142,8 +135,8 @@ public class DocumentBatchPublisher {
             CuckooFilter cuckooFilter,
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock) {
-        this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter,
-             writeLogAdapter, publicationLock, null, null, null);
+        this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter, null, null,
+             writeLogAdapter, publicationLock, null);
     }
 
     /**
@@ -166,36 +159,8 @@ public class DocumentBatchPublisher {
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock,
             IndexOrchestrator orchestrator) {
-        this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter,
-             writeLogAdapter, publicationLock, orchestrator, null, null);
-    }
-
-    /**
-     * Creates a new DocumentBatchPublisher with LSH indexing support.
-     *
-     * @param visibilityTracker The visibility tracker for epoch management
-     * @param documentRegistry The document registry for metadata tracking
-     * @param visibilityRegistry The visibility registry for document-atomic visibility (may be null)
-     * @param cuckooFilter The Cuckoo filter for chunk membership (may be null)
-     * @param writeLogAdapter The write log adapter for fsync operations
-     * @param publicationLock Lock for serializing publications (may be null)
-     * @param orchestrator The index orchestrator for backpressure checking (may be null)
-     * @param lshIngestionService The LSH ingestion service for vector indexing (may be null)
-     * @param segmentProvider The segment provider for LSH indexing (may be null)
-     * @throws NullPointerException if visibilityTracker or documentRegistry is null
-     */
-    public DocumentBatchPublisher(
-            VisibilityTracker visibilityTracker,
-            DocumentRegistry documentRegistry,
-            DocumentVisibilityRegistry visibilityRegistry,
-            CuckooFilter cuckooFilter,
-            WriteLogAdapter writeLogAdapter,
-            Lock publicationLock,
-            IndexOrchestrator orchestrator,
-            LshIngestionService lshIngestionService,
-            SegmentProvider segmentProvider) {
         this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter, null, null,
-             writeLogAdapter, publicationLock, orchestrator, lshIngestionService, segmentProvider);
+             writeLogAdapter, publicationLock, orchestrator);
     }
 
     /**
@@ -213,9 +178,7 @@ public class DocumentBatchPublisher {
             String segmentId,
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock,
-            IndexOrchestrator orchestrator,
-            LshIngestionService lshIngestionService,
-            SegmentProvider segmentProvider) {
+            IndexOrchestrator orchestrator) {
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
         this.documentRegistry = Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
         this.visibilityRegistry = visibilityRegistry;
@@ -225,8 +188,6 @@ public class DocumentBatchPublisher {
         this.writeLogAdapter = writeLogAdapter;
         this.publicationLock = publicationLock;
         this.orchestrator = orchestrator;
-        this.lshIngestionService = lshIngestionService;
-        this.segmentProvider = segmentProvider;
     }
 
     /**
@@ -315,7 +276,7 @@ public class DocumentBatchPublisher {
             Lock publicationLock,
             IndexOrchestrator orchestrator) {
         this(visibilityTracker, documentRegistry, visibilityRegistry, null, hierarchicalFilter,
-             segmentId, writeLogAdapter, publicationLock, orchestrator, null, null);
+             segmentId, writeLogAdapter, publicationLock, orchestrator);
     }
 
     /**
@@ -407,9 +368,7 @@ public class DocumentBatchPublisher {
             String.valueOf(targetSegmentId),
             this.writeLogAdapter,
             this.publicationLock,
-            this.orchestrator,
-            this.lshIngestionService,
-            this.segmentProvider
+            this.orchestrator
         );
     }
 
@@ -517,11 +476,6 @@ public class DocumentBatchPublisher {
                 visibilityRegistry.registerDocument(documentId, chunkIds, newEpoch);
                 LOGGER.debug("Document registered in visibility registry: {} at epoch {}",
                     documentId, newEpoch);
-            }
-
-            // Insert vectors into LSH index for vector similarity search
-            if (lshIngestionService != null && segmentProvider != null && segmentId != null) {
-                insertIntoLshIndex(buffer);
             }
 
             buffer.markPublished();
@@ -667,69 +621,6 @@ public class DocumentBatchPublisher {
         }
 
         return failed;
-    }
-
-    /**
-     * Inserts vectors into the LSH index for vector similarity search.
-     *
-     * <p>This method is called after Cuckoo filter insertion to add vectors
-     * to the segment's LSH index. LSH (Locality-Sensitive Hashing) enables
-     * efficient approximate nearest neighbor search by pre-filtering candidates.</p>
-     *
-     * <p><strong>Entry ID Mapping:</strong></p>
-     * <ul>
-     *   <li>The entry ID for LSH is derived from the write log offset</li>
-     *   <li>This allows the query pipeline to map LSH candidates back to storage entries</li>
-     *   <li>Entry IDs must be unique within a segment</li>
-     * </ul>
-     *
-     * @param buffer The buffer containing chunk entries with embeddings
-     */
-    private void insertIntoLshIndex(DocumentBatchBuffer buffer) {
-        if (lshIngestionService == null || segmentProvider == null || segmentId == null) {
-            return;
-        }
-
-        Segment segment = segmentProvider.getSegment(segmentId);
-        if (segment == null) {
-            LOGGER.warn("Cannot insert into LSH index: segment not found for segmentId={}", segmentId);
-            return;
-        }
-
-        int inserted = 0;
-        int failed = 0;
-
-        for (DocumentBatchBuffer.ChunkEntry entry : buffer.getEntries()) {
-            float[] embedding = entry.embedding();
-            if (embedding == null || embedding.length == 0) {
-                continue;
-            }
-
-            // Use writeLogOffset as the entry ID for LSH
-            // This maps LSH candidates back to storage entries
-            long entryId = entry.writeLogOffset();
-
-            try {
-                boolean success = lshIngestionService.insertVector(segment, embedding, entryId);
-                if (success) {
-                    inserted++;
-                } else {
-                    failed++;
-                    LOGGER.trace("Failed to insert vector into LSH index for chunk: {}", entry.chunkId());
-                }
-            } catch (Exception e) {
-                failed++;
-                LOGGER.warn("Exception inserting vector into LSH index for chunk {}: {}",
-                    entry.chunkId(), e.getMessage());
-            }
-        }
-
-        if (inserted > 0) {
-            LOGGER.debug("Inserted {} vectors into LSH index for segment {}, {} failed",
-                inserted, segmentId, failed);
-        } else if (failed > 0) {
-            LOGGER.warn("All {} vector insertions failed for LSH index in segment {}", failed, segmentId);
-        }
     }
 
     /**

@@ -31,19 +31,25 @@ import java.util.concurrent.ConcurrentHashMap;
  * </pre>
  *
  * <h2>Response Format</h2>
+ * <p>The two forms answer with different shapes. A named source is returned bare, because a caller
+ * that asked for one source should not have to unwrap a collection to find it, and 404 when it was
+ * never registered:</p>
  * <pre>{@code
+ * GET /v1/ingest/status?source_id=my-docs
  * {
- *   "sources": [
- *     {
- *       "source_id": "my-docs",
- *       "state": "crawling",
- *       "progress": 0.73,
- *       "entries_ingested": 450000,
- *       "entries_pending": 170000,
- *       "last_error": null
- *     }
- *   ]
+ *   "source_id": "my-docs",
+ *   "state": "crawling",
+ *   "progress": 0.7300,
+ *   "entries_ingested": 450000,
+ *   "entries_pending": 170000,
+ *   "last_error": null
  * }
+ * }</pre>
+ * <p>Every source is wrapped, so the response stays one shape whether none or many are
+ * registered:</p>
+ * <pre>{@code
+ * GET /v1/ingest/status
+ * {"sources": [ ...the objects above... ]}
  * }</pre>
  *
  * <h2>States</h2>
@@ -52,6 +58,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>{@code crawling} - Crawling documents from source</li>
  *   <li>{@code embedding} - Generating embeddings</li>
  *   <li>{@code indexing} - Building index structures</li>
+ *   <li>{@code unconfigured} - Registered, but this node has no ingestion pipeline; the
+ *       documents were counted into {@code entries_pending} and none were indexed, and
+ *       {@code last_error} says what to configure</li>
  * </ul>
  *
  * <h2>Domain Correctness</h2>
@@ -107,7 +116,11 @@ public class IngestStatusEndpoint implements HttpHandler {
 
             try {
                 // Parse query parameters
-                String query = exchange.getRequestURI().getQuery();
+                // getRawQuery, not getQuery: the latter is already percent-decoded, so a
+                // source id carrying an encoded "&" or "=" would be split on its own decoded
+                // delimiter and the value silently truncated, and everything surviving that
+                // would then be decoded a second time below.
+                String query = exchange.getRequestURI().getRawQuery();
                 String sourceId = getQueryParam(query, "source_id");
 
                 LOGGER.debug("Ingest status request for source: {}", sourceId != null ? sourceId : "all");
@@ -135,7 +148,11 @@ public class IngestStatusEndpoint implements HttpHandler {
     }
 
     /**
-     * Extracts a query parameter value from the query string.
+     * Extracts a query parameter value from a <em>raw</em> query string.
+     *
+     * <p>Splitting has to happen before decoding. A {@code &} or {@code =} that arrived
+     * percent-encoded is part of a value, not a delimiter, and splitting a decoded string
+     * cannot tell the two apart any more.</p>
      */
     private String getQueryParam(String query, String param) {
         if (query == null || query.isEmpty()) return null;
@@ -243,6 +260,16 @@ public class IngestStatusEndpoint implements HttpHandler {
      * Ingestion status for a source.
      */
     public static class IngestionStatus {
+
+        /**
+         * Reported for a source this node has accepted but cannot ingest.
+         *
+         * <p>Registration succeeds without an ingestion pipeline, because it is bookkeeping. This
+         * state is what keeps that from reading as an ingestion that worked: the source is known,
+         * its documents were counted into {@code entries_pending}, and none of them were indexed.
+         */
+        public static final String STATE_UNCONFIGURED = "unconfigured";
+
         private final String sourceId;
         private volatile String state;
         private volatile double progress;
@@ -279,10 +306,27 @@ public class IngestStatusEndpoint implements HttpHandler {
          */
         public void update(String state, double progress, long entriesIngested, long entriesPending) {
             this.state = state;
-            this.progress = Math.max(0.0, Math.min(1.0, progress));
+            this.progress = clampProgress(progress);
             this.entriesIngested = Math.max(0, entriesIngested);
             this.entriesPending = Math.max(0, entriesPending);
             this.lastUpdatedMs = System.currentTimeMillis();
+        }
+
+        /**
+         * Clamps a reported progress into [0.0, 1.0].
+         *
+         * <p>NaN is mapped to zero rather than left alone. Comparison against NaN is always
+         * false, so {@code Math.max(0.0, Math.min(1.0, NaN))} is NaN: the arithmetic clamp
+         * passes it straight through. This value is serialised with {@code %.4f}, and a body
+         * carrying a bare {@code NaN} is not JSON at all - every client fails to parse the whole
+         * response rather than reading one implausible number. The infinities need no special
+         * case; they clamp correctly.</p>
+         */
+        private static double clampProgress(double progress) {
+            if (Double.isNaN(progress)) {
+                return 0.0;
+            }
+            return Math.max(0.0, Math.min(1.0, progress));
         }
 
         /**
@@ -291,6 +335,27 @@ public class IngestStatusEndpoint implements HttpHandler {
         public void setError(String error) {
             this.lastError = error;
             this.state = "idle";
+            this.lastUpdatedMs = System.currentTimeMillis();
+        }
+
+        /**
+         * Records that this source will not be ingested until the node is configured for it.
+         *
+         * <p>Distinct from {@link #setError(String)}, which reports an ingestion that ran and
+         * failed and correctly leaves the source idle. Nothing ran here, so settling on
+         * {@code idle} would make a node that indexed nothing report the same state as one that
+         * finished. The crawled count is carried as pending because those documents exist and are
+         * waiting on configuration, not on work.</p>
+         *
+         * @param reason          What is missing, and what to change
+         * @param entriesPending  How many documents the crawl found
+         */
+        public void setUnconfigured(String reason, long entriesPending) {
+            this.state = STATE_UNCONFIGURED;
+            this.progress = 0.0;
+            this.entriesIngested = 0;
+            this.entriesPending = Math.max(0, entriesPending);
+            this.lastError = reason;
             this.lastUpdatedMs = System.currentTimeMillis();
         }
 

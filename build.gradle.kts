@@ -149,27 +149,49 @@ subprojects {
 
     // Coverage floors, enforced as part of `check`.
     //
-    // The project target is 80%, and nine modules meet it. The eight below are held at their
+    // The project target is 80%, and eleven modules meet it. The six below are held at their
     // measured level instead, so this is a ratchet rather than a lowered bar: coverage cannot
     // slide backwards, and each floor is a visible debt to be raised towards 0.80 rather than a
     // number chosen to make the build pass. Previously this rule declared 80% and was wired into
     // nothing, so it never ran and the figure was aspirational.
     //
+    // Each floor sits about a point under the module's measured coverage. The headroom is for
+    // the concurrency tests, whose branch mix varies slightly between runs; without it the
+    // build fails intermittently for no reason anyone can act on.
+    //
+    // excalibur-bench is the outlier and will stay one. Most of what it contains is JMH state
+    // classes, @Benchmark methods and runner mains, which exist to be executed by a benchmark
+    // run lasting minutes to hours -- not by `check`. Its validators, report writers and result
+    // parsing are ordinary code and are tested; the harness around them is deliberately not,
+    // for the same reason jmh_generated is excluded below.
+    //
     // Measured with generated code excluded; JMH's harness classes are machine-written and
     // counting them measures code generation rather than testing.
     val coverageFloors = mapOf(
         "excalibur-vector" to "0.79",
-        "excalibur-metrics" to "0.74",
-        "excalibur-api" to "0.66",
-        "excalibur-test" to "0.64",
-        "excalibur-ingest" to "0.62",
-        "excalibur-shard" to "0.60",
-        "excalibur-query" to "0.59",
-        "excalibur-bench" to "0.33"
+        "excalibur-test" to "0.78",
+        "excalibur-api" to "0.74",
+        "excalibur-shard" to "0.70",
+        "excalibur-ingest" to "0.67",
+        "excalibur-query" to "0.67",
+        "excalibur-bench" to "0.38"
     )
 
     tasks.jacocoTestCoverageVerification {
         dependsOn(tasks.test)
+        // classDirectories below reads compileJava's output. `dependsOn(test)` normally implies
+        // that, but `./gradlew build -x test` severs the implication and Gradle then refuses the
+        // whole build for an undeclared task dependency. That command is documented in the README
+        // and in USAGE.md, and analyze-flaky-tests.sh runs it, so the dependency is declared
+        // outright rather than left to be inferred from a task that may not run.
+        dependsOn(tasks.named("classes"))
+
+        // Skipping the tests skips the evidence. Verifying with no execution data reports 0% for
+        // every module and fails the build for a reason that has nothing to do with the code, so
+        // `-x test` degrades to "not verified" rather than to "failed".
+        onlyIf {
+            layout.buildDirectory.file("jacoco/test.exec").get().asFile.exists()
+        }
 
         classDirectories.setFrom(
             fileTree(layout.buildDirectory.dir("classes/java/main")) {
@@ -202,6 +224,9 @@ tasks.register<JacocoReport>("jacocoAggregateReport") {
     val covered = subprojects
 
     dependsOn(covered.map { it.tasks.named("test") })
+    // Same reason as the verification task: classDirectories reads each module's compiled
+    // output, and the test dependency alone does not survive `-x test`.
+    dependsOn(covered.map { it.tasks.named("classes") })
 
     // Resolved lazily. The previous version called File.exists() while configuring, before any
     // test had run, so on a clean build every path was skipped and the report came out empty --
@@ -254,22 +279,23 @@ tasks.register<JavaExec>("generateCoverageSummary") {
     dependsOn(":excalibur-core:classes")
 }
 
-// Combined coverage task that runs everything and enforces 80% threshold
+// Per-module reports plus the aggregate. The floors are enforced by `check` as well, so this
+// task is for reading the numbers rather than for gating on them.
+//
+// Every module, derived from the build. This listed four of eighteen, so it printed "Coverage
+// Report Generation Complete" over a run that had measured less than a quarter of the codebase
+// -- the same defect the aggregate report above was already fixed for, left in the task people
+// actually invoke.
 tasks.register("coverage") {
     group = "verification"
-    description = "Runs all tests, generates coverage reports, and enforces 80% minimum threshold"
+    description = "Runs tests, generates coverage reports, and enforces each module's coverage floor"
 
-    val targetProjects = listOf(
-        "excalibur-core",
-        "excalibur-store",
-        "excalibur-filter",
-        "excalibur-vector"
-    )
+    val targetProjects = subprojects.map { it.name }.sorted()
 
     targetProjects.forEach { projectName ->
         dependsOn(":${projectName}:test")
         dependsOn(":${projectName}:jacocoTestReport")
-        // Enforce 80% minimum coverage threshold
+        // Enforce this module's floor -- 0.80 unless the coverageFloors map holds it lower.
         dependsOn(":${projectName}:jacocoTestCoverageVerification")
     }
 
@@ -294,21 +320,18 @@ tasks.register("coverage") {
     }
 }
 
-// Task to analyze coverage gaps and identify missing test areas
+// Task to analyze coverage gaps and identify missing test areas.
+//
+// Across every module, for the same reason as `coverage` above: a gap report that only reads four
+// modules' XML names the gaps in those four and stays silent about the rest, which reads as "the
+// rest have none".
 tasks.register<JavaExec>("coverageGaps") {
     group = "verification"
     description = "Analyzes coverage reports to identify missing test coverage areas"
 
-    val targetProjects = listOf(
-        "excalibur-core",
-        "excalibur-store",
-        "excalibur-filter",
-        "excalibur-vector"
-    )
-
     // Ensure tests have run and coverage reports exist
-    targetProjects.forEach { projectName ->
-        dependsOn(":${projectName}:jacocoTestReport")
+    subprojects.forEach { project ->
+        dependsOn(":${project.name}:jacocoTestReport")
     }
 
     classpath = files("excalibur-core/build/classes/java/main")

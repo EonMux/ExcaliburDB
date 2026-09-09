@@ -257,6 +257,12 @@ public class StorageEngine implements AutoCloseable {
     private volatile HnswInitializer hnswInitializer;
 
     /**
+     * Vector pre-filter attached to every queryable segment alongside its HNSW graph.
+     * May be null if no pre-filter is configured.
+     */
+    private volatile VectorPrefilter vectorPrefilter;
+
+    /**
      * Background split worker for automatic capacity management.
      *
      * <p>The split worker monitors registered segments and performs
@@ -511,6 +517,7 @@ public class StorageEngine implements AutoCloseable {
 
                 // Recovered segments are queryable, so they need a graph too.
                 initializeHnswGraph(segment, segmentIndex);
+                initializeVectorPrefilter(segment, segmentIndex);
 
                 // Track max index for routing table sizing
                 if (segmentIndex > maxSegmentIndex) {
@@ -997,6 +1004,7 @@ public class StorageEngine implements AutoCloseable {
                 segment.attachWriteLog(new WriteLog(writeLogPath(segmentIndex)));
 
                 initializeHnswGraph(segment, segmentIndex);
+                initializeVectorPrefilter(segment, segmentIndex);
 
                 segments.put((long) segmentIndex, segment);
                 canonicalIndex.put(segment, (long) segmentIndex);
@@ -1061,6 +1069,60 @@ public class StorageEngine implements AutoCloseable {
             LOGGER.warning("Failed to initialize HNSW graph for segment "
                 + segmentIndex + ": " + e.getMessage());
             // Continue without HNSW - segment is still functional for KV operations
+        }
+    }
+
+    /**
+     * Attaches a vector pre-filter to a segment if one is configured.
+     *
+     * <p>Paired with {@link #initializeHnswGraph(Segment, long)} and called from the same places,
+     * because the pre-filter is keyed by the node ids that graph hands out. A segment with a
+     * graph and no pre-filter is merely slower to search; a segment whose pre-filter belongs to
+     * different data answers with the wrong nodes, which is why the split path discards the
+     * inherited state before this runs.</p>
+     *
+     * @param segment      The segment to initialize
+     * @param segmentIndex The segment's directory index, for logging
+     */
+    private void initializeVectorPrefilter(Segment segment, long segmentIndex) {
+        VectorPrefilter prefilter = this.vectorPrefilter;
+        if (prefilter == null || segment.getLshIndex() != null) {
+            return;
+        }
+        try {
+            prefilter.initialize(segment);
+            LOGGER.fine("Vector pre-filter initialized for segment " + segmentIndex);
+        } catch (RuntimeException e) {
+            LOGGER.warning("Failed to initialize vector pre-filter for segment "
+                + segmentIndex + ": " + e.getMessage());
+            // Continue without a pre-filter - the query pipeline falls back to a full search
+        }
+    }
+
+    /**
+     * Removes the persisted pre-filter state a split child would otherwise inherit.
+     *
+     * <p>The counterpart of {@link #discardInheritedGraph(Segment, long)}, and needed for the
+     * same reason: the pre-filter's files are derived from the segment's canonical name, the left
+     * child takes its parent's name, and the graph the child starts is a new one whose node ids
+     * begin again at zero. The inherited index holds its parent's ids, so leaving it would have
+     * the query pipeline restrict the child's search to nodes that are either absent or hold
+     * entirely different vectors.</p>
+     *
+     * @param child        The child being prepared
+     * @param segmentIndex The child's canonical index
+     */
+    private void discardInheritedPrefilter(Segment child, long segmentIndex) {
+        VectorPrefilter prefilter = this.vectorPrefilter;
+        if (prefilter == null || child.getLshIndex() != null) {
+            return;
+        }
+        try {
+            prefilter.discardPersistedState(child);
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.WARNING,
+                "Could not remove the vector pre-filter a split child would inherit (segment "
+                    + segmentIndex + ")", e);
         }
     }
 
@@ -1655,6 +1717,53 @@ public class StorageEngine implements AutoCloseable {
     }
 
     /**
+     * Sets the vector pre-filter attached to segments alongside their HNSW graphs.
+     *
+     * <p>The pre-filter is keyed by HNSW node id and is read by the query pipeline off the
+     * segment, so it has to be attached wherever a graph is: created segments, segments recovered
+     * at start-up, and split children. Leaving it to be created by the first write that reaches a
+     * segment means a segment that is only read never has one - which after a restart is every
+     * segment, however much persisted pre-filter state is sitting beside it on disk.</p>
+     *
+     * <p>As with {@link #setHnswInitializer(HnswInitializer)}, installing this after
+     * {@link #start()} back-fills the segments that already exist, because the ingestion side
+     * that owns the pre-filter is wired after the engine is running.</p>
+     *
+     * @param prefilter The vector pre-filter, or null to disable
+     */
+    public void setVectorPrefilter(VectorPrefilter prefilter) {
+        this.vectorPrefilter = prefilter;
+        LOGGER.info("Vector pre-filter " + (prefilter != null ? "configured" : "disabled"));
+
+        if (prefilter == null) {
+            return;
+        }
+
+        int initialized = 0;
+        for (Map.Entry<Long, Segment> entry : distinctSegments().entrySet()) {
+            Segment segment = entry.getValue();
+            if (segment.getLshIndex() == null && !segment.isClosed()) {
+                initializeVectorPrefilter(segment, entry.getKey());
+                if (segment.getLshIndex() != null) {
+                    initialized++;
+                }
+            }
+        }
+        if (initialized > 0) {
+            LOGGER.info("Back-filled vector pre-filters for " + initialized + " existing segment(s)");
+        }
+    }
+
+    /**
+     * Returns the vector pre-filter.
+     *
+     * @return The vector pre-filter, or null if not configured
+     */
+    public VectorPrefilter getVectorPrefilter() {
+        return vectorPrefilter;
+    }
+
+    /**
      * Returns the segment catalog.
      *
      * @return The catalog
@@ -2124,7 +2233,9 @@ public class StorageEngine implements AutoCloseable {
         }
 
         discardInheritedGraph(child, segmentIndex);
+        discardInheritedPrefilter(child, segmentIndex);
         initializeHnswGraph(child, segmentIndex);
+        initializeVectorPrefilter(child, segmentIndex);
         alignCheckpointToLog(child, segmentIndex);
     }
 

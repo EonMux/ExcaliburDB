@@ -371,6 +371,50 @@ public class ExcaliburDBServer {
      *
      * @return The orchestrator, or null when ingestion runs in stub mode
      */
+    /**
+     * Lexical retrieval over ingested chunks, attached by the application when it keeps an index.
+     *
+     * <p>Held here rather than passed to the constructor because the index is created from the
+     * data directory, which the application owns, and because it is optional.</p>
+     */
+    private volatile excalibur.api.retrieval.LexicalQueryService lexicalQueryService;
+
+    /**
+     * The chunk lexical index, so {@code GET /v1/stats} can report what it owes.
+     *
+     * <p>Held beside the query service rather than read out of it: what the stats endpoint needs
+     * is the index itself, and routing that through the thing that happens to search it would
+     * make the report depend on retrieval being wired.</p>
+     */
+    private volatile excalibur.ingest.lexical.ChunkIndex chunkIndex;
+
+    /** Reports this node's chunk lexical index on the stats endpoint. */
+    public void withChunkIndex(excalibur.ingest.lexical.ChunkIndex chunkIndex) {
+        this.chunkIndex = chunkIndex;
+    }
+
+    /**
+     * The service behind {@code POST /v1/erasure}.
+     *
+     * <p>Without one the route is not registered at all, rather than registered and answering that
+     * it cannot erase: a caller under an obligation should get a 404 they can escalate, not a 200
+     * that removed nothing.</p>
+     */
+    private volatile excalibur.ingest.erasure.DocumentErasureService documentErasure;
+
+    /** Enables {@code POST /v1/erasure} on this server. */
+    public void withDocumentErasure(excalibur.ingest.erasure.DocumentErasureService service) {
+        if (running.get()) {
+            throw new IllegalStateException("Cannot configure erasure after server has started");
+        }
+        this.documentErasure = service;
+    }
+
+    /** Attaches lexical retrieval, before the server starts. */
+    public void withLexicalQueryService(excalibur.api.retrieval.LexicalQueryService service) {
+        this.lexicalQueryService = service;
+    }
+
     public excalibur.ingest.pipeline.IngestionOrchestrator getIngestionOrchestrator() {
         return ingestionOrchestrator;
     }
@@ -874,7 +918,6 @@ public class ExcaliburDBServer {
                     };
                 }
             },
-            null,  // lshIngestionService - not configured here
             // No document chunk buffer. Document visibility does not depend on it -- publishDocument
             // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
             // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
@@ -966,7 +1009,6 @@ public class ExcaliburDBServer {
                     };
                 }
             },
-            null,  // lshIngestionService - not configured here
             // No document chunk buffer. Document visibility does not depend on it -- publishDocument
             // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
             // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
@@ -992,11 +1034,11 @@ public class ExcaliburDBServer {
     }
 
     /**
-     * Configures the ingestion pipeline with LSH support for approximate nearest neighbor pre-filtering.
+     * Configures the ingestion pipeline and the vector pre-filter used by stage 2 of queries.
      *
-     * <p>This overload creates the full ingestion pipeline with LSH index population during document
-     * ingestion. Vectors inserted into segments are also indexed in the segment's LSH index for
-     * efficient Stage 2 pre-filtering during queries.</p>
+     * <p>The pre-filter is not populated here. It is keyed by HNSW node id, so it is written by the
+     * integration worker as it assigns those ids; ingestion holds the vector before any id exists
+     * for it. This method wires the pre-filter to the index orchestrator that owns that worker.</p>
      *
      * <h3>LSH Integration</h3>
      * <p>When LSH is configured:</p>
@@ -1024,7 +1066,9 @@ public class ExcaliburDBServer {
             throw new IllegalStateException("Cannot configure ingestion pipeline after server has started");
         }
         Objects.requireNonNull(textChunker, "TextChunker cannot be null");
-        Objects.requireNonNull(embeddingClient, "EmbeddingClient cannot be null");
+        // embeddingClient may be null: that is lexical-only ingestion, where documents are
+        // chunked, stored and term-indexed but never embedded. Vector search is then the one
+        // retrieval signal this node cannot offer, rather than a reason to index nothing.
 
         this.textChunker = textChunker;
         this.embeddingClient = embeddingClient;
@@ -1039,7 +1083,7 @@ public class ExcaliburDBServer {
         // This enables query optimization by tracking term frequencies in segment sketches
         TermFrequencyTracker termFrequencyTracker = new TermFrequencyTracker();
 
-        // Create the ingestion orchestrator with LSH support
+        // Create the ingestion orchestrator
         this.ingestionOrchestrator = new IngestionOrchestrator(
             textChunker,
             embeddingClient,
@@ -1064,7 +1108,6 @@ public class ExcaliburDBServer {
                     };
                 }
             },
-            lshIngestionService,  // Pass LSH ingestion service for vector indexing
             // No document chunk buffer. Document visibility does not depend on it -- publishDocument
             // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
             // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
@@ -1077,6 +1120,17 @@ public class ExcaliburDBServer {
             documentTimeoutMs
         );
 
+        // The vector pre-filter is keyed by HNSW node id, so it is written by the integration
+        // worker as it assigns those ids rather than by ingestion, which holds the vector before
+        // any id exists for it. Wiring it here keeps that decision in one place for every caller.
+        indexOrchestrator.setVectorPrefilter(lshIngestionService);
+
+        // The engine owns when a pre-filter exists, because that has to follow the graph it is
+        // keyed against: attached to created, recovered and split segments alike, and discarded
+        // from a split child before it can adopt the one describing its parent. This runs after
+        // start(), so the engine back-fills the segments that already exist.
+        storageEngine.setVectorPrefilter(lshIngestionService);
+
         // Wire the visibility tracker to the query pipeline for atomicity filtering
         if (visibilityTracker != null && this.queryPipeline.getVisibilityChecker() == null) {
             this.queryPipeline = queryPipeline.withVisibilityChecker(
@@ -1085,8 +1139,10 @@ public class ExcaliburDBServer {
             LOGGER.info("Query pipeline wired with shared document visibility checker for atomicity filtering");
         }
 
-        LOGGER.info("Ingestion pipeline configured with LSH support: TextChunker, EmbeddingClient, LshIngestionService, TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity={}",
-            documentTimeoutMs, visibilityTracker != null ? "enabled" : "disabled");
+        LOGGER.info("Ingestion pipeline configured: TextChunker, EmbeddingClient, "
+            + "TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity={}, vectorPreFilter={}",
+            documentTimeoutMs, visibilityTracker != null ? "enabled" : "disabled",
+            lshIngestionService != null ? "enabled" : "disabled");
     }
 
     /**
@@ -1376,12 +1432,16 @@ public class ExcaliburDBServer {
         HealthEndpoint healthEndpoint = new HealthEndpoint(
             indexOrchestrator, readinessThreshold, healthyThreshold, maxLatencyMs);
         StatsEndpoint statsEndpoint = new StatsEndpoint(indexOrchestrator, storageEngine, volumeManager);
+        statsEndpoint.withLexicalIndex(this.chunkIndex);
 
         // QueryEndpoint - pass config for defaults, queryRegistry for cancellation,
         // and embeddingClient so clients can submit raw query text (recommended path)
         // instead of computing embeddings client-side.
         QueryEndpoint queryHandler = new QueryEndpoint(
             queryPipeline, config, null, queryRegistry, embeddingClient, security);
+        // Lexical retrieval, when this node keeps a chunk index. With no embedding client it is
+        // what /v1/query answers from instead of refusing; with one it is a second signal.
+        queryHandler.setLexicalQueryService(this.lexicalQueryService);
         this.queryEndpoint = queryHandler;
 
         // QueryCancelEndpoint for user-initiated query cancellation
@@ -1462,12 +1522,25 @@ public class ExcaliburDBServer {
         target.createContext("/v1/query", createQueryMethodRouter(
             guard.protect(RequestGuard.Access.READ, queryHandler),
             guard.protect(RequestGuard.Access.MUTATE, queryCancelEndpoint)));
-        target.createContext("/v1/ingest",
-            wrapHandler(guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint)));
+        // POST registers a source, DELETE stops crawling one. Both mutate, and both are charged
+        // against the mutate budget; the same shape /v1/query uses for query and cancel.
+        target.createContext("/v1/ingest", createMethodRouter("POST",
+            guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint),
+            "DELETE",
+            guard.protect(RequestGuard.Access.MUTATE,
+                new excalibur.api.endpoint.SourceDeregisterEndpoint(ingestSourceRegistry)),
+            "Method Not Allowed - Use POST to register a source or DELETE to stop crawling one"));
         target.createContext("/v1/reindex",
             wrapHandler(guard.protect(RequestGuard.Access.MUTATE, reindexHandler)));
         target.createContext("/v1/ingest/status",
             wrapHandler(guard.protect(RequestGuard.Access.READ, ingestStatusEndpoint)));
+        // A mutation, and the most consequential one: it removes content rather than adding it.
+        if (documentErasure != null) {
+            target.createContext("/v1/erasure", wrapHandler(guard.protect(
+                RequestGuard.Access.MUTATE,
+                new excalibur.api.endpoint.DocumentErasureEndpoint(
+                    documentErasure, ingestSourceRegistry))));
+        }
 
         // Registered only when a graph store is configured. A read, not a mutation: it walks the
         // graph and returns context, and charging it against the smaller mutate budget would
@@ -1493,9 +1566,11 @@ public class ExcaliburDBServer {
             wrapHandler(guard.protect(RequestGuard.Access.PUBLIC, this::handleNotFound)));
 
         LOGGER.info("Registered endpoints with authentication {}: /health (public), /v1/stats, "
-                + "/v1/query (POST=query, DELETE=cancel), /v1/ingest, /v1/reindex, "
-                + "/v1/ingest/status{}",
+                + "/v1/query (POST=query, DELETE=cancel), "
+                + "/v1/ingest (POST=register, DELETE=stop crawling), /v1/reindex, "
+                + "/v1/ingest/status{}{}",
             security.isAuthenticationRequired() ? "required" : "disabled",
+            documentErasure != null ? ", /v1/erasure" : "",
             graphTenants != null
                 ? ", /v1/graph/query, /v1/graph/build, /v1/graph/erasure"
                 : (graphPipeline != null ? ", /v1/graph/query" : ""));
@@ -1571,6 +1646,42 @@ public class ExcaliburDBServer {
      * @param cancelEndpoint The handler for DELETE requests
      * @return A composite handler that routes based on HTTP method
      */
+    /**
+     * Routes one context by request method.
+     *
+     * <p>Two operations on one noun rather than two nouns: registering a source and stopping one
+     * are the same resource, and inventing a second path for the second verb is what HTTP methods
+     * exist to avoid.</p>
+     */
+    private HttpHandler createMethodRouter(String firstMethod, HttpHandler first,
+                                           String secondMethod, HttpHandler second,
+                                           String otherwise) {
+        return exchange -> {
+            String method = exchange.getRequestMethod();
+            String path = exchange.getRequestURI().getPath();
+            long start = System.currentTimeMillis();
+            try {
+                LOGGER.debug("Request: {} {}", method, path);
+                if (firstMethod.equalsIgnoreCase(method)) {
+                    first.handle(exchange);
+                } else if (secondMethod.equalsIgnoreCase(method)) {
+                    second.handle(exchange);
+                } else {
+                    sendError(exchange, 405, otherwise);
+                }
+                LOGGER.debug("Response: {} {} - {}ms", method, path,
+                    System.currentTimeMillis() - start);
+            } catch (Exception e) {
+                LOGGER.error("Error handling {} {}: {}", method, path, e.getMessage(), e);
+                if (!exchange.getResponseHeaders().containsKey("Content-Type")) {
+                    sendError(exchange, 500, "Internal Server Error");
+                }
+            } finally {
+                exchange.close();
+            }
+        };
+    }
+
     private HttpHandler createQueryMethodRouter(HttpHandler queryEndpoint, HttpHandler cancelEndpoint) {
         return exchange -> {
             String method = exchange.getRequestMethod();

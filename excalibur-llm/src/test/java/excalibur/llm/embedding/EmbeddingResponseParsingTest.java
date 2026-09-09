@@ -371,16 +371,23 @@ class EmbeddingResponseParsingTest {
     }
 
     @Test
-    @DisplayName("parseBatchEmbeddingResponse: preserves order with non-sequential indices")
-    void parseBatchEmbeddingResponse_nonSequentialIndices_preservesOrder() {
-        // API might return indices in different order - verify we handle this
+    @DisplayName("parseBatchEmbeddingResponse: a reordered response is realigned by index")
+    void parseBatchEmbeddingResponse_nonSequentialIndices_realignsByIndex() {
+        // This test previously asserted the opposite -- that results come back in the order the
+        // response happened to list them. That contradicts embedBatch's own contract ("one per
+        // input text, in the same order") and is a data corruption rather than a formatting
+        // preference: element i of the returned list is paired with texts.get(i) by every
+        // caller, so honouring arrival order over the declared index attaches "Third"'s vector
+        // to "First". Every vector is individually valid, so nothing downstream can detect it.
+        // vLLM and other servers do reorder when a batch is split across workers, which is why
+        // the OpenAI schema carries an index at all.
         float[][] expected = {
                 createTestEmbedding(1536, 0.1f),
                 createTestEmbedding(1536, 0.2f),
                 createTestEmbedding(1536, 0.3f)
         };
 
-        // Build response with indices out of order (2, 0, 1)
+        // Response lists them 2, 0, 1.
         StringBuilder sb = new StringBuilder("{\"object\":\"list\",\"data\":[");
         sb.append("{\"object\":\"embedding\",\"embedding\":[").append(arrayToString(expected[2])).append("],\"index\":2},");
         sb.append("{\"object\":\"embedding\",\"embedding\":[").append(arrayToString(expected[0])).append("],\"index\":0},");
@@ -391,11 +398,65 @@ class EmbeddingResponseParsingTest {
 
         List<float[]> results = client.embedBatch(List.of("First", "Second", "Third"));
 
-        // Results should be in the order they appear in the response, not by index
         assertThat(results).hasSize(3);
-        assertThat(results.get(0)[0]).isEqualTo(0.3f); // index 2 in response first
-        assertThat(results.get(1)[0]).isEqualTo(0.1f); // index 0 in response second
-        assertThat(results.get(2)[0]).isEqualTo(0.2f); // index 1 in response third
+        assertThat(results.get(0)[0]).as("input 0 gets the vector declaring index 0").isEqualTo(0.1f);
+        assertThat(results.get(1)[0]).as("input 1 gets the vector declaring index 1").isEqualTo(0.2f);
+        assertThat(results.get(2)[0]).as("input 2 gets the vector declaring index 2").isEqualTo(0.3f);
+    }
+
+    @Test
+    @DisplayName("parseBatchEmbeddingResponse: a response with no index falls back to arrival order")
+    void parseBatchEmbeddingResponse_noIndexField_usesArrivalOrder() {
+        // Not every OpenAI-compatible server emits the index. Absent it, arrival order is the
+        // only signal there is, and it is the right one to use.
+        float[][] expected = {
+                createTestEmbedding(1536, 0.1f),
+                createTestEmbedding(1536, 0.2f)
+        };
+        StringBuilder sb = new StringBuilder("{\"object\":\"list\",\"data\":[");
+        sb.append("{\"object\":\"embedding\",\"embedding\":[").append(arrayToString(expected[0])).append("]},");
+        sb.append("{\"object\":\"embedding\",\"embedding\":[").append(arrayToString(expected[1])).append("]}");
+        sb.append("],\"model\":\"test\"}");
+
+        server.setEmbeddingHandler(createRawResponseHandler(sb.toString()));
+
+        List<float[]> results = client.embedBatch(List.of("First", "Second"));
+
+        assertThat(results).hasSize(2);
+        assertThat(results.get(0)[0]).isEqualTo(0.1f);
+        assertThat(results.get(1)[0]).isEqualTo(0.2f);
+    }
+
+    @Test
+    @DisplayName("parseBatchEmbeddingResponse: a duplicated index is refused, not silently kept")
+    void parseBatchEmbeddingResponse_duplicateIndex_throws() {
+        float[] v = createTestEmbedding(1536, 0.5f);
+        StringBuilder sb = new StringBuilder("{\"object\":\"list\",\"data\":[");
+        sb.append("{\"embedding\":[").append(arrayToString(v)).append("],\"index\":0},");
+        sb.append("{\"embedding\":[").append(arrayToString(v)).append("],\"index\":0}");
+        sb.append("],\"model\":\"test\"}");
+
+        server.setEmbeddingHandler(createRawResponseHandler(sb.toString()));
+
+        assertThatThrownBy(() -> client.embedBatch(List.of("First", "Second")))
+                .isInstanceOf(LLMException.class)
+                .hasMessageContaining("twice");
+    }
+
+    @Test
+    @DisplayName("parseBatchEmbeddingResponse: an out-of-range index is refused")
+    void parseBatchEmbeddingResponse_indexOutOfRange_throws() {
+        float[] v = createTestEmbedding(1536, 0.5f);
+        StringBuilder sb = new StringBuilder("{\"object\":\"list\",\"data\":[");
+        sb.append("{\"embedding\":[").append(arrayToString(v)).append("],\"index\":0},");
+        sb.append("{\"embedding\":[").append(arrayToString(v)).append("],\"index\":7}");
+        sb.append("],\"model\":\"test\"}");
+
+        server.setEmbeddingHandler(createRawResponseHandler(sb.toString()));
+
+        assertThatThrownBy(() -> client.embedBatch(List.of("First", "Second")))
+                .isInstanceOf(LLMException.class)
+                .hasMessageContaining("outside the batch");
     }
 
     @Test

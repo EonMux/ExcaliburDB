@@ -581,7 +581,18 @@ public final class EmbeddingClient {
 
         String dataArray = responseBody.substring(pos + 1, dataEnd);
 
-        // Parse each embedding object
+        // Parse each embedding object, placing it at the index the response gives it rather
+        // than at the position it happened to be written in.
+        //
+        // The OpenAI batch schema carries an "index" per element precisely because the order
+        // of the data array is not promised, and vLLM and other servers do reorder when a
+        // batch is split across workers. Trusting arrival order costs nothing when the server
+        // is well behaved and silently attaches every vector to the wrong input when it is
+        // not -- a corruption with no symptom, since every vector is individually valid and
+        // only the pairing is wrong.
+        List<float[]> byIndex = new ArrayList<>(java.util.Collections.nCopies(expectedCount, null));
+        boolean sawIndex = false;
+        int parsed = 0;
         int currentPos = 0;
         while (currentPos < dataArray.length()) {
             int embIdx = dataArray.indexOf("\"embedding\"", currentPos);
@@ -594,9 +605,47 @@ public final class EmbeddingClient {
             if (arrEnd == -1) break;
 
             String arrContent = dataArray.substring(arrStart + 1, arrEnd);
-            embeddings.add(parseFloatArray(arrContent));
+            float[] vector = parseFloatArray(arrContent);
 
+            int slot = parsed;
+            Integer declared = indexNear(dataArray, embIdx, arrEnd);
+            if (declared != null) {
+                sawIndex = true;
+                if (declared < 0 || declared >= expectedCount) {
+                    throw new LLMException(
+                            "Embedding index " + declared + " is outside the batch of "
+                            + expectedCount, ErrorType.PARSE_ERROR);
+                }
+                slot = declared;
+            }
+            if (byIndex.get(slot) != null) {
+                throw new LLMException(
+                        "Embedding index " + slot + " returned twice in one batch",
+                        ErrorType.PARSE_ERROR);
+            }
+            byIndex.set(slot, vector);
+            parsed++;
             currentPos = arrEnd + 1;
+        }
+
+        if (parsed == expectedCount) {
+            for (int i = 0; i < expectedCount; i++) {
+                if (byIndex.get(i) == null) {
+                    throw new LLMException(
+                            "Batch response left index " + i + " unfilled", ErrorType.PARSE_ERROR);
+                }
+            }
+            embeddings.addAll(byIndex);
+        } else {
+            // Fall through to the count check below, which reports the mismatch.
+            for (float[] v : byIndex) {
+                if (v != null) {
+                    embeddings.add(v);
+                }
+            }
+        }
+        if (!sawIndex) {
+            LOG.debug("Batch response carried no per-element index; relied on response order");
         }
 
         if (embeddings.size() != expectedCount) {
@@ -606,6 +655,46 @@ public final class EmbeddingClient {
         }
 
         return embeddings;
+    }
+
+    /**
+     * Reads the {@code "index"} of the batch element whose embedding array ends at
+     * {@code arrayEnd}, or null when the element does not declare one.
+     *
+     * <p>Scoped to the element rather than searched globally: an embedding array is a list of
+     * numbers, so a naive search for the next {@code "index"} would happily find the one
+     * belonging to the following element.</p>
+     */
+    private static Integer indexNear(String dataArray, int embeddingKeyPos, int arrayEnd) {
+        int objectStart = dataArray.lastIndexOf('{', embeddingKeyPos);
+        int searchFrom = objectStart == -1 ? 0 : objectStart;
+        int objectEnd = dataArray.indexOf('}', arrayEnd);
+        int searchTo = objectEnd == -1 ? dataArray.length() : objectEnd;
+
+        int key = dataArray.indexOf("\"index\"", searchFrom);
+        if (key == -1 || key > searchTo) {
+            return null;
+        }
+        int colon = dataArray.indexOf(':', key);
+        if (colon == -1 || colon > searchTo) {
+            return null;
+        }
+        int i = colon + 1;
+        while (i < searchTo && Character.isWhitespace(dataArray.charAt(i))) {
+            i++;
+        }
+        int start = i;
+        while (i < searchTo && Character.isDigit(dataArray.charAt(i))) {
+            i++;
+        }
+        if (start == i) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(dataArray.substring(start, i));
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private EmbeddingResponse parseEmbeddingResponseWithMetadata(String responseBody) {

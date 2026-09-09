@@ -83,6 +83,28 @@ public class QueryEndpoint implements HttpHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger(QueryEndpoint.class);
 
     /**
+     * Why a node answers 503 to every query, and what to change.
+     *
+     * <p>Returned to the client, not only logged. It names a configuration key and no internal
+     * detail: there is no path, no address and no state of this process in it, which is what makes
+     * it safe to hand out. {@code /v1/ingest/status} already reports the same gap the same way in
+     * {@code last_error}, and a node that explains it on one endpoint and not the other sends
+     * whoever hits the other one looking through the logs for it.</p>
+     */
+    /**
+     * Lexical retrieval over ingested chunks, or null when this node keeps no such index.
+     *
+     * <p>Set separately from construction because it is optional and orthogonal: a node may have
+     * embeddings, a lexical index, both, or in the degenerate case neither.</p>
+     */
+    private volatile excalibur.api.retrieval.LexicalQueryService lexicalQueryService;
+
+    static final String UNCONFIGURED_QUERY_REASON =
+        "Server is not configured for text queries: no embedding client is available. "
+        + "Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) so the server can embed queries "
+        + "with the same model that ingestion uses.";
+
+    /**
      * Default timeout for queries in milliseconds.
      * Initialized from config if available, otherwise falls back to 30 seconds.
      */
@@ -232,6 +254,26 @@ public class QueryEndpoint implements HttpHandler {
                 .build()) {
 
             try {
+                // Checked before the body is even read, and answered with the reason. A node
+                // without an embedding endpoint cannot serve any query, so this is a property of
+                // the deployment rather than of the request, and every request will meet it until
+                // someone changes the configuration. Saying only "not available" leaves an
+                // operator to guess which of the several things behind a 503 it was, while the
+                // startup log two hundred lines up already named it.
+                if (embeddingClient == null) {
+                    // No vectors, but possibly a lexical index. Answering from BM25 and query
+                    // expansion is the whole point of not requiring the corpus to be embedded:
+                    // this node has an index, it simply has a different signal in it.
+                    excalibur.api.retrieval.LexicalQueryService lexical = this.lexicalQueryService;
+                    if (lexical != null) {
+                        answerLexically(exchange, lexical, queryId, startTime);
+                        return;
+                    }
+                    LOGGER.error("Query endpoint is not ready: {}", UNCONFIGURED_QUERY_REASON);
+                    sendError(exchange, 503, UNCONFIGURED_QUERY_REASON);
+                    return;
+                }
+
                 // Parse and validate the request body. No network call happens here:
                 // embedding is a blocking call and must be paid for out of the
                 // request's own timeout budget, not before the clock starts.
@@ -306,10 +348,11 @@ public class QueryEndpoint implements HttpHandler {
                 sendError(exchange, 400, "Bad Request: " + e.getMessage());
 
             } catch (IllegalStateException e) {
-                // The server cannot embed queries (no embedding client configured).
-                // That is a deployment gap, not a client error and not an internal
-                // fault, so it is reported as such instead of a bare 500.
-                LOGGER.error("Query endpoint is not ready: {}", e.getMessage());
+                // The one state this endpoint knows how to explain is handled by the guard above,
+                // which answers with its reason. Anything else reaching here is unexpected, and
+                // its message is not written to be read by a client, so it is logged rather than
+                // returned.
+                LOGGER.error("Query endpoint is not ready: {}", e.getMessage(), e);
                 sendError(exchange, 503, "Query service is not available");
 
             } catch (Exception e) {
@@ -318,6 +361,63 @@ public class QueryEndpoint implements HttpHandler {
             }
         }
         // MDC context is automatically cleared when ctx.close() is called
+    }
+
+    /**
+     * Points this endpoint at a lexical index over the ingested corpus.
+     *
+     * @param service The service, or null to serve vector search only
+     */
+    public void setLexicalQueryService(excalibur.api.retrieval.LexicalQueryService service) {
+        this.lexicalQueryService = service;
+    }
+
+    /**
+     * Answers a query from the lexical index alone.
+     *
+     * <p>Reports the same response shape as vector search, with coverage marked degraded: the
+     * answer is real, and it came from fewer signals than a fully configured node would use.
+     * Saying so is what lets a caller tell "this is all there was" from "this is all we looked
+     * at".</p>
+     */
+    private void answerLexically(HttpExchange exchange,
+                                 excalibur.api.retrieval.LexicalQueryService lexical,
+                                 String queryId, long startTime) throws IOException {
+        String requestBody = readRequestBody(exchange);
+        ParsedQuery parsed;
+        try {
+            parsed = parseRequest(requestBody);
+        } catch (IllegalArgumentException e) {
+            sendError(exchange, 400, "Bad Request: " + e.getMessage());
+            return;
+        }
+
+        List<excalibur.api.retrieval.LexicalQueryService.Hit> hits =
+            lexical.search(parsed.query(), parsed.topK());
+        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("{\"query_id\": \"").append(JsonText.escape(queryId)).append("\", ");
+        sb.append("\"results\": [");
+        for (int i = 0; i < hits.size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append("{\"document_id\": \"")
+              .append(JsonText.escape(hits.get(i).chunkId()))
+              .append("\", \"score\": ").append(JsonText.number(hits.get(i).score(), 6))
+              .append("}");
+        }
+        sb.append("], ");
+        sb.append("\"retrieval\": \"lexical\", ");
+        sb.append("\"coverage\": {\"degraded\": true, \"estimated_corpus_coverage\": 1.0000}, ");
+        sb.append("\"timed_out\": false, ");
+        sb.append("\"query_time_ms\": ").append(durationMs);
+        sb.append("}");
+
+        byte[] bytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        ResponseBody.send(exchange, 200, bytes);
     }
 
     /**
@@ -387,12 +487,11 @@ public class QueryEndpoint implements HttpHandler {
         if (query == null || query.isEmpty()) {
             throw new IllegalArgumentException("Field 'query' is required and must be non-empty");
         }
-        if (embeddingClient == null) {
-            throw new IllegalStateException(
-                "Server is not configured for text queries: no embedding client is available. " +
-                "Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) so the server can embed queries " +
-                "with the same model that ingestion uses.");
-        }
+        // Deliberately no embedding-client check here. Parsing a request is not the same
+        // question as whether this node can run a vector search over it: handle() answers that
+        // before it reaches the vector path, and the lexical path parses the very same body and
+        // needs no embedding at all. Refusing here made a node that could answer from BM25
+        // report itself unconfigured.
 
         // Validate topK. This value sizes priority queues and result buffers inside
         // the pipeline, so an unbounded value is an allocation the caller controls.
@@ -559,8 +658,17 @@ public class QueryEndpoint implements HttpHandler {
         sb.append("\"active_segments\": ").append(coverage.activeSegments()).append(", ");
         sb.append("\"indexing_segments\": ").append(coverage.indexingSegments()).append(", ");
         sb.append("\"warming_segments\": ").append(coverage.warmingSegments()).append(", ");
+        sb.append("\"compacting_segments\": ").append(coverage.compactingSegments()).append(", ");
+        sb.append("\"tombstoned_segments\": ").append(coverage.tombstonedSegments()).append(", ");
         sb.append("\"estimated_corpus_coverage\": ")
             .append(JsonText.number(coverage.estimatedCorpusCoverage(), 4)).append(", ");
+        // What this query did, as opposed to what the catalog holds. Without these an empty
+        // answer reads the same whether the query searched the whole corpus and found nothing or
+        // was never allowed to look at any of it.
+        sb.append("\"segments_searched\": ").append(coverage.segmentsSearched()).append(", ");
+        sb.append("\"segments_excluded\": ").append(coverage.segmentsExcluded()).append(", ");
+        sb.append("\"segments_with_errors\": ").append(coverage.segmentsWithErrors()).append(", ");
+        sb.append("\"segments_timed_out\": ").append(coverage.segmentsTimedOut()).append(", ");
         sb.append("\"tail_scan_entries\": ").append(coverage.tailScanEntries()).append(", ");
         sb.append("\"degraded\": ").append(coverage.degraded());
         sb.append("}, ");

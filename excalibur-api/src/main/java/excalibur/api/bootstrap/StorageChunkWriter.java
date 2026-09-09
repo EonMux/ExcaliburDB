@@ -100,6 +100,28 @@ public final class StorageChunkWriter implements OffsetAwareStorageWriter {
         return offsetOf(routedSegment(key));
     }
 
+    /**
+     * Whether the storage engine holds a segment of its own under this ID.
+     *
+     * <p>Segment IDs minted by {@link io.excalibur.store.SegmentCatalog#create} are drawn from a
+     * counter the catalog advances past every ID it has issued, splits included, so a created
+     * entry always names an index beyond the engine's canonical ones. On an engine that has never
+     * split, that index is past the routing directory too and resolves to nothing.</p>
+     *
+     * <p>After a split it resolves anyway. Doubling the directory fills its upper half with buddy
+     * pointers to the segments already in the lower half, so an out-of-range ID lands on a live
+     * segment that is routing unrelated keys. Asking whether the ID resolves cannot tell the two
+     * apart; asking whether the engine holds a distinct segment <em>under that ID</em> can, and
+     * that is the question a caller wanting a segment to fill is really asking.</p>
+     *
+     * @param segmentId The routing index writes would be targeted at
+     * @return true if the engine holds a segment of its own at that index
+     */
+    @Override
+    public boolean canWriteTo(long segmentId) {
+        return storageEngine.getSegments().containsKey(segmentId);
+    }
+
     @Override
     public long writeChunkWithOffset(long segmentId, String chunkId, String content, float[] embedding) {
         byte[] key = keyOf(chunkId);

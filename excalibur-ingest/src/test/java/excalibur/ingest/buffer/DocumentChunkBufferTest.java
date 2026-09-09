@@ -206,11 +206,17 @@ class DocumentChunkBufferTest {
     }
 
     @Test
-    void testCommitDocumentWithEmbeddings_nullEmbeddings() {
+    void testCommitDocumentWithEmbeddings_nullEmbeddings() throws Exception {
+        // Null now means "commit these chunks with no vectors" rather than a programming error:
+        // lexical-only ingestion writes documents this way. The chunks are still committed as one
+        // contiguous run, and each value is codec-encoded with dimension 0 so readers can decode
+        // the text.
         buffer.bufferChunk(createChunk("doc1", 0, "content"));
-        
-        assertThrows(NullPointerException.class, 
-            () -> buffer.commitDocumentWithEmbeddings("doc1", null));
+
+        AtomicDocumentBatch batch = buffer.commitDocumentWithEmbeddings("doc1", null);
+
+        assertNotNull(batch);
+        assertEquals(1, batch.getChunkCount());
     }
 
     @Test

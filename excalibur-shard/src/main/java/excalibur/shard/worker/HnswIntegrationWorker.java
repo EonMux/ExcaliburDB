@@ -2,6 +2,7 @@ package excalibur.shard.worker;
 
 import excalibur.shard.visibility.EpochIsolationValidator;
 import excalibur.shard.VisibilityTracker;
+import io.excalibur.core.text.ChunkIdentifiers;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
@@ -168,6 +169,14 @@ public class HnswIntegrationWorker {
     private volatile long integrationIntervalMs;
     private volatile int queueDepthLimit;
     private volatile int batchSize;
+
+    /**
+     * The segment pre-filter mirrored with each integrated vector, or null when none is wired.
+     *
+     * <p>Set after construction because the pre-filter belongs to the ingestion side of the
+     * node, which is assembled later than the index orchestrator that owns this worker.</p>
+     */
+    private volatile io.excalibur.store.VectorPrefilter vectorPrefilter;
 
     private volatile Thread workerThread;
 
@@ -669,6 +678,8 @@ public class HnswIntegrationWorker {
 
             int successCount = recordInsertResults(graph, results, documentIds);
 
+            mirrorIntoPrefilter(segment, results, vectors);
+
             if (successCount > 0) {
                 LOGGER.debug("Integrated {}/{} vectors from segment {} at epoch {}",
                     successCount, vectors.size(), segment.path(), batchEpoch);
@@ -679,6 +690,11 @@ public class HnswIntegrationWorker {
                 // would silently lose vectors; one that was lost would re-insert the whole
                 // batch as duplicate nodes on restart.
                 tracker.flush();
+
+                // The pre-filter is made durable with the checkpoint that vouches for the nodes
+                // it names, so a restart cannot come back holding candidates for nodes the graph
+                // no longer has.
+                flushPrefilter(segment);
 
                 // Notify listener
                 listener.onVectorsIntegrated(segment, successCount);
@@ -785,6 +801,53 @@ public class HnswIntegrationWorker {
     }
 
     /**
+     * Mirrors each integrated vector into the segment's pre-filter under its new node id.
+     *
+     * <p>This is what keeps the pre-filter and the graph speaking the same id space. The query
+     * pipeline intersects the pre-filter's answer with the graph's node ids, so a pre-filter
+     * populated from any other id space excludes every result instead of narrowing the search.</p>
+     *
+     * <p>Best-effort throughout: the pre-filter is an optimisation, and no failure here may cost
+     * a vector its place in the graph, which is already durable by this point.</p>
+     */
+    private void mirrorIntoPrefilter(Segment segment, List<IncrementalInsertResult> results,
+                                     List<float[]> vectors) {
+        io.excalibur.store.VectorPrefilter prefilter = this.vectorPrefilter;
+        if (prefilter == null) {
+            return;
+        }
+
+        for (int i = 0; i < results.size() && i < vectors.size(); i++) {
+            IncrementalInsertResult result = results.get(i);
+            if (!result.isSuccess()) {
+                continue;
+            }
+            try {
+                prefilter.indexVector(segment, vectors.get(i), result.nodeId());
+            } catch (Exception e) {
+                LOGGER.warn("Failed to mirror node {} of segment {} into the vector pre-filter: {}",
+                    result.nodeId(), segment.path(), e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Forces the segment's pre-filter, ignoring failures for the same reason inserts ignore them.
+     */
+    private void flushPrefilter(Segment segment) {
+        io.excalibur.store.VectorPrefilter prefilter = this.vectorPrefilter;
+        if (prefilter == null) {
+            return;
+        }
+        try {
+            prefilter.flush(segment);
+        } catch (Exception e) {
+            LOGGER.warn("Failed to flush the vector pre-filter of segment {}: {}",
+                segment.path(), e.getMessage());
+        }
+    }
+
+    /**
      * Records the node-to-document mapping for the nodes a batch inserted.
      *
      * @param graph       The segment's graph
@@ -830,46 +893,25 @@ public class HnswIntegrationWorker {
     }
 
     /**
-     * Extracts the document ID from an entry key.
+     * Extracts the document key from an entry key.
      *
-     * <p>The entry key format is {@code documentId:chunkIndex}, where:</p>
-     * <ul>
-     *   <li>{@code documentId} - The actual document identifier (e.g., "doc1", "source1:file1")</li>
-     *   <li>{@code chunkIndex} - The chunk index within the document (e.g., "0", "1", "2")</li>
-     * </ul>
-     *
-     * <p>This method extracts just the document ID portion for use in the
-     * node-to-document mapping, which is required for document atomicity filtering.</p>
+     * <p>Delegates to {@link ChunkIdentifiers}, which is the single definition of this
+     * convention. The document key registered here is what excalibur-query's atomicity filter
+     * later looks up in the visibility tracker, and what {@code SegmentGraphRebuilder} registers
+     * when the same segment's graph is rebuilt instead of integrated incrementally. Deriving it
+     * here independently is how those three drift apart, and every way they can disagree is
+     * silent: the node is registered under a key nothing asks about, so the document is dropped
+     * from results rather than reported as an error.</p>
      *
      * @param key The entry key bytes (UTF-8 encoded)
-     * @return The document ID string, or null if extraction fails
+     * @return The document key, or null if the entry carries no key
      */
     private String extractDocumentId(byte[] key) {
         if (key == null || key.length == 0) {
             return null;
         }
-
-        try {
-            String keyStr = new String(key, java.nio.charset.StandardCharsets.UTF_8);
-            // Key format from IngestionOrchestrator: sourceId:documentId:chunk:chunkIndex
-            // e.g., "mySource:doc1:chunk:3"
-            // The document ID is "sourceId:documentId" -- strip the ":chunk:N" suffix.
-            // Find the ":chunk:" marker and strip everything from there.
-            int chunkMarker = keyStr.lastIndexOf(":chunk:");
-            if (chunkMarker > 0) {
-                return keyStr.substring(0, chunkMarker);
-            }
-            // Fallback: strip from the last colon (legacy format documentId:chunkIndex)
-            int lastColon = keyStr.lastIndexOf(':');
-            if (lastColon > 0) {
-                return keyStr.substring(0, lastColon);
-            }
-            // No colon found - return the whole key as document ID
-            return keyStr;
-        } catch (Exception e) {
-            LOGGER.debug("Failed to extract document ID from key: {}", e.getMessage());
-            return null;
-        }
+        return ChunkIdentifiers.documentKeyOfChunk(
+            new String(key, java.nio.charset.StandardCharsets.UTF_8));
     }
 
     /**
@@ -1002,6 +1044,21 @@ public class HnswIntegrationWorker {
     public void setBatchSize(int size) {
         validateBatchSize(size);
         this.batchSize = size;
+    }
+
+    /**
+     * Sets the vector pre-filter mirrored as vectors are integrated.
+     *
+     * <p>The pre-filter is keyed by HNSW node id, and node ids are assigned here, so this worker
+     * is the only place that can populate it consistently with the graph the query pipeline
+     * searches. Leaving it unset simply means no pre-filter is maintained.</p>
+     *
+     * @param vectorPrefilter The pre-filter to mirror into, or null to maintain none
+     */
+    public void setVectorPrefilter(io.excalibur.store.VectorPrefilter vectorPrefilter) {
+        this.vectorPrefilter = vectorPrefilter;
+        LOGGER.info("HNSW integration {} mirror integrated vectors into a pre-filter",
+            vectorPrefilter == null ? "will not" : "will");
     }
 
     // ==================== Listener Interface ====================

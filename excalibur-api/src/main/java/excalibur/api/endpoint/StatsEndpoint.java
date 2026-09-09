@@ -62,7 +62,18 @@ import java.util.Objects;
  *     "registeredSegments": 1024,
  *     "visibleSegments": 1024
  *   },
- *   "coverage": 0.96
+ *   "coverage": 0.96,
+ *   "lexical": {
+ *     "engine": "native",
+ *     "indexed": 15000000,
+ *     "segments": 12,
+ *     "liveChunks": 14980000,
+ *     "erasedChunks": 20000,
+ *     "erasedRatio": 0.0013,
+ *     "erasureRequests": 3,
+ *     "oldestErasureAgeMs": 412000,
+ *     "compactionDue": false
+ *   }
  * }
  * }</pre>
  *
@@ -89,6 +100,15 @@ public class StatsEndpoint implements HttpHandler {
     private final IndexOrchestrator indexOrchestrator;
     private final StorageEngine storageEngine;
     private final VolumeManager volumeManager;
+
+    /**
+     * The chunk lexical index, when this node keeps one.
+     *
+     * <p>Optional and set after construction, because whether there is an index at all depends on
+     * configuration this endpoint does not read. Absent, the response simply carries no
+     * {@code lexical} block, which is a different statement from an index reporting nothing.</p>
+     */
+    private volatile excalibur.ingest.lexical.ChunkIndex lexicalIndex;
 
     /**
      * Creates a new StatsEndpoint with required dependencies.
@@ -175,6 +195,18 @@ public class StatsEndpoint implements HttpHandler {
         this.volumeManager = volumeManager;
     }
 
+    /**
+     * Reports the chunk lexical index alongside the rest of the node's state.
+     *
+     * <p>Its erasure backlog is the one thing here that is a promise with a deadline attached, and
+     * nothing else in this response would show it going unmet.</p>
+     *
+     * @param lexicalIndex The index, or null for a node that keeps none
+     */
+    public void withLexicalIndex(excalibur.ingest.lexical.ChunkIndex lexicalIndex) {
+        this.lexicalIndex = lexicalIndex;
+    }
+
     @Override
     public void handle(HttpExchange exchange) throws IOException {
         String method = exchange.getRequestMethod();
@@ -244,7 +276,28 @@ public class StatsEndpoint implements HttpHandler {
 
         double coverage = computeCoverage(catalogMeta);
 
-        return new SystemStats(segments, entries, volumes, hnsw, cuckoo, visibility, coverage);
+        return new SystemStats(segments, entries, volumes, hnsw, cuckoo, visibility, coverage,
+            computeLexicalStats());
+    }
+
+    /**
+     * Reads the lexical index's own account of itself, or null when there is no index.
+     *
+     * <p>A failure here is reported as an absent block rather than as a failed request: the rest
+     * of the response is what most callers came for, and losing all of it to one subsystem that
+     * could not answer is the worse outcome.</p>
+     */
+    private excalibur.ingest.lexical.ChunkIndexStats computeLexicalStats() {
+        excalibur.ingest.lexical.ChunkIndex index = this.lexicalIndex;
+        if (index == null) {
+            return null;
+        }
+        try {
+            return index.stats();
+        } catch (RuntimeException e) {
+            LOGGER.warn("Lexical index stats unavailable: {}", e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -423,6 +476,25 @@ public class StatsEndpoint implements HttpHandler {
 
         sb.append("\"coverage\": ").append(JsonText.number(stats.coverage(), 4));
 
+        if (stats.lexical() != null) {
+            excalibur.ingest.lexical.ChunkIndexStats lexical = stats.lexical();
+            sb.append(", \"lexical\": {");
+            sb.append("\"engine\": \"").append(JsonText.escape(lexical.engine())).append("\", ");
+            sb.append("\"indexed\": ").append(lexical.indexed()).append(", ");
+            sb.append("\"segments\": ").append(lexical.segments()).append(", ");
+            sb.append("\"liveChunks\": ").append(lexical.liveDocuments()).append(", ");
+            sb.append("\"erasedChunks\": ").append(lexical.erasedDocuments()).append(", ");
+            sb.append("\"erasedRatio\": ").append(JsonText.number(lexical.erasedRatio(), 4)).append(", ");
+            sb.append("\"erasureRequests\": ").append(lexical.erasureRequests()).append(", ");
+            // Milliseconds since the oldest unmet request was accepted: the number an operator
+            // compares against the configured latency bound to see whether it is being met.
+            sb.append("\"oldestErasureAgeMs\": ").append(lexical.oldestErasureRequest()
+                .map(at -> String.valueOf(Math.max(0, System.currentTimeMillis() - at.toEpochMilli())))
+                .orElse("null")).append(", ");
+            sb.append("\"compactionDue\": ").append(lexical.compactionDue());
+            sb.append("}");
+        }
+
         sb.append("}");
         return sb.toString();
     }
@@ -438,7 +510,8 @@ public class StatsEndpoint implements HttpHandler {
         HnswStats hnsw,
         CuckooStats cuckoo,
         VisibilityStats visibility,
-        double coverage
+        double coverage,
+        excalibur.ingest.lexical.ChunkIndexStats lexical
     ) {
         /**
          * Validates domain constraints on construction.

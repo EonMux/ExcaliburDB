@@ -2,6 +2,7 @@ package io.excalibur.store;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -228,15 +229,14 @@ class CompactionWorkerTest {
     // ==================== Manual Compaction Tests ====================
 
     @Test
-    void requestCompaction_triggersCompaction() throws IOException, InterruptedException {
+    @DisplayName("compactNow rewrites the segment and reports it to the listener")
+    void compactNow_rewritesSegmentAndNotifiesListener() throws IOException {
         AtomicReference<Segment> oldSegmentRef = new AtomicReference<>();
         AtomicReference<Segment> newSegmentRef = new AtomicReference<>();
-        CountDownLatch compactionLatch = new CountDownLatch(1);
 
         CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
             oldSegmentRef.set(oldSeg);
             newSegmentRef.set(newSeg);
-            compactionLatch.countDown();
         });
 
         Segment segment = createTestSegment("test-segment");
@@ -249,15 +249,10 @@ class CompactionWorkerTest {
         segment.put(deleteKey, "delete-value".getBytes());
         segment.delete(deleteKey);
 
-        worker.requestCompaction(segment);
+        // Synchronously, so that what this test measures is the compaction rather than how
+        // quickly a virtual thread got scheduled on a loaded machine.
+        worker.compactNow(segment);
 
-        // A liveness guard, not a latency budget: a compaction rewrites a whole segment, and on a
-        // machine running every module's tests at once five seconds is a measurement of the load
-        // rather than of whether compaction works.
-        boolean completed = compactionLatch.await(30, TimeUnit.SECONDS);
-        assertThat(completed).isTrue();
-
-        // Verify compaction happened
         assertThat(oldSegmentRef.get()).isEqualTo(segment);
         assertThat(newSegmentRef.get()).isNotNull();
         assertThat(newSegmentRef.get().isClosed()).isFalse();
@@ -268,6 +263,65 @@ class CompactionWorkerTest {
         // New segment should have the original key but not the deleted key
         assertThat(newSegmentRef.get().get(key)).isNotNull();
         assertThat(newSegmentRef.get().get(deleteKey)).isNull();
+
+        worker.stop();
+    }
+
+    @Test
+    @DisplayName("a segment being split is not compacted")
+    void compactNow_refusesASplittingSegment() throws IOException {
+        AtomicReference<Segment> newSegmentRef = new AtomicReference<>();
+        CompactionWorker worker = new CompactionWorker(arena,
+            (oldSeg, newSeg) -> newSegmentRef.set(newSeg));
+
+        Segment segment = createTestSegment("splitting-segment");
+        segment.put("test-key".getBytes(), "test-value".getBytes());
+        byte[] deleteKey = "delete-key".getBytes();
+        segment.put(deleteKey, "delete-value".getBytes());
+        segment.delete(deleteKey);
+
+        // The state a split reaches before it publishes its children. Both operations replace the
+        // same directory entry, and compaction commits its half - the canonical file and the
+        // write log - before the registry is asked to accept it, so a compaction that runs to
+        // completion here has already discarded what the losing side needed.
+        segment.beginSplit();
+
+        worker.compactNow(segment);
+
+        assertThat(newSegmentRef.get())
+            .as("no replacement may be built for a segment that is being split")
+            .isNull();
+        assertThat(segment.isClosed())
+            .as("the segment is still the one the split is working from")
+            .isFalse();
+        assertThat(Files.exists(Path.of(segment.path().toString() + ".compact")))
+            .as("nothing may be left behind at the scratch path")
+            .isFalse();
+
+        worker.stop();
+    }
+
+    @Test
+    @DisplayName("requestCompaction dispatches the same work to a background thread")
+    void requestCompaction_triggersCompaction() throws IOException, InterruptedException {
+        CountDownLatch compactionLatch = new CountDownLatch(1);
+
+        CompactionWorker worker = new CompactionWorker(arena,
+            (oldSeg, newSeg) -> compactionLatch.countDown());
+
+        Segment segment = createTestSegment("dispatch-segment");
+        segment.put("test-key".getBytes(), "test-value".getBytes());
+        byte[] deleteKey = "delete-key".getBytes();
+        segment.put(deleteKey, "delete-value".getBytes());
+        segment.delete(deleteKey);
+
+        worker.requestCompaction(segment);
+
+        // A liveness guard, not a latency budget: this asserts only that the request reaches the
+        // compaction, which the test above already checks the outcome of.
+        assertThat(compactionLatch.await(30, TimeUnit.SECONDS))
+            .as("the requested compaction ran")
+            .isTrue();
 
         worker.stop();
     }

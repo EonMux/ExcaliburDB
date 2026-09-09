@@ -7,45 +7,51 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Manages LSH index population during document ingestion.
+ * The LSH implementation of a segment's {@link io.excalibur.store.VectorPrefilter}.
  *
  * <h2>Purpose</h2>
- * <p>This service is responsible for inserting vectors into segment LSH indices
- * during the ingestion pipeline. It ensures that every vector written to a segment
- * is also indexed in the segment's LSH index for efficient pre-filtering during queries.</p>
+ * <p>Maintains one locality-sensitive hash index per segment, keyed by HNSW node id, which
+ * stage 2 of the query pipeline uses to narrow a vector search before the graph is walked.</p>
  *
  * <h2>Integration Points</h2>
  * <ul>
- *   <li><strong>Ingestion Pipeline:</strong> After vectors are written to segments,
- *       this service is called to insert them into the LSH index</li>
- *   <li><strong>Segment Creation:</strong> When a new segment is created, this service
- *       initializes its LSH index with the configured dimensions</li>
- *   <li><strong>Deletion Propagation:</strong> When entries are tombstoned, this service
- *       removes them from the LSH index</li>
+ *   <li><strong>Storage engine:</strong> attaches and discards indexes over a segment's
+ *       lifetime - creation, recovery at start-up, and split children - through
+ *       {@link #initialize(Segment)} and {@link #discardPersistedState(Segment)}</li>
+ *   <li><strong>HNSW integration worker:</strong> records each vector through
+ *       {@link #indexVector(Segment, float[], long)} as it assigns the node id that keys it.
+ *       Ingestion does not write here: it holds the vector before any node id exists</li>
  * </ul>
  *
+ * <h2>Tombstones</h2>
+ * <p>Deleting an entry does not touch the index. A tombstoned node stays a candidate, the graph
+ * re-reads every candidate it returns and skips tombstoned ones, and the entry is reclaimed when
+ * the segment is compacted. {@link #removeEntry(Segment, long)} exists for a caller that holds a
+ * genuine node id; the deletion path does not.</p>
+ *
  * <h2>Thread Safety</h2>
- * <p>This class is fully thread-safe. LSH insertions are protected by per-segment locks
- * to allow concurrent ingestion across different segments while maintaining consistency
- * within each segment.</p>
+ * <p>This class is fully thread-safe. Index creation is serialized on a single lock, and the
+ * indexes themselves are internally striped.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li><strong>Vector dimensions:</strong> Must match the configured dimensions for the LSH index</li>
- *   <li><strong>Entry IDs:</strong> Non-negative long values representing unique entry identifiers</li>
+ *   <li><strong>Entry IDs:</strong> Non-negative HNSW node ids, in the graph's id space</li>
  *   <li><strong>Insertion order:</strong> LSH indices support incremental insertion</li>
- *   <li><strong>Error handling:</strong> Failed insertions are logged but don't fail the ingestion</li>
+ *   <li><strong>Error handling:</strong> Failures are logged and never fail the caller; the
+ *       pre-filter is an optimisation, not a system of record</li>
  * </ul>
  *
  * @author ExcaliburDB
  * @since 8.0
  */
-public class LshIngestionService {
+public class LshIngestionService implements io.excalibur.store.VectorPrefilter {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(LshIngestionService.class);
 
@@ -126,8 +132,11 @@ public class LshIngestionService {
      * from an empty pre-filter while the query pipeline still believes it has one.</p>
      *
      * <p>The seed is derived from the segment id rather than left to the {@link LshConfig}
-     * default of {@code System.nanoTime()}: a per-process random seed produces different
-     * hyperplanes on every start, which would make the persisted buckets meaningless.</p>
+     * default of {@code System.nanoTime()}, so that segments opened in the same instant do not
+     * share hyperplanes. It is not what makes the persisted buckets readable after a restart -
+     * the segment id counts segment instances and differs from one run to the next. Each table
+     * stores the seed it was built with and rebuilds its hash function from that, which is what
+     * survives; the configured seed only ever applies to a table being created.</p>
      *
      * <p>If the segment already has an LSH index, this method is a no-op.</p>
      *
@@ -286,6 +295,65 @@ public class LshIngestionService {
                 segment.segmentId(), e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Attaches a pre-filter to a segment, re-opening whatever is persisted beside it.
+     *
+     * <p>The {@link io.excalibur.store.VectorPrefilter} entry point the storage engine calls for
+     * every segment it makes queryable, so the pre-filter has the same lifecycle as the graph it
+     * is keyed against.</p>
+     *
+     * @param segment The segment to attach a pre-filter to
+     */
+    @Override
+    public void initialize(Segment segment) {
+        initializeLshIndex(segment);
+    }
+
+    /**
+     * Deletes the LSH tables persisted under a segment's current name.
+     *
+     * <p>Called by the storage engine on a split child before its own pre-filter is opened. The
+     * files are unlinked rather than truncated, so an index another segment still has mapped -
+     * the retiring parent's - keeps serving from its inode until that segment closes it.</p>
+     *
+     * @param segment The segment whose persisted tables must not be inherited
+     */
+    @Override
+    public void discardPersistedState(Segment segment) {
+        Objects.requireNonNull(segment, "segment must not be null");
+
+        Path directory = lshDirectory(segment);
+        if (directory == null || !Files.isDirectory(directory)) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> entries = Files.list(directory)) {
+            for (Path entry : entries.toList()) {
+                Files.deleteIfExists(entry);
+            }
+            Files.deleteIfExists(directory);
+            LOGGER.debug("Discarded inherited LSH tables at {}", directory);
+        } catch (IOException e) {
+            LOGGER.warn("Failed to discard inherited LSH tables at {}: {}",
+                directory, e.getMessage());
+        }
+    }
+
+    /**
+     * Records an integrated vector under the HNSW node id the graph assigned it.
+     *
+     * <p>This is the {@link io.excalibur.store.VectorPrefilter} entry point, called by the HNSW
+     * integration worker once a node id exists. It is the only caller that can key the index the
+     * way the query pipeline reads it.</p>
+     *
+     * @param segment The segment the vector was integrated into
+     * @param vector  The vector as integrated
+     * @param nodeId  The HNSW node id assigned to it
+     */
+    @Override
+    public void indexVector(Segment segment, float[] vector, long nodeId) {
+        insertVector(segment, vector, nodeId);
     }
 
     /**

@@ -17,10 +17,12 @@ import java.util.Objects;
 /**
  * Reranks query candidates by computing exact distances on full-precision vectors.
  *
- * <p>Stage 4 of the query pipeline uses this class to compute exact distances
- * for top candidates from Stage 3 (HNSW search + tail scan). This is critical
- * because Stage 3 may return approximate distances if Product Quantization (PQ)
- * was used for the search.</p>
+ * <p>Stage 4 of the query pipeline uses this class to measure the candidates Stage 3 returned
+ * against the query as the graph holds them now. Stage 3's distances are exact already, so the
+ * number this recomputes matches for a node that has not moved; what the second look catches is
+ * one that has. The node is re-read under the generation it was found at, so a candidate
+ * tombstoned since, or whose id a compaction has since given to another node, drops out instead
+ * of being ranked on a stale measurement.</p>
  *
  * <h2>Reranking Process</h2>
  * <ol>

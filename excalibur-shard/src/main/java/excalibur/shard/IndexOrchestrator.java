@@ -1016,6 +1016,19 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
+     * Sets the vector pre-filter that HNSW integration mirrors into.
+     *
+     * <p>The pre-filter is keyed by HNSW node id, and this orchestrator owns the worker that
+     * assigns those ids. Wiring it here is what lets the query pipeline intersect a pre-filter
+     * answer with the graph's own nodes rather than with an id space nothing else uses.</p>
+     *
+     * @param vectorPrefilter The pre-filter to mirror into, or null to maintain none
+     */
+    public void setVectorPrefilter(io.excalibur.store.VectorPrefilter vectorPrefilter) {
+        hnswWorker.setVectorPrefilter(vectorPrefilter);
+    }
+
+    /**
      * Returns the visibility tracker for epoch-based visibility.
      *
      * <p>Use this to capture epochs for queries and determine
@@ -1183,22 +1196,33 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * @param newSegment The compacted replacement
      */
     private void applyCompactionSwap(Segment oldSegment, Segment newSegment) {
-        long segmentId = registeredSegmentId(oldSegment);
-        if (segmentId < 0) {
-            // Not registered here, but the routing directory still has to be re-pointed:
-            // the compaction worker closes the old segment as soon as this returns, and a
-            // directory entry pointing at a closed segment fails every read and write.
-            segmentId = directoryIndexOf(oldSegment);
-        }
-        if (segmentId < 0) {
-            LOGGER.warn("Could not find segment ID for compacted segment: {}", oldSegment.path());
+        // The directory decides, because the directory is what the swap is validated against:
+        // replaceSegment compares the segment it holds at this index with the one being replaced.
+        // Asking it to swap at an index this orchestrator's own map happens to remember - a map
+        // that drifts when a segment moves between indices - names an index holding somebody
+        // else, and the swap is refused. The compaction worker closes the old segment as soon as
+        // this returns, so a refusal there retires a segment the directory is still routing to,
+        // and every read and write to it fails for the life of the process.
+        long directoryId = directoryIndexOf(oldSegment);
+        long registeredId = registeredSegmentId(oldSegment);
+        if (directoryId < 0) {
+            // Already replaced or retired by whoever won the race for it. Nothing routes to it,
+            // so there is nothing to swap and closing it costs nothing.
+            LOGGER.warn("Compacted segment {} is no longer in the storage directory; leaving the "
+                + "registry alone", oldSegment.path());
             return;
+        }
+        long segmentId = directoryId;
+        if (registeredId >= 0 && registeredId != directoryId) {
+            LOGGER.warn("Compacted segment {} is registered here as {} but held by the directory "
+                + "as {}; swapping at the directory's index", oldSegment.path(), registeredId,
+                directoryId);
         }
 
         LOGGER.info("Compaction complete for segment {}: {} -> {}",
             segmentId, oldSegment.path(), newSegment.path());
 
-        SegmentIndexInfo oldInfo = segmentIndexInfo.get(segmentId);
+        SegmentIndexInfo oldInfo = segmentIndexInfo.get(registeredId >= 0 ? registeredId : segmentId);
         HnswGraph graph = oldInfo != null && oldInfo.graph != null
             ? oldInfo.graph : oldSegment.getHnswGraph();
         TailOffsetTracker tracker = oldInfo != null && oldInfo.tracker != null
@@ -1220,7 +1244,10 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         } finally {
             if (!installed) {
                 // Put back what was quiesced, so a failed swap leaves the old segment served
-                // and indexed exactly as it was.
+                // and indexed exactly as it was. The attachments come back first: carrying them
+                // over moved ownership to a replacement that is about to be discarded and closed,
+                // and closing it releases the mappings of whatever is still attached to it.
+                returnIndexAttachments(oldSegment, newSegment);
                 if (graph != null && tracker != null) {
                     hnswWorker.registerSegment(oldSegment, graph, tracker);
                 }
@@ -1236,11 +1263,46 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
 
         repointWorkers(segmentId, oldSegment, newSegment, graph, filter, tracker);
 
+        if (registeredId >= 0 && registeredId != segmentId && oldInfo != null) {
+            // The drifted entry names the segment the worker is about to close. Left in place it
+            // would answer every later lookup of that index with a closed segment, and the
+            // reconciliation sweep would keep finding an index it believes is already registered.
+            segmentIndexInfo.remove(registeredId, oldInfo);
+            warmingWorker.unregisterSegment(registeredId);
+        }
+
         // Update catalog to complete compaction transition
         catalog.completeCompaction(segmentId);
 
         LOGGER.info("Compaction swap complete for segment {}: {} entries, registry updated",
             segmentId, newSegment.entryCount());
+    }
+
+    /**
+     * Moves the owned index structures back off a replacement that was not installed.
+     *
+     * <p>The mirror of {@link #carryIndexAttachments}, for the swap that did not happen. Only the
+     * two structures a segment closes are moved: the tail offset tracker and the term frequency
+     * sketch were attached to the replacement without being taken from the original, which still
+     * has them. Leaving the graph and the pre-filter on the replacement would hand them to
+     * {@code discardCompacted}, which closes it - releasing the mappings under the original
+     * segment, which is about to go on serving queries.</p>
+     *
+     * @param oldSegment The segment that stays in service
+     * @param newSegment The replacement that will be discarded
+     */
+    private void returnIndexAttachments(Segment oldSegment, Segment newSegment) {
+        if (newSegment == null || oldSegment.isClosed()) {
+            return;
+        }
+        io.excalibur.vector.hnsw.HnswGraph graph = newSegment.detachHnswGraph();
+        if (graph != null) {
+            oldSegment.attachHnswGraph(graph);
+        }
+        excalibur.filter.lsh.LshIndex prefilter = newSegment.detachLshIndex();
+        if (prefilter != null) {
+            oldSegment.attachLshIndex(prefilter);
+        }
     }
 
     /**
@@ -1295,6 +1357,18 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         excalibur.filter.sketch.CountMinSketch sketch = oldSegment.getTermFrequencySketch();
         if (sketch != null) {
             newSegment.attachTermFrequencySketch(sketch);
+        }
+
+        // The pre-filter is keyed by the node ids of the graph carried over just above, and
+        // compaction does not renumber them, so it describes the replacement exactly as well as
+        // it described the original. Detach it for the same reason the graph is detached: the old
+        // segment closes as soon as this listener returns, and Segment.close() closes whatever is
+        // still attached - one mapped file per hash table, released underneath a live query path.
+        // Left behind instead, a segment loses its pre-filter permanently on its first compaction
+        // and falls back to a full graph search for good.
+        excalibur.filter.lsh.LshIndex prefilter = oldSegment.detachLshIndex();
+        if (prefilter != null) {
+            newSegment.attachLshIndex(prefilter);
         }
     }
 

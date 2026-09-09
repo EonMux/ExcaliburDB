@@ -284,8 +284,9 @@ public class CuckooMetricsWorker {
 
                     // Log per-segment FP rate at trace level for debugging
                     if (LOGGER.isTraceEnabled()) {
-                        LOGGER.trace("Segment {} FP rate: {:.6f} (load factor: {:.4f})",
-                            entry.segmentId, fpRate, entry.filter.loadFactor());
+                        LOGGER.trace("Segment {} FP rate: {} (load factor: {})",
+                            entry.segmentId, String.format("%.6f", fpRate),
+                            String.format("%.4f", entry.filter.loadFactor()));
                     }
                 } catch (Exception e) {
                     LOGGER.warn("Error estimating FP rate for segment {}: {}",
@@ -306,16 +307,17 @@ public class CuckooMetricsWorker {
 
                 // Log at debug level to avoid spamming logs
                 if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Cuckoo FP rate sampling complete: avg={:.6f}, max={:.6f}, " +
+                    LOGGER.debug("Cuckoo FP rate sampling complete: avg={}, max={}, " +
                         "filters={}, samples={}, duration={}ms",
-                        avgFpRate, maxFpRate, filtersWithEntries, samplesRecorded, duration);
+                        String.format("%.6f", avgFpRate), String.format("%.6f", maxFpRate),
+                        filtersWithEntries, samplesRecorded, duration);
                 }
 
                 // Warn if FP rate is higher than expected (>0.1%)
                 if (avgFpRate > 0.001) {
-                    LOGGER.warn("Cuckoo filter FP rate ({:.4f}%) exceeds target (0.1%). " +
+                    LOGGER.warn("Cuckoo filter FP rate ({}%) exceeds target (0.1%). " +
                         "Consider increasing fingerprint bits or reducing load factor.",
-                        avgFpRate * 100);
+                        String.format("%.4f", avgFpRate * 100));
                 }
             }
 

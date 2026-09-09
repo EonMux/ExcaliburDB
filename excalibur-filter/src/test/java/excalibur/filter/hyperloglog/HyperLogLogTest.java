@@ -592,6 +592,85 @@ class HyperLogLogTest {
     }
 
     @Nested
+    @DisplayName("Seeding")
+    class SeedingTest {
+
+        /**
+         * The seed decides which register a term lands in, so it is what makes two sketches
+         * comparable at all. These pin that contract: merging is only meaningful between
+         * sketches that hash identically, and an estimate has to be reproducible across restarts
+         * because the query planner reads it as a statistic.
+         */
+
+        @Test
+        @DisplayName("two sketches of the same precision hash identically by default")
+        void defaultSeedIsFixed() {
+            HyperLogLog first = new HyperLogLog(DEFAULT_PRECISION);
+            HyperLogLog second = new HyperLogLog(DEFAULT_PRECISION);
+            for (int i = 0; i < 500; i++) {
+                first.insert(("term-" + i).getBytes(StandardCharsets.UTF_8));
+                second.insert(("term-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+
+            assertEquals(first.estimate(), second.estimate(),
+                "the same terms in two default sketches must give the same estimate; a per-"
+                    + "instance seed would make the planner's statistic differ per restart");
+        }
+
+        @Test
+        @DisplayName("merging overlapping sketches is a union, not a sum")
+        void mergeIsAUnion() {
+            // With a per-instance seed the same term lands in different registers in each
+            // sketch, so taking the per-register maximum reports roughly the sum instead of the
+            // union - a plausible-looking number that over-counts by the overlap.
+            HyperLogLog left = new HyperLogLog(DEFAULT_PRECISION);
+            HyperLogLog right = new HyperLogLog(DEFAULT_PRECISION);
+            for (int i = 0; i < 600; i++) {
+                left.insert(("term-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+            for (int i = 300; i < 900; i++) {
+                right.insert(("term-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+
+            left.merge(right);
+
+            double error = Math.abs(left.estimate() - 900) / 900.0;
+            assertTrue(error < 0.05,
+                "union of 900 distinct terms, got " + left.estimate());
+        }
+
+        @Test
+        @DisplayName("merging a sketch that hashes differently is refused, not guessed at")
+        void mismatchedSeedsAreRefused() {
+            HyperLogLog mine = new HyperLogLog(DEFAULT_PRECISION, 1L);
+            HyperLogLog theirs = new HyperLogLog(DEFAULT_PRECISION, 2L);
+
+            IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> mine.merge(theirs));
+            assertTrue(thrown.getMessage().contains("seed"), thrown.getMessage());
+        }
+
+        @Test
+        @DisplayName("a sketch round-trips through its serialised form and still merges")
+        void serialisedSketchesStillMerge() {
+            HyperLogLog original = new HyperLogLog(DEFAULT_PRECISION);
+            original.insert("a".getBytes(StandardCharsets.UTF_8));
+
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment written = original.toMemorySegment(arena);
+                HyperLogLog restored = HyperLogLog.fromMemorySegment(written);
+
+                HyperLogLog fresh = new HyperLogLog(DEFAULT_PRECISION);
+                fresh.insert("b".getBytes(StandardCharsets.UTF_8));
+
+                restored.merge(fresh);
+                assertEquals(2L, restored.estimate(),
+                    "a sketch read back from disk must still merge with a live one");
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("ToString")
     class ToStringTest {
 

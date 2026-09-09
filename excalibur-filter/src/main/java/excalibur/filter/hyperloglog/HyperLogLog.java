@@ -75,6 +75,22 @@ public class HyperLogLog {
     /** Maximum precision (16 bits = 65536 registers, ~0.81% error). */
     public static final int MAX_PRECISION = 16;
 
+    /**
+     * Hash seed used by every sketch that is not given one explicitly.
+     *
+     * <p>Fixed, not random. Two sketches can only be merged if the same term lands in the same
+     * register in both, which means they must hash it the same way; seeding each instance
+     * differently makes {@link #merge(HyperLogLog)} take the per-register maximum of two
+     * unrelated hashings and report a union that is neither sketch's contents. It over-counts by
+     * roughly the overlap, silently, because the result is still a plausible number.</p>
+     *
+     * <p>A fixed seed also makes an estimate reproducible across restarts, which a planner
+     * statistic has to be: the same corpus answering a different cardinality on Tuesday is not
+     * something anyone can debug. The seed is written into the serialised header regardless, so
+     * it was never secret and randomising it bought nothing.</p>
+     */
+    public static final long DEFAULT_SEED = 0x9E3779B97F4A7C15L;
+
     /** Number of bits used to select the register. */
     private final int precision;
 
@@ -111,7 +127,7 @@ public class HyperLogLog {
      * @throws IllegalArgumentException if precision is not in [4, 16]
      */
     public HyperLogLog(int precision) {
-        this(precision, System.nanoTime());
+        this(precision, DEFAULT_SEED);
     }
 
     /**
@@ -319,6 +335,14 @@ public class HyperLogLog {
             throw new IllegalArgumentException(
                 "Cannot merge HyperLogLog with different precision: " +
                 other.precision + " != " + this.precision);
+        }
+        if (other.seed != this.seed) {
+            // Registers are only comparable between sketches that hash identically. Merging
+            // across seeds produces a number rather than an error, and that number is wrong in
+            // the direction that looks reasonable, so it has to be refused here.
+            throw new IllegalArgumentException(
+                "Cannot merge HyperLogLog with different seed: " +
+                other.seed + " != " + this.seed);
         }
 
         // Acquire all locks in both sketches to prevent deadlock

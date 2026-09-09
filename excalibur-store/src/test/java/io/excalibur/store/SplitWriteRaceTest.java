@@ -37,6 +37,25 @@ class SplitWriteRaceTest {
             .isEqualTo(widthBefore * 2);
     }
 
+    /**
+     * Waits for the parent to reach the retired state, not merely for the table to widen.
+     *
+     * <p>Those are two transitions, and the routing table widens first. In between, the parent is
+     * still SPLITTING and refuses writes with the copy-on-write error rather than the retirement
+     * one - a refusal either way, so nothing is lost, but a different message. Waiting for the
+     * state the assertion is about is what makes the assertion about the state rather than about
+     * how loaded the machine was.</p>
+     */
+    private static void awaitRetired(Segment parent) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (!parent.isSplitComplete() && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(parent.isSplitComplete())
+            .as("the parent must be retired once its children are published")
+            .isTrue();
+    }
+
     @Test
     @DisplayName("a retired parent refuses a write instead of swallowing it")
     void retiredParentRefusesWrites(@TempDir Path tempDir) throws Exception {
@@ -53,6 +72,7 @@ class SplitWriteRaceTest {
             assertThat(parent).isNotNull();
 
             splitAndAwait(engine, parent);
+            awaitRetired(parent);
 
             assertThatThrownBy(() -> parent.put(key(9999), value(9999)))
                 .isInstanceOf(SegmentRetiredException.class);
