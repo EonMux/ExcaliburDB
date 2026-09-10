@@ -8,11 +8,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Validates epoch isolation guarantees to ensure no torn reads at the HNSW node level.
@@ -93,12 +90,6 @@ public final class EpochIsolationValidator {
     private static final int CHECKPOINTS_AFTER_PRUNE = (MAX_CHECKPOINTS_PER_SEGMENT * 3) / 4;
 
     /**
-     * Scope used by the deprecated segment-less API so its records can never collide
-     * with a real segment's node IDs.
-     */
-    private static final long UNSCOPED = Long.MIN_VALUE;
-
-    /**
      * Per-segment checkpoints: segment ID to (first node ID of a batch to its visible epoch).
      */
     private final ConcurrentHashMap<Long, ConcurrentSkipListMap<Long, Long>> segmentCheckpoints;
@@ -110,18 +101,11 @@ public final class EpochIsolationValidator {
     private final ConcurrentHashMap<Long, Long> segmentLastUpdateEpoch;
 
     /**
-     * Guards the one-time warning emitted when the segment-less filter is used while
-     * segment-scoped visibility data exists.
-     */
-    private final AtomicBoolean unscopedFilterWarned;
-
-    /**
      * Creates a new EpochIsolationValidator.
      */
     public EpochIsolationValidator() {
         this.segmentCheckpoints = new ConcurrentHashMap<>();
         this.segmentLastUpdateEpoch = new ConcurrentHashMap<>();
-        this.unscopedFilterWarned = new AtomicBoolean(false);
         LOGGER.debug("EpochIsolationValidator created");
     }
 
@@ -189,50 +173,7 @@ public final class EpochIsolationValidator {
         LOGGER.debug("Pruned {} aged visibility checkpoints for segment {}", pruned, segmentId);
     }
 
-    /**
-     * Registers a single node as visible at the specified epoch.
-     *
-     * @param nodeId The HNSW graph node ID
-     * @param visibleEpoch The epoch at which the node becomes visible
-     * @throws IllegalArgumentException if visibleEpoch is negative
-     * @deprecated Node IDs are only unique within one segment's graph. Use
-     *             {@link #registerNodeRange(long, long, long)}, which is scoped by segment
-     *             and bounded in memory.
-     */
-    @Deprecated
-    public void registerNode(long nodeId, long visibleEpoch) {
-        registerNodeRange(UNSCOPED, nodeId, visibleEpoch);
-    }
 
-    /**
-     * Registers multiple nodes as visible at the specified epoch.
-     *
-     * @param nodeIds The HNSW graph node IDs
-     * @param visibleEpoch The epoch at which all nodes become visible
-     * @deprecated Node IDs are only unique within one segment's graph. Use
-     *             {@link #registerNodeRange(long, long, long)}.
-     */
-    @Deprecated
-    public void registerNodes(Set<Long> nodeIds, long visibleEpoch) {
-        Objects.requireNonNull(nodeIds, "nodeIds must not be null");
-        if (visibleEpoch < 0) {
-            throw new IllegalArgumentException("visibleEpoch must be non-negative: " + visibleEpoch);
-        }
-
-        // Ascending, because a checkpoint only coalesces into the range below it. A Set makes no
-        // promise about iteration order and Set.of randomises it per JVM, so the same call could
-        // record one checkpoint for a contiguous batch on one run and one per node on the next.
-        // Every node ends up covered either way - this is not a correctness fix - but the memory
-        // this class uses, and the checkpoint count it reports, would otherwise depend on a hash
-        // seed rather than on what was registered.
-        List<Long> ascending = new ArrayList<>(nodeIds);
-        Collections.sort(ascending);
-
-        for (Long nodeId : ascending) {
-            registerNodeRange(UNSCOPED, nodeId, visibleEpoch);
-        }
-        LOGGER.trace("Registered {} nodes with visibility epoch {}", nodeIds.size(), visibleEpoch);
-    }
 
     /**
      * Registers a segment's last update epoch.
@@ -291,19 +232,6 @@ public final class EpochIsolationValidator {
         }
     }
 
-    /**
-     * Unregisters a node.
-     *
-     * @param nodeId The node ID to unregister
-     * @return true if a checkpoint for exactly this node ID was removed
-     * @deprecated Visibility is tracked as per-segment ranges; use
-     *             {@link #unregisterSegment(long)} or {@link #resetSegmentNodeEpochs(long)}.
-     */
-    @Deprecated
-    public boolean unregisterNode(long nodeId) {
-        ConcurrentSkipListMap<Long, Long> checkpoints = segmentCheckpoints.get(UNSCOPED);
-        return checkpoints != null && checkpoints.remove(nodeId) != null;
-    }
 
     // ==================== Visibility Queries ====================
 
@@ -348,31 +276,6 @@ public final class EpochIsolationValidator {
         return epoch < 0 ? 0 : epoch;
     }
 
-    /**
-     * Checks if a node is visible at the specified query epoch.
-     *
-     * @param nodeId The node ID to check
-     * @param queryEpoch The epoch at which the query was captured
-     * @return true if the node is visible at the query epoch
-     * @deprecated Node IDs are only unique within one segment's graph. Use
-     *             {@link #isNodeVisible(long, long, long)}.
-     */
-    @Deprecated
-    public boolean isNodeVisible(long nodeId, long queryEpoch) {
-        return isNodeVisible(UNSCOPED, nodeId, queryEpoch);
-    }
-
-    /**
-     * Gets the visibility epoch for a node registered through the segment-less API.
-     *
-     * @param nodeId The node ID
-     * @return The visibility epoch, or -1 if not registered
-     * @deprecated Use {@link #getNodeVisibilityEpoch(long, long)}.
-     */
-    @Deprecated
-    public long getNodeVisibilityEpoch(long nodeId) {
-        return getNodeVisibilityEpoch(UNSCOPED, nodeId);
-    }
 
     /**
      * Checks if a segment has any entries visible at the specified query epoch.
@@ -449,36 +352,7 @@ public final class EpochIsolationValidator {
         return Collections.unmodifiableList(filtered);
     }
 
-    /**
-     * Filters search results using the segment-less visibility scope.
-     *
-     * @param results The original HNSW search results
-     * @param queryEpoch The epoch at which the query was captured
-     * @return Filtered results containing only visible nodes
-     * @deprecated A bare node ID cannot be attributed to a graph, so this overload can
-     *             only consult records written through the equally deprecated
-     *             {@link #registerNode(long, long)}. Callers holding a segment ID must use
-     *             {@link #filterResults(long, List, long)}; node-level isolation is not
-     *             enforced for callers that do not.
-     */
-    @Deprecated
-    public List<HnswSearchResult> filterResults(List<HnswSearchResult> results, long queryEpoch) {
-        warnIfSegmentScopedDataIgnored();
-        return filterResults(UNSCOPED, results, queryEpoch);
-    }
 
-    /**
-     * Warns once when the segment-less filter is used while segment-scoped checkpoints
-     * exist, because those checkpoints cannot be applied without a segment ID.
-     */
-    private void warnIfSegmentScopedDataIgnored() {
-        if (segmentCheckpoints.size() > (segmentCheckpoints.containsKey(UNSCOPED) ? 1 : 0)
-            && unscopedFilterWarned.compareAndSet(false, true)) {
-            LOGGER.warn("filterResults(List, long) was called while segment-scoped node visibility "
-                + "records exist. Node-level epoch isolation cannot be enforced without a segment "
-                + "ID; call filterResults(segmentId, results, queryEpoch) instead.");
-        }
-    }
 
     // ==================== Validation ====================
 
@@ -533,18 +407,6 @@ public final class EpochIsolationValidator {
         return new ValidationResult(valid, totalChecked, violations, violationDetails);
     }
 
-    /**
-     * Validates results against the segment-less visibility scope.
-     *
-     * @param results The results to validate
-     * @param queryEpoch The query epoch
-     * @return Validation result with details of any violations
-     * @deprecated Use {@link #validateResults(long, List, long)}.
-     */
-    @Deprecated
-    public ValidationResult validateResults(List<HnswSearchResult> results, long queryEpoch) {
-        return validateResults(UNSCOPED, results, queryEpoch);
-    }
 
     // ==================== Statistics ====================
 

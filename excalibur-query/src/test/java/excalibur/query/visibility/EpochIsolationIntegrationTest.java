@@ -41,6 +41,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class EpochIsolationIntegrationTest {
 
+    /** Node ids are unique only within one graph, so every record names the graph it is in. */
+    private static final long SEGMENT = 0L;
+
     private EpochIsolationValidator validator;
 
     @BeforeEach
@@ -233,17 +236,17 @@ class EpochIsolationIntegrationTest {
             long nodeId = 12345L;
             long visibleEpoch = 100L;
 
-            validator.registerNode(nodeId, visibleEpoch);
+            validator.registerNodeRange(SEGMENT, nodeId, visibleEpoch);
 
             // Not visible before
-            assertThat(validator.isNodeVisible(nodeId, 99L)).isFalse();
+            assertThat(validator.isNodeVisible(SEGMENT, nodeId, 99L)).isFalse();
 
             // Visible at exact epoch
-            assertThat(validator.isNodeVisible(nodeId, 100L)).isTrue();
+            assertThat(validator.isNodeVisible(SEGMENT, nodeId, 100L)).isTrue();
 
             // Visible after
-            assertThat(validator.isNodeVisible(nodeId, 101L)).isTrue();
-            assertThat(validator.isNodeVisible(nodeId, 1000L)).isTrue();
+            assertThat(validator.isNodeVisible(SEGMENT, nodeId, 101L)).isTrue();
+            assertThat(validator.isNodeVisible(SEGMENT, nodeId, 1000L)).isTrue();
         }
 
         /**
@@ -252,8 +255,8 @@ class EpochIsolationIntegrationTest {
         @Test
         @DisplayName("epoch zero boundary works correctly")
         void epochZeroBoundary() {
-            validator.registerNode(1L, 0L);
-            validator.registerNode(2L, 1L);
+            validator.registerNodeRange(SEGMENT, 1L, 0L);
+            validator.registerNodeRange(SEGMENT, 2L, 1L);
 
             // Query at epoch 0 should only see node 1
             List<HnswSearchResult> results = List.of(
@@ -261,12 +264,12 @@ class EpochIsolationIntegrationTest {
                 new HnswSearchResult(2L, 0.2f)
             );
 
-            List<HnswSearchResult> filtered0 = validator.filterResults(results, 0L);
+            List<HnswSearchResult> filtered0 = validator.filterResults(SEGMENT, results, 0L);
             assertThat(filtered0).hasSize(1);
             assertThat(filtered0.get(0).nodeId()).isEqualTo(1L);
 
             // Query at epoch 1 should see both nodes
-            List<HnswSearchResult> filtered1 = validator.filterResults(results, 1L);
+            List<HnswSearchResult> filtered1 = validator.filterResults(SEGMENT, results, 1L);
             assertThat(filtered1).hasSize(2);
         }
 
@@ -278,7 +281,7 @@ class EpochIsolationIntegrationTest {
         void validationDetectsCrossEpochViolations() {
             // Register nodes at different epochs
             for (int i = 0; i < 20; i++) {
-                validator.registerNode(i, i * 5L);
+                validator.registerNodeRange(SEGMENT, i, i * 5L);
             }
 
             // Create results mixing epochs
@@ -289,7 +292,7 @@ class EpochIsolationIntegrationTest {
 
             // Query at epoch 50 should only see nodes 0-10 (epochs 0, 5, 10, ..., 50)
             long queryEpoch = 50L;
-            List<HnswSearchResult> filtered = validator.filterResults(results, queryEpoch);
+            List<HnswSearchResult> filtered = validator.filterResults(SEGMENT, results, queryEpoch);
 
             // Nodes 0-10 have epochs 0, 5, 10, ..., 50 (all <= 50)
             // Nodes 11-19 have epochs 55, 60, ..., 95 (all > 50)
@@ -297,12 +300,12 @@ class EpochIsolationIntegrationTest {
 
             // Validate the filtered results
             EpochIsolationValidator.ValidationResult validation =
-                validator.validateResults(filtered, queryEpoch);
+                validator.validateResults(SEGMENT, filtered, queryEpoch);
             assertThat(validation.valid()).isTrue();
 
             // Validate the unfiltered results (should have violations)
             EpochIsolationValidator.ValidationResult unfilteredValidation =
-                validator.validateResults(results, queryEpoch);
+                validator.validateResults(SEGMENT, results, queryEpoch);
             assertThat(unfilteredValidation.valid()).isFalse();
             assertThat(unfilteredValidation.violations()).isEqualTo(9); // nodes 11-19
         }
@@ -323,7 +326,7 @@ class EpochIsolationIntegrationTest {
         void filteringPreservesDistanceOrdering() {
             // Register all nodes at the same epoch
             for (int i = 0; i < 10; i++) {
-                validator.registerNode(i, 10L);
+                validator.registerNodeRange(SEGMENT, i, 10L);
             }
 
             // Create results sorted by distance
@@ -333,7 +336,7 @@ class EpochIsolationIntegrationTest {
             }
 
             // Filter at epoch 15 (all should be visible)
-            List<HnswSearchResult> filtered = validator.filterResults(results, 15L);
+            List<HnswSearchResult> filtered = validator.filterResults(SEGMENT, results, 15L);
 
             // Verify ordering is preserved
             assertThat(filtered).hasSize(10);
@@ -352,7 +355,7 @@ class EpochIsolationIntegrationTest {
             // Register nodes with alternating visibility
             for (int i = 0; i < 10; i++) {
                 // Even nodes visible at epoch 5, odd nodes visible at epoch 15
-                validator.registerNode(i, i % 2 == 0 ? 5L : 15L);
+                validator.registerNodeRange(SEGMENT, i, i % 2 == 0 ? 5L : 15L);
             }
 
             // Create results sorted by distance
@@ -362,7 +365,7 @@ class EpochIsolationIntegrationTest {
             }
 
             // Query at epoch 10 (only even nodes visible)
-            List<HnswSearchResult> filtered = validator.filterResults(results, 10L);
+            List<HnswSearchResult> filtered = validator.filterResults(SEGMENT, results, 10L);
 
             // Should have 5 results (nodes 0, 2, 4, 6, 8)
             assertThat(filtered).hasSize(5);
@@ -429,7 +432,7 @@ class EpochIsolationIntegrationTest {
         @DisplayName("empty results validate as valid")
         void emptyResultsValidateAsValid() {
             EpochIsolationValidator.ValidationResult validation =
-                validator.validateResults(List.of(), 10L);
+                validator.validateResults(SEGMENT, List.of(), 10L);
 
             assertThat(validation.valid()).isTrue();
             assertThat(validation.totalChecked()).isEqualTo(0);
@@ -443,7 +446,7 @@ class EpochIsolationIntegrationTest {
         @DisplayName("null results validate as valid")
         void nullResultsValidateAsValid() {
             EpochIsolationValidator.ValidationResult validation =
-                validator.validateResults(null, 10L);
+                validator.validateResults(SEGMENT, null, 10L);
 
             assertThat(validation.valid()).isTrue();
         }
@@ -455,12 +458,12 @@ class EpochIsolationIntegrationTest {
         @DisplayName("unregistered nodes are visible for backward compatibility")
         void unregisteredNodesAreVisible() {
             // Don't register node 999
-            assertThat(validator.isNodeVisible(999L, 0L)).isTrue();
-            assertThat(validator.isNodeVisible(999L, 1000L)).isTrue();
+            assertThat(validator.isNodeVisible(SEGMENT, 999L, 0L)).isTrue();
+            assertThat(validator.isNodeVisible(SEGMENT, 999L, 1000L)).isTrue();
 
             // Results with unregistered nodes should be included
             List<HnswSearchResult> results = List.of(new HnswSearchResult(999L, 0.5f));
-            List<HnswSearchResult> filtered = validator.filterResults(results, 10L);
+            List<HnswSearchResult> filtered = validator.filterResults(SEGMENT, results, 10L);
 
             assertThat(filtered).hasSize(1);
             assertThat(filtered.get(0).nodeId()).isEqualTo(999L);
@@ -474,11 +477,11 @@ class EpochIsolationIntegrationTest {
         void handlesLargeEpochValues() {
             long largeEpoch = Long.MAX_VALUE - 100;
 
-            validator.registerNode(1L, largeEpoch);
+            validator.registerNodeRange(SEGMENT, 1L, largeEpoch);
 
-            assertThat(validator.isNodeVisible(1L, largeEpoch)).isTrue();
-            assertThat(validator.isNodeVisible(1L, largeEpoch + 1)).isTrue();
-            assertThat(validator.isNodeVisible(1L, largeEpoch - 1)).isFalse();
+            assertThat(validator.isNodeVisible(SEGMENT, 1L, largeEpoch)).isTrue();
+            assertThat(validator.isNodeVisible(SEGMENT, 1L, largeEpoch + 1)).isTrue();
+            assertThat(validator.isNodeVisible(SEGMENT, 1L, largeEpoch - 1)).isFalse();
         }
     }
 }

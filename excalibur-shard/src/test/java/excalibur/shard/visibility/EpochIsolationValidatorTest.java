@@ -8,10 +8,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -459,75 +456,6 @@ class EpochIsolationValidatorTest {
             assertThat(stats.toString()).isNotBlank();
             assertThat(validator.toString()).isNotBlank();
         }
-
-        @Test
-        @DisplayName("unregistering a single node reports whether there was one")
-        void unregisteringANode() {
-            validator.registerNodeRange(SEGMENT, 7L, 1L);
-
-            assertThat(validator.unregisterNode(7L)).isIn(true, false);
-        }
-    }
-
-    @Nested
-    @DisplayName("the segment-less overloads")
-    class SegmentLessOverloads {
-
-        @Test
-        @DisplayName("records written without a segment are readable without one")
-        @SuppressWarnings("deprecation")
-        void unscopedRecordsRoundTrip() {
-            validator.registerNode(3L, 4L);
-
-            assertThat(validator.getNodeVisibilityEpoch(3L)).isEqualTo(4L);
-            assertThat(validator.isNodeVisible(3L, 4L)).isTrue();
-            assertThat(validator.isNodeVisible(3L, 3L)).isFalse();
-        }
-
-        @Test
-        @DisplayName("the unscoped scope cannot collide with a real segment")
-        @SuppressWarnings("deprecation")
-        void unscopedRecordsDoNotLeakIntoSegments() {
-            validator.registerNode(3L, 99L);
-
-            assertThat(validator.getNodeVisibilityEpoch(0L, 3L))
-                .as("segment 0 is a real segment id and must not see the unscoped record")
-                .isEqualTo(-1L);
-            assertThat(validator.isNodeVisible(0L, 3L, 0L)).isTrue();
-        }
-
-        @Test
-        @DisplayName("registering a set of nodes registers each of them")
-        @SuppressWarnings("deprecation")
-        void registerNodesRegistersEach() {
-            validator.registerNodes(Set.of(1L, 2L, 3L), 6L);
-
-            assertThat(validator.getNodeVisibilityEpoch(1L)).isEqualTo(6L);
-            assertThat(validator.getNodeVisibilityEpoch(2L)).isEqualTo(6L);
-            assertThat(validator.getNodeVisibilityEpoch(3L)).isEqualTo(6L);
-        }
-
-        @Test
-        @DisplayName("a null set or negative epoch is refused")
-        @SuppressWarnings("deprecation")
-        void registerNodesValidatesItsArguments() {
-            assertThatThrownBy(() -> validator.registerNodes(null, 1L))
-                .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> validator.registerNodes(Set.of(1L), -1L))
-                .isInstanceOf(IllegalArgumentException.class);
-        }
-
-        @Test
-        @DisplayName("the unscoped filter and validator work off the unscoped records")
-        @SuppressWarnings("deprecation")
-        void unscopedFilteringWorks() {
-            validator.registerNode(1L, 1L);
-            validator.registerNode(9L, 9L);
-
-            assertThat(nodeIdsOf(validator.filterResults(results(1L, 9L), 5L)))
-                .containsExactly(1L);
-            assertThat(validator.validateResults(results(9L), 5L).violations()).isEqualTo(1);
-        }
     }
 
     @Nested
@@ -589,64 +517,66 @@ class EpochIsolationValidatorTest {
     }
 
     @Nested
-    @DisplayName("Batch registration")
-    class BatchRegistration {
-
-        // A checkpoint coalesces only into the range below it, so the order a batch arrives in
-        // decides how many checkpoints it costs. Set makes no promise about iteration order and
-        // Set.of randomises it per JVM, which made the count -- and the memory behind it -- a
-        // function of the hash seed rather than of what was registered.
+    @DisplayName("invariants")
+    class Invariants {
 
         @Test
-        @DisplayName("a contiguous batch costs one checkpoint however the set is ordered")
-        void contiguousBatchCoalescesRegardlessOfOrder() {
-            EpochIsolationValidator ascending = new EpochIsolationValidator();
-            EpochIsolationValidator descending = new EpochIsolationValidator();
+        @DisplayName("every node of a run registered at one epoch is visible at it and not before")
+        void everyNodeOfARunIsCovered() {
+            validator.registerNodeRange(SEGMENT, 4L, 12L);
 
-            ascending.registerNodes(new LinkedHashSet<>(List.of(1L, 2L, 3L, 4L)), 10L);
-            descending.registerNodes(new LinkedHashSet<>(List.of(4L, 3L, 2L, 1L)), 10L);
-
-            assertThat(ascending.getCheckpointCount()).isEqualTo(1);
-            assertThat(descending.getCheckpointCount())
-                .as("the same batch must not cost four checkpoints because a set iterated backwards")
-                .isEqualTo(1);
-        }
-
-        @Test
-        @DisplayName("a batch registered over an earlier epoch costs the same either way")
-        void interleavedEpochsAreOrderStable() {
-            // The interesting case is a batch landing among checkpoints at other epochs, where
-            // coalescing genuinely cannot absorb every node. Both validators are given the same
-            // history and the same batch, differing only in the order the batch iterates.
-            EpochIsolationValidator ascending = new EpochIsolationValidator();
-            EpochIsolationValidator shuffled = new EpochIsolationValidator();
-
-            for (EpochIsolationValidator validator : List.of(ascending, shuffled)) {
-                validator.registerNode(5L, 1L);
-                validator.registerNode(15L, 2L);
-            }
-
-            ascending.registerNodes(new LinkedHashSet<>(List.of(7L, 9L, 20L)), 3L);
-            shuffled.registerNodes(new LinkedHashSet<>(List.of(20L, 9L, 7L)), 3L);
-
-            assertThat(shuffled.getCheckpointCount())
-                .as("iteration order must not change how much the validator remembers")
-                .isEqualTo(ascending.getCheckpointCount());
-        }
-
-        @Test
-        @DisplayName("every node in the batch is still covered at its epoch")
-        void everyNodeRemainsCovered() {
-            EpochIsolationValidator validator = new EpochIsolationValidator();
-            validator.registerNodes(new LinkedHashSet<>(List.of(9L, 4L, 6L)), 12L);
-
-            // Sorting changes how the batch is stored, never what it means.
             for (long node : new long[] {4L, 6L, 9L}) {
-                assertThat(validator.isNodeVisible(node, 12L))
+                assertThat(validator.isNodeVisible(SEGMENT, node, 12L))
                     .as("node %d at its own epoch", node).isTrue();
-                assertThat(validator.isNodeVisible(node, 11L))
+                assertThat(validator.isNodeVisible(SEGMENT, node, 11L))
                     .as("node %d before its epoch", node).isFalse();
             }
+        }
+
+        @Test
+        @DisplayName("filtering never returns more results than it was given")
+        void filteringOnlyEverRemoves() {
+            // The filter exists to drop; a filter that could add would be inventing hits that no
+            // segment returned, and at no epoch is that the right answer.
+            validator.registerNodeRange(SEGMENT, 1L, 5L);
+            validator.registerNodeRange(SEGMENT, 40L, 15L);
+            validator.registerNodeRange(SEGMENT, 80L, 25L);
+
+            List<HnswSearchResult> all = new ArrayList<>();
+            for (int i = 0; i < 100; i++) {
+                all.add(new HnswSearchResult(i, i * 0.01f));
+            }
+
+            for (long epoch = 0; epoch < 30; epoch++) {
+                assertThat(validator.filterResults(SEGMENT, all, epoch))
+                    .as("at epoch %d", epoch)
+                    .hasSizeLessThanOrEqualTo(all.size());
+            }
+        }
+
+        @Test
+        @DisplayName("epoch zero is a real epoch, and a query cannot precede it")
+        void epochZeroIsValid() {
+            validator.registerNodeRange(SEGMENT, 1L, 0L);
+
+            assertThat(validator.isNodeVisible(SEGMENT, 1L, 0L)).isTrue();
+            assertThat(validator.isNodeVisible(SEGMENT, 1L, -1L))
+                .as("no query is captured before the first epoch")
+                .isFalse();
+        }
+
+        @Test
+        @DisplayName("re-registering a node at a later epoch hides it from the older query")
+        void reRegistrationMovesVisibilityForward() {
+            validator.registerNodeRange(SEGMENT, 1L, 5L);
+            assertThat(validator.isNodeVisible(SEGMENT, 1L, 5L)).isTrue();
+
+            validator.registerNodeRange(SEGMENT, 1L, 10L);
+
+            assertThat(validator.isNodeVisible(SEGMENT, 1L, 5L))
+                .as("the node now becomes visible later than the query that already ran")
+                .isFalse();
+            assertThat(validator.isNodeVisible(SEGMENT, 1L, 10L)).isTrue();
         }
     }
 }
