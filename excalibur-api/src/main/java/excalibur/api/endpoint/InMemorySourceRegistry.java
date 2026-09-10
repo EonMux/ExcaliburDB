@@ -2,11 +2,14 @@ package excalibur.api.endpoint;
 
 import excalibur.api.security.ApiSecurityConfig;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
+import excalibur.ingest.registry.SourceCatalog;
 import excalibur.ingest.source.Source;
+import excalibur.ingest.source.SourceDescriptor;
 import excalibur.shard.worker.SegmentReindexScheduler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
@@ -28,6 +31,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>When a SegmentReindexScheduler is configured via
  * {@link #setReindexScheduler(SegmentReindexScheduler, long)}, sources
  * are automatically registered for periodic reindexing.</p>
+ *
+ * <p>In memory is where the sources live, not where the fact of their registration is kept. When
+ * a {@link SourceCatalog} is configured via {@link #setSourceCatalog(SourceCatalog)}, every
+ * registration is written to it and every removal taken back out, and {@link #restore(Source)}
+ * brings a recorded one back at startup. Without a catalog the registrations last as long as the
+ * process.</p>
  */
 public class InMemorySourceRegistry implements SourceRegistry {
 
@@ -39,6 +48,7 @@ public class InMemorySourceRegistry implements SourceRegistry {
     private volatile IngestStatusEndpoint.IngestionStatusRegistry statusRegistry;
     private volatile SegmentReindexScheduler reindexScheduler;
     private volatile long reindexIntervalMs = SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
+    private volatile SourceCatalog sourceCatalog;
 
     /**
      * Creates a registry bounded by the default source limit.
@@ -105,12 +115,11 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * be automatically registered with the scheduler for periodic reindexing.
      * The scheduler will trigger reindex operations at the configured interval.</p>
      *
-     * <h3>Domain Correctness</h3>
-     * <ul>
-     *   <li>Source IDs must be parseable as long integers for scheduler registration</li>
-     *   <li>Non-numeric source IDs will be logged as warnings but won't fail registration</li>
-     *   <li>The interval must be within scheduler's valid range (1 min to 24 hours)</li>
-     * </ul>
+     * <p>Sources are scheduled under the id they were registered with, whatever it is: the
+     * schedule has to be addressable by the same name {@code /v1/ingest} accepted, or a
+     * deregistration could not find what to cancel.</p>
+     *
+     * <p>The interval must be within the scheduler's valid range (1 minute to 24 hours).</p>
      *
      * @param scheduler The reindex scheduler (may be null to disable scheduled reindexing)
      * @param reindexIntervalMs The reindex interval in milliseconds
@@ -133,8 +142,74 @@ public class InMemorySourceRegistry implements SourceRegistry {
             SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
     }
 
+    /**
+     * Sets the catalog that makes registrations outlast the process.
+     *
+     * <p>With one attached, {@link #register(Source, SourceDescriptor)} writes the registration
+     * down before starting anything and {@link #remove(String)} takes it back out, so the set of
+     * sources a node crawls is the set an operator asked for rather than the set that happens to
+     * have been registered since the last restart.</p>
+     *
+     * @param catalog The source catalog (may be null to keep registrations in memory only)
+     */
+    public void setSourceCatalog(SourceCatalog catalog) {
+        this.sourceCatalog = catalog;
+    }
+
     @Override
     public void register(Source source) {
+        admit(source, null, Crawl.YES);
+    }
+
+    @Override
+    public void register(Source source, SourceDescriptor descriptor) {
+        Objects.requireNonNull(source, "Source cannot be null");
+        Objects.requireNonNull(descriptor, "descriptor must not be null");
+        if (!descriptor.sourceId().equals(source.getSourceId())) {
+            // The catalog is addressed by the same id as the registry and the re-crawl schedule.
+            // A record filed under a different one names a source no removal can cancel and no
+            // restart can match to a crawler.
+            throw new IllegalArgumentException("Descriptor names source "
+                + descriptor.sourceId() + " but the source is " + source.getSourceId());
+        }
+        admit(source, descriptor, Crawl.YES);
+    }
+
+    /**
+     * Brings back a source a previous run registered.
+     *
+     * <p>Everything registration starts except the crawl. The source takes its place in the
+     * registry, in {@code /v1/ingest/status} and in the re-crawl schedule, and the schedule is
+     * what crawls it next - one interval from now, which is what a source registered before the
+     * restart was already waiting for.</p>
+     *
+     * <p>Re-ingesting on the way up would be the wrong default: it re-fetches and re-hashes the
+     * whole corpus every time the node is bounced, to discover what the next scheduled re-crawl
+     * would have discovered anyway. {@code POST /v1/reindex} is there for an operator who wants
+     * it sooner.</p>
+     *
+     * <p>Nothing is written to the catalog: the registration being restored is already in it.</p>
+     *
+     * @param source The source to bring back
+     * @throws NullPointerException        if the source is null
+     * @throws SourceRegistrationException if the ID is taken or the registry is full
+     */
+    public void restore(Source source) {
+        admit(source, null, Crawl.NO);
+        LOGGER.info("Restored source {} from the catalog; next re-crawl in {}ms",
+            source.getSourceId(), reindexIntervalMs);
+    }
+
+    /** Whether admitting a source starts a crawl, or only takes its place in the schedule. */
+    private enum Crawl { YES, NO }
+
+    /**
+     * Takes a source into the registry and starts whatever that entails.
+     *
+     * <p>The catalog is written before anything else is started, so a registration that cannot be
+     * recorded leaves nothing behind to undo: no status entry, no schedule, no crawl.</p>
+     */
+    private void admit(Source source, SourceDescriptor descriptor, Crawl crawl) {
         Objects.requireNonNull(source, "Source cannot be null");
         String sourceId = source.getSourceId();
 
@@ -152,6 +227,10 @@ public class InMemorySourceRegistry implements SourceRegistry {
                 "Source registry is full (limit " + maxSources + ")");
         }
 
+        if (descriptor != null) {
+            record(source, descriptor);
+        }
+
         // Create initial status entry if status registry is configured
         // This ensures /v1/ingest/status returns data even without orchestrator
         IngestStatusEndpoint.IngestionStatus initialStatus = null;
@@ -164,13 +243,13 @@ public class InMemorySourceRegistry implements SourceRegistry {
 
         // Register with reindex scheduler for periodic reindexing
         if (reindexScheduler != null) {
-            try {
-                long numericSourceId = Long.parseLong(sourceId);
-                reindexScheduler.registerSource(numericSourceId, reindexIntervalMs);
-                LOGGER.debug("Registered source {} with reindex scheduler (interval={}ms)", sourceId, reindexIntervalMs);
-            } catch (NumberFormatException e) {
-                LOGGER.warn("Source ID '{}' is not numeric, cannot register with reindex scheduler", sourceId);
-            }
+            reindexScheduler.registerSource(sourceId, reindexIntervalMs);
+            LOGGER.debug("Registered source {} with reindex scheduler (interval={}ms)",
+                sourceId, reindexIntervalMs);
+        }
+
+        if (crawl == Crawl.NO) {
+            return;
         }
 
         // Trigger background ingestion
@@ -187,6 +266,47 @@ public class InMemorySourceRegistry implements SourceRegistry {
                 .name("source-probe-" + sourceId)
                 .start(new UnconfiguredSourceProbe(source, initialStatus));
             LOGGER.debug("No ingestion pipeline configured; probing source: {}", sourceId);
+        }
+    }
+
+    /**
+     * Writes a registration to the catalog, giving up the claimed id if it cannot be written.
+     *
+     * <p>Answering "registered" for a source that was never recorded is the failure this whole
+     * catalog exists to prevent, so it is refused rather than logged.</p>
+     */
+    private void record(Source source, SourceDescriptor descriptor) {
+        SourceCatalog catalog = this.sourceCatalog;
+        if (catalog == null) {
+            return;
+        }
+        try {
+            catalog.record(descriptor);
+        } catch (IOException e) {
+            sources.remove(descriptor.sourceId(), source);
+            throw new SourceCatalogException(
+                "Could not record source " + descriptor.sourceId(), e);
+        }
+    }
+
+    /**
+     * Takes a registration out of the catalog.
+     *
+     * <p>Runs before the live source is touched: a removal the catalog will not accept has to
+     * leave the node crawling what it was crawling, rather than stop and start again at the next
+     * restart.</p>
+     *
+     * @return true if the catalog held a record under that id
+     */
+    private boolean forget(String sourceId) {
+        SourceCatalog catalog = this.sourceCatalog;
+        if (catalog == null) {
+            return false;
+        }
+        try {
+            return catalog.forget(sourceId);
+        } catch (IOException e) {
+            throw new SourceCatalogException("Could not deregister source " + sourceId, e);
         }
     }
 
@@ -209,29 +329,34 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * request can name, reporting it on {@code /v1/ingest/status} forever, and logging a
      * source-not-found warning every scheduling interval for the life of the process.</p>
      *
-     * <p>The order matters: ingestion is stopped before the source is closed, because a run still
-     * inside {@code source.fetch} holds the very thing being closed.</p>
+     * <p>The order matters twice. The catalog record goes first, because a crawl stopped in
+     * memory and still recorded on disk restarts itself at the next boot. And ingestion is
+     * stopped before the source is closed, because a run still inside {@code source.fetch} holds
+     * the very thing being closed.</p>
      *
      * @param sourceId The source ID to remove
-     * @return true if the source was registered
+     * @return true if the source was registered, in this process or in the catalog
+     * @throws SourceCatalogException if the removal cannot be recorded
      */
     @Override
     public boolean remove(String sourceId) {
+        // The catalog first. A removal it will not accept leaves the source registered and the
+        // caller told so, which is recoverable; stopping the crawl and keeping the record is not -
+        // the source comes back at the next restart with nothing to say why.
+        boolean recorded = forget(sourceId);
+
         Source removed = sources.remove(sourceId);
         if (removed == null) {
-            return false;
+            // A record with no live source behind it is still a registration someone made: the
+            // node could not rebuild the crawler at startup, and this is what cancels it.
+            return recorded;
         }
 
         if (ingestionOrchestrator != null) {
             ingestionOrchestrator.stopIngestion(sourceId);
         }
         if (reindexScheduler != null) {
-            try {
-                reindexScheduler.unregisterSource(Long.parseLong(sourceId));
-            } catch (NumberFormatException e) {
-                // Never registered with the scheduler either; register() logs that at the time.
-                LOGGER.debug("Source ID '{}' is not numeric, nothing to unregister", sourceId);
-            }
+            reindexScheduler.unregisterSource(sourceId);
         }
         if (statusRegistry != null) {
             statusRegistry.remove(sourceId);

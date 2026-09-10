@@ -145,7 +145,7 @@ class ScheduledReindexIntegrationTest {
 
             // Get the reindex scheduler and register a source with numeric ID
             SegmentReindexScheduler scheduler = indexOrchestrator.getReindexScheduler();
-            long sourceId = 1L;
+            String sourceId = "1";
             scheduler.registerSource(sourceId);
 
             // Trigger reindex directly
@@ -171,7 +171,7 @@ class ScheduledReindexIntegrationTest {
 
             // Get the reindex scheduler and register a source with numeric ID
             SegmentReindexScheduler scheduler = indexOrchestrator.getReindexScheduler();
-            long sourceId = 999L;
+            String sourceId = "999";
             scheduler.registerSource(sourceId);
 
             // Trigger reindex - should fail because source not found
@@ -200,7 +200,7 @@ class ScheduledReindexIntegrationTest {
 
             // Get the reindex scheduler and register a source with numeric ID
             SegmentReindexScheduler scheduler = indexOrchestrator.getReindexScheduler();
-            long sourceId = 2L;
+            String sourceId = "2";
             scheduler.registerSource(sourceId);
 
             // Trigger reindex - should fail because of exception
@@ -230,7 +230,7 @@ class ScheduledReindexIntegrationTest {
 
             // Get the reindex scheduler and register a source with numeric ID
             SegmentReindexScheduler scheduler = indexOrchestrator.getReindexScheduler();
-            long sourceId = 3L;
+            String sourceId = "3";
             scheduler.registerSource(sourceId);
 
             // Trigger reindex - should return false because result has errors

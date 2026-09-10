@@ -274,6 +274,64 @@ class ExcaliburDBServerSecurityTest {
             assertThat(lastStatus).isEqualTo(429);
             assertThat(retryAfter).isNotNull();
         }
+
+        @Test
+        @DisplayName("a method the router does not serve is charged against the budget on /v1/query")
+        void refusesOverBudgetOnAnUnroutedQueryMethod() throws IOException {
+            restartWithReadBudget();
+
+            assertThat(statuses("GET", "/v1/query", 6))
+                .as("a method-router fall-through answers 405 without reaching either branch's "
+                    + "guard, so an anonymous caller could hold the connection open at line rate "
+                    + "unless the fall-through is guarded too")
+                .startsWith(405, 405)
+                .endsWith(429);
+        }
+
+        @Test
+        @DisplayName("a method the router does not serve is charged against the budget on /v1/ingest")
+        void refusesOverBudgetOnAnUnroutedIngestMethod() throws IOException {
+            restartWithReadBudget();
+
+            assertThat(statuses("GET", "/v1/ingest", 6))
+                .startsWith(405, 405)
+                .endsWith(429);
+        }
+
+        @Test
+        @DisplayName("the refusal carries Retry-After, as every other refusal does")
+        void theUnroutedMethodRefusalCarriesRetryAfter() throws IOException {
+            restartWithReadBudget();
+
+            HttpURLConnection conn = null;
+            for (int i = 0; i < 6; i++) {
+                conn = get("/v1/query", null);
+                conn.getResponseCode();
+            }
+
+            assertThat(conn.getResponseCode()).isEqualTo(429);
+            assertThat(conn.getHeaderField("Retry-After")).isNotNull();
+        }
+
+        private void restartWithReadBudget() throws IOException {
+            server.stop(0);
+            server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+            server.withSecurity(ApiSecurityConfig.builder()
+                .authToken(TOKEN)
+                .allowIngestRoot(allowedRoot)
+                .readBudget(1.0, 2.0)
+                .build());
+            server.start();
+            serverPort = server.getPort();
+        }
+
+        private int[] statuses(String method, String path, int count) throws IOException {
+            int[] codes = new int[count];
+            for (int i = 0; i < count; i++) {
+                codes[i] = open(method, path, null, null).getResponseCode();
+            }
+            return codes;
+        }
     }
 
     private HttpURLConnection get(String path, String authorization) throws IOException {

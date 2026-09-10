@@ -115,10 +115,15 @@ public class GraphErasureEndpoint implements HttpHandler {
                     + "\"namespace\": \"" + JsonText.escape(namespace.value()) + "\", "
                     + "\"detail\": \"" + JsonText.escape(outcome.reason()) + "\""
                     + "}");
-        } catch (IOException e) {
-            LOGGER.error("Erasure request failed: {}", e.toString());
-            ResponseBody.sendJson(exchange, 500,
-                "{\"error\": \"" + JsonText.escape("Erasure failed: " + e.getMessage()) + "\"}");
+        } catch (IOException | RuntimeException e) {
+            // RuntimeException is not defensive padding: a namespace that cannot be opened
+            // arrives here as an UncheckedIOException from the registry, and catching only
+            // IOException would let it escape the handler with no response sent at all.
+            //
+            // Logged with detail, answered without it: the message names the path the node
+            // failed on, which a client has no business seeing.
+            LOGGER.error("Erasure request failed", e);
+            ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
         }
     }
 
@@ -142,11 +147,32 @@ public class GraphErasureEndpoint implements HttpHandler {
             case "source" -> new ErasureScope.Source(
                 sourceTypeFrom(body),
                 requireLong(body, "source_id", "scope 'source' requires 'source_id'"));
-            case "extractor" -> new ErasureScope.ExtractorVersion(
-                (int) requireLong(body, "version", "scope 'extractor' requires 'version'"));
+            case "extractor" -> new ErasureScope.ExtractorVersion(extractorVersionFrom(body));
             default -> throw new IllegalArgumentException(
                 "unknown scope '" + scope + "'; expected entity, source or extractor");
         };
+    }
+
+    /**
+     * Reads the extractor version an extractor-scoped request names.
+     *
+     * <p>The store keeps the version in 32 bits, so a value outside that range has to be
+     * refused rather than narrowed. Narrowing is not a cosmetic loss here: {@code 2^32 + 1}
+     * becomes {@code 1}, and the request would be accepted as an obligation to erase
+     * everything version 1 ever extracted - irreversibly, and reported to the caller as
+     * {@code "accepted": true}.</p>
+     *
+     * @param body The request body
+     * @return The version
+     * @throws IllegalArgumentException if it is missing or outside the range the store holds
+     */
+    private static int extractorVersionFrom(String body) {
+        long version = requireLong(body, "version", "scope 'extractor' requires 'version'");
+        if (version < 0 || version > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                "'version' must be between 0 and " + Integer.MAX_VALUE + ", got " + version);
+        }
+        return (int) version;
     }
 
     /**

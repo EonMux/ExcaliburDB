@@ -232,7 +232,6 @@ class ParallelQueryDispatcherTest {
 
         assertThat(result).isNotNull();
         assertThat(result.segmentResults()).isNotNull();
-        assertThat(result.mergedResults()).isNotNull();
         assertThat(result.coverage()).isNotNull();
         assertThat(result.durationMs()).isNotNegative();
     }

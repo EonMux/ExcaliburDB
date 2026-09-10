@@ -80,7 +80,9 @@ public record CoreComponents(Arena arena,
 
         StorageEngine storageEngine = createStorageEngine(config, dataDir, arena, hnswConfigFactory);
         VolumeManager volumeManager = createVolumeManager(storageEngine);
-        IndexOrchestrator indexOrchestrator = createIndexOrchestrator(config, storageEngine, volumeManager);
+        IndexOrchestrator indexOrchestrator =
+            createIndexOrchestrator(config, dataDir, storageEngine, volumeManager);
+        shareTheVisibilityClock(storageEngine, indexOrchestrator);
         HierarchicalCuckooFilter hierarchicalFilter =
             createHierarchicalCuckooFilter(corpusCapacity);
         indexOrchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
@@ -149,11 +151,21 @@ public record CoreComponents(Arena arena,
      *
      * @return Initialized index orchestrator
      */
-    private static IndexOrchestrator createIndexOrchestrator(Config config, StorageEngine storageEngine,
+    private static IndexOrchestrator createIndexOrchestrator(Config config, Path dataDir,
+                                                             StorageEngine storageEngine,
                                                              VolumeManager volumeManager) {
         LOGGER.info("Initializing index orchestrator...");
 
         SegmentCatalog catalog = storageEngine.getCatalog();
+
+        // The catalog has been recovered by now, so every epoch this node's durable records
+        // carry is readable. Starting the counter below them hides the corpus and revives
+        // tombstones, both without an error anywhere.
+        long resumeEpoch = DurableEpochFloor.resumeEpoch(dataDir, catalog);
+        if (resumeEpoch > 0) {
+            LOGGER.info("Visibility epoch resumes at {}, above every epoch the durable stores "
+                + "already carry", resumeEpoch);
+        }
 
         IndexOrchestrator orchestrator = new IndexOrchestrator(
             catalog,
@@ -165,7 +177,8 @@ public record CoreComponents(Arena arena,
             config.shard().getHnswQueueLimit(),
             IndexOrchestrator.DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,
             IndexOrchestrator.DEFAULT_REINDEX_CHECK_INTERVAL_MS,
-            config.visibility().getEpochTickMs()
+            config.visibility().getEpochTickMs(),
+            resumeEpoch
         );
 
         // The configured delay before compaction's first check, matching what
@@ -259,30 +272,33 @@ public record CoreComponents(Arena arena,
     /**
      * Wires the compaction callback from the lifecycle manager to the compaction worker.
      *
-     * <p>This sets up the connection between the SegmentLifecycleManager (which detects
-     * when segments need compaction) and the CompactionWorker (which performs the
-     * actual compaction).</p>
+     * <p>The lifecycle manager decides which segments hold enough dead space to be worth
+     * rewriting; the compaction worker does the rewriting. Nothing is wired when the
+     * orchestrator has no compaction worker, so the lifecycle manager keeps whatever
+     * disposition it already had for those segments rather than being told they were
+     * handled.</p>
      */
     private static void wireCompactionCallback(StorageEngine storageEngine,
                                                IndexOrchestrator indexOrchestrator) {
+        var compactionWorker = indexOrchestrator.getCompactionWorker();
+        if (compactionWorker == null) {
+            LOGGER.warn("No compaction worker available; segments needing compaction will not be "
+                + "rewritten in the background");
+            return;
+        }
+
         LOGGER.info("Wiring compaction callback...");
 
-        // Get the lifecycle manager from the storage engine
         var lifecycleManager = storageEngine.getLifecycleManager();
 
-        // Set up the compaction callback
-        // When the lifecycle manager detects a segment needs compaction,
-        // it will call the compaction worker to perform the actual compaction
         lifecycleManager.setCompactionCallback(segmentId -> {
-            // Get the segment from the storage engine
             var segment = storageEngine.getSegment(segmentId);
             if (segment == null) {
                 LOGGER.warn("Compaction callback received for unknown segment: {}", segmentId);
                 return false;
             }
 
-            // Request compaction from the compaction worker
-            indexOrchestrator.getCompactionWorker().requestCompaction(segment);
+            compactionWorker.requestCompaction(segment);
             LOGGER.debug("Compaction requested for segment {} via lifecycle callback", segmentId);
             return true;
         });
@@ -319,6 +335,21 @@ public record CoreComponents(Arena arena,
         LOGGER.info("HNSW initializer created: dimension={}, maxNodes={}",
             initializer.getDimension(), initializer.getMaxNodes());
         return initializer;
+    }
+
+    /**
+     * Puts the storage engine and the index orchestrator on one visibility clock.
+     *
+     * <p>The engine starts on a local counter of its own, because it is built before anything
+     * that could coordinate one. Left there, a node runs two clocks: the engine advances its own
+     * on every write-log flush and stamps it into the catalog's tombstone epochs, while queries,
+     * ingestion and the lexical store read the orchestrator's, which advances on a timer. The
+     * two numbers are then compared to each other as though they meant the same thing, and
+     * whether a tombstoned segment is visible depends on which counter happened to be ahead.</p>
+     */
+    private static void shareTheVisibilityClock(StorageEngine storageEngine,
+                                                IndexOrchestrator indexOrchestrator) {
+        storageEngine.setVisibilityTracker(indexOrchestrator.getVisibilityTracker());
     }
 
     /**

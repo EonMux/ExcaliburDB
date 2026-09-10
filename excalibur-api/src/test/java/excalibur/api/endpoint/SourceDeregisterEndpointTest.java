@@ -126,6 +126,40 @@ class SourceDeregisterEndpointTest {
     }
 
     @Test
+    @DisplayName("a source id longer than one could ever be registered under is refused")
+    void oversizedSourceIdIsRefused() throws IOException {
+        String sourceId = "x".repeat(Source.MAX_ID_LENGTH + 1);
+
+        Response response = delete("{\"source_id\": \"" + sourceId + "\"}");
+
+        assertThat(response.status())
+            .as("registration bounds the id, so nothing this long is being crawled; 400 names the "
+                + "bound where a 404 would only say it was not found")
+            .isEqualTo(400);
+        assertThat(response.body())
+            .contains(String.valueOf(Source.MAX_ID_LENGTH))
+            .doesNotContain(sourceId);
+    }
+
+    @Test
+    @DisplayName("a deregistration that could not be recorded is not reported as done")
+    void anUnrecordableDeregistrationIsRefused() throws IOException {
+        // The source is still registered and still on the crawl schedule. A 200 here would tell
+        // the caller a crawl had stopped that starts itself again at the next boot.
+        SourceRegistry refusing = mock(SourceRegistry.class);
+        when(refusing.remove("project-docs"))
+            .thenThrow(new SourceCatalogException("catalog is unwritable", new IOException()));
+        endpoint = new SourceDeregisterEndpoint(refusing);
+
+        Response response = delete("{\"source_id\": \"project-docs\"}");
+
+        assertThat(response.status()).isEqualTo(503);
+        assertThat(response.body())
+            .as("the reply names no path on this node")
+            .doesNotContain("catalog is unwritable");
+    }
+
+    @Test
     @DisplayName("anything but DELETE is refused")
     void onlyDeleteDeregisters() throws IOException {
         register("project-docs");

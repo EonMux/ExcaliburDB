@@ -383,6 +383,23 @@ public class WriteLog implements AutoCloseable {
     }
 
     /**
+     * Whether the slot at this offset has never been written to.
+     *
+     * <p>The log is mapped at its maximum size and filled sparsely, so everything past the last
+     * entry reads as zeroes. Zero is not an opcode, which makes an unwritten slot the end of the
+     * log rather than a damaged entry - and the distinction has to be drawn before the checksum
+     * is consulted, because a zeroed slot fails that check for the same reason real corruption
+     * does. Reporting it as corruption made a clean start of a node with routed logs warn once
+     * per log, which is what a genuine emergency looks like.</p>
+     *
+     * @param offset Where the entry would begin
+     * @return true when nothing has been written there
+     */
+    private boolean isUnwritten(long offset) {
+        return mappedSegmentWrapper.getByte(offset + LogEntry.OPCODE_OFFSET) == 0;
+    }
+
+    /**
      * Scans existing entries to determine the next LSN and write offset.
      *
      * <p>This method reads through the log file from the beginning, validating
@@ -396,6 +413,10 @@ public class WriteLog implements AutoCloseable {
         while (offset < fileSize) {
             // Check if we have enough bytes for a header
             if (offset + LogEntry.HEADER_SIZE > fileSize) {
+                break;
+            }
+
+            if (isUnwritten(offset)) {
                 break;
             }
 

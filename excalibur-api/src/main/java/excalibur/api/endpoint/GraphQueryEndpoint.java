@@ -51,6 +51,20 @@ public class GraphQueryEndpoint implements HttpHandler {
     /** Longest question accepted, in characters, to bound the work one request can start. */
     private static final int MAX_QUESTION_LENGTH = 4096;
 
+    /**
+     * Most conversation entities accepted in one request.
+     *
+     * <p>Every mention is a candidate each pronoun in the question is compared against, and a name
+     * that can appear in the disambiguation question this endpoint answers with - so an unbounded
+     * array is both unbounded work and an unbounded response. The context window is three turns of
+     * a conversation; a hundred and twenty-eight entities inside it is already far more than a
+     * person mentions.</p>
+     */
+    private static final int MAX_CONTEXT_ENTITIES = 128;
+
+    /** Longest single conversation entity accepted, in characters. Longer than this is not a name. */
+    private static final int MAX_CONTEXT_ENTITY_LENGTH = 256;
+
     private final java.util.function.Supplier<java.util.Optional<GraphRagPipeline>> pipelineSource;
 
     /** The namespaces to answer from, when this node is multi-tenant; null otherwise. */
@@ -117,8 +131,16 @@ public class GraphQueryEndpoint implements HttpHandler {
             return;
         }
 
+        String[] mentions = JsonText.stringArray(body, "context_entities");
+        String violation = contextViolation(mentions);
+        if (violation != null) {
+            send(exchange, 400, "{\"error\":" + quoted(violation) + "}");
+            return;
+        }
+        ConversationContext context = contextFrom(mentions);
+
         if (tenants != null) {
-            answerFromTenant(exchange, question, body);
+            answerFromTenant(exchange, question, context);
             return;
         }
 
@@ -135,7 +157,7 @@ public class GraphQueryEndpoint implements HttpHandler {
 
         try {
             QueryTrace trace = new QueryTrace();
-            GraphRagResult result = pipeline.get().answer(question, contextFrom(body), trace);
+            GraphRagResult result = pipeline.get().answer(question, context, trace);
             send(exchange, 200, render(result, trace));
         } catch (IllegalArgumentException e) {
             send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
@@ -154,13 +176,20 @@ public class GraphQueryEndpoint implements HttpHandler {
      * mapping budget could unmap the store this query is walking - and a query reading unmapped
      * memory is the failure the budget exists to avoid, not one it is allowed to cause.</p>
      *
+     * <p>A namespace nobody has created is not created here. Opening one writes its staging
+     * directory, takes one of the node's open-graph slots and a share of the mapping budget, and
+     * evicts the least recently used real tenant to get them; the name arrives in a header, so a
+     * question would otherwise be enough to spend all three, once per name asked. A build is what
+     * brings a namespace into being, and until one has run there is no graph to serve - which is
+     * what the answer says.</p>
+     *
      * @param exchange The exchange
      * @param question The question asked
-     * @param body     The request body, for the conversation context
+     * @param context  The conversation the question is asked in
      * @throws IOException if the response cannot be written
      */
-    private void answerFromTenant(HttpExchange exchange, String question, String body)
-            throws IOException {
+    private void answerFromTenant(HttpExchange exchange, String question,
+                                  ConversationContext context) throws IOException {
         io.excalibur.tenancy.NamespaceId namespace;
         try {
             namespace = excalibur.api.bootstrap.GraphTenants.namespaceOf(
@@ -171,18 +200,34 @@ public class GraphQueryEndpoint implements HttpHandler {
             return;
         }
 
+        java.util.Optional<
+            io.excalibur.tenancy.NamespaceRegistry.Lease<excalibur.api.bootstrap.GraphTenant>>
+            borrowed;
+        try {
+            borrowed = tenants.borrowIfPresent(namespace);
+        } catch (RuntimeException e) {
+            LOGGER.error("graph query failed for namespace {}", namespace, e);
+            send(exchange, 500, "{\"error\":\"Internal Server Error\"}");
+            return;
+        }
+        if (borrowed.isEmpty()) {
+            // Deliberately the same answer an existing namespace with no built graph gets. Every
+            // tenant on this node presents the same bearer token, so a reply that separated the
+            // two would tell one tenant which namespaces the others have.
+            sendNoGraph(exchange);
+            return;
+        }
+
         try (io.excalibur.tenancy.NamespaceRegistry.Lease<excalibur.api.bootstrap.GraphTenant> lease
-                 = tenants.borrow(namespace)) {
+                 = borrowed.get()) {
             java.util.Optional<GraphRagPipeline> pipeline = lease.resource().holder().pipeline();
             if (pipeline.isEmpty()) {
-                send(exchange, 503,
-                    "{\"error\":\"No graph is being served for this namespace; POST "
-                        + "/v1/graph/build to build one from the facts ingestion has staged\"}");
+                sendNoGraph(exchange);
                 return;
             }
 
             QueryTrace trace = new QueryTrace();
-            GraphRagResult result = pipeline.get().answer(question, contextFrom(body), trace);
+            GraphRagResult result = pipeline.get().answer(question, context, trace);
             send(exchange, 200, render(result, trace));
         } catch (IllegalArgumentException e) {
             send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
@@ -193,14 +238,25 @@ public class GraphQueryEndpoint implements HttpHandler {
     }
 
     /**
+     * Says that this namespace has no graph to answer from, whatever the reason.
+     *
+     * @param exchange The exchange
+     * @throws IOException if the response cannot be written
+     */
+    private void sendNoGraph(HttpExchange exchange) throws IOException {
+        send(exchange, 503,
+            "{\"error\":\"No graph is being served for this namespace; POST "
+                + "/v1/graph/build to build one from the facts ingestion has staged\"}");
+    }
+
+    /**
      * Rebuilds the conversation from what the client sent.
      *
      * <p>The client owns the history; the server holds no session. That keeps the endpoint
      * stateless and horizontally scalable, and it means a client can replay or edit the context it
      * is being answered against — which is the only way to correct a mis-bound pronoun.
      */
-    private ConversationContext contextFrom(String body) {
-        String[] mentions = JsonText.stringArray(body, "context_entities");
+    private ConversationContext contextFrom(String[] mentions) {
         ConversationContext context = new ConversationContext();
         if (mentions != null) {
             for (String mention : mentions) {
@@ -213,6 +269,30 @@ public class GraphQueryEndpoint implements HttpHandler {
             context.nextTurn();
         }
         return context;
+    }
+
+    /**
+     * Says why a conversation context is not acceptable, or null when it is.
+     *
+     * <p>Refused rather than truncated: dropping half a context silently changes which entity a
+     * pronoun binds to, and the caller would read the answer as though it had been given the whole
+     * conversation.</p>
+     */
+    private static String contextViolation(String[] mentions) {
+        if (mentions == null) {
+            return null;
+        }
+        if (mentions.length > MAX_CONTEXT_ENTITIES) {
+            return "'context_entities' holds " + mentions.length + " entries; at most "
+                + MAX_CONTEXT_ENTITIES + " are accepted";
+        }
+        for (String mention : mentions) {
+            if (mention != null && mention.length() > MAX_CONTEXT_ENTITY_LENGTH) {
+                return "'context_entities' holds an entry of " + mention.length()
+                    + " characters; at most " + MAX_CONTEXT_ENTITY_LENGTH + " are accepted";
+            }
+        }
+        return null;
     }
 
     /**

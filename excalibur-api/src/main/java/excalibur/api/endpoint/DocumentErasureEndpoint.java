@@ -173,16 +173,25 @@ public class DocumentErasureEndpoint implements HttpHandler {
                     + "\"source_deregistered\": " + deregistered + ", "
                     + "\"chunks_erased\": " + outcome.chunksTombstoned() + ", "
                     + "\"chunks_unindexed\": " + outcome.chunksUnindexed() + ", "
+                    + "\"vectors_hidden\": " + outcome.vectorsHidden() + ", "
                     + "\"compacted\": " + outcome.compacted() + ", "
                     + "\"chunks_reclaimed\": " + outcome.chunksReclaimed() + ", "
                     + "\"outstanding\": " + outcome.outstanding() + ", "
                     + "\"detail\": \"" + JsonText.escape(outcome.detail()) + "\""
                     + "}");
+        } catch (SourceCatalogException e) {
+            // Nothing has been erased: the source comes off the crawl before its documents go,
+            // and that is the step that failed. A 500 would be true and would not say that the
+            // request can simply be repeated once the catalog is writable again.
+            LOGGER.error("Erasure of source {} could not deregister it: {}", sourceId, e.getMessage(), e);
+            ResponseBody.sendJson(exchange, SourceCatalogException.STATUS_CODE,
+                "{\"error\": \"" + SourceCatalogException.CLIENT_MESSAGE + "\"}");
         } catch (RuntimeException e) {
-            LOGGER.error("Erasure of {} document(s) from source {} failed: {}",
-                documentIds.size(), sourceId, e.toString());
-            ResponseBody.sendJson(exchange, 500,
-                "{\"error\": \"" + JsonText.escape("Erasure failed: " + e.getMessage()) + "\"}");
+            // Logged with detail, answered without it: the message names the path the node
+            // failed on, which a client has no business seeing.
+            LOGGER.error("Erasure of {} document(s) from source {} failed",
+                documentIds.size(), sourceId, e);
+            ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
         }
     }
 
@@ -221,6 +230,10 @@ public class DocumentErasureEndpoint implements HttpHandler {
         String sourceId = JsonText.string(body, "source_id");
         if (sourceId == null || sourceId.isBlank()) {
             throw new IllegalArgumentException("'source_id' is required");
+        }
+        String violation = SourceIds.violation(sourceId, "source_id");
+        if (violation != null) {
+            throw new IllegalArgumentException(violation);
         }
         return sourceId;
     }

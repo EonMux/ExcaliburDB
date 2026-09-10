@@ -2,6 +2,7 @@ package io.excalibur.tenancy;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -265,6 +266,48 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
     }
 
     /**
+     * Borrows {@code id} only if it already exists, and never brings it into being.
+     *
+     * <p>Loading a namespace is what creates it: the loader is handed a directory and writes what
+     * it does not find there. That is right for the operation that populates a namespace and wrong
+     * for one that only reads it, because the cost of a read that loads is not paid by the read.
+     * It leaves a directory on disk, takes a slot in this registry and a share of the mapping
+     * budget, and evicts whichever real namespace was least recently used to get them - once per
+     * name, and on a request path the name usually arrives with the request.</p>
+     *
+     * <p>Already open counts as existing without asking the filesystem, so a namespace whose
+     * resource lives only in memory is still readable. Otherwise the question is whether its
+     * directory is there, which is the same question {@link #load} would answer by creating one.</p>
+     *
+     * @param id the namespace to borrow
+     * @return a lease over the namespace's resource, or empty if the namespace does not exist
+     * @throws IllegalArgumentException if {@code id} is null
+     * @throws IllegalStateException    if the registry is closed
+     * @throws UncheckedIOException     if the namespace exists and cannot be opened
+     */
+    public Optional<Lease<T>> borrowIfPresent(NamespaceId id) {
+        if (id == null) {
+            throw new IllegalArgumentException("namespace id must not be null");
+        }
+        lock.lock();
+        try {
+            checkOpen();
+            Entry<T> entry = open.get(id);
+            if (entry == null) {
+                if (!Files.isDirectory(id.directoryUnder(root))) {
+                    return Optional.empty();
+                }
+                evictUntilRoomFor(id);
+                entry = load(id);
+            }
+            entry.borrows++;
+            return Optional.of(new BorrowedLease<>(this, entry));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Gives up one borrow, closing the resource if this was the last lease on an evicted entry.
      *
      * <p>Called only by {@link BorrowedLease}, and only once per lease.
@@ -329,6 +372,16 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
         long estimate = estimatedCostOfNextLoad();
         while (open.size() >= maxOpenNamespaces || budget.wouldExceedHighWater(estimate)) {
             NamespaceId victim = chooseVictim(incoming);
+            if (victim == null && open.isEmpty()) {
+                // Nothing is open, so nothing can be evicted: the budget has no room for even
+                // one namespace. Naming that is the useful thing to say - the other branch would
+                // report every one of zero namespaces as pinned, which reads as a leaked lease
+                // and sends an operator looking for one.
+                LOGGER.warn("mapping budget has no room for a single namespace, so {} is opened "
+                    + "outside it. Raise vm.max_map_count, or the configured budget. {}",
+                    incoming, budget);
+                return;
+            }
             if (victim == null) {
                 // Everything left is pinned or borrowed. Opening anyway is the lesser evil:
                 // refusing the request trades a definite failure now for a possible one later, and

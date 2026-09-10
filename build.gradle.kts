@@ -8,6 +8,9 @@ plugins {
 group = "io.excalibur"
 version = "1.0.0-SNAPSHOT"
 
+/** Stated once; every published POM's url and scm entries read from here. */
+val PROJECT_URL = "https://github.com/aeslampanah/excaliburdb"
+
 // Java 21 configuration
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -41,6 +44,81 @@ subprojects {
 
     repositories {
         mavenCentral()
+    }
+
+    // Publishing, declared once for every module an embedder can depend on.
+    //
+    // Presence in this map is what makes a module publishable, and the description is the one
+    // the POM carries. Five modules used to apply `maven-publish` and declare no publication, so
+    // they owned a publishToMavenLocal task that installed nothing while looking installable in a
+    // task listing; excalibur-store, excalibur-query and excalibur-vector -- the three an
+    // embedded query cannot do without -- did not apply the plugin at all, so the set that did
+    // install could not be assembled into a working dependency.
+    //
+    // Absent by intent: excalibur-bench is a JMH harness whose entry points are benchmark runs,
+    // and excalibur-integration has no main sources to publish.
+    val publishedModules = mapOf(
+        "excalibur-config" to "Configuration loading and validation",
+        "excalibur-metrics" to "Metrics registry and instrumentation",
+        "excalibur-core" to "Core primitives: memory-mapped I/O, serialization and utilities",
+        "excalibur-test" to "Shared test fixtures and harnesses",
+        "excalibur-store" to "Storage engine: segments, write-ahead log and catalog",
+        "excalibur-filter" to "Probabilistic membership structures",
+        "excalibur-vector" to "Vector index: HNSW graph and product quantization",
+        "excalibur-graph" to "Memory-mapped CSR adjacency alongside the vector index",
+        "excalibur-retrieval" to "Hybrid ranking: lexical, dense, fusion and full-precision rerank",
+        "excalibur-tenancy" to "Per-namespace index isolation, lifecycle and eviction",
+        "excalibur-planner" to "Deterministic query classification and coreference",
+        "excalibur-shard" to "Index orchestration and background maintenance",
+        "excalibur-query" to "Query pipeline: planning, execution and result aggregation",
+        "excalibur-llm" to "OpenAI-compatible client for embeddings and relevancy scoring",
+        "excalibur-ingest" to "Ingestion pipeline: chunking, indexing and erasure",
+        "excalibur-api" to "HTTP API surface and server bootstrap"
+    )
+
+    publishedModules[project.name]?.let { moduleDescription ->
+        apply(plugin = "maven-publish")
+
+        extensions.configure<PublishingExtension> {
+            publications {
+                create<MavenPublication>("mavenJava") {
+                    from(components["java"])
+
+                    pom {
+                        name.set(project.name)
+                        description.set(moduleDescription)
+                        url.set(PROJECT_URL)
+
+                        licenses {
+                            license {
+                                // Matches the LICENSE file at the repository root. The two are
+                                // the project's licence stated twice; they must not drift.
+                                name.set("Apache License, Version 2.0")
+                                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                                distribution.set("repo")
+                            }
+                        }
+
+                        developers {
+                            developer {
+                                // No email: the field is optional, and the address here was a
+                                // reserved example domain, so it was never reachable by anyone
+                                // who read it off a published artifact.
+                                id.set("aeslampanah")
+                                name.set("Amir Eslampanah")
+                            }
+                        }
+
+                        scm {
+                            url.set(PROJECT_URL)
+                            connection.set("scm:git:$PROJECT_URL.git")
+                            developerConnection.set(
+                                "scm:git:git@github.com:aeslampanah/excaliburdb.git")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     dependencies {

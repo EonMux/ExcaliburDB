@@ -2,6 +2,7 @@ package excalibur.integration;
 
 import excalibur.api.bootstrap.StorageChunkWriter;
 import excalibur.ingest.erasure.DocumentErasureService;
+import excalibur.ingest.erasure.SegmentVectorEraser;
 import excalibur.ingest.lexical.NativeChunkIndex;
 import excalibur.ingest.lexical.StoredChunkText;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
@@ -12,10 +13,16 @@ import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.shard.IndexOrchestrator;
+import io.excalibur.core.text.ChunkIdentifiers;
 import io.excalibur.retrieval.expand.QueryExpander;
 import io.excalibur.retrieval.lexical.native_.CompactionPlanner;
 import io.excalibur.retrieval.rank.RetrievalQuery;
+import io.excalibur.store.Segment;
 import io.excalibur.store.StorageEngine;
+import io.excalibur.vector.distance.L2Distance;
+import io.excalibur.vector.hnsw.HnswConfig;
+import io.excalibur.vector.hnsw.HnswGraph;
+import io.excalibur.vector.hnsw.NodeDocumentMapping;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -51,9 +58,10 @@ import static org.mockito.Mockito.when;
  * never wrote under, a storage adapter deleting nothing and reporting success.
  *
  * <p>So this test uses the real ones: chunks written by the ingestion pipeline into a real storage
- * engine, indexed by the real native index, and erased through the same adapter and text supplier
- * the running node wires up. The assertions are the promise itself - the document stops being
- * findable, its chunks leave storage, and its words leave the index's files.
+ * engine, indexed by the real native index, and erased through the same adapter, text supplier and
+ * vector eraser the running node wires up. The assertions are the promise itself - the document
+ * stops being findable, its chunks leave storage, its words leave the index's files, and no vector
+ * search still names it.
  */
 @DisplayName("Document erasure end to end")
 class DocumentErasureIntegrationTest {
@@ -61,12 +69,18 @@ class DocumentErasureIntegrationTest {
     private static final String SOURCE = "docs";
     private static final String SECRET = "zzquarantinedmarker";
 
+    /** The documents given a vector, in the order their vectors are assigned. */
+    private static final List<String> INDEXED = List.of("secret.md", "keep.md");
+
+    private static final int DIMENSION = 8;
+
     @TempDir
     Path tempDir;
 
     private StorageEngine storage;
     private NativeChunkIndex lexical;
     private DocumentRegistry registry;
+    private DocumentVisibilityTracker visibility;
     private IngestionOrchestrator orchestrator;
     private final AtomicLong epoch = new AtomicLong(1);
 
@@ -81,6 +95,7 @@ class DocumentErasureIntegrationTest {
         storage.start();
         lexical = NativeChunkIndex.open(tempDir.resolve("chunk-index"), epoch::get, 0, never());
         registry = new DocumentRegistry(tempDir.resolve("document-registry"));
+        visibility = new DocumentVisibilityTracker(registry);
 
         IndexOrchestrator index = mock(IndexOrchestrator.class);
         when(index.isBackpressured()).thenReturn(false);
@@ -99,7 +114,7 @@ class DocumentErasureIntegrationTest {
                 public void setError(String error) {
                 }
             },
-            null, new DocumentVisibilityTracker(registry), null, 5000);
+            visibility, null, 5000);
         orchestrator.setLexicalIndex(lexical);
     }
 
@@ -123,6 +138,13 @@ class DocumentErasureIntegrationTest {
     private DocumentErasureService erasure() {
         return new DocumentErasureService(registry,
             StorageChunkWriter.tombstoneAdapter(storage), lexical, StoredChunkText.of(storage));
+    }
+
+    /** The same erasure with the vector index attached, exactly as the node assembles it. */
+    private DocumentErasureService erasureWithVectors() {
+        return new DocumentErasureService(registry,
+            StorageChunkWriter.tombstoneAdapter(storage), lexical, StoredChunkText.of(storage),
+            visibility, SegmentVectorEraser.of(storage));
     }
 
     /** Runs one source to completion, then lets the node's epoch clock move on. */
@@ -170,6 +192,50 @@ class DocumentErasureIntegrationTest {
         documents.put("secret.md", "the incident report contains " + SECRET + " throughout");
         documents.put("keep.md", "routine capacity planning for the next quarter");
         return documents;
+    }
+
+    /**
+     * Gives every {@link #INDEXED} document a vector, the way the integration worker does.
+     *
+     * <p>Each node is attributed by running the chunk key the ingestion really wrote through
+     * {@link ChunkIdentifiers#documentKeyOfChunk(String)}, which is what {@code
+     * HnswIntegrationWorker} registers as it inserts. The erasure asks for the document under
+     * {@link ChunkIdentifiers#documentKey(String, String)}. Those two derivations agreeing is the
+     * whole of the attribution, and only running both of them can show that they do.</p>
+     *
+     * @return The graph the nodes were inserted into, attached to a segment of the live engine
+     */
+    private HnswGraph indexVectors() throws IOException {
+        Segment segment = storage.getSegments().values().stream().findFirst()
+            .orElseThrow(() -> new AssertionError("the engine holds no segment to attach a graph to"));
+        HnswGraph graph = new HnswGraph(tempDir.resolve("segment.hnsw"),
+            HnswConfig.create(DIMENSION), L2Distance.getInstance(), 100);
+        segment.attachHnswGraph(graph);
+
+        for (String documentId : INDEXED) {
+            String chunkId = ChunkIdentifiers.chunkId(SOURCE, documentId, 0);
+            assertThat(storageHolds(chunkId))
+                .as("a vector has to belong to a chunk the ingestion really wrote")
+                .isTrue();
+            graph.registerDocumentId(graph.insert(vectorOf(documentId)),
+                ChunkIdentifiers.documentKeyOfChunk(chunkId));
+        }
+        return graph;
+    }
+
+    /** The documents a vector search names, nearest first. */
+    private static List<String> documentsRanked(HnswGraph graph, float[] query) {
+        NodeDocumentMapping mapping = graph.getNodeDocumentMapping();
+        return graph.search(query, 10).stream()
+            .map(result -> mapping.getDocumentId(result.nodeId()))
+            .toList();
+    }
+
+    /** A distinct unit vector per indexed document, so a query can aim at one of them. */
+    private static float[] vectorOf(String documentId) {
+        float[] vector = new float[DIMENSION];
+        vector[INDEXED.indexOf(documentId)] = 1.0f;
+        return vector;
     }
 
     @Test
@@ -245,6 +311,42 @@ class DocumentErasureIntegrationTest {
             .as("an erasure that only happened in memory is one a restart undoes")
             .isFalse();
         assertThat(afterRestart.contains(SOURCE, "keep.md")).isTrue();
+    }
+
+    @Test
+    @DisplayName("a vector search stops naming an erased document")
+    void erasureReachesTheVectorIndex() throws Exception {
+        ingest(corpus());
+        HnswGraph graph = indexVectors();
+        String erased = ChunkIdentifiers.documentKey(SOURCE, "secret.md");
+
+        assertThat(documentsRanked(graph, vectorOf("secret.md")))
+            .as("precondition: the vector index answers with it")
+            .contains(erased);
+
+        DocumentErasureService.Outcome outcome =
+            erasureWithVectors().erase(SOURCE, List.of("secret.md"), true);
+
+        assertThat(outcome.vectorsHidden()).isEqualTo(1);
+        assertThat(documentsRanked(graph, vectorOf("secret.md")))
+            .as("a ranked node names its document and gives it a distance whether or not any text "
+                + "is left to show for it, and that naming is what the request asked to remove")
+            .doesNotContain(erased)
+            .contains(ChunkIdentifiers.documentKey(SOURCE, "keep.md"));
+    }
+
+    @Test
+    @DisplayName("erasing the whole source leaves the vector index with nothing to rank")
+    void sourceScopeReachesTheVectorIndex() throws Exception {
+        ingest(corpus());
+        HnswGraph graph = indexVectors();
+
+        DocumentErasureService.Outcome outcome = erasureWithVectors().eraseSource(SOURCE, 100, true);
+
+        assertThat(outcome.vectorsHidden()).isEqualTo(INDEXED.size());
+        assertThat(documentsRanked(graph, vectorOf("secret.md")))
+            .as("every document of the source is gone; none of them may still be ranked")
+            .isEmpty();
     }
 
     /** A source serving a fixed map of documents. */

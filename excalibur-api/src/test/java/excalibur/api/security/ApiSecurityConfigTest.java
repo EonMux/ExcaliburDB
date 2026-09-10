@@ -178,6 +178,7 @@ class ApiSecurityConfigTest {
             props.put(ApiSecurityConfig.KEY_RATE_LIMIT_MAX_CLIENTS, "11");
             props.put(ApiSecurityConfig.KEY_MAX_TOP_K, "42");
             props.put(ApiSecurityConfig.KEY_MAX_QUERY_TIMEOUT_MS, "1234");
+            props.put(ApiSecurityConfig.KEY_MAX_QUERY_CHARS, "2048");
             props.put(ApiSecurityConfig.KEY_MAX_SOURCES, "5");
             props.put(ApiSecurityConfig.KEY_ALLOWED_ROOTS, root.toString());
             props.put(ApiSecurityConfig.KEY_ALLOWED_HOSTS, "Docs.Example.COM, cdn.example.com");
@@ -192,6 +193,7 @@ class ApiSecurityConfigTest {
             assertThat(config.rateLimitMaxClients()).isEqualTo(11);
             assertThat(config.maxTopK()).isEqualTo(42);
             assertThat(config.maxQueryTimeoutMs()).isEqualTo(1234L);
+            assertThat(config.maxQueryChars()).isEqualTo(2048);
             assertThat(config.maxRegisteredSources()).isEqualTo(5);
             assertThat(config.allowedIngestRoots()).containsExactly(root.toRealPath());
             assertThat(config.allowedIngestHosts()).containsExactlyInAnyOrder(
@@ -204,11 +206,16 @@ class ApiSecurityConfigTest {
             Map<String, String> props = new HashMap<>();
             props.put(ApiSecurityConfig.KEY_READ_RATE, "not-a-number");
             props.put(ApiSecurityConfig.KEY_MAX_TOP_K, "0");
+            props.put(ApiSecurityConfig.KEY_MAX_QUERY_CHARS, "-1");
 
             ApiSecurityConfig config = ApiSecurityConfig.fromProperties(props);
 
             assertThat(config.readRatePerSecond()).isEqualTo(ApiSecurityConfig.DEFAULT_READ_RATE);
             assertThat(config.maxTopK()).isEqualTo(ApiSecurityConfig.DEFAULT_MAX_TOP_K);
+            assertThat(config.maxQueryChars())
+                .as("a bound of zero would refuse every query, so it is not a bound this "
+                    + "accepts from a typo")
+                .isEqualTo(ApiSecurityConfig.DEFAULT_MAX_QUERY_CHARS);
         }
 
         @Test

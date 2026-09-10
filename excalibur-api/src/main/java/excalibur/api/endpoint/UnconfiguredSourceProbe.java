@@ -13,13 +13,15 @@ import java.util.stream.Stream;
  * Reports what a node without an ingestion pipeline can honestly say about a registered source.
  *
  * <h2>Why this exists</h2>
- * <p>A node starts in stub mode when it has no embedding endpoint to call - no API key, or a
- * pipeline that failed to wire - and {@code POST /v1/ingest} still accepts sources, because
- * registration is bookkeeping and does not need a model. What it must not do is describe that as an
- * ingestion. Nothing is chunked, embedded or indexed, and a status that counts the crawled files as
- * {@code entries_ingested} and settles on {@code idle} at {@code progress: 1.0} is indistinguishable
- * from a run that worked - which leaves the one configuration mistake that stops the product
- * working looking exactly like success.</p>
+ * <p>A node reaches this state when its ingestion pipeline failed to wire at startup, and
+ * {@code POST /v1/ingest} still accepts sources, because registration is bookkeeping that does not
+ * need a pipeline. What it must not do is describe that as an ingestion. Nothing is chunked, stored
+ * or indexed, and a status that counts the crawled files as {@code entries_ingested} and settles on
+ * {@code idle} at {@code progress: 1.0} is indistinguishable from a run that worked - which leaves
+ * a broken node looking exactly like a healthy one.</p>
+ *
+ * <p>A missing API key is not this state. That node has a pipeline: documents are chunked, stored
+ * and term-indexed, and only the vector signal is absent.</p>
  *
  * <h2>Why it still crawls</h2>
  * <p>The crawl is the part that is real. It resolves the root, applies the extension filters and
@@ -36,11 +38,11 @@ public final class UnconfiguredSourceProbe implements Runnable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(UnconfiguredSourceProbe.class);
 
-    /** What the status reports, and what an operator has to change to make it go away. */
+    /** What the status reports, and where an operator finds the reason for it. */
     static final String REASON =
-        "This node has no ingestion pipeline configured, so no document was chunked, embedded or "
-        + "indexed. Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) to an OpenAI-compatible "
-        + "endpoint and restart; the startup log records why the pipeline was not wired.";
+        "This node has no ingestion pipeline, so no document was chunked, stored or indexed. The "
+        + "pipeline failed to wire at startup: the startup log records why, under \"Failed to "
+        + "configure ingestion pipeline\". Fix that and restart.";
 
     private final Source source;
     private final IngestStatusEndpoint.IngestionStatus status;

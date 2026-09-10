@@ -1,5 +1,10 @@
 package excalibur.api.endpoint;
 
+import com.sun.net.httpserver.Headers;
+import com.sun.net.httpserver.HttpExchange;
+
+import excalibur.api.security.ApiSecurityConfig;
+import excalibur.api.security.IngestTargetValidator;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
 import excalibur.ingest.source.Source;
 import excalibur.shard.worker.SegmentReindexScheduler;
@@ -7,15 +12,27 @@ import io.excalibur.store.SegmentCatalog;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Tests for IngestEndpoint and related classes.
@@ -130,14 +147,14 @@ class IngestEndpointTest {
 
         // Verify source is registered with scheduler
         assertEquals(1, scheduler.getRegisteredSourceCount(), "Source should be registered with scheduler");
-        assertNotNull(scheduler.getNextReindexTime(12345L), "Source should have scheduled reindex time");
+        assertNotNull(scheduler.getNextReindexTime("12345"), "Source should have scheduled reindex time");
 
         // Cleanup
         scheduler.stop();
     }
 
     @Test
-    @DisplayName("InMemorySourceRegistry should handle non-numeric source IDs gracefully")
+    @DisplayName("InMemorySourceRegistry should schedule a source under the name it was given")
     void testNonNumericSourceIdWithScheduler(@TempDir Path tempDir) {
         // Create a mock catalog and scheduler
         SegmentCatalog catalog = new SegmentCatalog(tempDir.resolve("catalog.dat"));
@@ -149,13 +166,15 @@ class IngestEndpointTest {
         // Configure registry with scheduler
         registry.setReindexScheduler(scheduler, 60000L);
 
-        // Register a source with non-numeric ID - should not throw
+        // Register a source under the kind of name a caller actually picks
         excalibur.ingest.source.Source mockSource = createMockSource("my-docs-source");
         assertDoesNotThrow(() -> registry.register(mockSource));
 
-        // Source should be in the registry but NOT in the scheduler
+        // Source should be in the registry and in the schedule, addressable by that same name
         assertTrue(registry.isRegistered("my-docs-source"), "Source should be in registry");
-        assertEquals(0, scheduler.getRegisteredSourceCount(), "Non-numeric source should not be in scheduler");
+        assertEquals(1, scheduler.getRegisteredSourceCount(), "Source should be in scheduler");
+        assertNotNull(scheduler.getNextReindexTime("my-docs-source"),
+            "the schedule has to be addressable by the name /v1/ingest accepted");
 
         // Cleanup
         scheduler.stop();
@@ -303,6 +322,73 @@ class IngestEndpointTest {
         } catch (Exception e) {
             throw new RuntimeException("Failed to create test index orchestrator", e);
         }
+    }
+
+    /**
+     * A source id is not free text. Registration writes it into the source catalog and into every
+     * document's registry record, so its length is multiplied by the size of the corpus rather
+     * than by the number of requests, and it is the name the crawl thread runs under. Nothing
+     * that identifies a source needs more characters than a name.
+     */
+    @Nested
+    @DisplayName("Source id length")
+    class SourceIdLength {
+
+        @Test
+        @DisplayName("refuses a source id longer than the bound, and names the bound")
+        void refusesAnOversizedSourceId(@TempDir Path root) throws IOException {
+            Response response = register(root, "x".repeat(Source.MAX_ID_LENGTH + 1));
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body())
+                .as("refused at the boundary, not inside a crawler constructor: that failure is "
+                    + "answered with a deliberately opaque 'Invalid source configuration', which "
+                    + "leaves the caller with nothing to correct")
+                .contains("source_id")
+                .contains(String.valueOf(Source.MAX_ID_LENGTH));
+            assertThat(registry.getAllSourceIds()).isEmpty();
+        }
+
+        @Test
+        @DisplayName("accepts a source id exactly at the bound")
+        void acceptsASourceIdAtTheBound(@TempDir Path root) throws IOException {
+            String sourceId = "x".repeat(Source.MAX_ID_LENGTH);
+
+            Response response = register(root, sourceId);
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registry.isRegistered(sourceId)).isTrue();
+        }
+    }
+
+    /** One captured HTTP response. */
+    private record Response(int status, String body) {}
+
+    /**
+     * Posts a filesystem registration for {@code root}, which the endpoint under test allows.
+     */
+    private Response register(Path root, String sourceId) throws IOException {
+        IngestEndpoint endpoint = new IngestEndpoint(registry, null, null,
+            new IngestTargetValidator(ApiSecurityConfig.builder().allowIngestRoot(root).build()));
+        String requestBody = "{\"source_type\": \"filesystem\", \"config\": {"
+            + "\"source_id\": \"" + sourceId + "\", "
+            + "\"root_path\": \"" + root + "\"}}";
+
+        HttpExchange exchange = mock(HttpExchange.class);
+        ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+        when(exchange.getRequestMethod()).thenReturn("POST");
+        when(exchange.getRequestURI()).thenReturn(URI.create("/v1/ingest"));
+        when(exchange.getRequestHeaders()).thenReturn(new Headers());
+        when(exchange.getResponseHeaders()).thenReturn(new Headers());
+        when(exchange.getRequestBody()).thenReturn(
+            new ByteArrayInputStream(requestBody.getBytes(StandardCharsets.UTF_8)));
+        when(exchange.getResponseBody()).thenReturn(responseBody);
+
+        endpoint.handle(exchange);
+
+        ArgumentCaptor<Integer> status = ArgumentCaptor.forClass(Integer.class);
+        verify(exchange).sendResponseHeaders(status.capture(), anyLong());
+        return new Response(status.getValue(), responseBody.toString(StandardCharsets.UTF_8));
     }
 
     // Helper to create mock Source

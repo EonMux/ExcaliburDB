@@ -1,6 +1,8 @@
 package io.excalibur.tenancy;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicLong;
@@ -70,14 +72,12 @@ public final class MappingBudget {
     /** A budget at a chosen high-water fraction. */
     public static MappingBudget detect(double highWaterFraction) {
         checkFraction(highWaterFraction);
-        try {
-            if (Files.isReadable(MAX_MAP_COUNT)) {
-                long limit = Long.parseLong(Files.readString(MAX_MAP_COUNT).trim());
-                if (limit > 0) {
-                    LOGGER.info("vm.max_map_count is {}; evicting namespaces above {} mappings",
-                        limit, (long) (limit * highWaterFraction));
-                    return new MappingBudget(limit, highWaterFraction, true);
-                }
+        try (InputStream in = Files.newInputStream(MAX_MAP_COUNT)) {
+            long limit = readLimit(in);
+            if (limit > 0) {
+                LOGGER.info("vm.max_map_count is {}; evicting namespaces above {} mappings",
+                    limit, (long) (limit * highWaterFraction));
+                return new MappingBudget(limit, highWaterFraction, true);
             }
         } catch (IOException | RuntimeException e) {
             // NumberFormatException lands here too: a limit file with unexpected content is the
@@ -86,6 +86,25 @@ public final class MappingBudget {
         }
         LOGGER.info("vm.max_map_count unavailable; assuming {} mappings", DEFAULT_MAX_MAPPINGS);
         return new MappingBudget(DEFAULT_MAX_MAPPINGS, highWaterFraction, false);
+    }
+
+    /**
+     * Reads a limit file to its end.
+     *
+     * <p>To the end of the stream rather than to the end of the first read. {@code /proc} reports
+     * no size for its files, and a short read there returns a leading digit of the real number -
+     * which parses cleanly and is wrong by orders of magnitude. A limit of 1 read out of a file
+     * holding 16777216 puts the high-water mark at zero, so the first namespace to open is
+     * already over budget and every open afterwards reports an eviction it cannot perform.</p>
+     *
+     * @param in The open limit file
+     * @return The limit it holds
+     * @throws IOException           if the file cannot be read
+     * @throws NumberFormatException if it holds something other than a number
+     */
+    static long readLimit(InputStream in) throws IOException {
+        return Long.parseLong(
+            new String(in.readAllBytes(), StandardCharsets.US_ASCII).trim());
     }
 
     /** A budget with an explicit limit, for tests and for deployments that know better. */

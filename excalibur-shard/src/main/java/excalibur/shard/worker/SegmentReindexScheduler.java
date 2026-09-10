@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -28,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * ingestion pipeline:</p>
  * <ol>
  *   <li>Identify segments that need re-indexing based on age</li>
- *   <li>Trigger re-index via {@link ReindexListener#onReindexNeeded(long)}</li>
+ *   <li>Trigger re-index via {@link ReindexListener#onReindexNeeded(String)}</li>
  *   <li>Track re-index progress and completion</li>
  *   <li>Report statistics for monitoring</li>
  * </ol>
@@ -96,7 +97,7 @@ public class SegmentReindexScheduler {
 
     private final SegmentCatalog catalog;
     private final ReindexListener listener;
-    private final Map<Long, SourceSchedule> sourceSchedules;
+    private final Map<String, SourceSchedule> sourceSchedules;
     private volatile ScheduledExecutorService scheduler;
 
     private final AtomicBoolean running;
@@ -268,7 +269,8 @@ public class SegmentReindexScheduler {
      * @param sourceId          The source ID
      * @param reindexIntervalMs The re-index interval for this source
      */
-    public void registerSource(long sourceId, long reindexIntervalMs) {
+    public void registerSource(String sourceId, long reindexIntervalMs) {
+        requireSourceId(sourceId);
         validateReindexInterval(reindexIntervalMs);
         sourceSchedules.put(sourceId, new SourceSchedule(sourceId, reindexIntervalMs));
         LOGGER.debug("Registered source {} for re-index scheduling with interval {}ms",
@@ -284,7 +286,8 @@ public class SegmentReindexScheduler {
      * @param sourceId          The source ID
      * @param reindexIntervalMs The re-index interval for this source (no min/max enforced)
      */
-    void registerSourceUnchecked(long sourceId, long reindexIntervalMs) {
+    void registerSourceUnchecked(String sourceId, long reindexIntervalMs) {
+        requireSourceId(sourceId);
         if (reindexIntervalMs <= 0) {
             throw new IllegalArgumentException("Reindex interval must be positive, got: " + reindexIntervalMs);
         }
@@ -298,7 +301,7 @@ public class SegmentReindexScheduler {
      *
      * @param sourceId The source ID
      */
-    public void registerSource(long sourceId) {
+    public void registerSource(String sourceId) {
         registerSource(sourceId, defaultReindexIntervalMs);
     }
 
@@ -307,7 +310,7 @@ public class SegmentReindexScheduler {
      *
      * @param sourceId The source ID
      */
-    public void unregisterSource(long sourceId) {
+    public void unregisterSource(String sourceId) {
         sourceSchedules.remove(sourceId);
         LOGGER.debug("Unregistered source {} from re-index scheduling", sourceId);
     }
@@ -318,12 +321,26 @@ public class SegmentReindexScheduler {
      * @param sourceId          The source ID
      * @param reindexIntervalMs The new re-index interval
      */
-    public void updateReindexInterval(long sourceId, long reindexIntervalMs) {
+    public void updateReindexInterval(String sourceId, long reindexIntervalMs) {
         validateReindexInterval(reindexIntervalMs);
         SourceSchedule schedule = sourceSchedules.get(sourceId);
         if (schedule != null) {
             schedule.reindexIntervalMs = reindexIntervalMs;
             LOGGER.debug("Updated re-index interval for source {} to {}ms", sourceId, reindexIntervalMs);
+        }
+    }
+
+    /**
+     * Rejects an id no removal could later name.
+     *
+     * @param sourceId The source ID to check
+     * @throws NullPointerException     if the id is null
+     * @throws IllegalArgumentException if the id is blank
+     */
+    private static void requireSourceId(String sourceId) {
+        Objects.requireNonNull(sourceId, "sourceId must not be null");
+        if (sourceId.isBlank()) {
+            throw new IllegalArgumentException("sourceId must not be blank");
         }
     }
 
@@ -346,7 +363,7 @@ public class SegmentReindexScheduler {
      * @param sourceId The source ID to re-index
      * @return true if re-index was triggered successfully
      */
-    public boolean triggerReindexNow(long sourceId) {
+    public boolean triggerReindexNow(String sourceId) {
         SourceSchedule schedule = sourceSchedules.get(sourceId);
         if (schedule == null) {
             LOGGER.warn("Cannot trigger re-index: source {} not registered", sourceId);
@@ -374,7 +391,7 @@ public class SegmentReindexScheduler {
      *
      * @param sourceId The source ID
      */
-    public void markReindexComplete(long sourceId) {
+    public void markReindexComplete(String sourceId) {
         SourceSchedule schedule = sourceSchedules.get(sourceId);
         if (schedule != null) {
             schedule.lastReindexTime = Instant.now();
@@ -398,7 +415,7 @@ public class SegmentReindexScheduler {
      * @param sourceId The source ID
      * @param error    The error message
      */
-    public void markReindexFailed(long sourceId, String error) {
+    public void markReindexFailed(String sourceId, String error) {
         SourceSchedule schedule = sourceSchedules.get(sourceId);
         if (schedule != null) {
             schedule.lastReindexTime = Instant.now();
@@ -559,7 +576,7 @@ public class SegmentReindexScheduler {
      * @param sourceId The source ID
      * @return The next re-index time, or null if not scheduled
      */
-    public Instant getNextReindexTime(long sourceId) {
+    public Instant getNextReindexTime(String sourceId) {
         SourceSchedule schedule = sourceSchedules.get(sourceId);
         if (schedule == null) {
             return null;
@@ -657,7 +674,7 @@ public class SegmentReindexScheduler {
          * @param sourceId The source ID to re-index
          * @return true if re-index was initiated successfully
          */
-        boolean onReindexNeeded(long sourceId);
+        boolean onReindexNeeded(String sourceId);
     }
 
     // ==================== Internal Classes ====================
@@ -666,13 +683,13 @@ public class SegmentReindexScheduler {
      * Holder for source schedule information.
      */
     private static class SourceSchedule {
-        final long sourceId;
+        final String sourceId;
         volatile long reindexIntervalMs;
         volatile Instant lastReindexTime;
         volatile boolean reindexInProgress;
         volatile int consecutiveFailures;
 
-        SourceSchedule(long sourceId, long reindexIntervalMs) {
+        SourceSchedule(String sourceId, long reindexIntervalMs) {
             this.sourceId = sourceId;
             this.reindexIntervalMs = reindexIntervalMs;
             // Registration counts as the moment the source was last indexed: the caller

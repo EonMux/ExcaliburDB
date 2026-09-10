@@ -345,7 +345,9 @@ public final class ExcaliburApplication {
      * @throws IOException if directory cannot be created
      */
     private Path initializeDataDirectory() throws IOException {
-        // Check for data directory in config or environment
+        // The environment is the only source. Deployments already spell this as a variable, and a
+        // properties key beside it would give the same node two answers with no rule for which
+        // wins - which is how a restart quietly starts serving from an empty directory.
         String dataDirPath = System.getenv("EXCALIBUR_DATA_DIR");
         if (dataDirPath == null || dataDirPath.isEmpty()) {
             dataDirPath = DEFAULT_DATA_DIR;
@@ -387,8 +389,7 @@ public final class ExcaliburApplication {
         // Create LLM scorer with query-specific timeout from config
         // Uses excalibur.query.llm-timeout-ms for relevancy scoring calls
         QueryPipeline.LlmScorer llmScorer = null;
-        String llmApiKey = config.llm().getApiKey();
-        if (llmApiKey != null && !llmApiKey.isEmpty()) {
+        if (excalibur.api.bootstrap.RetrievalCapabilities.from(config.llm()).chatModel()) {
             try {
                 int queryLlmTimeoutMs = config.query().getLlmTimeoutMs();
                 llmScorer = excalibur.query.scorer.LlmScorerFactory.fromConfigWithQueryTimeout(
@@ -447,11 +448,14 @@ public final class ExcaliburApplication {
     private void configureReindexer() {
         LOGGER.info("Configuring document reindexer...");
 
-        // Check if LLM API key is configured - required for generating embeddings during reindex
-        String llmApiKey = config.llm().getApiKey();
-        if (llmApiKey == null || llmApiKey.isEmpty()) {
-            LOGGER.warn("LLM API key not configured - POST /v1/reindex will answer 503. " +
-                "Set excalibur.llm.api-key in config or EXCALIBUR_LLM_API_KEY environment variable.");
+        // Reindexing re-embeds every chunk it rewrites, so it needs the same embedding endpoint
+        // ingestion used. A node that does not embed its corpus has nothing for this to do that
+        // would not contradict the way its index was built.
+        if (!excalibur.api.bootstrap.RetrievalCapabilities.from(config.llm()).embedCorpus()) {
+            LOGGER.warn("This node does not embed its corpus, so POST /v1/reindex will answer "
+                + "503: reindexing re-embeds what it rewrites. Set excalibur.llm.api-key (or "
+                + "EXCALIBUR_LLM_API_KEY), and leave excalibur.llm.embeddings-enabled at its "
+                + "default, to enable it.");
             return;
         }
 
@@ -493,6 +497,11 @@ public final class ExcaliburApplication {
         // One resolution of the security policy for the whole process
         srv.withSecurity(apiSecurity);
 
+        // Registrations are written down before the endpoints read them back, so a node that is
+        // restarted keeps crawling what it was asked to crawl. Fatal if the file exists and cannot
+        // be read: starting with an empty registry would silently cancel every source on it.
+        srv.withSourceCatalog(excalibur.ingest.registry.SourceCatalog.open(dataDirectory));
+
         // This enables /v1/ingest to trigger full document processing: chunking, embedding, storage
         configureIngestionPipeline(srv);
 
@@ -504,7 +513,11 @@ public final class ExcaliburApplication {
             excalibur.api.bootstrap.StorageChunkWriter.tombstoneAdapter(storageEngine),
             this.chunkIndex,
             excalibur.ingest.lexical.StoredChunkText.of(storageEngine),
-            documentVisibilityTracker));
+            documentVisibilityTracker,
+            // Without this a vector query still ranks the erased document: no text, because the
+            // payload comes from storage and storage no longer has it, but its name and a
+            // distance - which is the fact the request asked to remove.
+            excalibur.ingest.erasure.SegmentVectorEraser.of(storageEngine)));
 
         // Both graph routes, whether or not a graph exists yet: a node that has ingested and not
         // built needs the build route, and one that builds later must start answering without a
@@ -592,29 +605,31 @@ public final class ExcaliburApplication {
             TextChunker textChunker = new TextChunker();
             LOGGER.info("TextChunker created for document chunking");
 
-            // Check if LLM API key is configured before creating embedding client
-            // This is required for generating embeddings during ingestion
-            // No API key is lexical-only ingestion, not "no ingestion". Documents are chunked,
-            // written and term-indexed, and retrieval serves them through Lucene and the graph.
-            // Only the vector signal is missing, which is one signal of several rather than the
-            // precondition for having an index at all -- requiring it meant a corpus-wide
-            // embedding pass before a single document could be searched.
-            String llmApiKey = config.llm().getApiKey();
-            boolean embeddingsAvailable = llmApiKey != null && !llmApiKey.isEmpty();
+            // Not embedding is lexical-only ingestion, not "no ingestion". Documents are chunked,
+            // written and term-indexed either way; only the vector signal is missing, which is one
+            // signal of several rather than the precondition for having an index at all --
+            // requiring it meant a corpus-wide embedding pass before a single document could be
+            // searched.
+            excalibur.api.bootstrap.RetrievalCapabilities capabilities =
+                excalibur.api.bootstrap.RetrievalCapabilities.from(config.llm());
 
             LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
             EmbeddingClient embeddingClient = null;
-            if (embeddingsAvailable) {
+            if (capabilities.embedCorpus()) {
                 embeddingClient = new EmbeddingClient(llmClientConfig);
                 LOGGER.info("EmbeddingClient created: baseUrl={}, model={}, dimensions={}",
                     config.llm().getBaseUrl(), config.llm().getEmbeddingModel(),
                     llmClientConfig.getEmbeddingDimension());
+            } else if (capabilities.chatModel()) {
+                LOGGER.info("Corpus embedding declined by excalibur.llm.embeddings-enabled - "
+                    + "ingesting lexically. Documents are chunked, stored and term-indexed, and "
+                    + "POST /v1/query answers from BM25 with the chat model expanding the query.");
             } else {
                 LOGGER.warn("LLM API key not configured - ingesting lexically. Documents are "
-                    + "chunked, stored and term-indexed, and are retrievable through Lucene and "
-                    + "the graph; no vectors are produced, so POST /v1/query (vector search) "
-                    + "stays unavailable. Set excalibur.llm.api-key, or EXCALIBUR_LLM_API_KEY, "
-                    + "to add the vector signal.");
+                    + "chunked, stored and term-indexed, and POST /v1/query answers from BM25 "
+                    + "over that index. No vectors are produced, so the vector signal is "
+                    + "missing and every answer reports its coverage as degraded. Set "
+                    + "excalibur.llm.api-key, or EXCALIBUR_LLM_API_KEY, to add it.");
             }
 
             // The vector pre-filter. It is written by HNSW integration rather than by ingestion,
@@ -640,7 +655,7 @@ public final class ExcaliburApplication {
 
             // LSH places vectors; with none to place it is dead weight on every write.
             LshIngestionService lshIngestionService =
-                embeddingsAvailable ? new LshIngestionService(vectorDimensions) : null;
+                capabilities.embedCorpus() ? new LshIngestionService(vectorDimensions) : null;
             LOGGER.info("LshIngestionService: {}",
                 lshIngestionService == null ? "disabled (lexical-only ingestion)"
                                             : "dimensions=" + vectorDimensions);
@@ -655,17 +670,17 @@ public final class ExcaliburApplication {
                 if (orchestrator != null) {
                     orchestrator.setLexicalIndex(chunkIndex);
                 }
-                // Query expansion is what carries the semantics when the corpus is not embedded.
-                // It needs a chat model; without one this degrades to plain BM25, which is a
-                // weaker search and still a working one.
+                // Query expansion is what carries the semantics when the corpus is not embedded,
+                // so it belongs to nodes that have a chat model and no vectors. Without one this
+                // is plain BM25, which is a weaker search and still a working one.
                 io.excalibur.retrieval.expand.QueryExpander expander =
                     io.excalibur.retrieval.expand.QueryExpander.identity();
-                if (embeddingsAvailable) {
+                if (capabilities.expandQueries()) {
                     expander = new io.excalibur.retrieval.expand.LlmQueryExpander(
                         new io.excalibur.llm.client.LLMHttpClient(llmClientConfig));
                     LOGGER.info("Query expansion enabled with chat model {}",
                         config.llm().getChatModel());
-                } else {
+                } else if (!capabilities.embedCorpus()) {
                     LOGGER.info("No chat model configured; retrieval is plain BM25 without "
                         + "query expansion");
                 }
@@ -674,7 +689,9 @@ public final class ExcaliburApplication {
                 server.withChunkIndex(chunkIndex);
             }
 
-            if (embeddingsAvailable) {
+            // Relation extraction is a chat call, so it turns on with the model rather than with
+            // the embedding pass.
+            if (capabilities.chatModel()) {
                 configureGraphIngest(server, llmClientConfig);
             }
 
@@ -775,7 +792,7 @@ public final class ExcaliburApplication {
         // read and write memory-mapped segments through the shared Arena; closing that
         // arena while a mapping is still live crashes the JVM instead of throwing. So:
         // stop accepting, drain everything in flight, close storage, close the arena.
-        new ShutdownSequence()
+        ShutdownSequence sequence = new ShutdownSequence()
             .add("stop HTTP server and drain in-flight requests",
                 () -> server.stop(SHUTDOWN_TIMEOUT_SECONDS))
             .add("stop index orchestrator", indexOrchestrator::close)
@@ -792,10 +809,37 @@ public final class ExcaliburApplication {
                 () -> documentVisibilityTracker.getRegistry().persist())
             .addIfPresent("close graph tenants", graphTenants, graphTenants::close)
             .add("close storage engine", storageEngine::close)
-            .addIfPresent("release memory-mapped segments", arena, arena::close)
-            .run();
+            .addIfPresent("release memory-mapped segments", arena, arena::close);
 
-        LOGGER.info("ExcaliburDB shutdown complete");
+        int failedSteps = sequence.stepNames().size() - sequence.run().size();
+        reportShutdownOutcome(failedSteps, storageEngine.getCatalog().closeFailure());
+    }
+
+    /**
+     * Logs how the shutdown actually went.
+     *
+     * <p>An operator reads this line to decide whether the node can be restarted without further
+     * thought, so it has to distinguish a shutdown that persisted everything from one that did
+     * not. A stale catalog in particular is not cosmetic: the next start re-processes write-log
+     * ranges it has already integrated.</p>
+     *
+     * @param failedSteps    Number of shutdown steps that threw
+     * @param catalogFailure The failure that stopped the catalog closing durably, or null
+     */
+    private static void reportShutdownOutcome(int failedSteps, Throwable catalogFailure) {
+        if (failedSteps == 0 && catalogFailure == null) {
+            LOGGER.info("ExcaliburDB shutdown complete");
+            return;
+        }
+
+        if (catalogFailure != null) {
+            LOGGER.error("ExcaliburDB shutdown finished with {} failed step(s) and a catalog that "
+                + "did not close durably; the next start may re-process write-log ranges it had "
+                + "already integrated", failedSteps, catalogFailure);
+        } else {
+            LOGGER.error("ExcaliburDB shutdown finished with {} failed step(s); see the errors "
+                + "logged above", failedSteps);
+        }
     }
 
     /**

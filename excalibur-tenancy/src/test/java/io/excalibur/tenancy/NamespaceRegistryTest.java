@@ -1,8 +1,11 @@
 package io.excalibur.tenancy;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -767,6 +770,86 @@ class NamespaceRegistryTest {
                 assertThat(registry.pendingCloseCount())
                     .as("every deferred close ran when its lease was released")
                     .isZero();
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("borrowing only what exists")
+    class BorrowIfPresent {
+
+        private static final NamespaceId TENANT = NamespaceId.of("acme");
+
+        @Test
+        @DisplayName("a namespace nobody has created is not created by asking to read it")
+        void anUnknownNamespaceIsNotBroughtIntoBeing(@TempDir Path root) {
+            try (NamespaceRegistry<FakeIndex> registry = registry(root, 4)) {
+                assertThat(registry.borrowIfPresent(TENANT))
+                    .as("loading a namespace is what creates it on disk, so a read that loads "
+                        + "leaves a directory, a registry slot and a share of the budget behind "
+                        + "for every name it is asked about")
+                    .isEmpty();
+                assertThat(registry.openCount()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("a namespace with a directory under the root is opened and borrowed")
+        void anExistingNamespaceIsBorrowed(@TempDir Path root) throws IOException {
+            Files.createDirectories(TENANT.directoryUnder(root));
+
+            try (NamespaceRegistry<FakeIndex> registry = registry(root, 4)) {
+                Optional<NamespaceRegistry.Lease<FakeIndex>> lease =
+                    registry.borrowIfPresent(TENANT);
+
+                assertThat(lease).isPresent();
+                try (NamespaceRegistry.Lease<FakeIndex> held = lease.orElseThrow()) {
+                    assertThat(held.resource().id).isEqualTo(TENANT);
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("a namespace already open is borrowed without consulting the disk")
+        void anOpenNamespaceIsBorrowed(@TempDir Path root) {
+            // This loader writes nothing, so a namespace opened through get() has no directory.
+            // Disk is the fallback question, asked only when the registry does not already know.
+            try (NamespaceRegistry<FakeIndex> registry = registry(root, 4)) {
+                registry.get(TENANT);
+
+                try (NamespaceRegistry.Lease<FakeIndex> lease =
+                         registry.borrowIfPresent(TENANT).orElseThrow()) {
+                    assertThat(lease.resource().closed).isFalse();
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("the lease it hands out holds the namespace open, as any other lease does")
+        void theLeaseHoldsTheNamespaceOpen(@TempDir Path root) throws IOException {
+            Files.createDirectories(TENANT.directoryUnder(root));
+
+            try (NamespaceRegistry<FakeIndex> registry = registry(root, 4)) {
+                NamespaceRegistry.Lease<FakeIndex> lease =
+                    registry.borrowIfPresent(TENANT).orElseThrow();
+                FakeIndex index = lease.resource();
+
+                registry.evict(TENANT);
+                assertThat(index.closed)
+                    .as("a deferred close, exactly as borrow() would give")
+                    .isFalse();
+
+                lease.close();
+                assertThat(index.closed).isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("a null namespace is refused rather than treated as absent")
+        void aNullNamespaceIsRefused(@TempDir Path root) {
+            try (NamespaceRegistry<FakeIndex> registry = registry(root, 4)) {
+                assertThatThrownBy(() -> registry.borrowIfPresent(null))
+                    .isInstanceOf(IllegalArgumentException.class);
             }
         }
     }

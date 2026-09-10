@@ -1,10 +1,27 @@
 package excalibur.api.endpoint;
 
+import com.sun.net.httpserver.Headers;
+import com.sun.net.httpserver.HttpExchange;
+
+import excalibur.ingest.source.Source;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.BeforeEach;
+import org.mockito.ArgumentCaptor;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Tests for ReindexEndpoint and related classes.
@@ -200,5 +217,43 @@ class ReindexEndpointTest {
             new ReindexEndpoint(null, statusRegistry));
         assertThrows(NullPointerException.class, () ->
             new ReindexEndpoint(sourceRegistry, null));
+    }
+
+    @Test
+    @DisplayName("a source id longer than one could be registered under is refused")
+    void oversizedSourceIdIsRefused() throws IOException {
+        String sourceId = "x".repeat(Source.MAX_ID_LENGTH + 1);
+
+        Response response = post("{\"source_id\": \"" + sourceId + "\"}");
+
+        assertThat(response.status())
+            .as("registration bounds the id, so no source is registered under one this long")
+            .isEqualTo(400);
+        assertThat(response.body())
+            .contains("source_id")
+            .contains(String.valueOf(Source.MAX_ID_LENGTH))
+            .doesNotContain(sourceId);
+    }
+
+    /** One captured HTTP response. */
+    private record Response(int status, String body) {}
+
+    private Response post(String requestBody) throws IOException {
+        ReindexEndpoint endpoint = new ReindexEndpoint(sourceRegistry, statusRegistry);
+        HttpExchange exchange = mock(HttpExchange.class);
+        ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+        when(exchange.getRequestMethod()).thenReturn("POST");
+        when(exchange.getRequestURI()).thenReturn(URI.create("/v1/reindex"));
+        when(exchange.getRequestHeaders()).thenReturn(new Headers());
+        when(exchange.getResponseHeaders()).thenReturn(new Headers());
+        when(exchange.getRequestBody()).thenReturn(
+            new ByteArrayInputStream(requestBody.getBytes(StandardCharsets.UTF_8)));
+        when(exchange.getResponseBody()).thenReturn(responseBody);
+
+        endpoint.handle(exchange);
+
+        ArgumentCaptor<Integer> status = ArgumentCaptor.forClass(Integer.class);
+        verify(exchange).sendResponseHeaders(status.capture(), anyLong());
+        return new Response(status.getValue(), responseBody.toString(StandardCharsets.UTF_8));
     }
 }

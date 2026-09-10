@@ -1,6 +1,7 @@
 package excalibur.api.bootstrap;
 
 import io.excalibur.config.Config;
+import io.excalibur.retrieval.lexical.native_.SegmentManifest;
 import io.excalibur.store.Segment;
 import io.excalibur.vector.hnsw.HnswConfigFactory;
 import org.junit.jupiter.api.AfterEach;
@@ -9,6 +10,8 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
@@ -134,6 +137,52 @@ class CoreComponentsTest {
             // Nothing was opened before the value was rejected, so the directory the engine
             // would have used is still untouched and a retry with a good value can proceed.
             assertThat(dataDir).isEmptyDirectory();
+        }
+    }
+
+    @Nested
+    @DisplayName("the visibility clock")
+    class VisibilityClock {
+
+        // Epochs are stamped into durable records and compared against a counter held in memory.
+        // Two ways of getting that wrong were both live here, and neither shows up as an error:
+        // a counter restarted below the stamps on disk hides the whole corpus, and a second
+        // counter running beside the first puts two different scales into one catalog field.
+
+        @Test
+        @DisplayName("is one clock, shared by the storage engine and the index orchestrator")
+        void theEngineAndTheOrchestratorAgree(@TempDir Path dataDir) {
+            components = CoreComponents.create(config(), dataDir, HnswConfigFactory.withDefaults());
+
+            assertThat(components.storageEngine().getVisibilityTracker())
+                .as("a second epoch counter stamps tombstones on a scale nothing else reads")
+                .isSameAs(components.indexOrchestrator().getVisibilityTracker());
+        }
+
+        @Test
+        @DisplayName("resumes above every epoch the durable stores already stamped")
+        void resumesAboveTheDurableStamps(@TempDir Path dataDir) throws IOException {
+            // What an earlier run left behind: lexical segments published at epoch 9100.
+            Path lexical = Files.createDirectories(
+                dataDir.resolve(ChunkIndexFactory.NATIVE_DIRECTORY));
+            SegmentManifest manifest = SegmentManifest.empty();
+            manifest.add(new SegmentManifest.Entry("seg-0", 9_100, 3, 0));
+            manifest.write(lexical);
+
+            components = CoreComponents.create(config(), dataDir, HnswConfigFactory.withDefaults());
+
+            assertThat(components.indexOrchestrator().getVisibilityTracker().currentEpoch())
+                .as("below 9100 every published segment reads as written in the future")
+                .isGreaterThan(9_100L);
+        }
+
+        @Test
+        @DisplayName("starts at zero when nothing has ever been stamped")
+        void aFreshNodeStartsAtZero(@TempDir Path dataDir) {
+            components = CoreComponents.create(config(), dataDir, HnswConfigFactory.withDefaults());
+
+            assertThat(components.indexOrchestrator().getVisibilityTracker().currentEpoch())
+                .isZero();
         }
     }
 

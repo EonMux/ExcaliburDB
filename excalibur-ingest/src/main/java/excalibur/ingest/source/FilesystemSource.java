@@ -115,8 +115,9 @@ public class FilesystemSource implements Source {
         if (sourceId.isEmpty()) {
             throw new IllegalArgumentException("sourceId must not be empty");
         }
-        if (sourceId.length() > 256) {
-            throw new IllegalArgumentException("sourceId must not exceed 256 characters");
+        if (sourceId.length() > MAX_ID_LENGTH) {
+            throw new IllegalArgumentException(
+                "sourceId must not exceed " + MAX_ID_LENGTH + " characters");
         }
 
         this.rootPath = Objects.requireNonNull(builder.rootPath, "rootPath must not be null")

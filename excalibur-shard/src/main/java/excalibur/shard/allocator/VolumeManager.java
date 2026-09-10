@@ -295,29 +295,6 @@ public class VolumeManager {
     }
 
     /**
-     * Assigns a segment to a volume and updates the catalog.
-     *
-     * <p>This method assigns the segment and updates the segment's volumePath
-     * in the catalog if a catalog is configured.</p>
-     *
-     * @param segmentId The segment ID to assign
-     * @return The path to the assigned volume
-     */
-    public Path assignAndUpdateCatalog(long segmentId) {
-        Path volumePath = assignSegmentToVolume(segmentId);
-
-        if (volumePath != null && catalog != null) {
-            // Update catalog with volume path
-            SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
-            if (metadata != null) {
-                metadata.setVolumePath(volumePath);
-            }
-        }
-
-        return volumePath;
-    }
-
-    /**
      * Forces reassignment of a segment to a new volume.
      *
      * <p>This is useful when a volume is being removed and segments

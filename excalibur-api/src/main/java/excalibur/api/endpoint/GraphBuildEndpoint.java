@@ -84,13 +84,18 @@ public class GraphBuildEndpoint implements HttpHandler {
                     + "\"staged_facts\": " + outcome.staged() + ", "
                     + "\"namespace\": \"" + JsonText.escape(namespace.value()) + "\""
                     + "}");
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
             // The build failed; whatever was being served is still being served, because the
             // directory is only replaced by a rename after the whole thing is assembled.
-            LOGGER.error("Graph build failed: {}", e.toString());
-            ResponseBody.sendJson(exchange, 500,
-                "{\"error\": \"" + JsonText.escape("Graph build failed: " + e.getMessage())
-                    + "\"}");
+            //
+            // RuntimeException is not defensive padding: a namespace that cannot be opened
+            // arrives here as an UncheckedIOException from the registry, and catching only
+            // IOException would let it escape the handler with no response sent at all.
+            //
+            // Logged with detail, answered without it: the message names the path the node
+            // failed on, which a client has no business seeing.
+            LOGGER.error("Graph build failed", e);
+            ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
         }
     }
 }

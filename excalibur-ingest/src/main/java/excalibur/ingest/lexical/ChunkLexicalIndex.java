@@ -132,6 +132,11 @@ public final class ChunkLexicalIndex implements ChunkIndex {
     @Override
     public io.excalibur.retrieval.rank.Ranker ranker(
             io.excalibur.retrieval.expand.QueryExpander expander) {
+        // Ungated deliberately. A term the corpus lacks matches nothing, so refusing such a
+        // formulation cannot change what this ranker answers, only the work it does getting
+        // there - and whether that trade pays against Lucene's own term dictionary is what the
+        // bench's expansion and expansion+vocab strategies exist to measure. The native engine,
+        // whose gate is the dictionary its search already reads, takes the trade.
         return new io.excalibur.retrieval.expand.ExpandedLexicalRanker(index, expander);
     }
 

@@ -177,4 +177,44 @@ class GraphTenantsTest {
             assertThat(tenants.openNamespaces()).contains(NamespaceId.SHARED);
         }
     }
+
+    @Test
+    @DisplayName("reading a namespace nobody has built does not bring it into being")
+    void readingAnUnknownNamespaceCreatesNothing(@TempDir Path tempDir) throws IOException {
+        try (GraphTenants tenants = tenants(tempDir, 4)) {
+            assertThat(tenants.borrowIfPresent(NamespaceId.of("never-built"))).isEmpty();
+
+            assertThat(tempDir.resolve("never-built"))
+                .as("a graph tenant writes its staging directory as it opens, so a read that "
+                    + "opened would leave one behind for every name it was asked about - and the "
+                    + "names are the caller's to choose")
+                .doesNotExist();
+            assertThat(tenants.openNamespaces()).containsExactly(NamespaceId.SHARED);
+        }
+    }
+
+    @Test
+    @DisplayName("a namespace a build created is readable by the query that follows")
+    void aBuiltNamespaceIsReadable(@TempDir Path tempDir) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(tempDir, 4)) {
+            tenants.borrow(acme).close();
+
+            try (NamespaceRegistry.Lease<GraphTenant> lease =
+                     tenants.borrowIfPresent(acme).orElseThrow()) {
+                assertThat(lease.resource().id()).isEqualTo(acme);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("the shared namespace is readable on a node that has never seen the header")
+    void theSharedNamespaceIsAlwaysReadable(@TempDir Path tempDir) throws IOException {
+        try (GraphTenants tenants = tenants(tempDir, 4)) {
+            try (NamespaceRegistry.Lease<GraphTenant> lease =
+                     tenants.borrowIfPresent(NamespaceId.SHARED).orElseThrow()) {
+                assertThat(lease.resource().id()).isEqualTo(NamespaceId.SHARED);
+            }
+        }
+    }
 }

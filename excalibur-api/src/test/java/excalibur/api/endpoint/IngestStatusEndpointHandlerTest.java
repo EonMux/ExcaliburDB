@@ -4,6 +4,7 @@ import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 
 import excalibur.api.mcp.Json;
+import excalibur.ingest.source.Source;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -90,6 +91,23 @@ class IngestStatusEndpointHandlerTest {
                 "get", "/v1/ingest/status");
 
             assertThat(response.status()).isEqualTo(200);
+        }
+
+        @Test
+        @DisplayName("a source id longer than one could be registered under is refused")
+        void oversizedSourceIdIsRefused() throws IOException {
+            String sourceId = "x".repeat(Source.MAX_ID_LENGTH + 1);
+
+            Response response = call(new IngestStatusEndpoint(registryWith("known")),
+                "GET", "/v1/ingest/status?source_id=" + sourceId);
+
+            assertThat(response.status())
+                .as("registration bounds the id, so no source is under one this long")
+                .isEqualTo(400);
+            assertThat(Json.stringAt(response.json(), "error"))
+                .contains("source_id")
+                .contains(String.valueOf(Source.MAX_ID_LENGTH))
+                .doesNotContain(sourceId);
         }
 
         @Test

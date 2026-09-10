@@ -30,7 +30,8 @@ import java.util.Objects;
  * <p>This filter is used in Stage 4 of the query pipeline (full vector rerank):</p>
  * <pre>{@code
  * // After aggregating results from all segments
- * List<QueryResultItem> merged = aggregator.mergeAndRank(segmentResults);
+ * List<QueryResultItem> merged =
+ *     aggregator.mergeAndRankWithNormalization(segmentResults, distanceFunction);
  *
  * // Filter out partial documents
  * DocumentAtomicityFilter filter = new DocumentAtomicityFilter(visibilityChecker);

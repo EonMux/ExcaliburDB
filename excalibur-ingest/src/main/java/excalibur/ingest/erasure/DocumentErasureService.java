@@ -55,13 +55,12 @@ import java.util.function.Function;
  * safe direction to be wrong in. Segment filters are rebuilt when the segment is compacted.</p>
  *
  * <h2>What is left until a segment is compacted</h2>
- * <p>The vector indexes. A chunk's entry in the LSH and HNSW structures is keyed by an id, not by
- * its text, and those structures are reclaimed when their segment is compacted rather than per
- * entry. So until then a vector query can still rank the erased chunk: with no content, because the
- * payload is resolved from storage and storage no longer has it, but with its identifier and a
- * similarity score. That is the same residue a source-driven deletion leaves - the storage
- * tombstone is what the engine treats as the source of truth - and it is a real one: a chunk id
- * names its document, so what remains visible is that some document matched, not what it said.</p>
+ * <p>Disk, not answers. The graph node of an erased chunk is retired as part of the erasure, so no
+ * search traverses it or ranks it; the space it occupies is reclaimed when its graph is compacted.
+ * Its entry in the LSH pre-filter is left alone, because that index only narrows which segments
+ * and candidates a search looks at - it cannot produce a result of its own, so an entry left
+ * behind costs a candidate the graph then skips. Segment filters and LSH tables are rebuilt when
+ * the segment is compacted.</p>
  *
  * <h2>What it cannot reach</h2>
  * <p>The source. This removes what the node holds, not what the source serves: a document erased
@@ -87,18 +86,39 @@ public final class DocumentErasureService {
      *                           bounded rather than exhaustive
      * @param chunksTombstoned   Chunks removed from storage
      * @param chunksUnindexed    Chunks removed from the lexical index
+     * @param vectorsHidden      Graph nodes retired, so no search ranks the document again
      * @param compacted          Whether the index was rewritten, so the chunks are off disk
      * @param chunksReclaimed    Chunks physically removed by that rewrite
      * @param outstanding        Erasure requests this node still owes, including this one
      * @param detail             Why the compaction ran, or why it did not
      */
     public record Outcome(int documentsErased, int documentsNotFound, int documentsRemaining,
-                          int chunksTombstoned, int chunksUnindexed, boolean compacted,
-                          int chunksReclaimed, int outstanding, String detail) {
+                          int chunksTombstoned, int chunksUnindexed, int vectorsHidden,
+                          boolean compacted, int chunksReclaimed, int outstanding, String detail) {
 
         public Outcome {
             Objects.requireNonNull(detail, "detail must not be null");
         }
+    }
+
+    /**
+     * Retires the graph nodes of one document.
+     *
+     * <p>Named by document rather than by chunk because that is how a node is attributed: the
+     * integration worker records the document a node came from as it inserts, and nothing maps a
+     * node back to the chunk id the registry holds.</p>
+     */
+    @FunctionalInterface
+    public interface VectorEraser {
+
+        /**
+         * Retires every graph node attributed to a document.
+         *
+         * @param documentKey The document, as {@link ChunkIdentifiers#documentKey(String, String)}
+         *                    forms it
+         * @return The number of nodes retired
+         */
+        int erase(String documentKey);
     }
 
     private final DocumentRegistry registry;
@@ -116,6 +136,16 @@ public final class DocumentErasureService {
     private final DocumentVisibilityTracker visibility;
 
     /**
+     * Retires the erased document's graph nodes, or null on a node that keeps no vector index.
+     *
+     * <p>A node carries no text, so leaving one behind reads as harmless. It is not: a search that
+     * ranks it says the document matched the query, with a distance and the document's name, which
+     * is the fact the request asked to remove. Nothing else can reach the graphs - the registry
+     * names chunks, and a node is attributed to a document.</p>
+     */
+    private final VectorEraser vectorEraser;
+
+    /**
      * Creates the service.
      *
      * @param registry     Where a document's chunk ids are recorded
@@ -131,7 +161,7 @@ public final class DocumentErasureService {
                                   UpsertHandler.StorageAdapter storage,
                                   ChunkIndex lexicalIndex,
                                   Function<String, String> storedText) {
-        this(registry, storage, lexicalIndex, storedText, null);
+        this(registry, storage, lexicalIndex, storedText, null, null);
     }
 
     /**
@@ -150,6 +180,29 @@ public final class DocumentErasureService {
                                   ChunkIndex lexicalIndex,
                                   Function<String, String> storedText,
                                   DocumentVisibilityTracker visibility) {
+        this(registry, storage, lexicalIndex, storedText, visibility, null);
+    }
+
+    /**
+     * Creates the service, also retiring an erased document's vectors.
+     *
+     * @param registry     Where a document's chunk ids are recorded
+     * @param storage      Removes a chunk from storage by key
+     * @param lexicalIndex The lexical index, or null on a node that keeps none
+     * @param storedText   Reads a surviving chunk's text back for the index's compaction
+     * @param visibility   Where documents' publication epochs are tracked, or null for none
+     * @param vectorEraser Retires the document's graph nodes, or null on a node that keeps no
+     *                     vector index. Without one a vector query still ranks the erased
+     *                     document: no text, but its name and a distance
+     * @throws NullPointerException     if registry or storage is null
+     * @throws IllegalArgumentException if an index is given without a text supplier
+     */
+    public DocumentErasureService(DocumentRegistry registry,
+                                  UpsertHandler.StorageAdapter storage,
+                                  ChunkIndex lexicalIndex,
+                                  Function<String, String> storedText,
+                                  DocumentVisibilityTracker visibility,
+                                  VectorEraser vectorEraser) {
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.storage = Objects.requireNonNull(storage, "storage must not be null");
         if (lexicalIndex != null && storedText == null) {
@@ -160,6 +213,7 @@ public final class DocumentErasureService {
         this.lexicalIndex = lexicalIndex;
         this.storedText = storedText;
         this.visibility = visibility;
+        this.vectorEraser = vectorEraser;
     }
 
     /**
@@ -241,21 +295,45 @@ public final class DocumentErasureService {
 
         int tombstoned = tombstone(chunkIds);
         int unindexed = unindex(chunkIds);
+        int hidden = 0;
         for (String documentId : documentIds) {
+            String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
+            hidden += hideVectors(documentKey);
             registry.remove(sourceId, documentId);
             if (visibility != null) {
-                visibility.removeDocument(ChunkIdentifiers.documentKey(sourceId, documentId));
+                visibility.removeDocument(documentKey);
             }
         }
         persistRegistry();
 
         CompactionResult compaction = reclaim(compactNow);
         LOGGER.info("Erased {} document(s) of source {}: {} chunk(s) removed from storage, {} from "
-                + "the lexical index, {} not found, {} still held", documentIds.size(), sourceId,
-            tombstoned, unindexed, notFound, remaining);
-        return new Outcome(documentIds.size(), notFound, remaining, tombstoned, unindexed,
+                + "the lexical index, {} graph node(s) retired, {} not found, {} still held",
+            documentIds.size(), sourceId, tombstoned, unindexed, hidden, notFound, remaining);
+        return new Outcome(documentIds.size(), notFound, remaining, tombstoned, unindexed, hidden,
             compaction.performed(), compaction.documentsRemoved(), outstanding(),
             compaction.reason());
+    }
+
+    /**
+     * Retires the document's graph nodes, so no search ranks it again.
+     *
+     * @param documentKey The document, as node attribution names it
+     * @return The number of nodes retired
+     */
+    private int hideVectors(String documentKey) {
+        if (vectorEraser == null) {
+            return 0;
+        }
+        try {
+            return vectorEraser.erase(documentKey);
+        } catch (RuntimeException e) {
+            // Reported by the count rather than thrown, for the same reason a chunk that will not
+            // delete does not stop the rest: the content leaving storage is the half of the
+            // promise this node can always keep, and losing it here would be the worse outcome.
+            LOGGER.warn("Vectors of document {} stay searchable: {}", documentKey, e.getMessage());
+            return 0;
+        }
     }
 
     /**

@@ -126,6 +126,14 @@ public class SegmentCatalog {
      */
     private final CatalogFile catalogFile;
 
+    /**
+     * First failure seen while closing, or null when the catalog closed durably.
+     *
+     * <p>Volatile because {@link #closeFailure()} is read by whichever thread is winding the
+     * process down, which is not always the one that closed the catalog.</p>
+     */
+    private volatile Throwable closeFailure;
+
     // ==================== Constructors ====================
 
     /**
@@ -149,11 +157,7 @@ public class SegmentCatalog {
      * @throws UncheckedIOException if the catalog file cannot be created or opened
      */
     public SegmentCatalog(Path catalogPath) {
-        try {
-            this.catalogFile = new CatalogFile(catalogPath);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to open catalog file: " + catalogPath, e);
-        }
+        this(open(catalogPath));
     }
 
     /**
@@ -167,8 +171,31 @@ public class SegmentCatalog {
      * @throws UncheckedIOException if the catalog file cannot be created or opened
      */
     public SegmentCatalog(Path catalogPath, Arena arena) {
+        this(open(catalogPath));
+    }
+
+    /**
+     * Creates a new catalog over an already-open catalog file.
+     *
+     * <p>Call {@link #recover()} after construction to load persisted metadata. The catalog
+     * takes over closing the file.</p>
+     *
+     * @param catalogFile The file to persist metadata to, or null for in-memory only
+     */
+    public SegmentCatalog(CatalogFile catalogFile) {
+        this.catalogFile = catalogFile;
+    }
+
+    /**
+     * Opens the catalog file at the given path.
+     *
+     * @param catalogPath Path to the catalog file
+     * @return The open file
+     * @throws UncheckedIOException if the file cannot be created or opened
+     */
+    private static CatalogFile open(Path catalogPath) {
         try {
-            this.catalogFile = new CatalogFile(catalogPath);
+            return new CatalogFile(catalogPath);
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to open catalog file: " + catalogPath, e);
         }
@@ -860,14 +887,53 @@ public class SegmentCatalog {
      *
      * <p>If persistence is not enabled (in-memory only mode), this method
      * does nothing.</p>
+     *
+     * <p>The close always completes: a failure is recorded on {@link #closeFailure()} and logged
+     * rather than thrown, because the steps that follow a catalog close in a shutdown - releasing
+     * mappings above all - must still run. Callers that report the shutdown's outcome read
+     * {@link #closeFailure()}.</p>
      */
     public void close() {
-        if (catalogFile != null) {
-            try {
-                catalogFile.close();
-            } catch (Exception e) {
-                // Ignore close errors
-            }
+        if (catalogFile == null) {
+            return;
+        }
+
+        try {
+            catalogFile.close();
+        } catch (Exception e) {
+            recordCloseFailure(e);
+        }
+
+        // The file records a final flush that did not reach the device even when close() itself
+        // returns normally. That is the case this catalog exists to report.
+        Throwable fileFailure = catalogFile.closeFailure();
+        if (fileFailure != null) {
+            recordCloseFailure(fileFailure);
+        }
+    }
+
+    /**
+     * Returns the failure that prevented this catalog from closing durably.
+     *
+     * <p>A non-null value means the on-disk metadata may not reflect the last writes, so the
+     * shutdown must not be reported as clean.</p>
+     *
+     * @return The first close-time failure, or null when the close was clean
+     */
+    public Throwable closeFailure() {
+        return closeFailure;
+    }
+
+    /**
+     * Logs a close-time failure and keeps the first one.
+     *
+     * @param failure The failure to record
+     */
+    private void recordCloseFailure(Throwable failure) {
+        logger.error("Catalog {} did not close durably; on-disk segment metadata may be stale",
+            catalogFile.getPath(), failure);
+        if (closeFailure == null) {
+            closeFailure = failure;
         }
     }
 

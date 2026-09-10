@@ -8,6 +8,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.*;
@@ -499,6 +502,117 @@ class SegmentLifecycleManagerTest {
         @DisplayName("Should get epoch lag threshold")
         void shouldGetEpochLagThreshold() {
             assertThat(manager.getEpochLagThreshold()).isEqualTo(10L);
+        }
+    }
+
+    @Nested
+    @DisplayName("Indexing Completion Tests")
+    class IndexingCompletionTests {
+
+        @Test
+        @DisplayName("Should advance a segment whose index has caught up")
+        void shouldAdvanceCaughtUpSegment() {
+            long segmentId = createSegment();
+            manager.setIndexingCompletionProbe(id -> true);
+
+            manager.checkForIndexingCompletion();
+
+            assertThat(manager.getLifecycleState(segmentId)).isEqualTo(LifecycleState.WARMING);
+        }
+
+        @Test
+        @DisplayName("Should leave a segment whose index is still behind")
+        void shouldLeaveLaggingSegment() {
+            long segmentId = createSegment();
+            manager.setIndexingCompletionProbe(id -> false);
+
+            manager.checkForIndexingCompletion();
+
+            assertThat(manager.getLifecycleState(segmentId)).isEqualTo(LifecycleState.INDEXING);
+        }
+
+        @Test
+        @DisplayName("Should leave every segment alone when no probe is installed")
+        void shouldLeaveEverySegmentAloneWithoutAProbe() {
+            long segmentId = createSegment();
+
+            manager.checkForIndexingCompletion();
+
+            assertThat(manager.getLifecycleState(segmentId)).isEqualTo(LifecycleState.INDEXING);
+        }
+
+        @Test
+        @DisplayName("Should only offer segments that are still indexing to the probe")
+        void shouldOnlyOfferIndexingSegments() {
+            long indexing = createSegment();
+            long active = createSegment();
+            catalog.completeIndexing(active);
+            catalog.completeWarmup(active);
+
+            List<Long> offered = new CopyOnWriteArrayList<>();
+            manager.setIndexingCompletionProbe(id -> {
+                offered.add(id);
+                return false;
+            });
+
+            manager.checkForIndexingCompletion();
+
+            assertThat(offered).containsExactly(indexing);
+        }
+
+        @Test
+        @DisplayName("Should keep sweeping after a probe throws")
+        void shouldKeepSweepingAfterAProbeThrows() {
+            // A probe reads live engine state, so it can fail for one segment - a segment
+            // retired between the catalog listing and the read - while every other segment is
+            // still judgeable. Letting that abort the sweep retires the transition for the rest
+            // of the tick, and the same segment is likely to fail again on the next one.
+            long first = createSegment();
+            long second = createSegment();
+            manager.setIndexingCompletionProbe(id -> {
+                if (id == first) {
+                    throw new IllegalStateException("segment went away");
+                }
+                return true;
+            });
+
+            manager.checkForIndexingCompletion();
+
+            assertThat(manager.getLifecycleState(first)).isEqualTo(LifecycleState.INDEXING);
+            assertThat(manager.getLifecycleState(second)).isEqualTo(LifecycleState.WARMING);
+        }
+
+        @Test
+        @DisplayName("Should be driven by the periodic lifecycle check")
+        void shouldBeDrivenByThePeriodicCheck() throws InterruptedException {
+            // Nothing in production calls checkForIndexingCompletion directly. If the scheduled
+            // sweep does not run it, a live-ingested segment never leaves INDEXING, and
+            // compaction, PQ training and scheduled reindexing - which all select on later
+            // states - never see a candidate.
+            SegmentLifecycleManager periodic = new SegmentLifecycleManager(catalog, 20, 0.3, 100, 10);
+            try {
+                long segmentId = createSegment();
+                periodic.setIndexingCompletionProbe(id -> true);
+                periodic.start();
+
+                assertThat(awaitState(periodic, segmentId, LifecycleState.WARMING))
+                    .as("segment %d should have been advanced by the periodic check", segmentId)
+                    .isTrue();
+            } finally {
+                periodic.close();
+            }
+        }
+
+        private boolean awaitState(SegmentLifecycleManager target, long segmentId,
+                                   LifecycleState expected) throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (System.nanoTime() < deadline) {
+                if (target.getLifecycleState(segmentId) == expected) {
+                    return true;
+                }
+                Thread.sleep(10);
+            }
+            return false;
         }
     }
 }

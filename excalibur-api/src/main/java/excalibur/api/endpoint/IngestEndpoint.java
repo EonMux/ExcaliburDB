@@ -7,9 +7,8 @@ import excalibur.api.protocol.RequestBody;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
-import excalibur.ingest.source.FilesystemSource;
-import excalibur.ingest.source.HttpSource;
 import excalibur.ingest.source.Source;
+import excalibur.ingest.source.SourceDescriptor;
 import excalibur.api.security.ApiSecurityConfig;
 import excalibur.api.security.IngestTargetRejectedException;
 import excalibur.api.security.IngestTargetValidator;
@@ -20,9 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Path;
 import java.util.*;
 
 
@@ -88,18 +85,14 @@ public class IngestEndpoint implements HttpHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(IngestEndpoint.class);
 
-    /**
-     * Maximum request body size in bytes.
-     */
-
     private final SourceRegistry sourceRegistry;
 
     /**
-     * Validates client-supplied ingest targets against the configured allow-lists.
-     * Never null: an endpoint built without an explicit policy gets the default one,
+     * Builds the crawler a request describes, validating its target against the configured
+     * allow-lists. Never null: an endpoint built without an explicit policy gets the default one,
      * which disables both filesystem and URL ingest.
      */
-    private final IngestTargetValidator targetValidator;
+    private final SourceFactory sourceFactory;
 
     /**
      * Creates a new IngestEndpoint with a source registry.
@@ -187,7 +180,8 @@ public class IngestEndpoint implements HttpHandler {
                           IngestionOrchestrator orchestrator,
                           IngestTargetValidator targetValidator) {
         Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
-        this.targetValidator = Objects.requireNonNull(targetValidator, "IngestTargetValidator cannot be null");
+        this.sourceFactory = new SourceFactory(
+            Objects.requireNonNull(targetValidator, "IngestTargetValidator cannot be null"));
 
         // Configure InMemorySourceRegistry with both status and orchestrator
         if (sourceRegistry instanceof InMemorySourceRegistry) {
@@ -229,18 +223,18 @@ public class IngestEndpoint implements HttpHandler {
             try {
                 // Parse request body
                 String requestBody = readRequestBody(exchange);
-                IngestRequest request = parseRequest(requestBody);
+                SourceDescriptor request = parseRequest(requestBody);
 
                 // Set source ID in MDC for per-source logging
-                StructuredLoggingHelper.setSourceId(request.sourceId);
+                StructuredLoggingHelper.setSourceId(request.sourceId());
 
-                LOGGER.info("Registering ingestion source: type={}", request.sourceType);
+                LOGGER.info("Registering ingestion source: type={}", request.sourceType());
 
                 // Build the source. The target is validated against the configured
                 // allow-lists first, so an unknown root or host never reaches a crawler.
                 Source source;
                 try {
-                    source = createSource(request);
+                    source = sourceFactory.create(request);
                 } catch (IngestTargetRejectedException e) {
                     sendError(exchange, 403, e.getMessage());
                     return;
@@ -256,10 +250,20 @@ public class IngestEndpoint implements HttpHandler {
                 // first and registering afterwards lets two concurrent requests both
                 // start ingestion and orphan one unclosed Source.
                 try {
-                    sourceRegistry.register(source);
+                    sourceRegistry.register(source, request);
                 } catch (SourceRegistrationException e) {
                     closeQuietly(source);
                     sendError(exchange, e.reason().statusCode(), e.getMessage());
+                    return;
+                } catch (SourceCatalogException e) {
+                    // Accepted-but-unrecorded is the failure the catalog exists to prevent: the
+                    // caller would be told its source is registered and find it gone after the
+                    // next restart. The detail is for the log; the response names no path.
+                    closeQuietly(source);
+                    LOGGER.error("Source registration could not be recorded: {}",
+                        e.getMessage(), e);
+                    sendError(exchange, SourceCatalogException.STATUS_CODE,
+                        SourceCatalogException.CLIENT_MESSAGE);
                     return;
                 } catch (RuntimeException e) {
                     closeQuietly(source);
@@ -268,8 +272,8 @@ public class IngestEndpoint implements HttpHandler {
 
                 // Send success response
                 IngestResponse response = new IngestResponse(
-                    request.sourceId,
-                    request.sourceType,
+                    request.sourceId(),
+                    request.sourceType(),
                     "registered"
                 );
                 sendResponse(exchange, 200, response);
@@ -296,9 +300,12 @@ public class IngestEndpoint implements HttpHandler {
     }
 
     /**
-     * Parses the JSON request body into an IngestRequest.
+     * Parses the JSON request body into the registration it describes.
+     *
+     * <p>What comes out is what gets written down: the type, the id, and the configuration as the
+     * caller supplied it. A restart replays exactly this through the same allow-lists.</p>
      */
-    private IngestRequest parseRequest(String json) {
+    private static SourceDescriptor parseRequest(String json) {
         String sourceType = JsonText.string(json, "source_type");
         if (sourceType == null || sourceType.isEmpty()) {
             throw new IllegalArgumentException("Field 'source_type' is required");
@@ -311,28 +318,32 @@ public class IngestEndpoint implements HttpHandler {
         }
 
         String sourceId = JsonText.string(configJson, "source_id");
-        if (sourceId == null || sourceId.isEmpty()) {
+        if (sourceId == null || sourceId.isBlank()) {
             throw new IllegalArgumentException("Field 'config.source_id' is required");
+        }
+        String idViolation = SourceIds.violation(sourceId, "config.source_id");
+        if (idViolation != null) {
+            throw new IllegalArgumentException(idViolation);
         }
 
         // Type-specific config parsing
         Map<String, String> config = new HashMap<>();
 
         switch (sourceType.toLowerCase(Locale.ROOT)) {
-            case "filesystem":
-                String rootPath = JsonText.string(configJson, "root_path");
+            case SourceFactory.TYPE_FILESYSTEM:
+                String rootPath = JsonText.string(configJson, SourceFactory.ROOT_PATH);
                 if (rootPath == null || rootPath.isEmpty()) {
                     throw new IllegalArgumentException("Field 'config.root_path' is required for filesystem source");
                 }
-                config.put("root_path", rootPath);
+                config.put(SourceFactory.ROOT_PATH, rootPath);
                 break;
 
-            case "http":
-                String baseUrl = JsonText.string(configJson, "base_url");
+            case SourceFactory.TYPE_HTTP:
+                String baseUrl = JsonText.string(configJson, SourceFactory.BASE_URL);
                 if (baseUrl == null || baseUrl.isEmpty()) {
                     throw new IllegalArgumentException("Field 'config.base_url' is required for HTTP source");
                 }
-                config.put("base_url", baseUrl);
+                config.put(SourceFactory.BASE_URL, baseUrl);
                 break;
 
             default:
@@ -340,79 +351,17 @@ public class IngestEndpoint implements HttpHandler {
         }
 
         // Optional fields
-        String[] includedExtensions = JsonText.stringArray(configJson, "included_extensions");
+        String[] includedExtensions = JsonText.stringArray(configJson, SourceFactory.INCLUDED_EXTENSIONS);
         if (includedExtensions != null) {
-            config.put("included_extensions", String.join(",", includedExtensions));
+            config.put(SourceFactory.INCLUDED_EXTENSIONS, String.join(",", includedExtensions));
         }
 
-        String[] excludedDirectories = JsonText.stringArray(configJson, "excluded_directories");
+        String[] excludedDirectories = JsonText.stringArray(configJson, SourceFactory.EXCLUDED_DIRECTORIES);
         if (excludedDirectories != null) {
-            config.put("excluded_directories", String.join(",", excludedDirectories));
+            config.put(SourceFactory.EXCLUDED_DIRECTORIES, String.join(",", excludedDirectories));
         }
 
-        return new IngestRequest(sourceType, sourceId, config);
-    }
-
-    /**
-     * Creates a Source instance based on the request.
-     */
-    private Source createSource(IngestRequest request) {
-        switch (request.sourceType.toLowerCase(Locale.ROOT)) {
-            case "filesystem":
-                return createFilesystemSource(request);
-            case "http":
-                return createHttpSource(request);
-            default:
-                throw new IllegalArgumentException("Unknown source type: " + request.sourceType);
-        }
-    }
-
-    /**
-     * Creates a FilesystemSource from the request config.
-     *
-     * <p>The requested root is canonicalised and matched against the configured
-     * allow-list before a crawler is built, and the crawler is given the resolved
-     * real path so it cannot be re-pointed by a symlink swapped in afterwards.</p>
-     */
-    private FilesystemSource createFilesystemSource(IngestRequest request) {
-        Path rootPath = targetValidator.resolveFilesystemRoot(request.config.get("root_path"));
-
-        FilesystemSource.Builder builder = FilesystemSource.builder()
-            .sourceId(request.sourceId)
-            .rootPath(rootPath);
-
-        String extensions = request.config.get("included_extensions");
-        if (extensions != null && !extensions.isEmpty()) {
-            builder.includedExtensions(extensions.split(","));
-        }
-
-        String excluded = request.config.get("excluded_directories");
-        if (excluded != null && !excluded.isEmpty()) {
-            builder.excludedDirectories(excluded.split(","));
-        }
-
-        return builder.build();
-    }
-
-    /**
-     * Creates an HttpSource from the request config.
-     *
-     * <p>The URL is checked against the host allow-list and every address the host
-     * resolves to must be public, which is what keeps the crawler off cloud metadata
-     * endpoints and internal services. The crawl is then pinned to that single host so
-     * a redirect cannot walk it somewhere else: {@link HttpSource} follows redirects
-     * itself, with {@code Redirect.NEVER} on its client, and re-applies its domain
-     * policy to every hop.</p>
-     */
-    private HttpSource createHttpSource(IngestRequest request) {
-        URI baseUrl = targetValidator.resolveUrl(request.config.get("base_url"));
-
-        HttpSource.Builder builder = HttpSource.builder()
-            .sourceId(request.sourceId)
-            .baseUrl(baseUrl)
-            .allowedDomains(Set.of(IngestTargetValidator.hostOf(baseUrl)));
-
-        return builder.build();
+        return new SourceDescriptor(sourceType, sourceId, config);
     }
 
     /**
@@ -468,11 +417,6 @@ public class IngestEndpoint implements HttpHandler {
 
 
     // ==================== Inner Classes ====================
-
-    /**
-     * Request to register an ingestion source.
-     */
-    private record IngestRequest(String sourceType, String sourceId, Map<String, String> config) {}
 
     /**
      * Response after registering a source.

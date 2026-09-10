@@ -178,12 +178,62 @@ class RequestGuardTest {
         }
     }
 
+    @Nested
+    @DisplayName("The rate-limit key")
+    class RateLimitKey {
+
+        @Test
+        @DisplayName("charges every address in one IPv6 prefix against a single budget")
+        void aPrefixCannotMintFreshBudgets() throws IOException {
+            // The holder of a /64 - the smallest routine residential allocation - can source
+            // 2^64 addresses. Keyed on the full address, every request would arrive with a
+            // full bucket and the limiter would refuse nothing.
+            ApiSecurityConfig config = ApiSecurityConfig.builder()
+                .readBudget(1.0, 2.0)
+                .build();
+            RequestGuard guard = new RequestGuard(config);
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(exchangeFrom("2001:db8:1:2::1"));
+            handler.handle(exchangeFrom("2001:db8:1:2::2"));
+            HttpExchange third = exchangeFrom("2001:db8:1:2::3");
+            handler.handle(third);
+
+            assertThat(calls).hasValue(2);
+            verify(third).sendResponseHeaders(eq(429), anyLong());
+        }
+
+        @Test
+        @DisplayName("leaves a separate prefix its own budget")
+        void anUnrelatedPrefixIsNotCharged() throws IOException {
+            ApiSecurityConfig config = ApiSecurityConfig.builder()
+                .readBudget(1.0, 1.0)
+                .build();
+            RequestGuard guard = new RequestGuard(config);
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(exchangeFrom("2001:db8:1:2::1"));
+            handler.handle(exchangeFrom("2001:db8:1:3::1"));
+
+            assertThat(calls).hasValue(2);
+        }
+    }
+
     private static ApiSecurityConfig withToken() {
         return ApiSecurityConfig.builder().authToken(TOKEN).build();
     }
 
     private static HttpHandler countingHandler(AtomicInteger calls) {
         return exchange -> calls.incrementAndGet();
+    }
+
+    private static HttpExchange exchangeFrom(String remoteAddress) {
+        HttpExchange exchange = exchange(null);
+        when(exchange.getRemoteAddress())
+            .thenReturn(new InetSocketAddress(remoteAddress, 51234));
+        return exchange;
     }
 
     private static HttpExchange exchange(String authorization) {

@@ -378,8 +378,8 @@ class TailScanIntegrationTest {
      * Test: Verify TailScanner can extract vectors encoded with text.
      *
      * <p>This test verifies that TailScanner.extractVector() correctly handles
-     * values that contain both a vector and text (the production format from
-     * DocumentChunkBuffer.encodeChunkWithEmbedding()).</p>
+     * values that contain both a vector and text - the production format, written by
+     * {@code ChunkPayloadCodec.encode(String, float[])}.</p>
      */
     @Test
     void testTailScannerHandlesTextInValue() throws IOException {

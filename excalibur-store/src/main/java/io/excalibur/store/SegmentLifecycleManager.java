@@ -89,6 +89,14 @@ public class SegmentLifecycleManager implements AutoCloseable {
     private volatile ReclamationCallback reclamationCallback;
 
     /**
+     * Answers, for a segment still in {@link LifecycleState#INDEXING}, whether its index has
+     * absorbed everything written to it. Supplied by the owning engine, which is the only
+     * component that holds both the segment's write log and its integration checkpoint.
+     * When null no segment is advanced out of {@code INDEXING}.
+     */
+    private volatile IndexingCompletionProbe indexingCompletionProbe;
+
+    /**
      * Source of the current visibility epoch, injected by the owning engine.
      * When null the scheduled reclamation check falls back to a wall-clock grace period.
      */
@@ -120,6 +128,25 @@ public class SegmentLifecycleManager implements AutoCloseable {
          * @return true if the segment was purged successfully
          */
         boolean onReclamationReady(long segmentId);
+    }
+
+    /**
+     * Reports whether a segment's index has caught up with the segment.
+     *
+     * <p>{@code INDEXING} is the one lifecycle state this manager cannot leave on evidence the
+     * catalog holds: the catalog records how many entries a segment has, not how much of its
+     * write log the HNSW graph and pre-filter have absorbed. The owning engine supplies that
+     * answer through this probe.</p>
+     */
+    @FunctionalInterface
+    public interface IndexingCompletionProbe {
+        /**
+         * Called for each segment in {@link LifecycleState#INDEXING}.
+         *
+         * @param segmentId The segment to judge
+         * @return true if the segment's index speaks for every entry the segment holds
+         */
+        boolean isIndexingComplete(long segmentId);
     }
 
     /**
@@ -181,9 +208,18 @@ public class SegmentLifecycleManager implements AutoCloseable {
     }
 
     /**
-     * Sets the callback for reclamation operations.
+     * Sets the probe consulted for segments in {@link LifecycleState#INDEXING}.
      *
-     * @param callback The reclamation callback
+     * @param probe The probe, or null to leave indexing segments where they are
+     */
+    public void setIndexingCompletionProbe(IndexingCompletionProbe probe) {
+        this.indexingCompletionProbe = probe;
+    }
+
+    /**
+     * Sets the reclamation callback.
+     *
+     * @param callback The callback to invoke when a segment can be purged
      */
     public void setReclamationCallback(ReclamationCallback callback) {
         this.reclamationCallback = callback;
@@ -359,10 +395,45 @@ public class SegmentLifecycleManager implements AutoCloseable {
      */
     private void performLifecycleCheck() {
         try {
+            checkForIndexingCompletion();
             checkForCompactionCandidates();
             checkForReclamationCandidates();
         } catch (Exception e) {
             logger.error("Error during lifecycle check", e);
+        }
+    }
+
+    /**
+     * Advances every segment whose index has caught up with it out of {@code INDEXING}.
+     *
+     * <p>A segment enters {@code INDEXING} the moment it is created and nothing else in the
+     * engine takes it out again: the states after it are reached by workers that select on
+     * {@code ACTIVE} or {@code WARMING} and so never see a segment that is still indexing.
+     * Without this sweep a live-ingested segment stays partially indexed for the life of the
+     * process, and compaction, PQ training and scheduled reindexing never run at all.</p>
+     *
+     * <p>Public so the sweep can be driven directly by a caller that does not want to wait for
+     * the scheduler; the scheduled {@link #performLifecycleCheck()} calls it on every tick.</p>
+     */
+    public void checkForIndexingCompletion() {
+        IndexingCompletionProbe probe = this.indexingCompletionProbe;
+        if (probe == null) {
+            return;
+        }
+
+        for (Long segmentId : catalog.getSegmentsByState(LifecycleState.INDEXING)) {
+            try {
+                if (probe.isIndexingComplete(segmentId)) {
+                    completeIndexing(segmentId);
+                }
+            } catch (RuntimeException e) {
+                // The probe reads live engine state and the catalog listing is a snapshot, so a
+                // segment can be retired between the two. That is one segment's answer, not the
+                // sweep's: letting it escape would retire the transition for every segment
+                // behind it on this tick, and the next tick would fail the same way.
+                logger.warn("Could not advance segment {} out of INDEXING: {}",
+                    segmentId, e.getMessage());
+            }
         }
     }
 

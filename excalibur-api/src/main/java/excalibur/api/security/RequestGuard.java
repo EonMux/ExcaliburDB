@@ -192,10 +192,7 @@ public final class RequestGuard {
      */
     static String clientKey(HttpExchange exchange) {
         InetSocketAddress remote = exchange.getRemoteAddress();
-        if (remote == null || remote.getAddress() == null) {
-            return "unknown";
-        }
-        return remote.getAddress().getHostAddress();
+        return ClientAddressKey.of(remote == null ? null : remote.getAddress());
     }
 
     private static void sendJson(HttpExchange exchange, int statusCode, String message) throws IOException {

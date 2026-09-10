@@ -375,6 +375,49 @@ class QueryEndpointTest {
             assertThat(capturedRequest.topK()).isEqualTo(10); // Hardcoded default
         }
 
+        @Test
+        @DisplayName("a request that omits threshold gets the configured score floor")
+        void usesConfiguredThreshold() throws Exception {
+            Config mockConfig = createMockConfig();
+            when(mockConfig.query().getThreshold()).thenReturn(0.42);
+            QueryEndpoint endpointWithConfig = new QueryEndpoint(
+                queryPipeline, mockConfig, null, null, embeddingClient);
+
+            QueryRequest captured = capture(endpointWithConfig, "{\"query\": \"test\"}");
+
+            assertThat(captured.threshold())
+                .as("excalibur.query.threshold is the floor for requests that name none; a "
+                    + "setting an operator can change and the server never reads is a trap")
+                .isEqualTo(0.42f);
+        }
+
+        @Test
+        @DisplayName("a threshold in the request overrides the configured one")
+        void requestThresholdWins() throws Exception {
+            Config mockConfig = createMockConfig();
+            when(mockConfig.query().getThreshold()).thenReturn(0.42);
+            QueryEndpoint endpointWithConfig = new QueryEndpoint(
+                queryPipeline, mockConfig, null, null, embeddingClient);
+
+            QueryRequest captured =
+                capture(endpointWithConfig, "{\"query\": \"test\", \"threshold\": 0.1}");
+
+            assertThat(captured.threshold()).isEqualTo(0.1f);
+        }
+
+        /** Runs one request through the endpoint and returns what reached the pipeline. */
+        private QueryRequest capture(QueryEndpoint endpoint, String json) throws Exception {
+            ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody("POST", json, responseBody);
+            ArgumentCaptor<QueryRequest> requestCaptor =
+                ArgumentCaptor.forClass(QueryRequest.class);
+            when(queryPipeline.execute(requestCaptor.capture(), any(CancellationToken.class)))
+                .thenReturn(CompletableFuture.completedFuture(createMockResponse()));
+
+            endpoint.handle(exchange);
+
+            return requestCaptor.getValue();
+        }
     }
 
     // Helper method to create mock Config with standard setup
@@ -385,6 +428,7 @@ class QueryEndpointTest {
         when(mockQueryConfig.getDefaultTopK()).thenReturn(10);
         when(mockQueryConfig.getLlmTimeoutMs()).thenReturn(30000);
         when(mockQueryConfig.getRecallTarget()).thenReturn(0.95);
+        when(mockQueryConfig.getThreshold()).thenReturn(0.0);
         when(mockQueryConfig.getVectorDimensions()).thenReturn(-1);
         when(mockQueryConfig.isIncludePartialSegments()).thenReturn(true);
 
@@ -523,12 +567,141 @@ class QueryEndpointTest {
         }
 
         @Test
+        @DisplayName("reports the same coverage fields as vector search, so a client need not "
+            + "branch on which path answered")
+        void coverageIsTheSameShapeAsVectorSearch(
+                @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody(
+                "POST", "{\"query\": \"memory limit\"}", body);
+
+            withLexical(dir).handle(exchange);
+
+            String json = body.toString(StandardCharsets.UTF_8);
+            assertThat(json)
+                .as("without these an empty answer reads the same whether the node searched "
+                    + "the whole corpus and found nothing or never looked")
+                .contains("\"segments_searched\": ")
+                .contains("\"segments_excluded\": ")
+                .contains("\"segments_with_errors\": ")
+                .contains("\"segments_timed_out\": ")
+                .contains("\"total_segments\": ")
+                .contains("\"active_segments\": ")
+                .contains("\"tail_scan_entries\": ");
+        }
+
+        @Test
+        @DisplayName("says it searched the segment it actually holds, not a hardcoded 1.0")
+        void coverageDescribesTheIndexItSearched(
+                @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody(
+                "POST", "{\"query\": \"memory limit\"}", body);
+
+            withLexical(dir).handle(exchange);
+
+            String json = body.toString(StandardCharsets.UTF_8);
+            assertThat(json).contains("\"segments_searched\": 1");
+            assertThat(json).contains("\"total_segments\": 1");
+        }
+
+        @Test
+        @DisplayName("an empty index reports it covered nothing rather than everything")
+        void anEmptyIndexDoesNotClaimFullCoverage(
+                @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+            excalibur.ingest.lexical.ChunkLexicalIndex index =
+                excalibur.ingest.lexical.ChunkLexicalIndex.open(dir, 8.0);
+            QueryEndpoint endpoint = new QueryEndpoint(queryPipeline, null, null, null, null);
+            endpoint.setLexicalQueryService(new excalibur.api.retrieval.LexicalQueryService(
+                index, null, java.util.List.of()));
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody(
+                "POST", "{\"query\": \"memory limit\"}", body);
+
+            endpoint.handle(exchange);
+
+            assertThat(body.toString(StandardCharsets.UTF_8))
+                .as("an empty answer at full coverage would read as proof the corpus lacks "
+                    + "the term")
+                .contains("\"estimated_corpus_coverage\": 0");
+        }
+
+        @Test
         @DisplayName("a malformed body is still a 400, not a silent empty result")
         void malformedBodyStillRejected(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir)
                 throws Exception {
             HttpExchange exchange = createMockExchange("POST", "{\"top_k\": 3}");
 
             withLexical(dir).handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(400), anyLong());
+        }
+    }
+
+    @Nested
+    @DisplayName("Query length")
+    class QueryLength {
+
+        /**
+         * The other bounds on this endpoint exist because the value sizes something inside the
+         * process. This one exists because the value leaves it: the query text is the body of an
+         * embedding call and, on the lexical path, of an expansion call, so an unbounded query is
+         * an outbound request whose size the caller chooses and the operator pays for.
+         */
+        @Test
+        @DisplayName("refuses a query longer than the bound, and names the bound")
+        void refusesAnOversizedQuery() throws IOException {
+            QueryEndpoint bounded = new QueryEndpoint(queryPipeline, null, null, null,
+                embeddingClient, excalibur.api.security.ApiSecurityConfig.builder()
+                    .maxQueryChars(16).build());
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody(
+                "POST", "{\"query\": \"" + "x".repeat(17) + "\"}", body);
+
+            bounded.handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(400), anyLong());
+            assertThat(body.toString(StandardCharsets.UTF_8))
+                .as("a caller has to be able to shorten the query without guessing by how much")
+                .contains("query")
+                .contains("16");
+        }
+
+        @Test
+        @DisplayName("accepts a query exactly at the bound")
+        void acceptsAQueryAtTheBound() throws IOException {
+            when(queryPipeline.execute(any(QueryRequest.class), any(CancellationToken.class)))
+                .thenReturn(CompletableFuture.completedFuture(createMockResponse()));
+            QueryEndpoint bounded = new QueryEndpoint(queryPipeline, null, null, null,
+                embeddingClient, excalibur.api.security.ApiSecurityConfig.builder()
+                    .maxQueryChars(16).build());
+            HttpExchange exchange = createMockExchange(
+                "POST", "{\"query\": \"" + "x".repeat(16) + "\"}");
+
+            bounded.handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(200), anyLong());
+        }
+
+        @Test
+        @DisplayName("the lexical path applies the same bound")
+        void theLexicalPathIsBoundedToo(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir)
+                throws Exception {
+            // The two retrieval paths read and parse the body in different places, and a bound
+            // that only one of them applied would leave the expansion call - the one a chat model
+            // is billed for - unbounded on the path that makes it.
+            excalibur.ingest.lexical.ChunkLexicalIndex index =
+                excalibur.ingest.lexical.ChunkLexicalIndex.open(dir, 8.0);
+            index.add("kb:oom.txt:chunk:0", "the kernel OOM killer sent SIGKILL");
+            index.refresh();
+            QueryEndpoint bounded = new QueryEndpoint(queryPipeline, null, null, null, null,
+                excalibur.api.security.ApiSecurityConfig.builder().maxQueryChars(16).build());
+            bounded.setLexicalQueryService(new excalibur.api.retrieval.LexicalQueryService(
+                index, null, java.util.List.of()));
+            HttpExchange exchange = createMockExchange(
+                "POST", "{\"query\": \"" + "x".repeat(17) + "\"}");
+
+            bounded.handle(exchange);
 
             verify(exchange).sendResponseHeaders(eq(400), anyLong());
         }

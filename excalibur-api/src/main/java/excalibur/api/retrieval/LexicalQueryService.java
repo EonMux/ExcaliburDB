@@ -71,6 +71,18 @@ public final class LexicalQueryService {
     }
 
     /**
+     * The index's own account of itself.
+     *
+     * <p>What a query covered is derived from this rather than assumed, so an answer from an
+     * empty or partial index is not reported as an answer from the whole corpus.</p>
+     *
+     * @return The stats the index reports
+     */
+    public excalibur.ingest.lexical.ChunkIndexStats stats() {
+        return chunks.stats();
+    }
+
+    /**
      * Retrieves chunk identifiers for a query.
      *
      * @param queryText The user's query
@@ -107,7 +119,12 @@ public final class LexicalQueryService {
         }
     }
 
-    /** How many chunks are lexically searchable. */
+    /**
+     * How many chunks this node has handed to the index since it opened.
+     *
+     * <p>Not the size of the corpus: an index reopened over a populated store has been handed
+     * nothing yet and answers zero. {@link #stats()} reports the searchable count.</p>
+     */
     public long indexedChunks() {
         return chunks.indexedCount();
     }

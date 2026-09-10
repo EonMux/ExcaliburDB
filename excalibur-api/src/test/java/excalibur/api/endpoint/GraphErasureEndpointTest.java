@@ -22,6 +22,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
@@ -44,11 +45,13 @@ import static org.mockito.Mockito.when;
 @DisplayName("Graph erasure endpoint")
 class GraphErasureEndpointTest {
 
+    private Path root;
     private GraphTenants tenants;
     private GraphErasureEndpoint endpoint;
 
     @BeforeEach
     void setUp(@TempDir Path root) throws IOException {
+        this.root = root;
         Config config = new Config(new HashMap<>(Map.of("excalibur.graph.ram-buffer-mb", "4.0")));
         tenants = new GraphTenants(root, config, MappingBudget.detect(), 4);
         endpoint = new GraphErasureEndpoint(tenants);
@@ -284,6 +287,54 @@ class GraphErasureEndpointTest {
             assertThat(Json.stringAt(response.json(), "error"))
                 .contains("SPREADSHEET")
                 .contains("DOCUMENT");
+        }
+
+        @Test
+        @DisplayName("an extractor version outside the range the store holds is refused, "
+            + "not silently truncated")
+        void anOutOfRangeExtractorVersionIsRefused() throws IOException {
+            // The store keeps the version in 32 bits. Narrowing 2^32 + 1 gives 1, so a request
+            // that names a version this node has never heard of would be accepted as an
+            // obligation to erase everything version 1 ever extracted - destructively, and with
+            // "accepted": true reported to the caller.
+            Response response = post("{\"scope\": \"extractor\", \"version\": 4294967297}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(Json.stringAt(response.json(), "error")).contains("version");
+        }
+
+        @Test
+        @DisplayName("a negative extractor version is refused")
+        void aNegativeExtractorVersionIsRefused() throws IOException {
+            Response response = post("{\"scope\": \"extractor\", \"version\": -3}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(Json.stringAt(response.json(), "error")).contains("version");
+        }
+
+        @Test
+        @DisplayName("the largest version the store can hold is still accepted")
+        void theBoundaryItselfIsNotRefused() throws IOException {
+            assertThat(post("{\"scope\": \"extractor\", \"version\": 2147483647}").status())
+                .isEqualTo(202);
+        }
+
+        @Test
+        @DisplayName("a namespace that cannot be opened is answered, and answered without "
+            + "describing the filesystem")
+        void anUnopenableNamespaceIsStillAnswered() throws IOException {
+            // A regular file where the namespace's directory belongs. The registry wraps the
+            // failure as an UncheckedIOException, which is not an IOException - so a handler
+            // that catches only the latter never answers at all, and the caller sees the
+            // connection close rather than a status.
+            Files.writeString(root.resolve("acme"), "not a directory");
+
+            Response response = call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}", "acme");
+
+            assertThat(response.status()).isEqualTo(500);
+            assertThat(Json.stringAt(response.json(), "error"))
+                .as("the path it failed on belongs in the log, not in the response")
+                .isEqualTo("Internal Server Error");
         }
 
         @Test

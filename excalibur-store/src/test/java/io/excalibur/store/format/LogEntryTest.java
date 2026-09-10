@@ -8,6 +8,7 @@ import org.junit.jupiter.api.AfterEach;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
@@ -33,8 +34,32 @@ class LogEntryTest {
     private static final String TEST_KEY = "test-key";
     private static final String TEST_VALUE = "test-value";
     private static final long TEST_LSN = 12345L;
-    private static final long TEST_TIMESTAMP = System.currentTimeMillis();
+    /**
+     * A fixed millisecond timestamp, so an entry's bytes are the same on every run.
+     *
+     * <p>The value is chosen so that the second byte of the encoded timestamp - offset 10 of an
+     * entry, and the byte the CRC tests corrupt - is already {@code 0xFF}. That is the case a
+     * corruption written as an assignment cannot express, and pinning it here means such a
+     * corruption fails on every run instead of on one run in 256.</p>
+     */
+    private static final long TEST_TIMESTAMP = 1700000038656L;
     private static final long TEST_KEY_HASH = 12345678901234L;
+
+    /**
+     * Corrupts one byte of an entry by inverting it.
+     *
+     * <p>Assigning a chosen value instead corrupts nothing on the runs where the byte already
+     * held it, and the CRC then validates - so the assertion that corruption is detected fails
+     * on data the test did not choose. Inverting is the operation these tests actually mean:
+     * whatever was there, something else is there now.</p>
+     *
+     * @param segment The entry's memory
+     * @param offset  The byte to corrupt
+     */
+    private static void corruptByte(MemorySegment segment, long offset) {
+        byte original = segment.get(ValueLayout.JAVA_BYTE, offset);
+        segment.set(ValueLayout.JAVA_BYTE, offset, (byte) ~original);
+    }
 
     private Arena arena;
     private Path tempFile;
@@ -462,8 +487,7 @@ class LogEntryTest {
             MemorySegment segment = arena.allocate(entry.size());
             entry.writeTo(segment, 0);
 
-            // Corrupt a byte
-            segment.set(java.lang.foreign.ValueLayout.JAVA_BYTE, 5, (byte) 0xFF);
+            corruptByte(segment, 5);
 
             assertThrows(IllegalStateException.class, () ->
                 LogEntry.readFrom(segment, 0));
@@ -479,8 +503,7 @@ class LogEntryTest {
             MemorySegment segment = arena.allocate(entry.size());
             entry.writeTo(segment, 0);
 
-            // Corrupt a byte
-            segment.set(java.lang.foreign.ValueLayout.JAVA_BYTE, 5, (byte) 0xFF);
+            corruptByte(segment, 5);
 
             // Should not throw - unchecked read
             LogEntry read = LogEntry.readFromUnchecked(segment, 0);
@@ -510,8 +533,7 @@ class LogEntryTest {
             MemorySegment segment = arena.allocate(entry.size());
             entry.writeTo(segment, 0);
 
-            // Corrupt a byte
-            segment.set(java.lang.foreign.ValueLayout.JAVA_BYTE, 10, (byte) 0xFF);
+            corruptByte(segment, 10);
 
             assertFalse(LogEntry.validateCrc32(segment, 0));
         }
@@ -1006,8 +1028,7 @@ class LogEntryTest {
             MemorySegment segment = arena.allocate(entry.size());
             entry.writeTo(segment, 0);
 
-            // Corrupt header byte
-            segment.set(java.lang.foreign.ValueLayout.JAVA_BYTE, 5, (byte) 0xFF);
+            corruptByte(segment, 5);
 
             assertFalse(LogEntry.validateCrc32(segment, 0));
         }
@@ -1022,9 +1043,7 @@ class LogEntryTest {
             MemorySegment segment = arena.allocate(entry.size());
             entry.writeTo(segment, 0);
 
-            // Corrupt key byte
-            int keyOffset = LogEntry.KEY_BYTES_OFFSET;
-            segment.set(java.lang.foreign.ValueLayout.JAVA_BYTE, keyOffset, (byte) 0xFF);
+            corruptByte(segment, LogEntry.KEY_BYTES_OFFSET);
 
             assertFalse(LogEntry.validateCrc32(segment, 0));
         }
@@ -1039,9 +1058,7 @@ class LogEntryTest {
             MemorySegment segment = arena.allocate(entry.size());
             entry.writeTo(segment, 0);
 
-            // Corrupt value byte
-            int valueOffset = LogEntry.KEY_BYTES_OFFSET + key.length;
-            segment.set(java.lang.foreign.ValueLayout.JAVA_BYTE, valueOffset, (byte) 0xFF);
+            corruptByte(segment, LogEntry.KEY_BYTES_OFFSET + key.length);
 
             assertFalse(LogEntry.validateCrc32(segment, 0));
         }

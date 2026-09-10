@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Every namespace's graph, bounded by what the kernel will let this process map.
@@ -95,6 +96,22 @@ public final class GraphTenants implements AutoCloseable {
      */
     public NamespaceRegistry.Lease<GraphTenant> borrow(NamespaceId id) {
         return registry.borrow(Objects.requireNonNull(id, "id must not be null"));
+    }
+
+    /**
+     * Borrows a namespace's graph for one operation, but only if the namespace already exists.
+     *
+     * <p>For the operations that read. Opening a tenant writes its staging directory, takes one of
+     * the {@code maxOpen} slots and a share of the mapping budget, and evicts the least recently
+     * used graph to get them - so a read that opened would let a caller spend all three on any name
+     * it cared to put in the {@value #NAMESPACE_HEADER} header. The operations that populate a
+     * namespace still use {@link #borrow(NamespaceId)}: creating one is what they are for.</p>
+     *
+     * @param id The namespace
+     * @return The lease, or empty if no such namespace has been created; close it when done
+     */
+    public Optional<NamespaceRegistry.Lease<GraphTenant>> borrowIfPresent(NamespaceId id) {
+        return registry.borrowIfPresent(Objects.requireNonNull(id, "id must not be null"));
     }
 
     /**

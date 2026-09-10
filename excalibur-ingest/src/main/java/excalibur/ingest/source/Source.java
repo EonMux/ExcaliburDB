@@ -48,6 +48,17 @@ import java.util.stream.Stream;
 public interface Source extends Closeable {
 
     /**
+     * Longest source id an implementation accepts, in characters.
+     *
+     * <p>An id is not free text and not a path. It is copied into every document's registry
+     * record, written into the source catalog, and printed with every log line about the source,
+     * so its length is multiplied by the size of the corpus rather than by the number of times it
+     * is sent. This leaves room for a descriptive name - a team, a repository, a dated archive -
+     * and none for a payload.</p>
+     */
+    int MAX_ID_LENGTH = 256;
+
+    /**
      * Returns a unique identifier for this source.
      *
      * <p>The source ID is used to track which documents came from which source,
@@ -58,7 +69,7 @@ public interface Source extends Closeable {
      *   <li>Must be non-null and non-empty</li>
      *   <li>Should be stable across restarts (not randomly generated)</li>
      *   <li>Should be URL-safe (alphanumeric, dash, underscore)</li>
-     *   <li>Maximum length: 256 characters</li>
+     *   <li>Maximum length: {@value #MAX_ID_LENGTH} characters</li>
      * </ul>
      *
      * @return Unique source identifier (e.g., "filesystem-docs", "https-api-example-com")

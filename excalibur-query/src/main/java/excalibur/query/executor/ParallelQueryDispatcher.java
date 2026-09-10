@@ -394,7 +394,7 @@ public class ParallelQueryDispatcher {
      * @param queryVector The query vector
      * @param options Query options
      * @param distanceFunction The distance function
-     * @return DispatchResult with raw segment results, merged results, and coverage
+     * @return DispatchResult with the raw per-segment results and coverage
      */
     public DispatchResult dispatchRaw(
             float[] queryVector,
@@ -420,7 +420,6 @@ public class ParallelQueryDispatcher {
                 .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
                 .build();
             return new DispatchResult(
-                List.of(),
                 List.of(),
                 coverage,
                 0
@@ -461,7 +460,6 @@ public class ParallelQueryDispatcher {
                 .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
                 .build();
             return new DispatchResult(
-                List.of(),
                 List.of(),
                 coverage,
                 (System.nanoTime() - startTime) / 1_000_000
@@ -526,21 +524,16 @@ public class ParallelQueryDispatcher {
             }
         }
 
-        // Aggregate results
-        ResultAggregator aggregator = new ResultAggregator(options);
-        List<QueryResultItem> mergedResults = aggregator.mergeAndRank(segmentResults);
-
         // Build coverage
         IndexCoverage coverage = buildCoverage(segmentResults, segmentsTimedOut, selection.excluded());
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 
-        LOGGER.trace("Query completed: {} results, {}ms, coverage={}",
-            mergedResults.size(), durationMs, coverage.estimatedCorpusCoverage());
+        LOGGER.trace("Query completed: {} segments, {}ms, coverage={}",
+            segmentResults.size(), durationMs, coverage.estimatedCorpusCoverage());
 
         return new DispatchResult(
             segmentResults,
-            mergedResults,
             coverage,
             durationMs
         );
@@ -549,24 +542,22 @@ public class ParallelQueryDispatcher {
     /**
      * Result of a parallel dispatch operation.
      *
-     * <p>Contains both the raw segment results and the merged/aggregated results.</p>
+     * <p>Per-segment results, unmerged. Merging belongs to the caller, because only the caller
+     * knows what scale the scores have to end up on: {@link excalibur.query.pipeline.QueryPipeline}
+     * normalises each distance to [0, 1] before it ranks or filters, and a merge performed here
+     * would either be discarded or, worse, applied a second time on the raw distance scale.</p>
      */
     public static final class DispatchResult {
         private final List<SegmentQueryTask.SegmentQueryResult> segmentResults;
-        private final List<QueryResultItem> mergedResults;
         private final IndexCoverage coverage;
         private final long durationMs;
 
         public DispatchResult(
                 List<SegmentQueryTask.SegmentQueryResult> segmentResults,
-                List<QueryResultItem> mergedResults,
                 IndexCoverage coverage,
                 long durationMs) {
             this.segmentResults = segmentResults != null
                 ? List.copyOf(segmentResults)
-                : List.of();
-            this.mergedResults = mergedResults != null
-                ? List.copyOf(mergedResults)
                 : List.of();
             this.coverage = coverage;
             this.durationMs = durationMs;
@@ -577,13 +568,6 @@ public class ParallelQueryDispatcher {
          */
         public List<SegmentQueryTask.SegmentQueryResult> segmentResults() {
             return segmentResults;
-        }
-
-        /**
-         * Returns the merged and ranked results from all segments.
-         */
-        public List<QueryResultItem> mergedResults() {
-            return mergedResults;
         }
 
         /**
@@ -673,7 +657,7 @@ public class ParallelQueryDispatcher {
      * @param queryVector The query vector
      * @param options Query options
      * @param distanceFunction The distance function
-     * @return DispatchResult with raw segment results, merged results, and coverage
+     * @return DispatchResult with the raw per-segment results and coverage
      */
     public DispatchResult dispatchToSpecificSegments(
             List<SegmentInfo> segmentsToSearch,
@@ -695,7 +679,6 @@ public class ParallelQueryDispatcher {
                 .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
                 .build();
             return new DispatchResult(
-                List.of(),
                 List.of(),
                 coverage,
                 0
@@ -735,7 +718,6 @@ public class ParallelQueryDispatcher {
                 .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
                 .build();
             return new DispatchResult(
-                List.of(),
                 List.of(),
                 coverage,
                 (System.nanoTime() - startTime) / 1_000_000
@@ -800,21 +782,16 @@ public class ParallelQueryDispatcher {
             }
         }
 
-        // Aggregate results
-        ResultAggregator aggregator = new ResultAggregator(options);
-        List<QueryResultItem> mergedResults = aggregator.mergeAndRank(segmentResults);
-
         // Build coverage
         IndexCoverage coverage = buildCoverageForSpecificSegments(segmentResults, segmentsTimedOut);
 
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
 
-        LOGGER.trace("Query completed: {} results, {}ms, coverage={}",
-            mergedResults.size(), durationMs, coverage.estimatedCorpusCoverage());
+        LOGGER.trace("Query completed: {} segments, {}ms, coverage={}",
+            segmentResults.size(), durationMs, coverage.estimatedCorpusCoverage());
 
         return new DispatchResult(
             segmentResults,
-            mergedResults,
             coverage,
             durationMs
         );

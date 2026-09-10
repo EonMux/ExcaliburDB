@@ -22,6 +22,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
@@ -44,11 +45,13 @@ import static org.mockito.Mockito.when;
 @DisplayName("Graph build endpoint")
 class GraphBuildEndpointTest {
 
+    private Path root;
     private GraphTenants tenants;
     private GraphBuildEndpoint endpoint;
 
     @BeforeEach
     void setUp(@TempDir Path root) throws IOException {
+        this.root = root;
         Config config = new Config(new HashMap<>(Map.of("excalibur.graph.ram-buffer-mb", "4.0")));
         tenants = new GraphTenants(root, config, MappingBudget.detect(), 4);
         endpoint = new GraphBuildEndpoint(tenants);
@@ -86,6 +89,24 @@ class GraphBuildEndpointTest {
         ArgumentCaptor<Integer> status = ArgumentCaptor.forClass(Integer.class);
         verify(exchange).sendResponseHeaders(status.capture(), anyLong());
         return new Response(status.getValue(), out.toString(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    @DisplayName("a namespace that cannot be opened is answered, and answered without "
+        + "describing the filesystem")
+    void anUnopenableNamespaceIsStillAnswered() throws IOException {
+        // A regular file where the namespace's directory belongs. The registry wraps the
+        // failure as an UncheckedIOException, which is not an IOException - so a handler that
+        // catches only the latter never answers at all, and the caller sees the connection
+        // close rather than a status.
+        Files.writeString(root.resolve("acme"), "not a directory");
+
+        Response response = call("POST", "acme");
+
+        assertThat(response.status()).isEqualTo(500);
+        assertThat(Json.stringAt(response.json(), "error"))
+            .as("the path it failed on belongs in the log, not in the response")
+            .isEqualTo("Internal Server Error");
     }
 
     @Test

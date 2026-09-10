@@ -52,12 +52,16 @@ class DocumentErasureEndpointTest {
         storage.clear();
         registry = new DocumentRegistry();
         sources = new InMemorySourceRegistry();
-        UpsertHandler.StorageAdapter adapter =
-            key -> storage.remove(new String(key, StandardCharsets.UTF_8)) != null;
+        UpsertHandler.StorageAdapter adapter = storageAdapter();
         // No lexical index: this test is about the endpoint's contract, and the service's own
         // tests cover what an index adds to it.
         endpoint = new DocumentErasureEndpoint(
             new DocumentErasureService(registry, adapter, null, null), sources);
+    }
+
+    /** Erasure's reach into storage: this test's map stands in for the chunks on disk. */
+    private UpsertHandler.StorageAdapter storageAdapter() {
+        return key -> storage.remove(new String(key, StandardCharsets.UTF_8)) != null;
     }
 
     /** Registers a crawlable source, so a source-scoped erasure has one to take out of the crawl. */
@@ -209,6 +213,28 @@ class DocumentErasureEndpointTest {
         }
 
         @Test
+        @DisplayName("a deregistration that could not be recorded erases nothing")
+        void anUnrecordableDeregistrationErasesNothing() throws IOException {
+            // The source comes out of the crawl first precisely so nothing restores what is
+            // being erased. When that step fails the documents have to stay: erasing them and
+            // leaving the source scheduled reports an obligation as met and then undoes it.
+            SourceRegistry refusing = mock(SourceRegistry.class);
+            when(refusing.remove("docs"))
+                .thenThrow(new SourceCatalogException("catalog is unwritable", new IOException()));
+            endpoint = new DocumentErasureEndpoint(
+                new DocumentErasureService(registry, storageAdapter(), null, null), refusing);
+            ingest("docs", "a.md", 1);
+
+            Response response = post("{\"source_id\": \"docs\", \"scope\": \"source\"}");
+
+            assertThat(response.status()).isEqualTo(503);
+            assertThat(storage).as("the documents are still there to erase on a retry").isNotEmpty();
+            assertThat(response.body())
+                .as("the reply names no path on this node")
+                .doesNotContain("catalog is unwritable");
+        }
+
+        @Test
         @DisplayName("a source that was not registered is reported as such, not as an error")
         void unregisteredSourceIsReported() throws IOException {
             ingest("docs", "a.md", 1);
@@ -304,6 +330,20 @@ class DocumentErasureEndpointTest {
                 .isEqualTo(400);
             assertThat(post("{\"source_id\": \"docs\", \"document_ids\": []}").status())
                 .isEqualTo(400);
+        }
+
+        @Test
+        @DisplayName("a source id longer than one could be registered under is refused")
+        void oversizedSourceIdIsRefused() throws IOException {
+            String sourceId = "x".repeat(Source.MAX_ID_LENGTH + 1);
+
+            Response response = post(
+                "{\"source_id\": \"" + sourceId + "\", \"document_id\": \"a.md\"}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(Json.stringAt(response.json(), "error"))
+                .contains("source_id")
+                .contains(String.valueOf(Source.MAX_ID_LENGTH));
         }
 
         @Test

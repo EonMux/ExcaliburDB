@@ -516,8 +516,10 @@ public final class Config {
         // Default recall target
         public static final double DEFAULT_RECALL_TARGET = 0.95;
 
-        // Default threshold for filtering results
-        public static final double DEFAULT_THRESHOLD = 0.3;
+        // Default score floor for queries that name none. Zero means no filtering: a query
+        // that returns nothing because of a floor nobody chose is harder to diagnose than one
+        // that returns weak results.
+        public static final double DEFAULT_THRESHOLD = 0.0;
 
         // Default vector dimensions
         public static final int DEFAULT_VECTOR_DIMENSIONS = 1536;
@@ -623,6 +625,7 @@ public final class Config {
      *   <li><code>excalibur.llm.model</code> - Legacy generic model name (default: text-embedding-ada-002)</li>
      *   <li><code>excalibur.llm.chat-model</code> - Model for chat completions (default: gpt-4o-mini)</li>
      *   <li><code>excalibur.llm.embedding-model</code> - Model for embeddings (default: text-embedding-3-small)</li>
+     *   <li><code>excalibur.llm.embeddings-enabled</code> - Whether the corpus and queries are embedded (default: true)</li>
      *   <li><code>excalibur.llm.embeddings-dimensions</code> - Embedding vector dimensions (default: 1536)</li>
      *   <li><code>excalibur.llm.timeout-ms</code> - HTTP request timeout (default: 60000)</li>
      *   <li><code>excalibur.llm.max-retries</code> - Maximum retry attempts (default: 3)</li>
@@ -653,6 +656,12 @@ public final class Config {
 
         // Default embeddings dimensions
         public static final int DEFAULT_EMBEDDINGS_DIMENSIONS = 1536;
+
+        // Whether a configured key is spent on embedding the corpus. On by default: a key is
+        // normally set because vector retrieval is wanted. Turning it off keeps the chat model
+        // and drops the embedding pass, which is the lexical-only deployment - BM25 over the
+        // chunks with the model spent on expanding the query instead.
+        public static final boolean DEFAULT_EMBEDDINGS_ENABLED = true;
 
         // Default timeout in milliseconds
         public static final int DEFAULT_TIMEOUT_MS = 60000;
@@ -705,6 +714,7 @@ public final class Config {
         private final String chatModel;
         private final String embeddingModel;
         private final int embeddingsDimensions;
+        private final boolean embeddingsEnabled;
         private final int timeoutMs;
         private final int maxRetries;
         private final int failureThreshold;
@@ -726,6 +736,7 @@ public final class Config {
             this.chatModel = PropertyParser.parseString(props, "excalibur.llm.chat-model", DEFAULT_CHAT_MODEL);
             this.embeddingModel = PropertyParser.parseString(props, "excalibur.llm.embedding-model", DEFAULT_EMBEDDING_MODEL);
             this.embeddingsDimensions = PropertyParser.parseInt(props, "excalibur.llm.embeddings-dimensions", DEFAULT_EMBEDDINGS_DIMENSIONS);
+            this.embeddingsEnabled = PropertyParser.parseBoolean(props, "excalibur.llm.embeddings-enabled", DEFAULT_EMBEDDINGS_ENABLED);
             this.timeoutMs = PropertyParser.parseInt(props, "excalibur.llm.timeout-ms", DEFAULT_TIMEOUT_MS);
             this.maxRetries = PropertyParser.parseInt(props, "excalibur.llm.max-retries", DEFAULT_MAX_RETRIES);
             this.failureThreshold = PropertyParser.parseInt(props, "excalibur.llm.failure-threshold", DEFAULT_FAILURE_THRESHOLD);
@@ -771,6 +782,19 @@ public final class Config {
          */
         public String getEmbeddingModel() {
             return embeddingModel;
+        }
+
+        /**
+         * Whether this node embeds its corpus and its queries.
+         *
+         * <p>False leaves the key configured and the chat model reachable while producing no
+         * vectors, so retrieval is BM25 over the chunk index with the query expanded by the
+         * chat model. Meaningless without a key: nothing is embedded either way.</p>
+         *
+         * @return true if documents and query text are embedded
+         */
+        public boolean isEmbeddingsEnabled() {
+            return embeddingsEnabled;
         }
 
         /**

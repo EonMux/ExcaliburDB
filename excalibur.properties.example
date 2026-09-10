@@ -47,6 +47,10 @@ excalibur.api.rate-limit-max-clients=10000
 # Bounds applied to client-supplied query fields before they size anything server-side.
 excalibur.api.max-top-k=1000
 excalibur.api.max-query-timeout-ms=60000
+# The query text is embedded, and on the lexical path expanded, so its length is an outbound
+# call the caller sizes. The default is four times a chunk -- the largest unit anything in the
+# index was embedded as.
+excalibur.api.max-query-chars=8192
 
 # Transport Security
 # Setting a keystore turns TLS on. The keystore holds the server certificate and its
@@ -185,6 +189,11 @@ excalibur.llm.model=text-embedding-ada-002
 excalibur.llm.chat-model=gpt-4o-mini
 excalibur.llm.embedding-model=text-embedding-3-small
 excalibur.llm.embeddings-dimensions=1536
+# Whether a configured key is spent on embedding the corpus. Turning it off keeps the chat model
+# and drops the embedding pass: documents are chunked, stored and term-indexed, and /v1/query
+# answers from BM25 with the model spent on expanding the query. Worth it for a corpus of
+# identifiers, error codes or DOIs, where the literal token is the match.
+excalibur.llm.embeddings-enabled=true
 excalibur.llm.timeout-ms=60000
 excalibur.llm.max-retries=3
 excalibur.llm.failure-threshold=5

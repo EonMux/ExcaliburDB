@@ -258,11 +258,6 @@ public class NodeDocumentMapping {
     }
 
     /**
-     * Returns the number of registered mappings.
-     *
-     * @return Mapping count
-     */
-    /**
      * Whether this mapping is backed by a file.
      *
      * @return true when {@link #persist()} and {@link #load()} are available
@@ -271,6 +266,11 @@ public class NodeDocumentMapping {
         return persistent;
     }
 
+    /**
+     * Returns the number of registered mappings.
+     *
+     * @return Mapping count
+     */
     public int size() {
         return nodeToDocument.size();
     }

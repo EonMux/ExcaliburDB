@@ -127,14 +127,20 @@ class UnconfiguredSourceProbeTest {
     }
 
     @Test
-    @DisplayName("the status says what to configure")
+    @DisplayName("the status says where the reason is, and does not guess at one")
     void theReasonIsActionable() {
         String reason = probe(FakeSource.holding("a.md")).lastError();
 
         assertThat(reason).isNotNull();
         assertThat(reason)
             .as("an operator has to be able to act on this without reading the source")
-            .contains("excalibur.llm.api-key");
+            .contains("no ingestion pipeline")
+            .contains("startup log");
+        assertThat(reason)
+            .as("a missing API key is lexical-only ingestion, not this: naming it here sends an "
+                + "operator to set a key that would not have changed anything")
+            .doesNotContain("excalibur.llm.api-key")
+            .doesNotContain("EXCALIBUR_LLM_API_KEY");
     }
 
     @Test
@@ -157,7 +163,7 @@ class UnconfiguredSourceProbeTest {
         // Conflating the two would send an operator to fix an API key when the path is wrong.
         assertThat(status.lastError())
             .contains("permission denied")
-            .doesNotContain("excalibur.llm.api-key");
+            .doesNotContain("no ingestion pipeline");
         assertThat(status.state())
             .isNotEqualTo(IngestStatusEndpoint.IngestionStatus.STATE_UNCONFIGURED);
     }

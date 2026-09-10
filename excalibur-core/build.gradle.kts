@@ -1,7 +1,6 @@
 // excalibur-core (Phase 1) - Core Primitives
 plugins {
     `java-library`
-    `maven-publish`
 }
 
 
@@ -44,47 +43,6 @@ sourceSets {
     test {
         java {
             srcDir("src/test/java")
-        }
-    }
-}
-
-// Publishing configuration
-publishing {
-    publications {
-        create<MavenPublication>("mavenJava") {
-            from(components["java"])
-            
-            pom {
-                name.set("ExcaliburDB Core")
-                description.set("Core primitives for ExcaliburDB - Memory-mapped I/O, serialization, and utilities")
-                url.set("https://github.com/aeslampanah/excaliburdb")
-                
-                licenses {
-                    license {
-                        // Matches the LICENSE file at the repository root. The two are the
-                        // project's licence stated twice; they must not be allowed to drift.
-                        name.set("Apache License, Version 2.0")
-                        url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
-                        distribution.set("repo")
-                    }
-                }
-                
-                developers {
-                    developer {
-                        // No email: the field is optional, and the address here was
-                        // "amir.eslampanah@example.com", which is a reserved example domain and
-                        // so was never reachable by anyone who read it off a published artifact.
-                        id.set("aeslampanah")
-                        name.set("Amir Eslampanah")
-                    }
-                }
-                
-                scm {
-                    url.set("https://github.com/aeslampanah/excaliburdb")
-                    connection.set("scm:git:https://github.com/aeslampanah/excaliburdb.git")
-                    developerConnection.set("scm:git:git@github.com:aeslampanah/excaliburdb.git")
-                }
-            }
         }
     }
 }

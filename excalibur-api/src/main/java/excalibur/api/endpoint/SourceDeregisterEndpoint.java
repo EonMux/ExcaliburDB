@@ -74,8 +74,25 @@ public class SourceDeregisterEndpoint implements HttpHandler {
             ResponseBody.sendJson(exchange, 400, "{\"error\": \"'source_id' is required\"}");
             return;
         }
+        String violation = SourceIds.violation(sourceId, "source_id");
+        if (violation != null) {
+            ResponseBody.sendJson(exchange, 400,
+                "{\"error\": \"" + JsonText.escape(violation) + "\"}");
+            return;
+        }
 
-        boolean removed = sourceRegistry.remove(sourceId);
+        boolean removed;
+        try {
+            removed = sourceRegistry.remove(sourceId);
+        } catch (SourceCatalogException e) {
+            // The source is still registered and still being crawled. Reporting success here
+            // would leave the caller believing a crawl had stopped that restarts itself at the
+            // next boot; the detail is for the log, and the response names no path.
+            LOGGER.error("Source deregistration could not be recorded: {}", e.getMessage(), e);
+            ResponseBody.sendJson(exchange, SourceCatalogException.STATUS_CODE,
+                "{\"error\": \"" + SourceCatalogException.CLIENT_MESSAGE + "\"}");
+            return;
+        }
         if (!removed) {
             // 404, not a quiet success: a caller stopping a crawl needs to know whether they named
             // a source this node was actually crawling, or misspelled one that still is.

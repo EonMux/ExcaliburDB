@@ -44,6 +44,8 @@ import java.util.Set;
  *   <tr><td>{@code excalibur.api.rate-limit-max-clients}</td><td>Bound on tracked clients</td><td>10000</td></tr>
  *   <tr><td>{@code excalibur.api.max-top-k}</td><td>Upper bound on {@code top_k}</td><td>1000</td></tr>
  *   <tr><td>{@code excalibur.api.max-query-timeout-ms}</td><td>Upper bound on {@code timeout_ms}</td><td>60000</td></tr>
+ *   <tr><td>{@code excalibur.api.max-query-chars}</td>
+ *       <td>Upper bound on the length of {@code query}</td><td>8192</td></tr>
  *   <tr><td>{@code excalibur.ingest.allowed-roots}</td>
  *       <td>Comma-separated absolute directories filesystem ingest may read</td>
  *       <td>empty - filesystem ingest disabled</td></tr>
@@ -95,6 +97,8 @@ public final class ApiSecurityConfig {
     public static final String KEY_MAX_TOP_K = "excalibur.api.max-top-k";
     /** Configuration key bounding {@code timeout_ms} on the query endpoint. */
     public static final String KEY_MAX_QUERY_TIMEOUT_MS = "excalibur.api.max-query-timeout-ms";
+    /** Configuration key bounding the length of {@code query} on the query endpoint. */
+    public static final String KEY_MAX_QUERY_CHARS = "excalibur.api.max-query-chars";
     /** Configuration key listing the directories filesystem ingest may read. */
     public static final String KEY_ALLOWED_ROOTS = "excalibur.ingest.allowed-roots";
     /** Configuration key listing the hosts URL ingest may crawl. */
@@ -120,6 +124,16 @@ public final class ApiSecurityConfig {
     public static final int DEFAULT_MAX_TOP_K = 1_000;
     /** Default upper bound on {@code timeout_ms}. */
     public static final long DEFAULT_MAX_QUERY_TIMEOUT_MS = 60_000L;
+    /**
+     * Default upper bound on the length of {@code query}, in characters.
+     *
+     * <p>Four times the largest thing in the index: the corpus is embedded a chunk at a time and
+     * a chunk is about five hundred tokens, so a query several times that size has nothing of its
+     * own shape to match against. It is also well inside the input limit of every embedding model
+     * this talks to, which is what keeps an over-long query a rejected request rather than a
+     * provider error halfway through one.</p>
+     */
+    public static final int DEFAULT_MAX_QUERY_CHARS = 8_192;
     /** Default bound on registered ingestion sources. */
     public static final int DEFAULT_MAX_SOURCES = 256;
 
@@ -133,6 +147,7 @@ public final class ApiSecurityConfig {
     private final int rateLimitMaxClients;
     private final int maxTopK;
     private final long maxQueryTimeoutMs;
+    private final int maxQueryChars;
     private final List<Path> allowedIngestRoots;
     private final Set<String> allowedIngestHosts;
     private final int maxRegisteredSources;
@@ -150,6 +165,7 @@ public final class ApiSecurityConfig {
         this.rateLimitMaxClients = builder.rateLimitMaxClients;
         this.maxTopK = builder.maxTopK;
         this.maxQueryTimeoutMs = builder.maxQueryTimeoutMs;
+        this.maxQueryChars = builder.maxQueryChars;
         this.allowedIngestRoots = List.copyOf(builder.allowedIngestRoots);
         this.allowedIngestHosts = Set.copyOf(builder.allowedIngestHosts);
         this.maxRegisteredSources = builder.maxRegisteredSources;
@@ -197,6 +213,7 @@ public final class ApiSecurityConfig {
             (int) ConfigText.positiveLong(props, KEY_RATE_LIMIT_MAX_CLIENTS, DEFAULT_RATE_LIMIT_MAX_CLIENTS));
         builder.maxTopK((int) ConfigText.positiveLong(props, KEY_MAX_TOP_K, DEFAULT_MAX_TOP_K));
         builder.maxQueryTimeoutMs(ConfigText.positiveLong(props, KEY_MAX_QUERY_TIMEOUT_MS, DEFAULT_MAX_QUERY_TIMEOUT_MS));
+        builder.maxQueryChars((int) ConfigText.positiveLong(props, KEY_MAX_QUERY_CHARS, DEFAULT_MAX_QUERY_CHARS));
         builder.maxRegisteredSources((int) ConfigText.positiveLong(props, KEY_MAX_SOURCES, DEFAULT_MAX_SOURCES));
 
         for (String root : ConfigText.splitList(props.get(KEY_ALLOWED_ROOTS))) {
@@ -346,6 +363,11 @@ public final class ApiSecurityConfig {
         return maxQueryTimeoutMs;
     }
 
+    /** @return upper bound accepted for the length of {@code query}, in characters */
+    public int maxQueryChars() {
+        return maxQueryChars;
+    }
+
     /** @return real paths filesystem ingest may read; empty means disabled */
     public List<Path> allowedIngestRoots() {
         return allowedIngestRoots;
@@ -402,6 +424,7 @@ public final class ApiSecurityConfig {
         private int rateLimitMaxClients = DEFAULT_RATE_LIMIT_MAX_CLIENTS;
         private int maxTopK = DEFAULT_MAX_TOP_K;
         private long maxQueryTimeoutMs = DEFAULT_MAX_QUERY_TIMEOUT_MS;
+        private int maxQueryChars = DEFAULT_MAX_QUERY_CHARS;
         private final List<Path> allowedIngestRoots = new ArrayList<>();
         private final Set<String> allowedIngestHosts = new LinkedHashSet<>();
         private int maxRegisteredSources = DEFAULT_MAX_SOURCES;
@@ -494,6 +517,17 @@ public final class ApiSecurityConfig {
          */
         public Builder maxQueryTimeoutMs(long maxQueryTimeoutMs) {
             this.maxQueryTimeoutMs = maxQueryTimeoutMs;
+            return this;
+        }
+
+        /**
+         * Bounds the length of {@code query}.
+         *
+         * @param maxQueryChars Maximum accepted query length in characters
+         * @return this builder
+         */
+        public Builder maxQueryChars(int maxQueryChars) {
+            this.maxQueryChars = maxQueryChars;
             return this;
         }
 

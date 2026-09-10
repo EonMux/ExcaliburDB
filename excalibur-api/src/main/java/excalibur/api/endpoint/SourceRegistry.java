@@ -1,6 +1,7 @@
 package excalibur.api.endpoint;
 
 import excalibur.ingest.source.Source;
+import excalibur.ingest.source.SourceDescriptor;
 
 import java.util.Set;
 
@@ -19,6 +20,28 @@ public interface SourceRegistry extends AutoCloseable {
      * @throws SourceRegistrationException if the ID is taken or the registry is full
      */
     void register(Source source);
+
+    /**
+     * Registers a source and records what it was registered as.
+     *
+     * <p>A {@link Source} is a live crawler and cannot describe itself, so a registry that has to
+     * bring one back after a restart needs the descriptor the registration was built from. The
+     * two arrive together because they are one act: a source claimed but not recorded is crawled
+     * until the process ends and then forgotten, with the corpus still indexed and nothing in the
+     * node reporting that a crawl schedule has quietly stopped.</p>
+     *
+     * <p>A registry that keeps no catalog registers the source and has nothing to do with the
+     * descriptor; the registration then lasts as long as the process, which is all such a
+     * registry ever promised.</p>
+     *
+     * @param source     The source to register
+     * @param descriptor What the source was registered as
+     * @throws SourceRegistrationException if the ID is taken or the registry is full
+     * @throws SourceCatalogException      if the registration cannot be recorded
+     */
+    default void register(Source source, SourceDescriptor descriptor) {
+        register(source);
+    }
 
     /**
      * Checks if a source ID is already registered.

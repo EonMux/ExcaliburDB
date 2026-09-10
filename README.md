@@ -84,10 +84,9 @@ export EXCALIBUR_LLM_API_KEY=sk-...
 ```
 
 `excalibur.properties` is gitignored precisely because it is the file a key ends up in;
-`excalibur.properties.example` is the tracked template. A node started without a key still runs —
-it registers sources and crawls them, so a wrong path is still reported as a wrong path — but
-nothing is chunked, embedded or indexed, and `/v1/ingest/status` reports every source as
-`idle` once indexed, and `POST /v1/query` answers from BM25. Only dense retrieval is missing,
+`excalibur.properties.example` is the tracked template. A node started without a key still runs, and
+still indexes: documents are chunked, stored and term-indexed, `/v1/ingest/status` reports each
+source as `idle` once done, and `POST /v1/query` answers from BM25. Only dense retrieval is missing,
 which is one signal of several rather than the precondition for having an index at all.
 
 ### 3. Run
@@ -136,9 +135,9 @@ curl 'http://localhost:8080/v1/ingest/status?source_id=my-docs'
  "entries_ingested": 450, "entries_pending": 170, "last_error": null}
 ```
 
-`state` runs `crawling` → `embedding` → `indexing` → `idle`. `unconfigured` means this node has no
-ingestion pipeline; `last_error` says what to configure. Drop `?source_id=` to get every source
-instead, wrapped in a `sources` array.
+`state` runs `crawling` → `embedding` → `indexing` → `idle`. `unconfigured` means this node's
+ingestion pipeline failed to wire at startup; `last_error` says where the reason is. Drop
+`?source_id=` to get every source instead, wrapped in a `sources` array.
 
 ### 5. Query
 
@@ -263,7 +262,7 @@ spell them this way:
 | `excalibur.visibility.query-timeout-ms` | 30000 | Query timeout (ms) |
 | `excalibur.query.top-k-default` | 100 | Default number of results |
 | `excalibur.query.recall-target` | 0.95 | Default for the `recall_target` request field. Accepted and validated, but not currently consumed by the search path — breadth is set by `excalibur.shard.default-ef-search` |
-| `excalibur.query.threshold` | 0.3 | Parsed and range-checked, but read by nothing. The score floor a query applies comes from the request's `threshold` field |
+| `excalibur.query.threshold` | 0.0 | Score floor for requests that omit `threshold`; a request's own `threshold` overrides it. 0 disables filtering |
 | `excalibur.query.vector-dimensions` | 1536 | Vector dimensionality |
 | `excalibur.query.include-partial-segments` | true | Include indexing segments in queries |
 | `excalibur.query.llm-timeout-ms` | 60000 | LLM scoring timeout (ms) |
@@ -276,12 +275,13 @@ spell them this way:
 | `excalibur.ingest.document-atomicity` | true | Whether a document's chunks become visible together. Turning it off removes the guarantee listed under [Visibility and Consistency](#visibility-and-consistency): a query can then see half a document |
 | `excalibur.ingest.reindex-interval-ms` | 3600000 | How often a registered source is re-crawled on its own (1 hour) |
 | `excalibur.filter.corpus-capacity` | 10000000 | Entries the membership filter is sized for. **Size this to your corpus.** The filter cannot record a term it has no room for, and a term it has no record of prunes every segment — so an undersized value returns empty results for documents that are sitting in storage, rather than degrading gracefully |
-| `excalibur.llm.api-key` | _(none)_ | Key for the OpenAI-compatible endpoint. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Without it nothing is indexed |
+| `excalibur.llm.api-key` | _(none)_ | Key for the OpenAI-compatible endpoint. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Without it the corpus is still chunked, stored and term-indexed; only the vector signal is missing |
 | `excalibur.llm.base-url` | https://api.openai.com/v1 | API root. The clients append `/v1/embeddings` and `/v1/chat/completions` themselves; a trailing `/v1` is stripped, so `https://api.openai.com` and `https://api.openai.com/v1` mean the same thing |
 | `excalibur.llm.model` | text-embedding-ada-002 | Legacy generic model name. Parsed and exposed, but no component reads it — `embedding-model` and `chat-model` are what the clients use |
 | `excalibur.llm.chat-model` | gpt-4o-mini | Chat model for relevancy scoring |
 | `excalibur.llm.embedding-model` | text-embedding-3-small | Embedding model name |
 | `excalibur.llm.embeddings-dimensions` | 1536 | Embedding vector dimensions |
+| `excalibur.llm.embeddings-enabled` | true | Whether the key is spent on embedding the corpus. Set `false` to keep the chat model and skip the embedding pass: retrieval is then BM25 over the chunk index with the chat model expanding the query. Inert without a key |
 | `excalibur.llm.relevancy-threshold` | 0.3 | Minimum relevancy score (0.0-1.0) |
 | `excalibur.llm.timeout-ms` | 60000 | LLM request timeout (ms) |
 | `excalibur.llm.max-retries` | 3 | Maximum retry attempts |
@@ -315,6 +315,7 @@ spell them this way:
 | `excalibur.api.rate-limit-max-clients` | 10000 | Clients tracked before eviction |
 | `excalibur.api.max-top-k` | 1000 | Largest `top_k` a query may request |
 | `excalibur.api.max-query-timeout-ms` | 60000 | Largest query timeout a request may ask for |
+| `excalibur.api.max-query-chars` | 8192 | Longest `query` text a request may send. It is embedded, and on the lexical path expanded, so its size is an outbound call the caller picks |
 | `excalibur.ingest.allowed-roots` | _(empty)_ | Filesystem roots ingest may read. Empty means filesystem ingest is **disabled** |
 | `excalibur.ingest.allowed-hosts` | _(empty)_ | Hosts ingest may crawl. Empty means URL ingest is **disabled** |
 | `excalibur.ingest.max-sources` | 256 | Registered ingestion sources before new ones are refused |
@@ -508,8 +509,13 @@ The model is not asked to answer the question, and never sees the corpus. Its ou
 constrained list — which is what makes it affordable on a query path. The formulations collapse
 into one weighted term set and are searched as a single query, so expansion costs a fraction of a
 search rather than one search per formulation. A term several formulations agree on has their
-weights summed, so agreement counts for more than the strongest single suggestion. The user's own words always carry weight `1.0` and cannot be
-outranked by a guess about vocabulary.
+weights summed, so agreement counts for more than the strongest single suggestion. The user's own
+words always carry weight `1.0` and cannot be outranked by a guess about vocabulary.
+
+Expansion belongs to the lexical path: it rewrites the terms BM25 is searched with, and a node whose
+corpus is embedded searches by vector and never calls it. The deployment it is for has a chat model
+and no embedding pass — `excalibur.llm.api-key` set, `excalibur.llm.embeddings-enabled=false` — and
+spends the model on each query instead of on the whole corpus.
 
 ### Degradation
 
@@ -522,6 +528,11 @@ retrieval:
 | Embedding endpoint | No dense signal and no vector rerank; lexical and graph retrieval unaffected |
 | Graph | No traversal; lexical and vector signals unaffected |
 | Expansion returns nothing usable | The original query is executed directly |
+
+Two of those rows are configurations rather than failures. Without `excalibur.llm.api-key` a node has
+neither a chat model nor an embedding endpoint, so the first two apply together and retrieval is
+plain BM25. With a key and `excalibur.llm.embeddings-enabled=false` only the second applies: the
+chat model expands the query and BM25 answers it.
 
 A response says which signals answered it: `"retrieval": "lexical"` and a `coverage.degraded` flag
 distinguish "this is all there was" from "this is all we looked at".
@@ -571,14 +582,16 @@ separate so a burst of writes cannot starve ordinary reads.
 | `POST` | `/v1/ingest` | bearer | mutate | Register an ingestion source and start indexing it |
 | `DELETE` | `/v1/ingest` | bearer | mutate | Stop crawling a source. Its indexed documents are kept |
 | `GET` | `/v1/ingest/status` | bearer | read | Ingestion state per source, or all sources |
-| `POST` | `/v1/reindex` | bearer | mutate | Re-index a registered source. Answers 503 when the node was built without a reindexer |
+| `POST` | `/v1/reindex` | bearer | mutate | Re-index a registered source. Answers 503 on a node that does not embed its corpus: reindexing re-embeds what it rewrites |
 | `POST` | `/v1/erasure` | bearer | mutate | Remove named documents from the corpus: storage, the lexical index, and the registry |
 | `POST` | `/v1/graph/query` | bearer | read | Answer a question from the graph. A walk that returns context, so it is charged as a read |
 | `POST` | `/v1/graph/build` | bearer | mutate | Publish the facts ingestion has staged as the served graph |
 | `POST` | `/v1/graph/erasure` | bearer | mutate | Record an obligation to erase, and compact when it is due |
 
-Anything else answers 404. The graph routes are registered on every node; a node that has never
-built a graph answers `/v1/graph/query` with 503 rather than 404, because the capability is there
+A method a registered path does not serve answers 405, and is charged against the read budget: it
+is unauthenticated, so leaving it uncharged would let an anonymous caller spend a routing decision
+per request at line rate. Anything else answers 404. The graph routes are registered on every
+node; a node that has never built a graph answers `/v1/graph/query` with 503 rather than 404, because the capability is there
 and only the data is missing. `/v1/erasure` is the opposite case: a node built without an erasure
 service does not register it at all, so a caller under an obligation gets a 404 they can escalate
 rather than a 200 that removed nothing.
@@ -647,6 +660,14 @@ A served store is thirteen memory mappings, and a process has a finite number of
 `excalibur.graph.max-open-namespaces` graphs stay open at once and the least recently used is
 evicted to make room. Every request holds a lease for its duration: a namespace being read is passed
 over by eviction, and an eviction that lands on one is deferred until the last reader is done.
+
+A namespace comes into being when something publishes to it — a build, or an erasure obligation
+recorded against it. `/v1/graph/query` never creates one: opening a namespace writes its staging
+directory, claims one of those open slots and evicts a real tenant to get it, and the name arrives
+in a header, so a question that created would let a caller spend all three on any name it chose. A
+question about a namespace that has never been built is answered exactly as one about a namespace
+that exists and has nothing built in it — the same 503, deliberately, because every tenant on a node
+presents the same token and a different answer would say which namespaces the other tenants have.
 
 ### Securing the API
 
@@ -801,6 +822,11 @@ curl -X POST http://localhost:8080/v1/ingest \
 not the path. The other supported `source_type` is `http`, whose `base_url` is checked against
 `excalibur.ingest.allowed-hosts` and refused if it resolves to any private address.
 
+`source_id` is bounded at 256 characters. A copy of it is kept in every document's registry record
+and printed with every log line about the source, so its length is multiplied by the size of the
+corpus rather than by the number of requests. Every route that names a source — deregister,
+reindex, erasure, status — refuses the same lengths, since nothing can be registered under one.
+
 ### Ingest Status Example
 
 The two forms return different shapes. Named source, bare object, 404 if it was never registered:
@@ -843,11 +869,12 @@ curl http://localhost:8080/v1/ingest/status
 | `embedding` | Chunking and embedding documents |
 | `indexing` | Building index structures |
 | `idle` | Nothing in progress; a source that finished sits here |
-| `unconfigured` | Registered, but this node has no ingestion pipeline. The documents were counted into `entries_pending` and none were indexed; `last_error` names what to set |
+| `unconfigured` | Registered, but this node's ingestion pipeline failed to wire at startup. The documents were counted into `entries_pending` and none were indexed; `last_error` says where the reason is |
 
-`unconfigured` is deliberately not `idle` at `progress: 1.0`. A missing API key is the one
-configuration mistake that stops the product working, and reporting it as a completed run would
-make it look exactly like success.
+`unconfigured` is deliberately not `idle` at `progress: 1.0`. A node whose pipeline never wired
+indexes nothing at all, and reporting that as a completed run would make a broken node look exactly
+like a healthy one. A missing API key is *not* this state: that node has a pipeline and indexes
+lexically.
 
 ### Stats Example
 
@@ -937,6 +964,11 @@ it. `timings_ms` carries only the stages that actually ran, drawn from a fixed s
 `traverse`, `rank`, `serialize`, `prefill`, `decode` — plus `total`. It comes back on all three
 statuses, because a refusal that took two seconds is as much a performance question as an answer
 that did.
+
+The request is bounded: `query` at 4096 characters, `context_entities` at 128 entries of at most 256
+characters each. Exceeding either is a 400 naming the bound. A context is refused rather than
+truncated, because dropping part of one silently changes which entity a pronoun binds to and the
+answer would read as though the whole conversation had been given.
 
 ```bash
 curl -X POST http://localhost:8080/v1/graph/erasure \
@@ -1029,11 +1061,13 @@ java --enable-preview --enable-native-access=ALL-UNNAMED \
 
 ### What has to be configured first
 
-Ingestion needs an OpenAI-compatible endpoint for embeddings, and fact extraction needs one for
-chat. Without `excalibur.llm.api-key` the node still accepts sources, but indexes nothing and says
-so: `/v1/ingest/status` reports `state: unconfigured` with `last_error` naming what to set. Filesystem
-ingestion also requires the directory to be listed in `excalibur.ingest.allowed-roots`, and fact
-extraction requires `excalibur.graph.extraction-enabled=true`.
+Only one thing is required: filesystem ingestion needs the directory listed in
+`excalibur.ingest.allowed-roots`, and HTTP ingestion needs the host listed in
+`excalibur.ingest.allowed-hosts`. Without a matching entry the registration is refused.
+
+`excalibur.llm.api-key` is optional. Without it the corpus is chunked, stored and term-indexed and
+`/v1/query` answers from BM25; with it the corpus is also embedded and dense retrieval joins the
+fusion. Fact extraction needs the same key plus `excalibur.graph.extraction-enabled=true`.
 
 ## Architecture
 
@@ -1158,6 +1192,15 @@ erasure. A node that lost it would read every document as new — reingesting th
 chunks already there and tombstoning none of them — and would report every erasure request as naming
 a document it never held. A registry that exists and cannot be read fails the start rather than
 being treated as an empty one, for the same reason.
+
+`<data dir>/source-catalog` holds the other half of what a restart has to carry: the registration
+requests behind every crawl this node was asked to keep running. It records the request rather than
+the crawler built from it, so a restored source goes back through the same allow-lists a fresh
+`POST /v1/ingest` would meet — re-checking the target on the way back in is the point, and recording
+an already-approved result would defeat it. A source whose target is no longer permitted is kept on
+the catalog and left uncrawled, with a warning naming it, so that narrowing the allow-list pauses a
+crawl rather than silently cancelling it. Like the document registry, a catalog that exists and
+cannot be read fails the start.
 
 ### Visibility and Consistency
 
@@ -1421,13 +1464,16 @@ should not have to unwrap a collection to find it.
 **Every query returns 503.**
 
 ```
-Server is not configured for text queries: no embedding client is available.
-Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY)...
+Server is not configured for text queries: this node has neither an embedding client
+nor a lexical index, so there is no index to search...
 ```
 
-The server embeds your query text itself, so it cannot answer anything without an embedding
-endpoint. This is a property of the deployment, not of the request — the check runs before the body
-is even read, so a malformed body will not shadow it with a 400.
+A missing API key alone does not cause this. Without an embedding endpoint the node still chunks,
+stores and lexically indexes what it ingests, and `/v1/query` answers from BM25 with
+`"retrieval": "lexical"` and `"degraded": true`. The 503 means both paths are gone: no embedding
+client *and* no chunk lexical index, which is a failure to open the index rather than a missing
+key — the startup log names the reason. This is a property of the deployment, not of the request:
+the check runs before the body is even read, so a malformed body will not shadow it with a 400.
 
 **Can I send my own vectors?**
 No, and this is deliberate. A vector only means something in one model's embedding space. If a
@@ -1437,9 +1483,16 @@ Point `excalibur.llm.base-url` at any OpenAI-compatible endpoint — Ollama, vLL
 a different model.
 
 **Which embedding model should I use, and do I need one?**
-You need one: the server embeds both the documents it ingests and the query text you send, so
-without an embedding endpoint nothing is indexed and every query answers 503. What it needs is any
+You need one for vector retrieval, not to run the server. The server embeds both the documents it
+ingests and the query text you send; without an embedding endpoint it falls back to BM25 over the
+same chunks, which is a weaker search and a working one. What vector retrieval needs is any
 OpenAI-compatible `/v1/embeddings` endpoint — hosted or local.
+
+For a corpus of identifiers, DOIs, error codes and titles, embedding it may be the wrong trade
+outright: those are exactly what BM25 answers well and a dense vector blurs. Set
+`excalibur.llm.embeddings-enabled=false` with the key still configured and the chat model is spent
+on expanding each query rather than on embedding every document — a few dozen generated tokens per
+query instead of billions of embedded tokens per corpus.
 
 The default, `text-embedding-3-small` at 1536 dimensions, is a reasonable starting point and needs
 no configuration beyond an API key. Four things about this codebase narrow the choice:
@@ -1501,9 +1554,10 @@ No graph is being served for this namespace; POST /v1/graph/build to build one
 from the facts ingestion has staged
 ```
 
-Nothing has been built yet. It is 503 and not 404 on purpose: the capability is there, the data is
-not, and those need different responses. Note the ordering — turn on
-`excalibur.graph.extraction-enabled` *before* ingesting, then build, or there will be nothing
+Nothing has been built yet, or the namespace in the `X-Excalibur-Namespace` header has never been
+built at all — one answer covers both, on purpose. It is 503 and not 404 on purpose too: the
+capability is there, the data is not, and those need different responses. Note the ordering — turn
+on `excalibur.graph.extraction-enabled` *before* ingesting, then build, or there will be nothing
 staged to build from.
 
 **`/v1/graph/build` returned `"published": false`.**

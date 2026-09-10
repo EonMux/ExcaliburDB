@@ -1812,6 +1812,46 @@ public class HnswGraph implements AutoCloseable {
     }
 
     /**
+     * Retires every node a named document contributed.
+     *
+     * <p>A node carries no text, so an erased document's vectors look like harmless residue. They
+     * are not: a node is attributed to a document, and a search that ranks it says that document
+     * matched - with a distance, and with the document's name - whether or not there is any text
+     * left to show for it. This is what makes an erasure reach the vector index.</p>
+     *
+     * <p>Each node is retired by {@link #delete(long)}, so the tombstones are the same ones every
+     * traversal skips, a restart reads back, and {@link #compact(java.nio.file.Path)} reclaims.
+     * Nodes are attributed by {@link #registerDocumentId(long, String)}, which the integration
+     * worker calls as it inserts; a graph with no mapping has nothing to name and retires
+     * nothing.</p>
+     *
+     * @param documentId The document to retire, in the form node attribution uses
+     * @return The number of nodes newly tombstoned; zero when the graph holds none of them, or
+     *         when they were already retired
+     * @throws IllegalStateException if graph is closed
+     */
+    public int deleteDocument(String documentId) {
+        validateNotClosed();
+
+        NodeDocumentMapping mapping = this.nodeDocumentMapping;
+        if (documentId == null || mapping == null) {
+            return 0;
+        }
+
+        int retired = 0;
+        for (long nodeId : mapping.getNodesForDocument(documentId)) {
+            if (delete(nodeId)) {
+                retired++;
+            }
+        }
+
+        if (retired > 0) {
+            LOGGER.info("Retired {} node(s) of document {}", retired, documentId);
+        }
+        return retired;
+    }
+
+    /**
      * Checks if a node is tombstoned (soft-deleted).
      *
      * <p>This method provides a way to check the deletion status of a node

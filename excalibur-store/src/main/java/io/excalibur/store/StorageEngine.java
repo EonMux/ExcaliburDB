@@ -654,10 +654,18 @@ public class StorageEngine implements AutoCloseable {
         // split. Beyond that it cannot be exact -- two segments that split from a common
         // ancestor look the same by file name as two that did not -- so it is a best effort and
         // says so. See RoutingDirectory for the worked example.
-        LOGGER.log(Level.WARNING,
-            "No routing directory at {0}; reconstructing it from segment file names. This is "
-                + "exact only if at most one segment has ever split.",
-            dataDir.resolve(RoutingDirectory.FILE_NAME));
+        if (maxSegmentIndex < 0) {
+            // A store with no segments has no directory because it has never needed one. What is
+            // built below is the initial directory rather than a reconstruction of a lost one,
+            // and nothing has split for it to get wrong - so warning here would only teach an
+            // operator that the first line of every new deployment is noise.
+            LOGGER.log(Level.INFO, "New store: routing directory created with {0} slots", width);
+        } else {
+            LOGGER.log(Level.WARNING,
+                "No routing directory at {0}; reconstructing it from segment file names. This is "
+                    + "exact only if at most one segment has ever split.",
+                dataDir.resolve(RoutingDirectory.FILE_NAME));
+        }
 
         for (int i = DEFAULT_INITIAL_SEGMENTS; i < width; i++) {
             if (segments.containsKey((long) i)) {
@@ -1278,6 +1286,15 @@ public class StorageEngine implements AutoCloseable {
     private volatile SegmentLifecycleManager lifecycleManager;
 
     /**
+     * Segment indices whose reclamation has already been refused and logged.
+     *
+     * <p>A refusal is a standing condition, not an event: the lifecycle sweep offers the same
+     * segment on every tick for as long as it stays tombstoned. Recording it keeps the warning
+     * to once per segment instead of once per tick.</p>
+     */
+    private final java.util.Set<Long> refusedReclamations = ConcurrentHashMap.newKeySet();
+
+    /**
      * Gets or creates the lifecycle manager for this engine.
      *
      * <p>The lifecycle manager is created lazily on first access.</p>
@@ -1291,11 +1308,61 @@ public class StorageEngine implements AutoCloseable {
                     SegmentLifecycleManager manager = new SegmentLifecycleManager(catalog);
                     // Reclamation must be gated on the visibility epoch, not wall clock.
                     manager.setCurrentEpochSupplier(() -> visibilityTracker.currentEpoch());
+                    // Nothing else moves a segment out of INDEXING: every later transition is
+                    // driven by a worker that selects on a later state.
+                    manager.setIndexingCompletionProbe(this::isIndexingComplete);
+                    // Only the engine knows which indices the directory still routes to, and
+                    // reclaiming one of those is undone by the next start.
+                    manager.setReclamationCallback(segmentId -> reclaim(manager, segmentId));
                     lifecycleManager = manager;
                 }
             }
         }
         return lifecycleManager;
+    }
+
+    /**
+     * Reclaims a tombstoned segment, or refuses one the directory still routes to.
+     *
+     * <p>A segment index is a slot in a hash directory: every key whose hash lands on it is
+     * written there, and a slot cannot be vacated - there is no operation that takes a segment
+     * out of the directory, only ones that re-point a slot at a different segment. Purging such
+     * a segment removes its catalog row and leaves the file and the writes behind. From that
+     * moment {@link #getQueryableSegments()} skips the slot, because it has no metadata to
+     * judge, so everything routed there stops being answerable; and the next {@link #start()}
+     * rediscovers the file, finds no row naming it and adds one back as a live segment, so the
+     * tombstone a rolling reindex placed is undone by a bounce and the superseded copy of every
+     * document it retired answers queries again.</p>
+     *
+     * <p>Refusing leaves the segment TOMBSTONED. That is durable, it is not queryable, and it
+     * means the same thing after a restart as before one - which is the whole point.</p>
+     *
+     * @param manager      The lifecycle manager that offered the segment
+     * @param segmentIndex The segment offered for reclamation
+     * @return true if the catalog row was removed
+     */
+    private boolean reclaim(SegmentLifecycleManager manager, long segmentIndex) {
+        if (segments.get(segmentIndex) != null) {
+            if (refusedReclamations.add(segmentIndex)) {
+                LOGGER.log(Level.WARNING,
+                    "Segment {0} is tombstoned but the routing directory still writes to it, so "
+                    + "it is kept tombstoned rather than purged: a purged row is recreated as a "
+                    + "live segment by the next start",
+                    segmentIndex);
+            }
+            return false;
+        }
+
+        try {
+            manager.purge(segmentIndex);
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.WARNING,
+                "Failed to purge segment " + segmentIndex + "; it stays tombstoned", e);
+            return false;
+        }
+
+        refusedReclamations.remove(segmentIndex);
+        return true;
     }
 
     /**
@@ -1315,6 +1382,35 @@ public class StorageEngine implements AutoCloseable {
         if (lifecycleManager != null) {
             lifecycleManager.stop();
         }
+    }
+
+    /**
+     * Reports whether a segment's index has absorbed everything written to the segment.
+     *
+     * <p>This is the evidence the {@link SegmentLifecycleManager} cannot gather for itself: the
+     * catalog records how many entries a segment holds, not how much of its write log the HNSW
+     * graph has taken in. The engine owns both the log and the integration checkpoint, so it
+     * answers the question and the manager acts on the answer.</p>
+     *
+     * <p>A segment with no checkpoint is not caught up. It has no integration machinery
+     * attached, so nothing will ever advance a checkpoint for it and nothing downstream is
+     * registered to warm it either - advancing it on the absence of evidence would move the
+     * stall one state along rather than clear it.</p>
+     *
+     * @param segmentIndex The segment index
+     * @return true if the segment's index speaks for every entry it holds
+     */
+    public boolean isIndexingComplete(long segmentIndex) {
+        Segment segment = segments.get(segmentIndex);
+        if (segment == null) {
+            return false;
+        }
+        io.excalibur.vector.hnsw.TailOffsetTracker tracker = segment.getTailOffsetTracker();
+        if (tracker == null) {
+            return false;
+        }
+        return IndexingProgress.isComplete(segment.entryCount(),
+            tracker.getLastIntegratedOffset(), segment.getWriteLogHead());
     }
 
     /**
@@ -1591,8 +1687,15 @@ public class StorageEngine implements AutoCloseable {
         canonicalIndex.clear();
         publishRouting();
 
-        // Flush and close catalog to persist metadata
-        catalog.flush();
+        // Flush and close catalog to persist metadata. A failed flush must not abort the rest of
+        // this method: the mappings released below are still held by this process, and an arena
+        // left open keeps them held for the life of the JVM. So record it and carry on - the
+        // catalog's own close reports whether its metadata reached the device.
+        try {
+            catalog.flush();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.SEVERE, "Failed to flush the catalog while closing", e);
+        }
         catalog.close();
         catalog.clear();
 

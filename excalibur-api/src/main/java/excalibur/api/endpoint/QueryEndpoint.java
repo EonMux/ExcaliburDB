@@ -9,6 +9,7 @@ import excalibur.query.executor.CancellationToken;
 import excalibur.query.executor.QueryRegistry;
 import excalibur.query.pipeline.QueryPipeline;
 import excalibur.api.protocol.JsonText;
+import excalibur.api.retrieval.LexicalCoverage;
 import excalibur.api.protocol.ResponseBody;
 import excalibur.api.security.ApiSecurityConfig;
 import io.excalibur.config.Config;
@@ -49,6 +50,7 @@ import java.util.concurrent.*;
  * <h2>Response Format</h2>
  * <pre>{@code
  * {
+ *   "query_id": "b3d9f4a0-1e2c-4a7b-9c3d-5e6f7a8b9c0d",
  *   "results": [
  *     {"document_id": "my-docs:guide.md:chunk:2", "score": 0.950000, "segment_id": 3}
  *   ],
@@ -57,7 +59,13 @@ import java.util.concurrent.*;
  *     "active_segments": 980,
  *     "indexing_segments": 40,
  *     "warming_segments": 4,
- *     "estimated_corpus_coverage": 0.96,
+ *     "compacting_segments": 0,
+ *     "tombstoned_segments": 0,
+ *     "estimated_corpus_coverage": 0.9600,
+ *     "segments_searched": 980,
+ *     "segments_excluded": 44,
+ *     "segments_with_errors": 0,
+ *     "segments_timed_out": 0,
  *     "tail_scan_entries": 12500,
  *     "degraded": false
  *   },
@@ -65,6 +73,10 @@ import java.util.concurrent.*;
  *   "query_time_ms": 42
  * }
  * }</pre>
+ *
+ * <p>A node with no embedding client answers from the lexical index instead. The shape is the
+ * same, with a {@code "retrieval": "lexical"} field the vector path does not emit, no
+ * {@code segment_id} on a result, and {@code degraded} always true.</p>
  *
  * <h2>Timeout Handling</h2>
  * <p>Queries that exceed their timeout return partial results with
@@ -100,19 +112,16 @@ public class QueryEndpoint implements HttpHandler {
     private volatile excalibur.api.retrieval.LexicalQueryService lexicalQueryService;
 
     static final String UNCONFIGURED_QUERY_REASON =
-        "Server is not configured for text queries: no embedding client is available. "
-        + "Set excalibur.llm.api-key (or EXCALIBUR_LLM_API_KEY) so the server can embed queries "
-        + "with the same model that ingestion uses.";
+        "Server is not configured for text queries: this node has neither an embedding client "
+        + "nor a lexical index, so there is no index to search. Set excalibur.llm.api-key (or "
+        + "EXCALIBUR_LLM_API_KEY) so the server can embed queries with the same model that "
+        + "ingestion uses, or see the startup log for why the chunk lexical index was not opened.";
 
     /**
      * Default timeout for queries in milliseconds.
      * Initialized from config if available, otherwise falls back to 30 seconds.
      */
     private final long defaultTimeoutMs;
-
-    /**
-     * Maximum request body size in bytes.
-     */
 
     private final QueryPipeline queryPipeline;
     private final ExecutorService executorService;
@@ -121,9 +130,10 @@ public class QueryEndpoint implements HttpHandler {
 
     /**
      * Bounds on client-supplied request values. {@code top_k} sizes priority queues
-     * and result arrays inside the pipeline, and {@code timeout_ms} decides how long
-     * one request may hold server resources, so both are bounded at the boundary
-     * rather than wherever they happen to be consumed.
+     * and result arrays inside the pipeline, {@code timeout_ms} decides how long
+     * one request may hold server resources, and {@code query} is the body of the
+     * outbound embedding and expansion calls, so all three are bounded at the
+     * boundary rather than wherever they happen to be consumed.
      */
     private final ApiSecurityConfig limits;
 
@@ -254,12 +264,12 @@ public class QueryEndpoint implements HttpHandler {
                 .build()) {
 
             try {
-                // Checked before the body is even read, and answered with the reason. A node
-                // without an embedding endpoint cannot serve any query, so this is a property of
-                // the deployment rather than of the request, and every request will meet it until
-                // someone changes the configuration. Saying only "not available" leaves an
-                // operator to guess which of the several things behind a 503 it was, while the
-                // startup log two hundred lines up already named it.
+                // Checked before the body is even read, and answered with the reason. Which
+                // retrieval paths a node has is a property of the deployment rather than of the
+                // request, so a node that has none meets this on every query until someone
+                // changes the configuration. Saying only "not available" leaves an operator to
+                // guess which of the several things behind a 503 it was, while the startup log
+                // two hundred lines up already named it.
                 if (embeddingClient == null) {
                     // No vectors, but possibly a lexical index. Answering from BM25 and query
                     // expansion is the whole point of not requiring the corpus to be embedded:
@@ -375,10 +385,11 @@ public class QueryEndpoint implements HttpHandler {
     /**
      * Answers a query from the lexical index alone.
      *
-     * <p>Reports the same response shape as vector search, with coverage marked degraded: the
-     * answer is real, and it came from fewer signals than a fully configured node would use.
-     * Saying so is what lets a caller tell "this is all there was" from "this is all we looked
-     * at".</p>
+     * <p>Reports the same response shape as vector search, through the same coverage renderer
+     * and over numbers the index is asked for rather than assumed - see {@link LexicalCoverage}.
+     * Coverage is always marked degraded: the answer is real, and it came from fewer signals than
+     * a fully configured node would use. Saying so is what lets a caller tell "this is all there
+     * was" from "this is all we looked at".</p>
      */
     private void answerLexically(HttpExchange exchange,
                                  excalibur.api.retrieval.LexicalQueryService lexical,
@@ -410,7 +421,7 @@ public class QueryEndpoint implements HttpHandler {
         }
         sb.append("], ");
         sb.append("\"retrieval\": \"lexical\", ");
-        sb.append("\"coverage\": {\"degraded\": true, \"estimated_corpus_coverage\": 1.0000}, ");
+        appendCoverage(sb, LexicalCoverage.of(lexical.stats()));
         sb.append("\"timed_out\": false, ");
         sb.append("\"query_time_ms\": ").append(durationMs);
         sb.append("}");
@@ -432,7 +443,8 @@ public class QueryEndpoint implements HttpHandler {
      *
      * <p><strong>Domain Correctness:</strong> validates that:</p>
      * <ul>
-     *   <li>{@code query} is present and non-empty - the server embeds it with the
+     *   <li>{@code query} is present, non-empty, and no longer than
+     *       {@code excalibur.api.max-query-chars} - the server embeds it with the
      *       same model ingestion used, so a client-supplied vector is not accepted</li>
      *   <li>{@code top_k} is positive and within the configured maximum</li>
      *   <li>{@code threshold} and {@code llm_threshold} are in [0.0, 1.0]</li>
@@ -453,7 +465,11 @@ public class QueryEndpoint implements HttpHandler {
         int defaultTopK = config != null ? config.query().getDefaultTopK() : 10;
         int topK = JsonText.integer(json, "top_k", defaultTopK);
 
-        float threshold = JsonText.floatValue(json, "threshold", 0.0f);
+        // Use config default for threshold if config is provided
+        float defaultThreshold = config != null
+            ? (float) config.query().getThreshold()
+            : 0.0f;
+        float threshold = JsonText.floatValue(json, "threshold", defaultThreshold);
         long timeoutMs = JsonText.longValue(json, "timeout_ms", defaultTimeoutMs);
 
         // Use config default for include_partial_segments if config is provided
@@ -486,6 +502,15 @@ public class QueryEndpoint implements HttpHandler {
         // silently wrong results. Embedding is a server invariant.
         if (query == null || query.isEmpty()) {
             throw new IllegalArgumentException("Field 'query' is required and must be non-empty");
+        }
+        // Every other bound here exists because the value sizes something inside this process.
+        // This one exists because the value leaves it: the text is the body of an embedding call,
+        // and on the lexical path of an expansion call as well, so an unbounded query is an
+        // outbound request whose size the caller picks and the operator is billed for. The
+        // BM25 pass is bounded by it too - term count is not what top_k limits.
+        if (query.length() > limits.maxQueryChars()) {
+            throw new IllegalArgumentException("Field 'query' must be at most "
+                + limits.maxQueryChars() + " characters: " + query.length());
         }
         // Deliberately no embedding-client check here. Parsing a request is not the same
         // question as whether this node can run a vector search over it: handle() answers that
@@ -651,8 +676,27 @@ public class QueryEndpoint implements HttpHandler {
         }
         sb.append("], ");
 
-        // Coverage
-        IndexCoverage coverage = response.coverage();
+        appendCoverage(sb, response.coverage());
+
+        // Query metadata
+        sb.append("\"timed_out\": ").append(response.timedOut()).append(", ");
+        sb.append("\"query_time_ms\": ").append(response.queryTimeMs());
+
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /**
+     * Renders the coverage block.
+     *
+     * <p>One renderer for both retrieval paths. A client that has to branch on which path
+     * answered in order to read how much of the corpus was searched cannot use the field for
+     * what it is for, so the shape is not allowed to differ between them.</p>
+     *
+     * @param sb       The response under construction
+     * @param coverage What the query covered
+     */
+    private static void appendCoverage(StringBuilder sb, IndexCoverage coverage) {
         sb.append("\"coverage\": {");
         sb.append("\"total_segments\": ").append(coverage.totalSegments()).append(", ");
         sb.append("\"active_segments\": ").append(coverage.activeSegments()).append(", ");
@@ -672,13 +716,6 @@ public class QueryEndpoint implements HttpHandler {
         sb.append("\"tail_scan_entries\": ").append(coverage.tailScanEntries()).append(", ");
         sb.append("\"degraded\": ").append(coverage.degraded());
         sb.append("}, ");
-
-        // Query metadata
-        sb.append("\"timed_out\": ").append(response.timedOut()).append(", ");
-        sb.append("\"query_time_ms\": ").append(response.queryTimeMs());
-
-        sb.append("}");
-        return sb.toString();
     }
 
     /**

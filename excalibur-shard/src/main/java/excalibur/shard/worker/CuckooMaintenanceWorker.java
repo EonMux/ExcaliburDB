@@ -36,15 +36,16 @@ import java.util.concurrent.atomic.AtomicLong;
  * <ul>
  *   <li>Deleting filter entries for tombstoned segments</li>
  *   <li>Propagating removals up the filter hierarchy</li>
- *   <li>Monitoring filter health and false positive rates</li>
  * </ul>
+ *
+ * <p>False positive rates are not measured here: {@link CuckooMetricsWorker} samples them, and
+ * two workers reporting the same number on different schedules is how they come to disagree.</p>
  *
  * <h2>Hierarchical Filter Maintenance</h2>
  * <p>When a segment is tombstoned:</p>
  * <ol>
  *   <li>Entries are deleted from the segment-level filter</li>
  *   <li>Deletions are propagated to parent filters in the hierarchy</li>
- *   <li>False positive rate is recalculated and logged</li>
  * </ol>
  *
  * <h2>Thread Safety</h2>
@@ -286,7 +287,6 @@ public class CuckooMaintenanceWorker {
      * <ul>
      *   <li>Tombstoned segments that need filter cleanup</li>
      *   <li>Pending deletions from the queue</li>
-     *   <li>Filter health (false positive rates)</li>
      * </ul>
      *
      * <p>If the worker is already running, this method does nothing.</p>
@@ -468,9 +468,6 @@ public class CuckooMaintenanceWorker {
 
             // Step 3: Propagate deletions up the hierarchy
             propagateDeletionsUpHierarchy();
-
-            // Step 4: Check filter health
-            checkFilterHealth();
 
             // Update statistics
             totalDeletions.addAndGet(deletionsThisCycle);
@@ -725,26 +722,6 @@ public class CuckooMaintenanceWorker {
         if (processed > 0) {
             LOGGER.debug("Propagated {} deletions through hierarchy, {} pending",
                 processed, pendingDeletions.size());
-        }
-    }
-
-    /**
-     * Checks filter health by monitoring false positive rates.
-     */
-    private void checkFilterHealth() {
-        for (SegmentFilter sf : segmentFilters) {
-            // Get filter statistics
-            long count = sf.filter.count();
-            if (count <= 0) {
-                continue;
-            }
-
-            // Note: Actual FP rate measurement would require sampling
-            // For now, we log filter size for monitoring
-            if (LOGGER.isTraceEnabled()) {
-                LOGGER.trace("Filter health check: segment {} has {} entries",
-                    sf.segmentId, count);
-            }
         }
     }
 

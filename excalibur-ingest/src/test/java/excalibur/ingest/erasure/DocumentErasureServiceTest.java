@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -505,6 +506,98 @@ class DocumentErasureServiceTest {
                 .isInstanceOf(NullPointerException.class);
             assertThatThrownBy(() -> new DocumentErasureService(registry, null, null, null))
                 .isInstanceOf(NullPointerException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("The vector index")
+    class Vectors {
+
+        /** Records what it was asked to retire, standing in for the segments' graphs. */
+        private final List<String> retired = new ArrayList<>();
+
+        private DocumentErasureService.VectorEraser recording(int perDocument) {
+            return documentKey -> {
+                retired.add(documentKey);
+                return perDocument;
+            };
+        }
+
+        private DocumentErasureService withEraser(DocumentErasureService.VectorEraser eraser) {
+            return new DocumentErasureService(registry, adapter, index, storage::get, null, eraser);
+        }
+
+        @Test
+        @DisplayName("the document's vectors are retired, named the way nodes are attributed")
+        void retiresTheDocumentsVectors() throws Exception {
+            // A node carries no text, so an erased document's vectors look like harmless residue.
+            // They are not: a hit names its document and its distance, which says that document
+            // matched the query - the one fact the erasure was asked to remove.
+            open(never());
+            ingest("docs", "secret.md", "confidential incident postmortem", "second half");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            DocumentErasureService.Outcome outcome =
+                withEraser(recording(2)).erase("docs", List.of("secret.md"), false);
+
+            assertThat(retired)
+                .as("nodes are attributed by source and document, and must be asked for that way")
+                .containsExactly("docs:secret.md");
+            assertThat(outcome.vectorsHidden()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("erasing a whole source reaches the vectors of every document in the batch")
+        void reachesEveryDocumentOfASource() throws Exception {
+            open(never());
+            ingest("docs", "first.md", "confidential");
+            ingest("docs", "second.md", "also confidential");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            DocumentErasureService.Outcome outcome =
+                withEraser(recording(3)).eraseSource("docs", 100, false);
+
+            assertThat(retired).containsExactlyInAnyOrder("docs:first.md", "docs:second.md");
+            assertThat(outcome.vectorsHidden()).isEqualTo(6);
+        }
+
+        @Test
+        @DisplayName("a node with no vector index erases just the same")
+        void aVectorIndexIsOptional() throws Exception {
+            open(never());
+            ingest("docs", "secret.md", "confidential");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            DocumentErasureService.Outcome outcome =
+                service().erase("docs", List.of("secret.md"), false);
+
+            assertThat(outcome.documentsErased()).isEqualTo(1);
+            assertThat(outcome.vectorsHidden()).isZero();
+        }
+
+        @Test
+        @DisplayName("vectors that will not retire are reported, not thrown")
+        void aFailureDoesNotStopTheRest() throws Exception {
+            // The content leaving storage is the part of the promise this node can always keep.
+            // Losing it because the graph would not take a write would be the worse outcome.
+            open(never());
+            ingest("docs", "secret.md", "confidential");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            DocumentErasureService.Outcome outcome = withEraser(documentKey -> {
+                throw new IllegalStateException("graph is closed");
+            }).erase("docs", List.of("secret.md"), false);
+
+            assertThat(outcome.documentsErased()).isEqualTo(1);
+            assertThat(outcome.chunksTombstoned()).isEqualTo(1);
+            assertThat(outcome.vectorsHidden())
+                .as("nothing was retired, and the reply must not claim otherwise")
+                .isZero();
+            assertThat(storage).isEmpty();
         }
     }
 }

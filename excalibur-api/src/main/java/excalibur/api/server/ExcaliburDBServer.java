@@ -1,5 +1,6 @@
 package excalibur.api.server;
 
+import excalibur.api.bootstrap.DurableEpochFloor;
 import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.ResponseBody;
 import com.sun.net.httpserver.HttpServer;
@@ -13,6 +14,7 @@ import excalibur.api.endpoint.QueryCancelEndpoint;
 import excalibur.api.endpoint.IngestEndpoint;
 import excalibur.api.endpoint.ReindexEndpoint;
 import excalibur.api.endpoint.IngestStatusEndpoint;
+import excalibur.api.bootstrap.SourceRestoration;
 import excalibur.api.endpoint.InMemorySourceRegistry;
 import excalibur.api.endpoint.SourceRegistry;
 import excalibur.api.reindex.ReindexCoordinator;
@@ -410,6 +412,32 @@ public class ExcaliburDBServer {
         this.documentErasure = service;
     }
 
+    /**
+     * Where registered ingest sources are written down, so they outlive the process.
+     *
+     * <p>Optional. Without one the registry keeps its sources in memory alone, and a restart
+     * leaves the node holding an indexed corpus that nothing re-crawls - which is the state
+     * every {@code /v1/ingest} caller was told it had avoided.</p>
+     */
+    private volatile excalibur.ingest.registry.SourceCatalog sourceCatalog;
+
+    /**
+     * Makes source registrations survive a restart.
+     *
+     * <p>Must be called before {@link #start()}: the catalog is read once while the endpoints are
+     * built, and its records are put back through the same allow-lists a fresh {@code POST
+     * /v1/ingest} would meet.</p>
+     *
+     * @param catalog Where registrations are recorded
+     * @throws IllegalStateException if the server is already running
+     */
+    public void withSourceCatalog(excalibur.ingest.registry.SourceCatalog catalog) {
+        if (running.get()) {
+            throw new IllegalStateException("Cannot configure the source catalog after server has started");
+        }
+        this.sourceCatalog = catalog;
+    }
+
     /** Attaches lexical retrieval, before the server starts. */
     public void withLexicalQueryService(excalibur.api.retrieval.LexicalQueryService service) {
         this.lexicalQueryService = service;
@@ -477,13 +505,16 @@ public class ExcaliburDBServer {
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
         Objects.requireNonNull(queryPipeline, "queryPipeline cannot be null");
 
-        // Create IndexOrchestrator from Config.Shard settings
+        // Create IndexOrchestrator from Config.Shard settings, on one visibility clock with
+        // the engine and resumed above the epochs this node's durable records already carry.
         IndexOrchestrator orchestrator = IndexOrchestrator.fromConfig(
             catalog,
             storageEngine,
             volumeManager,
-            config.shard()
+            config.shard(),
+            DurableEpochFloor.resumeEpoch(storageEngine.dataDir(), catalog)
         );
+        storageEngine.setVisibilityTracker(orchestrator.getVisibilityTracker());
 
         LOGGER.info("Created ExcaliburDBServer with Config.Shard: efConstruction={}, efSearch={}, hnswQueueLimit={}, loadFactor={}",
             config.shard().getEfConstruction(),
@@ -532,13 +563,16 @@ public class ExcaliburDBServer {
             throw new IllegalArgumentException("Port must be in range 0-65535: " + port);
         }
 
-        // Create IndexOrchestrator from Config.Shard settings
+        // Create IndexOrchestrator from Config.Shard settings, on one visibility clock with
+        // the engine and resumed above the epochs this node's durable records already carry.
         IndexOrchestrator orchestrator = IndexOrchestrator.fromConfig(
             catalog,
             storageEngine,
             volumeManager,
-            config.shard()
+            config.shard(),
+            DurableEpochFloor.resumeEpoch(storageEngine.dataDir(), catalog)
         );
+        storageEngine.setVisibilityTracker(orchestrator.getVisibilityTracker());
 
         LOGGER.info("Created ExcaliburDBServer on port {} with Config.Shard: efConstruction={}, efSearch={}, hnswQueueLimit={}",
             port,
@@ -918,13 +952,6 @@ public class ExcaliburDBServer {
                     };
                 }
             },
-            // No document chunk buffer. Document visibility does not depend on it -- publishDocument
-            // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
-            // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
-            // is not active. Wiring it needs a write log this buffer can own (it appends and
-            // assumes exclusive use), and the node has no such log today: every WriteLog here
-            // belongs to a segment. That is a lifecycle decision, not a call-site one.
-            null,
             documentVisibilityTracker,  // Wire visibility tracker for document atomicity
             termFrequencyTracker,  // Term frequency tracker for selectivity estimation
             documentTimeoutMs
@@ -1009,13 +1036,6 @@ public class ExcaliburDBServer {
                     };
                 }
             },
-            // No document chunk buffer. Document visibility does not depend on it -- publishDocument
-            // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
-            // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
-            // is not active. Wiring it needs a write log this buffer can own (it appends and
-            // assumes exclusive use), and the node has no such log today: every WriteLog here
-            // belongs to a segment. That is a lifecycle decision, not a call-site one.
-            null,
             visibilityTracker,  // Use provided visibility tracker (may be null)
             termFrequencyTracker,  // Term frequency tracker for selectivity estimation
             documentTimeoutMs
@@ -1053,11 +1073,11 @@ public class ExcaliburDBServer {
      * before starting the server.</p>
      *
      * @param textChunker The text chunker for splitting documents into chunks
-     * @param embeddingClient The embedding client for generating embeddings
+     * @param embeddingClient The embedding client, or null for lexical-only ingestion
      * @param lshIngestionService The LSH ingestion service for vector indexing (may be null to disable LSH)
      * @param visibilityTracker The document visibility tracker for atomic visibility (may be null)
      * @throws IllegalStateException if the server is already running
-     * @throws NullPointerException if textChunker or embeddingClient is null
+     * @throws NullPointerException if textChunker is null
      */
     public void withIngestionPipeline(TextChunker textChunker, EmbeddingClient embeddingClient,
                                       LshIngestionService lshIngestionService,
@@ -1108,13 +1128,6 @@ public class ExcaliburDBServer {
                     };
                 }
             },
-            // No document chunk buffer. Document visibility does not depend on it -- publishDocument
-            // falls through to registerFromMetadata -- but it means the WAL mirror, and so the
-            // tail-scan hand-off that makes a chunk queryable before HNSW integration catches up,
-            // is not active. Wiring it needs a write log this buffer can own (it appends and
-            // assumes exclusive use), and the node has no such log today: every WriteLog here
-            // belongs to a segment. That is a lifecycle decision, not a call-site one.
-            null,
             visibilityTracker,
             termFrequencyTracker,  // Term frequency tracker for selectivity estimation
             documentTimeoutMs
@@ -1139,8 +1152,9 @@ public class ExcaliburDBServer {
             LOGGER.info("Query pipeline wired with shared document visibility checker for atomicity filtering");
         }
 
-        LOGGER.info("Ingestion pipeline configured: TextChunker, EmbeddingClient, "
-            + "TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity={}, vectorPreFilter={}",
+        LOGGER.info("Ingestion pipeline configured: TextChunker, TermFrequencyTracker, "
+            + "embedding={}, documentTimeoutMs={}ms, documentAtomicity={}, vectorPreFilter={}",
+            embeddingClient != null ? "enabled" : "disabled",
             documentTimeoutMs, visibilityTracker != null ? "enabled" : "disabled",
             lshIngestionService != null ? "enabled" : "disabled");
     }
@@ -1475,6 +1489,17 @@ public class ExcaliburDBServer {
                 reindexIntervalMs
             );
             LOGGER.info("IngestSourceRegistry wired to ReindexScheduler with interval={}ms", reindexIntervalMs);
+
+            // The catalog is attached before its records are read back, so a source restored here
+            // stays recorded rather than being re-written on the way in.
+            if (sourceCatalog != null) {
+                inMemRegistry.setSourceCatalog(sourceCatalog);
+                SourceRestoration.restore(
+                    sourceCatalog,
+                    new excalibur.api.endpoint.SourceFactory(new IngestTargetValidator(security)),
+                    inMemRegistry
+                );
+            }
         }
 
         // Create ReindexEndpoint with shared source registry for consistency
@@ -1518,18 +1543,22 @@ public class ExcaliburDBServer {
             wrapHandler(guard.protect(RequestGuard.Access.PUBLIC, healthEndpoint)));
         target.createContext("/v1/stats",
             wrapHandler(guard.protect(RequestGuard.Access.READ, statsEndpoint)));
-        // Create a composite handler for /v1/query that routes based on HTTP method
-        target.createContext("/v1/query", createQueryMethodRouter(
-            guard.protect(RequestGuard.Access.READ, queryHandler),
-            guard.protect(RequestGuard.Access.MUTATE, queryCancelEndpoint)));
+        // POST runs a query, DELETE cancels one. Any other method is answered by a handler of its
+        // own, so the 405 is charged against the read budget rather than served below the guard.
+        target.createContext("/v1/query", wrapHandler(createMethodRouter(
+            "POST", guard.protect(RequestGuard.Access.READ, queryHandler),
+            "DELETE", guard.protect(RequestGuard.Access.MUTATE, queryCancelEndpoint),
+            guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                "Method Not Allowed - Use POST for queries or DELETE for cancellation")))));
         // POST registers a source, DELETE stops crawling one. Both mutate, and both are charged
         // against the mutate budget; the same shape /v1/query uses for query and cancel.
-        target.createContext("/v1/ingest", createMethodRouter("POST",
-            guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint),
-            "DELETE",
-            guard.protect(RequestGuard.Access.MUTATE,
+        target.createContext("/v1/ingest", wrapHandler(createMethodRouter(
+            "POST", guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint),
+            "DELETE", guard.protect(RequestGuard.Access.MUTATE,
                 new excalibur.api.endpoint.SourceDeregisterEndpoint(ingestSourceRegistry)),
-            "Method Not Allowed - Use POST to register a source or DELETE to stop crawling one"));
+            guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                "Method Not Allowed - Use POST to register a source "
+                    + "or DELETE to stop crawling one")))));
         target.createContext("/v1/reindex",
             wrapHandler(guard.protect(RequestGuard.Access.MUTATE, reindexHandler)));
         target.createContext("/v1/ingest/status",
@@ -1634,87 +1663,48 @@ public class ExcaliburDBServer {
     }
 
     /**
-     * Creates a method-based router for /v1/query endpoint.
-     *
-     * <p>Routes requests based on HTTP method:</p>
-     * <ul>
-     *   <li>POST - Query execution (delegates to QueryEndpoint)</li>
-     *   <li>DELETE - Query cancellation (delegates to QueryCancelEndpoint)</li>
-     * </ul>
-     *
-     * @param queryEndpoint The handler for POST requests
-     * @param cancelEndpoint The handler for DELETE requests
-     * @return A composite handler that routes based on HTTP method
-     */
-    /**
      * Routes one context by request method.
      *
      * <p>Two operations on one noun rather than two nouns: registering a source and stopping one
      * are the same resource, and inventing a second path for the second verb is what HTTP methods
      * exist to avoid.</p>
+     *
+     * <p>Every branch is a whole handler, the fall-through included, so each one carries its own
+     * {@link RequestGuard} decision. A router that wrote the 405 itself would answer it below the
+     * guard: an anonymous caller could then spend a path's worth of work per request, at line rate,
+     * on a method the route does not serve. Logging, error handling and closing the exchange are
+     * {@link #wrapHandler}'s, as they are for every other context.</p>
+     *
+     * @param firstMethod  The method the first handler serves
+     * @param first        The handler for {@code firstMethod}
+     * @param secondMethod The method the second handler serves
+     * @param second       The handler for {@code secondMethod}
+     * @param otherwise    The handler for every other method
+     * @return A handler that dispatches on the request method
      */
     private HttpHandler createMethodRouter(String firstMethod, HttpHandler first,
                                            String secondMethod, HttpHandler second,
-                                           String otherwise) {
+                                           HttpHandler otherwise) {
         return exchange -> {
             String method = exchange.getRequestMethod();
-            String path = exchange.getRequestURI().getPath();
-            long start = System.currentTimeMillis();
-            try {
-                LOGGER.debug("Request: {} {}", method, path);
-                if (firstMethod.equalsIgnoreCase(method)) {
-                    first.handle(exchange);
-                } else if (secondMethod.equalsIgnoreCase(method)) {
-                    second.handle(exchange);
-                } else {
-                    sendError(exchange, 405, otherwise);
-                }
-                LOGGER.debug("Response: {} {} - {}ms", method, path,
-                    System.currentTimeMillis() - start);
-            } catch (Exception e) {
-                LOGGER.error("Error handling {} {}: {}", method, path, e.getMessage(), e);
-                if (!exchange.getResponseHeaders().containsKey("Content-Type")) {
-                    sendError(exchange, 500, "Internal Server Error");
-                }
-            } finally {
-                exchange.close();
+            if (firstMethod.equalsIgnoreCase(method)) {
+                first.handle(exchange);
+            } else if (secondMethod.equalsIgnoreCase(method)) {
+                second.handle(exchange);
+            } else {
+                otherwise.handle(exchange);
             }
         };
     }
 
-    private HttpHandler createQueryMethodRouter(HttpHandler queryEndpoint, HttpHandler cancelEndpoint) {
-        return exchange -> {
-            String method = exchange.getRequestMethod();
-            String path = exchange.getRequestURI().getPath();
-            long start = System.currentTimeMillis();
-
-            try {
-                LOGGER.debug("Request: {} {} from {}", method, path,
-                    exchange.getRemoteAddress().getAddress().getHostAddress());
-
-                // Route based on method
-                if ("POST".equalsIgnoreCase(method)) {
-                    queryEndpoint.handle(exchange);
-                } else if ("DELETE".equalsIgnoreCase(method)) {
-                    cancelEndpoint.handle(exchange);
-                } else {
-                    // Return method not allowed for other methods
-                    sendError(exchange, 405, "Method Not Allowed - Use POST for queries or DELETE for cancellation");
-                }
-
-                long duration = System.currentTimeMillis() - start;
-                LOGGER.debug("Response: {} {} - {}ms", method, path, duration);
-            } catch (Exception e) {
-                long duration = System.currentTimeMillis() - start;
-                LOGGER.error("Error handling {} {}: {} ({}ms)", method, path, e.getMessage(), duration, e);
-
-                if (!exchange.getResponseHeaders().containsKey("Content-Type")) {
-                    sendError(exchange, 500, "Internal Server Error");
-                }
-            } finally {
-                exchange.close();
-            }
-        };
+    /**
+     * A handler that answers 405 and nothing else.
+     *
+     * @param message The reason, naming the methods the route does serve
+     * @return A handler for the methods a route does not serve
+     */
+    private HttpHandler methodNotAllowed(String message) {
+        return exchange -> sendError(exchange, 405, message);
     }
 
     /**

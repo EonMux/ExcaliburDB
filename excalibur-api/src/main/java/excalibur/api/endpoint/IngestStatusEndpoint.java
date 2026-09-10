@@ -126,6 +126,12 @@ public class IngestStatusEndpoint implements HttpHandler {
                 LOGGER.debug("Ingest status request for source: {}", sourceId != null ? sourceId : "all");
 
                 if (sourceId != null) {
+                    String violation = SourceIds.violation(sourceId, "source_id");
+                    if (violation != null) {
+                        sendError(exchange, 400, violation);
+                        return;
+                    }
+
                     // Get status for specific source
                     IngestionStatus status = statusRegistry.getStatus(sourceId);
                     if (status == null) {

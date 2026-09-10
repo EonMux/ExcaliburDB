@@ -4,6 +4,7 @@ import excalibur.filter.CuckooFilter;
 import io.excalibur.retrieval.lexical.LexicalIndex;
 import io.excalibur.retrieval.rank.RankedList;
 import io.excalibur.retrieval.rank.RetrievalQuery;
+import io.excalibur.retrieval.rank.ScoredDocument;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -119,6 +120,54 @@ class VocabularyGateTest {
 
                 assertThat(gated.documents()).isNotEmpty();
                 assertThat(gated.documents().get(0).documentId()).isEqualTo(1L);
+            }
+        }
+
+        @Test
+        @DisplayName("a formulation the gate refuses is not searched")
+        void refusedFormulationsAreNotSearched(@TempDir Path dir) throws Exception {
+            try (LexicalIndex index = indexed(dir)) {
+                QueryExpander expanding = query -> List.of(
+                    SearchFormulation.original(query),
+                    new SearchFormulation("SIGKILL", 1.0));
+                // Refusing a term the corpus does hold is the only way to see the gate from
+                // outside it: a term the corpus lacks matches nothing whether or not it is
+                // searched, so gating it away changes the work done and not the answer.
+                VocabularyGate refusing = term -> !"sigkill".equals(term);
+
+                RankedList out = new ExpandedLexicalRanker(index, expanding, "gated", refusing)
+                    .rank(RetrievalQuery.ofText("handshake"), 5);
+
+                assertThat(out.documents()).extracting(ScoredDocument::documentId)
+                    .as("the refused formulation is the only reason document 1 would rank")
+                    .containsExactly(2L);
+            }
+        }
+
+        @Test
+        @DisplayName("a formulation the corpus does hold survives, whatever its script")
+        void presentFormulationsSurviveTheGate(@TempDir Path dir) throws Exception {
+            try (LexicalIndex index = LexicalIndex.open(dir, 8.0)) {
+                // The gate answers about the terms the index holds, which are whatever its
+                // analyzer produced. Asking it about anything else - a run of CJK the analyzer
+                // split into bigrams, a contraction it kept whole - is asking about terms no
+                // index has, and every answer is "absent".
+                index.put(1L, "\u5185\u5b58\u4e0d\u8db3\u5bfc\u81f4\u8fdb\u7a0b\u88ab\u7ec8\u6b62", "a");
+                index.put(2L, "the certificate chain could not be verified", "b");
+                index.refresh();
+
+                QueryExpander expanding = query -> List.of(
+                    SearchFormulation.original(query),
+                    new SearchFormulation("\u5185\u5b58\u4e0d\u8db3", 1.0));
+
+                RankedList gated = new ExpandedLexicalRanker(index, expanding,
+                    "gated", new LuceneVocabulary(index))
+                    .rank(RetrievalQuery.ofText("certificate"), 5);
+
+                assertThat(gated.documents()).extracting(ScoredDocument::documentId)
+                    .as("the formulation names words document 1 really holds; dropping it loses "
+                        + "a hit the ungated ranker returns")
+                    .contains(1L);
             }
         }
 

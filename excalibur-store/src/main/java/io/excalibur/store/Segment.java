@@ -1291,10 +1291,13 @@ public class Segment implements AutoCloseable {
             }
 
             // Close the file channel
+            // The segment counts as closed either way - callers must not retry - but a channel
+            // that would not close is a descriptor this process keeps until it exits.
             try {
                 fileChannel.close();
             } catch (IOException e) {
-                // Ignore close errors - segment is still considered closed
+                LOGGER.log(java.util.logging.Level.WARNING,
+                    "Failed to close file channel for segment " + path, e);
             }
         } finally {
             lock.writeLock().unlock();

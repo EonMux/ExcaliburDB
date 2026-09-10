@@ -6,6 +6,8 @@ import io.excalibur.retrieval.rank.Ranker;
 import io.excalibur.retrieval.rank.RetrievalQuery;
 import io.excalibur.retrieval.rank.ScoredDocument;
 
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.queryparser.classic.ParseException;
@@ -83,17 +85,27 @@ public final class ExpandedLexicalRanker implements Ranker {
      *
      * <p>Any rather than all: a multi-word formulation whose head term is present is still worth
      * searching, and requiring every token would discard phrases over one incidental word.</p>
+     *
+     * <p>Tokenised by the index's own analyzer, because that is what decides which terms the
+     * dictionary holds. Splitting the text some other way asks about strings no index has - a run
+     * of CJK the analyzer indexed as bigrams, a contraction it kept whole - and every answer comes
+     * back "absent", so the gate drops formulations the corpus really can match.</p>
      */
     private boolean inVocabulary(String text) {
         boolean sawToken = false;
-        for (String token : text.toLowerCase(java.util.Locale.ROOT).split("[^\\p{L}\\p{N}]+")) {
-            if (token.isEmpty()) {
-                continue;
+        try (TokenStream tokens = index.analyzer().tokenStream(LexicalIndex.FIELD_TEXT, text)) {
+            CharTermAttribute token = tokens.addAttribute(CharTermAttribute.class);
+            tokens.reset();
+            while (tokens.incrementToken()) {
+                sawToken = true;
+                if (vocabulary.mayContain(token.toString())) {
+                    return true;
+                }
             }
-            sawToken = true;
-            if (vocabulary.mayContain(token)) {
-                return true;
-            }
+            tokens.end();
+        } catch (IOException e) {
+            // A gate that cannot read must not be the reason a query returns nothing.
+            return true;
         }
         // A formulation with no searchable token at all is not evidence of anything.
         return !sawToken;

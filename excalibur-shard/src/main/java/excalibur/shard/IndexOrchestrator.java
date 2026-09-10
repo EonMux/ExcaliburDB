@@ -132,6 +132,15 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     public static final long DEFAULT_EPOCH_TICK_INTERVAL_MS = 100;
 
     /**
+     * Epoch the visibility counter starts at when the caller names none.
+     *
+     * <p>Right only for a node with no durable records to be older than: an empty data directory,
+     * or an engine built for a test. A node recovering a data directory has to resume above the
+     * epochs those records carry - see the constructor that takes one.</p>
+     */
+    public static final long DEFAULT_INITIAL_EPOCH = 0L;
+
+    /**
      * Default interval between segment directory reconciliation sweeps, in milliseconds.
      *
      * <p>Segments appear and disappear behind the orchestrator's back: the storage engine
@@ -149,6 +158,16 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     private final HnswIntegrationWorker hnswWorker;
     private final CuckooMaintenanceWorker cuckooWorker;
     private final SegmentReindexScheduler reindexScheduler;
+
+    /**
+     * Background tombstone cleanup, or null when the storage engine exposes no Arena.
+     *
+     * <p>Compaction maps its replacement segment out of that Arena, and the segment stays readable
+     * only while the Arena is open - so it has to outlive every reader of every segment compaction
+     * ever produced, which is longer than this orchestrator lives. Only the engine that owns the
+     * segments can hold an Arena to that contract, so when it offers none there is no compaction:
+     * dead space is then reclaimed by reindex alone, which is slower, not wrong.</p>
+     */
     private final CompactionWorker compactionWorker;
 
     /**
@@ -294,6 +313,36 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
                               VolumeManager volumeManager,
                               int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
                               long reindexCheckIntervalMs, long epochTickIntervalMs) {
+        this(catalog, storageEngine, volumeManager, hnswQueueDepthLimit,
+             cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs,
+             DEFAULT_INITIAL_EPOCH);
+    }
+
+    /**
+     * Creates a new IndexOrchestrator whose visibility counter resumes at a given epoch.
+     *
+     * <p>Epochs are stamped into durable records and compared against this counter. A node
+     * holding records from an earlier run has to resume above every epoch those records carry,
+     * or it reads its own corpus as written in the future and its own tombstones as not yet
+     * applied. The caller that knows which stores exist computes that floor; here it is taken
+     * as given.</p>
+     *
+     * @param catalog                       The segment catalog
+     * @param storageEngine                 The storage engine
+     * @param volumeManager                 The volume manager for disk space tracking (optional)
+     * @param hnswQueueDepthLimit           HNSW integration queue depth limit
+     * @param cuckooMaintenanceIntervalMs   Cuckoo maintenance interval (ms)
+     * @param reindexCheckIntervalMs        Re-index check interval (ms)
+     * @param epochTickIntervalMs           Epoch tick interval (ms)
+     * @param initialEpoch                  Epoch the visibility counter starts at
+     * @throws NullPointerException         if catalog or storageEngine is null
+     * @throws IllegalArgumentException     if configuration values are invalid
+     */
+    public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
+                              VolumeManager volumeManager,
+                              int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
+                              long reindexCheckIntervalMs, long epochTickIntervalMs,
+                              long initialEpoch) {
         if (catalog == null) {
             throw new NullPointerException("Catalog cannot be null");
         }
@@ -308,8 +357,9 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         this.running = new AtomicBoolean(false);
         this.stopped = new AtomicBoolean(false);
 
-        // Create visibility tracker for coordinating epochs across segments
-        this.visibilityTracker = new VisibilityTracker(catalog);
+        // Create visibility tracker for coordinating epochs across segments, resumed above
+        // whatever epochs the durable stores already carry.
+        this.visibilityTracker = new VisibilityTracker(catalog, initialEpoch);
 
         // Create epoch isolation validator for node-level epoch tracking
         this.epochIsolationValidator = new EpochIsolationValidator();
@@ -340,20 +390,18 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             sourceId -> onReindexNeeded(sourceId),
             reindexCheckIntervalMs, 3600000);
 
-        // Create compaction worker for background tombstone cleanup
-        // Uses Arena from storage engine for memory allocation
+        // Background tombstone cleanup, allocating replacement segments out of the storage
+        // engine's Arena. See the compactionWorker field for why no other Arena will do.
         Arena arena = storageEngine.arena();
         if (arena != null) {
             this.compactionWorker = new CompactionWorker(arena, (oldSegment, newSegment) -> {
                 onCompactionComplete(oldSegment, newSegment);
             });
-            LOGGER.info("CompactionWorker initialized with Panama FFM Arena");
+            LOGGER.info("CompactionWorker initialized over the storage engine's Arena");
         } else {
-            // Fallback: Create CompactionWorker with a shared arena for non-Panama environments
-            this.compactionWorker = new CompactionWorker(Arena.ofShared(), (oldSegment, newSegment) -> {
-                onCompactionComplete(oldSegment, newSegment);
-            });
-            LOGGER.info("CompactionWorker initialized with fallback shared Arena");
+            this.compactionWorker = null;
+            LOGGER.warn("Storage engine exposes no Arena; background tombstone compaction is "
+                + "disabled. Dead space is reclaimed by reindex only.");
         }
 
         // Create warming phase worker for PQ codebook training
@@ -421,6 +469,26 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
                                                 StorageEngine storageEngine,
                                                 VolumeManager volumeManager,
                                                 Config.Shard shard) {
+        return fromConfig(catalog, storageEngine, volumeManager, shard, DEFAULT_INITIAL_EPOCH);
+    }
+
+    /**
+     * Creates an IndexOrchestrator from shard configuration, resuming at a given epoch.
+     *
+     * @param catalog       The segment catalog
+     * @param storageEngine The storage engine
+     * @param volumeManager The volume manager (optional, may be null)
+     * @param shard         The shard configuration from Config.Shard
+     * @param initialEpoch  Epoch the visibility counter starts at, above every epoch the node's
+     *                      durable records carry
+     * @return A new IndexOrchestrator configured with shard settings
+     * @throws NullPointerException if catalog, storageEngine, or shard is null
+     */
+    public static IndexOrchestrator fromConfig(SegmentCatalog catalog,
+                                                StorageEngine storageEngine,
+                                                VolumeManager volumeManager,
+                                                Config.Shard shard,
+                                                long initialEpoch) {
         Objects.requireNonNull(catalog, "catalog cannot be null");
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
         Objects.requireNonNull(shard, "shard config cannot be null");
@@ -435,7 +503,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             shard.getHnswQueueLimit(),        // HNSW queue depth limit from config
             DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,  // Keep default: 5000ms
             DEFAULT_REINDEX_CHECK_INTERVAL_MS,       // Keep default: 60000ms
-            DEFAULT_EPOCH_TICK_INTERVAL_MS           // Keep default: 100ms
+            DEFAULT_EPOCH_TICK_INTERVAL_MS,          // Keep default: 100ms
+            initialEpoch
         );
 
         // The key was parsed, range-checked, shipped and logged at startup while reaching no
@@ -459,6 +528,37 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             compactionWorker.withStartDelayMs(delayMs);
         }
         return this;
+    }
+
+    /**
+     * Registers a segment for background tombstone cleanup, if compaction is available.
+     *
+     * @param segment The segment
+     */
+    private void registerForCompaction(Segment segment) {
+        if (compactionWorker != null) {
+            compactionWorker.registerSegment(segment);
+        }
+    }
+
+    /**
+     * Unregisters a segment from background tombstone cleanup, if compaction is available.
+     *
+     * @param segment The segment
+     */
+    private void unregisterFromCompaction(Segment segment) {
+        if (compactionWorker != null) {
+            compactionWorker.unregisterSegment(segment);
+        }
+    }
+
+    /**
+     * Returns how many compactions have run, which is none when compaction is unavailable.
+     *
+     * @return The compaction count
+     */
+    private long compactionCount() {
+        return compactionWorker != null ? compactionWorker.getCompactionCount() : 0L;
     }
 
     // ==================== Lifecycle Management ====================
@@ -486,7 +586,9 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             warmingWorker.start();
             hnswCompactionWorker.start();
             reindexScheduler.start();
-            compactionWorker.start();
+            if (compactionWorker != null) {
+                compactionWorker.start();
+            }
 
             // Converge the registrations with the storage engine's directory. Segments
             // created after boot - lazily on first write, or as the children of a split -
@@ -512,7 +614,9 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
 
             // Stop workers in reverse order
             stopSegmentSync();
-            compactionWorker.stop();
+            if (compactionWorker != null) {
+                compactionWorker.stop();
+            }
             reindexScheduler.stop();
             hnswCompactionWorker.stop();
             warmingWorker.stop();
@@ -525,7 +629,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
 
             LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Cuckoo deletions: {}, Reindexes: {}, Compactions: {}, HNSW compactions: {}, PQ trained: {}, Epoch ticks: {}, Cuckoo FP samples: {}",
                 hnswWorker.getTotalIntegrated(), cuckooWorker.getTotalDeletions(),
-                reindexScheduler.getTotalReindexesTriggered(), compactionWorker.getCompactionCount(),
+                reindexScheduler.getTotalReindexesTriggered(), compactionCount(),
                 hnswCompactionWorker.getCompactionCount(),
                 warmingWorker.getTotalPqTrained(), epochTickScheduler.getTickCount(),
                 cuckooMetricsWorker.getTotalSamplesRecorded());
@@ -659,8 +763,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             cuckooMetricsWorker.registerFilter(segmentId, filter);
         }
 
-        // Register with compaction worker for background tombstone cleanup
-        compactionWorker.registerSegment(segment);
+        registerForCompaction(segment);
 
         // Register with hierarchical Cuckoo filter for corpus → cluster → segment membership
         // This enables efficient query pruning via Stage 1 Cuckoo filter cascade
@@ -723,7 +826,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
 
         if (!isSegmentRegisteredElsewhere(info.segment)) {
             hnswWorker.unregisterSegment(info.segment);
-            compactionWorker.unregisterSegment(info.segment);
+            unregisterFromCompaction(info.segment);
         }
         if (info.graph != null && !isGraphRegisteredElsewhere(info.graph)) {
             hnswCompactionWorker.unregisterGraph(info.graph);
@@ -1235,7 +1338,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         // inserts every vector a second time, and a batch already in flight completes and pushes
         // the offset back up to one measured against a log the replacement does not have.
         hnswWorker.unregisterSegment(oldSegment);
-        compactionWorker.unregisterSegment(oldSegment);
+        unregisterFromCompaction(oldSegment);
 
         boolean installed = false;
         try {
@@ -1251,7 +1354,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
                 if (graph != null && tracker != null) {
                     hnswWorker.registerSegment(oldSegment, graph, tracker);
                 }
-                compactionWorker.registerSegment(oldSegment);
+                registerForCompaction(oldSegment);
             }
         }
 
@@ -1458,7 +1561,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     private void repointWorkers(long segmentId, Segment oldSegment, Segment newSegment,
                                 HnswGraph graph, CuckooFilter filter, TailOffsetTracker tracker) {
         hnswWorker.unregisterSegment(oldSegment);
-        compactionWorker.unregisterSegment(oldSegment);
+        unregisterFromCompaction(oldSegment);
 
         if (graph != null && tracker != null) {
             hnswWorker.registerSegment(newSegment, graph, tracker);
@@ -1467,7 +1570,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             // The graph itself is unchanged, so its HNSW compaction registration stands.
         }
 
-        compactionWorker.registerSegment(newSegment);
+        registerForCompaction(newSegment);
 
         SegmentIndexInfo newInfo = new SegmentIndexInfo(
             segmentId, newSegment, graph, filter, tracker);
@@ -1656,7 +1759,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * will delegate to it. Otherwise, it logs a warning and completes without
      * performing any actual reindexing.</p>
      */
-    private boolean onReindexNeeded(long sourceId) {
+    private boolean onReindexNeeded(String sourceId) {
         LOGGER.info("Re-index needed for source {}", sourceId);
         try {
             // Trigger the ingestion pipeline for reindex
@@ -1690,7 +1793,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * @param sourceId The source ID to re-index
      * @return true if reindex succeeded, false otherwise
      */
-    private boolean triggerReindexOperation(long sourceId) {
+    private boolean triggerReindexOperation(String sourceId) {
         // If handler is not configured, the reindex cannot run
         if (reindexOperationHandler == null) {
             LOGGER.warn("Reindex triggered for source {} but ReindexOperationHandler not configured. " +
@@ -1701,7 +1804,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         // Delegate to the handler
         LOGGER.debug("Executing reindex operation for source {} via ReindexOperationHandler", sourceId);
         try {
-            return reindexOperationHandler.executeReindex(String.valueOf(sourceId));
+            return reindexOperationHandler.executeReindex(sourceId);
         } catch (Exception e) {
             LOGGER.error("ReindexOperationHandler threw exception for source {}: {}", sourceId, e.getMessage());
             return false;
@@ -1759,7 +1862,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     /**
      * Returns the compaction worker for background tombstone cleanup.
      *
-     * @return Compaction worker
+     * @return The compaction worker, or null when the storage engine exposes no Arena to allocate
+     *         replacement segments out of
      */
     public CompactionWorker getCompactionWorker() {
         return compactionWorker;

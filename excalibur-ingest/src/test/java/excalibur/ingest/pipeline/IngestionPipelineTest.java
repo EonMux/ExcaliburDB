@@ -835,7 +835,7 @@ class IngestionPipelineTest {
             // index into an ingestion that silently indexes nothing.
             IngestionOrchestrator withZero = new IngestionOrchestrator(
                 new TextChunker(), embeddings, storage, index, registry,
-                null, null, null, 0);
+                null, null, 0);
 
             FakeSource source = new FakeSource("docs", Map.of("a.txt", "text"));
             RecordingStatus status = ingest(withZero, source);
@@ -849,7 +849,7 @@ class IngestionPipelineTest {
         void optionalCollaboratorsMayBeNull() {
             IngestionOrchestrator minimal = new IngestionOrchestrator(
                 new TextChunker(), embeddings, storage, index, registry,
-                null, null, null, 2000);
+                null, null, 2000);
             minimal.setGraphSink(null);
 
             RecordingStatus status = ingest(minimal,

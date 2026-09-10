@@ -58,11 +58,11 @@ class SourceRemovalTest {
     @DisplayName("a removed source stops being re-crawled")
     void unregistersFromTheScheduler() {
         registry.register(source("42"));
-        verify(scheduler).registerSource(42L, 3_600_000L);
+        verify(scheduler).registerSource("42", 3_600_000L);
 
         registry.remove("42");
 
-        verify(scheduler).unregisterSource(42L);
+        verify(scheduler).unregisterSource("42");
     }
 
     @Test
@@ -80,22 +80,20 @@ class SourceRemovalTest {
     }
 
     @Test
-    @DisplayName("a non-numeric source id is removed without an error")
-    void nonNumericIdsAreRemovable() {
-        // register() logs that such an id cannot join the reindex schedule; removal must not then
-        // fail trying to take it out of one.
+    @DisplayName("a source named like a source is removed like any other")
+    void namedIdsAreRemovable() {
         registry.register(source("project-docs"));
 
         assertThat(registry.remove("project-docs")).isTrue();
         assertThat(registry.isRegistered("project-docs")).isFalse();
-        verify(scheduler, never()).unregisterSource(org.mockito.ArgumentMatchers.anyLong());
+        verify(scheduler).unregisterSource("project-docs");
     }
 
     @Test
     @DisplayName("removing a source that was never registered changes nothing")
     void removingAnAbsentSource() {
         assertThat(registry.remove("nothing")).isFalse();
-        verify(scheduler, never()).unregisterSource(org.mockito.ArgumentMatchers.anyLong());
+        verify(scheduler, never()).unregisterSource(org.mockito.ArgumentMatchers.anyString());
     }
 
     @Test

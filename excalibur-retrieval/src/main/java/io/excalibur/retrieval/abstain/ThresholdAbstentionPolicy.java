@@ -24,8 +24,12 @@ import io.excalibur.retrieval.fusion.FusedDocument;
  *       the same confidence as its firmest.</li>
  * </ul>
  *
- * <p>The thresholds are not guesses to be hand-tuned. {@link AbstentionCalibrator} fits them
- * against outcomes that could actually be checked.
+ * <p>The thresholds are configuration. Serving cannot fit them itself: fitting needs to know
+ * whether an answer was right, and that is exactly what a server answering a live question does
+ * not have. {@link AbstentionCalibrator} fits them offline against outcomes that could actually be
+ * checked, and {@link AbstentionCalibrator#toPolicy} turns a fit into a policy to configure - so
+ * the numbers a deployment runs on are measured rather than guessed, but the measuring happens
+ * before the deployment, not during it.
  */
 public final class ThresholdAbstentionPolicy implements AbstentionPolicy {
 

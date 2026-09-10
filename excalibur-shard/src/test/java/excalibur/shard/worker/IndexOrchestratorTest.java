@@ -217,13 +217,13 @@ class IndexOrchestratorTest {
 
         assertEquals(0, scheduler.getRegisteredSourceCount());
 
-        scheduler.registerSource(1L);
+        scheduler.registerSource("docs");
         assertEquals(1, scheduler.getRegisteredSourceCount());
 
-        scheduler.registerSource(2L, 1800000L);
+        scheduler.registerSource("wiki", 1800000L);
         assertEquals(2, scheduler.getRegisteredSourceCount());
 
-        scheduler.unregisterSource(1L);
+        scheduler.unregisterSource("docs");
         assertEquals(1, scheduler.getRegisteredSourceCount());
 
         catalog.close();
@@ -441,15 +441,15 @@ class IndexOrchestratorTest {
 
         assertEquals(0, scheduler.getRegisteredSourceCount());
 
-        scheduler.registerSource(1L, 1_800_000L);
+        scheduler.registerSource("docs", 1_800_000L);
         assertEquals(1, scheduler.getRegisteredSourceCount());
 
-        scheduler.registerSource(2L); // Using default interval
+        scheduler.registerSource("wiki"); // Using default interval
         assertEquals(2, scheduler.getRegisteredSourceCount());
 
-        scheduler.updateReindexInterval(1L, 3_600_000L);
+        scheduler.updateReindexInterval("docs", 3_600_000L);
 
-        scheduler.unregisterSource(2L);
+        scheduler.unregisterSource("wiki");
         assertEquals(1, scheduler.getRegisteredSourceCount());
 
         catalog.close();
@@ -463,15 +463,15 @@ class IndexOrchestratorTest {
         SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
             sourceId -> { triggered.set(true); return true; });
 
-        scheduler.registerSource(1L);
+        scheduler.registerSource("docs");
 
         // Trigger immediate reindex
-        assertTrue(scheduler.triggerReindexNow(1L));
+        assertTrue(scheduler.triggerReindexNow("docs"));
         assertTrue(triggered.get());
         assertEquals(1L, scheduler.getTotalReindexesTriggered());
 
         // Unknown source should return false
-        assertFalse(scheduler.triggerReindexNow(999L));
+        assertFalse(scheduler.triggerReindexNow("absent"));
 
         catalog.close();
     }
@@ -483,12 +483,12 @@ class IndexOrchestratorTest {
         SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
             sourceId -> true);
 
-        scheduler.registerSource(1L);
+        scheduler.registerSource("docs");
 
-        scheduler.markReindexComplete(1L);
+        scheduler.markReindexComplete("docs");
         assertEquals(1L, scheduler.getTotalReindexesCompleted());
 
-        scheduler.markReindexFailed(1L, "Test error");
+        scheduler.markReindexFailed("docs", "Test error");
         assertEquals(1L, scheduler.getTotalReindexesFailed());
 
         catalog.close();
@@ -564,13 +564,13 @@ class IndexOrchestratorTest {
         SegmentReindexScheduler scheduler = new SegmentReindexScheduler(catalog,
             sourceId -> true);
 
-        scheduler.registerSource(1L, 3_600_000L); // 1 hour
+        scheduler.registerSource("docs", 3_600_000L); // 1 hour
 
-        java.time.Instant nextTime = scheduler.getNextReindexTime(1L);
+        java.time.Instant nextTime = scheduler.getNextReindexTime("docs");
         assertNotNull(nextTime);
 
         // Unknown source should return null
-        assertNull(scheduler.getNextReindexTime(999L));
+        assertNull(scheduler.getNextReindexTime("absent"));
 
         catalog.close();
     }
@@ -891,7 +891,7 @@ class IndexOrchestratorTest {
         scheduler.setCheckIntervalMsUnchecked(20);
         scheduler.setDefaultReindexIntervalMsUnchecked(30);
 
-        scheduler.registerSourceUnchecked(1L, 30);
+        scheduler.registerSourceUnchecked("docs", 30);
         scheduler.start();
 
         // Wait for multiple reindex cycles to occur
@@ -932,7 +932,7 @@ class IndexOrchestratorTest {
         scheduler.setCheckIntervalMsUnchecked(20);
         scheduler.setDefaultReindexIntervalMsUnchecked(30);
 
-        scheduler.registerSourceUnchecked(1L, 30);
+        scheduler.registerSourceUnchecked("docs", 30);
         scheduler.start();
 
         // Wait for multiple potential reindex cycles
@@ -970,14 +970,14 @@ class IndexOrchestratorTest {
         SegmentReindexScheduler scheduler = orchestrator.getReindexScheduler();
 
         // Register a source
-        scheduler.registerSource(1L);
+        scheduler.registerSource("docs");
 
         // Trigger a manual reindex through the scheduler
         // This will call IndexOrchestrator.onReindexNeeded which should call markReindexComplete
         long triggeredBefore = scheduler.getTotalReindexesTriggered();
         long completedBefore = scheduler.getTotalReindexesCompleted();
 
-        boolean result = scheduler.triggerReindexNow(1L);
+        boolean result = scheduler.triggerReindexNow("docs");
 
         assertTrue(result, "Reindex should have been triggered successfully");
         assertEquals(1, handlerCalls.get(), "The configured handler should have run");
@@ -1006,10 +1006,10 @@ class IndexOrchestratorTest {
         IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
 
         SegmentReindexScheduler scheduler = orchestrator.getReindexScheduler();
-        scheduler.registerSource(1L);
+        scheduler.registerSource("docs");
 
         // No ReindexOperationHandler is configured, so no document can be re-indexed.
-        boolean result = scheduler.triggerReindexNow(1L);
+        boolean result = scheduler.triggerReindexNow("docs");
 
         assertFalse(result, "A reindex with no handler to run it has not been triggered");
         assertEquals(0L, scheduler.getTotalReindexesTriggered(),
@@ -1037,11 +1037,11 @@ class IndexOrchestratorTest {
         orchestrator.setReindexOperationHandler(sourceId -> true);
 
         SegmentReindexScheduler scheduler = orchestrator.getReindexScheduler();
-        scheduler.registerSource(1L);
+        scheduler.registerSource("docs");
 
         // Trigger multiple reindexes in succession
         for (int i = 0; i < 5; i++) {
-            boolean result = scheduler.triggerReindexNow(1L);
+            boolean result = scheduler.triggerReindexNow("docs");
             assertTrue(result, "Reindex " + (i + 1) + " should succeed");
         }
 
@@ -1126,13 +1126,14 @@ class IndexOrchestratorTest {
             "ReindexOperationHandler should be configured");
 
         // Register a source and trigger reindex via the scheduler
-        orchestrator.getReindexScheduler().registerSourceUnchecked(42L, 1000L);
-        boolean result = orchestrator.getReindexScheduler().triggerReindexNow(42L);
+        orchestrator.getReindexScheduler().registerSourceUnchecked("docs", 1000L);
+        boolean result = orchestrator.getReindexScheduler().triggerReindexNow("docs");
 
         // Verify the handler was invoked
         assertTrue(result, "Reindex should succeed");
         assertTrue(handlerCalled.get(), "ReindexOperationHandler should have been called");
-        assertEquals("42", capturedSourceId.get(), "Handler should receive correct source ID");
+        assertEquals("docs", capturedSourceId.get(),
+            "the handler is given the id the source was registered under, unchanged");
 
         orchestrator.close();
         storageEngine.close();

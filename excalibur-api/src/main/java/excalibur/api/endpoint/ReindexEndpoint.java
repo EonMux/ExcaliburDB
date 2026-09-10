@@ -336,8 +336,12 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
      */
     private ReindexRequest parseRequest(String json) {
         String sourceId = JsonText.string(json, "source_id");
-        if (sourceId == null || sourceId.isEmpty()) {
+        if (sourceId == null || sourceId.isBlank()) {
             throw new IllegalArgumentException("Field 'source_id' is required");
+        }
+        String violation = SourceIds.violation(sourceId, "source_id");
+        if (violation != null) {
+            throw new IllegalArgumentException(violation);
         }
         return new ReindexRequest(sourceId);
     }

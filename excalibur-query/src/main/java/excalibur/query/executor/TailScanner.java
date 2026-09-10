@@ -47,8 +47,10 @@ import java.util.PriorityQueue;
  * [dimension:4][vector:dim*4][optional text bytes]
  * </pre>
  * The first 4 bytes are the dimension (int, little-endian), followed by
- * the vector components (floats, little-endian). Optional text bytes may follow
- * the vector when using DocumentChunkBuffer.encodeChunkWithEmbedding().</p>
+ * the vector components (floats, little-endian). The chunk text follows the vector, and is
+ * what a tail-scan hit carries back as its payload. Both halves are written by
+ * {@code io.excalibur.core.codec.ChunkPayloadCodec}, which is the only encoder of this
+ * layout; this scanner is the only decoder of it outside that class.</p>
  *
  * <h2>Result Identity</h2>
  * <p>Each result carries a synthetic node ID (tagged with the high bit so

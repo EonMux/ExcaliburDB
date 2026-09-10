@@ -1,8 +1,7 @@
 package excalibur.ingest.pipeline;
 
+import io.excalibur.core.codec.ChunkPayloadCodec;
 import io.excalibur.core.text.ChunkIdentifiers;
-import excalibur.ingest.buffer.AtomicDocumentBatch;
-import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.processor.TermFrequencyTracker;
@@ -55,10 +54,6 @@ import java.util.stream.Stream;
  * excalibur-shard derives from the storage key and excalibur-query's atomicity filter asks
  * about. A document whose chunks could not all be embedded or written is rolled back and never
  * registered, so a query can never observe half of it.</p>
- *
- * <p>An optional {@link DocumentChunkBuffer} additionally mirrors the document into a
- * write-ahead log as one contiguous batch, which records the offset range on the published
- * batch. Publication does not depend on it.</p>
  *
  * <h2>Source Ownership</h2>
  * <p>The orchestrator does <strong>not</strong> own the {@link Source} it is handed and never
@@ -139,7 +134,6 @@ public class IngestionOrchestrator {
     private final StorageEngine storageEngine;
     private final IndexOrchestrator indexOrchestrator;
     private final StatusRegistry statusRegistry;
-    private final DocumentChunkBuffer documentChunkBuffer; // optional, nullable - WAL offset mirror
     private final DocumentVisibilityTracker visibilityTracker; // optional, nullable - visibility epoch
 
     /**
@@ -229,31 +223,20 @@ public class IngestionOrchestrator {
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry) {
         this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
-             null, null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+             null, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
     /**
-     * Creates a new IngestionOrchestrator with full document atomicity support.
+     * Creates a new IngestionOrchestrator that publishes documents atomically.
      *
-     * <p>This constructor enables document-atomic visibility: all chunks of a document
-     * become visible to queries at the same visibility epoch. When provided:</p>
-     * <ul>
-     *   <li>Chunks are buffered in memory per document</li>
-     *   <li>On commit, all chunks are written atomically to the write log</li>
-     *   <li>The batch is registered with the visibility tracker</li>
-     *   <li>Queries never see partially-ingested documents</li>
-     * </ul>
-     *
-     * <p><strong>Important:</strong> the documentChunkBuffer must own the write log it appends
-     * to, so that one document's chunks land at contiguous offsets. The storageEngine remains
-     * the source of truth.</p>
+     * <p>Every chunk of a document is embedded and written before the visibility epoch is
+     * advanced, so a query sees all of a document or none of it.</p>
      *
      * @param textChunker Text chunker for splitting documents
      * @param embeddingClient Embedding client for generating embeddings
      * @param storageEngine Storage engine for persisting entries
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
-     * @param documentChunkBuffer Buffer mirroring documents into a write log (may be null)
      * @param visibilityTracker Tracker for document visibility epochs (may be null)
      * @throws NullPointerException if required parameters are null
      */
@@ -262,10 +245,9 @@ public class IngestionOrchestrator {
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry,
-                                  DocumentChunkBuffer documentChunkBuffer,
                                   DocumentVisibilityTracker visibilityTracker) {
         this(textChunker, embeddingClient, storageEngine, indexOrchestrator, statusRegistry,
-             documentChunkBuffer, visibilityTracker, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
+             visibilityTracker, null, DEFAULT_DOCUMENT_TIMEOUT_MS);
     }
 
     /**
@@ -278,7 +260,6 @@ public class IngestionOrchestrator {
      * @param storageEngine Storage engine for persisting entries
      * @param indexOrchestrator Index orchestrator for coordinating indexing
      * @param statusRegistry Status registry for tracking progress
-     * @param documentChunkBuffer Buffer mirroring documents into a write log (may be null)
      * @param visibilityTracker Tracker for document visibility epochs (may be null)
      * @param termFrequencyTracker Tracker for term frequencies in segment sketches (may be null to disable selectivity estimation)
      * @param documentTimeoutMs Timeout for awaiting backpressure release in milliseconds
@@ -289,7 +270,6 @@ public class IngestionOrchestrator {
                                   StorageEngine storageEngine,
                                   IndexOrchestrator indexOrchestrator,
                                   StatusRegistry statusRegistry,
-                                  DocumentChunkBuffer documentChunkBuffer,
                                   DocumentVisibilityTracker visibilityTracker,
                                   TermFrequencyTracker termFrequencyTracker,
                                   int documentTimeoutMs) {
@@ -302,7 +282,6 @@ public class IngestionOrchestrator {
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.indexOrchestrator = Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
         this.statusRegistry = Objects.requireNonNull(statusRegistry, "StatusRegistry cannot be null");
-        this.documentChunkBuffer = documentChunkBuffer; // may be null
         this.visibilityTracker = visibilityTracker; // may be null
         this.documentRegistry = visibilityTracker != null ? visibilityTracker.getRegistry() : null;
         this.termFrequencyTracker = termFrequencyTracker; // may be null
@@ -311,9 +290,8 @@ public class IngestionOrchestrator {
         this.ingestionThreads = new ConcurrentHashMap<>();
         this.shutdown = new AtomicBoolean(false);
 
-        LOGGER.info("IngestionOrchestrator initialized with visibilityPublishing={}, walMirror={}, termFrequencyTracking={}, documentTimeoutMs={}",
+        LOGGER.info("IngestionOrchestrator initialized with visibilityPublishing={}, termFrequencyTracking={}, documentTimeoutMs={}",
             (visibilityTracker != null ? "enabled" : "disabled"),
-            (documentChunkBuffer != null ? "enabled" : "disabled"),
             (termFrequencyTracker != null ? "enabled" : "disabled"),
             this.documentTimeoutMs);
     }
@@ -573,8 +551,7 @@ public class IngestionOrchestrator {
             // whole ones. Publishing clears it; so does rollback.
             beginIngestion(documentKey, chunks);
             writeChunks(documentKey, chunks, embeddings, writtenKeys);
-            AtomicDocumentBatch batch = mirrorToWriteLog(documentKey, chunks, embeddings);
-            publishDocument(sourceId, documentId, documentKey, doc, chunks, batch);
+            publishDocument(sourceId, documentId, documentKey, doc, chunks);
         } catch (Exception e) {
             rollbackChunks(documentKey, writtenKeys, e);
             return 0;
@@ -661,32 +638,12 @@ public class IngestionOrchestrator {
             String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
             float[] vector = embeddings == null ? null : embeddings.get(chunk.getChunkIndex());
             byte[] value = vector == null
-                ? io.excalibur.core.codec.ChunkPayloadCodec.encodeTextOnly(chunk.getText())
-                : DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(chunk.getText(), vector);
+                ? ChunkPayloadCodec.encodeTextOnly(chunk.getText())
+                : ChunkPayloadCodec.encode(chunk.getText(), vector);
             storageEngine.put(chunkId.getBytes(StandardCharsets.UTF_8), value);
             indexLexically(chunkId, chunk.getText());
             writtenKeys.add(chunkId);
         }
-    }
-
-    /**
-     * Mirrors the document into the chunk buffer's write log as one contiguous batch.
-     *
-     * <p>The write log fsyncs each append before it returns, so the batch is already durable
-     * when this method hands it back and the document may be published straight away.</p>
-     *
-     * @return The batch with its write log offset range, or null when no buffer is configured
-     * @throws IOException if the write log append fails
-     */
-    private AtomicDocumentBatch mirrorToWriteLog(String documentKey, List<TextChunk> chunks,
-                                                 Map<Integer, float[]> embeddings) throws IOException {
-        if (documentChunkBuffer == null) {
-            return null;
-        }
-        for (TextChunk chunk : chunks) {
-            documentChunkBuffer.bufferChunk(chunk);
-        }
-        return documentChunkBuffer.commitDocumentWithEmbeddings(documentKey, embeddings);
     }
 
     /**
@@ -698,8 +655,7 @@ public class IngestionOrchestrator {
      * change and tombstone exactly these chunk ids.</p>
      */
     private void publishDocument(String sourceId, String documentId, String documentKey,
-                                 FetchedDocument doc, List<TextChunk> chunks,
-                                 AtomicDocumentBatch batch) {
+                                 FetchedDocument doc, List<TextChunk> chunks) {
         byte[] content = doc.getContent();
         List<String> chunkIds = new ArrayList<>(chunks.size());
         for (TextChunk chunk : chunks) {
@@ -718,11 +674,7 @@ public class IngestionOrchestrator {
 
         if (visibilityTracker != null) {
             long epoch = visibilityTracker.advanceEpoch();
-            if (batch != null) {
-                visibilityTracker.registerAtomicDocument(batch, epoch);
-            } else {
-                visibilityTracker.registerFromMetadata(metadata, epoch);
-            }
+            visibilityTracker.registerFromMetadata(metadata, epoch);
             LOGGER.debug("Document {} published at epoch {} with {} chunks",
                 documentKey, epoch, chunkIds.size());
         }
@@ -733,16 +685,11 @@ public class IngestionOrchestrator {
     }
 
     /**
-     * Removes chunks written for a document that failed to publish, and discards anything the
-     * chunk buffer is still holding for it.
+     * Removes chunks written for a document that failed to publish.
      */
     private void rollbackChunks(String documentKey, List<String> writtenKeys, Exception cause) {
         LOGGER.error("Rolling back document {} after publication failure: {}",
             documentKey, cause.getMessage(), cause);
-
-        if (documentChunkBuffer != null) {
-            documentChunkBuffer.abortDocument(documentKey);
-        }
 
         // Clear the in-flight marker. A document left pending is invisible to every query
         // for the life of the process, and never released.
