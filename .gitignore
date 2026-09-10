@@ -1,5 +1,9 @@
-# Build outputs
-build/
+# Build outputs. Anchored to the root and to module roots rather than left to match any
+# directory named "build": a bare "build/" also matches a Java package called build, which
+# silently kept io.excalibur.retrieval.build out of the repository and left a fresh clone
+# unable to compile excalibur-api.
+/build/
+*/build/
 *.class
 *.jar
 *.war
