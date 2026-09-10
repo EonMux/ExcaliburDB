@@ -1,6 +1,5 @@
 package excalibur.api.security;
 
-import java.net.Inet4Address;
 import java.net.InetAddress;
 
 /**
@@ -24,13 +23,18 @@ import java.net.InetAddress;
  * entire office behind NAT - so widening the IPv4 key would cost real users their
  * budget and gain nothing.</p>
  *
- * <p>Only the peer address is ever consulted. Forwarding headers are attacker-controlled
- * and would let one client masquerade as many.</p>
+ * <p>What address gets here is decided before this class sees it. A forwarding header is
+ * attacker-controlled, so {@link RequestGuard} reads one only from a hop named in
+ * {@link TrustedProxies} and takes the nearest entry the client could not have written; with no
+ * proxy configured the peer address is the only thing consulted.</p>
  */
 final class ClientAddressKey {
 
     /** Charged when the peer address is unavailable, so such requests are still metered. */
     static final String UNKNOWN = "unknown";
+
+    /** Bytes in an IPv4 address, which is keyed whole. */
+    private static final int IPV4_BYTES = 4;
 
     /** Leading bytes of an IPv6 address that identify the delegated network: a /64. */
     private static final int IPV6_PREFIX_BYTES = 8;
@@ -47,17 +51,37 @@ final class ClientAddressKey {
      * @return A stable key naming the span charged
      */
     static String of(InetAddress address) {
-        if (address == null) {
+        return ofBytes(address == null ? null : address.getAddress());
+    }
+
+    /**
+     * Derives the rate-limit key from raw address bytes.
+     *
+     * @param octets Four or sixteen bytes, or null when the client is unknown
+     * @return A stable key naming the span charged
+     */
+    static String ofBytes(byte[] octets) {
+        if (octets == null) {
             return UNKNOWN;
         }
-        if (address instanceof Inet4Address) {
-            return address.getHostAddress();
+        if (octets.length == IPV4_BYTES) {
+            return dottedQuad(octets);
         }
-        byte[] octets = address.getAddress();
         if (octets.length < IPV6_PREFIX_BYTES) {
-            return address.getHostAddress();
+            return UNKNOWN;
         }
         return prefixOf(octets);
+    }
+
+    private static String dottedQuad(byte[] octets) {
+        StringBuilder key = new StringBuilder(15);
+        for (int i = 0; i < IPV4_BYTES; i++) {
+            if (i > 0) {
+                key.append('.');
+            }
+            key.append(octets[i] & 0xFF);
+        }
+        return key.toString();
     }
 
     private static String prefixOf(byte[] octets) {

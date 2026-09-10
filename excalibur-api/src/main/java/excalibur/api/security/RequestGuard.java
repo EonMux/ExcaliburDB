@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -44,6 +45,15 @@ public final class RequestGuard {
     private static final Logger LOGGER = LoggerFactory.getLogger(RequestGuard.class);
 
     private static final String AUTHORIZATION_HEADER = "Authorization";
+
+    /**
+     * The forwarding header read from a trusted proxy.
+     *
+     * <p>Only this one. RFC 7239's {@code Forwarded} says the same thing in a richer grammar,
+     * and a second parser over the same attacker-supplied text is more ways to disagree with
+     * the proxy in front, not more capability.</p>
+     */
+    private static final String FORWARDED_FOR_HEADER = "X-Forwarded-For";
     private static final String BEARER_PREFIX = "bearer ";
 
     private final ApiSecurityConfig config;
@@ -124,7 +134,7 @@ public final class RequestGuard {
      * @throws IOException if the refusal response cannot be written
      */
     public boolean allow(HttpExchange exchange, Access access) throws IOException {
-        String clientKey = clientKey(exchange);
+        String clientKey = clientKey(exchange, config.trustedProxies());
         ClientRateLimiter.Decision decision = rateLimiter.check(clientKey, access.isMutating());
         if (!decision.allowed()) {
             LOGGER.warn("Rate limit exceeded for {} on {}", clientKey, exchange.getRequestURI().getPath());
@@ -184,15 +194,27 @@ public final class RequestGuard {
     /**
      * Derives the rate-limit key for an exchange.
      *
-     * <p>Only the peer address is used. Forwarding headers are attacker-controlled
-     * and would let one client masquerade as many.</p>
+     * <p>The peer address, except when the peer is a configured proxy. A forwarding header is
+     * attacker-controlled and believing one from an arbitrary peer would let a client meter
+     * itself as a thousand clients, or spend somebody else's budget; with no proxy configured
+     * none is read. Behind one, the peer is the same address for every caller and metering it
+     * would put every client in one bucket, so the header is read - from the right, stopping at
+     * the first hop this deployment has not vouched for.</p>
      *
      * @param exchange The exchange
-     * @return A stable key for the calling peer
+     * @param trustedProxies The hops whose forwarding header may be believed
+     * @return A stable key for the calling client
      */
-    static String clientKey(HttpExchange exchange) {
+    static String clientKey(HttpExchange exchange, TrustedProxies trustedProxies) {
         InetSocketAddress remote = exchange.getRemoteAddress();
-        return ClientAddressKey.of(remote == null ? null : remote.getAddress());
+        InetAddress peer = remote == null ? null : remote.getAddress();
+        if (peer == null || trustedProxies.isEmpty() || !trustedProxies.trusts(peer)) {
+            return ClientAddressKey.of(peer);
+        }
+        List<String> forwarded = exchange.getRequestHeaders().get(FORWARDED_FOR_HEADER);
+        byte[] origin = trustedProxies.originBehind(
+            forwarded == null ? List.of() : forwarded, peer.getAddress());
+        return ClientAddressKey.ofBytes(origin);
     }
 
     private static void sendJson(HttpExchange exchange, int statusCode, String message) throws IOException {

@@ -107,6 +107,8 @@ public final class ApiSecurityConfig {
     public static final String KEY_MAX_SOURCES = "excalibur.ingest.max-sources";
     /** Configuration key permitting a non-loopback bind without TLS. */
     public static final String KEY_ALLOW_PLAINTEXT = "excalibur.api.allow-plaintext";
+    /** Configuration key listing the proxies whose forwarding header may be believed. */
+    public static final String KEY_TRUSTED_PROXIES = "excalibur.api.trusted-proxies";
 
     /** Default listen address: loopback only. */
     public static final String DEFAULT_BIND_ADDRESS = "127.0.0.1";
@@ -153,6 +155,7 @@ public final class ApiSecurityConfig {
     private final int maxRegisteredSources;
     private final TlsConfig tls;
     private final boolean allowPlaintext;
+    private final TrustedProxies trustedProxies;
 
     private ApiSecurityConfig(Builder builder) {
         this.authToken = builder.authToken != null ? builder.authToken.clone() : null;
@@ -171,6 +174,7 @@ public final class ApiSecurityConfig {
         this.maxRegisteredSources = builder.maxRegisteredSources;
         this.tls = builder.tls;
         this.allowPlaintext = builder.allowPlaintext;
+        this.trustedProxies = TrustedProxies.of(builder.trustedProxies);
     }
 
     /**
@@ -221,6 +225,10 @@ public final class ApiSecurityConfig {
         }
         for (String host : ConfigText.splitList(props.get(KEY_ALLOWED_HOSTS))) {
             builder.allowIngestHost(host);
+        }
+
+        for (String proxy : ConfigText.splitList(props.get(KEY_TRUSTED_PROXIES))) {
+            builder.trustProxy(proxy);
         }
 
         builder.tls(TlsConfig.fromProperties(props));
@@ -388,6 +396,15 @@ public final class ApiSecurityConfig {
         return tls;
     }
 
+    /**
+     * The hops whose forwarding header names the client to rate limit.
+     *
+     * @return The trusted proxies; empty unless configured, meaning only the peer is believed
+     */
+    public TrustedProxies trustedProxies() {
+        return trustedProxies;
+    }
+
     /** @return true when a non-loopback bind may serve cleartext */
     public boolean allowsPlaintext() {
         return allowPlaintext;
@@ -430,6 +447,7 @@ public final class ApiSecurityConfig {
         private int maxRegisteredSources = DEFAULT_MAX_SOURCES;
         private TlsConfig tls = TlsConfig.disabled();
         private boolean allowPlaintext;
+        private final List<String> trustedProxies = new ArrayList<>();
 
         private Builder() {
         }
@@ -592,6 +610,25 @@ public final class ApiSecurityConfig {
             String trimmed = ConfigText.trimToNull(host);
             if (trimmed != null) {
                 allowedIngestHosts.add(trimmed.toLowerCase(Locale.ROOT));
+            }
+            return this;
+        }
+
+        /**
+         * Believes the forwarding header of one proxy address or range.
+         *
+         * <p>Name only hops this deployment actually puts in front of the node. Anything named
+         * here can tell the rate limiter which client to charge, so a range wider than the
+         * proxies it is meant to cover hands that decision to whoever else is inside it.</p>
+         *
+         * @param proxy An address or CIDR range; null or blank is ignored
+         * @return this builder
+         * @throws IllegalArgumentException if the entry is not an address or range
+         */
+        public Builder trustProxy(String proxy) {
+            String trimmed = ConfigText.trimToNull(proxy);
+            if (trimmed != null) {
+                trustedProxies.add(trimmed);
             }
             return this;
         }

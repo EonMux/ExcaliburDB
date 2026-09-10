@@ -313,6 +313,7 @@ spell them this way:
 | `excalibur.api.mutate-rate-per-second` | 5 | Sustained mutating requests per client per second |
 | `excalibur.api.mutate-burst` | 20 | Mutation burst allowance |
 | `excalibur.api.rate-limit-max-clients` | 10000 | Clients tracked before eviction |
+| `excalibur.api.trusted-proxies` | _(empty)_ | Addresses and CIDR ranges whose `X-Forwarded-For` is believed, so callers behind a proxy are rate-limited individually instead of sharing the proxy's budget. Empty means only the peer address is ever metered |
 | `excalibur.api.max-top-k` | 1000 | Largest `top_k` a query may request |
 | `excalibur.api.max-query-timeout-ms` | 60000 | Largest query timeout a request may ask for |
 | `excalibur.api.max-query-chars` | 8192 | Longest `query` text a request may send. It is embedded, and on the lexical path expanded, so its size is an outbound call the caller picks |
@@ -730,6 +731,14 @@ JVM default store, which trusts the public web CAs — so almost any certificate
 
 Requests are rate limited with separate budgets for reads and mutations; exceeding either returns
 429 with `Retry-After`.
+
+Each caller is metered on its own address — the whole IPv4 address, or the `/64` for IPv6, because a
+single routine IPv6 allocation would otherwise supply an endless run of fresh budgets. Behind a
+reverse proxy that address is the proxy's, which puts every caller in one bucket; list the proxy in
+`excalibur.api.trusted-proxies` and its `X-Forwarded-For` is read instead. The chain is read right
+to left and stops at the first hop the deployment has not vouched for, so prepending a name to it
+cannot get a caller metered as somebody else, and nothing is believed from a peer that is not on the
+list.
 
 **Ingestion is deny-by-default.** `POST /v1/ingest` accepts a filesystem path or a URL, and both are
 checked against allow-lists that are empty until configured:

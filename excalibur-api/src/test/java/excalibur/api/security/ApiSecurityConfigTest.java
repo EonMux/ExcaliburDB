@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
+import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
@@ -182,6 +183,7 @@ class ApiSecurityConfigTest {
             props.put(ApiSecurityConfig.KEY_MAX_SOURCES, "5");
             props.put(ApiSecurityConfig.KEY_ALLOWED_ROOTS, root.toString());
             props.put(ApiSecurityConfig.KEY_ALLOWED_HOSTS, "Docs.Example.COM, cdn.example.com");
+            props.put(ApiSecurityConfig.KEY_TRUSTED_PROXIES, "10.0.0.0/8, 192.168.1.5");
 
             ApiSecurityConfig config = ApiSecurityConfig.fromProperties(props);
 
@@ -198,6 +200,29 @@ class ApiSecurityConfigTest {
             assertThat(config.allowedIngestRoots()).containsExactly(root.toRealPath());
             assertThat(config.allowedIngestHosts()).containsExactlyInAnyOrder(
                 "docs.example.com", "cdn.example.com");
+            assertThat(config.trustedProxies().trusts(InetAddress.getByName("10.9.9.9"))).isTrue();
+            assertThat(config.trustedProxies().trusts(InetAddress.getByName("192.168.1.5"))).isTrue();
+            assertThat(config.trustedProxies().trusts(InetAddress.getByName("192.168.1.6"))).isFalse();
+        }
+
+        @Test
+        @DisplayName("trusts no proxy unless one is named")
+        void trustsNoProxyByDefault() {
+            assertThat(ApiSecurityConfig.fromProperties(new HashMap<>()).trustedProxies().isEmpty())
+                .as("a node that believes a forwarding header by default is a node whose rate "
+                    + "limit any caller can step around")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("refuses to start on a malformed proxy range")
+        void rejectsMalformedProxy() {
+            Map<String, String> props = new HashMap<>();
+            props.put(ApiSecurityConfig.KEY_TRUSTED_PROXIES, "10.0.0.0/99");
+
+            assertThatThrownBy(() -> ApiSecurityConfig.fromProperties(props))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("10.0.0.0/99");
         }
 
         @Test

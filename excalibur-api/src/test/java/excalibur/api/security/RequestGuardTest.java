@@ -221,12 +221,169 @@ class RequestGuardTest {
         }
     }
 
+    @Nested
+    @DisplayName("Client identity behind a proxy")
+    class ClientIdentity {
+
+        @Test
+        @DisplayName("meters the forwarded client rather than the proxy that relayed it")
+        void aTrustedProxyReportsTheRealClient() throws IOException {
+            // One client reaching two proxies is still one client. Keyed on the peer it would
+            // hold a budget per proxy, which is the same budget per proxy every caller holds -
+            // so behind a load balancer nobody is limited and one noisy client limits everybody.
+            RequestGuard guard = new RequestGuard(behind("10.0.0.0/8"));
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(forwarded("10.0.0.1", "203.0.113.9"));
+            HttpExchange viaAnotherProxy = forwarded("10.0.0.2", "203.0.113.9");
+            handler.handle(viaAnotherProxy);
+
+            assertThat(calls).hasValue(1);
+            verify(viaAnotherProxy).sendResponseHeaders(eq(429), anyLong());
+        }
+
+        @Test
+        @DisplayName("gives each forwarded client its own budget")
+        void forwardedClientsDoNotShareABucket() throws IOException {
+            RequestGuard guard = new RequestGuard(behind("10.0.0.0/8"));
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(forwarded("10.0.0.1", "203.0.113.9"));
+            handler.handle(forwarded("10.0.0.1", "198.51.100.7"));
+
+            assertThat(calls)
+                .as("both callers arrive through the same proxy, and the proxy is not the client")
+                .hasValue(2);
+        }
+
+        @Test
+        @DisplayName("reaches past a chain of trusted hops to the first untrusted one")
+        void walksBackThroughTheChain() throws IOException {
+            // Appending an internal hop, or arriving through a different one, must not mint a
+            // fresh budget: all three of these are the same client.
+            RequestGuard guard = new RequestGuard(behind("10.0.0.0/8"));
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(forwarded("10.0.0.1", "203.0.113.9"));
+            HttpExchange throughOneMoreHop = forwarded("10.0.0.1", "203.0.113.9, 10.0.0.7");
+            handler.handle(throughOneMoreHop);
+            HttpExchange throughAnotherProxy = forwarded("10.0.0.2", "203.0.113.9, 10.0.0.7");
+            handler.handle(throughAnotherProxy);
+
+            assertThat(calls).hasValue(1);
+            verify(throughOneMoreHop).sendResponseHeaders(eq(429), anyLong());
+            verify(throughAnotherProxy).sendResponseHeaders(eq(429), anyLong());
+        }
+
+        @Test
+        @DisplayName("ignores the header when the peer is not a trusted proxy")
+        void anUntrustedPeerCannotNameItself() throws IOException {
+            // The header is attacker-controlled. Honouring it from an arbitrary peer would let
+            // any caller mint a fresh budget per request just by varying the value.
+            RequestGuard guard = new RequestGuard(behind("10.0.0.0/8"));
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(forwarded("198.51.100.4", "203.0.113.1"));
+            HttpExchange second = forwarded("198.51.100.4", "203.0.113.2");
+            handler.handle(second);
+
+            assertThat(calls).hasValue(1);
+            verify(second).sendResponseHeaders(eq(429), anyLong());
+        }
+
+        @Test
+        @DisplayName("ignores the header entirely when no proxy is configured")
+        void theDefaultDeploymentTrustsNoHeader() throws IOException {
+            RequestGuard guard = new RequestGuard(ApiSecurityConfig.builder()
+                .readBudget(1.0, 1.0)
+                .build());
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(forwarded("10.0.0.1", "203.0.113.1"));
+            HttpExchange second = forwarded("10.0.0.1", "203.0.113.2");
+            handler.handle(second);
+
+            assertThat(calls).hasValue(1);
+            verify(second).sendResponseHeaders(eq(429), anyLong());
+        }
+
+        @Test
+        @DisplayName("stops at a garbled hop instead of reading past it")
+        void junkInTheChainChargesTheProxy() throws IOException {
+            // Skipping an unparseable entry would let a caller write "victim, %%%" and be
+            // metered as the victim. The walk ends there and the relaying proxy pays instead.
+            RequestGuard guard = new RequestGuard(behind("10.0.0.0/8"));
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(forwarded("10.0.0.1", "203.0.113.9"));
+            handler.handle(forwarded("10.0.0.2", "203.0.113.9, not-an-address"));
+            HttpExchange sameProxyAgain = forwarded("10.0.0.2", "%%%");
+            handler.handle(sameProxyAgain);
+
+            assertThat(calls).hasValue(2);
+            verify(sameProxyAgain).sendResponseHeaders(eq(429), anyLong());
+        }
+
+        @Test
+        @DisplayName("charges a forwarded IPv6 client by its prefix")
+        void forwardedIpv6IsKeyedByPrefix() throws IOException {
+            RequestGuard guard = new RequestGuard(behind("10.0.0.0/8"));
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(forwarded("10.0.0.1", "2001:db8:1:2::1"));
+            HttpExchange samePrefix = forwarded("10.0.0.1", "2001:db8:1:2::2");
+            handler.handle(samePrefix);
+            handler.handle(forwarded("10.0.0.1", "2001:db8:1:3::1"));
+
+            assertThat(calls).hasValue(2);
+            verify(samePrefix).sendResponseHeaders(eq(429), anyLong());
+        }
+
+        @Test
+        @DisplayName("reads a chain split across repeated header lines")
+        void spansRepeatedHeaders() throws IOException {
+            // A hop that adds its own line rather than extending the existing one describes the
+            // same chain, and must be read as one.
+            RequestGuard guard = new RequestGuard(behind("10.0.0.0/8"));
+            AtomicInteger calls = new AtomicInteger();
+            HttpHandler handler = guard.protect(RequestGuard.Access.READ, countingHandler(calls));
+
+            handler.handle(forwarded("10.0.0.1", "203.0.113.9"));
+            HttpExchange split = forwarded("10.0.0.1", "203.0.113.9");
+            split.getRequestHeaders().add("X-Forwarded-For", "10.0.0.7");
+            handler.handle(split);
+
+            assertThat(calls).hasValue(1);
+            verify(split).sendResponseHeaders(eq(429), anyLong());
+        }
+    }
+
     private static ApiSecurityConfig withToken() {
         return ApiSecurityConfig.builder().authToken(TOKEN).build();
     }
 
     private static HttpHandler countingHandler(AtomicInteger calls) {
         return exchange -> calls.incrementAndGet();
+    }
+
+    private static ApiSecurityConfig behind(String proxy) {
+        return ApiSecurityConfig.builder()
+            .readBudget(1.0, 1.0)
+            .trustProxy(proxy)
+            .build();
+    }
+
+    private static HttpExchange forwarded(String remoteAddress, String forwardedFor) {
+        HttpExchange exchange = exchangeFrom(remoteAddress);
+        exchange.getRequestHeaders().add("X-Forwarded-For", forwardedFor);
+        return exchange;
     }
 
     private static HttpExchange exchangeFrom(String remoteAddress) {
