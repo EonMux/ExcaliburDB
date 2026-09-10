@@ -1,6 +1,6 @@
 package excalibur.ingest.pipeline;
 
-import excalibur.ingest.buffer.DocumentChunkBuffer;
+import io.excalibur.core.codec.ChunkPayloadCodec;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -37,7 +37,7 @@ class IngestionOrchestratorTest {
             String text = "Hello, world!";
             float[] embedding = {0.1f, 0.2f, 0.3f, 0.4f};
 
-            byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, embedding);
+            byte[] encoded = ChunkPayloadCodec.encode(text, embedding);
 
             // Verify format: [dimension:4][vector:dim*4][text:variable]
             ByteBuffer buffer = ByteBuffer.wrap(encoded).order(ByteOrder.LITTLE_ENDIAN);
@@ -65,7 +65,7 @@ class IngestionOrchestratorTest {
             String text = "Test chunk content for vector search";
             float[] embedding = {0.5f, -0.3f, 0.8f, 0.1f, -0.2f};
 
-            byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, embedding);
+            byte[] encoded = ChunkPayloadCodec.encode(text, embedding);
 
             // Extract vector using the same logic as HnswIntegrationWorker.extractVector()
             float[] extracted = extractVector(encoded);
@@ -87,7 +87,7 @@ class IngestionOrchestratorTest {
                 embedding[i] = (float) Math.random();
             }
 
-            byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, embedding);
+            byte[] encoded = ChunkPayloadCodec.encode(text, embedding);
             float[] extracted = extractVector(encoded);
 
             assertNotNull(extracted, "Vector extraction should succeed for large dimensions");
@@ -100,7 +100,7 @@ class IngestionOrchestratorTest {
             String text = "";
             float[] embedding = {1.0f, 0.0f, -1.0f};
 
-            byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, embedding);
+            byte[] encoded = ChunkPayloadCodec.encode(text, embedding);
             float[] extracted = extractVector(encoded);
 
             assertNotNull(extracted, "Vector extraction should succeed with empty text");
@@ -113,10 +113,10 @@ class IngestionOrchestratorTest {
             String text = "Hello, 世界! Привет мир! 🌍";
             float[] embedding = {0.1f, 0.2f};
 
-            byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, embedding);
+            byte[] encoded = ChunkPayloadCodec.encode(text, embedding);
 
             // Verify text can be decoded back
-            String decodedText = DocumentChunkBuffer.decodeText(encoded);
+            String decodedText = ChunkPayloadCodec.textOf(encoded);
             assertEquals(text, decodedText, "UTF-8 text should round-trip correctly");
         }
 
@@ -125,7 +125,7 @@ class IngestionOrchestratorTest {
         void testLittleEndianByteOrder() {
             // Test that dimension is stored as little-endian
             float[] embedding = {1.0f};
-            byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding("test", embedding);
+            byte[] encoded = ChunkPayloadCodec.encode("test", embedding);
 
             // Dimension 1 as little-endian: 01 00 00 00
             assertEquals(0x01, encoded[0] & 0xFF, "First byte should be 0x01 (little-endian)");
@@ -171,14 +171,14 @@ class IngestionOrchestratorTest {
                 Float.MAX_VALUE, Float.MIN_VALUE, 0.0f, -0.0f, 1.0f
             };
 
-            byte[] encoded = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(originalText, originalEmbedding);
+            byte[] encoded = ChunkPayloadCodec.encode(originalText, originalEmbedding);
 
             // Decode embedding
             float[] decodedEmbedding = extractVector(encoded);
             assertNotNull(decodedEmbedding, "Embedding extraction should succeed");
 
             // Decode text
-            String decodedText = DocumentChunkBuffer.decodeText(encoded);
+            String decodedText = ChunkPayloadCodec.textOf(encoded);
             assertNotNull(decodedText, "Text extraction should succeed");
 
             // Verify
@@ -191,17 +191,17 @@ class IngestionOrchestratorTest {
         }
 
         @Test
-        @DisplayName("IngestionOrchestrator uses DocumentChunkBuffer encoding")
+        @DisplayName("IngestionOrchestrator uses ChunkPayloadCodec encoding")
         void testIngestionOrchestratorUsesCorrectEncoding() {
             // This test verifies that the encoding method used by IngestionOrchestrator
-            // (DocumentChunkBuffer.encodeChunkWithTextAndEmbedding) produces the correct format
+            // (ChunkPayloadCodec.encode) produces the correct format
             // for HnswIntegrationWorker.extractVector()
 
             String text = "Sample chunk text";
             float[] embedding = {0.1f, 0.2f, 0.3f, 0.4f};
 
             // This is what IngestionOrchestrator.runIngestion() now calls
-            byte[] valueBytes = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, embedding);
+            byte[] valueBytes = ChunkPayloadCodec.encode(text, embedding);
 
             // This is what HnswIntegrationWorker.extractVector() expects
             float[] extracted = extractVector(valueBytes);

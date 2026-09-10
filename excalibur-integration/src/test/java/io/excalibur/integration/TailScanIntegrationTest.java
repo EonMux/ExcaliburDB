@@ -10,7 +10,7 @@ import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.HnswSearchResult;
 import excalibur.query.executor.SegmentQueryTask;
 import excalibur.query.executor.TailScanner;
-import excalibur.ingest.buffer.DocumentChunkBuffer;
+import io.excalibur.core.codec.ChunkPayloadCodec;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -321,12 +321,12 @@ class TailScanIntegrationTest {
 
     /**
      * Encodes a vector to bytes with dimension prefix.
-     * Uses the production encoder from DocumentChunkBuffer to ensure
+     * Uses the production encoder from ChunkPayloadCodec to ensure
      * the actual ingestion format is tested.
      * Format (LITTLE-ENDIAN): [dimension:4][vector:dim*4]
      */
     private byte[] encodeVector(float[] vector) {
-        return DocumentChunkBuffer.encodeVectorOnly(vector);
+        return ChunkPayloadCodec.encode(vector);
     }
 
     /**
@@ -334,14 +334,14 @@ class TailScanIntegrationTest {
      * Format (LITTLE-ENDIAN): [dimension:4][vector:dim*4][text:variable]
      */
     private byte[] encodeVectorWithText(float[] vector, String text) {
-        return DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(text, vector);
+        return ChunkPayloadCodec.encode(text, vector);
     }
 
     /**
-     * Test: Verify round-trip encoding/decoding between DocumentChunkBuffer and TailScanner.
+     * Test: Verify round-trip encoding/decoding between ChunkPayloadCodec and TailScanner.
      *
      * <p>This test verifies the critical fix for the byte order mismatch bug:
-     * DocumentChunkBuffer must encode vectors in LITTLE_ENDIAN format to match
+     * ChunkPayloadCodec must encode vectors in LITTLE_ENDIAN format to match
      * TailScanner's expected format.</p>
      */
     @Test
@@ -357,9 +357,9 @@ class TailScanIntegrationTest {
         assertThat(encoded).isNotNull();
         assertThat(encoded.length).isGreaterThanOrEqualTo(4 + dimension * Float.BYTES);
 
-        // Decode using DocumentChunkBuffer's public decode method
-        float[] decodedVector = DocumentChunkBuffer.decodeEmbedding(encoded, dimension);
-        String decodedText = DocumentChunkBuffer.decodeText(encoded);
+        // Decode using the codec's public decode methods
+        float[] decodedVector = ChunkPayloadCodec.embeddingOf(encoded, dimension);
+        String decodedText = ChunkPayloadCodec.textOf(encoded);
 
         // Verify round-trip
         assertThat(decodedVector).isNotNull();

@@ -1,7 +1,5 @@
 package excalibur.integration;
 
-import excalibur.ingest.buffer.AtomicDocumentBatch;
-import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.pipeline.DocumentBatchBuffer;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.processor.TextChunk;
@@ -65,7 +63,7 @@ class DocumentAtomicVisibilityIntegrationTest {
     Path tempDir;
 
     private WriteLog writeLog;
-    private DocumentChunkBuffer chunkBuffer;
+    private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
     private TestVisibilityTracker visibilityTracker;
     private DocumentBatchPublisher publisher;
@@ -74,7 +72,7 @@ class DocumentAtomicVisibilityIntegrationTest {
     void setUp() throws IOException {
         Path logPath = tempDir.resolve("test-atomic.log");
         writeLog = new WriteLog(logPath);
-        chunkBuffer = new DocumentChunkBuffer(writeLog);
+        documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
         visibilityTracker = new TestVisibilityTracker();
         
@@ -108,27 +106,22 @@ class DocumentAtomicVisibilityIntegrationTest {
         String documentId = "doc-contiguous-1";
         
         List<TextChunk> chunks = createChunks(documentId, 5);
-        chunkBuffer.bufferChunks(chunks);
-        
-        AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
-        
+
+        DocumentBatchBuffer batch = documentWriter.write(documentId, chunks);
+
         assertThat(batch.getStartOffset()).isGreaterThanOrEqualTo(0);
         assertThat(batch.getEndOffset()).isGreaterThan(batch.getStartOffset());
         assertThat(batch.getChunkCount()).isEqualTo(5);
-        
-        List<Long> entryIds = batch.getEntryIdList();
-        assertThat(entryIds).hasSize(5);
-        
-        for (int i = 1; i < entryIds.size(); i++) {
-            assertThat(entryIds.get(i)).isGreaterThan(entryIds.get(i - 1));
+
+        List<Long> offsets = batch.getEntries().stream()
+            .map(DocumentBatchBuffer.ChunkEntry::writeLogOffset)
+            .toList();
+        assertThat(offsets).hasSize(5);
+        for (int i = 1; i < offsets.size(); i++) {
+            assertThat(offsets.get(i))
+                .as("Chunk %d must be written after chunk %d", i, i - 1)
+                .isGreaterThan(offsets.get(i - 1));
         }
-        
-        long byteSize = batch.getByteSize();
-        assertThat(byteSize).isGreaterThan(0);
-        
-        System.out.println("Document " + documentId + " committed with contiguous offsets: " +
-            "start=" + batch.getStartOffset() + ", end=" + batch.getEndOffset() + 
-            ", size=" + byteSize + " bytes, chunks=" + batch.getChunkCount());
     }
 
     /**
@@ -136,24 +129,22 @@ class DocumentAtomicVisibilityIntegrationTest {
      */
     @Test
     void testNonOverlappingOffsetRanges() throws IOException {
-        List<AtomicDocumentBatch> batches = new ArrayList<>();
-        
+        List<DocumentBatchBuffer> batches = new ArrayList<>();
+
         for (int d = 0; d < 10; d++) {
             String documentId = "doc-overlap-" + d;
             List<TextChunk> chunks = createChunks(documentId, 3);
-            chunkBuffer.bufferChunks(chunks);
-            AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
-            batches.add(batch);
+            batches.add(documentWriter.write(documentId, chunks));
         }
-        
+
         for (int i = 0; i < batches.size() - 1; i++) {
-            AtomicDocumentBatch current = batches.get(i);
-            AtomicDocumentBatch next = batches.get(i + 1);
-            
-            assertThat(current.getEndOffset()).isLessThanOrEqualTo(next.getStartOffset());
+            DocumentBatchBuffer current = batches.get(i);
+            DocumentBatchBuffer next = batches.get(i + 1);
+
+            assertThat(current.getEndOffset())
+                .as("Document %d must be written before document %d begins", i, i + 1)
+                .isLessThan(next.getStartOffset());
         }
-        
-        System.out.println("Verified non-overlapping offset ranges for " + batches.size() + " documents");
     }
 
     /**
@@ -213,14 +204,13 @@ class DocumentAtomicVisibilityIntegrationTest {
         int chunkCount = 10;
         
         List<TextChunk> chunks = createChunks(documentId, chunkCount);
-        chunkBuffer.bufferChunks(chunks);
-        
-        AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
-        
+
+        DocumentBatchBuffer batch = documentWriter.write(documentId, chunks);
+
         long visibilityEpoch = visibilityTracker.advanceEpoch();
-        
+
         Set<Long> visibleEpochs = new HashSet<>();
-        for (String chunkId : batch.getChunkIdList()) {
+        for (String chunkId : batch.getChunkIds()) {
             visibleEpochs.add(visibilityEpoch);
         }
         
@@ -275,9 +265,8 @@ class DocumentAtomicVisibilityIntegrationTest {
                 for (int d = 0; d < numDocuments; d++) {
                     String documentId = "doc-concurrent-" + d;
                     List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                    chunkBuffer.bufferChunks(chunks);
 
-                    AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
+                    DocumentBatchBuffer batch = documentWriter.write(documentId, chunks);
 
                     long epoch = visibilityTracker.advanceEpoch();
 
@@ -292,11 +281,11 @@ class DocumentAtomicVisibilityIntegrationTest {
                     // can see is already complete.
                     //
                     // All chunks of a document share one epoch; that is the property under test.
-                    for (String chunkId : batch.getChunkIdsList()) {
+                    for (String chunkId : batch.getChunkIds()) {
                         chunkVisibleEpochs.put(chunkId, epoch);
                     }
                     documentChunkCounts.put(documentId, batch.getChunkCount());
-                    documentChunkIds.put(documentId, new ArrayList<>(batch.getChunkIdsList()));
+                    documentChunkIds.put(documentId, new ArrayList<>(batch.getChunkIds()));
                     documentVisibleEpochs.put(documentId, new AtomicLong(epoch));
 
                     // Small delay to allow readers to catch concurrent visibility changes
@@ -417,8 +406,7 @@ class DocumentAtomicVisibilityIntegrationTest {
         for (int d = 0; d < numDocuments; d++) {
             String documentId = "doc-epoch-" + d;
             List<TextChunk> chunks = createChunks(documentId, 3);
-            chunkBuffer.bufferChunks(chunks);
-            chunkBuffer.commitDocument(documentId);
+            documentWriter.write(documentId, chunks);
             
             long epoch = visibilityTracker.advanceEpoch();
             documentEpochs.put(documentId, epoch);
@@ -436,8 +424,7 @@ class DocumentAtomicVisibilityIntegrationTest {
         for (int d = numDocuments; d < numDocuments + 5; d++) {
             String documentId = "doc-epoch-" + d;
             List<TextChunk> chunks = createChunks(documentId, 3);
-            chunkBuffer.bufferChunks(chunks);
-            chunkBuffer.commitDocument(documentId);
+            documentWriter.write(documentId, chunks);
             visibilityTracker.advanceEpoch();
         }
         
@@ -592,8 +579,7 @@ class DocumentAtomicVisibilityIntegrationTest {
         for (int i = 0; i < 100; i++) {
             String documentId = "doc-epoch-monotonic-" + i;
             List<TextChunk> chunks = createChunks(documentId, 1);
-            chunkBuffer.bufferChunks(chunks);
-            chunkBuffer.commitDocument(documentId);
+            documentWriter.write(documentId, chunks);
             
             long newEpoch = visibilityTracker.advanceEpoch();
             
@@ -614,8 +600,7 @@ class DocumentAtomicVisibilityIntegrationTest {
         int embeddingDimension = 128;
         
         List<TextChunk> chunks = createChunks(documentId, chunkCount);
-        chunkBuffer.bufferChunks(chunks);
-        
+
         Map<Integer, float[]> embeddings = new java.util.HashMap<>();
         for (int i = 0; i < chunkCount; i++) {
             float[] embedding = new float[embeddingDimension];
@@ -625,13 +610,13 @@ class DocumentAtomicVisibilityIntegrationTest {
             embeddings.put(i, embedding);
         }
         
-        AtomicDocumentBatch batch = chunkBuffer.commitDocumentWithEmbeddings(documentId, embeddings);
-        
+        DocumentBatchBuffer batch = documentWriter.write(documentId, chunks, embeddings);
+
         assertThat(batch.getChunkCount()).isEqualTo(chunkCount);
-        assertThat(batch.getByteSize()).isGreaterThan(0);
-        
-        System.out.println("Document with embeddings: " + chunkCount + " chunks, " + 
-            batch.getByteSize() + " bytes, dimension=" + embeddingDimension);
+        assertThat(batch.getEndOffset()).isGreaterThan(batch.getStartOffset());
+        assertThat(batch.getEntries())
+            .as("Every chunk must have been stored with its embedding")
+            .allMatch(DocumentBatchBuffer.ChunkEntry::hasEmbedding);
     }
 
     // ==================== Helper Methods ====================

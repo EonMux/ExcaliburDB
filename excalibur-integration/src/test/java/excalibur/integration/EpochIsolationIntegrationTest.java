@@ -1,7 +1,5 @@
 package excalibur.integration;
 
-import excalibur.ingest.buffer.AtomicDocumentBatch;
-import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.pipeline.DocumentBatchBuffer;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.processor.TextChunk;
@@ -98,7 +96,7 @@ class EpochIsolationIntegrationTest {
     private TestVisibilityTracker visibilityTracker;
     private TestDocumentVisibilityTracker documentVisibilityTracker;
     private WriteLog writeLog;
-    private DocumentChunkBuffer chunkBuffer;
+    private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
     private DocumentBatchPublisher publisher;
 
@@ -123,7 +121,7 @@ class EpochIsolationIntegrationTest {
         writeLog = new WriteLog(logPath);
 
         // Create ingestion infrastructure
-        chunkBuffer = new DocumentChunkBuffer(writeLog);
+        documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
@@ -220,8 +218,7 @@ class EpochIsolationIntegrationTest {
                     for (int d = 0; d < numDocuments; d++) {
                         String documentId = "doc-torn-" + d;
                         List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                        chunkBuffer.bufferChunks(chunks);
-                        AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
+                        DocumentBatchBuffer batch = documentWriter.write(documentId, chunks);
 
                         // Insert vector into graph
                         float[] vector = createRandomVector(dimension);
@@ -231,8 +228,8 @@ class EpochIsolationIntegrationTest {
                         long epoch = visibilityTracker.advanceEpoch();
 
                         // Publish the document atomically, then announce it to the readers
-                        tracker.registerAtomicDocument(batch, epoch);
-                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIdsList()));
+                        tracker.registerDocument(documentId, batch.getChunkIds(), epoch);
+                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIds()));
                         publishedDocuments.add(documentId);
 
                         Thread.sleep(2);
@@ -355,13 +352,12 @@ class EpochIsolationIntegrationTest {
             for (int d = 0; d < numDocuments; d++) {
                 String documentId = "doc-epoch-identical-" + d;
                 List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                chunkBuffer.bufferChunks(chunks);
-                AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
+                DocumentBatchBuffer batch = documentWriter.write(documentId, chunks);
 
                 long epoch = visibilityTracker.advanceEpoch();
-                tracker.registerAtomicDocument(batch, epoch);
+                tracker.registerDocument(documentId, batch.getChunkIds(), epoch);
 
-                List<String> chunkIds = batch.getChunkIdsList();
+                List<String> chunkIds = batch.getChunkIds();
                 assertThat(chunkIds)
                     .as("The batch must carry every chunk of " + documentId)
                     .hasSize(chunksPerDocument);
@@ -579,8 +575,7 @@ class EpochIsolationIntegrationTest {
                         String documentId = "doc-concurrent-" + threadId + "-" + d;
 
                         List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                        chunkBuffer.bufferChunks(chunks);
-                        chunkBuffer.commitDocument(documentId);
+                        documentWriter.write(documentId, chunks);
 
                         float[] vector = createRandomVector(dimension);
                         graph.insert(vector);
@@ -746,8 +741,7 @@ class EpochIsolationIntegrationTest {
                                 // Ingest operation
                                 String documentId = "doc-cme-" + threadId + "-" + i;
                                 List<TextChunk> chunks = createChunks(documentId, 3);
-                                chunkBuffer.bufferChunks(chunks);
-                                chunkBuffer.commitDocument(documentId);
+                                documentWriter.write(documentId, chunks);
 
                                 float[] vector = createRandomVector(dimension);
                                 graph.insert(vector);

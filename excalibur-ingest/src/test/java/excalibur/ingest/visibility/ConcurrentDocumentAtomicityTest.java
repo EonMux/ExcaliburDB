@@ -2,7 +2,6 @@ package excalibur.ingest.visibility;
 
 import io.excalibur.core.text.ChunkIdentifiers;
 
-import excalibur.ingest.buffer.AtomicDocumentBatch;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -11,7 +10,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -92,18 +90,10 @@ class ConcurrentDocumentAtomicityTest {
                             chunkIds.add(docId + ":chunk:" + c);
                         }
 
-                        AtomicDocumentBatch batch = new AtomicDocumentBatch(
-                            docId,
-                            100L + writerId * 10000L + d * 100L,
-                            200L + writerId * 10000L + d * 100L,
-                            chunkIds,
-                            Collections.nCopies(chunkIds.size(), 1L)
-                        );
-
                         Thread.sleep(1);
 
                         long commitEpoch = epochCounter.incrementAndGet();
-                        tracker.registerAtomicDocument(batch, commitEpoch);
+                        tracker.registerDocument(docId, chunkIds, commitEpoch);
                         registry.registerDocument(docId, new HashSet<>(chunkIds), commitEpoch);
                         documentCommitEpochs.put(docId, commitEpoch);
                     }
@@ -175,12 +165,10 @@ class ConcurrentDocumentAtomicityTest {
 
         ExecutorService executor = Executors.newFixedThreadPool(numQueries);
 
-        AtomicDocumentBatch batch1 = createBatch("doc1", 0, 100, "doc1:0", "doc1:1");
-        AtomicDocumentBatch batch2 = createBatch("doc2", 100, 200, "doc2:0", "doc2:1");
-        AtomicDocumentBatch batch3 = createBatch("doc3", 200, 300, "doc3:0", "doc3:1");
+        List<String> doc3Chunks = List.of("doc3:0", "doc3:1");
 
-        tracker.registerAtomicDocument(batch1, 1L);
-        tracker.registerAtomicDocument(batch2, 2L);
+        tracker.registerDocument("doc1", List.of("doc1:0", "doc1:1"), 1L);
+        tracker.registerDocument("doc2", List.of("doc2:0", "doc2:1"), 2L);
 
         for (int i = 0; i < numQueries; i++) {
             final int queryId = i;
@@ -212,7 +200,7 @@ class ConcurrentDocumentAtomicityTest {
                         violations.incrementAndGet();
                     }
 
-                    tracker.registerAtomicDocument(batch3, 3L);
+                    tracker.registerDocument("doc3", doc3Chunks, 3L);
 
                     Set<String> visibleAtEpoch1After = tracker.getVisibleDocuments(epoch1);
                     if (visibleAtEpoch1After.contains("doc3")) {
@@ -245,12 +233,8 @@ class ConcurrentDocumentAtomicityTest {
             chunkIds.add(docId + ":chunk:" + i);
         }
 
-        AtomicDocumentBatch batch = new AtomicDocumentBatch(
-            docId, 0L, 1000L, chunkIds, Collections.nCopies(numChunks, 1L)
-        );
-
         long commitEpoch = 5L;
-        tracker.registerAtomicDocument(batch, commitEpoch);
+        tracker.registerDocument(docId, chunkIds, commitEpoch);
 
         for (int i = 0; i < numChunks; i++) {
             String chunkId = docId + ":chunk:" + i;
@@ -292,16 +276,8 @@ class ConcurrentDocumentAtomicityTest {
                         chunkIds.add(docId + ":chunk:" + c);
                     }
 
-                    AtomicDocumentBatch batch = new AtomicDocumentBatch(
-                        docId,
-                        docIndex * 1000L,
-                        docIndex * 1000L + 500L,
-                        chunkIds,
-                        Collections.nCopies(chunkIds.size(), 1L)
-                    );
-
                     long commitEpoch = tracker.advanceEpoch();
-                    tracker.registerAtomicDocument(batch, commitEpoch);
+                    tracker.registerDocument(docId, chunkIds, commitEpoch);
 
                     boolean allVisible = true;
                     boolean noneVisible = true;
@@ -412,16 +388,8 @@ class ConcurrentDocumentAtomicityTest {
                             chunkIds.add(docId + ":chunk:" + c);
                         }
 
-                        AtomicDocumentBatch batch = new AtomicDocumentBatch(
-                            docId,
-                            System.nanoTime(),
-                            System.nanoTime() + 1000,
-                            new ArrayList<>(chunkIds),
-                            Collections.nCopies(chunkIds.size(), 1L)
-                        );
-
                         long epoch = tracker.advanceEpoch();
-                        tracker.registerAtomicDocument(batch, epoch);
+                        tracker.registerDocument(docId, chunkIds, epoch);
                         registry.registerDocument(docId, chunkIds, epoch);
                         documentEpochs.put(docId, epoch);
 
@@ -539,16 +507,6 @@ class ConcurrentDocumentAtomicityTest {
         }
 
         assertEquals(0, registry.getDocumentCount());
-    }
-
-    private AtomicDocumentBatch createBatch(String documentId, long startOffset, long endOffset, String... chunkIds) {
-        return new AtomicDocumentBatch(
-            documentId,
-            startOffset,
-            endOffset,
-            Arrays.asList(chunkIds),
-            Collections.nCopies(chunkIds.length, 1L)
-        );
     }
 
     /**

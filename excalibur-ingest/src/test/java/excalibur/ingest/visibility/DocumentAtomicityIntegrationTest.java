@@ -1,6 +1,5 @@
 package excalibur.ingest.visibility;
 
-import excalibur.ingest.buffer.AtomicDocumentBatch;
 import excalibur.ingest.registry.DocumentRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -318,13 +317,8 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testTrackerWithRegistry() {
-        AtomicDocumentBatch batch = new AtomicDocumentBatch(
-            "doc1", 0L, 100L, 
-            List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"),
-            List.of(1L, 2L, 3L)
-        );
-        
-        tracker.registerAtomicDocument(batch, 5L);
+        tracker.registerDocument(
+            "doc1", List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"), 5L);
         
         assertTrue(tracker.isDocumentFullyVisible("doc1", 5L));
         assertTrue(tracker.isDocumentFullyVisible("doc1", 10L));
@@ -337,13 +331,7 @@ class DocumentAtomicityIntegrationTest {
 
     @Test
     void testTrackerFilterPartialDocuments() {
-        AtomicDocumentBatch batch1 = new AtomicDocumentBatch(
-            "doc1", 0L, 100L, 
-            List.of("doc1:chunk:0", "doc1:chunk:1"),
-            List.of(1L, 2L)
-        );
-        
-        tracker.registerAtomicDocument(batch1, 5L);
+        tracker.registerDocument("doc1", List.of("doc1:chunk:0", "doc1:chunk:1"), 5L);
         
         List<String> chunks = new ArrayList<>();
         chunks.add("doc1:chunk:0");
@@ -363,12 +351,8 @@ class DocumentAtomicityIntegrationTest {
         String docId = "atomicDoc";
         List<String> chunkIds = List.of(docId + ":chunk:0", docId + ":chunk:1", docId + ":chunk:2", docId + ":chunk:3");
         
-        AtomicDocumentBatch batch = new AtomicDocumentBatch(
-            docId, 0L, 1000L, chunkIds, List.of(1L, 2L, 3L, 4L)
-        );
-        
         long commitEpoch = 10L;
-        tracker.registerAtomicDocument(batch, commitEpoch);
+        tracker.registerDocument(docId, chunkIds, commitEpoch);
         
         for (String chunkId : chunkIds) {
             assertFalse(tracker.isChunkVisible(chunkId, commitEpoch - 1),

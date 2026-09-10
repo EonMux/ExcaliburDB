@@ -641,24 +641,4 @@ public class XxHash64 {
         }
         return true;
     }
-
-    /**
-     * Main method to run test vector verification.
-     *
-     * @param args Command line arguments (ignored)
-     */
-    public static void main(String[] args) {
-        System.out.println("Verifying XxHash64 implementation against test vectors...");
-        System.out.println();
-
-        boolean passed = verifyTestVectors();
-
-        System.out.println();
-        if (passed) {
-            System.out.println("All test vectors PASSED!");
-        } else {
-            System.out.println("Some test vectors FAILED!");
-            System.exit(1);
-        }
-    }
 }

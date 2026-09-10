@@ -1,8 +1,6 @@
 package excalibur.integration;
 
 import excalibur.filter.CuckooFilter;
-import excalibur.ingest.buffer.AtomicDocumentBatch;
-import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.pipeline.DocumentBatchBuffer;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.processor.TextChunk;
@@ -14,6 +12,7 @@ import excalibur.query.QueryResponse;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.pipeline.QueryPipeline;
 import excalibur.shard.VisibilityTracker;
+import io.excalibur.core.codec.ChunkPayloadCodec;
 import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
@@ -94,7 +93,7 @@ class FullPipelineIntegrationTest {
     private TestStorageEngine storageEngine;
     private TestVisibilityTracker visibilityTracker;
     private WriteLog writeLog;
-    private DocumentChunkBuffer chunkBuffer;
+    private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
     private DocumentBatchPublisher publisher;
 
@@ -118,7 +117,7 @@ class FullPipelineIntegrationTest {
         writeLog = new WriteLog(logPath);
 
         // Create ingestion infrastructure
-        chunkBuffer = new DocumentChunkBuffer(writeLog);
+        documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
@@ -181,10 +180,9 @@ class FullPipelineIntegrationTest {
 
                 // Create chunks
                 List<TextChunk> chunks = createChunks(documentId, 3);
-                chunkBuffer.bufferChunks(chunks);
 
                 // Commit to write log
-                AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
+                documentWriter.write(documentId, chunks);
 
                 // Insert vector into HNSW graph
                 graph.insert(vector);
@@ -510,13 +508,10 @@ class FullPipelineIntegrationTest {
                     0
                 ));
 
-                // Buffer chunks
-                chunkBuffer.bufferChunks(chunks);
-
                 // Commit with embedding
                 Map<Integer, float[]> embeddings = new HashMap<>();
                 embeddings.put(0, vector);
-                AtomicDocumentBatch batch = chunkBuffer.commitDocumentWithEmbeddings(documentId, embeddings);
+                DocumentBatchBuffer batch = documentWriter.write(documentId, chunks, embeddings);
 
                 // Insert vector into HNSW graph and register document ID
                 long nodeId = graph.insert(vector);
@@ -658,12 +653,10 @@ class FullPipelineIntegrationTest {
                 0
             ));
 
-            chunkBuffer.bufferChunks(chunks);
-
             // Commit with embedding
             Map<Integer, float[]> embeddings = new HashMap<>();
             embeddings.put(0, vector);
-            AtomicDocumentBatch batch = chunkBuffer.commitDocumentWithEmbeddings(testDocumentId, embeddings);
+            DocumentBatchBuffer batch = documentWriter.write(testDocumentId, chunks, embeddings);
 
             // Verify batch was created correctly
             assertThat(batch).isNotNull();
@@ -680,17 +673,17 @@ class FullPipelineIntegrationTest {
             assertThat(writeLog.writeOffset()).isGreaterThan(0);
 
             // CRITICAL VERIFICATION: Verify content can be decoded from encoded format
-            // Create a sample encoded value using the same format as DocumentChunkBuffer
-            byte[] encodedValue = DocumentChunkBuffer.encodeChunkWithTextAndEmbedding(testContent, vector);
+            // Create a sample encoded value using the same format as ChunkPayloadCodec
+            byte[] encodedValue = ChunkPayloadCodec.encode(testContent, vector);
 
             // Decode the text
-            String decodedText = DocumentChunkBuffer.decodeText(encodedValue);
+            String decodedText = ChunkPayloadCodec.textOf(encodedValue);
             assertThat(decodedText)
                 .as("Decoded text should match original content")
                 .isEqualTo(testContent);
 
             // Decode the embedding
-            float[] decodedVector = DocumentChunkBuffer.decodeEmbedding(encodedValue, dimension);
+            float[] decodedVector = ChunkPayloadCodec.embeddingOf(encodedValue, dimension);
             assertThat(decodedVector)
                 .as("Decoded vector should not be null")
                 .isNotNull();
@@ -749,11 +742,9 @@ class FullPipelineIntegrationTest {
                 List<TextChunk> chunks = new ArrayList<>();
                 chunks.add(new TextChunk(documentId, uniqueContent, uniqueContent.length() / 4, 0, uniqueContent.length(), 0));
 
-                chunkBuffer.bufferChunks(chunks);
-
                 Map<Integer, float[]> embeddings = new HashMap<>();
                 embeddings.put(0, vector);
-                chunkBuffer.commitDocumentWithEmbeddings(documentId, embeddings);
+                documentWriter.write(documentId, chunks, embeddings);
 
                 long nodeId = graph.insert(vector);
                 graph.registerDocumentId(nodeId, documentId);

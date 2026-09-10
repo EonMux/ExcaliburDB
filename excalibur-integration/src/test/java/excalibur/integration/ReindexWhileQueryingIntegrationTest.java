@@ -1,7 +1,5 @@
 package excalibur.integration;
 
-import excalibur.ingest.buffer.AtomicDocumentBatch;
-import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.pipeline.DocumentBatchBuffer;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.processor.TextChunk;
@@ -95,7 +93,7 @@ class ReindexWhileQueryingIntegrationTest {
     private TestStorageEngine storageEngine;
     private TestVisibilityTracker visibilityTracker;
     private WriteLog writeLog;
-    private DocumentChunkBuffer chunkBuffer;
+    private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
     private DocumentBatchPublisher publisher;
 
@@ -119,7 +117,7 @@ class ReindexWhileQueryingIntegrationTest {
         writeLog = new WriteLog(logPath);
 
         // Create ingestion infrastructure
-        chunkBuffer = new DocumentChunkBuffer(writeLog);
+        documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
@@ -925,8 +923,7 @@ class ReindexWhileQueryingIntegrationTest {
 
     private void ingestDocument(String documentId, int chunkCount, HnswGraph graph) throws IOException {
         List<TextChunk> chunks = createChunks(documentId, chunkCount);
-        chunkBuffer.bufferChunks(chunks);
-        chunkBuffer.commitDocument(documentId);
+        documentWriter.write(documentId, chunks);
 
         float[] vector = createRandomVector(dimension);
         graph.insert(vector);

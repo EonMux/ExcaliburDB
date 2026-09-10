@@ -1,7 +1,6 @@
 package excalibur.integration;
 
-import excalibur.ingest.buffer.AtomicDocumentBatch;
-import excalibur.ingest.buffer.DocumentChunkBuffer;
+import excalibur.ingest.pipeline.DocumentBatchBuffer;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.registry.DocumentRegistry;
@@ -104,7 +103,7 @@ class LiveIndexingIntegrationTest {
     private TestStorageEngine storageEngine;
     private TestVisibilityTracker visibilityTracker;
     private WriteLog writeLog;
-    private DocumentChunkBuffer chunkBuffer;
+    private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
     private DocumentBatchPublisher publisher;
 
@@ -128,7 +127,7 @@ class LiveIndexingIntegrationTest {
         writeLog = new WriteLog(logPath);
 
         // Create ingestion infrastructure
-        chunkBuffer = new DocumentChunkBuffer(writeLog);
+        documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
@@ -259,8 +258,7 @@ class LiveIndexingIntegrationTest {
 
                     // Create document with multiple chunks
                     List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                    chunkBuffer.bufferChunks(chunks);
-                    AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
+                    DocumentBatchBuffer batch = documentWriter.write(documentId, chunks);
 
                     // Insert vector into HNSW graph
                     float[] vector = createRandomVector(dimension);
@@ -272,8 +270,8 @@ class LiveIndexingIntegrationTest {
 
                     // Announce the chunk ids first, then publish: a reader that sees the
                     // document as visible must always be able to enumerate its chunks.
-                    documentChunkIds.put(documentId, List.copyOf(batch.getChunkIdList()));
-                    atomicityTracker.registerAtomicDocument(batch, commitEpoch);
+                    documentChunkIds.put(documentId, List.copyOf(batch.getChunkIds()));
+                    atomicityTracker.registerDocument(documentId, batch.getChunkIds(), commitEpoch);
 
                     Thread.sleep(2); // Small delay to allow readers
                 }
@@ -549,8 +547,7 @@ class LiveIndexingIntegrationTest {
                                 // Ingest operation
                                 String documentId = "doc-exception-" + threadId + "-" + i;
                                 List<TextChunk> chunks = createChunks(documentId, 3);
-                                chunkBuffer.bufferChunks(chunks);
-                                chunkBuffer.commitDocument(documentId);
+                                documentWriter.write(documentId, chunks);
 
                                 float[] vector = createRandomVector(dimension);
                                 graph.insert(vector);
@@ -654,8 +651,7 @@ class LiveIndexingIntegrationTest {
                 for (int d = current; d < target; d++) {
                     String documentId = "doc-progressive-" + d;
                     List<TextChunk> chunks = createChunks(documentId, 3);
-                    chunkBuffer.bufferChunks(chunks);
-                    chunkBuffer.commitDocument(documentId);
+                    documentWriter.write(documentId, chunks);
 
                     float[] vector = createRandomVector(dimension);
                     long nodeId = graph.insert(vector);
@@ -759,8 +755,7 @@ class LiveIndexingIntegrationTest {
                     for (int d = 0; d < numDocuments; d++) {
                         String documentId = "doc-torn-" + d;
                         List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                        chunkBuffer.bufferChunks(chunks);
-                        AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
+                        DocumentBatchBuffer batch = documentWriter.write(documentId, chunks);
 
                         float[] vector = createRandomVector(dimension);
                         graph.insert(vector);
@@ -768,8 +763,8 @@ class LiveIndexingIntegrationTest {
 
                         long commitEpoch = visibilityTracker.advanceEpoch();
 
-                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIdsList()));
-                        atomicityTracker.registerAtomicDocument(batch, commitEpoch);
+                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIds()));
+                        atomicityTracker.registerDocument(documentId, batch.getChunkIds(), commitEpoch);
 
                         Thread.sleep(3);
                     }
@@ -913,12 +908,11 @@ class LiveIndexingIntegrationTest {
                     for (int d = 0; d < numDocuments; d++) {
                         String documentId = "doc-atomic-" + d;
 
-                        // Write the document's chunks through the real buffer: the batch it
-                        // returns carries the chunk ids and the write-log offset range that
+                        // Write the document's chunks the way ingestion does: the batch that
+                        // comes back carries the chunk ids and the write-log offsets that
                         // atomic publication is defined over.
                         List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                        chunkBuffer.bufferChunks(chunks);
-                        AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
+                        DocumentBatchBuffer batch = documentWriter.write(documentId, chunks);
 
                         float[] vector = createRandomVector(dimension);
                         long nodeId = graph.insert(vector);
@@ -927,8 +921,8 @@ class LiveIndexingIntegrationTest {
 
                         long commitEpoch = visibilityTracker.advanceEpoch();
 
-                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIdsList()));
-                        atomicityTracker.registerAtomicDocument(batch, commitEpoch);
+                        documentChunkIds.put(documentId, List.copyOf(batch.getChunkIds()));
+                        atomicityTracker.registerDocument(documentId, batch.getChunkIds(), commitEpoch);
 
                         Thread.sleep(5);
                     }

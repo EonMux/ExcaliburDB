@@ -245,14 +245,4 @@ public class CRC32Checksum {
         }
         return true;
     }
-
-    /**
-     * Main method for testing.
-     */
-    public static void main(String[] args) {
-        System.out.println("CRC32 Test Vector Verification");
-        System.out.println("==============================");
-        boolean passed = verifyTestVectors();
-        System.exit(passed ? 0 : 1);
-    }
 }

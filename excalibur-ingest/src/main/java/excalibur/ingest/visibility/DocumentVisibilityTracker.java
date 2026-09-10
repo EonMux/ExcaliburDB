@@ -1,13 +1,13 @@
 package excalibur.ingest.visibility;
 
 import io.excalibur.core.text.ChunkIdentifiers;
-import excalibur.ingest.buffer.AtomicDocumentBatch;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -240,52 +240,45 @@ public class DocumentVisibilityTracker {
     }
 
     /**
-     * Registers a document as atomically committed at the specified epoch.
+     * Registers a document as visible from the given epoch, with every one of its chunks.
      *
-     * <p>This method should be called after all chunks have been written to
-     * the write log and the epoch has been advanced.</p>
+     * <p>All-or-nothing is the whole point: a document is registered with its complete chunk
+     * set or not at all, which is what lets {@link #isDocumentFullyVisible} answer for the
+     * document rather than chunk by chunk. Callers publish only after every chunk is durable.</p>
      *
-     * <p><strong>Domain correctness:</strong></p>
-     * <ul>
-     *   <li>batch must have non-null documentId</li>
-     *   <li>batch must have valid offset range (startOffset &lt; endOffset)</li>
-     *   <li>commitEpoch must be non-negative</li>
-     * </ul>
-     *
-     * @param batch The atomic document batch containing chunk information
+     * @param documentKey The document key the chunks were written under; production keys are
+     *                    {@code sourceId:documentId}
+     * @param chunkIds All chunk ids belonging to the document
      * @param commitEpoch The epoch at which this document becomes visible
-     * @throws NullPointerException if batch is null
+     * @throws NullPointerException if documentKey or chunkIds is null
      * @throws IllegalArgumentException if commitEpoch is negative
      */
-    public void registerAtomicDocument(AtomicDocumentBatch batch, long commitEpoch) {
-        Objects.requireNonNull(batch, "batch must not be null");
+    public void registerDocument(String documentKey, Collection<String> chunkIds, long commitEpoch) {
+        Objects.requireNonNull(documentKey, "documentKey must not be null");
+        Objects.requireNonNull(chunkIds, "chunkIds must not be null");
         if (commitEpoch < 0) {
             throw new IllegalArgumentException("commitEpoch must be non-negative: " + commitEpoch);
         }
 
-        String documentId = batch.getDocumentId();
-        List<String> chunkIds = batch.getChunkIdList();
+        DocumentVisibility visibility =
+            new DocumentVisibility(documentKey, new HashSet<>(chunkIds), commitEpoch);
 
-        DocumentVisibility visibility = new DocumentVisibility(
-            documentId,
-            Set.copyOf(chunkIds),
-            commitEpoch,
-            batch.getStartOffset(),
-            batch.getEndOffset()
-        );
-
-        documentVisibility.put(documentId, visibility);
-        pendingChunks.remove(documentId);
+        documentVisibility.put(documentKey, visibility);
+        // Clearing the in-flight marker is what completes the publish. Without it a document
+        // begun with beginIngestion and finished here stays pending forever: invisible to every
+        // query, and never released.
+        pendingChunks.remove(documentKey);
         forgetOldestBeyondRetention();
 
-        LOGGER.debug("Document {} registered as atomic at epoch {} with {} chunks",
-            documentId, commitEpoch, chunkIds.size());
+        LOGGER.debug("Document {} registered at epoch {} with {} chunks",
+            documentKey, commitEpoch, visibility.chunkCount());
     }
 
     /**
-     * Registers a document from its metadata with the current epoch.
+     * Registers a document from its registry metadata.
      *
-     * <p>This is a convenience method for recovering documents on restart.</p>
+     * <p>The key is derived the way excalibur-shard derives it from a storage key, so the
+     * document registered here is the one excalibur-query's atomicity filter looks up.</p>
      *
      * @param metadata The document metadata containing chunk IDs
      * @param commitEpoch The epoch at which this document becomes visible
@@ -293,27 +286,10 @@ public class DocumentVisibilityTracker {
      */
     public void registerFromMetadata(DocumentMetadata metadata, long commitEpoch) {
         Objects.requireNonNull(metadata, "metadata must not be null");
-
-        String key = makeKey(metadata.getSourceId(), metadata.getDocumentId());
-        Set<String> chunkIds = new HashSet<>(metadata.getChunkIds());
-
-        DocumentVisibility visibility = new DocumentVisibility(
-            key,
-            chunkIds,
-            commitEpoch,
-            -1,
-            -1
-        );
-
-        documentVisibility.put(key, visibility);
-        // Clearing the in-flight marker is what completes the publish. Without it a document
-        // begun with beginIngestion and finished through this path stays pending forever:
-        // invisible to every query, and never released.
-        pendingChunks.remove(key);
-        forgetOldestBeyondRetention();
-
-        LOGGER.debug("Document {} recovered from metadata at epoch {} with {} chunks",
-            key, commitEpoch, chunkIds.size());
+        registerDocument(
+            makeKey(metadata.getSourceId(), metadata.getDocumentId()),
+            metadata.getChunkIds(),
+            commitEpoch);
     }
 
     /**
@@ -653,15 +629,11 @@ public class DocumentVisibilityTracker {
      * @param documentId The document identifier
      * @param chunkIds Set of all chunk IDs for this document
      * @param commitEpoch The epoch at which this document became visible
-     * @param startOffset The start offset in the write log (-1 if unknown)
-     * @param endOffset The end offset in the write log (-1 if unknown)
      */
     public record DocumentVisibility(
         String documentId,
         Set<String> chunkIds,
-        long commitEpoch,
-        long startOffset,
-        long endOffset
+        long commitEpoch
     ) {
         public DocumentVisibility {
             Objects.requireNonNull(documentId, "documentId must not be null");
@@ -673,14 +645,6 @@ public class DocumentVisibilityTracker {
 
         public int chunkCount() {
             return chunkIds.size();
-        }
-
-        public boolean hasOffsetRange() {
-            return startOffset >= 0 && endOffset > startOffset;
-        }
-
-        public long byteSize() {
-            return hasOffsetRange() ? endOffset - startOffset : 0;
         }
     }
 

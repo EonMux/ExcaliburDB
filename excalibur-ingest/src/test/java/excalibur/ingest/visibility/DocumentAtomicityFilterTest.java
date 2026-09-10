@@ -4,7 +4,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -36,20 +35,14 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testIsDocumentVisible_visibleDocument() {
-        tracker.registerAtomicDocument(
-            createBatch("1", 0L, 100L, "1:chunk:0"),
-            5L
-        );
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
 
         assertTrue(checker.isDocumentVisible("1", 10L));
     }
 
     @Test
     void testIsDocumentVisible_notYetVisible() {
-        tracker.registerAtomicDocument(
-            createBatch("1", 0L, 100L, "1:chunk:0"),
-            10L
-        );
+        tracker.registerDocument("1", List.of("1:chunk:0"), 10L);
 
         assertFalse(checker.isDocumentVisible("1", 5L));
     }
@@ -61,10 +54,7 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testIsChunkVisible_filtersByVisibility() {
-        tracker.registerAtomicDocument(
-            createBatch("doc1", 0L, 100L, "doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"),
-            5L
-        );
+        tracker.registerDocument("doc1", List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"), 5L);
 
         assertTrue(checker.isChunkVisible("doc1:chunk:0", 10L));
         assertTrue(checker.isChunkVisible("doc1:chunk:1", 10L));
@@ -74,10 +64,7 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testFilterPartialDocuments_filtersByVisibility() {
-        tracker.registerAtomicDocument(
-            createBatch("doc1", 0L, 100L, "doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"),
-            5L
-        );
+        tracker.registerDocument("doc1", List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"), 5L);
 
         List<String> chunks = Arrays.asList("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2", "doc2:chunk:0");
 
@@ -92,9 +79,9 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testGetVisibleDocuments() {
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0"), 5L);
-        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:chunk:0"), 10L);
-        tracker.registerAtomicDocument(createBatch("3", 200L, 300L, "3:chunk:0"), 15L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 10L);
+        tracker.registerDocument("3", List.of("3:chunk:0"), 15L);
 
         assertEquals(1, checker.getVisibleDocuments(5L).size());
         assertEquals(2, checker.getVisibleDocuments(10L).size());
@@ -103,7 +90,7 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testGetCommitEpoch() {
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0"), 10L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 10L);
 
         assertEquals(10L, checker.getCommitEpoch("1"));
         assertEquals(-1L, checker.getCommitEpoch("999"));
@@ -111,7 +98,7 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testGetChunkCount() {
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0", "1:chunk:1"), 5L);
+        tracker.registerDocument("1", List.of("1:chunk:0", "1:chunk:1"), 5L);
 
         assertEquals(2, checker.getChunkCount("1"));
         assertEquals(0, checker.getChunkCount("999"));
@@ -121,17 +108,17 @@ class DocumentAtomicityFilterTest {
     void testGetDocumentCount() {
         assertEquals(0, checker.getDocumentCount());
         
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0"), 5L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
         assertEquals(1, checker.getDocumentCount());
         
-        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:chunk:0"), 10L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 10L);
         assertEquals(2, checker.getDocumentCount());
     }
 
     @Test
     void testEpochIsolation() {
-        tracker.registerAtomicDocument(createBatch("1", 0L, 100L, "1:chunk:0"), 5L);
-        tracker.registerAtomicDocument(createBatch("2", 100L, 200L, "2:chunk:0"), 10L);
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 10L);
 
         List<String> chunks = Arrays.asList("1:chunk:0", "2:chunk:0");
 
@@ -145,10 +132,7 @@ class DocumentAtomicityFilterTest {
 
     @Test
     void testNoPartialDocumentsVisible() {
-        tracker.registerAtomicDocument(
-            createBatch("1", 0L, 100L, "1:chunk:0", "1:chunk:1", "1:chunk:2"),
-            5L
-        );
+        tracker.registerDocument("1", List.of("1:chunk:0", "1:chunk:1", "1:chunk:2"), 5L);
 
         long commitEpoch = checker.getCommitEpoch("1");
 
@@ -159,17 +143,6 @@ class DocumentAtomicityFilterTest {
 
         List<String> beforeCommit = checker.filterPartialDocuments(chunks, commitEpoch - 1);
         assertEquals(0, beforeCommit.size());
-    }
-
-    private excalibur.ingest.buffer.AtomicDocumentBatch createBatch(
-            String documentId, long startOffset, long endOffset, String... chunkIds) {
-        return new excalibur.ingest.buffer.AtomicDocumentBatch(
-            documentId,
-            startOffset,
-            endOffset,
-            Arrays.asList(chunkIds),
-            Collections.nCopies(chunkIds.length, 1L)
-        );
     }
 
     /**

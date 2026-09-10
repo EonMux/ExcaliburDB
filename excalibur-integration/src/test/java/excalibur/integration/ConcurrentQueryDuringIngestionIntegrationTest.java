@@ -1,7 +1,5 @@
 package excalibur.integration;
 
-import excalibur.ingest.buffer.AtomicDocumentBatch;
-import excalibur.ingest.buffer.DocumentChunkBuffer;
 import excalibur.ingest.pipeline.DocumentBatchBuffer;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
 import excalibur.ingest.processor.TextChunk;
@@ -99,7 +97,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
     private TestStorageEngine storageEngine;
     private TestVisibilityTracker visibilityTracker;
     private WriteLog writeLog;
-    private DocumentChunkBuffer chunkBuffer;
+    private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
     private DocumentVisibilityRegistry visibilityRegistry;
     private DocumentBatchPublisher publisher;
@@ -124,7 +122,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
         writeLog = new WriteLog(logPath);
 
         // Create ingestion infrastructure
-        chunkBuffer = new DocumentChunkBuffer(writeLog);
+        documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
         visibilityRegistry = new DocumentVisibilityRegistry();
         publisher = new DocumentBatchPublisher(
@@ -216,8 +214,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
                         // Create document with chunks
                         List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                        chunkBuffer.bufferChunks(chunks);
-                        AtomicDocumentBatch batch = chunkBuffer.commitDocument(documentId);
+                        documentWriter.write(documentId, chunks);
 
                         // Insert vector into HNSW graph
                         float[] vector = createRandomVector(dimension);
@@ -408,8 +405,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
                 for (int d = currentDocs; d < targetDocs; d++) {
                     String documentId = "doc-progressive-" + d;
                     List<TextChunk> chunks = createChunks(documentId, chunksPerDocument);
-                    chunkBuffer.bufferChunks(chunks);
-                    chunkBuffer.commitDocument(documentId);
+                    documentWriter.write(documentId, chunks);
 
                     float[] vector = createRandomVector(dimension);
                     long nodeId = graph.insert(vector);
@@ -1153,8 +1149,7 @@ class ConcurrentQueryDuringIngestionIntegrationTest {
 
     private void ingestDocument(String documentId, int chunkCount, HnswGraph graph) throws IOException {
         List<TextChunk> chunks = createChunks(documentId, chunkCount);
-        chunkBuffer.bufferChunks(chunks);
-        chunkBuffer.commitDocument(documentId);
+        documentWriter.write(documentId, chunks);
 
         float[] vector = createRandomVector(dimension);
         // CRITICAL: Register document ID with HNSW graph so results include the string ID
