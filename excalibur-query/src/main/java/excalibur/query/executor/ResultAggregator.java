@@ -13,12 +13,10 @@ import java.util.Locale;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.PriorityQueue;
-import java.util.Set;
 
 /**
  * Aggregates and merges results from multiple segment queries.
@@ -234,122 +232,6 @@ public class ResultAggregator {
 
         LOGGER.trace("Aggregated {} results from {} segments ({} unique documents)",
             results.size(), segmentResults.size(), bestResultsByDocId.size());
-
-        return results;
-    }
-
-    /**
-     * Merges results from multiple segment queries.
-     *
-     * <p>This method takes the list of segment query results and produces
-     * a unified list of top-k QueryResultItems.</p>
-     *
-     * <h3>Deduplication Strategy</h3>
-     * <p>When the same document ID appears in multiple segments (e.g., during re-indexing
-     * with rolling replacement), this method keeps the result with the BEST score
-     * (lowest distance for distance-based metrics). This ensures:</p>
-     * <ul>
-     *   <li>No duplicate document IDs in the final result set</li>
-     *   <li>The best matching result is retained when duplicates exist</li>
-     *   <li>Consistent behavior across segment overlap scenarios</li>
-     * </ul>
-     *
-     * <h3>Domain Correctness</h3>
-     * <ul>
-     *   <li>Results are sorted by score (ascending - closest first)</li>
-     *   <li>No duplicate document IDs in output</li>
-     *   <li>When duplicates exist, the one with the lowest score is kept</li>
-     *   <li>Exactly topK results (or fewer if insufficient candidates)</li>
-     * </ul>
-     *
-     * @param segmentResults Results from each segment
-     * @return Aggregated and ranked results (at most topK items)
-     * @deprecated Use {@link #mergeAndRankWithNormalization} for proper [0,1] score normalization
-     */
-    @Deprecated
-    public List<QueryResultItem> mergeAndRank(List<SegmentQueryTask.SegmentQueryResult> segmentResults) {
-        Objects.requireNonNull(segmentResults, "Segment results cannot be null");
-
-        if (segmentResults.isEmpty()) {
-            return new ArrayList<>();
-        }
-
-        // Phase 1: Collect all results and deduplicate, keeping the best score for each document
-        // We use string document IDs for deduplication when available (actual document IDs like "doc1")
-        // This correctly handles the case where the same document appears in multiple segments
-        // during re-indexing or segment overlap scenarios
-        // Fallback to nodeId-based deduplication for backward compatibility
-        Map<String, QueryResultItem> bestResultsByDocIdStr = new HashMap<>();
-
-        // Process results from all segments
-        for (SegmentQueryTask.SegmentQueryResult segmentResult : segmentResults) {
-            if (!segmentResult.success()) {
-                LOGGER.debug("Skipping failed segment {} results", segmentResult.segmentId());
-                continue;
-            }
-
-            for (HnswSearchResult hnswResult : segmentResult.results()) {
-                // Drop non-finite distances at the source rather than letting
-                // QueryResultItem's finiteness check abort the entire query.
-                if (!Float.isFinite(hnswResult.distance())) {
-                    LOGGER.debug("Skipping result with non-finite distance {}: nodeId={}, documentId={}",
-                        hnswResult.distance(), hnswResult.nodeId(), hnswResult.documentId());
-                    continue;
-                }
-
-                // Apply threshold filter (distance() is an ordered dissimilarity:
-                // larger means further away, so anything above the threshold is dropped)
-                if (threshold > 0 && hnswResult.distance() > threshold) {
-                    continue;
-                }
-
-                // Get the actual document ID string from the HNSW result
-                // This is populated from the node-to-document mapping during search
-                String documentIdStr = hnswResult.documentId();
-                long nodeId = hnswResult.nodeId();
-
-                // Create result item with string document ID for atomicity filtering
-                QueryResultItem item = new QueryResultItem(
-                    nodeId, // Numeric ID for backward compatibility
-                    documentIdStr, // Actual string document ID
-                    hnswResult.distance(),
-                    segmentResult.payload(nodeId), // Chunk text, for tail-scan hits
-                    segmentResult.segmentId(),
-                    nodeId,
-                    hnswResult.generation()
-                );
-
-                // Keep the best (lowest distance) result for each document ID
-                // Use string document ID for deduplication when available
-                String dedupeKey = dedupeKey(documentIdStr, segmentResult.segmentId(), nodeId);
-                bestResultsByDocIdStr.merge(dedupeKey, item, (existing, newItem) ->
-                    newItem.score() < existing.score() ? newItem : existing
-                );
-            }
-        }
-
-        // Phase 2: Select top-k results using a max-heap
-        // Max-heap: keep largest (worst) at top so we can remove it
-        PriorityQueue<QueryResultItem> topResults = new PriorityQueue<>(
-            heapCapacity(topK),
-            Comparator.comparingDouble(QueryResultItem::score).reversed()
-        );
-
-        for (QueryResultItem item : bestResultsByDocIdStr.values()) {
-            if (topResults.size() < topK) {
-                topResults.add(item);
-            } else if (item.score() < topResults.peek().score()) {
-                topResults.poll();
-                topResults.add(item);
-            }
-        }
-
-        // Phase 3: Convert heap to sorted list (smallest distance first)
-        List<QueryResultItem> results = new ArrayList<>(topResults);
-        results.sort(Comparator.comparingDouble(QueryResultItem::score));
-
-        LOGGER.trace("Aggregated {} results from {} segments ({} unique documents)",
-            results.size(), segmentResults.size(), bestResultsByDocIdStr.size());
 
         return results;
     }

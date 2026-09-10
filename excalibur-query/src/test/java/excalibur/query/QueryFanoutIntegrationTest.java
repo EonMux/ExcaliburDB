@@ -3,6 +3,8 @@ package excalibur.query;
 import excalibur.query.executor.ParallelQueryDispatcher;
 import excalibur.query.executor.ResultAggregator;
 import excalibur.query.executor.SegmentQueryTask;
+import io.excalibur.vector.distance.CosineSimilarity;
+import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.junit.jupiter.api.Test;
 
@@ -13,6 +15,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.within;
 
 /**
  * Integration tests for Top-K ANN Query Fan-out.
@@ -29,6 +32,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * @since 1.0
  */
 class QueryFanoutIntegrationTest {
+
+    /** Ordered cosine distance d normalizes to (1 - d) / 2, so closer is still first. */
+    private static final DistanceFunction COSINE = CosineSimilarity.getInstance();
+
+    private static final float EPSILON = 1e-6f;
 
     /**
      * Test result aggregation across multiple simulated segments.
@@ -85,17 +93,18 @@ class QueryFanoutIntegrationTest {
 
         // Aggregate with top-k = 5
         ResultAggregator aggregator = new ResultAggregator(5);
-        List<QueryResultItem> merged = aggregator.mergeAndRank(segmentResults);
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            segmentResults, COSINE);
 
         // Verify we get exactly 5 results
         assertThat(merged).hasSize(5);
 
-        // Verify global ranking (closest first)
-        assertThat(merged.get(0).score()).isEqualTo(0.1f);
-        assertThat(merged.get(1).score()).isEqualTo(0.2f);
-        assertThat(merged.get(2).score()).isEqualTo(0.3f);
-        assertThat(merged.get(3).score()).isEqualTo(0.4f);
-        assertThat(merged.get(4).score()).isEqualTo(0.5f);
+        // Verify global ranking (closest first, so highest normalized score first)
+        assertThat(merged.get(0).score()).isCloseTo(0.45f, within(EPSILON));
+        assertThat(merged.get(1).score()).isCloseTo(0.40f, within(EPSILON));
+        assertThat(merged.get(2).score()).isCloseTo(0.35f, within(EPSILON));
+        assertThat(merged.get(3).score()).isCloseTo(0.30f, within(EPSILON));
+        assertThat(merged.get(4).score()).isCloseTo(0.25f, within(EPSILON));
 
         // Verify document IDs are correct
         assertThat(merged.get(0).documentId()).isEqualTo(101L);
@@ -137,16 +146,17 @@ class QueryFanoutIntegrationTest {
         ));
 
         ResultAggregator aggregator = new ResultAggregator(10);
-        List<QueryResultItem> merged = aggregator.mergeAndRank(segmentResults);
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            segmentResults, COSINE);
 
         // Should have 3 unique documents
         assertThat(merged).hasSize(3);
 
-        // doc100 should appear once, with the best (lowest) distance
+        // doc100 should appear once, scored from the best (lowest) distance
         assertThat(merged.stream().filter(r -> "doc100".equals(r.documentIdStr()))).hasSize(1);
         assertThat(merged.stream()
             .filter(r -> "doc100".equals(r.documentIdStr()))
-            .findFirst().orElseThrow().score()).isEqualTo(0.1f);
+            .findFirst().orElseThrow().score()).isCloseTo(0.45f, within(EPSILON));
 
         // Verify all documents present
         assertThat(merged.stream().map(QueryResultItem::documentIdStr))
@@ -231,13 +241,14 @@ class QueryFanoutIntegrationTest {
         ));
 
         ResultAggregator aggregator = new ResultAggregator(10);
-        List<QueryResultItem> merged = aggregator.mergeAndRank(segmentResults);
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            segmentResults, COSINE);
 
         // Should return results from successful segments only
         assertThat(merged).hasSize(3);
-        assertThat(merged.get(0).score()).isEqualTo(0.1f);
-        assertThat(merged.get(1).score()).isEqualTo(0.2f);
-        assertThat(merged.get(2).score()).isEqualTo(0.3f);
+        assertThat(merged.get(0).score()).isCloseTo(0.45f, within(EPSILON));
+        assertThat(merged.get(1).score()).isCloseTo(0.40f, within(EPSILON));
+        assertThat(merged.get(2).score()).isCloseTo(0.35f, within(EPSILON));
     }
 
     /**

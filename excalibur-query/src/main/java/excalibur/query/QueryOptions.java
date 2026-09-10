@@ -95,10 +95,11 @@ public final class QueryOptions {
     }
 
     /**
-     * Returns the minimum score threshold for results.
+     * Returns the minimum score a result must reach to be returned.
      *
-     * <p>Results with scores below this threshold are filtered out.
-     * For distance-based metrics, this is a maximum distance threshold.</p>
+     * <p>A floor on the normalized [0, 1] score, never a ceiling on raw distance. Every metric's
+     * distance is converted to that scale before this is applied, so one number means the same
+     * thing under cosine, L2 and inner product; 0 disables filtering.</p>
      *
      * @return The threshold value
      */

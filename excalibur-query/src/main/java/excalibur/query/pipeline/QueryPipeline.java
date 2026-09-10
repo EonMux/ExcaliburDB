@@ -1214,8 +1214,8 @@ public class QueryPipeline {
         token.checkCancelled("Stage 3 cancelled after segment search");
 
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = dispatchResult.segmentResults();
-        long totalTailScanEntries = dispatchResult.coverage().tailScanEntries();
-        int segmentsTimedOut = dispatchResult.coverage().segmentsTimedOut();
+        long totalTailScanEntries = dispatchResult.tailScanEntries();
+        int segmentsTimedOut = dispatchResult.segmentsTimedOut();
 
         // Apply epoch isolation filtering to HNSW results to prevent torn reads
         // Filter out nodes that were inserted after the query's captured epoch

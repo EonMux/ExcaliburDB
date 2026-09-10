@@ -140,6 +140,19 @@ class QueryPipelineSegmentSelectionTest {
     }
 
     @Test
+    @DisplayName("a strict query reads a compacting segment")
+    void strictQueryReadsCompacting() throws IOException {
+        // Compaction reclaims tombstones behind a frozen snapshot, and the snapshot is whole -
+        // so the segment answers a strict query as completely as an active one does.
+        register(1L, LifecycleState.COMPACTING, true);
+
+        QueryResponse response = pipeline.executeSync(strict(), new CancellationToken());
+
+        assertThat(response.coverage().segmentsExcluded()).isZero();
+        assertThat(response.coverage().estimatedCorpusCoverage()).isEqualTo(1.0);
+    }
+
+    @Test
     @DisplayName("a segment whose graph is missing is a gap, not full coverage")
     void aGraphlessSegmentIsAnExclusion() throws IOException {
         // Nothing about the catalog says a graph failed to load. The census counts the segment as

@@ -7,6 +7,7 @@ import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.junit.jupiter.api.Test;
 
 import io.excalibur.vector.distance.CosineSimilarity;
+import io.excalibur.vector.distance.DistanceFunction;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -16,11 +17,24 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 
 /**
  * Unit tests for ResultAggregator.
  */
 class ResultAggregatorTest {
+
+    /**
+     * The metric every merge test below uses.
+     *
+     * <p>Its ordered distance is the negated similarity, so the aggregator normalizes a
+     * distance d to (1 - d) / 2: 0.1 becomes 0.45, 0.5 becomes 0.25, and closer is still
+     * first because the mapping is strictly decreasing.
+     */
+    private static final DistanceFunction COSINE = CosineSimilarity.getInstance();
+
+    /** Tolerance for a score that has been through the normalization arithmetic. */
+    private static final float EPSILON = 1e-6f;
 
     /**
      * Test constructor with valid parameters.
@@ -72,23 +86,23 @@ class ResultAggregatorTest {
     }
 
     /**
-     * Test mergeAndRank with empty results.
+     * Test merging with empty results.
      */
     @Test
-    void testMergeAndRankEmptyResults() {
+    void testMergeEmptyResults() {
         ResultAggregator aggregator = new ResultAggregator(10);
         List<SegmentQueryTask.SegmentQueryResult> results = new ArrayList<>();
-        List<QueryResultItem> merged = aggregator.mergeAndRank(results);
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(results, COSINE);
         assertThat(merged).isEmpty();
     }
 
     /**
-     * Test mergeAndRank with null results throws.
+     * Test merging with null results throws.
      */
     @Test
-    void testMergeAndRankNullResults() {
+    void testMergeNullResults() {
         ResultAggregator aggregator = new ResultAggregator(10);
-        assertThatThrownBy(() -> aggregator.mergeAndRank(null))
+        assertThatThrownBy(() -> aggregator.mergeAndRankWithNormalization(null, COSINE))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("Segment results cannot be null");
     }
@@ -132,10 +146,10 @@ class ResultAggregatorTest {
     }
 
     /**
-     * Test mergeAndRank with single segment.
+     * Test merging with single segment.
      */
     @Test
-    void testMergeAndRankSingleSegment() {
+    void testMergeSingleSegment() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         List<HnswSearchResult> hnswResults = List.of(
@@ -148,19 +162,20 @@ class ResultAggregatorTest {
             1L, hnswResults, 0, 10, true, null
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(segmentResult));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(segmentResult), COSINE);
 
         assertThat(merged).hasSize(3);
-        assertThat(merged.get(0).score()).isEqualTo(0.1f);
-        assertThat(merged.get(1).score()).isEqualTo(0.2f);
-        assertThat(merged.get(2).score()).isEqualTo(0.3f);
+        assertThat(merged.get(0).score()).isCloseTo(0.45f, within(EPSILON));
+        assertThat(merged.get(1).score()).isCloseTo(0.40f, within(EPSILON));
+        assertThat(merged.get(2).score()).isCloseTo(0.35f, within(EPSILON));
     }
 
     /**
-     * Test mergeAndRank with multiple segments.
+     * Test merging across multiple segments.
      */
     @Test
-    void testMergeAndRankMultipleSegments() {
+    void testMergeMultipleSegments() {
         ResultAggregator aggregator = new ResultAggregator(5);
 
         // Segment 1: distances 0.1, 0.3, 0.5
@@ -184,22 +199,23 @@ class ResultAggregatorTest {
             2L, segment2Results, 0, 10, true, null
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(result1, result2));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(result1, result2), COSINE);
 
         assertThat(merged).hasSize(5);
-        // Should be sorted by distance
-        assertThat(merged.get(0).score()).isEqualTo(0.1f);
-        assertThat(merged.get(1).score()).isEqualTo(0.2f);
-        assertThat(merged.get(2).score()).isEqualTo(0.3f);
-        assertThat(merged.get(3).score()).isEqualTo(0.4f);
-        assertThat(merged.get(4).score()).isEqualTo(0.5f);
+        // Best score first, which for distances 0.1 through 0.5 is the same order
+        assertThat(merged.get(0).score()).isCloseTo(0.45f, within(EPSILON));
+        assertThat(merged.get(1).score()).isCloseTo(0.40f, within(EPSILON));
+        assertThat(merged.get(2).score()).isCloseTo(0.35f, within(EPSILON));
+        assertThat(merged.get(3).score()).isCloseTo(0.30f, within(EPSILON));
+        assertThat(merged.get(4).score()).isCloseTo(0.25f, within(EPSILON));
     }
 
     /**
-     * Test mergeAndRank deduplicates by document ID.
+     * Test merging deduplicates by document ID.
      */
     @Test
-    void testMergeAndRankDeduplication() {
+    void testMergeDeduplication() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         // The same DOCUMENT appears in both segments with different distances. Identity
@@ -222,25 +238,27 @@ class ResultAggregatorTest {
             2L, segment2Results, 0, 10, true, null
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(result1, result2));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(result1, result2), COSINE);
 
         // Should have 3 unique document IDs
         assertThat(merged).hasSize(3);
 
-        // doc1 should appear once with the BEST distance (0.1, not 0.5)
+        // doc1 should appear once, scored from its BEST distance (0.1, not 0.5)
         assertThat(merged.stream().anyMatch(
-            r -> "doc1".equals(r.documentIdStr()) && r.score() == 0.1f)).isTrue();
+            r -> "doc1".equals(r.documentIdStr())
+                && Math.abs(r.score() - 0.45f) < EPSILON)).isTrue();
         // Ensure no duplicate with worse score
         assertThat(merged.stream().filter(r -> "doc1".equals(r.documentIdStr()))).hasSize(1);
     }
 
     /**
-     * Test mergeAndRank keeps the BEST score when duplicates exist across segments.
+     * Test merging keeps the BEST score when duplicates exist across segments.
      * This simulates re-indexing scenario where the same document appears in
      * both old and new segments with different distances.
      */
     @Test
-    void testMergeAndRankKeepsBestScoreForDuplicates() {
+    void testMergeKeepsBestScoreForDuplicates() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         // Segment 1 (old segment during re-index): doc 1 with WORSE distance
@@ -264,28 +282,29 @@ class ResultAggregatorTest {
 
         // Process in order: new segment first, then old segment
         // The aggregator should still keep the best score regardless of processing order
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(newResult, oldResult));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(newResult, oldResult), COSINE);
 
         // Should have 3 unique document IDs
         assertThat(merged).hasSize(3);
 
-        // doc1 should appear with the BEST distance (0.1), not the worse one (0.9)
+        // doc1 should be scored from the BEST distance (0.1), not the worse one (0.9)
         QueryResultItem doc1Result = merged.stream()
             .filter(r -> "doc1".equals(r.documentIdStr()))
             .findFirst()
             .orElseThrow();
-        assertThat(doc1Result.score()).isEqualTo(0.1f);
+        assertThat(doc1Result.score()).isCloseTo(0.45f, within(EPSILON));
 
         // Verify only one entry for doc1
         assertThat(merged.stream().filter(r -> "doc1".equals(r.documentIdStr()))).hasSize(1);
     }
 
     /**
-     * Test mergeAndRank keeps best score regardless of segment processing order.
+     * Test merging keeps best score regardless of segment processing order.
      * Verifies that processing order doesn't affect which duplicate is kept.
      */
     @Test
-    void testMergeAndRankDeduplicationOrderIndependent() {
+    void testMergeDeduplicationOrderIndependent() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         // Segment 1: doc1 with worse distance
@@ -306,24 +325,26 @@ class ResultAggregatorTest {
         );
 
         // Process segment 1 FIRST (worse score comes first)
-        List<QueryResultItem> mergedOrder1 = aggregator.mergeAndRank(List.of(result1, result2));
+        List<QueryResultItem> mergedOrder1 = aggregator.mergeAndRankWithNormalization(
+            List.of(result1, result2), COSINE);
 
         // Process segment 2 FIRST (better score comes first)
-        List<QueryResultItem> mergedOrder2 = aggregator.mergeAndRank(List.of(result2, result1));
+        List<QueryResultItem> mergedOrder2 = aggregator.mergeAndRankWithNormalization(
+            List.of(result2, result1), COSINE);
 
-        // Both should have the same result: doc 1 with the BEST score (0.2)
+        // Both should have the same result: doc 1 scored from its BEST distance (0.2)
         assertThat(mergedOrder1).hasSize(1);
         assertThat(mergedOrder2).hasSize(1);
-        assertThat(mergedOrder1.get(0).score()).isEqualTo(0.2f);
-        assertThat(mergedOrder2.get(0).score()).isEqualTo(0.2f);
+        assertThat(mergedOrder1.get(0).score()).isCloseTo(0.40f, within(EPSILON));
+        assertThat(mergedOrder2.get(0).score()).isCloseTo(0.40f, within(EPSILON));
     }
 
     /**
-     * Test mergeAndRank with multiple duplicates across many segments.
+     * Test merging with multiple duplicates across many segments.
      * Verifies deduplication works correctly with complex overlap scenarios.
      */
     @Test
-    void testMergeAndRankMultipleDuplicatesAcrossSegments() {
+    void testMergeMultipleDuplicatesAcrossSegments() {
         ResultAggregator aggregator = new ResultAggregator(5);
 
         // Three segments, each containing some overlapping documents. Node IDs repeat
@@ -353,18 +374,18 @@ class ResultAggregatorTest {
             new SegmentQueryTask.SegmentQueryResult(3L, segment3, 0, 10, true, null)
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(results);
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(results, COSINE);
 
         // Should have 5 unique documents
         assertThat(merged).hasSize(5);
 
         // Verify each document has its best score
         java.util.Map<String, Float> expectedScores = java.util.Map.of(
-            "doc1", 0.2f,  // Best of {0.5, 0.2, 0.8}
-            "doc2", 0.3f,  // Best of {0.3, 0.6}
-            "doc3", 0.1f,  // Best of {0.9, 0.1}
-            "doc4", 0.4f,  // Only one
-            "doc5", 0.7f   // Only one
+            "doc1", 0.40f,  // Best of {0.5, 0.2, 0.8} is 0.2
+            "doc2", 0.35f,  // Best of {0.3, 0.6} is 0.3
+            "doc3", 0.45f,  // Best of {0.9, 0.1} is 0.1
+            "doc4", 0.30f,  // Only one, at 0.4
+            "doc5", 0.15f   // Only one, at 0.7
         );
 
         for (QueryResultItem item : merged) {
@@ -372,7 +393,7 @@ class ResultAggregatorTest {
             assertThat(item.score())
                 .withFailMessage("Document %s should have score %.2f but got %.2f",
                     item.documentIdStr(), expected, item.score())
-                .isEqualTo(expected);
+                .isCloseTo(expected, within(EPSILON));
         }
 
         // Verify no duplicates
@@ -392,7 +413,7 @@ class ResultAggregatorTest {
      * different segments and silently discards legitimate top-k hits.</p>
      */
     @Test
-    void testMergeAndRankDoesNotCollapseSameNodeIdAcrossSegments() {
+    void testMergeDoesNotCollapseSameNodeIdAcrossSegments() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         List<SegmentQueryTask.SegmentQueryResult> results = List.of(
@@ -402,7 +423,7 @@ class ResultAggregatorTest {
                 2L, List.of(new HnswSearchResult(0L, 0.2f)), 0, 10, true, null)
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(results);
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(results, COSINE);
 
         assertThat(merged).hasSize(2);
         assertThat(merged).extracting(QueryResultItem::segmentId)
@@ -410,10 +431,10 @@ class ResultAggregatorTest {
     }
 
     /**
-     * Test mergeAndRank respects topK limit.
+     * Test merging respects topK limit.
      */
     @Test
-    void testMergeAndRankRespectsTopK() {
+    void testMergeRespectsTopK() {
         ResultAggregator aggregator = new ResultAggregator(3);
 
         List<HnswSearchResult> segment1Results = List.of(
@@ -435,47 +456,75 @@ class ResultAggregatorTest {
             2L, segment2Results, 0, 10, true, null
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(result1, result2));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(result1, result2), COSINE);
 
         // Should only return top 3
         assertThat(merged).hasSize(3);
-        assertThat(merged.get(0).score()).isEqualTo(0.1f);
-        assertThat(merged.get(1).score()).isEqualTo(0.2f);
-        assertThat(merged.get(2).score()).isEqualTo(0.3f);
+        assertThat(merged.get(0).score()).isCloseTo(0.45f, within(EPSILON));
+        assertThat(merged.get(1).score()).isCloseTo(0.40f, within(EPSILON));
+        assertThat(merged.get(2).score()).isCloseTo(0.35f, within(EPSILON));
     }
 
     /**
-     * Test mergeAndRank applies threshold filter.
+     * The threshold is a floor on the normalized score, not a ceiling on raw distance.
+     *
+     * <p>The two read the same configured number in opposite directions, so a query asking
+     * for "nothing below 0.35" served as "nothing further than 0.35 away" would admit the
+     * results it meant to exclude.</p>
      */
     @Test
-    void testMergeAndRankThresholdFilter() {
+    void testThresholdIsAFloorOnTheNormalizedScore() {
         ResultAggregator aggregator = new ResultAggregator(10, 0.35f, 0.5);
 
         List<HnswSearchResult> segmentResults = List.of(
-            new HnswSearchResult(1L, 0.1f),  // Included
-            new HnswSearchResult(2L, 0.2f),  // Included
-            new HnswSearchResult(3L, 0.3f),  // Included
-            new HnswSearchResult(4L, 0.4f),  // Excluded by threshold
-            new HnswSearchResult(5L, 0.5f)   // Excluded by threshold
+            new HnswSearchResult(1L, 0.1f),  // Scores 0.45 - included
+            new HnswSearchResult(2L, 0.2f),  // Scores 0.40 - included
+            new HnswSearchResult(3L, 0.3f),  // Scores 0.35 - included, exactly at the floor
+            new HnswSearchResult(4L, 0.4f),  // Scores 0.30 - excluded
+            new HnswSearchResult(5L, 0.5f)   // Scores 0.25 - excluded
         );
 
         SegmentQueryTask.SegmentQueryResult result = new SegmentQueryTask.SegmentQueryResult(
             1L, segmentResults, 0, 10, true, null
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(result));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(result), COSINE);
 
         assertThat(merged).hasSize(3);
-        assertThat(merged.get(0).score()).isEqualTo(0.1f);
-        assertThat(merged.get(1).score()).isEqualTo(0.2f);
-        assertThat(merged.get(2).score()).isEqualTo(0.3f);
+        assertThat(merged.get(0).score()).isCloseTo(0.45f, within(EPSILON));
+        assertThat(merged.get(1).score()).isCloseTo(0.40f, within(EPSILON));
+        assertThat(merged.get(2).score()).isCloseTo(0.35f, within(EPSILON));
     }
 
     /**
-     * Test mergeAndRank skips failed segments.
+     * A floor above every score returns nothing, rather than everything.
+     *
+     * <p>Read as a distance ceiling the same 0.9 would admit all five of these.</p>
      */
     @Test
-    void testMergeAndRankSkipsFailedSegments() {
+    void testAThresholdAboveEveryScoreExcludesEverything() {
+        ResultAggregator aggregator = new ResultAggregator(10, 0.9f, 0.5);
+
+        SegmentQueryTask.SegmentQueryResult result = new SegmentQueryTask.SegmentQueryResult(
+            1L, List.of(
+                new HnswSearchResult(1L, 0.1f),
+                new HnswSearchResult(2L, 0.2f),
+                new HnswSearchResult(3L, 0.3f),
+                new HnswSearchResult(4L, 0.4f),
+                new HnswSearchResult(5L, 0.5f)),
+            0, 10, true, null
+        );
+
+        assertThat(aggregator.mergeAndRankWithNormalization(List.of(result), COSINE)).isEmpty();
+    }
+
+    /**
+     * Test merging skips failed segments.
+     */
+    @Test
+    void testMergeSkipsFailedSegments() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         List<HnswSearchResult> successResults = List.of(
@@ -491,33 +540,35 @@ class ResultAggregatorTest {
             2L, Collections.emptyList(), 0, 10, false, "Search failed"
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(successResult, failedResult));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(successResult, failedResult), COSINE);
 
         // Should only include results from successful segment
         assertThat(merged).hasSize(2);
     }
 
     /**
-     * Test mergeAndRank with empty segment results.
+     * Test merging with empty segment results.
      */
     @Test
-    void testMergeAndRankEmptySegmentResults() {
+    void testMergeEmptySegmentResults() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         SegmentQueryTask.SegmentQueryResult emptyResult = new SegmentQueryTask.SegmentQueryResult(
             1L, Collections.emptyList(), 0, 10, true, null
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(emptyResult));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(emptyResult), COSINE);
 
         assertThat(merged).isEmpty();
     }
 
     /**
-     * Test mergeAndRank with null result list in segment.
+     * Test merging with null result list in segment.
      */
     @Test
-    void testMergeAndRankNullResultList() {
+    void testMergeNullResultList() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         // SegmentQueryResult constructor handles null by using empty list
@@ -525,7 +576,8 @@ class ResultAggregatorTest {
             1L, null, 0, 10, true, null
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(nullResult));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(nullResult), COSINE);
 
         assertThat(merged).isEmpty();
     }
@@ -735,10 +787,10 @@ class ResultAggregatorTest {
     }
 
     /**
-     * Test results are sorted correctly (smallest distance first).
+     * Test results are sorted correctly (best score first, so smallest distance first).
      */
     @Test
-    void testMergeAndRankSortingOrder() {
+    void testMergeSortingOrder() {
         ResultAggregator aggregator = new ResultAggregator(10);
 
         // Provide results in random order
@@ -754,7 +806,8 @@ class ResultAggregatorTest {
             1L, segmentResults, 0, 10, true, null
         );
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(List.of(result));
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            List.of(result), COSINE);
 
         // Verify sorted order (smallest first)
         assertThat(merged).hasSize(5);
@@ -766,10 +819,10 @@ class ResultAggregatorTest {
     }
 
     /**
-     * Test mergeAndRank handles large number of segments.
+     * Test merging handles large number of segments.
      */
     @Test
-    void testMergeAndRankManySegments() {
+    void testMergeManySegments() {
         ResultAggregator aggregator = new ResultAggregator(5);
 
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
@@ -780,14 +833,16 @@ class ResultAggregatorTest {
             segmentResults.add(new SegmentQueryTask.SegmentQueryResult(i, results, 0, 10, true, null));
         }
 
-        List<QueryResultItem> merged = aggregator.mergeAndRank(segmentResults);
+        List<QueryResultItem> merged = aggregator.mergeAndRankWithNormalization(
+            segmentResults, COSINE);
 
         // Should only return top 5
         assertThat(merged).hasSize(5);
 
-        // Verify they are the best 5 (lowest distances)
+        // Verify they are the best 5 (lowest distances, so highest scores)
         for (int i = 0; i < 5; i++) {
-            assertThat(merged.get(i).score()).isEqualTo(i * 0.01f);
+            assertThat(merged.get(i).score())
+                .isCloseTo((1.0f - i * 0.01f) / 2.0f, within(EPSILON));
         }
     }
 

@@ -1,10 +1,6 @@
 package excalibur.query.executor;
 
-import excalibur.query.IndexCoverage;
 import excalibur.query.QueryOptions;
-import excalibur.query.QueryResponse;
-import excalibur.query.QueryResultItem;
-import io.excalibur.store.LifecycleState;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.vector.distance.DistanceFunction;
@@ -62,11 +58,6 @@ public class ParallelQueryDispatcher {
      */
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
 
-    /**
-     * Default coverage threshold for degraded state.
-     */
-    public static final double DEFAULT_COVERAGE_THRESHOLD = 0.5;
-
     private final SegmentCatalog catalog;
     private final Map<Long, Segment> segments;
     private final HnswGraphProvider graphProvider;
@@ -92,496 +83,32 @@ public class ParallelQueryDispatcher {
     }
 
     /**
-     * Dispatches a query to all queryable segments.
-     *
-     * <p>This method:</p>
-     * <ol>
-     *   <li>Identifies queryable segments based on lifecycle state</li>
-     *   <li>Creates SegmentQueryTask for each segment</li>
-     *   <li>Dispatches tasks in parallel using virtual threads</li>
-     *   <li>Collects results with timeout enforcement</li>
-     *   <li>Aggregates results using ResultAggregator</li>
-     * </ol>
-     *
-     * @param queryVector The query vector
-     * @param options Query options
-     * @param distanceFunction The distance function
-     * @return QueryResponse with results and coverage
-     */
-    public QueryResponse dispatch(
-            float[] queryVector,
-            QueryOptions options,
-            DistanceFunction distanceFunction) {
-
-        Objects.requireNonNull(queryVector, "Query vector cannot be null");
-        Objects.requireNonNull(options, "Query options cannot be null");
-        Objects.requireNonNull(distanceFunction, "Distance function cannot be null");
-
-        long startTime = System.nanoTime();
-
-        // Get queryable segments
-        SegmentSelection selection = getQueryableSegments(options.includePartialSegments());
-        List<SegmentInfo> queryableSegments = selection.searchable();
-
-        if (queryableSegments.isEmpty()) {
-            LOGGER.debug("No queryable segments available");
-            IndexCoverage coverage = IndexCoverage.builder()
-                .totalSegments(catalog.size())
-                .segmentsExcluded(selection.excluded())
-                .computeCoverage()
-                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
-                .build();
-            return QueryResponse.empty(coverage, 0);
-        }
-
-        LOGGER.trace("Dispatching query to {} segments", queryableSegments.size());
-
-        // Create tasks for each segment
-        List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks = new ArrayList<>();
-        for (SegmentInfo info : queryableSegments) {
-            SegmentQueryTask task = new SegmentQueryTask(
-                info.segmentId,
-                info.segment,
-                info.graph,
-                queryVector,
-                options.topK(),
-                options.oversamplingFactor(),
-                distanceFunction
-            );
-            tasks.add(task);
-        }
-
-        // Dispatch tasks in parallel with timeout
-        List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
-        List<Future<SegmentQueryTask.SegmentQueryResult>> futures;
-
-        try {
-            futures = executor.invokeAll(tasks, options.timeout().toMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            LOGGER.warn("Query dispatch interrupted");
-            return createErrorResponse(options, System.nanoTime() - startTime);
-        }
-
-        // Collect results
-        int segmentsTimedOut = 0;
-        for (int i = 0; i < futures.size(); i++) {
-            Future<SegmentQueryTask.SegmentQueryResult> future = futures.get(i);
-            SegmentInfo segmentInfo = queryableSegments.get(i);
-
-            try {
-                if (future.isDone()) {
-                    SegmentQueryTask.SegmentQueryResult result = future.get();
-                    segmentResults.add(result);
-                } else {
-                    // Timeout - create error result
-                    segmentsTimedOut++;
-                    segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                        segmentInfo.segmentId,
-                        List.of(),
-                        0,
-                        options.timeout().toMillis(),
-                        false,
-                        "Timeout"
-                    ));
-                    future.cancel(true);
-                }
-            } catch (ExecutionException e) {
-                LOGGER.warn("Segment {} query failed: {}", segmentInfo.segmentId, e.getCause().getMessage());
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId,
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    e.getCause().getMessage()
-                ));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                segmentsTimedOut++;
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId,
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    "Interrupted"
-                ));
-            } catch (java.util.concurrent.CancellationException e) {
-                // Future was cancelled due to invokeAll timeout
-                segmentsTimedOut++;
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId,
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    "Timeout"
-                ));
-            }
-        }
-
-        // Aggregate results
-        ResultAggregator aggregator = new ResultAggregator(options);
-        List<QueryResultItem> mergedResults = aggregator.mergeAndRank(segmentResults);
-
-        // Build coverage
-        IndexCoverage coverage = buildCoverage(segmentResults, segmentsTimedOut, selection.excluded());
-
-        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-
-        LOGGER.trace("Query completed: {} results, {}ms, coverage={}",
-            mergedResults.size(), durationMs, coverage.estimatedCorpusCoverage());
-
-        return new QueryResponse(mergedResults, coverage, durationMs);
-    }
-
-    /**
-     * Gets all segments that are queryable, with a count of the ones held back.
-     *
-     * <p>Queryable segments are in INDEXING, WARMING, ACTIVE, or COMPACTING states. When
-     * {@code includePartial} is false the partially-indexed ones are dropped - that is INDEXING
-     * alone, since a warming segment has every entry in and a compacting one serves a frozen
-     * snapshot, and both answer a query exactly as an active segment does.</p>
-     *
-     * <p>A segment the catalog counts as live corpus and this query does not read is a gap in the
-     * answer. It is counted here so the response can say so; a dropped segment is not an error
-     * anywhere else, and coverage taken from the catalog alone cannot see it.</p>
-     *
-     * @param includePartial Whether to include partially-indexed segments
-     * @return The segments to search and the number withheld from this query
-     */
-    private SegmentSelection getQueryableSegments(boolean includePartial) {
-        List<SegmentInfo> queryable = new ArrayList<>();
-        int excluded = 0;
-
-        for (Map.Entry<Long, Segment> entry : segments.entrySet()) {
-            long segmentId = entry.getKey();
-            Segment segment = entry.getValue();
-
-            // Check lifecycle state
-            SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
-            if (metadata == null) {
-                continue;
-            }
-
-            LifecycleState state = metadata.getLifecycleState();
-
-            // Check if queryable
-            if (!state.isQueryable()) {
-                continue;
-            }
-
-            // If not including partial, hold back the segments still taking entries
-            if (!includePartial && state.isPartiallyIndexed()) {
-                excluded++;
-                continue;
-            }
-
-            // Get HNSW graph
-            HnswGraph graph = graphProvider.getGraph(segmentId);
-            if (graph == null) {
-                LOGGER.trace("No graph available for segment {}", segmentId);
-                excluded++;
-                continue;
-            }
-
-            queryable.add(new SegmentInfo(segmentId, segment, graph));
-        }
-
-        return new SegmentSelection(queryable, excluded);
-    }
-
-    /**
-     * The segments a query may search, and how many of the live corpus it may not.
-     *
-     * @param searchable The segments to fan out to
-     * @param excluded How many queryable segments were withheld from this query
-     */
-    private record SegmentSelection(List<SegmentInfo> searchable, int excluded) {}
-
-    /**
-     * Builds index coverage from segment results.
-     *
-     * @param segmentResults One result per segment the query fanned out to
-     * @param segmentsTimedOut How many of those did not answer in time
-     * @param segmentsExcluded How many queryable segments the query never reached
-     */
-    private IndexCoverage buildCoverage(
-            List<SegmentQueryTask.SegmentQueryResult> segmentResults,
-            int segmentsTimedOut,
-            int segmentsExcluded) {
-
-        long totalSegments = catalog.size();
-        long activeSegments = 0;
-        long indexingSegments = 0;
-        long warmingSegments = 0;
-        long compactingSegments = 0;
-        long tombstonedSegments = 0;
-        long totalTailScanEntries = 0;
-        int segmentsSearched = 0;
-        int segmentsWithErrors = 0;
-
-        // Count segment states
-        for (SegmentCatalog.SegmentMetadata metadata : catalog.getAll().values()) {
-            switch (metadata.getLifecycleState()) {
-                case ACTIVE -> activeSegments++;
-                case INDEXING -> indexingSegments++;
-                case WARMING -> warmingSegments++;
-                case COMPACTING -> compactingSegments++;
-                case TOMBSTONED -> tombstonedSegments++;
-                default -> {}
-            }
-        }
-
-        // Count search results
-        for (SegmentQueryTask.SegmentQueryResult result : segmentResults) {
-            if (result.success()) {
-                segmentsSearched++;
-                totalTailScanEntries += result.tailScanEntries();
-            } else {
-                segmentsWithErrors++;
-            }
-        }
-
-        return IndexCoverage.builder()
-            .totalSegments(totalSegments)
-            .activeSegments(activeSegments)
-            .indexingSegments(indexingSegments)
-            .warmingSegments(warmingSegments)
-            .compactingSegments(compactingSegments)
-            .tombstonedSegments(tombstonedSegments)
-            .tailScanEntries(totalTailScanEntries)
-            .segmentsSearched(segmentsSearched)
-            .segmentsExcluded(segmentsExcluded)
-            .segmentsWithErrors(segmentsWithErrors)
-            .segmentsTimedOut(segmentsTimedOut)
-            .computeCoverage()
-            .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
-            .build();
-    }
-
-    /**
-     * Creates an error response for failed queries.
-     */
-    private QueryResponse createErrorResponse(QueryOptions options, long durationNanos) {
-        IndexCoverage coverage = IndexCoverage.builder()
-            .degraded(true)
-            .computeCoverage()
-            .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
-            .build();
-
-        return new QueryResponse(
-            List.of(),
-            coverage,
-            durationNanos / 1_000_000
-        );
-    }
-
-    /**
-     * Dispatches a query to all queryable segments and returns raw segment results.
-     *
-     * <p>This method is similar to {@link #dispatch(float[], QueryOptions, DistanceFunction)}
-     * but returns the raw segment results alongside the merged results. This is useful
-     * for pipelines that need access to per-segment results for subsequent stages
-     * (e.g., reranking, LLM scoring).</p>
-     *
-     * <p>Every queryable segment is searched whole. Narrowing one to a pre-filter's candidates is
-     * {@link #dispatchToSpecificSegments(List, float[], QueryOptions, DistanceFunction)}, which
-     * takes the set per segment: HNSW node ids are dense and start at zero in every graph, so a
-     * set built against one segment names entirely different vectors in the next.</p>
-     *
-     * @param queryVector The query vector
-     * @param options Query options
-     * @param distanceFunction The distance function
-     * @return DispatchResult with the raw per-segment results and coverage
-     */
-    public DispatchResult dispatchRaw(
-            float[] queryVector,
-            QueryOptions options,
-            DistanceFunction distanceFunction) {
-
-        Objects.requireNonNull(queryVector, "Query vector cannot be null");
-        Objects.requireNonNull(options, "Query options cannot be null");
-        Objects.requireNonNull(distanceFunction, "Distance function cannot be null");
-
-        long startTime = System.nanoTime();
-
-        // Get queryable segments
-        SegmentSelection selection = getQueryableSegments(options.includePartialSegments());
-        List<SegmentInfo> queryableSegments = selection.searchable();
-
-        if (queryableSegments.isEmpty()) {
-            LOGGER.debug("No queryable segments available");
-            IndexCoverage coverage = IndexCoverage.builder()
-                .totalSegments(catalog.size())
-                .segmentsExcluded(selection.excluded())
-                .computeCoverage()
-                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
-                .build();
-            return new DispatchResult(
-                List.of(),
-                coverage,
-                0
-            );
-        }
-
-        LOGGER.trace("Dispatching query to {} segments", queryableSegments.size());
-
-        List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks = new ArrayList<>();
-        for (SegmentInfo info : queryableSegments) {
-            SegmentQueryTask task = new SegmentQueryTask(
-                info.segmentId(),
-                info.segment(),
-                info.graph(),
-                queryVector,
-                options.topK(),
-                options.oversamplingFactor(),
-                distanceFunction,
-                info.lshCandidates()
-            );
-            tasks.add(task);
-        }
-
-        // Dispatch tasks in parallel with timeout
-        List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
-        List<Future<SegmentQueryTask.SegmentQueryResult>> futures;
-
-        try {
-            futures = executor.invokeAll(tasks, options.timeout().toMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            LOGGER.warn("Query dispatch interrupted");
-            IndexCoverage coverage = IndexCoverage.builder()
-                .totalSegments(catalog.size())
-                .segmentsExcluded(selection.excluded())
-                .degraded(true)
-                .computeCoverage()
-                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
-                .build();
-            return new DispatchResult(
-                List.of(),
-                coverage,
-                (System.nanoTime() - startTime) / 1_000_000
-            );
-        }
-
-        // Collect results
-        int segmentsTimedOut = 0;
-        for (int i = 0; i < futures.size(); i++) {
-            Future<SegmentQueryTask.SegmentQueryResult> future = futures.get(i);
-            SegmentInfo segmentInfo = queryableSegments.get(i);
-
-            try {
-                if (future.isDone()) {
-                    SegmentQueryTask.SegmentQueryResult result = future.get();
-                    segmentResults.add(result);
-                } else {
-                    // Timeout - create error result
-                    segmentsTimedOut++;
-                    segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                        segmentInfo.segmentId,
-                        List.of(),
-                        0,
-                        options.timeout().toMillis(),
-                        false,
-                        "Timeout"
-                    ));
-                    future.cancel(true);
-                }
-            } catch (ExecutionException e) {
-                LOGGER.warn("Segment {} query failed: {}", segmentInfo.segmentId, e.getCause().getMessage());
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId,
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    e.getCause().getMessage()
-                ));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                segmentsTimedOut++;
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId,
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    "Interrupted"
-                ));
-            } catch (java.util.concurrent.CancellationException e) {
-                // Future was cancelled due to invokeAll timeout
-                segmentsTimedOut++;
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId,
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    "Timeout"
-                ));
-            }
-        }
-
-        // Build coverage
-        IndexCoverage coverage = buildCoverage(segmentResults, segmentsTimedOut, selection.excluded());
-
-        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-
-        LOGGER.trace("Query completed: {} segments, {}ms, coverage={}",
-            segmentResults.size(), durationMs, coverage.estimatedCorpusCoverage());
-
-        return new DispatchResult(
-            segmentResults,
-            coverage,
-            durationMs
-        );
-    }
-
-    /**
-     * Result of a parallel dispatch operation.
+     * What one fan-out observed.
      *
      * <p>Per-segment results, unmerged. Merging belongs to the caller, because only the caller
      * knows what scale the scores have to end up on: {@link excalibur.query.pipeline.QueryPipeline}
      * normalises each distance to [0, 1] before it ranks or filters, and a merge performed here
      * would either be discarded or, worse, applied a second time on the raw distance scale.</p>
+     *
+     * <p>Coverage is not reported here either, and for the same reason. Corpus coverage is a
+     * statement about the whole catalog against the segments a query was allowed to read, and the
+     * dispatcher has seen only the list it was handed - a coverage figure computed from that would
+     * describe the caller's selection back to it as though it were the index. The two facts the
+     * dispatcher alone knows are below; the caller builds the census.</p>
+     *
+     * @param segmentResults   One result per segment searched, in the order dispatched
+     * @param tailScanEntries  Write-log entries the searches scanned beyond the graphs
+     * @param segmentsTimedOut How many segments did not answer within the query's timeout
+     * @param durationMs       Wall-clock time the fan-out took
      */
-    public static final class DispatchResult {
-        private final List<SegmentQueryTask.SegmentQueryResult> segmentResults;
-        private final IndexCoverage coverage;
-        private final long durationMs;
+    public record DispatchResult(
+            List<SegmentQueryTask.SegmentQueryResult> segmentResults,
+            long tailScanEntries,
+            int segmentsTimedOut,
+            long durationMs) {
 
-        public DispatchResult(
-                List<SegmentQueryTask.SegmentQueryResult> segmentResults,
-                IndexCoverage coverage,
-                long durationMs) {
-            this.segmentResults = segmentResults != null
-                ? List.copyOf(segmentResults)
-                : List.of();
-            this.coverage = coverage;
-            this.durationMs = durationMs;
-        }
-
-        /**
-         * Returns the raw results from each segment.
-         */
-        public List<SegmentQueryTask.SegmentQueryResult> segmentResults() {
-            return segmentResults;
-        }
-
-        /**
-         * Returns the index coverage information.
-         */
-        public IndexCoverage coverage() {
-            return coverage;
-        }
-
-        /**
-         * Returns the total duration in milliseconds.
-         */
-        public long durationMs() {
-            return durationMs;
+        public DispatchResult {
+            segmentResults = segmentResults == null ? List.of() : List.copyOf(segmentResults);
         }
     }
 
@@ -643,13 +170,11 @@ public class ParallelQueryDispatcher {
     /**
      * Dispatches a query to specific segments and returns raw segment results.
      *
-     * <p>This method is designed for use by {@link excalibur.query.pipeline.QueryPipeline}
-     * when it has already filtered segments through earlier pipeline stages
-     * (visibility tracking, Cuckoo filter cascade, LSH pre-filtering).</p>
-     *
-     * <p>Unlike {@link #dispatchRaw(float[], QueryOptions, DistanceFunction)},
-     * this method accepts specific segments to search rather than determining
-     * queryable segments automatically.</p>
+     * <p>The dispatcher fans out; it does not decide what to fan out to. Which segments a query
+     * may read is settled by {@link excalibur.query.pipeline.QueryPipeline}'s earlier stages -
+     * visibility, lifecycle state, the Cuckoo filter cascade, LSH pre-filtering - and arrives
+     * here already chosen, so there is one answer to "was this segment searched" rather than two
+     * that can drift apart.</p>
      *
      * @param segmentsToSearch The segments to search, each with the graph to search it in and the
      *                         node ids a pre-filter narrowed it to, or a null set for a whole-graph
@@ -674,15 +199,7 @@ public class ParallelQueryDispatcher {
 
         if (segmentsToSearch.isEmpty()) {
             LOGGER.debug("No segments to search");
-            IndexCoverage coverage = IndexCoverage.builder()
-                .computeCoverage()
-                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
-                .build();
-            return new DispatchResult(
-                List.of(),
-                coverage,
-                0
-            );
+            return new DispatchResult(List.of(), 0L, 0, 0L);
         }
 
         LOGGER.trace("Dispatching query to {} specific segments", segmentsToSearch.size());
@@ -712,16 +229,12 @@ public class ParallelQueryDispatcher {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOGGER.warn("Query dispatch interrupted");
-            IndexCoverage coverage = IndexCoverage.builder()
-                .degraded(true)
-                .computeCoverage()
-                .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
-                .build();
+            // Every segment is reported as unanswered rather than as searched-and-empty: an
+            // interrupted fan-out has no evidence about the corpus, and saying nothing matched
+            // would be the one reading the caller cannot tell from a real empty result.
             return new DispatchResult(
-                List.of(),
-                coverage,
-                (System.nanoTime() - startTime) / 1_000_000
-            );
+                List.of(), 0L, segmentsToSearch.size(),
+                (System.nanoTime() - startTime) / 1_000_000);
         }
 
         // Collect results
@@ -782,55 +295,19 @@ public class ParallelQueryDispatcher {
             }
         }
 
-        // Build coverage
-        IndexCoverage coverage = buildCoverageForSpecificSegments(segmentResults, segmentsTimedOut);
-
-        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-
-        LOGGER.trace("Query completed: {} segments, {}ms, coverage={}",
-            segmentResults.size(), durationMs, coverage.estimatedCorpusCoverage());
-
-        return new DispatchResult(
-            segmentResults,
-            coverage,
-            durationMs
-        );
-    }
-
-    /**
-     * Builds index coverage from segment results for specific segment searches.
-     *
-     * <p>Unlike {@link #buildCoverage(List, int, int)}, this method doesn't count
-     * segments by lifecycle state since we're only searching specific segments.</p>
-     */
-    private IndexCoverage buildCoverageForSpecificSegments(
-            List<SegmentQueryTask.SegmentQueryResult> segmentResults,
-            int segmentsTimedOut) {
-
-        long totalSegments = catalog.size();
-        long totalTailScanEntries = 0;
-        int segmentsSearched = 0;
-        int segmentsWithErrors = 0;
-
-        // Count search results
+        long tailScanEntries = 0;
         for (SegmentQueryTask.SegmentQueryResult result : segmentResults) {
             if (result.success()) {
-                segmentsSearched++;
-                totalTailScanEntries += result.tailScanEntries();
-            } else {
-                segmentsWithErrors++;
+                tailScanEntries += result.tailScanEntries();
             }
         }
 
-        return IndexCoverage.builder()
-            .totalSegments(totalSegments)
-            .tailScanEntries(totalTailScanEntries)
-            .segmentsSearched(segmentsSearched)
-            .segmentsWithErrors(segmentsWithErrors)
-            .segmentsTimedOut(segmentsTimedOut)
-            .computeCoverage()
-            .computeDegraded(DEFAULT_COVERAGE_THRESHOLD)
-            .build();
+        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+
+        LOGGER.trace("Query completed: {} segments, {}ms, {} timed out",
+            segmentResults.size(), durationMs, segmentsTimedOut);
+
+        return new DispatchResult(segmentResults, tailScanEntries, segmentsTimedOut, durationMs);
     }
 
     /**
