@@ -84,6 +84,26 @@ class ConfigGraphTest {
         }
 
         @Test
+        @DisplayName("the namespace tiers are read as lists, trimmed and without blanks")
+        void namespaceTiersAreLists() {
+            Config.Graph settings = graph(Map.of(
+                "excalibur.graph.hot-namespaces", " vip , , flagship ",
+                "excalibur.graph.cold-namespaces", "bulk-import,archive,"));
+
+            assertThat(settings.getHotNamespaces()).containsExactly("vip", "flagship");
+            assertThat(settings.getColdNamespaces()).containsExactly("bulk-import", "archive");
+        }
+
+        @Test
+        @DisplayName("no namespace is hot or cold unless it is named")
+        void namespaceTiersDefaultToEmpty() {
+            // Empty means the shipped default: the shared index pinned, everything else warm and
+            // evicted by recency. A deployment gets a different policy only by asking for one.
+            assertThat(graph(Map.of()).getHotNamespaces()).isEmpty();
+            assertThat(graph(Map.of()).getColdNamespaces()).isEmpty();
+        }
+
+        @Test
         @DisplayName("the boundary values of a threshold are accepted")
         void thresholdBoundaries() {
             assertThat(graph(Map.of("excalibur.graph.min-score", "0.0")).getMinScore()).isZero();
@@ -153,6 +173,33 @@ class ConfigGraphTest {
             assertThat(graph(props)).isNotEqualTo(graph(Map.of("excalibur.graph.top-k", "8")));
             assertThat(graph(props)).isNotEqualTo(null).isNotEqualTo("not a config");
             assertThat(graph(props)).isEqualTo(graph(props));
+        }
+
+        @Test
+        @DisplayName("every configured key is part of the section's identity")
+        void equalityCoversEveryKey() {
+            // Equality is what tells a caller two configurations are the same configuration.
+            // A field left out of it says "identical" about sections that would run differently.
+            Map<String, String> base = Map.of("excalibur.graph.top-k", "7");
+            Map<String, String> keys = Map.of(
+                "excalibur.graph.path", "/srv/graph",
+                "excalibur.graph.extraction-enabled", "true",
+                "excalibur.graph.extractor-version", "3",
+                "excalibur.graph.entity-vectors-enabled", "false",
+                "excalibur.graph.single-valued-relations", "employed-by",
+                "excalibur.graph.hot-namespaces", "vip",
+                "excalibur.graph.cold-namespaces", "bulk-import",
+                "excalibur.graph.max-open-namespaces", "32",
+                "excalibur.graph.erasure-tombstone-ratio", "0.4",
+                "excalibur.graph.erasure-max-latency-seconds", "600");
+
+            keys.forEach((key, value) -> {
+                Map<String, String> changed = new HashMap<>(base);
+                changed.put(key, value);
+                assertThat(graph(changed))
+                    .as("%s must change the section's identity", key)
+                    .isNotEqualTo(graph(base));
+            });
         }
 
         @Test

@@ -326,6 +326,8 @@ spell them this way:
 | `excalibur.graph.entity-vectors-enabled` | true | Embed each entity's text at build time, so retrieval can rerank against real vectors |
 | `excalibur.graph.single-valued-relations` | *(empty)* | Comma-separated relations that hold one value at a time, whose new values close the previous interval |
 | `excalibur.graph.max-open-namespaces` | 16 | Graphs held open at once before the least recently used is evicted |
+| `excalibur.graph.hot-namespaces` | *(empty)* | Comma-separated namespaces never evicted, alongside the shared index. Each one spends a slot permanently |
+| `excalibur.graph.cold-namespaces` | *(empty)* | Comma-separated namespaces evicted before any other, whatever their recency — for a bulk import or an idle tenant. Naming one in both lists refuses to start |
 | `excalibur.graph.erasure-tombstone-ratio` | 0.2 | Tombstoned fraction of the store at which a compaction becomes worthwhile |
 | `excalibur.graph.erasure-max-latency-seconds` | 3600 | Longest an erasure obligation waits before a compaction runs regardless |
 | `excalibur.graph.top-k` | 10 | Documents each retrieval signal contributes before fusion |
@@ -661,6 +663,15 @@ A served store is thirteen memory mappings, and a process has a finite number of
 `excalibur.graph.max-open-namespaces` graphs stay open at once and the least recently used is
 evicted to make room. Every request holds a lease for its duration: a namespace being read is passed
 over by eviction, and an eviction that lands on one is deferred until the last reader is done.
+
+Recency alone is the wrong rule when namespaces are not interchangeable: the shared index is read by
+nearly every query and costs seconds to reopen, so it is pinned. Two keys extend that judgement to
+named tenants — `excalibur.graph.hot-namespaces` pins them alongside the shared one, and
+`excalibur.graph.cold-namespaces` marks the ones to evict first whatever their recency, which is
+what a bulk import or a tenant known to be idle should be. Both are empty by default, so an
+unconfigured node evicts by recency and nothing else. A name in both lists, or one that is not a
+valid namespace, refuses to start rather than leaving a policy that reads as configured and does
+nothing.
 
 A namespace comes into being when something publishes to it — a build, or an erasure obligation
 recorded against it. `/v1/graph/query` never creates one: opening a namespace writes its staging

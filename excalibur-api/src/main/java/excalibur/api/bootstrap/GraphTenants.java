@@ -4,15 +4,18 @@ import io.excalibur.config.Config;
 import io.excalibur.tenancy.MappingBudget;
 import io.excalibur.tenancy.NamespaceId;
 import io.excalibur.tenancy.NamespaceRegistry;
+import io.excalibur.tenancy.TieringPolicy;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Every namespace's graph, bounded by what the kernel will let this process map.
@@ -74,14 +77,40 @@ public final class GraphTenants implements AutoCloseable {
         // under the registry's lock on the first request of every namespace.
         java.nio.file.Files.createDirectories(root);
 
+        TieringPolicy tiering = TieringPolicy.declared(
+            namespaces(config.graph().getHotNamespaces(), "excalibur.graph.hot-namespaces"),
+            namespaces(config.graph().getColdNamespaces(), "excalibur.graph.cold-namespaces"));
+
         this.registry = new NamespaceRegistry<>(
             root,
             (id, directory) -> GraphTenant.open(id, directory.resolve("graph"), config),
             GraphTenant::cost,
             budget,
+            tiering,
             maxOpen);
         this.sharedLease = registry.borrow(NamespaceId.SHARED);
         LOGGER.info("graph tenants rooted at {}: at most {} open, {}", root, maxOpen, budget);
+    }
+
+    /**
+     * Reads configured namespace names, refusing rather than dropping anything unusable.
+     *
+     * <p>A name that is not a valid identifier cannot be the namespace it was meant to name, and
+     * skipping it would leave a deployment with a tiering policy that reads as configured and
+     * silently does nothing. The shared namespace is rejected here too, by
+     * {@link NamespaceId#of(String)}: it is pinned regardless, and naming it says otherwise.</p>
+     */
+    private static Set<NamespaceId> namespaces(List<String> names, String key) {
+        Set<NamespaceId> ids = new LinkedHashSet<>(names.size());
+        for (String name : names) {
+            try {
+                ids.add(NamespaceId.of(name));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(
+                    key + " cannot name '" + name + "': " + e.getMessage(), e);
+            }
+        }
+        return ids;
     }
 
     /**

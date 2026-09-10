@@ -1,5 +1,6 @@
 package io.excalibur.config;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -1128,8 +1129,18 @@ public final class Config {
         private final List<String> singleValuedRelations;
         private final boolean entityVectorsEnabled;
         private final int maxOpenNamespaces;
+        private final List<String> hotNamespaces;
+        private final List<String> coldNamespaces;
         private final double erasureTombstoneRatio;
         private final long erasureMaxLatencySeconds;
+
+        /** A comma-separated key read as a list, trimmed, with empty entries dropped. */
+        private static List<String> parseList(Map<String, String> props, String key) {
+            return Arrays.stream(PropertyParser.parseString(props, key, "").split(","))
+                .map(String::trim)
+                .filter(value -> !value.isEmpty())
+                .toList();
+        }
 
         /**
          * Creates a Graph config from properties.
@@ -1167,13 +1178,14 @@ public final class Config {
             // Relations that hold one value at a time. Empty by default, because closing an
             // interval destroys information: a relation wrongly left multi-valued returns a stale
             // extra answer, while one wrongly superseded silently deletes a true fact.
-            this.singleValuedRelations = List.of(
-                PropertyParser.parseString(props, "excalibur.graph.single-valued-relations", "")
-                    .split(","))
-                .stream()
-                .map(String::trim)
-                .filter(value -> !value.isEmpty())
-                .toList();
+            this.singleValuedRelations =
+                parseList(props, "excalibur.graph.single-valued-relations");
+            // Which namespaces resist eviction and which give way first. Both empty by default,
+            // which is the shipped policy: the shared index pinned, everything else evicted by
+            // recency. The names are validated where they become namespace identifiers, not
+            // here - this section does not depend on the tenancy module.
+            this.hotNamespaces = parseList(props, "excalibur.graph.hot-namespaces");
+            this.coldNamespaces = parseList(props, "excalibur.graph.cold-namespaces");
             this.minScore = requireInUnitRange(PropertyParser.parseDouble(
                 props, "excalibur.graph.min-score", DEFAULT_MIN_SCORE), "min-score");
             this.minSeparation = requireInUnitRange(PropertyParser.parseDouble(
@@ -1250,9 +1262,27 @@ public final class Config {
             return topK;
         }
 
-        /** @return Lucene RAM buffer in megabytes */
+        /** @return relations that hold one value at a time, whose new values close the old */
         public List<String> getSingleValuedRelations() {
             return singleValuedRelations;
+        }
+
+        /**
+         * Namespaces pinned against eviction, alongside the shared index.
+         *
+         * @return Their names, in the order configured; empty by default
+         */
+        public List<String> getHotNamespaces() {
+            return hotNamespaces;
+        }
+
+        /**
+         * Namespaces evicted before any other, whatever their recency.
+         *
+         * @return Their names, in the order configured; empty by default
+         */
+        public List<String> getColdNamespaces() {
+            return coldNamespaces;
         }
 
         /**
@@ -1340,13 +1370,25 @@ public final class Config {
                 && contextTokenBudget == other.contextTokenBudget
                 && topK == other.topK
                 && Double.compare(ramBufferMb, other.ramBufferMb) == 0
+                && extractionEnabled == other.extractionEnabled
+                && extractorVersion == other.extractorVersion
+                && entityVectorsEnabled == other.entityVectorsEnabled
+                && maxOpenNamespaces == other.maxOpenNamespaces
+                && Double.compare(erasureTombstoneRatio, other.erasureTombstoneRatio) == 0
+                && erasureMaxLatencySeconds == other.erasureMaxLatencySeconds
+                && Objects.equals(singleValuedRelations, other.singleValuedRelations)
+                && Objects.equals(hotNamespaces, other.hotNamespaces)
+                && Objects.equals(coldNamespaces, other.coldNamespaces)
                 && Objects.equals(path, other.path);
         }
 
         @Override
         public int hashCode() {
             return Objects.hash(path, minScore, minSeparation, minMeanConfidence,
-                maxAmbiguousCandidates, contextTokenBudget, topK, ramBufferMb);
+                maxAmbiguousCandidates, contextTokenBudget, topK, ramBufferMb,
+                extractionEnabled, extractorVersion, entityVectorsEnabled, maxOpenNamespaces,
+                erasureTombstoneRatio, erasureMaxLatencySeconds, singleValuedRelations,
+                hotNamespaces, coldNamespaces);
         }
     }
 }

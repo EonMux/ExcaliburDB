@@ -413,13 +413,71 @@ class NamespaceRegistryTest {
         }
 
         @Test
-        @DisplayName("pinning keeps the shared namespace hot alongside the named ones")
-        void pinningIncludesShared() {
-            TieringPolicy policy = TieringPolicy.pinning(Set.of(NamespaceId.of("vip")));
+        @DisplayName("declared keeps the shared namespace hot alongside the named ones")
+        void declaredIncludesShared() {
+            TieringPolicy policy = TieringPolicy.declared(Set.of(NamespaceId.of("vip")), Set.of());
 
             assertThat(policy.tierOf(NamespaceId.of("vip"))).isEqualTo(NamespaceTier.HOT);
             assertThat(policy.tierOf(NamespaceId.SHARED)).isEqualTo(NamespaceTier.HOT);
             assertThat(policy.tierOf(NamespaceId.of("other"))).isEqualTo(NamespaceTier.WARM);
+        }
+
+        @Test
+        @DisplayName("declared is how a namespace becomes cold")
+        void declaredMakesNamespacesCold() {
+            // Without this factory nothing a deployment can configure ever returns COLD, and the
+            // registry's evict-cold-first branch is unreachable outside its own tests.
+            TieringPolicy policy = TieringPolicy.declared(
+                Set.of(NamespaceId.of("vip")),
+                Set.of(NamespaceId.of("bulk-import"), NamespaceId.of("archive")));
+
+            assertThat(policy.tierOf(NamespaceId.of("bulk-import"))).isEqualTo(NamespaceTier.COLD);
+            assertThat(policy.tierOf(NamespaceId.of("archive"))).isEqualTo(NamespaceTier.COLD);
+            assertThat(policy.tierOf(NamespaceId.of("vip"))).isEqualTo(NamespaceTier.HOT);
+            assertThat(policy.tierOf(NamespaceId.of("other"))).isEqualTo(NamespaceTier.WARM);
+        }
+
+        @Test
+        @DisplayName("declared refuses a namespace named both hot and cold")
+        void declaredRefusesContradiction() {
+            // Picking a winner would make the effective tier depend on which set was consulted
+            // first, which is not something an operator can read off their configuration.
+            NamespaceId both = NamespaceId.of("confused");
+
+            assertThatThrownBy(() -> TieringPolicy.declared(Set.of(both), Set.of(both)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("confused");
+        }
+
+        @Test
+        @DisplayName("declared with nothing named is the default policy")
+        void declaredEmptyMatchesTheDefault() {
+            TieringPolicy policy = TieringPolicy.declared(Set.of(), Set.of());
+
+            assertThat(policy.tierOf(NamespaceId.SHARED)).isEqualTo(NamespaceTier.HOT);
+            assertThat(policy.tierOf(NamespaceId.of("tenant-1"))).isEqualTo(NamespaceTier.WARM);
+        }
+
+        @Test
+        @DisplayName("a cold namespace named by declared is evicted before an older warm one")
+        void aDeclaredColdNamespaceGoesFirst(@TempDir Path root) {
+            // The end of the chain: a tier a deployment can actually configure reaches
+            // chooseVictim, rather than only a lambda written inside this test class.
+            NamespaceId cold = NamespaceId.of("bulk-import");
+
+            try (NamespaceRegistry<FakeIndex> registry = registry(
+                    root, 2, TieringPolicy.declared(Set.of(), Set.of(cold)),
+                    MappingBudget.of(1000, 1.0))) {
+
+                FakeIndex warm = registry.get(NamespaceId.of("a"));
+                FakeIndex coldIndex = registry.get(cold);
+                registry.get(NamespaceId.of("c"));
+
+                assertThat(coldIndex.closed).isTrue();
+                assertThat(warm.closed)
+                    .as("the warm namespace is older and survives anyway")
+                    .isFalse();
+            }
         }
 
         @Test

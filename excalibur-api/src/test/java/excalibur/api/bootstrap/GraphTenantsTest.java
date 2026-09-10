@@ -52,6 +52,13 @@ class GraphTenantsTest {
         return new GraphTenants(root, config(), MappingBudget.detect(), maxOpen);
     }
 
+    private static GraphTenants tenants(Path root, int maxOpen, Map<String, String> extra)
+            throws IOException {
+        Map<String, String> props = new HashMap<>(Map.of("excalibur.graph.ram-buffer-mb", "4.0"));
+        props.putAll(extra);
+        return new GraphTenants(root, new Config(props), MappingBudget.detect(), maxOpen);
+    }
+
     @Test
     @DisplayName("a node that never sends the header uses one shared namespace")
     void theDefaultIsASingleSharedNamespace(@TempDir Path tempDir) throws IOException {
@@ -176,6 +183,64 @@ class GraphTenantsTest {
             assertThat(staging.stagedCount()).isEqualTo(1);
             assertThat(tenants.openNamespaces()).contains(NamespaceId.SHARED);
         }
+    }
+
+    @Test
+    @DisplayName("a namespace configured cold is evicted before a warm one that is older")
+    void aColdNamespaceIsEvictedFirst(@TempDir Path tempDir) throws IOException {
+        // The tier a deployment declares has to reach the registry that acts on it. Without the
+        // wiring nothing this node can be configured with is ever anything but hot or warm, and
+        // "evicted first" is a promise the configuration cannot keep.
+        try (GraphTenants tenants = tenants(tempDir, 3,
+                Map.of("excalibur.graph.cold-namespaces", "bulk-import"))) {
+
+            tenants.borrow(NamespaceId.of("steady")).close();
+            tenants.borrow(NamespaceId.of("bulk-import")).close();
+            tenants.borrow(NamespaceId.of("late-arrival")).close();
+
+            assertThat(tenants.openNamespaces())
+                .as("the bulk import gives way despite being the more recently used")
+                .containsExactlyInAnyOrder(
+                    NamespaceId.SHARED, NamespaceId.of("steady"), NamespaceId.of("late-arrival"));
+        }
+    }
+
+    @Test
+    @DisplayName("a namespace configured hot outlives the bound, like the shared one")
+    void aHotNamespaceIsPinned(@TempDir Path tempDir) throws IOException {
+        try (GraphTenants tenants = tenants(tempDir, 3,
+                Map.of("excalibur.graph.hot-namespaces", "vip"))) {
+
+            tenants.borrow(NamespaceId.of("vip")).close();
+            for (int i = 0; i < 6; i++) {
+                tenants.borrow(NamespaceId.of("tenant-" + i)).close();
+            }
+
+            assertThat(tenants.openNamespaces())
+                .as("a pinned tenant is not evicted however long it has been idle")
+                .contains(NamespaceId.of("vip"));
+        }
+    }
+
+    @Test
+    @DisplayName("a namespace named both hot and cold stops the node rather than picking one")
+    void aContradictoryTierIsRefused(@TempDir Path tempDir) {
+        assertThatThrownBy(() -> tenants(tempDir, 3, Map.of(
+                "excalibur.graph.hot-namespaces", "confused",
+                "excalibur.graph.cold-namespaces", "confused")))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("confused");
+    }
+
+    @Test
+    @DisplayName("an unusable namespace name in the tiering configuration is refused")
+    void anInvalidTieredNamespaceIsRefused(@TempDir Path tempDir) {
+        // Silently dropping it would leave the operator with a policy that reads as configured
+        // and does nothing.
+        assertThatThrownBy(() -> tenants(tempDir, 3,
+                Map.of("excalibur.graph.cold-namespaces", "Not A Namespace")))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("Not A Namespace");
     }
 
     @Test
