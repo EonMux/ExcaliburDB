@@ -159,6 +159,71 @@ class GraphQueryEndpointTest {
         assertThat(parse(call("GET", "")).get("error").isTextual()).isTrue();
     }
 
+    @Nested
+    @DisplayName("Answering at an instant the caller names")
+    class AsOf {
+
+        @Test
+        @DisplayName("an ISO date is accepted and echoed back")
+        void anIsoDateIsAccepted() throws IOException {
+            // Valid time was reachable only through date words the classifier happened to
+            // recognise, so a client that knew the instant it wanted had to phrase a question
+            // around the heuristic and could not tell which instant it got.
+            var node = parse(call("POST", "{\"query\": \"Who did Ada Lovelace collaborate with?\","
+                + " \"as_of\": \"1843-01-01\"}"));
+
+            assertThat(node.get("status").asText()).isEqualTo("answered");
+            assertThat(node.get("as_of").asText()).isEqualTo("1843-01-01");
+        }
+
+        @Test
+        @DisplayName("an ISO instant is accepted, at the UTC day it falls in")
+        void anIsoInstantIsAccepted() throws IOException {
+            var node = parse(call("POST", "{\"query\": \"Who did Ada Lovelace collaborate with?\","
+                + " \"as_of\": \"1843-01-01T18:30:00Z\"}"));
+
+            assertThat(node.get("status").asText()).isEqualTo("answered");
+            assertThat(node.get("as_of").asText()).isEqualTo("1843-01-01");
+        }
+
+        @Test
+        @DisplayName("\"all\" asks for the whole history rather than a snapshot of it")
+        void allAsksForTheWholeHistory() throws IOException {
+            var node = parse(call("POST", "{\"query\": \"Who did Ada Lovelace collaborate with?\","
+                + " \"as_of\": \"all\"}"));
+
+            assertThat(node.get("status").asText()).isEqualTo("answered");
+            assertThat(node.get("as_of").asText()).isEqualTo("all");
+        }
+
+        @Test
+        @DisplayName("a question with no as_of does not claim one")
+        void noAsOfIsNotReported() throws IOException {
+            var node = parse(call("POST",
+                "{\"query\": \"Who did Ada Lovelace collaborate with?\"}"));
+
+            assertThat(node.get("status").asText()).isEqualTo("answered");
+            assertThat(node.has("as_of"))
+                .as("a node that answered at now has not been asked for an instant")
+                .isFalse();
+        }
+
+        @Test
+        @DisplayName("something that is not a date is refused rather than ignored")
+        void nonsenseIsRefused() throws IOException {
+            for (String bad : new String[] {"yesterday", "1843", "2024-13-01", ""}) {
+                Response response = call("POST",
+                    "{\"query\": \"Who did Ada Lovelace collaborate with?\", \"as_of\": \""
+                        + bad + "\"}");
+
+                assertThat(response.status())
+                    .as("as_of: %s", bad)
+                    .isEqualTo(400);
+                assertThat(parse(response).get("error").asText()).contains("as_of");
+            }
+        }
+    }
+
     @Test
     @DisplayName("a quote in the question does not break the response body")
     void quotesAreEscaped() throws IOException {

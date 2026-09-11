@@ -9,6 +9,7 @@ import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.ResponseBody;
 import excalibur.api.protocol.RequestBody;
 import io.excalibur.core.trace.QueryTrace;
+import io.excalibur.graph.temporal.TemporalFilter;
 import io.excalibur.core.trace.Stage;
 import io.excalibur.planner.ConversationContext;
 import io.excalibur.planner.Grammar;
@@ -47,6 +48,9 @@ import java.util.Objects;
 public class GraphQueryEndpoint implements HttpHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GraphQueryEndpoint.class);
+
+    /** The {@code as_of} value asking for the whole history rather than a snapshot. */
+    private static final String ALL_HISTORY = "all";
 
     /** Longest question accepted, in characters, to bound the work one request can start. */
     private static final int MAX_QUESTION_LENGTH = 4096;
@@ -115,7 +119,7 @@ public class GraphQueryEndpoint implements HttpHandler {
         String body;
         try {
             body = RequestBody.read(exchange);
-        } catch (IllegalArgumentException e) {
+        } catch (RequestBody.TooLargeException e) {
             send(exchange, 413, "{\"error\":" + quoted(e.getMessage()) + "}");
             return;
         }
@@ -139,8 +143,17 @@ public class GraphQueryEndpoint implements HttpHandler {
         }
         ConversationContext context = contextFrom(mentions);
 
+        String asOfText = JsonText.string(body, "as_of");
+        TemporalFilter asOf;
+        try {
+            asOf = temporalFilterFrom(asOfText);
+        } catch (IllegalArgumentException e) {
+            send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
+            return;
+        }
+
         if (tenants != null) {
-            answerFromTenant(exchange, question, context);
+            answerFromTenant(exchange, question, context, asOf);
             return;
         }
 
@@ -157,8 +170,8 @@ public class GraphQueryEndpoint implements HttpHandler {
 
         try {
             QueryTrace trace = new QueryTrace();
-            GraphRagResult result = pipeline.get().answer(question, context, trace);
-            send(exchange, 200, render(result, trace));
+            GraphRagResult result = pipeline.get().answer(question, context, asOf, trace);
+            send(exchange, 200, render(result, trace, asOf));
         } catch (IllegalArgumentException e) {
             send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
         } catch (RuntimeException e) {
@@ -186,10 +199,12 @@ public class GraphQueryEndpoint implements HttpHandler {
      * @param exchange The exchange
      * @param question The question asked
      * @param context  The conversation the question is asked in
+     * @param asOf     The valid-time instant to answer at, or null for the question's own
      * @throws IOException if the response cannot be written
      */
     private void answerFromTenant(HttpExchange exchange, String question,
-                                  ConversationContext context) throws IOException {
+                                  ConversationContext context, TemporalFilter asOf)
+            throws IOException {
         io.excalibur.tenancy.NamespaceId namespace;
         try {
             namespace = excalibur.api.bootstrap.GraphTenants.namespaceOf(
@@ -227,8 +242,8 @@ public class GraphQueryEndpoint implements HttpHandler {
             }
 
             QueryTrace trace = new QueryTrace();
-            GraphRagResult result = pipeline.get().answer(question, context, trace);
-            send(exchange, 200, render(result, trace));
+            GraphRagResult result = pipeline.get().answer(question, context, asOf, trace);
+            send(exchange, 200, render(result, trace, asOf));
         } catch (IllegalArgumentException e) {
             send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
         } catch (RuntimeException e) {
@@ -306,7 +321,50 @@ public class GraphQueryEndpoint implements HttpHandler {
         return "\"" + JsonText.escape(value) + "\"";
     }
 
-    private String render(GraphRagResult result, QueryTrace trace) {
+    /**
+     * Reads the valid-time instant a request named.
+     *
+     * <p>Three spellings, because they are three different questions. An ISO date is a day; an
+     * ISO instant is the UTC day it falls in, since valid time is kept to day granularity; and
+     * {@code all} is the whole history rather than a snapshot of it, which is what a caller
+     * comparing a fact against the one it replaced wants. Anything else is refused rather than
+     * ignored: a request that asked for 2019 and silently got today is the failure this
+     * parameter exists to prevent.</p>
+     *
+     * @param text The raw {@code as_of} value, or null when the request carried none
+     * @return The filter, or null to leave the question's own dates in charge
+     * @throws IllegalArgumentException if the value is present and is not one of the three
+     */
+    static TemporalFilter temporalFilterFrom(String text) {
+        if (text == null) {
+            return null;
+        }
+        String trimmed = text.trim();
+        if (ALL_HISTORY.equalsIgnoreCase(trimmed)) {
+            return TemporalFilter.ALL;
+        }
+        try {
+            return TemporalFilter.asOf(java.time.LocalDate.parse(trimmed));
+        } catch (java.time.format.DateTimeParseException notADate) {
+            // Not a date; an instant is the other accepted spelling.
+        }
+        try {
+            return TemporalFilter.asOf(java.time.Instant.parse(trimmed));
+        } catch (java.time.format.DateTimeParseException notAnInstant) {
+            throw new IllegalArgumentException("'as_of' must be an ISO-8601 date (2019-03-01), "
+                + "an ISO-8601 instant (2019-03-01T00:00:00Z) or \"" + ALL_HISTORY
+                + "\" for the whole history");
+        }
+    }
+
+    /** How a resolved instant is reported back. */
+    private static String textOf(TemporalFilter asOf) {
+        return asOf.isUnbounded()
+            ? ALL_HISTORY
+            : java.time.LocalDate.ofEpochDay(asOf.asOfDays()).toString();
+    }
+
+    private String render(GraphRagResult result, QueryTrace trace, TemporalFilter asOf) {
         StringBuilder json = new StringBuilder("{");
 
         if (result.hasAnswer()) {
@@ -341,6 +399,11 @@ public class GraphQueryEndpoint implements HttpHandler {
         json.append(",\"plan\":").append(result.plan()
             .map(plan -> quoted(plan.getClass().getSimpleName().toLowerCase(Locale.ROOT)))
             .orElse("null"));
+        // Only when the caller named one. Echoing the instant a node happened to answer at
+        // when nobody asked for one would read as a promise that the value was honoured.
+        if (asOf != null) {
+            json.append(",\"as_of\":").append(quoted(textOf(asOf)));
+        }
         json.append(",\"timings_ms\":{");
         boolean first = true;
         for (Stage stage : Stage.values()) {

@@ -87,10 +87,10 @@ class CoreComponentsTest {
 
         // This value was read from System.getProperty rather than from the configuration, so it
         // answered to neither the properties file nor the environment while looking exactly like
-        // every key that does. Sizing it too small is not a degradation: the corpus level cannot
-        // record a term it has no room for, and a term it has no record of prunes every segment,
-        // so queries return nothing for documents that are sitting in storage. These tests pin
-        // the channel, because the failure it caused is invisible from the outside.
+        // every key that does. Sizing it too small costs every query a full scan, because a
+        // level that has refused a term stops being trusted to rule anything out. These tests
+        // pin the channel, because a capacity that does not reach the filter is invisible from
+        // the outside.
 
         @Test
         @DisplayName("comes from the properties, not from a system property")
@@ -118,10 +118,56 @@ class CoreComponentsTest {
         }
 
         @Test
+        @DisplayName("the per-segment level is sizeable too")
+        void readsTheConfiguredSegmentCapacity(@TempDir Path dataDir) {
+            // A segment level that runs out of room stops pruning that segment, which is safe
+            // and slow. Without a knob an operator watching cuckoo.saturatedSegments climb has
+            // nothing to turn: the corpus capacity does not size this level.
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.query.vector-dimensions", "128");
+            props.put(CoreComponents.KEY_SEGMENT_CAPACITY, "250000");
+
+            components = CoreComponents.create(
+                new Config(props), dataDir, HnswConfigFactory.withDefaults());
+
+            assertThat(components.hierarchicalFilter().segmentCapacity())
+                .isGreaterThanOrEqualTo(250_000);
+        }
+
+        @Test
+        @DisplayName("the per-segment level falls back to its default")
+        void defaultsTheSegmentCapacity(@TempDir Path dataDir) {
+            components = CoreComponents.create(
+                config(), dataDir, HnswConfigFactory.withDefaults());
+
+            assertThat(components.hierarchicalFilter().segmentCapacity())
+                .isGreaterThanOrEqualTo(CoreComponents.DEFAULT_SEGMENT_CAPACITY);
+        }
+
+        @Test
+        @DisplayName("a per-segment value that is not a positive number fails the start")
+        void refusesNonsenseSegmentCapacity(@TempDir Path dataDir) {
+            for (String bad : new String[] {"not-a-number", "0", "-1"}) {
+                Map<String, String> props = new HashMap<>();
+                props.put("excalibur.query.vector-dimensions", "128");
+                props.put(CoreComponents.KEY_SEGMENT_CAPACITY, bad);
+
+                assertThatThrownBy(() -> CoreComponents.create(
+                    new Config(props), dataDir, HnswConfigFactory.withDefaults()))
+                    .as("rejected value: %s", bad)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining(CoreComponents.KEY_SEGMENT_CAPACITY);
+            }
+
+            assertThat(dataDir).isEmptyDirectory();
+        }
+
+        @Test
         @DisplayName("a value that is not a positive number fails the start")
         void refusesNonsense(@TempDir Path dataDir) {
             // Falling back to the default would leave a node sized for a tenth of the corpus its
-            // operator asked for, answering nothing and reporting itself healthy.
+            // operator asked for, scanning every segment on every query and reporting nothing
+            // about why.
             for (String bad : new String[] {"not-a-number", "0", "-1"}) {
                 Map<String, String> props = new HashMap<>();
                 props.put("excalibur.query.vector-dimensions", "128");

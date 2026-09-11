@@ -55,6 +55,19 @@ class RequestBodyTest {
     }
 
     @Test
+    @DisplayName("the refusal is typed, so an endpoint can answer 413 rather than 400")
+    void refusalIsTyped() {
+        // Every endpoint validates its fields by throwing IllegalArgumentException, so a size
+        // failure that is only an IllegalArgumentException is indistinguishable from a bad
+        // field and gets answered 400 - telling the caller not to retry, when splitting the
+        // payload is exactly what they should do.
+        String body = "a".repeat(RequestBody.MAX_REQUEST_SIZE + 1);
+
+        assertThatThrownBy(() -> RequestBody.read(stream(body)))
+            .isInstanceOf(RequestBody.TooLargeException.class);
+    }
+
+    @Test
     @DisplayName("an endless body is refused after reading the limit, not after exhausting memory")
     void endlessBody() {
         // The chunked-encoding case: a stream that never reports end of input. The assertion is

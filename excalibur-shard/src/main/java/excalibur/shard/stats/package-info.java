@@ -1,8 +1,7 @@
 /**
  * Statistics and metrics collection for shard-level operations.
  *
- * <p>This package provides classes for tracking and exposing statistics
- * about shard operations, including unique term counting via HyperLogLog.</p>
+ * <p>Probabilistic cardinality estimation over a segment's terms.</p>
  *
  * <h2>Key Classes</h2>
  * <ul>
@@ -10,10 +9,8 @@
  * </ul>
  *
  * <h2>Configuration</h2>
- * <p>The precision of HyperLogLog can be configured via:</p>
- * <pre>
- * excalibur.shard.hyperloglog-precision=14
- * </pre>
+ * <p>None. Precision is a constructor argument, and no configuration key reaches it: the server
+ * does not build one of these. See the class javadoc for what is and is not wired.</p>
  *
  * @author ExcaliburDB
  * @since 5.0

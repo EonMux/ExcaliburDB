@@ -78,6 +78,34 @@ class IngestStatusEndpointTest {
     }
 
     @Test
+    @DisplayName("a run that has started supersedes the error from the run before it")
+    void testUpdateClearsAStaleError() {
+        // An operator reading last_error has no way to tell which run it belongs to. Left in
+        // place, an error from a run that has since been retried successfully reads as a
+        // failure of the run that just finished.
+        IngestStatusEndpoint.IngestionStatus status = new IngestStatusEndpoint.IngestionStatus("test-source");
+        status.setError("Connection failed");
+
+        status.update("crawling", 0.0, 0, 0);
+
+        assertNull(status.lastError());
+        assertEquals("crawling", status.state());
+    }
+
+    @Test
+    @DisplayName("an error reported once the run is over is kept")
+    void testIdleUpdateKeepsAnErrorFromThisRun() {
+        IngestStatusEndpoint.IngestionStatus status = new IngestStatusEndpoint.IngestionStatus("test-source");
+        status.update("crawling", 0.0, 0, 0);
+        status.update("idle", 1.0, 5, 0);
+
+        status.setError("3 of 8 documents were not ingested");
+
+        assertEquals("3 of 8 documents were not ingested", status.lastError());
+        assertEquals("idle", status.state());
+    }
+
+    @Test
     @DisplayName("IngestionStatus should reset correctly")
     void testIngestionStatusReset() {
         IngestStatusEndpoint.IngestionStatus status = new IngestStatusEndpoint.IngestionStatus("test-source");

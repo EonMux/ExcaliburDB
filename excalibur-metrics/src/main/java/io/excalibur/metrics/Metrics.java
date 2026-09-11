@@ -416,9 +416,11 @@ public final class Metrics {
     // ============================================
     // Ingestion Queue Depth
     // ============================================
-
-    // Note: queueDepth AtomicLong retained for backward compatibility but no longer used.
-    // IngestionQueueMBean now delegates to HNSW queue depth methods.
+    //
+    // One number under two names. Everything here reads the HNSW integration backlog, which
+    // is what ingestion backpressure is actually measured against; there is no separate
+    // ingestion queue to report. The IngestionQueue MBean is an alias of HnswQueueDepth and
+    // says so in its own description.
 
     /**
      * Gets the current ingestion queue depth.
@@ -444,10 +446,11 @@ public final class Metrics {
             "HNSW queue depth: " + depth,
             depth
         );
-        // Emit IngestionQueue notification for backward compatibility
+        // Emit the aliased notification too, so a listener on either name sees the change.
+        // The text names the queue it came from rather than the bean it arrived on.
         ingestionQueueMBeanInstance.getBroadcaster().sendNotification(
             MBeanNotificationBroadcaster.NotificationTypes.INGESTION_QUEUE,
-            "Ingestion queue depth: " + depth,
+            "HNSW integration backlog: " + depth,
             depth
         );
     }
@@ -902,16 +905,25 @@ public final class Metrics {
             new String[]{ MBeanNotificationBroadcaster.NotificationTypes.QUERY_LATENCY }
         );
 
+        private static final String PERCENTILE_CEILING =
+            " (ms); reads " + FixedBucketHistogram.RANGE_MS + " when it falls among samples "
+                + "past the histogram's range - see overflowCount";
+
         private static final MBeanAttributeInfo[] ATTRIBUTES = {
             new MBeanAttributeInfo("count", "long", "Total count", true, false, false),
-            new MBeanAttributeInfo("p50", "long", "50th percentile latency (ms)", true, false, false),
-            new MBeanAttributeInfo("p90", "long", "90th percentile latency (ms)", true, false, false),
-            new MBeanAttributeInfo("p95", "long", "95th percentile latency (ms)", true, false, false),
-            new MBeanAttributeInfo("p99", "long", "99th percentile latency (ms)", true, false, false),
-            new MBeanAttributeInfo("p99.9", "long", "99.9th percentile latency (ms)", true, false, false),
-            new MBeanAttributeInfo("average", "double", "Average latency (ms)", true, false, false),
+            new MBeanAttributeInfo("p50", "long", "50th percentile latency" + PERCENTILE_CEILING, true, false, false),
+            new MBeanAttributeInfo("p90", "long", "90th percentile latency" + PERCENTILE_CEILING, true, false, false),
+            new MBeanAttributeInfo("p95", "long", "95th percentile latency" + PERCENTILE_CEILING, true, false, false),
+            new MBeanAttributeInfo("p99", "long", "99th percentile latency" + PERCENTILE_CEILING, true, false, false),
+            new MBeanAttributeInfo("p99.9", "long", "99.9th percentile latency" + PERCENTILE_CEILING, true, false, false),
+            new MBeanAttributeInfo("average", "double", "Average latency (ms), counting samples past the range at their real size", true, false, false),
             new MBeanAttributeInfo("minimum", "long", "Minimum latency (ms)", true, false, false),
-            new MBeanAttributeInfo("maximum", "long", "Maximum latency (ms)", true, false, false)
+            new MBeanAttributeInfo("maximum", "long", "Maximum latency (ms), exact for samples past the range", true, false, false),
+            new MBeanAttributeInfo("overflowCount", "long",
+                "Queries slower than " + FixedBucketHistogram.RANGE_MS + "ms. The percentiles "
+                    + "cannot resolve these and report the range's edge for them, so a flat "
+                    + "percentile with this above zero is a ceiling, not a measurement",
+                true, false, false)
         };
 
         /**
@@ -957,7 +969,8 @@ public final class Metrics {
          * @return Set of attribute names
          */
         public Set<String> getAttributes() {
-            return Set.of("count", "p50", "p90", "p95", "p99", "p99.9", "average", "minimum", "maximum");
+            return Set.of("count", "p50", "p90", "p95", "p99", "p99.9", "average", "minimum",
+                "maximum", "overflowCount");
         }
 
         // ============================================
@@ -986,6 +999,8 @@ public final class Metrics {
                     return hist.getMinimum();
                 case "maximum":
                     return hist.getMaximum();
+                case "overflowCount":
+                    return hist.getOverflowCount();
                 default:
                     throw new AttributeNotFoundException("Unknown attribute: " + attribute);
             }
@@ -1207,8 +1222,16 @@ public final class Metrics {
     }
 
     /**
-     * JMX MBean for ingestion queue.
-     * Implements DynamicMBean and NotificationEmitter for JMX compliance.
+     * JMX MBean that is an alias of {@code io.excalibur:type=HnswQueueDepth}.
+     *
+     * <p>Every attribute here reads the same value that bean reads: the count of write-log
+     * entries the HNSW integration worker has not absorbed yet. There is no separate
+     * ingestion queue behind this name and nothing else writes the number.</p>
+     *
+     * <p>The name is kept because it is what existing dashboards poll, but the descriptions
+     * say what it measures. Two beans reporting one number under two names read as two
+     * subsystems in trouble at once, and send an operator looking for an ingestion queue that
+     * does not exist.</p>
      */
     public static class IngestionQueueMBean implements DynamicMBean, NotificationEmitter {
 
@@ -1219,11 +1242,21 @@ public final class Metrics {
         );
 
         private static final MBeanAttributeInfo[] ATTRIBUTES = {
-            new MBeanAttributeInfo("depth", "long", "Current queue depth", true, false, false),
-            new MBeanAttributeInfo("percent", "double", "Queue depth as percentage of limit", true, false, false),
-            new MBeanAttributeInfo("isUnderControl", "boolean", "Whether queue is under control (< 50%)", true, false, false),
-            new MBeanAttributeInfo("isCritical", "boolean", "Whether queue is critical (> 80%)", true, false, false),
-            new MBeanAttributeInfo("isFull", "boolean", "Whether queue is full (> 100%)", true, false, false)
+            new MBeanAttributeInfo("depth", "long",
+                "HNSW integration backlog: entries not yet absorbed into the graph. Same value "
+                    + "as HnswQueueDepth.depth", true, false, false),
+            new MBeanAttributeInfo("percent", "double",
+                "HNSW integration backlog as a percentage of its limit. Same value as "
+                    + "HnswQueueDepth.percent", true, false, false),
+            new MBeanAttributeInfo("isUnderControl", "boolean",
+                "Whether the HNSW integration backlog is under control (< 50%). Same value as "
+                    + "HnswQueueDepth.isUnderControl", true, false, false),
+            new MBeanAttributeInfo("isCritical", "boolean",
+                "Whether the HNSW integration backlog is critical (> 80%). Same value as "
+                    + "HnswQueueDepth.isCritical", true, false, false),
+            new MBeanAttributeInfo("isFull", "boolean",
+                "Whether the HNSW integration backlog is full (> 100%). Same value as "
+                    + "HnswQueueDepth.isFull", true, false, false)
         };
 
         /**
@@ -1327,7 +1360,8 @@ public final class Metrics {
         public MBeanInfo getMBeanInfo() {
             return new MBeanInfo(
                 this.getClass().getName(),
-                "Ingestion Queue MBean",
+                "Alias of io.excalibur:type=HnswQueueDepth. Reports the HNSW integration "
+                    + "backlog, not a separate ingestion queue - the two beans carry one number",
                 ATTRIBUTES,
                 null, // constructors
                 null, // operations

@@ -402,4 +402,67 @@ class HnswGraphDiagnosticTest {
         }
         return vector;
     }
+
+    @Nested
+    @DisplayName("A probe the graph could not answer")
+    class ProbeFailures {
+
+        @Test
+        @DisplayName("a graph closed by compaction is not reported as broken traversal")
+        void aGraphClosedByCompactionIsNotReportedAsBroken() throws IOException {
+            // Compaction holds the write lock while the graph is closed and reopened, and
+            // search() checks the closed flag before taking the read lock. A diagnostic that
+            // lands in that window gets an exception, not an empty result - and reporting
+            // "Graph traversal is broken" sends an operator after a fault that does not exist.
+            Path graphPath = tempDir.resolve("compacting.graph");
+            HnswConfig config = HnswConfig.create(dimension);
+            HnswGraph graph = new UnreachableDuringCompaction(graphPath, config);
+            for (int i = 0; i < 10; i++) {
+                graph.insert(createRandomVector(dimension));
+            }
+
+            HnswGraphDiagnostic.GraphDiagnosticResult result =
+                HnswGraphDiagnostic.runFullDiagnostic(graph, 0);
+
+            assertThat(result.issues())
+                .as("the probe failed, not the graph")
+                .noneMatch(issue -> "SELF_SEARCH_EMPTY".equals(issue.code()));
+            assertThat(result.issues())
+                .anyMatch(issue -> "SELF_SEARCH_UNAVAILABLE".equals(issue.code()));
+            graph.close();
+        }
+
+        @Test
+        @DisplayName("the unavailable probe names compaction as the likely cause")
+        void theUnavailableProbeNamesCompaction() throws IOException {
+            Path graphPath = tempDir.resolve("compacting-2.graph");
+            HnswConfig config = HnswConfig.create(dimension);
+            HnswGraph graph = new UnreachableDuringCompaction(graphPath, config);
+            for (int i = 0; i < 10; i++) {
+                graph.insert(createRandomVector(dimension));
+            }
+
+            HnswGraphDiagnostic.GraphDiagnosticResult result =
+                HnswGraphDiagnostic.runFullDiagnostic(graph, 0);
+
+            assertThat(result.issues())
+                .filteredOn(issue -> "SELF_SEARCH_UNAVAILABLE".equals(issue.code()))
+                .allSatisfy(issue -> assertThat(issue.recommendation()).contains("ompaction"));
+            graph.close();
+        }
+
+        /** A graph in the window where compaction has closed it and not yet reopened it. */
+        private final class UnreachableDuringCompaction extends HnswGraph {
+
+            UnreachableDuringCompaction(Path path, HnswConfig config) throws IOException {
+                super(path, config, distanceFunction, 10000);
+            }
+
+            @Override
+            public List<io.excalibur.vector.hnsw.HnswSearchResult> search(float[] query, int k) {
+                throw new IllegalStateException("HNSW graph is closed");
+            }
+        }
+    }
+
 }

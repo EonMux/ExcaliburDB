@@ -660,8 +660,9 @@ public class CompactionWorker {
 
         Files.deleteIfExists(compactPath);
 
-        // Same slot count as the old segment, plus a 1MB data region
-        long capacity = (long) segment.slotCount() * 24 * 2 + 1024 * 1024;
+        // The same geometry as the segment being replaced. The constructor adds the data
+        // region itself, so this passes the slot table alone.
+        long capacity = Segment.capacityForSlots(segment.slotCount());
 
         int entriesCopied;
         Segment newSegment = null;

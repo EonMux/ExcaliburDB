@@ -204,7 +204,11 @@ class QueryFanoutIntegrationTest {
         assertThat(coverage.totalSegments()).isEqualTo(10);
         assertThat(coverage.activeSegments()).isEqualTo(5);
         assertThat(coverage.segmentsSearched()).isEqualTo(5);
-        assertThat(coverage.segmentsWithErrors()).isEqualTo(2);
+        // Two segments failed, and each is counted once under the reason it failed for.
+        // Reporting the timeout in both places would read as three segments in trouble, and
+        // would subtract it from coverage twice.
+        assertThat(coverage.segmentsTimedOut()).isEqualTo(1);
+        assertThat(coverage.segmentsWithErrors()).isEqualTo(1);
         assertThat(coverage.tailScanEntries()).isEqualTo(500); // 5 segments * 100 each
 
         // Coverage should be degraded due to errors

@@ -508,19 +508,39 @@ public final class Config {
      * Query configuration.
      *
      * <p>This class is IMMUTABLE and thread-safe.</p>
+     *
+     * <h2>Configuration Properties</h2>
+     * <ul>
+     *   <li><code>excalibur.query.top-k-default</code> - Results returned when a request names
+     *       no {@code top_k} (default: 100)</li>
+     *   <li><code>excalibur.query.threshold</code> - Score floor for vector search
+     *       (default: 0.0, meaning no floor)</li>
+     *   <li><code>excalibur.query.vector-dimensions</code> - Dimensionality of the index
+     *       (default: 1536)</li>
+     *   <li><code>excalibur.query.llm-timeout-ms</code> - Budget for the relevancy-scoring call
+     *       (default: 60000)</li>
+     *   <li><code>excalibur.query.include-partial-segments</code> - Whether a segment still being
+     *       built may contribute results (default: true)</li>
+     *   <li><code>excalibur.query.hybrid-retrieval</code> - Whether a node holding both signals
+     *       fuses them on {@code /v1/query} (default: true)</li>
+     * </ul>
      */
     public static final class Query {
 
         // Default top-k value
         public static final int DEFAULT_TOP_K = 100;
 
-        // Default recall target
-        public static final double DEFAULT_RECALL_TARGET = 0.95;
-
         // Default score floor for queries that name none. Zero means no filtering: a query
         // that returns nothing because of a floor nobody chose is harder to diagnose than one
         // that returns weak results.
         public static final double DEFAULT_THRESHOLD = 0.0;
+
+        // Whether a node that has both an embedding model and a lexical index answers
+        // /v1/query from both. On by default: the BM25 index over the chunks is written,
+        // compacted and erasure-swept whether or not a query reads it, so a node holding
+        // both signals and using one is paying for an index it never consults. Off restores
+        // vector-only ranking, which is what a deployment tuned against cosine scores wants.
+        public static final boolean DEFAULT_HYBRID_RETRIEVAL = true;
 
         // Default vector dimensions
         public static final int DEFAULT_VECTOR_DIMENSIONS = 1536;
@@ -540,11 +560,11 @@ public final class Config {
 
         // All fields final for immutability
         private final int defaultTopK;
-        private final double recallTarget;
         private final double threshold;
         private final int vectorDimensions;
         private final int llmTimeoutMs;
         private final boolean includePartialSegments;
+        private final boolean hybridRetrieval;
 
         /**
          * Creates a Query config from properties.
@@ -553,11 +573,11 @@ public final class Config {
          */
         public Query(Map<String, String> props) {
             this.defaultTopK = PropertyParser.parseInt(props, "excalibur.query.top-k-default", DEFAULT_TOP_K);
-            this.recallTarget = PropertyParser.parseDouble(props, "excalibur.query.recall-target", DEFAULT_RECALL_TARGET);
             this.threshold = PropertyParser.parseDouble(props, "excalibur.query.threshold", DEFAULT_THRESHOLD);
             this.vectorDimensions = PropertyParser.parseInt(props, "excalibur.query.vector-dimensions", DEFAULT_VECTOR_DIMENSIONS);
             this.llmTimeoutMs = PropertyParser.parseInt(props, "excalibur.query.llm-timeout-ms", DEFAULT_LLM_TIMEOUT_MS);
             this.includePartialSegments = PropertyParser.parseBoolean(props, "excalibur.query.include-partial-segments", true);
+            this.hybridRetrieval = PropertyParser.parseBoolean(props, "excalibur.query.hybrid-retrieval", DEFAULT_HYBRID_RETRIEVAL);
         }
 
         /**
@@ -565,13 +585,6 @@ public final class Config {
          */
         public int getDefaultTopK() {
             return defaultTopK;
-        }
-
-        /**
-         * Gets the recall target.
-         */
-        public double getRecallTarget() {
-            return recallTarget;
         }
 
         /**
@@ -602,11 +615,25 @@ public final class Config {
             return includePartialSegments;
         }
 
+        /**
+         * Whether {@code /v1/query} fuses BM25 with vector search on a node that has both.
+         *
+         * <p>Has no effect on a node that holds only one of them: with no embedding model the
+         * route answers from BM25, and with no lexical index it answers from vectors, whichever
+         * way this is set.</p>
+         *
+         * @return true when both signals should answer, false for vector-only ranking
+         */
+        public boolean isHybridRetrieval() {
+            return hybridRetrieval;
+        }
+
         @Override
         public String toString() {
-            return "Query{defaultTopK=" + defaultTopK + ", recallTarget=" + recallTarget +
+            return "Query{defaultTopK=" + defaultTopK +
                    ", threshold=" + threshold + ", vectorDimensions=" + vectorDimensions +
-                   ", llmTimeoutMs=" + llmTimeoutMs + ", includePartialSegments=" + includePartialSegments + '}';
+                   ", llmTimeoutMs=" + llmTimeoutMs + ", includePartialSegments=" + includePartialSegments +
+                   ", hybridRetrieval=" + hybridRetrieval + '}';
         }
     }
 
@@ -623,7 +650,6 @@ public final class Config {
      * <ul>
      *   <li><code>excalibur.llm.base-url</code> - Base URL for the LLM API (default: OpenAI)</li>
      *   <li><code>excalibur.llm.api-key</code> - API key for authentication (default: empty)</li>
-     *   <li><code>excalibur.llm.model</code> - Legacy generic model name (default: text-embedding-ada-002)</li>
      *   <li><code>excalibur.llm.chat-model</code> - Model for chat completions (default: gpt-4o-mini)</li>
      *   <li><code>excalibur.llm.embedding-model</code> - Model for embeddings (default: text-embedding-3-small)</li>
      *   <li><code>excalibur.llm.embeddings-enabled</code> - Whether the corpus and queries are embedded (default: true)</li>
@@ -642,9 +668,6 @@ public final class Config {
 
         // Default OpenAI base URL
         public static final String DEFAULT_BASE_URL = "https://api.openai.com/v1";
-
-        // Default model name (legacy)
-        public static final String DEFAULT_MODEL = "text-embedding-ada-002";
 
         // Default chat model
         public static final String DEFAULT_CHAT_MODEL = "gpt-4o-mini";
@@ -711,7 +734,6 @@ public final class Config {
         // All fields final for immutability
         private final String baseUrl;
         private final String apiKey;
-        private final String model;
         private final String chatModel;
         private final String embeddingModel;
         private final int embeddingsDimensions;
@@ -733,7 +755,6 @@ public final class Config {
         public Llm(Map<String, String> props) {
             this.baseUrl = PropertyParser.parseString(props, "excalibur.llm.base-url", DEFAULT_BASE_URL);
             this.apiKey = PropertyParser.parseString(props, "excalibur.llm.api-key", DEFAULT_API_KEY);
-            this.model = PropertyParser.parseString(props, "excalibur.llm.model", DEFAULT_MODEL);
             this.chatModel = PropertyParser.parseString(props, "excalibur.llm.chat-model", DEFAULT_CHAT_MODEL);
             this.embeddingModel = PropertyParser.parseString(props, "excalibur.llm.embedding-model", DEFAULT_EMBEDDING_MODEL);
             this.embeddingsDimensions = PropertyParser.parseInt(props, "excalibur.llm.embeddings-dimensions", DEFAULT_EMBEDDINGS_DIMENSIONS);
@@ -760,15 +781,6 @@ public final class Config {
          */
         public String getApiKey() {
             return apiKey;
-        }
-
-        /**
-         * Gets the legacy generic model name.
-         * @deprecated Use {@link #getChatModel()} or {@link #getEmbeddingModel()} instead.
-         */
-        @Deprecated
-        public String getModel() {
-            return model;
         }
 
         /**
@@ -1194,9 +1206,13 @@ public final class Config {
             this.minMeanConfidence = requireInUnitRange(PropertyParser.parseDouble(
                 props, "excalibur.graph.min-mean-confidence", DEFAULT_MIN_MEAN_CONFIDENCE),
                 "min-mean-confidence");
-            this.maxAmbiguousCandidates = requirePositive(PropertyParser.parseInt(
+            // At least two, not at least one: the abstention policy calls a result ambiguous by
+            // comparing competing readings, so one candidate is not a value it can work with and
+            // it refuses it. Accepting it here deferred the refusal to the graph open, where the
+            // same mistake reads as a broken store rather than a setting to correct.
+            this.maxAmbiguousCandidates = requireAtLeast(PropertyParser.parseInt(
                 props, "excalibur.graph.max-ambiguous-candidates",
-                DEFAULT_MAX_AMBIGUOUS_CANDIDATES), "max-ambiguous-candidates");
+                DEFAULT_MAX_AMBIGUOUS_CANDIDATES), 2, "max-ambiguous-candidates");
             this.contextTokenBudget = requirePositive(PropertyParser.parseInt(
                 props, "excalibur.graph.context-token-budget", DEFAULT_CONTEXT_TOKEN_BUDGET),
                 "context-token-budget");
@@ -1220,9 +1236,14 @@ public final class Config {
         }
 
         private static int requirePositive(int value, String name) {
-            if (value < 1) {
+            return requireAtLeast(value, 1, name);
+        }
+
+        private static int requireAtLeast(int value, int minimum, String name) {
+            if (value < minimum) {
                 throw new IllegalArgumentException(
-                    "excalibur.graph." + name + " must be at least 1, got: " + value);
+                    "excalibur.graph." + name + " must be at least " + minimum
+                        + ", got: " + value);
             }
             return value;
         }

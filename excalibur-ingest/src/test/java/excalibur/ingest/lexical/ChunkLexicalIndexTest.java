@@ -98,6 +98,72 @@ class ChunkLexicalIndexTest {
     }
 
     @Nested
+    @DisplayName("Identifier collisions")
+    class Collisions {
+
+        @Test
+        @DisplayName("a chunk written again is not reported as a collision")
+        void reindexingIsNotACollision(@TempDir Path dir) throws Exception {
+            // The index holds one document where two were written, which is what a collision
+            // looks like from a counter - and what every reindex looks like too. Reporting it
+            // as data lost to a hash collision is a false alarm on a routine operation.
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "the certificate chain could not be verified");
+                index.refresh();
+                index.add("kb:a.txt:chunk:0", "the certificate chain could not be verified");
+                index.refresh();
+
+                assertThat(index.collisionCount()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("an erased chunk is not reported as a collision")
+        void erasureIsNotACollision(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "confidential postmortem");
+                index.add("kb:a.txt:chunk:1", "routine planning");
+                index.refresh();
+
+                index.erase(Set.of("kb:a.txt:chunk:0"));
+                index.refresh();
+
+                assertThat(index.collisionCount()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("reopening an index and rewriting its chunks is not a collision")
+        void reopeningIsNotACollision(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "the certificate chain could not be verified");
+                index.refresh();
+            }
+            try (ChunkLexicalIndex reopened = open(dir)) {
+                reopened.add("kb:a.txt:chunk:0", "the certificate chain could not be verified");
+                reopened.refresh();
+
+                assertThat(reopened.collisionCount()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("two chunk names arriving under one id are still reported")
+        void twoNamesUnderOneIdAreReported(@TempDir Path dir) throws Exception {
+            // What the check is for: a fresh index, every name minted once, and fewer documents
+            // stored than were written. Whether the cause is a 64-bit collision or ingestion
+            // minting a name twice, a chunk is missing from the corpus.
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "the certificate chain could not be verified");
+                index.add("kb:a.txt:chunk:0", "an entirely different chunk of text");
+                index.refresh();
+
+                assertThat(index.collisionCount()).isEqualTo(1);
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("Reporting")
     class Reporting {
 

@@ -35,6 +35,7 @@ import java.util.Set;
  *   <li>No segments are visible at the query epoch</li>
  *   <li>The query vector genuinely doesn't match any vectors in queryable segments</li>
  *   <li>Threshold filtering removes all candidates</li>
+ *   <li>No segment answered - every one the query reached failed or timed out</li>
  * </ul>
  *
  * <h2>Illegitimate Empty Result Scenarios</h2>
@@ -133,6 +134,9 @@ public final class EmptyResultValidator {
             NO_VECTOR_MATCH(true, "Query vector doesn't match any vectors in queryable segments"),
             /** Threshold filtering removed all results */
             THRESHOLD_FILTERING(true, "Threshold filtering removed all candidates"),
+            /** Every segment the query reached failed or timed out */
+            NO_SEGMENT_ANSWERED(true,
+                "No segment answered - every one the query reached failed or timed out"),
             /** Segments have vectors but HNSW returned empty - potential bug */
             HNSW_EMPTY_BUG(false, "Segments have vectors but HNSW search returned empty - potential graph or search bug"),
             /** Visibility tracking may be broken */
@@ -334,7 +338,21 @@ public final class EmptyResultValidator {
             "Search: %d segments searched, %d with results, %d raw results, threshold=%.2f",
             segmentsSearched, segmentsWithResults, rawResultCount, request.threshold()));
 
-        // Check 5: Segments were searched but returned no results
+        // Check 5: The query was dispatched but nothing came back from it
+        if (segmentResults != null && !segmentResults.isEmpty() && segmentsSearched == 0) {
+            // The emptiness is already accounted for: no segment produced evidence either way.
+            // Reading it as a suspected bug would flag every query a timing-out shard serves.
+            diagnosticDetails.add("No segment answered - all " + segmentResults.size()
+                + " failed or timed out");
+            return new ValidationResult(
+                true, ValidationResult.Reason.NO_SEGMENT_ANSWERED,
+                catalogSegments, queryableSegments, visibleSegments,
+                totalVectorsInGraphs, activeVectorsInGraphs,
+                0, 0, 0, false, diagnosticDetails
+            );
+        }
+
+        // Check 6: Segments were searched but returned no results
         if (segmentsSearched > 0 && segmentsWithResults == 0 && activeVectorsInGraphs > 0) {
             diagnosticDetails.add("Segments were searched with active vectors but HNSW returned empty");
             return new ValidationResult(
@@ -345,7 +363,7 @@ public final class EmptyResultValidator {
             );
         }
 
-        // Check 6: Raw results existed but were filtered out by threshold
+        // Check 7: Raw results existed but were filtered out by threshold
         if (rawResultCount > 0 && thresholdFiltering) {
             diagnosticDetails.add(String.format(
                 "Threshold filtering: %d raw results removed by threshold %.2f",
@@ -358,7 +376,7 @@ public final class EmptyResultValidator {
             );
         }
 
-        // Check 7: Raw results existed but were lost during aggregation
+        // Check 8: Raw results existed but were lost during aggregation
         if (rawResultCount > 0 && response.isEmpty()) {
             diagnosticDetails.add(String.format(
                 "Results lost: %d raw results but final response is empty - aggregation bug?",

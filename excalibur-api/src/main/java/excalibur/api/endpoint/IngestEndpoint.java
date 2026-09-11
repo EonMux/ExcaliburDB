@@ -280,6 +280,12 @@ public class IngestEndpoint implements HttpHandler {
 
                 LOGGER.info("Source registered successfully");
 
+            } catch (RequestBody.TooLargeException e) {
+                // Well-formed and too big is not the same failure as malformed: 400 tells the
+                // caller not to send it again, 413 tells it to split the payload.
+                LOGGER.warn("Refused an oversized ingest body: {}", e.getMessage());
+                sendError(exchange, 413, e.getMessage());
+
             } catch (IllegalArgumentException e) {
                 LOGGER.warn("Invalid ingest request: {}", e.getMessage());
                 sendError(exchange, 400, "Bad Request: " + e.getMessage());

@@ -7,9 +7,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A hierarchical Cuckoo filter structure for efficient segment-level membership testing.
@@ -47,6 +51,15 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *   <li>Hierarchy modifications use read-write locks</li>
  * </ul>
  *
+ * <h2>When a level runs out of room</h2>
+ * <p>A cuckoo filter refuses an insert once its buckets are exhausted, and a refused term is one
+ * the filter does not hold and will answer "absent" for. A reader that prunes on that answer
+ * drops documents that are sitting in storage - the one failure a membership filter must never
+ * cause, and a silent one. So a level that has refused a term records it and stops claiming to
+ * speak for its scope: {@link #coversSegment(String)} returns false, the caller searches the
+ * segment, and pruning costs latency instead of answers. The mark is sticky until the filter is
+ * rebuilt, because freeing space elsewhere does not record the term that was refused.</p>
+ *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Segment IDs are non-null, non-empty strings</li>
@@ -62,6 +75,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class HierarchicalCuckooFilter {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(HierarchicalCuckooFilter.class);
+
     private static final int DEFAULT_FINGERPRINT_BITS = 13;
     private static final int DEFAULT_CLUSTER_CAPACITY = 100_000;
     private static final int DEFAULT_SEGMENT_CAPACITY = 10_000;
@@ -70,6 +85,15 @@ public class HierarchicalCuckooFilter {
     private final Map<String, CuckooFilter> clusterFilters;
     private final Map<String, CuckooFilter> segmentFilters;
     private final Map<String, String> segmentToCluster;
+
+    // Levels that have refused a term. A cuckoo filter that cannot accept an item does not hold
+    // it, and every later question about that item gets "no" from a level that was never told.
+    // A reader that prunes on such an answer drops documents that are sitting in storage, so a
+    // level records the refusal and stops claiming to know what it holds. Sticky until the
+    // filter is rebuilt: freeing space elsewhere does not record the term that was refused.
+    private final Set<String> saturatedSegments;
+    private final Set<String> saturatedClusters;
+    private volatile boolean corpusSaturated;
 
     private final int fingerprintBits;
     private final int clusterCapacity;
@@ -119,6 +143,8 @@ public class HierarchicalCuckooFilter {
         this.segmentToCluster = new ConcurrentHashMap<>();
         this.hierarchyLock = new ReentrantReadWriteLock();
         this.totalEntries = new AtomicLong(0);
+        this.saturatedSegments = ConcurrentHashMap.newKeySet();
+        this.saturatedClusters = ConcurrentHashMap.newKeySet();
     }
 
     /**
@@ -148,6 +174,8 @@ public class HierarchicalCuckooFilter {
         this.segmentToCluster = new ConcurrentHashMap<>();
         this.hierarchyLock = new ReentrantReadWriteLock();
         this.totalEntries = new AtomicLong(0);
+        this.saturatedSegments = ConcurrentHashMap.newKeySet();
+        this.saturatedClusters = ConcurrentHashMap.newKeySet();
     }
 
     /**
@@ -175,8 +203,16 @@ public class HierarchicalCuckooFilter {
             clusterFilters.computeIfAbsent(clusterId, k -> 
                 CuckooFilter.create(clusterCapacity, fingerprintBits));
 
-            return segmentFilters.computeIfAbsent(segmentId, k ->
-                CuckooFilter.create(segmentCapacity, fingerprintBits));
+            CuckooFilter existing = segmentFilters.get(segmentId);
+            if (existing != null) {
+                return existing;
+            }
+            // A segment id can come back after a split or a reindex, holding a filter that has
+            // refused nothing. Carrying the old mark would disable pruning for that id forever.
+            saturatedSegments.remove(segmentId);
+            CuckooFilter created = CuckooFilter.create(segmentCapacity, fingerprintBits);
+            segmentFilters.put(segmentId, created);
+            return created;
         } finally {
             hierarchyLock.writeLock().unlock();
         }
@@ -204,6 +240,7 @@ public class HierarchicalCuckooFilter {
             segmentToCluster.put(segmentId, clusterId);
             clusterFilters.computeIfAbsent(clusterId, k -> 
                 CuckooFilter.create(clusterCapacity, fingerprintBits));
+            saturatedSegments.remove(segmentId);
             segmentFilters.put(segmentId, filter);
         } finally {
             hierarchyLock.writeLock().unlock();
@@ -227,6 +264,7 @@ public class HierarchicalCuckooFilter {
         try {
             CuckooFilter removed = segmentFilters.remove(segmentId);
             segmentToCluster.remove(segmentId);
+            saturatedSegments.remove(segmentId);
             return removed != null;
         } finally {
             hierarchyLock.writeLock().unlock();
@@ -282,6 +320,11 @@ public class HierarchicalCuckooFilter {
             // is the false negative this whole arrangement exists to prevent.
             LevelInsert segmentResult = insertIfAbsent(segmentFilter, item);
             if (segmentResult == LevelInsert.FULL) {
+                if (saturatedSegments.add(segmentId)) {
+                    LOGGER.warn("Segment {} filter is full at {} entries; it can no longer rule "
+                        + "the segment out and every query will search it. Raise the segment "
+                        + "capacity if this is common", segmentId, segmentFilter.count());
+                }
                 return false;
             }
 
@@ -291,6 +334,10 @@ public class HierarchicalCuckooFilter {
             LevelInsert clusterResult = insertIfAbsent(clusterFilter, item);
             if (clusterResult == LevelInsert.FULL) {
                 rollBack(segmentFilter, item, segmentResult);
+                if (saturatedClusters.add(clusterId)) {
+                    LOGGER.warn("Cluster {} filter is full at {} entries; no segment in it can "
+                        + "be ruled out any more", clusterId, clusterFilter.count());
+                }
                 return false;
             }
 
@@ -298,6 +345,13 @@ public class HierarchicalCuckooFilter {
             if (corpusResult == LevelInsert.FULL) {
                 rollBack(segmentFilter, item, segmentResult);
                 rollBack(clusterFilter, item, clusterResult);
+                if (!corpusSaturated) {
+                    corpusSaturated = true;
+                    LOGGER.warn("Corpus filter is full at {} entries; segment pruning is off and "
+                        + "every query now searches every segment. Raise "
+                        + "excalibur.filter.corpus-capacity past the corpus term count and "
+                        + "restart", corpusFilter.count());
+                }
                 return false;
             }
 
@@ -375,6 +429,15 @@ public class HierarchicalCuckooFilter {
      */
     public long corpusCapacity() {
         return corpusFilter.capacity();
+    }
+
+    /**
+     * Entries each segment's own filter is sized for.
+     *
+     * @return The per-segment capacity this filter was built with
+     */
+    public int segmentCapacity() {
+        return segmentCapacity;
     }
 
     /**
@@ -676,6 +739,60 @@ public class HierarchicalCuckooFilter {
      */
     public boolean removeSegment(String segmentId) {
         return unregisterSegment(segmentId);
+    }
+
+    /**
+     * Whether this filter may be used to rule a segment out.
+     *
+     * <p>A pre-filter earns the right to exclude a segment only by holding everything that
+     * segment holds. Three things take that right away, and all three are silent: the segment
+     * may hold nothing yet, so the filter has looked at nothing rather than looked and found
+     * nothing; a level may have refused a term for want of room, so the term is absent from a
+     * filter whose absences a reader would otherwise trust; and the corpus level - the first one
+     * consulted - may be full, which makes every segment's verdict worthless at once.</p>
+     *
+     * <p>When this returns false the caller must search the segment. Pruning is an optimisation;
+     * answering a query with nothing while the documents sit in storage is not a slow answer but
+     * a wrong one.</p>
+     *
+     * @param segmentId The segment's id
+     * @return true when the filter's silence about a term genuinely means the segment lacks it
+     */
+    public boolean coversSegment(String segmentId) {
+        if (segmentId == null || corpusSaturated || saturatedSegments.contains(segmentId)) {
+            return false;
+        }
+        String clusterId = segmentToCluster.get(segmentId);
+        if (clusterId == null || saturatedClusters.contains(clusterId)) {
+            return false;
+        }
+        CuckooFilter segmentFilter = segmentFilters.get(segmentId);
+        return segmentFilter != null && segmentFilter.count() > 0;
+    }
+
+    /**
+     * Whether the corpus level has run out of room.
+     *
+     * <p>Once it has, no segment can be ruled out by this filter and every query pays the full
+     * scan. Sized by {@code excalibur.filter.corpus-capacity}; an operator seeing this wants to
+     * raise it and restart rather than to keep running without pruning.</p>
+     *
+     * @return true when a term has been refused by the corpus filter
+     */
+    public boolean isSaturated() {
+        return corpusSaturated;
+    }
+
+    /**
+     * Segments this filter can no longer rule out because a term was refused for them.
+     *
+     * <p>For reporting. A growing count is the signal that {@code segmentCapacity} is too small
+     * for the vocabulary the segments actually hold.</p>
+     *
+     * @return How many segments have refused a term
+     */
+    public int saturatedSegmentCount() {
+        return saturatedSegments.size();
     }
 
     /**

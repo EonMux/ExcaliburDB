@@ -126,7 +126,7 @@ public class DocumentErasureEndpoint implements HttpHandler {
         String body;
         try {
             body = RequestBody.read(exchange);
-        } catch (IllegalArgumentException e) {
+        } catch (RequestBody.TooLargeException e) {
             ResponseBody.sendJson(exchange, 413, "{\"error\": \"Request body too large\"}");
             return;
         }
@@ -134,17 +134,21 @@ public class DocumentErasureEndpoint implements HttpHandler {
         String sourceId;
         String scope;
         List<String> documentIds;
+        boolean compactNow;
         try {
             sourceId = requireSourceId(body);
             scope = scopeFrom(body);
             documentIds = SCOPE_SOURCE.equals(scope) ? List.of() : documentsFrom(body);
+            // Read with the rest of the request, not after it. A body this cannot make sense of
+            // is a bad request whichever field it stumbles on, and answering one malformed field
+            // with a 500 tells the caller the node broke when it was the caller that did.
+            compactNow = JsonText.booleanValue(body, "compact", false);
         } catch (IllegalArgumentException e) {
             ResponseBody.sendJson(exchange, 400,
                 "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
             return;
         }
 
-        boolean compactNow = JsonText.booleanValue(body, "compact", false);
         try {
             boolean deregistered = false;
             DocumentErasureService.Outcome outcome;

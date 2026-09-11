@@ -1132,6 +1132,15 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
+     * Returns the segment catalog this orchestrator indexes into.
+     *
+     * @return The catalog, never null
+     */
+    public SegmentCatalog getCatalog() {
+        return catalog;
+    }
+
+    /**
      * Returns the visibility tracker for epoch-based visibility.
      *
      * <p>Use this to capture epochs for queries and determine

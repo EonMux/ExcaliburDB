@@ -108,7 +108,9 @@ class ExcaliburMcpServerTest {
 
             Object tools = Json.at(Json.objectAt(response, "result"), "tools");
             assertThat(tools).isInstanceOf(List.class);
-            assertThat((List<?>) tools).hasSize(4);
+            assertThat(((List<?>) tools).stream().map(t -> Json.stringAt(t, "name")).toList())
+                .containsExactlyInAnyOrder(McpTools.SEARCH_DOCUMENTS, McpTools.SEARCH_GRAPH,
+                    McpTools.BUILD_GRAPH, McpTools.INGEST_DOCUMENTS, McpTools.INGESTION_STATUS);
         }
     }
 

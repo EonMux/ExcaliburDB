@@ -45,6 +45,7 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     private final AtomicLong documentsSeen = new AtomicLong();
     private final AtomicLong factsStaged = new AtomicLong();
     private final AtomicLong extractionFailures = new AtomicLong();
+    private final AtomicLong stagingFailures = new AtomicLong();
     private final AtomicLong indexFailures = new AtomicLong();
 
     /**
@@ -83,6 +84,7 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
                 staging.append(triple);
                 staged++;
             } catch (IOException | RuntimeException e) {
+                stagingFailures.incrementAndGet();
                 LOGGER.warn("could not stage {} {} {}: {}",
                     triple.subject(), triple.relation(), triple.object(), e.toString());
             }
@@ -167,6 +169,19 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     }
 
     /**
+     * How many facts it extracted and could not write to the staging store.
+     *
+     * <p>The extraction succeeded and the fact was lost anyway, which is the failure a count of
+     * extraction failures cannot show. A store refusing every append leaves a graph that stops
+     * growing while everything upstream of it reports success.</p>
+     *
+     * @return The count
+     */
+    public long stagingFailures() {
+        return stagingFailures.get();
+    }
+
+    /**
      * How many entity mentions it could not record text for.
      *
      * @return The count
@@ -179,6 +194,7 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     public String toString() {
         return "StagingGraphIngestSink[" + documentsSeen() + " documents, " + factsStaged()
             + " facts, " + extractionFailures() + " extraction failures, "
+            + stagingFailures() + " staging failures, "
             + indexFailures() + " index failures]";
     }
 }

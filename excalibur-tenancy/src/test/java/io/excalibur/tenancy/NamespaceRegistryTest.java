@@ -236,6 +236,51 @@ class NamespaceRegistryTest {
         }
 
         @Test
+        @DisplayName("a background visit neither opens a namespace nor makes it look fresh")
+        void aBackgroundVisitIsInvisibleToEviction(@TempDir Path root) {
+            // A sweep that walks every open namespace on a timer must not be the thing that
+            // decides which one is evicted. Borrowing through the ordinary path would do exactly
+            // that: it marks the namespace recently used, so after one pass every namespace is
+            // equally fresh and the LRU order is whatever the sweep's iteration order was. It
+            // would also reopen a namespace that had just been evicted, spending the mappings
+            // the eviction freed.
+            try (NamespaceRegistry<FakeIndex> registry =
+                     registry(root, 2, TieringPolicy.uniform(), MappingBudget.of(1000, 1.0))) {
+
+                FakeIndex a = registry.get(NamespaceId.of("a"));
+                registry.get(NamespaceId.of("b"));
+
+                // A sweep touches "a", which must not save it.
+                try (NamespaceRegistry.Lease<FakeIndex> lease =
+                         registry.borrowResident(NamespaceId.of("a")).orElseThrow()) {
+                    assertThat(lease.resource()).isSameAs(a);
+                }
+                registry.get(NamespaceId.of("c"));
+
+                assertThat(registry.openNamespaces())
+                    .extracting(NamespaceId::value)
+                    .as("a was least recently used before the sweep and must still be")
+                    .containsExactlyInAnyOrder("b", "c");
+            }
+        }
+
+        @Test
+        @DisplayName("a background visit to an evicted namespace does not reopen it")
+        void aBackgroundVisitDoesNotReopen(@TempDir Path root) {
+            try (NamespaceRegistry<FakeIndex> registry =
+                     registry(root, 1, TieringPolicy.uniform(), MappingBudget.of(1000, 1.0))) {
+
+                registry.get(NamespaceId.of("a"));
+                registry.get(NamespaceId.of("b"));
+
+                assertThat(registry.borrowResident(NamespaceId.of("a"))).isEmpty();
+                assertThat(registry.openNamespaces())
+                    .extracting(NamespaceId::value)
+                    .containsExactly("b");
+            }
+        }
+
+        @Test
         @DisplayName("crossing the mapping high-water mark evicts even under the count limit")
         void evictsOnMappingPressure(@TempDir Path root) {
             // Few large namespaces exhaust the mapping budget long before the count limit; the
@@ -358,8 +403,8 @@ class NamespaceRegistryTest {
             MappingBudget budget = MappingBudget.of(100, 0.7);
             budget.acquire(60, 5);
 
-            assertThat(budget.wouldExceedHighWater(5)).isFalse();
-            assertThat(budget.wouldExceedHighWater(20)).isTrue();
+            assertThat(budget.wouldExceedHighWater(5, 0)).isFalse();
+            assertThat(budget.wouldExceedHighWater(20, 0)).isTrue();
         }
 
         @Test

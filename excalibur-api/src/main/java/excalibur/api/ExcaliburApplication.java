@@ -34,6 +34,7 @@ import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.hnsw.HnswConfigFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.bridge.SLF4JBridgeHandler;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -105,15 +106,13 @@ public final class ExcaliburApplication {
      * every query.</p>
      */
     private volatile excalibur.ingest.lexical.ChunkIndex chunkIndex;
+
     /**
-     * The graph-RAG stack, or null where no graph store is on disk.
+     * Enforces the chunk index's erasure deadline.
      *
-     * <p>Optional: a deployment doing only vector search has no graph, and the
-     * {@code /v1/graph/query} route is simply not registered. Held here rather than
-     * only inside the server because its mappings and Lucene readers have to be
-     * released on shutdown.
+     * <p>Held so shutdown can stop it before the index it compacts is closed underneath it.</p>
      */
-    private final GraphRagFactory.GraphRag graphRag;
+    private volatile excalibur.api.bootstrap.LexicalErasureSweep lexicalErasureSweep;
 
     /** Every namespace's graph: what it has staged, what it serves, and what it owes. */
     private final excalibur.api.bootstrap.GraphTenants graphTenants;
@@ -165,6 +164,7 @@ public final class ExcaliburApplication {
      * @param args Command-line arguments
      */
     public static void main(String[] args) {
+        routeStorageEngineLogsToTheConfiguredAppender();
         try {
             // Parse command-line arguments
             String configPath = parseConfigPath(args);
@@ -177,6 +177,27 @@ public final class ExcaliburApplication {
             LOGGER.error("Failed to start ExcaliburDB: {}", e.getMessage(), e);
             System.exit(1);
         }
+    }
+
+    /**
+     * Sends {@code java.util.logging} records through SLF4J, like everything else.
+     *
+     * <p>The storage engine logs through the JDK's logger rather than SLF4J. Left alone those
+     * records go to the JDK's own root handler: they are written in the JDK's two-line format
+     * rather than the JSON every other line has, so a log pipeline that parses this process's
+     * output either drops them or files them as junk - and they are the lines that report a
+     * tombstone the directory still routes to, a segment that would not purge, a checksum that
+     * did not match. Records below {@code INFO} never leave the JDK logger at all, so raising
+     * the log level does not reach them either.</p>
+     *
+     * <p>Removing the root handler first is what stops the same record being written twice.
+     * Levels stay in step from the other direction: {@code LevelChangePropagator} in
+     * {@code logback.xml} pushes the configured level onto the JDK loggers, so a record the
+     * appender would discard is discarded before it is built.</p>
+     */
+    static void routeStorageEngineLogsToTheConfiguredAppender() {
+        SLF4JBridgeHandler.removeHandlersForRootLogger();
+        SLF4JBridgeHandler.install();
     }
 
     /**
@@ -270,11 +291,6 @@ public final class ExcaliburApplication {
 
         // Initialize query pipeline
         this.queryPipeline = createQueryPipeline();
-
-        // Open the graph-RAG stack, if one was built into the data directory. A graph that is
-        // present but unreadable fails the start: the alternative is a node that silently
-        // answers 404 on a documented endpoint.
-        this.graphRag = openGraphRag(dataDir);
 
         // The build side of the graph, per namespace. A node that never sees the namespace
         // header runs with exactly one, called shared, which is the single-tenant arrangement.
@@ -533,8 +549,9 @@ public final class ExcaliburApplication {
     /**
      * Opens every namespace's graph, bounded by what this process may map.
      *
-     * <p>Rooted at the configured graph path's parent, one subdirectory per namespace, with the
-     * shared namespace being the one a node that never sees the header uses. The mapping budget is
+     * <p>Rooted at {@code excalibur.graph.path}, or the data directory when that is unset, with
+     * one subdirectory per namespace and the shared namespace being the one a node that never
+     * sees the header uses. The mapping budget is
      * detected once and governs how many graphs stay open at a time: a served store is thirteen
      * mappings, and a node with a graph per tenant will otherwise exhaust the process's supply at
      * whatever unrelated allocation happens to come next.</p>
@@ -543,10 +560,7 @@ public final class ExcaliburApplication {
      * @return The tenant registry
      */
     private excalibur.api.bootstrap.GraphTenants openGraphTenants(Path dataDir) {
-        Path root = GraphRagFactory.directoryFor(config, dataDir).getParent();
-        if (root == null) {
-            root = dataDir;
-        }
+        Path root = GraphRagFactory.tenantRootFor(config, dataDir);
         try {
             return new excalibur.api.bootstrap.GraphTenants(
                 root, config,
@@ -554,26 +568,6 @@ public final class ExcaliburApplication {
                 config.graph().getMaxOpenNamespaces());
         } catch (IOException e) {
             throw new IllegalStateException("Graph tenants under " + root
-                + " could not be opened: " + e.getMessage(), e);
-        }
-    }
-
-    /**
-     * Opens the graph-RAG stack, or returns null when the node has no graph.
-     *
-     * <p>An unreadable graph is a startup failure rather than a silently absent endpoint. The
-     * two look identical from a client - both answer 404 - and only one of them is what the
-     * operator configured.
-     *
-     * @param dataDir The data directory the graph lives under by default
-     * @return The opened stack, or null
-     */
-    private GraphRagFactory.GraphRag openGraphRag(Path dataDir) {
-        try {
-            return GraphRagFactory.open(config, dataDir);
-        } catch (IOException e) {
-            throw new IllegalStateException("Graph store at "
-                + GraphRagFactory.directoryFor(config, dataDir)
                 + " could not be opened: " + e.getMessage(), e);
         }
     }
@@ -664,6 +658,15 @@ public final class ExcaliburApplication {
             server.withIngestionPipeline(textChunker, embeddingClient, lshIngestionService, documentVisibilityTracker);
             LOGGER.info("Ingestion pipeline configured with document atomicity");
 
+            // Stage 1 of the query pipeline prunes on this filter. Without it, only the reindex
+            // path fills it, so a node that crawled its corpus once read every segment on every
+            // query.
+            excalibur.ingest.pipeline.IngestionOrchestrator ingestion =
+                server.getIngestionOrchestrator();
+            if (ingestion != null) {
+                ingestion.setMembershipFilter(hierarchicalFilter);
+            }
+
             if (chunkIndex != null) {
                 excalibur.ingest.pipeline.IngestionOrchestrator orchestrator =
                     server.getIngestionOrchestrator();
@@ -687,7 +690,17 @@ public final class ExcaliburApplication {
                 server.withLexicalQueryService(new excalibur.api.retrieval.LexicalQueryService(
                     chunkIndex, expander, java.util.List.of()));
                 server.withChunkIndex(chunkIndex);
+
+                // What makes excalibur.ingest.lexical-max-latency-seconds a bound. Compaction is
+                // otherwise only checked at the end of an ingestion or reindex run, so a node
+                // that erased a chunk and then went quiet kept it on disk indefinitely.
+                this.lexicalErasureSweep = new excalibur.api.bootstrap.LexicalErasureSweep(
+                    chunkIndex,
+                    excalibur.ingest.lexical.StoredChunkText.of(storageEngine),
+                    config.ingest().getLexicalMaxLatencySeconds());
             }
+
+            logRetrievalMode(config, capabilities, chunkIndex != null);
 
             // Relation extraction is a chat call, so it turns on with the model rather than with
             // the embedding pass.
@@ -701,6 +714,38 @@ public final class ExcaliburApplication {
             // Continue without the pipeline: registration is bookkeeping and does not need one,
             // and /v1/ingest/status reports every source as unconfigured rather than as ingested.
         }
+    }
+
+    /**
+     * Says once, at startup, what {@code /v1/query} will actually do.
+     *
+     * <p>Every input to that decision is already logged separately - the embedding model, the
+     * chunk index opening, the expansion model - and none of them answers the question. A node
+     * can hold both signals and read one of them, and the difference is a configuration key
+     * rather than anything visible in the data directory. An operator who has to infer it from
+     * three other lines will infer it wrong.</p>
+     *
+     * @param config        The configuration, for whether fusion is enabled
+     * @param capabilities  What the configured models allow
+     * @param hasChunkIndex Whether the lexical index opened
+     */
+    private static void logRetrievalMode(Config config,
+                                         excalibur.api.bootstrap.RetrievalCapabilities capabilities,
+                                         boolean hasChunkIndex) {
+        if (!capabilities.embedCorpus()) {
+            LOGGER.info("/v1/query retrieval: {}", hasChunkIndex
+                ? "lexical - BM25 over the chunk index"
+                : "unavailable - no embedding model and no chunk index");
+            return;
+        }
+        if (!hasChunkIndex) {
+            LOGGER.info("/v1/query retrieval: vector - no chunk index to fuse with");
+            return;
+        }
+        LOGGER.info("/v1/query retrieval: {}", config.query().isHybridRetrieval()
+            ? "hybrid - BM25 fused with vector search by reciprocal rank"
+            : "vector - the chunk index is maintained but not read, because "
+                + "excalibur.query.hybrid-retrieval is false");
     }
 
     /**
@@ -801,6 +846,9 @@ public final class ExcaliburApplication {
             // A lambda, not a bound method reference: the arguments are evaluated before
             // addIfPresent gets to check for null, so `chunkIndex::close` would fail here on
             // exactly the shutdown where no index was ever opened.
+            // Before the index: a sweep in flight is inside a compaction of it.
+            .addIfPresent("stop lexical erasure sweep", lexicalErasureSweep,
+                () -> lexicalErasureSweep.close())
             .addIfPresent("close chunk lexical index", chunkIndex, () -> chunkIndex.close())
             // After ingestion has stopped, so what is written is the final state rather than a
             // snapshot something was still adding to. Every operation that changes the registry

@@ -152,6 +152,18 @@ class ConfigGraphTest {
         }
 
         @Test
+        @DisplayName("one ambiguous candidate is refused here, not later at graph-open")
+        void oneAmbiguousCandidateIsRefused() {
+            // The abstention policy needs two readings to call anything ambiguous and throws on
+            // one. Accepting it here only moved the failure to the graph open, where it reads as
+            // a broken store rather than a configuration value the operator can correct.
+            assertThatThrownBy(() ->
+                graph(Map.of("excalibur.graph.max-ambiguous-candidates", "1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max-ambiguous-candidates must be at least 2");
+        }
+
+        @Test
         @DisplayName("a non-positive RAM buffer is refused")
         void nonPositiveRamBuffer() {
             assertThatThrownBy(() -> graph(Map.of("excalibur.graph.ram-buffer-mb", "0")))

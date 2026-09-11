@@ -198,6 +198,40 @@ class DocumentReindexerResultTest {
         }
 
         @Test
+        @DisplayName("a document with nothing to index is skipped, not failed")
+        void aDocumentWithNothingToIndexIsSkipped() {
+            // An empty file, or one the chunker produces nothing from, fails nothing: it is
+            // reported with a reason so the run can account for it, and counting that reason
+            // as an error turns a run that indexed everything it could into a failed run.
+            DocumentReindexer.ReindexResult result = DocumentReindexer.ReindexResult.builder("source-1")
+                .addDocumentResult(new DocumentReindexer.DocumentResult(
+                    "doc-1", 0, 0, 0, 100L, "Empty content"))
+                .addDocumentResult(new DocumentReindexer.DocumentResult(
+                    "doc-2", 0, 0, 0, 100L, "No chunks produced"))
+                .addDocumentResult(new DocumentReindexer.DocumentResult(
+                    "doc-3", 5, 5, 0, 100L, null))
+                .build();
+
+            assertThat(result.getDocumentsSkipped()).isEqualTo(2);
+            assertThat(result.hasErrors())
+                .as("nothing failed, so the run did not fail")
+                .isFalse();
+            assertThat(result.getDocumentsIndexed()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("a document whose chunks failed is still an error")
+        void aDocumentWhoseChunksFailedIsStillAnError() {
+            DocumentReindexer.ReindexResult result = DocumentReindexer.ReindexResult.builder("source-1")
+                .addDocumentResult(new DocumentReindexer.DocumentResult(
+                    "doc-1", 5, 0, 5, 100L, "5 of 5 chunks failed"))
+                .build();
+
+            assertThat(result.hasErrors()).isTrue();
+            assertThat(result.getDocumentsSkipped()).isZero();
+        }
+
+        @Test
         @DisplayName("getErrors returns immutable list")
         void getErrorsReturnsImmutableList() {
             DocumentReindexer.ReindexResult result = DocumentReindexer.ReindexResult.builder("source-1")

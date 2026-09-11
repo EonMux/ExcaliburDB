@@ -147,4 +147,65 @@ class JsonTextTest {
                 .isEqualTo(0.75);
         }
     }
+
+    @Nested
+    @DisplayName("a field is the member of that name, not the first text that looks like it")
+    class FieldIdentity {
+
+        // Every case here is a body a client can send today. The reader used to locate a field by
+        // searching the whole document for its quoted name, so any string the caller controls -
+        // an entity name, a document id, a source id - could stand in for the field itself.
+
+        @Test
+        @DisplayName("an array element does not stand in for the field that follows it")
+        void anArrayElementIsNotTheField() {
+            String body = "{\"context_entities\":[\"query\"],\"query\":\"Who founded Acme?\"}";
+            assertThat(JsonText.string(body, "query")).isEqualTo("Who founded Acme?");
+        }
+
+        @Test
+        @DisplayName("a document id equal to a field name does not redirect the field")
+        void aValueIsNotTheField() {
+            String body = "{\"document_ids\":[\"source_id\",\"victim\"],\"source_id\":\"mine\"}";
+            assertThat(JsonText.string(body, "source_id")).isEqualTo("mine");
+        }
+
+        @Test
+        @DisplayName("a nested member does not answer for a top-level one")
+        void aNestedMemberIsNotTheField() {
+            String body = "{\"config\":{\"source_id\":\"inner\"},\"source_id\":\"outer\"}";
+            assertThat(JsonText.string(body, "source_id")).isEqualTo("outer");
+        }
+
+        @Test
+        @DisplayName("a value that merely reads like a field name is not that field")
+        void aFieldNameInAValueIsNotTheField() {
+            String body = "{\"source_id\":\"docs\",\"document_id\":\"compact\"}";
+            assertThat(JsonText.booleanValue(body, "compact", false)).isFalse();
+        }
+
+        @Test
+        @DisplayName("an absent array field does not adopt the next array in the document")
+        void anArrayFieldDoesNotRunOn() {
+            String body = "{\"included\":\".md\",\"excluded\":[\".git\",\"node_modules\"]}";
+            assertThat(JsonText.stringArray(body, "included")).isNull();
+            assertThat(JsonText.stringArray(body, "excluded"))
+                .containsExactly(".git", "node_modules");
+        }
+
+        @Test
+        @DisplayName("an object field does not adopt the next object in the document")
+        void anObjectFieldDoesNotRunOn() {
+            String body = "{\"name\":\"x\",\"config\":{\"a\":1}}";
+            assertThat(JsonText.object(body, "name")).isNull();
+            assertThat(JsonText.object(body, "config")).isEqualTo("{\"a\":1}");
+        }
+
+        @Test
+        @DisplayName("a number field is read from its own member")
+        void numbersComeFromTheirOwnMember() {
+            String body = "{\"label\":\"top_k\",\"top_k\":7}";
+            assertThat(JsonText.integer(body, "top_k", -1)).isEqualTo(7);
+        }
+    }
 }

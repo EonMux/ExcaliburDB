@@ -30,7 +30,6 @@ import excalibur.shard.ReindexOperationHandler;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceResolver;
-import excalibur.ingest.visibility.DocumentVisibilityChecker;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
 import excalibur.ingest.processor.TermFrequencyTracker;
@@ -55,6 +54,8 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.security.GeneralSecurityException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -366,14 +367,6 @@ public class ExcaliburDBServer {
     }
 
     /**
-     * Returns the ingestion orchestrator, once one has been wired.
-     *
-     * <p>For a caller that has to attach an optional collaborator to it after the pipeline is
-     * built - the graph sink, which belongs to a stack assembled later than this server.</p>
-     *
-     * @return The orchestrator, or null when ingestion runs in stub mode
-     */
-    /**
      * Lexical retrieval over ingested chunks, attached by the application when it keeps an index.
      *
      * <p>Held here rather than passed to the constructor because the index is created from the
@@ -443,6 +436,15 @@ public class ExcaliburDBServer {
         this.lexicalQueryService = service;
     }
 
+    /**
+     * Returns the ingestion orchestrator, once one has been wired.
+     *
+     * <p>For a caller that has to attach an optional collaborator to it after the pipeline is
+     * built: the graph sink and the membership filter both belong to stacks assembled later
+     * than this server.</p>
+     *
+     * @return The orchestrator, or null when ingestion runs in stub mode
+     */
     public excalibur.ingest.pipeline.IngestionOrchestrator getIngestionOrchestrator() {
         return ingestionOrchestrator;
     }
@@ -622,55 +624,42 @@ public class ExcaliburDBServer {
     }
 
     /**
-     * Configures document atomicity based on the provided configuration.
+     * Whether a document's chunks become visible to queries together.
      *
-     * <p>Document atomicity ensures that a document's chunks are buffered and published
-     * to the visibility epoch as a batch, so queries never see partially-ingested documents.
-     * When disabled, chunks become visible immediately upon ingestion.</p>
+     * <p>On, the atomicity filter is installed on the query pipeline and a query never sees
+     * half of a document being ingested. Off, chunks become visible as they land, which is
+     * cheaper and is what {@code excalibur.ingest.document-atomicity=false} asks for.</p>
      *
-     * <h3>Configuration</h3>
-     * <p>This method uses the {@code excalibur.ingest.document-atomicity} config key:
-     * <ul>
-     *   <li>{@code true} (default) - Document atomicity enabled, visibility checker is used</li>
-     *   <li>{@code false} - Document atomicity disabled, visibility checker is null</li>
-     * </ul>
-     * </p>
+     * <p>A server built without a {@link Config} has it on: atomicity is the safe reading, and
+     * the absence of configuration is not a request to drop a correctness guarantee.</p>
      *
-     * <h3>Domain Correctness</h3>
-     * <ul>
-     *   <li>If config is null, document atomicity defaults to enabled (true)</li>
-     *   <li>Method must be called before {@link #start()} to take effect</li>
-     *   <li>Creates a new QueryPipeline instance with appropriate visibility checker</li>
-     * </ul>
-     *
-     * <h3>Thread Safety</h3>
-     * <p>This method is NOT thread-safe and should only be called during initialization,
-     * before starting the server.</p>
-     *
-     * @param documentVisibilityChecker The visibility checker to use when atomicity is enabled,
-     *                                   or null to use config setting
-     * @throws IllegalStateException if the server is already running
+     * @return true when the filter should run
      */
-    public void withDocumentAtomicity(DocumentVisibilityChecker documentVisibilityChecker) {
-        if (running.get()) {
-            throw new IllegalStateException("Cannot configure document atomicity after server has started");
-        }
+    boolean isDocumentAtomicityEnabled() {
+        return config == null || config.ingest().isDocumentAtomicityEnabled();
+    }
 
-        // Determine if document atomicity should be enabled
-        boolean atomicityEnabled = config != null
-            ? config.ingest().isDocumentAtomicityEnabled()
-            : true; // Default to enabled if no config
-
-        if (atomicityEnabled && documentVisibilityChecker != null) {
-            this.queryPipeline = queryPipeline.withVisibilityChecker(documentVisibilityChecker);
-            LOGGER.info("Document atomicity enabled with DocumentVisibilityChecker");
-        } else if (!atomicityEnabled) {
-            // Disable document atomicity by setting visibility checker to null
-            this.queryPipeline = queryPipeline.withVisibilityChecker(null);
-            LOGGER.info("Document atomicity disabled via configuration");
-        } else {
-            LOGGER.debug("Document atomicity enabled but no DocumentVisibilityChecker provided");
+    /**
+     * Installs the atomicity filter on the query pipeline, unless it is turned off or already
+     * installed.
+     *
+     * <p>Every path that configures an ingestion pipeline calls this, so the knob is honoured
+     * in one place rather than in three that can drift.</p>
+     *
+     * @param tracker The tracker the filter reads, or null when this node has none
+     */
+    private void wireDocumentAtomicity(DocumentVisibilityTracker tracker) {
+        if (tracker == null || this.queryPipeline.getVisibilityChecker() != null) {
+            return;
         }
+        if (!isDocumentAtomicityEnabled()) {
+            LOGGER.info("Document atomicity disabled by excalibur.ingest.document-atomicity; "
+                + "a query may see a document that is still being ingested");
+            return;
+        }
+        this.queryPipeline = queryPipeline.withVisibilityChecker(
+            new DocumentVisibilityTrackerAdapter(tracker));
+        LOGGER.info("Query pipeline wired with document visibility checker for atomicity filtering");
     }
 
     /**
@@ -957,17 +946,10 @@ public class ExcaliburDBServer {
             documentTimeoutMs
         );
 
-        // Wire the visibility tracker to the query pipeline for atomicity filtering
-        // This enables DocumentAtomicityFilter to exclude partial documents from query results
-        if (this.queryPipeline.getVisibilityChecker() == null) {
-            this.queryPipeline = queryPipeline.withVisibilityChecker(
-                new DocumentVisibilityTrackerAdapter(documentVisibilityTracker)
-            );
-            LOGGER.info("Query pipeline wired with document visibility checker for atomicity filtering");
-        }
+        wireDocumentAtomicity(documentVisibilityTracker);
 
-        LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity=enabled",
-            documentTimeoutMs);
+        LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity={}",
+            documentTimeoutMs, isDocumentAtomicityEnabled() ? "enabled" : "disabled");
     }
 
     /**
@@ -1041,16 +1023,11 @@ public class ExcaliburDBServer {
             documentTimeoutMs
         );
 
-        // Wire the visibility tracker to the query pipeline for atomicity filtering
-        if (visibilityTracker != null && this.queryPipeline.getVisibilityChecker() == null) {
-            this.queryPipeline = queryPipeline.withVisibilityChecker(
-                new DocumentVisibilityTrackerAdapter(visibilityTracker)
-            );
-            LOGGER.info("Query pipeline wired with shared document visibility checker for atomicity filtering");
-        }
+        wireDocumentAtomicity(visibilityTracker);
 
         LOGGER.info("Ingestion pipeline configured with TextChunker, EmbeddingClient, TermFrequencyTracker, documentTimeoutMs={}ms, documentAtomicity={}",
-            documentTimeoutMs, visibilityTracker != null ? "enabled" : "disabled");
+            documentTimeoutMs,
+            visibilityTracker != null && isDocumentAtomicityEnabled() ? "enabled" : "disabled");
     }
 
     /**
@@ -1144,18 +1121,13 @@ public class ExcaliburDBServer {
         // start(), so the engine back-fills the segments that already exist.
         storageEngine.setVectorPrefilter(lshIngestionService);
 
-        // Wire the visibility tracker to the query pipeline for atomicity filtering
-        if (visibilityTracker != null && this.queryPipeline.getVisibilityChecker() == null) {
-            this.queryPipeline = queryPipeline.withVisibilityChecker(
-                new DocumentVisibilityTrackerAdapter(visibilityTracker)
-            );
-            LOGGER.info("Query pipeline wired with shared document visibility checker for atomicity filtering");
-        }
+        wireDocumentAtomicity(visibilityTracker);
 
         LOGGER.info("Ingestion pipeline configured: TextChunker, TermFrequencyTracker, "
             + "embedding={}, documentTimeoutMs={}ms, documentAtomicity={}, vectorPreFilter={}",
             embeddingClient != null ? "enabled" : "disabled",
-            documentTimeoutMs, visibilityTracker != null ? "enabled" : "disabled",
+            documentTimeoutMs,
+            visibilityTracker != null && isDocumentAtomicityEnabled() ? "enabled" : "disabled",
             lshIngestionService != null ? "enabled" : "disabled");
     }
 
@@ -1231,16 +1203,59 @@ public class ExcaliburDBServer {
         server = created;
         running.set(true);
 
+        // getPort(), not the configured port: a node started on 0 binds an ephemeral port, and
+        // telling the operator it came up "on port 0" withholds the one fact they need to reach it.
         LOGGER.info("ExcaliburDB API server started successfully on port {} ({})",
-            port, security.tls().isEnabled() ? "TLS" : "cleartext");
+            getPort(), security.tls().isEnabled() ? "TLS" : "cleartext");
         LOGGER.info("Endpoints available:");
-        LOGGER.info("  GET    /health           - Health check");
-        LOGGER.info("  GET    /v1/stats         - System statistics");
-        LOGGER.info("  POST   /v1/query         - Query execution");
-        LOGGER.info("  DELETE /v1/query/{id}    - Cancel in-progress query");
-        LOGGER.info("  POST   /v1/ingest        - Register ingestion source");
-        LOGGER.info("  POST   /v1/reindex       - Force reindex");
-        LOGGER.info("  GET    /v1/ingest/status - Ingestion status");
+        for (String line : endpointBanner(documentErasure != null, graphTenants != null,
+                graphTenants == null && graphPipeline != null)) {
+            LOGGER.info("{}", line);
+        }
+    }
+
+    /**
+     * The routes this node serves, as an operator reads them at startup.
+     *
+     * <p>Derived from the same three conditions {@link #registerEndpoints(HttpServer)} branches
+     * on, and package-private so a test can hold the two against each other. The banner is the
+     * only inventory of the HTTP surface an operator is given, so one that quietly omits a
+     * registered route is worse than no banner at all.</p>
+     *
+     * @param erasureWired    Whether {@code /v1/erasure} is registered
+     * @param graphTenanted   Whether the full tenant-backed graph surface is registered
+     * @param graphQueryOnly  Whether only {@code /v1/graph/query} is registered, from a pipeline
+     *                        wired without tenants
+     * @return One line per route, aligned on the description
+     */
+    static List<String> endpointBanner(boolean erasureWired, boolean graphTenanted,
+                                       boolean graphQueryOnly) {
+        List<String> lines = new ArrayList<>(13);
+        lines.add(route("GET", "/health", "Liveness and readiness (unauthenticated)"));
+        lines.add(route("GET", "/v1/stats", "System statistics"));
+        lines.add(route("POST", "/v1/query", "Query execution"));
+        lines.add(route("DELETE", "/v1/query/{query_id}", "Cancel an in-progress query"));
+        lines.add(route("POST", "/v1/ingest", "Register an ingestion source"));
+        lines.add(route("DELETE", "/v1/ingest", "Stop crawling a source"));
+        lines.add(route("GET", "/v1/ingest/status", "Ingestion status per source"));
+        lines.add(route("POST", "/v1/reindex", "Force a reindex"));
+        lines.add(route("GET", "/v1/reindex/status", "Reindex status per source"));
+        if (erasureWired) {
+            lines.add(route("POST", "/v1/erasure", "Remove named documents from the corpus"));
+        }
+        if (graphTenanted || graphQueryOnly) {
+            lines.add(route("POST", "/v1/graph/query", "Answer a question from the graph"));
+        }
+        if (graphTenanted) {
+            lines.add(route("POST", "/v1/graph/build", "Publish the staged facts as the graph"));
+            lines.add(route("POST", "/v1/graph/erasure", "Record an obligation to erase"));
+        }
+        return List.copyOf(lines);
+    }
+
+    /** Widths chosen for the longest method and the longest path above. */
+    private static String route(String method, String path, String description) {
+        return String.format("  %-6s %-20s - %s", method, path, description);
     }
 
     /**
@@ -1389,11 +1404,24 @@ public class ExcaliburDBServer {
      * @param target The HTTP server to register contexts on
      */
     /**
-     * Attaches the graph-RAG pipeline, enabling {@code POST /v1/graph/query}.
+     * Attaches a graph-RAG pipeline the caller opened itself, enabling
+     * {@code POST /v1/graph/query} and nothing else.
+     *
+     * <p>For embedding this server in a process that already holds a pipeline. The standalone
+     * node uses {@link #withGraphSupport} instead, which also registers the build and erasure
+     * routes; a pipeline attached here is a graph somebody else's code owns, so this server
+     * offers no way to rebuild or erase from it and does not close it.</p>
+     *
+     * <p>Ignored when {@link #withGraphSupport} has also been called: a node that can build its
+     * own graph serves that one.</p>
      *
      * <p>Must be called before {@link #start()}; endpoints are registered there, so a pipeline
      * supplied afterwards would be silently ignored. Rejecting it late is better than accepting it
-     * and serving 404.
+     * and serving 404.</p>
+     *
+     * @param pipeline The pipeline to serve, or null for none
+     * @return this server, for chaining
+     * @throws IllegalStateException if the server is already running
      */
     public ExcaliburDBServer withGraphPipeline(
             io.excalibur.retrieval.pipeline.GraphRagPipeline pipeline) {
@@ -1415,9 +1443,10 @@ public class ExcaliburDBServer {
      *
      * <p>Must be called before {@link #start()}; endpoints are registered there.
      *
-     * @param holder       Holds the stack currently being served
-     * @param buildService Builds a new stack from staged facts and installs it
+     * @param tenants Every namespace's graph: what it serves, what it has staged, what it owes
      * @return this server, for chaining
+     * @throws IllegalStateException if the server is already running
+     * @throws NullPointerException if tenants is null
      */
     public ExcaliburDBServer withGraphSupport(excalibur.api.bootstrap.GraphTenants tenants) {
         if (isRunning()) {
@@ -1453,8 +1482,11 @@ public class ExcaliburDBServer {
         // instead of computing embeddings client-side.
         QueryEndpoint queryHandler = new QueryEndpoint(
             queryPipeline, config, null, queryRegistry, embeddingClient, security);
-        // Lexical retrieval, when this node keeps a chunk index. With no embedding client it is
-        // what /v1/query answers from instead of refusing; with one it is a second signal.
+        // Lexical retrieval, when this node keeps a chunk index. On a node with no embedding
+        // client it is what /v1/query answers from instead of refusing the query; on a node
+        // that has one it is the second signal, fused with vector search by rank. Both name
+        // the same thing - the chunk id ingestion assigned - which is what makes them fusible
+        // rather than two id spaces to reconcile.
         queryHandler.setLexicalQueryService(this.lexicalQueryService);
         this.queryEndpoint = queryHandler;
 
@@ -1488,6 +1520,10 @@ public class ExcaliburDBServer {
                 indexOrchestrator.getReindexScheduler(),
                 reindexIntervalMs
             );
+            // So that deregistering a source forgets what its reindex runs did, the way it
+            // already forgets what its ingestion did. /v1/reindex/status serves this registry,
+            // and without the wiring it keeps answering for sources that are gone.
+            inMemRegistry.setReindexStatusRegistry(reindexStatusRegistry);
             LOGGER.info("IngestSourceRegistry wired to ReindexScheduler with interval={}ms", reindexIntervalMs);
 
             // The catalog is attached before its records are read back, so a source restored here
@@ -1539,65 +1575,84 @@ public class ExcaliburDBServer {
         // Register endpoints. Every path goes through the guard: /health is the one
         // unauthenticated route, because a liveness probe cannot carry a token, and it
         // is still rate limited.
+        // Every context below is pinned to its own path. HttpServer matches on the longest
+        // prefix, so without this a path that merely begins with a route's name is served by
+        // that route: /healthz reads back as healthy and /v1/statsfoo returns the statistics.
+        HttpHandler notFound = guard.protect(RequestGuard.Access.PUBLIC, this::handleNotFound);
         target.createContext("/health",
-            wrapHandler(guard.protect(RequestGuard.Access.PUBLIC, healthEndpoint)));
+            wrapHandler(exactPath("/health",
+                guard.protect(RequestGuard.Access.PUBLIC, healthEndpoint), notFound)));
         target.createContext("/v1/stats",
-            wrapHandler(guard.protect(RequestGuard.Access.READ, statsEndpoint)));
+            wrapHandler(exactPath("/v1/stats",
+                guard.protect(RequestGuard.Access.READ, statsEndpoint), notFound)));
         // POST runs a query, DELETE cancels one. Any other method is answered by a handler of its
         // own, so the 405 is charged against the read budget rather than served below the guard.
-        target.createContext("/v1/query", wrapHandler(createMethodRouter(
-            "POST", guard.protect(RequestGuard.Access.READ, queryHandler),
+        // POST is the query itself and takes no sub-path; DELETE carries the query id in one,
+        // so the context serves its own path and its children and each method is pinned within.
+        target.createContext("/v1/query", wrapHandler(pathOrChild("/v1/query", createMethodRouter(
+            "POST", exactPath("/v1/query",
+                guard.protect(RequestGuard.Access.READ, queryHandler), notFound),
             "DELETE", guard.protect(RequestGuard.Access.MUTATE, queryCancelEndpoint),
-            guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
-                "Method Not Allowed - Use POST for queries or DELETE for cancellation")))));
+            exactPath("/v1/query", guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                "Method Not Allowed - Use POST for queries or DELETE for cancellation")),
+                notFound)), notFound)));
         // POST registers a source, DELETE stops crawling one. Both mutate, and both are charged
         // against the mutate budget; the same shape /v1/query uses for query and cancel.
-        target.createContext("/v1/ingest", wrapHandler(createMethodRouter(
+        target.createContext("/v1/ingest", wrapHandler(exactPath("/v1/ingest", createMethodRouter(
             "POST", guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint),
             "DELETE", guard.protect(RequestGuard.Access.MUTATE,
                 new excalibur.api.endpoint.SourceDeregisterEndpoint(ingestSourceRegistry)),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use POST to register a source "
-                    + "or DELETE to stop crawling one")))));
+                    + "or DELETE to stop crawling one"))), notFound)));
         target.createContext("/v1/reindex",
-            wrapHandler(guard.protect(RequestGuard.Access.MUTATE, reindexHandler)));
+            wrapHandler(exactPath("/v1/reindex",
+                guard.protect(RequestGuard.Access.MUTATE, reindexHandler), notFound)));
         target.createContext("/v1/ingest/status",
-            wrapHandler(guard.protect(RequestGuard.Access.READ, ingestStatusEndpoint)));
+            wrapHandler(exactPath("/v1/ingest/status",
+                guard.protect(RequestGuard.Access.READ, ingestStatusEndpoint), notFound)));
+        // The readback for /v1/reindex, which answers 202 and works in the background. Without
+        // it the run's verdict reached the node's log and nothing else. A longer path than
+        // /v1/reindex, so the server's longest-prefix matching routes it here rather than to
+        // the reindex handler, which answers 405 to a GET.
+        target.createContext("/v1/reindex/status",
+            wrapHandler(exactPath("/v1/reindex/status", guard.protect(RequestGuard.Access.READ,
+                new excalibur.api.endpoint.ReindexStatusEndpoint(reindexStatusRegistry)),
+                notFound)));
         // A mutation, and the most consequential one: it removes content rather than adding it.
         if (documentErasure != null) {
-            target.createContext("/v1/erasure", wrapHandler(guard.protect(
-                RequestGuard.Access.MUTATE,
-                new excalibur.api.endpoint.DocumentErasureEndpoint(
-                    documentErasure, ingestSourceRegistry))));
+            target.createContext("/v1/erasure", wrapHandler(exactPath("/v1/erasure",
+                guard.protect(RequestGuard.Access.MUTATE,
+                    new excalibur.api.endpoint.DocumentErasureEndpoint(
+                        documentErasure, ingestSourceRegistry)), notFound)));
         }
 
         // Registered only when a graph store is configured. A read, not a mutation: it walks the
         // graph and returns context, and charging it against the smaller mutate budget would
         // throttle ordinary questions.
         if (graphTenants != null) {
-            target.createContext("/v1/graph/query", wrapHandler(guard.protect(
-                RequestGuard.Access.READ,
-                new excalibur.api.endpoint.GraphQueryEndpoint(graphTenants))));
+            target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
+                guard.protect(RequestGuard.Access.READ,
+                    new excalibur.api.endpoint.GraphQueryEndpoint(graphTenants)), notFound)));
             // Both mutations: they rewrite the served graph.
-            target.createContext("/v1/graph/build", wrapHandler(guard.protect(
-                RequestGuard.Access.MUTATE,
-                new excalibur.api.endpoint.GraphBuildEndpoint(graphTenants))));
-            target.createContext("/v1/graph/erasure", wrapHandler(guard.protect(
-                RequestGuard.Access.MUTATE,
-                new excalibur.api.endpoint.GraphErasureEndpoint(graphTenants))));
+            target.createContext("/v1/graph/build", wrapHandler(exactPath("/v1/graph/build",
+                guard.protect(RequestGuard.Access.MUTATE,
+                    new excalibur.api.endpoint.GraphBuildEndpoint(graphTenants)), notFound)));
+            target.createContext("/v1/graph/erasure", wrapHandler(exactPath("/v1/graph/erasure",
+                guard.protect(RequestGuard.Access.MUTATE,
+                    new excalibur.api.endpoint.GraphErasureEndpoint(graphTenants)), notFound)));
         } else if (graphPipeline != null) {
-            target.createContext("/v1/graph/query", wrapHandler(guard.protect(
-                RequestGuard.Access.READ,
-                new excalibur.api.endpoint.GraphQueryEndpoint(graphPipeline))));
+            target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
+                guard.protect(RequestGuard.Access.READ,
+                    new excalibur.api.endpoint.GraphQueryEndpoint(graphPipeline)), notFound)));
         }
 
-        target.createContext("/",
-            wrapHandler(guard.protect(RequestGuard.Access.PUBLIC, this::handleNotFound)));
+        target.createContext("/", wrapHandler(notFound));
 
         LOGGER.info("Registered endpoints with authentication {}: /health (public), /v1/stats, "
                 + "/v1/query (POST=query, DELETE=cancel), "
                 + "/v1/ingest (POST=register, DELETE=stop crawling), /v1/reindex, "
-                + "/v1/ingest/status{}{}",
+                + "/v1/ingest/status, /v1/reindex/status{}{}",
             security.isAuthenticationRequired() ? "required" : "disabled",
             documentErasure != null ? ", /v1/erasure" : "",
             graphTenants != null
@@ -1627,6 +1682,62 @@ public class ExcaliburDBServer {
         public excalibur.ingest.source.Source get(String sourceId) {
             return delegate.get(sourceId);
         }
+    }
+
+    /**
+     * Serves a context only for the exact path it was registered under.
+     *
+     * <p>{@code HttpServer} dispatches on the longest matching <em>prefix</em>, so a context at
+     * {@code /v1/stats} also receives {@code /v1/statsfoo}, and {@code /health} receives
+     * {@code /healthz}. A client with a typo in its URL would be answered as though it had
+     * none - a liveness probe pointed at the wrong path reading back "healthy" is the worst
+     * case, and the documented contract is that anything this server does not serve answers
+     * 404. One trailing slash is the same path, because that is what a browser and most HTTP
+     * clients produce for a bare route.</p>
+     *
+     * @param context  The path this context is registered under
+     * @param delegate What serves the path itself
+     * @param notFound What answers every other path reaching this context
+     * @return A handler that answers 404 for every other path under the context
+     */
+    private static HttpHandler exactPath(String context, HttpHandler delegate,
+                                         HttpHandler notFound) {
+        return exchange -> {
+            if (isExactly(context, exchange.getRequestURI().getPath())) {
+                delegate.handle(exchange);
+            } else {
+                notFound.handle(exchange);
+            }
+        };
+    }
+
+    /**
+     * Serves a context for its own path and for the paths directly beneath it.
+     *
+     * <p>For {@code /v1/query}, whose cancel route carries the query id in the path. Anything
+     * deeper than one segment, or under a longer prefix that merely starts the same way, is
+     * still 404.</p>
+     *
+     * @param context  The path this context is registered under
+     * @param delegate What serves the path and its children
+     * @param notFound What answers every other path reaching this context
+     * @return A handler that answers 404 for paths outside the context
+     */
+    private static HttpHandler pathOrChild(String context, HttpHandler delegate,
+                                           HttpHandler notFound) {
+        return exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if (isExactly(context, path) || path.startsWith(context + "/")) {
+                delegate.handle(exchange);
+            } else {
+                notFound.handle(exchange);
+            }
+        };
+    }
+
+    /** Whether a request path is a context's own path, with or without one trailing slash. */
+    private static boolean isExactly(String context, String path) {
+        return context.equals(path) || (context + "/").equals(path);
     }
 
     /**

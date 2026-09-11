@@ -523,6 +523,46 @@ public class WriteLog implements AutoCloseable {
     }
 
     /**
+     * Checks that this log can take an entry for {@code key} and {@code value}.
+     *
+     * <p>What makes the log write-ahead. A segment cannot append first and mutate second,
+     * because the mutation is also what decides whether the write is admissible at all - a
+     * Robin Hood insertion discovers a probe-length or distance overflow only by attempting the
+     * placement, and a write the segment refuses must never be in the log for a tail scan to
+     * read or a restart to replay. So the order is: ask here whether the log could take it,
+     * mutate, then append. This is the only part of an append that can refuse a well-formed
+     * entry, so once it has passed the append that follows cannot leave the segment holding a
+     * change the log has no record of.</p>
+     *
+     * <p>A check, not a booking: nothing is held. It stays true only for as long as no other
+     * thread appends, which is what the caller's own lock is for - every mutation of a segment
+     * holds that segment's write lock, and a log belongs to one segment.</p>
+     *
+     * @param opcode The operation code the entry will carry
+     * @param key    The key bytes
+     * @param value  The value bytes, empty for a delete
+     * @throws IOException              if the log could not take the entry
+     * @throws IllegalArgumentException if the entry is malformed, exactly as the append would
+     * @throws IllegalStateException    if the log is closed
+     */
+    public void reserve(byte opcode, byte[] key, byte[] value) throws IOException {
+        // The same validation the entry itself performs, and for the same reason it has to
+        // happen here: an entry rejected during the append has already been applied to the
+        // segment. Anything append can refuse, reserve refuses first.
+        LogEntry.validateOpcode(opcode);
+        LogEntry.validateKey(key);
+        LogEntry.validateValue(value, opcode);
+        ensureOpen();
+
+        appendLock.lock();
+        try {
+            ensureCapacity(LogEntry.calculateSize(key.length, value.length));
+        } finally {
+            appendLock.unlock();
+        }
+    }
+
+    /**
      * Appends a PUT entry to the write-ahead log.
      *
      * @param key   The key bytes

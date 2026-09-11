@@ -341,6 +341,99 @@ class HierarchicalCuckooFilterTest {
     }
 
     @Nested
+    @DisplayName("Saturation withdraws the level's authority")
+    class SaturationTests {
+
+        /** Fills a segment until the hierarchy refuses a term, and returns how many it took. */
+        private int fillUntilRefused(HierarchicalCuckooFilter filter, String segment, int bound) {
+            for (int i = 0; i < bound; i++) {
+                if (!filter.insert(toBytes(segment + "-term-" + i), segment)) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        @Test
+        @DisplayName("a segment that refused a term can no longer answer for that segment")
+        void aRefusedTermWithdrawsTheSegmentsVerdict() {
+            // A cuckoo filter that cannot accept a term does not hold it, and a query for that
+            // term would read the filter's silence as "not in this segment" and skip it. The
+            // documents are in storage and the answer is empty, which is the one outcome a
+            // pre-filter must never produce.
+            HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 100_000, 8);
+            small.registerSegment(SEGMENT_1, CLUSTER_1);
+            small.registerSegment(SEGMENT_2, CLUSTER_1);
+            small.insert(toBytes("kept"), SEGMENT_2);
+
+            assertThat(fillUntilRefused(small, SEGMENT_1, 4096))
+                .as("the segment level has to fill for this test to mean anything")
+                .isNotNegative();
+
+            assertThat(small.coversSegment(SEGMENT_1)).isFalse();
+            assertThat(small.coversSegment(SEGMENT_2))
+                .as("one segment running out of room says nothing about another")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("a full corpus level withdraws every segment's verdict")
+        void aFullCorpusLevelWithdrawsEveryVerdict() {
+            // The corpus filter is the first level findCandidateSegments consults, so a term it
+            // has no room for is invisible everywhere - not only in the segment being written.
+            HierarchicalCuckooFilter tiny = new HierarchicalCuckooFilter(8, 13, 1_000_000, 1_000_000);
+            tiny.registerSegment(SEGMENT_1, CLUSTER_1);
+            tiny.registerSegment(SEGMENT_2, CLUSTER_2);
+            tiny.insert(toBytes("kept"), SEGMENT_2);
+
+            assertThat(fillUntilRefused(tiny, SEGMENT_1, 4096))
+                .as("the corpus level has to fill for this test to mean anything")
+                .isNotNegative();
+
+            assertThat(tiny.isSaturated()).isTrue();
+            assertThat(tiny.coversSegment(SEGMENT_1)).isFalse();
+            assertThat(tiny.coversSegment(SEGMENT_2)).isFalse();
+        }
+
+        @Test
+        @DisplayName("a populated segment that never refused anything is authoritative")
+        void aPopulatedSegmentIsAuthoritative() {
+            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.insert(toBytes("alpha"), SEGMENT_1);
+
+            assertThat(hierarchy.coversSegment(SEGMENT_1)).isTrue();
+            assertThat(hierarchy.isSaturated()).isFalse();
+        }
+
+        @Test
+        @DisplayName("a segment holding nothing has no verdict to give")
+        void anEmptySegmentHasNoVerdict() {
+            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+
+            assertThat(hierarchy.coversSegment(SEGMENT_1)).isFalse();
+            assertThat(hierarchy.coversSegment("never-registered")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a segment rebuilt from scratch is trusted again")
+        void aRebuiltSegmentIsTrustedAgain() {
+            // A split replaces a segment with children, and a reindex re-registers one. The new
+            // filter has refused nothing, so carrying the old mark would disable pruning for a
+            // segment id forever.
+            HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 100_000, 8);
+            small.registerSegment(SEGMENT_1, CLUSTER_1);
+            assertThat(fillUntilRefused(small, SEGMENT_1, 4096)).isNotNegative();
+            assertThat(small.coversSegment(SEGMENT_1)).isFalse();
+
+            small.unregisterSegment(SEGMENT_1);
+            small.registerSegment(SEGMENT_1, CLUSTER_1);
+            small.insert(toBytes("fresh"), SEGMENT_1);
+
+            assertThat(small.coversSegment(SEGMENT_1)).isTrue();
+        }
+    }
+
+    @Nested
     @DisplayName("String Key Helpers")
     class StringKeyHelperTests {
 

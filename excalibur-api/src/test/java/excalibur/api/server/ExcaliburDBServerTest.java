@@ -312,11 +312,10 @@ class ExcaliburDBServerTest {
     class MethodTests {
 
         @Test
-        @DisplayName("health accepts POST (returns 200 for any method if process is alive)")
-        void healthAcceptsPost() throws IOException {
+        @DisplayName("health rejects POST, like every other read route")
+        void healthRejectsPost() throws IOException {
             HttpURLConnection conn = connect("POST", "/health");
-            // Health endpoint returns 200 for any HTTP method if process is alive
-            assertThat(conn.getResponseCode()).isEqualTo(200);
+            assertThat(conn.getResponseCode()).isEqualTo(405);
             conn.disconnect();
         }
 

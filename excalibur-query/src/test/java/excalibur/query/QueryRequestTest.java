@@ -77,38 +77,6 @@ class QueryRequestTest {
         }
 
         @Test
-        @DisplayName("rejects recallTarget outside [0.0, 1.0]")
-        void rejectsInvalidRecallTarget() {
-            assertThatThrownBy(() -> QueryRequest.builder()
-                    .queryVector(createVector(10))
-                    .recallTarget(-0.1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("recallTarget must be in [0.0, 1.0]");
-
-            assertThatThrownBy(() -> QueryRequest.builder()
-                    .queryVector(createVector(10))
-                    .recallTarget(1.1))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("recallTarget must be in [0.0, 1.0]");
-        }
-
-        @Test
-        @DisplayName("accepts recallTarget at boundaries")
-        void acceptsBoundaryRecallTarget() {
-            QueryRequest r1 = QueryRequest.builder()
-                .queryVector(createVector(10))
-                .recallTarget(0.0)
-                .build();
-            assertThat(r1.recallTarget()).isEqualTo(0.0);
-
-            QueryRequest r2 = QueryRequest.builder()
-                .queryVector(createVector(10))
-                .recallTarget(1.0)
-                .build();
-            assertThat(r2.recallTarget()).isEqualTo(1.0);
-        }
-
-        @Test
         @DisplayName("rejects non-positive timeoutMs")
         void rejectsNonPositiveTimeoutMs() {
             assertThatThrownBy(() -> QueryRequest.builder()
@@ -236,7 +204,6 @@ class QueryRequestTest {
                 .queryText("test query")
                 .queryVector(vector)
                 .topK(20)
-                .recallTarget(0.95)
                 .timeoutMs(5000)
                 .includePartialSegments(false)
                 .threshold(0.5f)
@@ -248,7 +215,6 @@ class QueryRequestTest {
             assertThat(request.queryText()).isEqualTo("test query");
             assertThat(request.dimension()).isEqualTo(128);
             assertThat(request.topK()).isEqualTo(20);
-            assertThat(request.recallTarget()).isEqualTo(0.95);
             assertThat(request.timeoutMs()).isEqualTo(5000);
             assertThat(request.includePartialSegments()).isFalse();
             assertThat(request.threshold()).isEqualTo(0.5f);

@@ -308,6 +308,71 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
     }
 
     /**
+     * Borrows {@code id} only if it is already open, and without counting as a use of it.
+     *
+     * <p>For background work that visits every open namespace on a schedule - an erasure sweep,
+     * a metrics pass. Two things separate it from {@link #borrowIfPresent}, and both matter only
+     * because the caller is a timer rather than a request:</p>
+     *
+     * <ul>
+     *   <li>It never loads. A namespace the budget has already evicted is not serving anything,
+     *       and reopening it to ask a question about it spends the mappings the eviction freed.
+     *       It is visited again on the first pass after a real request brings it back.</li>
+     *   <li>It does not touch recency. The open map is access-ordered, so an ordinary lookup
+     *       marks a namespace recently used - and a sweep that touches all of them leaves every
+     *       one equally fresh, which makes the eviction order the sweep's iteration order rather
+     *       than the workload's. A visit nobody asked for must not decide what stays resident.</li>
+     * </ul>
+     *
+     * <p>The lease still defers eviction for as long as it is held, which is the point: a
+     * compaction the sweep starts must not have its store unmapped underneath it.</p>
+     *
+     * @param id the namespace to visit
+     * @return a lease over the resource, or empty if the namespace is not currently open
+     * @throws IllegalArgumentException if {@code id} is null
+     * @throws IllegalStateException    if the registry is closed
+     */
+    public Optional<Lease<T>> borrowResident(NamespaceId id) {
+        if (id == null) {
+            throw new IllegalArgumentException("namespace id must not be null");
+        }
+        lock.lock();
+        try {
+            checkOpen();
+            // getOrDefault(..., null) rather than get: both read the map, and only this one
+            // leaves the access order alone. That is the whole difference this method exists for.
+            Entry<T> entry = residentWithoutTouching(id);
+            if (entry == null) {
+                return Optional.empty();
+            }
+            entry.borrows++;
+            return Optional.of(new BorrowedLease<>(this, entry));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Looks a namespace up without recording the lookup as a use.
+     *
+     * <p>{@link LinkedHashMap} in access order reorders on {@code get} and on
+     * {@code getOrDefault}, but not on {@code containsKey} - so the entry is reached by iterating
+     * the values, which is bounded by {@code maxOpenNamespaces} and is not on any request path.
+     * </p>
+     */
+    private Entry<T> residentWithoutTouching(NamespaceId id) {
+        if (!open.containsKey(id)) {
+            return null;
+        }
+        for (Entry<T> candidate : open.values()) {
+            if (candidate.id.equals(id)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Gives up one borrow, closing the resource if this was the last lease on an evicted entry.
      *
      * <p>Called only by {@link BorrowedLease}, and only once per lease.
@@ -369,8 +434,9 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
      * limit: the headroom absorbs the times a namespace turns out larger than the average.
      */
     private void evictUntilRoomFor(NamespaceId incoming) {
-        long estimate = estimatedCostOfNextLoad();
-        while (open.size() >= maxOpenNamespaces || budget.wouldExceedHighWater(estimate)) {
+        long[] estimate = estimatedCostOfNextLoad();
+        while (open.size() >= maxOpenNamespaces
+                || budget.wouldExceedHighWater(estimate[0], estimate[1])) {
             NamespaceId victim = chooseVictim(incoming);
             if (victim == null && open.isEmpty()) {
                 // Nothing is open, so nothing can be evicted: the budget has no room for even
@@ -398,21 +464,28 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
     }
 
     /**
-     * How many mappings to reserve for a namespace that has not been opened yet.
+     * How many mappings and descriptors to reserve for a namespace not yet opened.
      *
      * <p>The mean of what is already open, which is the only evidence available. Falls back to one
-     * mapping when nothing is open - enough that an empty registry does not reserve the whole
+     * of each when nothing is open - enough that an empty registry does not reserve the whole
      * budget for a namespace whose size is entirely unknown.
+     *
+     * @return {@code {mappings, descriptors}}
      */
-    private long estimatedCostOfNextLoad() {
+    private long[] estimatedCostOfNextLoad() {
         if (open.isEmpty()) {
-            return 1L;
+            return new long[] {1L, 1L};
         }
-        long total = 0;
+        long mappings = 0;
+        long descriptors = 0;
         for (Entry<T> entry : open.values()) {
-            total += entry.mappings;
+            mappings += entry.mappings;
+            descriptors += entry.descriptors;
         }
-        return Math.max(1L, total / open.size());
+        return new long[] {
+            Math.max(1L, mappings / open.size()),
+            Math.max(1L, descriptors / open.size())
+        };
     }
 
     /**
@@ -487,6 +560,50 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
      * @return what happened - {@link Eviction#NOT_OPEN}, {@link Eviction#CLOSED} or
      *         {@link Eviction#DEFERRED}
      */
+    /**
+     * Re-measures what an open namespace costs and corrects the budget by the difference.
+     *
+     * <p>A resource's cost is not fixed for its lifetime. A graph tenant that was opened before
+     * anything had been built into it holds no mappings and is charged none; once a build
+     * installs a store it holds thirteen. Nothing reopens it - a pinned namespace never is - so
+     * without this the budget would go on believing the figure taken at load and under-count the
+     * process's real mappings for as long as it ran.
+     *
+     * <p>Evicting it to force a reopen would also re-measure, and used to be how this happened,
+     * but eviction hands the next caller a <em>different</em> resource. For a namespace something
+     * holds for the life of the process that is not a re-measurement, it is a second resource on
+     * the same files.
+     *
+     * @param id the namespace to re-measure
+     * @return true if it was open and its cost had changed
+     * @throws IllegalArgumentException if {@code id} is null
+     */
+    public boolean recost(NamespaceId id) {
+        if (id == null) {
+            throw new IllegalArgumentException("namespace id must not be null");
+        }
+        lock.lock();
+        try {
+            Entry<T> entry = open.get(id);
+            if (entry == null) {
+                return false;
+            }
+            long[] measured = cost.costOf(entry.resource);
+            if (measured[0] == entry.mappings && measured[1] == entry.descriptors) {
+                return false;
+            }
+            budget.release(entry.mappings, entry.descriptors);
+            budget.acquire(measured[0], measured[1]);
+            LOGGER.debug("recosted namespace {}: {} -> {} mappings, {} -> {} fds; {}",
+                id, entry.mappings, measured[0], entry.descriptors, measured[1], budget);
+            entry.mappings = measured[0];
+            entry.descriptors = measured[1];
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public Eviction evictOrDefer(NamespaceId id) {
         lock.lock();
         try {
@@ -554,6 +671,10 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
      * <p>Worth a gauge. This is the only outward sign of a lease that was never closed, and such a
      * lease holds mappings the registry can no longer reclaim by any means short of a restart, so a
      * count that does not come back down is the shape a mapping leak has.
+     *
+     * <p>On a registry that has been closed the count means something else: readers that outlived
+     * the shutdown drain, which release on their own. Read it as a leak gauge only while the
+     * registry is open.
      */
     public int pendingCloseCount() {
         lock.lock();
@@ -589,9 +710,14 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
      *
      * <p>The registry itself is closed regardless and refuses further work at once. It does not
      * wait for leases: blocking shutdown on a lease that is never released would hang the process,
-     * where returning leaves at worst a few namespaces mapped until the process exits. An
-     * outstanding lease at this point is a caller that has not finished tidying up, so the count is
-     * logged at warning level. {@link #pendingCloseCount()} reports what is left.
+     * where returning leaves at worst a few namespaces mapped until the process exits.
+     *
+     * <p>A lease outstanding here is a reader that outlived the shutdown drain - a graph query
+     * waiting on a chat model, typically - and the deferred close is the designed outcome, not a
+     * fault. The count is recorded at info level for that reason: at shutdown "still mapped"
+     * means "until this process exits, moments from now", and warning about it sends an operator
+     * hunting a lease leak that is not there. {@link #pendingCloseCount()} is the leak gauge, and
+     * it is a gauge for a <em>running</em> registry.
      */
     @Override
     public void close() {
@@ -605,8 +731,9 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
                 evictOrDefer(id, "registry closing");
             }
             if (pendingCloses > 0) {
-                LOGGER.warn("registry closed with {} namespace(s) still borrowed; each stays "
-                    + "mapped until its last lease is released. {}", pendingCloses, budget);
+                LOGGER.info("registry closed with {} namespace(s) still borrowed by in-flight "
+                    + "readers; each unmaps as its last lease is released, or with the process. "
+                    + "{}", pendingCloses, budget);
             }
         } finally {
             lock.unlock();
@@ -636,8 +763,10 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
 
         private final NamespaceId id;
         private final T resource;
-        private final long mappings;
-        private final long descriptors;
+
+        /** What this resource is charged for. Re-measured by recost; guarded by the lock. */
+        private long mappings;
+        private long descriptors;
 
         /** Leases outstanding. Guarded by the registry's lock. */
         private int borrows;

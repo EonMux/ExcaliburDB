@@ -526,6 +526,38 @@ class CompactionWorkerTest {
         worker.stop();
     }
 
+    @Test
+    @DisplayName("compaction sizes the replacement from the original, not one region larger")
+    void compaction_doesNotGrowTheSlotTable() throws IOException, InterruptedException {
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<Segment> replacement = new AtomicReference<>();
+        CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
+            replacement.set(newSeg);
+            latch.countDown();
+        });
+
+        Segment segment = createTestSegment("segment_slots");
+        segment.attachWriteLog(new WriteLog(tempDir.resolve("segment_slots.wal")));
+        int before = segment.slotCount();
+
+        segment.put("keep".getBytes(), "value".getBytes());
+        segment.put("drop".getBytes(), "value".getBytes());
+        segment.delete("drop".getBytes());
+
+        worker.requestCompaction(segment);
+        assertThat(latch.await(30, TimeUnit.SECONDS)).isTrue();
+
+        // The Segment constructor adds its own 1MB data region on top of the slot table it
+        // derives from the byte count. A caller that also adds one is sizing the slot table
+        // from a byte count that includes it, so every generation of compaction doubles the
+        // table while the data region it is meant to serve stays exactly as big as it was.
+        assertThat(replacement.get().slotCount())
+            .as("a compaction must not widen the slot table it was asked to reproduce")
+            .isEqualTo(before);
+
+        worker.stop();
+    }
+
     private Segment createTestSegment(String name) throws IOException {
         Path segmentPath = tempDir.resolve(name + ".dat");
         Segment segment = new Segment(segmentPath, 1024 * 1024, arena);

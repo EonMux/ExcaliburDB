@@ -57,7 +57,8 @@ public final class SegmentGraphRebuilder {
      *
      * <p>The checkpoint is set last and to the head of the log the segment holds now: after the
      * rebuild the graph describes the data file, and the only entries still to integrate are the
-     * ones appended from this point on.</p>
+     * ones appended from this point on. A rebuild that stops partway leaves it alone instead,
+     * and reports the count it reached.</p>
      *
      * @param segment The segment whose entries to index
      * @param graph   The graph to fill; expected to be empty
@@ -96,8 +97,14 @@ public final class SegmentGraphRebuilder {
                 inserted++;
             }
         } catch (RuntimeException e) {
-            LOGGER.error("Rebuilding the HNSW graph for {} stopped after {} vectors: {}",
-                segment.path(), inserted, e.toString());
+            // The checkpoint is deliberately left where it is. Moving it to the head says the
+            // graph speaks for the whole data file, and everything behind it is never read
+            // again - so on a rebuild that stopped partway it would retire exactly the entries
+            // that still need indexing, silently and for good.
+            LOGGER.error("Rebuilding the HNSW graph for {} stopped after {} vectors, leaving the "
+                + "checkpoint at {} so the entries it did not reach are still to integrate: {}",
+                segment.path(), inserted, graph.getLastIntegratedOffset(), e.toString());
+            return inserted;
         }
 
         long head = segment.getWriteLogHead();

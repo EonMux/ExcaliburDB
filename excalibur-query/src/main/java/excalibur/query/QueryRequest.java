@@ -19,7 +19,6 @@ import java.util.Objects;
  *     .queryText("search query text")
  *     .queryVector(vector)
  *     .topK(10)
- *     .recallTarget(0.95)
  *     .timeoutMs(5000)
  *     .includePartialSegments(true)
  *     .build();
@@ -32,7 +31,6 @@ import java.util.Objects;
  * <ul>
  *   <li>Query vector must be non-null and non-empty</li>
  *   <li>topK must be positive and at most {@link #MAX_TOP_K}</li>
- *   <li>recallTarget must be in range [0.0, 1.0]</li>
  *   <li>timeoutMs must be positive</li>
  *   <li>threshold must be in range [0.0, 1.0]</li>
  * </ul>
@@ -79,7 +77,6 @@ public final class QueryRequest {
      * Target recall for the query (0.0 to 1.0).
      * Higher values may result in longer query times.
      */
-    private final double recallTarget;
 
     /**
      * Timeout for query execution in milliseconds.
@@ -125,7 +122,6 @@ public final class QueryRequest {
             ? builder.queryVector.clone()
             : null;
         this.topK = builder.topK;
-        this.recallTarget = builder.recallTarget;
         this.timeoutMs = builder.timeoutMs;
         this.includePartialSegments = builder.includePartialSegments;
         this.threshold = builder.threshold;
@@ -151,9 +147,6 @@ public final class QueryRequest {
         }
         if (topK > MAX_TOP_K) {
             throw new IllegalStateException("topK must be at most " + MAX_TOP_K + ": " + topK);
-        }
-        if (recallTarget < 0.0 || recallTarget > 1.0) {
-            throw new IllegalStateException("recallTarget must be in [0.0, 1.0]: " + recallTarget);
         }
         if (timeoutMs <= 0) {
             throw new IllegalStateException("timeoutMs must be positive: " + timeoutMs);
@@ -256,9 +249,6 @@ public final class QueryRequest {
      *
      * @return The recall target (0.0 to 1.0)
      */
-    public double recallTarget() {
-        return recallTarget;
-    }
 
     /**
      * Returns the timeout for query execution.
@@ -339,7 +329,17 @@ public final class QueryRequest {
     // ==================== Conversion ====================
 
     /**
-     * Converts this request to QueryOptions.
+     * Converts this request to QueryOptions, timeout and all.
+     *
+     * <p>Not what the pipeline uses, and deliberately so. The timeout carried here is the
+     * request's whole budget, measured from before stage 0; a segment fan-out given that budget
+     * outlives the pipeline's own deadline, so the pipeline is abandoned first and every segment
+     * that did answer in time is discarded - a partial result turned into an empty one. The
+     * pipeline therefore builds its own options against what is left of the deadline, less the
+     * share the merge needs.</p>
+     *
+     * <p>For a caller running a single search outside the pipeline, where the request's budget
+     * is the only budget there is.</p>
      *
      * @return QueryOptions with equivalent settings
      */
@@ -361,7 +361,6 @@ public final class QueryRequest {
         if (o == null || getClass() != o.getClass()) return false;
         QueryRequest that = (QueryRequest) o;
         return topK == that.topK &&
-            Double.compare(that.recallTarget, recallTarget) == 0 &&
             timeoutMs == that.timeoutMs &&
             includePartialSegments == that.includePartialSegments &&
             Float.compare(that.threshold, threshold) == 0 &&
@@ -375,7 +374,7 @@ public final class QueryRequest {
 
     @Override
     public int hashCode() {
-        int result = Objects.hash(queryText, topK, recallTarget, timeoutMs,
+        int result = Objects.hash(queryText, topK, timeoutMs,
             includePartialSegments, threshold, enableLlmScoring, llmThreshold,
             oversamplingFactor, correlationId);
         result = 31 * result + Arrays.hashCode(queryVector);
@@ -385,8 +384,8 @@ public final class QueryRequest {
     @Override
     public String toString() {
         return String.format(
-            "QueryRequest{dim=%d, topK=%d, recall=%.2f, timeout=%dms, partial=%s, threshold=%.2f, oversampling=%d}",
-            queryVector.length, topK, recallTarget, timeoutMs, includePartialSegments, threshold, oversamplingFactor);
+            "QueryRequest{dim=%d, topK=%d, timeout=%dms, partial=%s, threshold=%.2f, oversampling=%d}",
+            queryVector.length, topK, timeoutMs, includePartialSegments, threshold, oversamplingFactor);
     }
 
     // ==================== Builder ====================
@@ -398,7 +397,6 @@ public final class QueryRequest {
         private String queryText;
         private float[] queryVector;
         private int topK = 10;
-        private double recallTarget = 0.95;
         private long timeoutMs = 30_000; // 30 seconds default
         private boolean includePartialSegments = true;
         private float threshold = 0.0f;
@@ -446,20 +444,6 @@ public final class QueryRequest {
                 throw new IllegalArgumentException("topK must be at most " + MAX_TOP_K + ": " + topK);
             }
             this.topK = topK;
-            return this;
-        }
-
-        /**
-         * Sets the target recall for the query.
-         *
-         * @param recallTarget The recall target (0.0 to 1.0)
-         * @return This builder
-         */
-        public Builder recallTarget(double recallTarget) {
-            if (recallTarget < 0.0 || recallTarget > 1.0) {
-                throw new IllegalArgumentException("recallTarget must be in [0.0, 1.0]: " + recallTarget);
-            }
-            this.recallTarget = recallTarget;
             return this;
         }
 

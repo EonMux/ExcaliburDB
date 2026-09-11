@@ -17,8 +17,10 @@ import io.excalibur.config.Config;
  * <ul>
  *   <li><b>No key.</b> Documents are chunked, stored and term-indexed; queries answer from plain
  *       BM25. Nothing calls out to a model.</li>
- *   <li><b>A key.</b> The corpus is embedded, and {@code POST /v1/query} takes the vector path,
- *       which fuses its own signals and does not consult the lexical service.</li>
+ *   <li><b>A key.</b> The corpus is embedded, and {@code POST /v1/query} runs both signals:
+ *       vector search and BM25 over the same chunks, fused by rank. The query is not expanded,
+ *       because expansion is what carries the semantics when there are no vectors and here
+ *       there are.</li>
  *   <li><b>A key with {@code excalibur.llm.embeddings-enabled=false}.</b> No embedding pass; the
  *       chat model expands the query instead, and BM25 does the retrieval. A few dozen generated
  *       tokens per query against billions of embedded tokens per corpus.</li>

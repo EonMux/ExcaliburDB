@@ -85,6 +85,46 @@ class TermFilterCoverageTest {
     }
 
     @Test
+    @DisplayName("a segment whose filter ran out of room excludes nothing")
+    void aSaturatedSegmentHasNoVerdict() {
+        // The undersized-filter case. Terms were recorded right up to the point the segment's
+        // filter filled, so it holds some of what the segment holds and reads as authoritative
+        // - and every term it had no room for now prunes the segment that contains it. The
+        // documents are in storage and the query answers with nothing.
+        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(10_000L, 13, 1_000, 8);
+        filter.registerSegment("0", "cluster-0");
+        boolean refused = false;
+        for (int i = 0; i < 4096 && !refused; i++) {
+            refused = !filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), "0");
+        }
+        assertThat(refused).as("the segment filter has to fill for this test to mean anything")
+            .isTrue();
+
+        assertThat(QueryPipeline.filterCovers(filter, 0L)).isFalse();
+        assertThat(QueryPipeline.survivesTermFilter(filter, 0L, Set.of())).isTrue();
+    }
+
+    @Test
+    @DisplayName("a full corpus level excludes nothing anywhere")
+    void aSaturatedCorpusHasNoVerdict() {
+        // The corpus filter is the first level consulted, so a term it could not record is
+        // invisible in every segment - not only the one being written when it filled.
+        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(8L, 13, 1_000_000, 1_000_000);
+        filter.registerSegment("0", "cluster-0");
+        filter.registerSegment("1", "cluster-0");
+        filter.insert("invoice".getBytes(StandardCharsets.UTF_8), "1");
+        boolean refused = false;
+        for (int i = 0; i < 4096 && !refused; i++) {
+            refused = !filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), "0");
+        }
+        assertThat(refused).as("the corpus filter has to fill for this test to mean anything")
+            .isTrue();
+
+        assertThat(QueryPipeline.survivesTermFilter(filter, 0L, Set.of())).isTrue();
+        assertThat(QueryPipeline.survivesTermFilter(filter, 1L, Set.of())).isTrue();
+    }
+
+    @Test
     @DisplayName("no filter at all excludes nothing")
     void nullFilterHasNoVerdict() {
         assertThat(QueryPipeline.filterCovers(null, 0L)).isFalse();

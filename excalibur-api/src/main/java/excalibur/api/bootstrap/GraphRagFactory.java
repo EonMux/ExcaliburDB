@@ -105,17 +105,23 @@ public final class GraphRagFactory {
     }
 
     /**
-     * Opens the stack rooted at the configured directory, or returns null when there is none.
+     * Opens a single store under a data directory, at {@code <dataDir>/graph}.
      *
-     * @param config  Application configuration
-     * @param dataDir The node's data directory, which the graph lives under by default
-     * @return The opened stack, or null when no graph is configured
+     * <p>Deliberately not a reader of {@code excalibur.graph.path}: that key names the root the
+     * node serves <em>namespaces</em> from, and a store lives one level inside it. Resolving it
+     * here would give this method and the running node two different answers for the same
+     * configuration - which is how a previous version of this class came to open a graph at a
+     * path nothing served.</p>
+     *
+     * @param config  Application configuration, for the read-side settings
+     * @param dataDir The node's data directory
+     * @return The opened stack, or null when there is no graph there
      * @throws IOException if a graph is present but cannot be opened
      */
     public static GraphRag open(Config config, Path dataDir) throws IOException {
         Objects.requireNonNull(config, "config cannot be null");
         Objects.requireNonNull(dataDir, "dataDir cannot be null");
-        return openAt(config, directoryFor(config, dataDir));
+        return openAt(config, dataDir.resolve(DEFAULT_DIRECTORY));
     }
 
     /**
@@ -283,10 +289,26 @@ public final class GraphRagFactory {
         return text -> client.embedWithCircuitBreaker(text);
     }
 
-    public static Path directoryFor(Config config, Path dataDir) {
+    /**
+     * The directory holding one subdirectory per namespace, each with that namespace's graph.
+     *
+     * <p>This is what {@code excalibur.graph.path} names, and it is the only reader of that key.
+     * The served store for namespace {@code n} is {@code <root>/n/graph} and its staging area is
+     * {@code <root>/n/graph-staging}; a node that never sees the namespace header uses exactly
+     * one, {@code shared}.</p>
+     *
+     * <p>The configured value is the root itself. Taking its parent - which an earlier version
+     * did - discarded the last segment, so {@code /mnt/graphs/alpha} and {@code /mnt/graphs/beta}
+     * named one deployment, and a relative single-segment value named none.</p>
+     *
+     * @param config  Application configuration
+     * @param dataDir The node's data directory, used when the key is unset or blank
+     * @return The graph root
+     */
+    public static Path tenantRootFor(Config config, Path dataDir) {
+        Objects.requireNonNull(config, "config cannot be null");
+        Objects.requireNonNull(dataDir, "dataDir cannot be null");
         String configured = config.graph().getPath();
-        return configured != null && !configured.isBlank()
-            ? Path.of(configured)
-            : dataDir.resolve(DEFAULT_DIRECTORY);
+        return configured != null && !configured.isBlank() ? Path.of(configured) : dataDir;
     }
 }

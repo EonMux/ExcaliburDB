@@ -204,4 +204,53 @@ class FixedBucketHistogramTest {
         assertEquals(1, histogram.getTotalCount());
         assertEquals(0, histogram.getMinimum());
     }
+
+    @Test
+    @DisplayName("A latency past the last bucket is counted as overflow, not as 9999ms")
+    void latencyPastTheLastBucketOverflows() {
+        // A 45-second query and a 10-second one both landed in the top bucket, so a tail
+        // getting steadily worse past ten seconds charted as a flat line at 9999.
+        histogram.record(45_000);
+        histogram.record(10_000);
+        histogram.record(500);
+
+        assertEquals(2, histogram.getOverflowCount(),
+            "both samples are above the range the buckets cover");
+        assertEquals(45_000, histogram.getMaximum(),
+            "the largest sample is reported as itself, not as the top bucket");
+    }
+
+    @Test
+    @DisplayName("The average counts an overflowing sample at its real size")
+    void theAverageCountsOverflowAtItsRealSize() {
+        histogram.record(0);
+        histogram.record(40_000);
+
+        assertEquals(20_000.0, histogram.getAverage(), 1.0,
+            "clamping the sample would report an average of about 5000");
+    }
+
+    @Test
+    @DisplayName("A percentile in the overflow region reports the floor of it")
+    void aPercentileInTheOverflowRegionReportsItsFloor() {
+        for (int i = 0; i < 99; i++) {
+            histogram.record(10);
+        }
+        histogram.record(60_000);
+
+        assertEquals(10, histogram.getPercentile(50.0));
+        assertEquals(10_000, histogram.getPercentile(100.0),
+            "a percentile the buckets cannot resolve is reported at the range's edge, and "
+                + "getOverflowCount says how many samples are past it");
+        assertEquals(1, histogram.getOverflowCount());
+    }
+
+    @Test
+    @DisplayName("A latency at the last bucket is not overflow")
+    void aLatencyAtTheLastBucketIsNotOverflow() {
+        histogram.record(9_999);
+
+        assertEquals(0, histogram.getOverflowCount());
+        assertEquals(9_999, histogram.getMaximum());
+    }
 }

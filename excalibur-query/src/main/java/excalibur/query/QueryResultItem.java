@@ -160,6 +160,29 @@ public final class QueryResultItem {
     }
 
     /**
+     * Returns how this result is named back to a caller outside this process.
+     *
+     * <p>The string identifier the ingestion pipeline assigned, when there is one. That is the
+     * identifier a caller can actually look something up by, and the one both retrieval paths
+     * report, which is what lets a result found by each of them be recognised as one result.</p>
+     *
+     * <p><strong>Not a unique key.</strong> A result the pipeline could not name - a graph with
+     * no node-document mapping, a write-log entry with an empty key - falls back to the numeric
+     * identifier, and for those results the numeric identifier is the node ID. Node IDs are
+     * unique only within their segment and are renumbered by compaction, so two such results
+     * can share this string and be different documents. Anything keying on identity rather than
+     * display must pair it with {@link #segmentId()}, as
+     * {@code ResultAggregator} and {@code HybridFusion} both do.</p>
+     *
+     * @return The display identifier, never null
+     */
+    public String externalId() {
+        return documentIdStr != null && !documentIdStr.isEmpty()
+            ? documentIdStr
+            : Long.toString(documentId);
+    }
+
+    /**
      * Returns the similarity score or distance.
      *
      * <p>The interpretation depends on the distance function used:</p>

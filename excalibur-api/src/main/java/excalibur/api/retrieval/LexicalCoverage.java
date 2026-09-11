@@ -46,6 +46,47 @@ public final class LexicalCoverage {
     }
 
     /**
+     * Describes what a lexical query covered when it ran out of time.
+     *
+     * <p>BM25 visits every segment the manifest names, so a search cut off partway has read
+     * an unknown prefix of them and can claim none: the segments are reported as timed out
+     * rather than searched, and coverage is 0.0. Reporting the healthy 1.0 here would say the
+     * whole corpus was read to produce what is actually an empty answer.</p>
+     *
+     * @param stats The index's own account of itself, or null when it has none to give
+     * @return Coverage in the shape the vector path reports
+     */
+    public static IndexCoverage timedOut(ChunkIndexStats stats) {
+        return unreached(stats, true);
+    }
+
+    /**
+     * Describes what a lexical query covered when the caller withdrew it.
+     *
+     * <p>Nothing was searched, as with a timeout - but no segment timed out, and saying one
+     * did would blame the deadline for a request the caller took back. Which of the two
+     * happened is on the response itself, in {@code cancelled} and {@code timed_out}.</p>
+     *
+     * @param stats The index's own account of itself, or null when it has none to give
+     * @return Coverage in the shape the vector path reports
+     */
+    public static IndexCoverage cancelled(ChunkIndexStats stats) {
+        return unreached(stats, false);
+    }
+
+    private static IndexCoverage unreached(ChunkIndexStats stats, boolean timedOut) {
+        int segments = stats == null ? 0 : stats.segments();
+        return IndexCoverage.builder()
+            .totalSegments(segments)
+            .activeSegments(segments)
+            .segmentsSearched(0)
+            .segmentsTimedOut(timedOut ? segments : 0)
+            .estimatedCorpusCoverage(0.0)
+            .degraded(true)
+            .build();
+    }
+
+    /**
      * Describes what a lexical query covered.
      *
      * @param stats The index's own account of itself, or null when it has none to give

@@ -35,7 +35,6 @@ import java.util.Locale;
  *   <li><strong>Query:</strong>
  *     <ul>
  *       <li>top-k-default: 1-10000 (default: 100)</li>
- *       <li>recall-target: 0.0-1.0 (default: 0.95)</li>
  *       <li>threshold: 0.0-1.0 (default: 0.3)</li>
  *       <li>vector-dimensions: 128-4096 (default: 1536)</li>
  *       <li>llm-timeout-ms: 5000-300000 (default: 60000)</li>
@@ -192,8 +191,6 @@ public final class ConfigValidation {
     private static void validateQuery(Config.Query query) {
         requireInRange("query.top-k-default", query.getDefaultTopK(),
             Config.Query.MIN_TOP_K, Config.Query.MAX_TOP_K);
-        requireInRange("query.recall-target", query.getRecallTarget(),
-            Config.Query.MIN_PROBABILITY, Config.Query.MAX_PROBABILITY);
         requireInRange("query.threshold", query.getThreshold(),
             Config.Query.MIN_PROBABILITY, Config.Query.MAX_PROBABILITY);
         requireInRange("query.vector-dimensions", query.getVectorDimensions(),

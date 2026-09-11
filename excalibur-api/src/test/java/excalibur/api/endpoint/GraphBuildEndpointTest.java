@@ -179,8 +179,7 @@ class GraphBuildEndpointTest {
     @Test
     @DisplayName("a build can be repeated without failing")
     void buildsAreRepeatable() throws IOException {
-        // Every build invalidates the tenant so the next request reopens what was published.
-        // Repeating it is how a caller recovers from a build it did not observe the result of.
+        // Repeating a build is how a caller recovers from one it did not observe the result of.
         assertThat(call("POST", null).status()).isEqualTo(200);
         assertThat(call("POST", null).status()).isEqualTo(200);
         assertThat(call("POST", null).status()).isEqualTo(200);

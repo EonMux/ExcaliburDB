@@ -137,6 +137,21 @@ class ConfigPropertyParsingTest {
         }
 
         @Test
+        @DisplayName("fuses BM25 with vector search unless an operator turns it off")
+        void hybridRetrievalDefaultsOn() {
+            assertThat(new Config(new HashMap<>()).query().isHybridRetrieval())
+                .as("a node holding both signals should use both")
+                .isTrue();
+
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.query.hybrid-retrieval", "false");
+
+            assertThat(new Config(props).query().isHybridRetrieval())
+                .as("the escape hatch back to vector-only ranking")
+                .isFalse();
+        }
+
+        @Test
         @DisplayName("rejects an unrecognised spelling instead of inverting the default")
         void rejectsUnrecognisedBoolean() {
             Map<String, String> props = new HashMap<>();

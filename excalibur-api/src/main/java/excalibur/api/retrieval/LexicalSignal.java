@@ -1,0 +1,208 @@
+package excalibur.api.retrieval;
+
+import excalibur.query.QueryResultItem;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * The BM25 half of a hybrid query: starting it, bounding it, and reading it back.
+ *
+ * <h2>Why it is a thing rather than a call</h2>
+ * <p>The two signals on {@code /v1/query} are independent, and the whole value of that is lost
+ * if they run in series. So this one starts before the embedding call and is read back after the
+ * vector pipeline returns, which means something has to hold it in between - together with the
+ * index that is running it, so that a fallback describes the coverage of the index that actually
+ * answered rather than whatever the endpoint's field points at by then.</p>
+ *
+ * <h2>Degradation is the contract</h2>
+ * <p>Every failure here produces null, never an exception: a search that breaks, misses its
+ * budget, is refused by the pool, or is shed for want of a permit leaves the caller with the
+ * other signal's answer. Null and an empty list are different answers - empty means BM25 ran and
+ * matched nothing, which is a fact about the corpus and is reported as one.</p>
+ *
+ * <p>The exception is an interrupt, which {@link #await} lets through. A handler answers 503 to
+ * an interrupted request and writes nothing else; continuing would build a 200 on a thread whose
+ * interrupt flag is set, which closes the channel mid-write and drops the very answer the
+ * degradation exists to deliver.</p>
+ */
+public final class LexicalSignal {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(LexicalSignal.class);
+
+    /**
+     * How many BM25 searches may be in flight across all requests at once.
+     *
+     * <p>The vector half of a query stops when its deadline passes, because every stage of the
+     * pipeline polls the cancellation token. This half does not: it is a search inside the
+     * lexical engine, and interrupting it is neither reliable nor safe. So a caller sending
+     * {@code timeout_ms: 1} gets an immediate answer and leaves a full search running, and at
+     * the request rate the guard allows that work accumulates faster than it drains.</p>
+     *
+     * <p>This is the bound on what can accumulate. Sized to the cores available because the
+     * search is CPU-bound: more concurrent searches than cores finish no sooner and only hold
+     * memory.</p>
+     */
+    public static final int MAX_CONCURRENT = Math.max(2, Runtime.getRuntime().availableProcessors());
+
+    /** Permits for {@link #MAX_CONCURRENT}, shared by every request on this node. */
+    private static final Semaphore PERMITS = new Semaphore(MAX_CONCURRENT);
+
+    private final LexicalQueryService service;
+    private final Future<List<LexicalQueryService.Hit>> pending;
+
+    private LexicalSignal(LexicalQueryService service,
+                          Future<List<LexicalQueryService.Hit>> pending) {
+        this.service = service;
+        this.pending = pending;
+    }
+
+    /**
+     * Starts a search, or returns null when this node cannot run a second signal right now.
+     *
+     * <p>Null is the answer for all three reasons a request may have only one signal: there is
+     * no lexical index, the pool refused the task, or too many searches are already running. A
+     * request that cannot get a permit answers from vector search instead of queueing behind
+     * one, because queueing would make the node slower under exactly the load that made the
+     * permit scarce.</p>
+     *
+     * @param service  The index to search, or null when this node keeps none
+     * @param executor Where the search runs
+     * @param query    The query text
+     * @param limit    Most hits to return - {@code top_k}, not a multiple of it. A document
+     *                 only BM25 returned has to out-score the weakest of the vector signal's
+     *                 top-k to enter a top-k fused list, and by the reciprocal-rank arithmetic
+     *                 nothing below rank top-k can. Asking deeper buys ranks that cannot be
+     *                 returned, and the service already over-fetches internally so the list is
+     *                 not thinned by hits whose ids no longer resolve.
+     * @return The running search, or null when only the other signal will answer
+     */
+    public static LexicalSignal start(LexicalQueryService service, ExecutorService executor,
+                                      String query, int limit) {
+        if (service == null || executor == null) {
+            return null;
+        }
+        if (!PERMITS.tryAcquire()) {
+            LOGGER.debug("No permit for the BM25 signal; answering from the other signal alone");
+            return null;
+        }
+        try {
+            return new LexicalSignal(service, executor.submit(() -> {
+                try {
+                    return service.search(query, limit);
+                } finally {
+                    // Released when the search stops, not when the request stops waiting for
+                    // it. Releasing at the call site would let abandoned searches pile up
+                    // behind a permit count that says they are not there.
+                    PERMITS.release();
+                }
+            }));
+        } catch (RejectedExecutionException e) {
+            PERMITS.release();
+            LOGGER.warn("Could not start the BM25 signal; answering from the other signal "
+                + "alone: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /** The index answering this request, for the coverage a fallback has to report. */
+    public LexicalQueryService service() {
+        return service;
+    }
+
+    /**
+     * Stops the search if it is still running.
+     *
+     * <p>A no-op once it has finished; on every path that did not read it, this is what stops
+     * an abandoned search outliving the request that asked for it.</p>
+     */
+    public void cancel() {
+        pending.cancel(true);
+    }
+
+    /**
+     * Waits up to {@code budgetMs} for the search, degrading to null rather than throwing.
+     *
+     * @param budgetMs How long the request has left
+     * @return The hits, or null when this signal produced none
+     * @throws InterruptedException if the request is interrupted while waiting
+     */
+    public List<LexicalQueryService.Hit> await(long budgetMs) throws InterruptedException {
+        try {
+            return pending.get(budgetMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            LOGGER.warn("The BM25 signal did not finish inside the query's budget; "
+                + "answering from the other signal alone");
+        } catch (CancellationException e) {
+            LOGGER.debug("The BM25 signal was cancelled with the query");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            LOGGER.warn("The BM25 signal failed; answering from the other signal alone: {}",
+                cause.getMessage(), cause);
+        }
+        return null;
+    }
+
+    /**
+     * What the search has already returned, without waiting for it.
+     *
+     * <p>For the paths where the other signal has failed and the answer is about to be built
+     * out of this one. Never blocks, so it cannot be interrupted, and a response is never
+     * written on a thread carrying an interrupt it has not answered. A search still running is
+     * treated as having produced nothing: the request is already past its deadline, and waiting
+     * longer to report a timeout is the wrong trade.</p>
+     *
+     * @return The hits, or null when this signal has none to give yet
+     */
+    public List<LexicalQueryService.Hit> ready() {
+        if (!pending.isDone() || pending.isCancelled()) {
+            return null;
+        }
+        try {
+            // Cannot block: the task is done, so get() reports the outcome without waiting,
+            // and without consulting the interrupt flag.
+            return pending.get();
+        } catch (InterruptedException e) {
+            // Unreachable for a completed task; restoring the flag is what to do if it ever is.
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (CancellationException | ExecutionException e) {
+            LOGGER.warn("The BM25 signal failed; nothing to fall back to: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Fuses this signal's ranking with the vector ranking, inside the request's remaining budget.
+     *
+     * @param dense    What the vector pipeline produced, best first
+     * @param topK     Most results to return
+     * @param budgetMs How long the request has left
+     * @return The fused ranking, or null when only the vector signal answered
+     * @throws InterruptedException if the request is interrupted while waiting
+     */
+    public List<HybridFusion.Result> fuseWith(List<QueryResultItem> dense, int topK,
+                                              long budgetMs) throws InterruptedException {
+        List<LexicalQueryService.Hit> hits = await(budgetMs);
+        if (hits == null) {
+            return null;
+        }
+        try {
+            return HybridFusion.fuse(dense, hits, topK);
+        } catch (RuntimeException e) {
+            LOGGER.warn("Could not fuse the two signals; answering from vector search alone: {}",
+                e.getMessage(), e);
+            return null;
+        }
+    }
+}

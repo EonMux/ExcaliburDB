@@ -183,6 +183,9 @@ public class Segment implements AutoCloseable {
     /** Size of each slot in the hash table (bytes). */
     private static final int SLOT_SIZE = 24;
 
+    /** The value a delete record carries, which is none. */
+    private static final byte[] EMPTY_VALUE = new byte[0];
+
     /** Size of entry header (key_hash + key_len + value_len + distance). */
     private static final int ENTRY_HEADER_SIZE = 17; // 8 + 4 + 4 + 1
 
@@ -741,43 +744,59 @@ public class Segment implements AutoCloseable {
     /**
      * Applies a put to the segment. The caller must hold the write lock.
      *
-     * <p>Ordering matters here:</p>
+     * <p>Ordering matters here, and it has to satisfy two things at once:</p>
      * <ol>
-     *   <li>An overwrite of an existing key consumes no new slot, so the load-factor
-     *       guard is evaluated only for a genuine insert. Otherwise a segment at the
-     *       capacity boundary would reject updates it can trivially satisfy.</li>
-     *   <li>The segment mutation happens <em>before</em> the write-ahead log append.
-     *       The log is a live read source for tail-scan queries, so a write that the
-     *       segment rejects must never be visible in the log or replayed on restart.</li>
+     *   <li>A write the segment rejects must never be in the log. Tail-scan queries read the
+     *       log live and restart replays it, so a record there is a write that happened.</li>
+     *   <li>A write the segment applies must always be in the log. Otherwise an acknowledged
+     *       write is lost on restart - or, worse, a write the caller was told had failed is
+     *       readable now and gone after a crash.</li>
      * </ol>
+     *
+     * <p>Appending first satisfies the second and breaks the first: whether a Robin Hood
+     * insertion is admissible is discovered by attempting the placement, so the segment cannot
+     * say in advance that it will accept. Mutating first satisfies the first and breaks the
+     * second, which is what this used to do. The way to have both is to ask the log whether it
+     * could take the record before touching the segment, and append after: the reservation is
+     * the only part of an append that refuses a well-formed entry, so once it has passed the
+     * append cannot leave the segment holding a change the log has no record of.</p>
+     *
+     * <p>The load-factor guard is evaluated only for a genuine insert, because an overwrite
+     * consumes no new slot and a segment at the boundary would otherwise reject updates it can
+     * trivially satisfy.</p>
      *
      * @param key   The key (already validated)
      * @param value The value (already validated)
      * @throws SegmentCapacityExceededException if the segment cannot admit the write
+     * @throws IllegalStateException            if the log cannot record it
      */
     private void putInternal(byte[] key, byte[] value) {
         long keyHash = computeHash(key);
         int existingSlot = findSlot(keyHash, key);
 
-        if (existingSlot >= 0) {
-            updateEntry(existingSlot, key, value);
-        } else {
+        if (existingSlot < 0) {
             if (isFull()) {
                 double loadFactor = (double) (entryCount + 1) / slotCount;
                 throw new SegmentCapacityExceededException(
                     SegmentCapacityExceededException.Reason.LOAD_FACTOR,
                     "Load factor " + loadFactor + " would reach or exceed threshold " + loadFactorThreshold);
             }
+            requireDataSpace(ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE);
+        }
 
-            int entrySize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
-            requireDataSpace(entrySize);
+        reserveLogSpace(LogEntry.OPCODE_PUT, key, value);
+
+        if (existingSlot >= 0) {
+            updateEntry(existingSlot, key, value);
+        } else {
             insertEntry(keyHash, key, value);
         }
 
-        appendPutToLog(key, value);
-
-        // Increment modification epoch to invalidate existing zero-copy slices
+        // Before the append, not after: the bytes have already changed, so a slice handed out
+        // earlier is stale whether or not the record that follows reaches the log.
         modificationEpoch++;
+
+        appendPutToLog(key, value);
     }
 
     /**
@@ -803,6 +822,29 @@ public class Segment implements AutoCloseable {
      * @param value The value
      * @throws IllegalStateException if the log append fails
      */
+    /**
+     * Asks the attached log whether it could record this mutation, before the segment makes it.
+     *
+     * <p>A segment with no log has already been warned about by {@link #warnUnlogged()} on the
+     * append that follows, so this stays silent rather than warning twice per write.</p>
+     *
+     * @param opcode The operation the log will be asked to record
+     * @param key    The key
+     * @param value  The value, empty for a delete
+     * @throws IllegalStateException if the log could not take it
+     */
+    private void reserveLogSpace(byte opcode, byte[] key, byte[] value) {
+        WriteLog log = this.writeLog;
+        if (log == null) {
+            return;
+        }
+        try {
+            log.reserve(opcode, key, value);
+        } catch (IOException e) {
+            throw new IllegalStateException("Write-ahead log cannot record the write", e);
+        }
+    }
+
     private void appendPutToLog(byte[] key, byte[] value) {
         WriteLog log = this.writeLog;
         if (log == null) {
@@ -1100,14 +1142,17 @@ public class Segment implements AutoCloseable {
                 return false;
             }
 
-            // Mark slot and entry as tombstoned first: a delete the segment rejects
-            // must never appear in the log, which tail-scan queries read live.
-            markAsTombstoned(slotIndex);
+            // Both refusals are already behind us, so the log is asked before the segment is
+            // touched: a delete the log cannot record must not take effect here, or a reader is
+            // told the key is gone and a restart brings it back.
+            reserveLogSpace(LogEntry.OPCODE_DELETE, key, EMPTY_VALUE);
 
-            appendDeleteToLog(key);
+            markAsTombstoned(slotIndex);
 
             // Increment modification epoch to invalidate existing zero-copy slices
             modificationEpoch++;
+
+            appendDeleteToLog(key);
 
             // Note: entryCount is NOT decremented for tombstones - the slot stays
             // occupied until compaction. liveEntryCount is decremented instead.
@@ -1600,14 +1645,15 @@ public class Segment implements AutoCloseable {
             return false;
         }
 
-        // Mark slot and entry as tombstoned first: a delete the segment rejects
-        // must never appear in the log, which tail-scan queries read live.
-        markAsTombstoned(slotIndex);
+        // The log is asked before the segment is touched, for the reason delete() gives.
+        reserveLogSpace(LogEntry.OPCODE_DELETE, key, EMPTY_VALUE);
 
-        appendDeleteToLog(key);
+        markAsTombstoned(slotIndex);
 
         // Increment modification epoch to invalidate existing zero-copy slices
         modificationEpoch++;
+
+        appendDeleteToLog(key);
 
         return true;
     }
@@ -2212,6 +2258,22 @@ public class Segment implements AutoCloseable {
     /**
      * Rounds an integer up to the nearest power of 2.
      */
+    /**
+     * The {@code capacityBytes} that produces exactly {@code slots} slots.
+     *
+     * <p>The constructor reads its byte figure as "half slot table, half data" and then adds a
+     * fixed data region of its own on top. A caller reproducing an existing segment's geometry
+     * therefore has to pass the slot table alone: adding a data region to the figure sizes the
+     * next slot table from it, and a segment compacted or split repeatedly doubles its table
+     * every generation while the data region it is meant to serve stays exactly as big.
+     *
+     * @param slots How many slots the segment must have
+     * @return The byte figure to construct it with
+     */
+    public static long capacityForSlots(int slots) {
+        return (long) slots * SLOT_SIZE * 2;
+    }
+
     private static int roundToPowerOf2(int n) {
         if (n <= 0) {
             return MIN_SEGMENT_CAPACITY;
@@ -2313,6 +2375,12 @@ public class Segment implements AutoCloseable {
     private void validateKey(byte[] key) {
         if (key == null) {
             throw new IllegalArgumentException("Key cannot be null");
+        }
+        // Nothing that reads this segment back can carry an empty key: neither a log record nor
+        // the SegmentEntry the iterators build. Admitting one here writes an entry that no
+        // compaction and no split can ever read past.
+        if (key.length == 0) {
+            throw new IllegalArgumentException("Key cannot be empty");
         }
         if (key.length > Integer.MAX_VALUE - ENTRY_HEADER_SIZE - ENTRY_TRAILER_SIZE - 4) {
             throw new IllegalArgumentException("Key too large: " + key.length + " bytes");

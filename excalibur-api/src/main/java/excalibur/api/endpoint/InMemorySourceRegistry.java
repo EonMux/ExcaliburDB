@@ -46,6 +46,7 @@ public class InMemorySourceRegistry implements SourceRegistry {
     private final int maxSources;
     private volatile IngestionOrchestrator ingestionOrchestrator;
     private volatile IngestStatusEndpoint.IngestionStatusRegistry statusRegistry;
+    private volatile ReindexEndpoint.ReindexStatusRegistry reindexStatusRegistry;
     private volatile SegmentReindexScheduler reindexScheduler;
     private volatile long reindexIntervalMs = SegmentReindexScheduler.DEFAULT_REINDEX_INTERVAL_MS;
     private volatile SourceCatalog sourceCatalog;
@@ -106,6 +107,21 @@ public class InMemorySourceRegistry implements SourceRegistry {
      */
     public void setStatusRegistry(IngestStatusEndpoint.IngestionStatusRegistry statusRegistry) {
         this.statusRegistry = statusRegistry;
+    }
+
+    /**
+     * Sets the registry holding what each source's reindex runs did.
+     *
+     * <p>Only so that deregistering a source forgets its reindex status too. The status
+     * otherwise outlives the source it describes - {@code GET /v1/reindex/status} keeps
+     * answering for something that is gone - and the map grows for the life of the
+     * process.</p>
+     *
+     * @param reindexStatusRegistry The registry (may be null to disable)
+     */
+    public void setReindexStatusRegistry(
+            ReindexEndpoint.ReindexStatusRegistry reindexStatusRegistry) {
+        this.reindexStatusRegistry = reindexStatusRegistry;
     }
 
     /**
@@ -360,6 +376,9 @@ public class InMemorySourceRegistry implements SourceRegistry {
         }
         if (statusRegistry != null) {
             statusRegistry.remove(sourceId);
+        }
+        if (reindexStatusRegistry != null) {
+            reindexStatusRegistry.remove(sourceId);
         }
 
         closeSource(sourceId, removed);

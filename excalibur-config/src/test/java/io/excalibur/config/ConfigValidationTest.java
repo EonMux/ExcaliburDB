@@ -31,7 +31,6 @@ class ConfigValidationTest {
         baseProps.put("excalibur.health.healthy-threshold", "0.9");
         baseProps.put("excalibur.health.max-latency-ms", "5000");
         baseProps.put("excalibur.query.top-k-default", "100");
-        baseProps.put("excalibur.query.recall-target", "0.95");
         baseProps.put("excalibur.query.threshold", "0.3");
         baseProps.put("excalibur.query.vector-dimensions", "1536");
         baseProps.put("excalibur.query.llm-timeout-ms", "60000");
@@ -279,28 +278,6 @@ class ConfigValidationTest {
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("query.top-k-default must be <= 10000");
-        }
-
-        @Test
-        @DisplayName("rejects recall-target below 0.0")
-        void rejectsRecallTargetBelowZero() {
-            baseProps.put("excalibur.query.recall-target", "-0.1");
-            Config config = new Config(baseProps);
-
-            assertThatThrownBy(() -> ConfigValidation.validate(config))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.recall-target must be >= 0.0");
-        }
-
-        @Test
-        @DisplayName("rejects recall-target above 1.0")
-        void rejectsRecallTargetAboveOne() {
-            baseProps.put("excalibur.query.recall-target", "1.1");
-            Config config = new Config(baseProps);
-
-            assertThatThrownBy(() -> ConfigValidation.validate(config))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("query.recall-target must be <= 1.0");
         }
 
         @Test

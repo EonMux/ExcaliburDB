@@ -46,6 +46,24 @@ class SourceRemovalTest {
     }
 
     @Test
+    @DisplayName("a removed source's reindex status is cleared with it")
+    void clearsTheReindexStatus() {
+        // The status outlives the source otherwise: /v1/reindex/status keeps answering for a
+        // source that is gone, and the map grows for the life of the process. The ingestion
+        // status is already cleared here; the reindex status describes the same source.
+        ReindexEndpoint.InMemoryReindexStatusRegistry reindexes =
+            new ReindexEndpoint.InMemoryReindexStatusRegistry();
+        registry.setReindexStatusRegistry(reindexes);
+        registry.register(source("42"));
+        reindexes.startReindex("42");
+
+        registry.remove("42");
+
+        assertThat(reindexes.getStatus("42")).isNull();
+        assertThat(reindexes.getAllStatuses()).isEmpty();
+    }
+
+    @Test
     @DisplayName("a removed source is no longer registered")
     void removesTheEntry() {
         registry.register(source("42"));

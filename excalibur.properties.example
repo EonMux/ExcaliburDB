@@ -14,16 +14,22 @@ excalibur.ingest.document-atomicity-timeout-ms=2000
 # Whether a document's chunks become visible together. Leave it on: off, a query can match half
 # a document while the rest is still being written, which is a wrong answer rather than a slow one.
 excalibur.ingest.document-atomicity=true
-# How often a registered source is re-crawled on its own. One hour.
+# How often a registered source is re-crawled on its own. One hour. Needs an embedding endpoint:
+# a re-crawl re-embeds what it rewrites, so on a node without one the sweep fires and records a
+# failed run, and the corpus stays as it was first crawled.
 excalibur.ingest.reindex-interval-ms=3600000
 
 # Membership Filter
 # Entries the hierarchical Cuckoo filter is sized for. SIZE THIS TO YOUR CORPUS. The filter is
 # what prunes segments that cannot hold a query's terms, and a filter with no room left cannot
-# record a new term -- a term it has no record of prunes every segment, so queries return nothing
-# for documents that are sitting in storage. Under-sizing fails silently and completely; the only
-# cost of over-sizing is memory.
+# record a new term. A level that has refused one is no longer trusted to rule anything out, so
+# pruning switches off for its scope and every query scans it: results stay correct and queries
+# get slower. /v1/stats reports it as cuckoo.saturated. The only cost of over-sizing is memory.
 excalibur.filter.corpus-capacity=10000000
+# Distinct terms one segment's own level is sized for. Separate from the corpus capacity: that
+# level holds every term on the node, this one holds a single segment's vocabulary. A segment
+# that outgrows it stops being pruned, which /v1/stats counts as cuckoo.saturatedSegments.
+excalibur.filter.segment-capacity=10000
 
 # API Server Configuration
 # Port to listen on. EXCALIBUR_PORT in the environment overrides this; a value that is not a
@@ -44,6 +50,13 @@ excalibur.api.read-burst=200
 excalibur.api.mutate-rate-per-second=5
 excalibur.api.mutate-burst=20
 excalibur.api.rate-limit-max-clients=10000
+# Hops whose X-Forwarded-For this node believes, as addresses or CIDR ranges. Empty means only
+# the peer address is ever metered, which is right with nothing in front of the node and wrong
+# behind a TLS-terminating proxy, where every caller shares the proxy's budget. Naming the proxy
+# makes the rightmost entry of its forwarding header the unit charged -- the nearest hop the
+# client could not have written. Never set it to a range you do not control: the header is
+# whatever a caller types.
+#excalibur.api.trusted-proxies=10.0.0.0/8,192.168.1.7
 # Bounds applied to client-supplied query fields before they size anything server-side.
 excalibur.api.max-top-k=1000
 excalibur.api.max-query-timeout-ms=60000
@@ -51,6 +64,10 @@ excalibur.api.max-query-timeout-ms=60000
 # call the caller sizes. The default is four times a chunk -- the largest unit anything in the
 # index was embedded as.
 excalibur.api.max-query-chars=8192
+# Largest oversampling_factor a request may ask for. The factor multiplies top_k into the HNSW
+# beam width, and the beam is what bounds how much of a segment a search walks, so leaving it
+# unbounded lets one small request scan every candidate segment end to end.
+excalibur.api.max-oversampling-factor=16
 
 # Transport Security
 # Setting a keystore turns TLS on. The keystore holds the server certificate and its
@@ -84,10 +101,11 @@ excalibur.api.max-query-chars=8192
 #excalibur.api.allow-plaintext=false
 
 # Graph-RAG Configuration
-# Where the graph store lives, one subdirectory per namespace. Leave unset to look under
-# <data dir>/graph. The route is registered either way: a node that has never built a graph
-# answers POST /v1/graph/query with 503 and says a build is what is missing, which is a
-# different statement from 404.
+# The root the graph stores live under, one subdirectory per namespace: namespace n serves
+# <root>/n/graph and stages in <root>/n/graph-staging. Leave unset for the data directory, so a
+# single-tenant node serves <data dir>/shared/graph. The route is registered either way: a node
+# that has never built a graph answers POST /v1/graph/query with 503 and says a build is what is
+# missing, which is a different statement from 404.
 #excalibur.graph.path=
 # Documents each retrieval signal contributes before fusion, and the token budget the
 # serialised subgraph must fit into.
@@ -122,11 +140,19 @@ excalibur.graph.entity-vectors-enabled=true
 # number of them, so the least recently used graph is evicted to make room rather than the node
 # running out at whatever unrelated allocation comes next.
 excalibur.graph.max-open-namespaces=16
+# Namespaces that override recency. A hot one is never evicted and spends a slot permanently; a
+# cold one is evicted before any other, which is what a bulk import or an idle tenant wants.
+# Naming the same namespace in both refuses to start, as does naming the shared one: it is
+# pinned regardless.
+#excalibur.graph.hot-namespaces=acme,globex
+#excalibur.graph.cold-namespaces=archive
 
 # When an erasure compaction becomes worthwhile. The ratio amortises the rewrite; the latency bound
 # is what makes an obligation a promise rather than a tuning knob, since a single request on a large
 # store would otherwise never reach the ratio.
 excalibur.graph.erasure-tombstone-ratio=0.2
+# Checked every tenth of this by a sweep over the open namespaces, so an obligation submitted to
+# a node that then goes quiet is still discharged on time.
 excalibur.graph.erasure-max-latency-seconds=3600
 
 # Ingest Target Allow-Lists
@@ -166,13 +192,22 @@ excalibur.health.max-latency-ms=5000
 
 # Query Configuration
 excalibur.query.top-k-default=100
-# Accepted and range-checked, but read by nothing: breadth comes from
-# excalibur.shard.default-ef-search, and a query's score floor comes from its own threshold field.
-excalibur.query.recall-target=0.95
-excalibur.query.threshold=0.3
+# A score floor for requests that name no threshold of their own. 0.0 filters nothing, which is
+# the built-in default and what this file keeps: a floor tuned on someone else's corpus silently
+# drops every result scoring under it, and on a corpus whose scores run lower than the floor that
+# is every result. Raise it once you have seen what your own queries score.
+excalibur.query.threshold=0.0
+# excalibur.query.threshold=0.3
 excalibur.query.include-partial-segments=true
 excalibur.query.vector-dimensions=1536
 excalibur.query.llm-timeout-ms=60000
+# Whether a node holding both signals answers /v1/query from both. The BM25 index over the
+# chunks is written, compacted and erasure-swept whether or not a query reads it, so leaving
+# this on is what stops a node that has it from paying for an index it never consults. It
+# changes what `score` means on that route: fused answers score by summed reciprocal rank, not
+# by similarity, and the response says so in `retrieval`. Set it to false to get vector-only
+# ranking back - which is what a deployment with a threshold tuned against cosine scores wants.
+excalibur.query.hybrid-retrieval=true
 
 # LLM Configuration
 # The API root. The clients append the OpenAI paths themselves (/v1/embeddings,
@@ -183,9 +218,6 @@ excalibur.llm.base-url=https://api.openai.com/v1
 # Never set the api key here. Supply it as the EXCALIBUR_LLM_API_KEY environment variable,
 # so it cannot be committed or read out of the working directory.
 #excalibur.llm.api-key=
-# Legacy generic model name. Parsed and exposed on the config, but no component reads it;
-# embedding-model and chat-model below are what the clients actually use.
-excalibur.llm.model=text-embedding-ada-002
 excalibur.llm.chat-model=gpt-4o-mini
 excalibur.llm.embedding-model=text-embedding-3-small
 excalibur.llm.embeddings-dimensions=1536

@@ -698,9 +698,13 @@ public class DocumentBatchPublisher {
                 List<String> failed = insertIntoFilters(buffer);
                 if (!failed.isEmpty()) {
                     failedDocuments.add(buffer.getDocumentId());
-                    LOGGER.warn("Failed to insert {} chunks for document {}",
-                        failed.size(), buffer.getDocumentId());
+                    LOGGER.warn("Document {} is not published: {} of its {} chunks could not be "
+                        + "inserted into the filters, and a document is published whole or not "
+                        + "at all", buffer.getDocumentId(), failed.size(), buffer.getChunkCount());
+                    continue;
                 }
+                // Only what is published is counted. A refused document's chunks are not in the
+                // index, and counting them reports a corpus larger than the one that exists.
                 totalChunks += buffer.getChunkCount();
             }
 

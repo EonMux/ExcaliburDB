@@ -375,8 +375,23 @@ public final class HnswGraphDiagnostic {
         // === Check 6: Self-search test ===
         // Try to search the graph using one of its own vectors
         if (activeNodeCount > 0 && entryPoint >= 0) {
-            searchResultCount = testSelfSearch(graph);
-            if (searchResultCount == 0) {
+            SelfSearch selfSearch = testSelfSearch(graph);
+            searchResultCount = selfSearch.results();
+            if (!selfSearch.ran()) {
+                // The probe did not get an answer to judge. Compaction renumbers node ids and
+                // closes the graph while it swaps, and search() checks the closed flag before
+                // taking the read lock, so a diagnostic landing in that window fails here with
+                // the graph entirely intact. Calling that broken traversal sends an operator
+                // after a fault that does not exist.
+                issues.add(GraphDiagnosticIssue.warning(
+                    "SELF_SEARCH_UNAVAILABLE",
+                    "Self-search probe could not run: " + selfSearch.reason(),
+                    "Usually a compaction that closed or renumbered the graph between choosing "
+                        + "the probe node and reading it, which is routine and clears itself. "
+                        + "The probe failed, not the graph. Investigate only if it persists "
+                        + "across runs while nothing is compacting."
+                ));
+            } else if (searchResultCount == 0) {
                 issues.add(GraphDiagnosticIssue.critical(
                     "SELF_SEARCH_EMPTY",
                     "Self-search test returned 0 results (graph has " + activeNodeCount + " active nodes)",
@@ -419,33 +434,56 @@ public final class HnswGraphDiagnostic {
     }
 
     /**
+     * What a self-search probe found, or why it could not look.
+     *
+     * <p>The distinction is the whole point of the type. A search that ran and returned
+     * nothing says the graph cannot find its own vectors, which is a fault. A probe that
+     * never ran says nothing about the graph at all, and folding both into the number 0 made
+     * a routine compaction indistinguishable from broken traversal.</p>
+     *
+     * @param ran     Whether a search actually completed
+     * @param results How many it returned, 0 when it did not run
+     * @param reason  Why it did not run, empty when it did
+     */
+    private record SelfSearch(boolean ran, int results, String reason) {
+
+        static SelfSearch completed(int results) {
+            return new SelfSearch(true, results, "");
+        }
+
+        static SelfSearch couldNotRun(String reason) {
+            return new SelfSearch(false, 0, reason);
+        }
+    }
+
+    /**
      * Tests if the graph can find results by searching with one of its own vectors.
      *
      * <p>This is a basic sanity check: if a graph with nodes cannot find results
      * when searching with one of its own vectors, something is fundamentally broken.</p>
      *
      * @param graph The graph to test
-     * @return Number of results found, or 0 if search failed
+     * @return What the probe found, or why it could not look
      */
-    private static int testSelfSearch(HnswGraph graph) {
+    private static SelfSearch testSelfSearch(HnswGraph graph) {
         try {
             // Find an active node to use as the query vector
             long queryNodeId = findFirstActiveNode(graph);
             if (queryNodeId < 0) {
                 LOGGER.debug("Self-search test: no active nodes found");
-                return 0;
+                return SelfSearch.couldNotRun("no active node to query with");
             }
 
             HnswGraph.NodeView queryNode = graph.readNode(queryNodeId);
             if (queryNode == null) {
                 LOGGER.debug("Self-search test: could not read node {}", queryNodeId);
-                return 0;
+                return SelfSearch.couldNotRun("node " + queryNodeId + " could not be read");
             }
 
             float[] queryVector = queryNode.vector();
             if (queryVector == null || queryVector.length == 0) {
                 LOGGER.debug("Self-search test: node {} has no vector", queryNodeId);
-                return 0;
+                return SelfSearch.couldNotRun("node " + queryNodeId + " carries no vector");
             }
 
             // Search with k=10
@@ -454,10 +492,10 @@ public final class HnswGraphDiagnostic {
             LOGGER.debug("Self-search test: found {} results using node {} as query",
                 results.size(), queryNodeId);
 
-            return results.size();
+            return SelfSearch.completed(results.size());
         } catch (Exception e) {
             LOGGER.debug("Self-search test failed with exception: {}", e.getMessage());
-            return 0;
+            return SelfSearch.couldNotRun(e.toString());
         }
     }
 
@@ -515,14 +553,19 @@ public final class HnswGraphDiagnostic {
      *
      * <p>This is a basic sanity check using self-search.</p>
      *
+     * <p>A probe that could not run answers true. It found no evidence either way, and the
+     * caller reads a false as "this graph cannot find its own vectors" - a verdict a probe
+     * beaten by a concurrent compaction has not earned.</p>
+     *
      * @param graph The graph to test
-     * @return true if the graph can find at least one result
+     * @return true if the graph can find at least one result, or the probe could not run
      */
     public static boolean canFindResults(HnswGraph graph) {
         if (graph.activeNodeCount() == 0) {
             return true; // Empty graph is trivially OK
         }
-        return testSelfSearch(graph) > 0;
+        SelfSearch probe = testSelfSearch(graph);
+        return !probe.ran() || probe.results() > 0;
     }
 
     /**

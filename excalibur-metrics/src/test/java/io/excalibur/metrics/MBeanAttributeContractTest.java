@@ -109,6 +109,23 @@ class MBeanAttributeContractTest {
     }
 
     @Test
+    @DisplayName("IngestionQueue says in its own description that it is an alias")
+    void ingestionQueueDeclaresItselfAnAlias() {
+        // The two beans carry one number, and it is the HNSW integration backlog rather than
+        // an ingestion queue. An operator graphing both sees two independent subsystems in
+        // trouble where there is one, and looks for an ingestion queue that does not exist.
+        javax.management.MBeanInfo info = Metrics.getIngestionQueueMBean().getMBeanInfo();
+
+        assertTrue(info.getDescription().contains("HnswQueueDepth"),
+            "the bean must name what it actually reports: " + info.getDescription());
+        for (javax.management.MBeanAttributeInfo attribute : info.getAttributes()) {
+            assertTrue(attribute.getDescription().contains("HNSW"),
+                attribute.getName() + " does not say which queue it measures: "
+                    + attribute.getDescription());
+        }
+    }
+
+    @Test
     @DisplayName("Queue verdicts follow the configured limit")
     void queueVerdictsFollowTheConfiguredLimit() throws Exception {
         assertEquals(DEFAULT_QUEUE_LIMIT, Metrics.getHnswQueueLimit(),

@@ -116,6 +116,25 @@ class StorageEngineBasicTest {
         }
 
         @Test
+        @DisplayName("Should report which segment a write landed in")
+        void shouldReportTheTargetSegment() {
+            // The engine routes by key hash, so a caller that wants to record something about a
+            // written key per segment - a membership filter, a per-segment index - cannot work
+            // out where it went. Without this the ingestion path has no segment id to file a
+            // term under and the pre-filter it would populate stays empty.
+            byte[] key = "routed-key".getBytes();
+
+            long segmentId = engine.putReportingSegment(key, "value".getBytes());
+
+            assertThat(engine.getSegments().values())
+                .as("the reported id must name a segment this engine holds")
+                .anyMatch(segment -> segment.segmentId() == segmentId);
+            assertThat(engine.putReportingSegment(key, "value2".getBytes()))
+                .as("the same key routes to the same segment")
+                .isEqualTo(segmentId);
+        }
+
+        @Test
         @DisplayName("Should handle empty value")
         void shouldHandleEmptyValue() {
             byte[] key = "empty-value-key".getBytes();

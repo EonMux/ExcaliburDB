@@ -73,17 +73,23 @@ public class GraphErasureEndpoint implements HttpHandler {
         String body;
         try {
             body = RequestBody.read(exchange);
-        } catch (IllegalArgumentException e) {
+        } catch (RequestBody.TooLargeException e) {
             ResponseBody.sendJson(exchange, 413, "{\"error\": \"Request body too large\"}");
             return;
         }
 
         NamespaceId namespace;
         ErasureScope scope;
+        boolean compactNow;
         try {
             namespace = GraphTenants.namespaceOf(
                 exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
             scope = scopeFrom(body);
+            // Every field of the request is read before any of it is acted on. Reading this one
+            // after the obligation was submitted meant a body with a malformed "compact" was
+            // durably recorded and then answered 500, so the caller retried and recorded it
+            // twice.
+            compactNow = JsonText.booleanValue(body, "compact", false);
         } catch (IllegalArgumentException e) {
             ResponseBody.sendJson(exchange, 400,
                 "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
@@ -93,15 +99,15 @@ public class GraphErasureEndpoint implements HttpHandler {
         try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
             GraphErasureService erasureService = lease.resource().erasureService();
             long id = erasureService.submit(scope);
-            boolean compactNow = JsonText.booleanValue(body, "compact", false);
 
             GraphErasureService.ErasureOutcome outcome = compactNow
                 ? erasureService.compactNow()
                 : erasureService.compactIfDue();
             if (outcome.ran()) {
-                // The store on disk has been rewritten, so any stack this node still holds for
-                // the namespace describes edges that are no longer there.
-                tenants.invalidate(namespace);
+                // The compaction reopened the rewritten store into this tenant's holder already.
+                // Only the accounting is left: the store it now maps is not the one the budget
+                // was told about.
+                tenants.recost(namespace);
             }
 
             ResponseBody.sendJson(exchange, 202,

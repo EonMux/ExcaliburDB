@@ -312,6 +312,12 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
 
                 LOGGER.info("Reindex started for source");
 
+            } catch (RequestBody.TooLargeException e) {
+                // Well-formed and too big is not the same failure as malformed: 400 tells the
+                // caller not to send it again, 413 tells it to split the payload.
+                LOGGER.warn("Refused an oversized reindex body: {}", e.getMessage());
+                sendError(exchange, 413, e.getMessage());
+
             } catch (IllegalArgumentException e) {
                 LOGGER.warn("Invalid reindex request: {}", e.getMessage());
                 sendError(exchange, 400, "Bad Request: " + e.getMessage());
@@ -486,19 +492,31 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 reindexStatusRegistry.updateProgress(sourceId, "indexing", 0.7,
                     result.getDocumentsIndexed(), result.getDocumentsIndexed() + result.getChunksFailed());
 
-                if (result.hasErrors()) {
-                    String error = String.format("Reindex completed with %d errors: %s",
+                // The same rule the rolling branch applies: a run is failed when it indexed
+                // nothing, and a partial success is a completed run with a warning. Failing on
+                // any error at all reported a run that reindexed four hundred documents and
+                // could not read one of them as a failed reindex, which is the opposite of
+                // what an operator would do about it.
+                if (result.hasErrors() && result.getDocumentsIndexed() == 0) {
+                    String error = String.format("Reindex failed completely with %d errors: %s",
                         result.getErrorCount(),
                         result.getErrors().stream()
                             .map(DocumentReindexer.ReindexResult.OperationError::getMessage)
                             .reduce((a, b) -> a + "; " + b)
                             .orElse("unknown"));
-                    LOGGER.warn("[reindex-{}] Reindex completed with errors for {}: {}",
-                        threadName, sourceId, error);
+                    LOGGER.error("[reindex-{}] {} for source: {}", threadName, error, sourceId);
                     reindexStatusRegistry.failReindex(sourceId, error);
+                } else if (result.hasErrors()) {
+                    LOGGER.warn("[reindex-{}] Reindex completed with {} errors for {}: {} docs "
+                            + "indexed, {} skipped, {} chunks created",
+                        threadName, result.getErrorCount(), sourceId, result.getDocumentsIndexed(),
+                        result.getDocumentsSkipped(), result.getChunksCreated());
+                    reindexStatusRegistry.completeReindex(sourceId);
                 } else {
-                    LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs indexed, {} chunks created",
-                        threadName, sourceId, result.getDocumentsIndexed(), result.getChunksCreated());
+                    LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs "
+                            + "indexed, {} skipped, {} chunks created",
+                        threadName, sourceId, result.getDocumentsIndexed(),
+                        result.getDocumentsSkipped(), result.getChunksCreated());
                     reindexStatusRegistry.completeReindex(sourceId);
                 }
             }
@@ -550,6 +568,10 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
      * Reindex status for a source.
      */
     public static class ReindexStatus {
+
+        /** Reported for a run that stopped without finishing; {@code lastError} says why. */
+        public static final String STATE_FAILED = "failed";
+
         private final String sourceId;
         private volatile String state;
         private volatile double progress;
@@ -609,8 +631,18 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             this.progress = 1.0;
         }
 
+        /**
+         * Records that the run stopped without finishing.
+         *
+         * <p>A state of its own rather than {@code idle}: this status is served over
+         * {@code GET /v1/reindex/status}, and a failed run reported as idle-with-an-error
+         * reads as a run that finished and left a note. The two are different verdicts and a
+         * caller acts differently on each.</p>
+         *
+         * @param error Why it stopped
+         */
         public void fail(String error) {
-            this.state = "idle";
+            this.state = STATE_FAILED;
             this.lastError = error;
         }
     }
@@ -646,6 +678,18 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         void completeReindex(String sourceId);
         void failReindex(String sourceId, String error);
         Map<String, ReindexStatus> getAllStatuses();
+
+        /**
+         * Forgets a source's reindex status.
+         *
+         * <p>Called when the source is deregistered. Without it the status outlives the source
+         * it describes - {@code GET /v1/reindex/status} keeps answering for something that is
+         * gone - and the map grows for the life of the process.</p>
+         *
+         * @param sourceId The source to forget
+         * @return true if a status was removed
+         */
+        boolean remove(String sourceId);
     }
 
     /**
@@ -711,6 +755,11 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         @Override
         public ReindexStatus getStatus(String sourceId) {
             return statuses.get(sourceId);
+        }
+
+        @Override
+        public boolean remove(String sourceId) {
+            return statuses.remove(sourceId) != null;
         }
 
         @Override

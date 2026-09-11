@@ -69,12 +69,12 @@ class HealthConfigurationIntegrationTest {
             props.put("excalibur.health.healthy-threshold", "0.9");
             Config config = new Config(props);
 
-            // Add segments: 5 active, 5 tombstoned -> coverage = 5/10 = 0.5
+            // Add segments: 5 a query reads, 5 stranded -> coverage = 5/10 = 0.5
             for (int i = 1; i <= 5; i++) {
                 addActiveSegment(segmentCatalog, i);
             }
             for (int i = 6; i <= 10; i++) {
-                addTombstonedSegment(segmentCatalog, i);
+                addStrandedSegment(segmentCatalog, i);
             }
 
             // Create HealthEndpoint with config values
@@ -108,12 +108,12 @@ class HealthConfigurationIntegrationTest {
             props.put("excalibur.health.healthy-threshold", "0.8");
             Config config = new Config(props);
 
-            // Add segments: 5 active, 5 tombstoned -> coverage = 5/10 = 0.5
+            // Add segments: 5 a query reads, 5 stranded -> coverage = 5/10 = 0.5
             for (int i = 1; i <= 5; i++) {
                 addActiveSegment(segmentCatalog, i);
             }
             for (int i = 6; i <= 10; i++) {
-                addTombstonedSegment(segmentCatalog, i);
+                addStrandedSegment(segmentCatalog, i);
             }
 
             HealthEndpoint endpoint = new HealthEndpoint(
@@ -152,12 +152,12 @@ class HealthConfigurationIntegrationTest {
             assertThat(config.health().getReadinessThreshold()).isEqualTo(0.3);
             assertThat(config.health().getHealthyThreshold()).isEqualTo(0.4);
 
-            // Add segments: 3 active, 2 tombstoned -> coverage = 3/5 = 0.6
+            // Add segments: 3 a query reads, 2 stranded -> coverage = 3/5 = 0.6
             for (int i = 1; i <= 3; i++) {
                 addActiveSegment(segmentCatalog, i);
             }
             for (int i = 4; i <= 5; i++) {
-                addTombstonedSegment(segmentCatalog, i);
+                addStrandedSegment(segmentCatalog, i);
             }
 
             HealthEndpoint endpoint = new HealthEndpoint(
@@ -246,12 +246,12 @@ class HealthConfigurationIntegrationTest {
         void healthStatusWithVariousSegmentDistributions() throws IOException {
             // Test different coverage levels and verify thresholds work correctly
 
-            // 25% coverage: 1 active, 3 tombstoned
+            // 25% coverage: 1 a query reads, 3 stranded
             SegmentCatalog catalog25 = new SegmentCatalog();
             VisibilityTracker tracker25 = new VisibilityTracker(catalog25);
             addActiveSegment(catalog25, 1);
             for (int i = 2; i <= 4; i++) {
-                addTombstonedSegment(catalog25, i);
+                addStrandedSegment(catalog25, i);
             }
 
             HealthEndpoint endpoint25 = new HealthEndpoint(tracker25, catalog25, 0.2, 0.3, 5000);
@@ -264,13 +264,13 @@ class HealthConfigurationIntegrationTest {
             assertThat(response25).contains("\"ready\": true");
             assertThat(response25).contains("\"healthy\": false");
 
-            // 75% coverage: 3 active, 1 tombstoned
+            // 75% coverage: 3 a query reads, 1 stranded
             SegmentCatalog catalog75 = new SegmentCatalog();
             VisibilityTracker tracker75 = new VisibilityTracker(catalog75);
             for (int i = 1; i <= 3; i++) {
                 addActiveSegment(catalog75, i);
             }
-            addTombstonedSegment(catalog75, 4);
+            addStrandedSegment(catalog75, 4);
 
             HealthEndpoint endpoint75 = new HealthEndpoint(tracker75, catalog75, 0.5, 0.8, 5000);
             HttpExchange exchange75 = createMockExchange("GET");
@@ -348,12 +348,12 @@ class HealthConfigurationIntegrationTest {
             props.put("excalibur.health.healthy-threshold", "0.85");
             Config config = new Config(props);
 
-            // Create segment distribution: 6 active, 4 tombstoned -> coverage = 0.6
+            // Create segment distribution: 6 a query reads, 4 stranded -> coverage = 0.6
             for (int i = 1; i <= 6; i++) {
                 addActiveSegment(segmentCatalog, i);
             }
             for (int i = 7; i <= 10; i++) {
-                addTombstonedSegment(segmentCatalog, i);
+                addStrandedSegment(segmentCatalog, i);
             }
 
             // Create HealthEndpoint using config values (as ExcaliburDBServer does)
@@ -398,6 +398,15 @@ class HealthConfigurationIntegrationTest {
         metadata.transitionToIndexing();
         metadata.transitionToWarming();
         metadata.transitionToActive();
+    }
+
+    /**
+     * A segment whose file is registered but which no transition ever brought up: live, and in
+     * no state a query reads. A retired segment is not the way to arrange a partial coverage -
+     * compaction retiring a segment does not make a node less ready.
+     */
+    private void addStrandedSegment(SegmentCatalog catalog, long segmentId) {
+        catalog.registerFile(segmentId, Path.of("/tmp/segment" + segmentId));
     }
 
     private void addTombstonedSegment(SegmentCatalog catalog, long segmentId) {

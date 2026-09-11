@@ -299,13 +299,13 @@ public class ResultAggregator {
             if (result.success()) {
                 segmentsSearched++;
                 totalTailScanEntries += result.tailScanEntries();
+            } else if (result.errorMessage() != null
+                    && result.errorMessage().toLowerCase(Locale.ROOT).contains("timeout")) {
+                // One failure is one count. A segment reported as both an error and a timeout
+                // reads as two segments in trouble, and is subtracted from coverage twice.
+                segmentsTimedOut++;
             } else {
                 segmentsWithErrors++;
-                // Check if error was a timeout (simplified check)
-                if (result.errorMessage() != null &&
-                    result.errorMessage().toLowerCase(Locale.ROOT).contains("timeout")) {
-                    segmentsTimedOut++;
-                }
             }
         }
 

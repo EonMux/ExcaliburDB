@@ -692,4 +692,56 @@ class TextChunkerTest {
         
         return sb.toString().trim();
     }
+
+    @Nested
+    @DisplayName("Every character reaches a chunk")
+    class Coverage {
+
+        // A chunk that is never emitted is not a formatting problem: that text is never embedded,
+        // never written to storage and never indexed for BM25, while the chunk indices stay
+        // contiguous so nothing downstream can tell it is missing.
+
+        private void assertCoversEveryCharacter(String label, String text) {
+            List<TextChunk> chunks = new TextChunker().chunk("doc", text);
+            String normalized = text.stripTrailing();
+
+            boolean[] covered = new boolean[normalized.length()];
+            for (TextChunk chunk : chunks) {
+                for (int i = chunk.getStartOffset(); i < chunk.getEndOffset(); i++) {
+                    covered[i] = true;
+                }
+            }
+            for (int i = 0; i < covered.length; i++) {
+                assertThat(covered[i])
+                    .as("%s: character %d of %d reached no chunk", label, i, covered.length)
+                    .isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("text with no whitespace at all is chunked whole")
+        void textWithoutWhitespaceIsCovered() {
+            // Realigning the next chunk to a word boundary used to scan forward without a bound.
+            // These have no boundary to find, so the scan ran to the end of the document and
+            // everything it passed over was dropped - over 80% of the input.
+            assertCoversEveryCharacter("chinese", "这是一个测试文档内容很长".repeat(1000));
+            assertCoversEveryCharacter("japanese", "これはテストの文書です".repeat(1100));
+            assertCoversEveryCharacter("minified json", "{\"k\":\"v\",\"n\":123}".repeat(950));
+        }
+
+        @Test
+        @DisplayName("a single token longer than a chunk does not swallow what follows it")
+        void aLongTokenIsCovered() {
+            assertCoversEveryCharacter("long token",
+                "word ".repeat(400) + "T".repeat(2600) + " word".repeat(400));
+            assertCoversEveryCharacter("base64 blob",
+                "word ".repeat(300) + "QUJDREVG".repeat(1500) + " tail".repeat(200));
+        }
+
+        @Test
+        @DisplayName("ordinary prose is still covered")
+        void proseIsCovered() {
+            assertCoversEveryCharacter("prose", "the quick brown fox ".repeat(700).stripTrailing());
+        }
+    }
 }

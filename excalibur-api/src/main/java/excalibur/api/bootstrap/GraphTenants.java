@@ -11,6 +11,9 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
@@ -33,6 +36,15 @@ import java.util.Set;
  * eviction, and an eviction that lands on one is deferred until the last reader is done. Without
  * that, the mechanism that keeps the node alive would be the mechanism that crashes it.</p>
  *
+ * <h2>Why the erasure deadline is swept here</h2>
+ * <p>{@code excalibur.graph.erasure-max-latency-seconds} bounds how long an obligation may wait
+ * before a compaction runs regardless of how little has accumulated. Nothing evaluated that
+ * bound: the only caller of {@code compactIfDue} was the handler of the <em>next</em> erasure
+ * request, which on a quiet node never arrives - so a single request submitted to an idle node
+ * waited forever and the bound was a number in a table. The sweep below is what makes it a
+ * deadline. It visits the namespaces that are open, which on a node that never sees the
+ * namespace header is the only one there is.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use.</p>
  *
@@ -45,8 +57,24 @@ public final class GraphTenants implements AutoCloseable {
     /** Header naming the namespace a request belongs to. */
     public static final String NAMESPACE_HEADER = "X-Excalibur-Namespace";
 
+    /**
+     * How much of the configured bound may pass between two checks.
+     *
+     * <p>A tenth, so an obligation is discharged within 110% of the bound rather than within
+     * twice it. Checking is cheap - an outstanding count per open namespace, and nothing else
+     * unless something is owed.</p>
+     */
+    private static final long SWEEP_FRACTION = 10;
+
+    /** Shortest gap between sweeps, so a small configured bound cannot turn into a spin. */
+    static final long MIN_SWEEP_INTERVAL_MS = 1_000L;
+
+    /** How long close() waits for a sweep in flight, which may be inside a compaction. */
+    private static final long SHUTDOWN_WAIT_SECONDS = 30L;
+
     private final NamespaceRegistry<GraphTenant> registry;
     private final MappingBudget budget;
+    private final ScheduledExecutorService erasureSweep;
 
     /**
      * A lease on the shared namespace, held for the life of this registry.
@@ -89,7 +117,89 @@ public final class GraphTenants implements AutoCloseable {
             tiering,
             maxOpen);
         this.sharedLease = registry.borrow(NamespaceId.SHARED);
-        LOGGER.info("graph tenants rooted at {}: at most {} open, {}", root, maxOpen, budget);
+
+        long intervalMs = sweepIntervalMillis(config.graph().getErasureMaxLatencySeconds());
+        this.erasureSweep = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "graph-erasure-sweep");
+            thread.setDaemon(true);
+            return thread;
+        });
+        this.erasureSweep.scheduleWithFixedDelay(
+            this::sweepQuietly, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+
+        LOGGER.info("graph tenants rooted at {}: at most {} open, erasure deadline swept every "
+            + "{}ms, {}", root, maxOpen, intervalMs, budget);
+    }
+
+    /**
+     * How often to check whether an erasure obligation has passed its deadline.
+     *
+     * @param maxLatencySeconds The configured bound
+     * @return The gap between sweeps, never below {@link #MIN_SWEEP_INTERVAL_MS}
+     */
+    static long sweepIntervalMillis(long maxLatencySeconds) {
+        return Math.max(MIN_SWEEP_INTERVAL_MS,
+            maxLatencySeconds * 1_000L / SWEEP_FRACTION);
+    }
+
+    /**
+     * Runs a sweep, swallowing whatever it throws.
+     *
+     * <p>A scheduled task that throws is silently cancelled and never runs again, which would
+     * turn one failed compaction into an erasure deadline that stops being enforced for the life
+     * of the process - the exact failure this sweep exists to prevent, arrived at quietly.</p>
+     */
+    private void sweepQuietly() {
+        try {
+            compactDueErasures();
+        } catch (RuntimeException e) {
+            LOGGER.error("graph erasure sweep failed; the next one will try again", e);
+        }
+    }
+
+    /**
+     * Compacts every open namespace whose erasure policy says a compaction is due.
+     *
+     * <p>Open namespaces only. One that has been evicted is not holding anything this node is
+     * serving, and reopening every tenant on disk to ask would spend the mapping budget the
+     * eviction was protecting; an evicted namespace settles its backlog on its next sweep after
+     * something reopens it. A tenant being read is left alone by eviction for the length of the
+     * lease this takes, so a compaction never unmaps a store out from under a query.</p>
+     *
+     * @return How many namespaces were visited with something outstanding
+     */
+    public int compactDueErasures() {
+        int owing = 0;
+        for (NamespaceId id : openNamespaces()) {
+            Optional<NamespaceRegistry.Lease<GraphTenant>> lease = borrowResident(id);
+            if (lease.isEmpty()) {
+                // Evicted between listing and borrowing. borrowResident declines to reopen it
+                // rather than spending the mapping budget the eviction just reclaimed; the
+                // request is on disk and is swept once something else reopens the namespace.
+                continue;
+            }
+            try (NamespaceRegistry.Lease<GraphTenant> held = lease.get()) {
+                GraphErasureService erasure = held.resource().erasureService();
+                if (erasure.outstandingCount() == 0) {
+                    continue;
+                }
+                owing++;
+                GraphErasureService.ErasureOutcome outcome = erasure.compactIfDue();
+                if (outcome.ran()) {
+                    LOGGER.info("erasure deadline reached for namespace {}: {} edge(s) removed, "
+                        + "{} request(s) discharged", id, outcome.edgesRemoved(),
+                        outcome.requestsSatisfied());
+                } else {
+                    LOGGER.debug("namespace {} owes {} erasure(s), none due yet: {}",
+                        id, erasure.outstandingCount(), outcome.reason());
+                }
+            } catch (IOException e) {
+                // One namespace's compaction failing must not stop the others being swept, and
+                // must not stop this one being retried on the next pass.
+                LOGGER.error("could not compact namespace {} for erasure: {}", id, e.toString());
+            }
+        }
+        return owing;
     }
 
     /**
@@ -144,18 +254,61 @@ public final class GraphTenants implements AutoCloseable {
     }
 
     /**
+     * Borrows a namespace's graph only while it is already open, never loading it.
+     *
+     * <p>For the background passes, which visit every open namespace rather than serving a
+     * caller who asked for one. {@link #borrowIfPresent(NamespaceId)} would load a namespace
+     * whose directory exists, so a sweep running against a list taken a moment earlier could
+     * reopen a tenant that was evicted in between - spending the mapping budget the eviction
+     * had just reclaimed - and would mark every namespace it visited as recently used, making
+     * eviction order the sweep's iteration order rather than the deployment's access pattern.</p>
+     *
+     * @param id The namespace
+     * @return The lease, or empty if the namespace is not currently open; close it when done
+     */
+    public Optional<NamespaceRegistry.Lease<GraphTenant>> borrowResident(NamespaceId id) {
+        return registry.borrowResident(Objects.requireNonNull(id, "id must not be null"));
+    }
+
+    /**
      * Drops a namespace's graph so the next request reopens it.
      *
-     * <p>How a build makes its result visible: the directory on disk has been replaced, and the
-     * stack this node had open describes what was there before. Evicting rather than swapping in
-     * place means the reopen happens on the next request, under a lease, with the budget consulted
-     * as it would be for any other namespace.</p>
+     * <p>For a namespace whose directory was replaced by something other than this node - a
+     * restore, or an operator swapping it - so that the next request reads what is now there.
+     * A build does not need this: it installs its new stack into the tenant's holder, which is
+     * what the holder is for.</p>
+     *
+     * <p>The shared namespace cannot be dropped. This class borrows it once and keeps that lease
+     * for the life of the process, so evicting it would not close it - it would leave the old
+     * tenant alive behind {@link #shared()} and open a second one on the same directory at the
+     * next borrow. Two {@code GraphStagingStore}s appending to one log truncate each other's
+     * partial records and hand the same interned id to different labels.</p>
      *
      * @param id The namespace
      * @return true if it was open
+     * @throws IllegalArgumentException if {@code id} is the shared namespace
      */
     public boolean invalidate(NamespaceId id) {
-        return registry.evict(Objects.requireNonNull(id, "id must not be null"));
+        Objects.requireNonNull(id, "id must not be null");
+        if (id.isShared()) {
+            throw new IllegalArgumentException(
+                "the shared namespace is held for the life of the process and cannot be dropped");
+        }
+        return registry.evict(id);
+    }
+
+    /**
+     * Re-measures what a namespace costs after a build or a compaction changed it.
+     *
+     * <p>A tenant opened before anything was built into it holds no mappings and is charged none.
+     * The build that installs a store gives it thirteen, and nothing reopens it to notice - so
+     * without this the budget under-counts the process's real mappings for as long as it runs.</p>
+     *
+     * @param id The namespace
+     * @return true if it was open and its cost had changed
+     */
+    public boolean recost(NamespaceId id) {
+        return registry.recost(Objects.requireNonNull(id, "id must not be null"));
     }
 
     /**
@@ -227,7 +380,20 @@ public final class GraphTenants implements AutoCloseable {
 
     @Override
     public void close() {
-        // The lease first: while it is outstanding the registry defers closing the shared tenant,
+        // The sweep first, and waited for: it borrows tenants and may be inside a compaction
+        // that has the served stack closed, so shutting the registry under it would race a
+        // reopen against the close.
+        erasureSweep.shutdownNow();
+        try {
+            if (!erasureSweep.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
+                LOGGER.warn("the graph erasure sweep did not stop within {}s",
+                    SHUTDOWN_WAIT_SECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // The lease next: while it is outstanding the registry defers closing the shared tenant,
         // so releasing it is what lets the close below actually release its files.
         try {
             sharedLease.close();

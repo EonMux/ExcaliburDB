@@ -173,6 +173,27 @@ public class IngestionOrchestrator {
      */
     private volatile excalibur.ingest.lexical.ChunkIndex lexicalIndex;
 
+    /**
+     * Membership filter the query pipeline prunes segments with, or null when the node keeps
+     * none.
+     *
+     * <p>Written from the same loop that writes the chunks, under the segment the engine
+     * reports the chunk landed in. Populating it is an optimisation and never a condition of
+     * the write: a term the filter cannot take costs the pruning of one segment, and a filter
+     * that is never given a term costs all of it, but neither loses a chunk.</p>
+     */
+    private volatile excalibur.filter.HierarchicalCuckooFilter membershipFilter;
+
+    /**
+     * Cluster every segment is filed under in the membership filter.
+     *
+     * <p>The filter's middle level partitions segments by topic; nothing in this server assigns
+     * topics, so there is one cluster and it matches what excalibur-shard registers segments
+     * under. A second name here would put ingested terms in a cluster the query side never
+     * looks in.</p>
+     */
+    private static final String MEMBERSHIP_CLUSTER = "default";
+
     private final Set<String> activeIngestions;
     private final Map<String, Thread> ingestionThreads;
     private final AtomicBoolean shutdown;
@@ -297,15 +318,6 @@ public class IngestionOrchestrator {
     }
 
     /**
-     * Sets where published documents are reported so a graph can be built from them.
-     *
-     * <p>Set after construction because the graph stack belongs to the API layer, which is
-     * assembled after this orchestrator. Null disables it, which is the state of any deployment
-     * that indexes text and does not extract facts.</p>
-     *
-     * @param graphSink The sink, or null for none
-     */
-    /**
      * Points ingestion at a lexical index, so stored chunks are also BM25-searchable.
      *
      * @param lexicalIndex The index, or null to keep none
@@ -316,6 +328,30 @@ public class IngestionOrchestrator {
             ? "disabled" : "enabled (" + lexicalIndex.engine() + " engine)");
     }
 
+    /**
+     * Points ingestion at the membership filter the query pipeline prunes with.
+     *
+     * <p>Set after construction, like the lexical index: the filter is built by the API layer's
+     * bootstrap alongside the index orchestrator. Without one, stage 1 of the query pipeline
+     * has nothing to say about anything this node crawled and every query reads every
+     * segment.</p>
+     *
+     * @param membershipFilter The filter, or null to keep none
+     */
+    public void setMembershipFilter(excalibur.filter.HierarchicalCuckooFilter membershipFilter) {
+        this.membershipFilter = membershipFilter;
+        LOGGER.info("Membership filter {}", membershipFilter == null ? "disabled" : "enabled");
+    }
+
+    /**
+     * Sets where published documents are reported so a graph can be built from them.
+     *
+     * <p>Set after construction because the graph stack belongs to the API layer, which is
+     * assembled after this orchestrator. Null disables it, which is the state of any deployment
+     * that indexes text and does not extract facts.</p>
+     *
+     * @param graphSink The sink, or null for none
+     */
     public void setGraphSink(excalibur.ingest.graph.GraphIngestSink graphSink) {
         this.graphSink = graphSink;
         LOGGER.info("Graph ingest sink {}", graphSink == null ? "disabled" : "enabled");
@@ -449,6 +485,7 @@ public class IngestionOrchestrator {
 
         long totalIngested = 0;
         int processedDocs = 0;
+        int failedDocs = 0;
 
         for (String documentId : documentIds) {
             if (shutdown.get() || Thread.currentThread().isInterrupted()) {
@@ -467,10 +504,13 @@ public class IngestionOrchestrator {
                 StructuredLoggingHelper.setDocumentId(documentId);
                 totalIngested += ingestDocument(source, sourceId, documentId);
             } catch (DocumentNotFoundException e) {
+                failedDocs++;
                 LOGGER.warn("Document not found: {}", documentId);
             } catch (SourceException e) {
+                failedDocs++;
                 LOGGER.warn("Failed to fetch document {}: {}", documentId, e.getMessage());
             } catch (Exception e) {
+                failedDocs++;
                 LOGGER.warn("Unexpected error processing document {}: {}", documentId, e.getMessage(), e);
             } finally {
                 StructuredLoggingHelper.clearDocumentId();
@@ -494,7 +534,33 @@ public class IngestionOrchestrator {
         persistRegistry();
 
         status.update("idle", 1.0, totalIngested, 0);
-        LOGGER.info("Ingestion complete: {} chunks from {} documents", totalIngested, processedDocs);
+        reportDroppedDocuments(sourceId, status, failedDocs, totalPending);
+        LOGGER.info("Ingestion complete: {} chunks from {} of {} documents",
+            totalIngested, processedDocs - failedDocs, totalPending);
+    }
+
+    /**
+     * Records on the source's status that the run did not ingest everything it listed.
+     *
+     * <p>A document that could not be fetched is skipped rather than fatal, so the run reaches
+     * {@code idle} at full progress either way. Left at that, a run in which every document
+     * failed reports exactly what a source with nothing to ingest reports - idle, complete,
+     * nothing ingested, no error - and the log is the only place the difference exists. An
+     * operator polling the status endpoint has no reason to read it.</p>
+     *
+     * @param sourceId     The source that was ingested
+     * @param status       The status to report on
+     * @param failedDocs   Documents that were listed but not ingested
+     * @param totalPending Documents the crawl listed
+     */
+    private void reportDroppedDocuments(String sourceId, IngestionStatus status,
+                                        int failedDocs, long totalPending) {
+        if (failedDocs <= 0) {
+            return;
+        }
+        LOGGER.warn("Ingestion of {} did not ingest {} of {} documents", sourceId, failedDocs, totalPending);
+        status.setError(failedDocs + " of " + totalPending
+            + " documents were not ingested; each failure is logged separately");
     }
 
     /**
@@ -640,8 +706,10 @@ public class IngestionOrchestrator {
             byte[] value = vector == null
                 ? ChunkPayloadCodec.encodeTextOnly(chunk.getText())
                 : ChunkPayloadCodec.encode(chunk.getText(), vector);
-            storageEngine.put(chunkId.getBytes(StandardCharsets.UTF_8), value);
+            long segmentId = storageEngine.putReportingSegment(
+                chunkId.getBytes(StandardCharsets.UTF_8), value);
             indexLexically(chunkId, chunk.getText());
+            recordTermsForPruning(segmentId, chunkId, chunk.getText());
             writtenKeys.add(chunkId);
         }
     }
@@ -849,6 +917,35 @@ public class IngestionOrchestrator {
             target.add(chunkId, text);
         } catch (IOException e) {
             LOGGER.warn("Chunk {} stored but not lexically indexed: {}", chunkId, e.getMessage());
+        }
+    }
+
+    /**
+     * Files one chunk's distinct terms under the segment it was written to.
+     *
+     * <p>Distinct terms, because the filter answers whether a segment holds a term: a word
+     * occurring forty times in a chunk is one fact. The segment is registered first because the
+     * engine creates segments as writes route to them, and a segment the filter has never been
+     * told about would be refused rather than recorded; registration is idempotent.</p>
+     *
+     * <p>Nothing here can fail the write. A term the filter has no room for takes that segment
+     * out of pruning - {@link excalibur.filter.HierarchicalCuckooFilter#coversSegment} then
+     * reports it - and the query reads the segment in full, which is slower and not wrong.</p>
+     */
+    private void recordTermsForPruning(long segmentId, String chunkId, String text) {
+        excalibur.filter.HierarchicalCuckooFilter target = this.membershipFilter;
+        if (target == null || text == null || text.isEmpty()) {
+            return;
+        }
+        String segment = String.valueOf(segmentId);
+        try {
+            target.registerSegment(segment, MEMBERSHIP_CLUSTER);
+            for (String term : io.excalibur.core.text.TermExtractor.extractUniqueTerms(text)) {
+                target.insert(term.getBytes(StandardCharsets.UTF_8), segment);
+            }
+        } catch (RuntimeException e) {
+            LOGGER.warn("Chunk {} stored but its terms were not filed for pruning; segment {} "
+                + "will be read in full: {}", chunkId, segment, e.toString());
         }
     }
 

@@ -199,8 +199,10 @@ class SplitWorkerTest {
             // Wait for split to complete
             assertTrue(splitLatch.await(SPLIT_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Split should complete within timeout");
 
-            // Verify split completed
-            assertTrue(segment.isSplitComplete(), "Segment should be SPLIT_COMPLETE");
+            // The listener runs before the parent is retired - deliberately, so the children
+            // are published before anything routes away from the parent - so the callback
+            // firing is not yet the parent reaching SPLIT_COMPLETE.
+            assertTrue(awaitSplitComplete(segment), "Segment should be SPLIT_COMPLETE");
             assertNotNull(leftChildRef.get(), "Left child should be created");
             assertNotNull(rightChildRef.get(), "Right child should be created");
 

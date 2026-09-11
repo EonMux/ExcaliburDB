@@ -95,7 +95,8 @@ public final class ClientRateLimiter {
             evictIfFull(nowNanos);
             buckets = clients.computeIfAbsent(key, ignored -> new ClientBuckets(
                 new TokenBucket(readRatePerSecond, readBurst, nowNanos),
-                new TokenBucket(mutateRatePerSecond, mutateBurst, nowNanos)));
+                new TokenBucket(mutateRatePerSecond, mutateBurst, nowNanos),
+                nowNanos));
         }
         buckets.lastSeenNanos = nowNanos;
         TokenBucket bucket = mutating ? buckets.mutate : buckets.read;
@@ -156,11 +157,24 @@ public final class ClientRateLimiter {
     private static final class ClientBuckets {
         private final TokenBucket read;
         private final TokenBucket mutate;
+
+        /**
+         * When this client was last charged.
+         *
+         * <p>Stamped at construction rather than left at zero and set by the caller afterwards.
+         * {@code System.nanoTime()} is far past the idle threshold by the time a process serves
+         * traffic, so an unstamped entry reads as ten minutes idle for the moment between being
+         * published into the map and being stamped - and another thread's eviction sweep, which
+         * runs precisely when the map is full, deletes it. The client it belonged to then gets a
+         * fresh bucket on its next request, which is a hole in the limit exactly when the limit
+         * is the thing holding.</p>
+         */
         private volatile long lastSeenNanos;
 
-        ClientBuckets(TokenBucket read, TokenBucket mutate) {
+        ClientBuckets(TokenBucket read, TokenBucket mutate, long nowNanos) {
             this.read = read;
             this.mutate = mutate;
+            this.lastSeenNanos = nowNanos;
         }
     }
 

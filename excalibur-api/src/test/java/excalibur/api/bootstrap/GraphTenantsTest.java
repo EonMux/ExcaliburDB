@@ -59,6 +59,73 @@ class GraphTenantsTest {
         return new GraphTenants(root, new Config(props), MappingBudget.detect(), maxOpen);
     }
 
+    @org.junit.jupiter.api.Nested
+    @DisplayName("Enforcing the erasure deadline")
+    class ErasureSweep {
+
+        @Test
+        @DisplayName("sweeps every open namespace, so a quiet node still meets its bound")
+        void sweepsTheOpenNamespaces(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 4,
+                    Map.of("excalibur.graph.erasure-max-latency-seconds", "1"))) {
+                try (NamespaceRegistry.Lease<GraphTenant> lease =
+                         tenants.borrow(NamespaceId.of("acme"))) {
+                    lease.resource().erasureService().submit(new io.excalibur.graph.erasure
+                        .ErasureScope.Entity(7));
+                }
+
+                // Nothing has been built, so no store can be rewritten - but the sweep must
+                // still have visited the namespace that owes something rather than skipping
+                // straight past it.
+                assertThat(tenants.compactDueErasures()).isEqualTo(1);
+            }
+        }
+
+        @Test
+        @DisplayName("passes over namespaces that owe nothing")
+        void skipsNamespacesThatOweNothing(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 4)) {
+                assertThat(tenants.compactDueErasures()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("does not reopen a namespace the eviction just closed")
+        void doesNotReopenAnEvictedNamespace(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 4)) {
+                NamespaceId acme = NamespaceId.of("acme");
+                tenants.borrow(acme).close();
+                assertThat(tenants.invalidate(acme)).isTrue();
+
+                // The sweep runs against a list of open namespaces taken a moment earlier, so it
+                // has to decline the ones that went away in between. Borrowing the way a request
+                // does would reopen this one, spending the mapping budget the eviction reclaimed.
+                assertThat(tenants.borrowResident(acme)).isEmpty();
+
+                try (NamespaceRegistry.Lease<GraphTenant> served =
+                         tenants.borrowIfPresent(acme).orElseThrow()) {
+                    assertThat(served.resource().id()).isEqualTo(acme);
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("checks often enough that the bound is met rather than merely approached")
+        void checksWellInsideTheBound() {
+            assertThat(GraphTenants.sweepIntervalMillis(3600)).isEqualTo(360_000L);
+            assertThat(GraphTenants.sweepIntervalMillis(60)).isEqualTo(6_000L);
+        }
+
+        @Test
+        @DisplayName("never spins, however short the configured bound")
+        void neverSpins() {
+            assertThat(GraphTenants.sweepIntervalMillis(1))
+                .isGreaterThanOrEqualTo(GraphTenants.MIN_SWEEP_INTERVAL_MS);
+            assertThat(GraphTenants.sweepIntervalMillis(0))
+                .isGreaterThanOrEqualTo(GraphTenants.MIN_SWEEP_INTERVAL_MS);
+        }
+    }
+
     @Test
     @DisplayName("a node that never sends the header uses one shared namespace")
     void theDefaultIsASingleSharedNamespace(@TempDir Path tempDir) throws IOException {
@@ -279,6 +346,78 @@ class GraphTenantsTest {
             try (NamespaceRegistry.Lease<GraphTenant> lease =
                      tenants.borrowIfPresent(NamespaceId.SHARED).orElseThrow()) {
                 assertThat(lease.resource().id()).isEqualTo(NamespaceId.SHARED);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("the shared namespace cannot be dropped out from under ingestion")
+    void theSharedNamespaceCannotBeInvalidated(@TempDir Path tempDir) throws IOException {
+        try (GraphTenants tenants = tenants(tempDir, 4)) {
+            // This class keeps a lease on the shared tenant for the life of the process, so an
+            // eviction would not close it - it would leave the old one behind shared() and open a
+            // second GraphStagingStore on the same log at the next borrow.
+            assertThatThrownBy(() -> tenants.invalidate(NamespaceId.SHARED))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("shared");
+        }
+    }
+
+    @Test
+    @DisplayName("building the shared namespace leaves ingestion holding the same staging store")
+    void buildingSharedKeepsOneStagingStore(@TempDir Path tempDir) throws IOException {
+        try (GraphTenants tenants = tenants(tempDir, 4)) {
+            GraphTenant held = tenants.shared();
+            var staging = held.staging();
+
+            // What the build endpoint does for a request that carried no namespace header,
+            // repeated - a caller recovers from a build it did not see the result of by retrying.
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try (NamespaceRegistry.Lease<GraphTenant> lease =
+                         tenants.borrow(NamespaceId.SHARED)) {
+                    new StagingGraphIngestSink(lease.resource().staging(), facts("Ada", "Babbage"))
+                        .onDocumentPublished("doc-" + attempt, "Ada knows Babbage.");
+                    assertThat(lease.resource().buildService().build().published()).isTrue();
+                    tenants.recost(NamespaceId.SHARED);
+                }
+
+                assertThat(tenants.shared())
+                    .as("ingestion was handed this tenant once; a build must not replace it")
+                    .isSameAs(held);
+                assertThat(tenants.shared().staging()).isSameAs(staging);
+            }
+
+            // And the graph the build published is the one being served.
+            assertThat(tenants.shared().holder().isPresent()).isTrue();
+        }
+    }
+
+    @Test
+    @DisplayName("a graph built after the tenant was opened is charged to the budget")
+    void aGraphBuiltLaterIsCharged(@TempDir Path tempDir) throws IOException {
+        try (GraphTenants tenants = tenants(tempDir, 4)) {
+            NamespaceId acme = NamespaceId.of("acme");
+
+            try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
+                // Opened with nothing built into it, so it maps nothing and is charged nothing.
+                assertThat(lease.resource().cost()[0]).isZero();
+                long before = tenants.budget().mappings();
+
+                new StagingGraphIngestSink(lease.resource().staging(), facts("Ada", "Babbage"))
+                    .onDocumentPublished("acme:doc", "Ada knows Babbage.");
+                assertThat(lease.resource().buildService().build().published()).isTrue();
+
+                long mapped = lease.resource().cost()[0];
+                assertThat(mapped).isPositive();
+                assertThat(tenants.recost(acme)).isTrue();
+                assertThat(tenants.budget().mappings())
+                    .as("a budget that never learns what a built tenant costs under-counts "
+                        + "the process's mappings for as long as it runs")
+                    .isEqualTo(before + mapped);
+
+                // Idempotent: nothing changed, so nothing is charged twice.
+                assertThat(tenants.recost(acme)).isFalse();
+                assertThat(tenants.budget().mappings()).isEqualTo(before + mapped);
             }
         }
     }

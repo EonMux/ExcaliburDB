@@ -180,6 +180,15 @@ public class HnswIntegrationWorker {
 
     private volatile Thread workerThread;
 
+    /**
+     * The offset each stalled segment's tail is stuck at, keyed by segment file.
+     *
+     * <p>Only ever holds segments the worker cannot read past. An entry is removed the moment
+     * the tail moves again, so the map is empty on a healthy node.</p>
+     */
+    private final java.util.Map<java.nio.file.Path, Long> stalledTails =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
     // ==================== Constructors ====================
 
     /**
@@ -631,6 +640,54 @@ public class HnswIntegrationWorker {
     }
 
     /**
+     * Reports a write log the worker cannot read past, once per place it gets stuck.
+     *
+     * <p>The tail is read one entry at a time from the checkpoint, and an entry that will not
+     * parse - a failed CRC, most of all - stops the read where it is. The checkpoint cannot be
+     * moved past it without declaring entries integrated that are not, so it stays, and every
+     * cycle from then on reads the same byte and gets the same answer. Nothing above debug is
+     * written by the read itself, so the effect is a segment whose vectors quietly stop
+     * becoming searchable while ingestion keeps reporting success.</p>
+     *
+     * <p>Reported once per offset rather than once per cycle: the offset does not move while
+     * the tail is stuck, so this is one message per stall, and a new one if it ever moves and
+     * sticks again.</p>
+     *
+     * @param segment      The segment whose tail is stuck
+     * @param offset       The offset that will not parse
+     * @param writeLogHead The head the tail should have reached
+     */
+    private void reportStalledTail(Segment segment, long offset, long writeLogHead) {
+        Long reported = stalledTails.put(segment.path(), offset);
+        if (reported != null && reported == offset) {
+            return;
+        }
+        LOGGER.error("HNSW integration for {} cannot read the write log entry at offset {}. The "
+            + "{} bytes from there to the head will not be indexed and their vectors will not be "
+            + "searchable, on this run or any later one, until the segment is reindexed.",
+            segment.path(), offset, writeLogHead - offset);
+    }
+
+    /** Forgets a stall once the segment's tail moves again. */
+    private void tailMoved(Segment segment) {
+        if (!stalledTails.isEmpty()) {
+            stalledTails.remove(segment.path());
+        }
+    }
+
+    /**
+     * The offset each segment's tail is stuck at, for segments the worker cannot read past.
+     *
+     * <p>Empty on a healthy node. A segment listed here is one whose newer vectors are not
+     * reaching its graph - see {@link #reportStalledTail}.</p>
+     *
+     * @return An immutable snapshot, keyed by segment file
+     */
+    public java.util.Map<java.nio.file.Path, Long> stalledTails() {
+        return java.util.Map.copyOf(stalledTails);
+    }
+
+    /**
      * Integrates a batch of entries from a segment's write log into the HNSW graph.
      *
      * @param indexable The segment with its graph and tracker
@@ -665,10 +722,15 @@ public class HnswIntegrationWorker {
             // No usable vectors found; advance past the entries that were skipped so a
             // malformed or wrongly dimensioned entry cannot stall the log tail forever.
             if (currentOffset > lastIntegrated) {
+                tailMoved(segment);
                 tracker.compareAndSetOffset(currentOffset);
+            } else {
+                reportStalledTail(segment, lastIntegrated, writeLogHead);
             }
             return 0;
         }
+
+        tailMoved(segment);
 
         // Integrate batch into HNSW graph
         try {

@@ -388,8 +388,11 @@ public class TailScanner {
     private long resync(long offset, ScanState state) {
         state.resyncBytes++;
         if (state.resyncBytes > MAX_RESYNC_BYTES) {
-            LOGGER.warn("Tail scan aborted at offset {}: could not resynchronise within {} bytes. " +
-                       "The write log is likely corrupted; {} entries were scanned before aborting.",
+            LOGGER.warn("Tail scan aborted at offset {}: no entry boundary was found within {} "
+                       + "bytes, so the rest of the tail was not searched and {} entries were "
+                       + "scanned before aborting. The scan starts at a checkpoint, so this is "
+                       + "an offset that does not name the start of an entry - a checkpoint "
+                       + "written against a different log, or bytes that did not survive.",
                        offset, MAX_RESYNC_BYTES, state.entriesScanned);
             return -1;
         }

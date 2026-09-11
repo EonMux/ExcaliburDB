@@ -576,8 +576,9 @@ public class SplitWorker {
         Files.deleteIfExists(leftChildPath);
         Files.deleteIfExists(rightChildPath);
 
-        // Slot table + 1MB data region, matching the parent's slot count
-        long childCapacity = (long) segment.slotCount() * 24L * 2 + 1024L * 1024;
+        // Each child gets the parent's geometry. The constructor adds the data region
+        // itself, so this passes the slot table alone.
+        long childCapacity = Segment.capacityForSlots(segment.slotCount());
 
         Segment leftChild = null;
         Segment rightChild = null;

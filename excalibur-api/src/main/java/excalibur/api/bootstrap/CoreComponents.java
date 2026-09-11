@@ -54,6 +54,12 @@ public record CoreComponents(Arena arena,
     /** Entries the membership filter is sized for when nothing says otherwise. */
     public static final long DEFAULT_CORPUS_CAPACITY = 10_000_000L;
 
+    /** Property sizing each segment's own level of the membership filter. */
+    public static final String KEY_SEGMENT_CAPACITY = "excalibur.filter.segment-capacity";
+
+    /** Distinct terms one segment's filter is sized for when nothing says otherwise. */
+    public static final int DEFAULT_SEGMENT_CAPACITY = 10_000;
+
     /**
      * Builds and starts the storage stack.
      *
@@ -72,6 +78,7 @@ public record CoreComponents(Arena arena,
         // keystore before the listener -- and a capacity rejected halfway through leaves an open
         // Arena and a started storage engine behind with nothing left holding them.
         long corpusCapacity = corpusCapacity(config);
+        int segmentCapacity = segmentCapacity(config);
 
         boolean panamaAvailable = MemorySegmentFactory.isPanamaAvailable();
         Arena arena = panamaAvailable ? Arena.ofShared() : null;
@@ -84,7 +91,7 @@ public record CoreComponents(Arena arena,
             createIndexOrchestrator(config, dataDir, storageEngine, volumeManager);
         shareTheVisibilityClock(storageEngine, indexOrchestrator);
         HierarchicalCuckooFilter hierarchicalFilter =
-            createHierarchicalCuckooFilter(corpusCapacity);
+            createHierarchicalCuckooFilter(corpusCapacity, segmentCapacity);
         indexOrchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
 
         wireCompactionCallback(storageEngine, indexOrchestrator);
@@ -202,13 +209,16 @@ public record CoreComponents(Arena arena,
      *       {@code excalibur.filter.corpus-capacity}</li>
      *   <li>Fingerprint bits: 13 (provides ~0.1% false positive rate)</li>
      *   <li>Cluster capacity: the corpus capacity, because every segment shares one cluster</li>
-     *   <li>Segment capacity: 10,000 entries per segment</li>
+     *   <li>Segment capacity: {@value #DEFAULT_SEGMENT_CAPACITY} distinct terms, or
+     *       {@code excalibur.filter.segment-capacity}</li>
      * </ul>
      *
-     * @param corpusCapacity Entries the corpus level is sized for, already validated
+     * @param corpusCapacity  Entries the corpus level is sized for, already validated
+     * @param segmentCapacity Distinct terms each segment's level is sized for, already validated
      * @return Initialized hierarchical Cuckoo filter
      */
-    private static HierarchicalCuckooFilter createHierarchicalCuckooFilter(long corpusCapacity) {
+    private static HierarchicalCuckooFilter createHierarchicalCuckooFilter(long corpusCapacity,
+                                                                           int segmentCapacity) {
         LOGGER.info("Initializing hierarchical Cuckoo filter...");
 
         // Default parameters tuned for ~0.1% false positive rate
@@ -216,12 +226,10 @@ public record CoreComponents(Arena arena,
 
         // Every segment is registered into a single "default" cluster, so the cluster level does
         // not partition anything: it holds the whole corpus's terms. Sized at a fraction of the
-        // corpus it saturates first, and a level that cannot accept a term is a level that
-        // denies it - which prunes every segment for that term and answers with nothing while
-        // the documents sit in storage. Until clusters mean something, the cluster level is the
-        // corpus level and is sized like it.
+        // corpus it fills first, and a level that has refused a term stops being trusted for its
+        // whole scope - which here is every segment on the node. Until clusters mean something,
+        // the cluster level is the corpus level and is sized like it.
         int clusterCapacity = (int) Math.min(corpusCapacity, Integer.MAX_VALUE);
-        int segmentCapacity = 10_000;
 
         HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(
             corpusCapacity,
@@ -251,20 +259,50 @@ public record CoreComponents(Arena arena,
      * @throws IllegalArgumentException if a value is configured and is not a positive number
      */
     private static long corpusCapacity(Config config) {
-        String value = config.getEffectiveProperties().get(KEY_CORPUS_CAPACITY);
+        return positiveCapacity(config, KEY_CORPUS_CAPACITY, DEFAULT_CORPUS_CAPACITY);
+    }
+
+    /**
+     * Resolves the distinct terms one segment's level of the filter is sized against.
+     *
+     * <p>Separate from the corpus capacity because the two answer different questions: the
+     * corpus level holds every term on the node, a segment level holds one segment's
+     * vocabulary. A segment that outgrows its level keeps answering correctly and stops being
+     * pruned, which shows up as {@code cuckoo.saturatedSegments} on {@code /v1/stats} and as
+     * latency. This is the knob that responds to it.</p>
+     *
+     * @param config The application configuration
+     * @return The configured capacity, or {@link #DEFAULT_SEGMENT_CAPACITY}
+     * @throws IllegalArgumentException if a value is configured and is not a positive number
+     */
+    private static int segmentCapacity(Config config) {
+        long parsed = positiveCapacity(config, KEY_SEGMENT_CAPACITY, DEFAULT_SEGMENT_CAPACITY);
+        return (int) Math.min(parsed, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Reads one capacity key, refusing a value that cannot be one.
+     *
+     * @param config       The application configuration
+     * @param key          The property key
+     * @param fallback     What an absent or blank value means
+     * @return The configured capacity, or the fallback
+     * @throws IllegalArgumentException if a value is configured and is not a positive number
+     */
+    private static long positiveCapacity(Config config, String key, long fallback) {
+        String value = config.getEffectiveProperties().get(key);
         if (value == null || value.isBlank()) {
-            return DEFAULT_CORPUS_CAPACITY;
+            return fallback;
         }
         long parsed;
         try {
             parsed = Long.parseLong(value.trim());
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(KEY_CORPUS_CAPACITY
+            throw new IllegalArgumentException(key
                 + " must be a positive number of entries; got: " + value, e);
         }
         if (parsed <= 0) {
-            throw new IllegalArgumentException(KEY_CORPUS_CAPACITY
-                + " must be positive; got: " + parsed);
+            throw new IllegalArgumentException(key + " must be positive; got: " + parsed);
         }
         return parsed;
     }

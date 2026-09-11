@@ -10,15 +10,21 @@ import java.util.Objects;
  * query quality and detect degraded states.</p>
  *
  * <h2>Coverage Calculation</h2>
- * <p>Estimated corpus coverage is the share of the live corpus this query was allowed to read:</p>
+ * <p>Estimated corpus coverage is the share of the live corpus this query actually read:</p>
  * <pre>
  * queryable = activeSegments + indexingSegments + warmingSegments + compactingSegments
- * coverage  = (queryable - segmentsExcluded) / (totalSegments - tombstonedSegments)
+ * unread    = segmentsExcluded + segmentsWithErrors + segmentsTimedOut
+ * coverage  = (queryable - unread) / (totalSegments - tombstonedSegments)
  * </pre>
- * <p>{@code segmentsExcluded} is what separates this from a catalog census. A segment held back
- * because the caller asked for complete segments only, or dropped because its graph was not
- * available, is counted by the catalog and never searched; without subtracting it the response
- * reports full coverage over an answer the query never saw.</p>
+ * <p>Everything subtracted is a segment the catalog counts and the answer does not rest on.
+ * A segment held back because the caller asked for complete segments only, or dropped because
+ * its graph was not available, was never searched; one that failed or did not answer in time was
+ * searched and produced nothing. Reporting any of them as covered tells a client the answer is
+ * more complete than it is - which is the one thing this number exists to prevent, since it is
+ * what a client reads to decide whether to retry.</p>
+ *
+ * <p>The three subtracted counts name disjoint sets, so a segment is never charged twice: a
+ * segment that did not answer in time is a timeout and not also an error.</p>
  *
  * <h2>Degraded State</h2>
  * <p>A query is considered "degraded" when:</p>
@@ -392,7 +398,15 @@ public final class IndexCoverage {
         }
 
         /**
-         * Sets the number of segments the query was not permitted to search.
+         * Sets the number of live segments this query did not read, for a reason that is not
+         * a failure.
+         *
+         * <p>Two things land here, and they are not the same problem. A segment held back
+         * because the request asked for fully-indexed segments only is the caller's own
+         * choice. A segment with no vector index to search is the node's: its entries are in
+         * storage and no graph speaks for them, which is what an integration tail that stopped
+         * being read leaves behind. Both are corpus the answer did not come from, which is
+         * what this number is for; distinguishing them means reading the node's own logs.</p>
          */
         public Builder segmentsExcluded(int segmentsExcluded) {
             if (segmentsExcluded < 0) {
@@ -403,7 +417,10 @@ public final class IndexCoverage {
         }
 
         /**
-         * Sets the number of segments with errors.
+         * Sets the number of segments that failed for a reason other than not answering in time.
+         *
+         * <p>Disjoint from {@link #segmentsTimedOut(int)}: one segment that did not answer is
+         * one problem, and counting it in both places reports two.</p>
          */
         public Builder segmentsWithErrors(int segmentsWithErrors) {
             if (segmentsWithErrors < 0) {
@@ -414,7 +431,9 @@ public final class IndexCoverage {
         }
 
         /**
-         * Sets the number of segments that timed out.
+         * Sets the number of segments that did not answer within the query's deadline.
+         *
+         * <p>Disjoint from {@link #segmentsWithErrors(int)}.</p>
          */
         public Builder segmentsTimedOut(int segmentsTimedOut) {
             if (segmentsTimedOut < 0) {
@@ -427,9 +446,10 @@ public final class IndexCoverage {
         /**
          * Computes coverage from segment counts and sets it.
          *
-         * <p>The numerator is what this query was allowed to read: the queryable segments the
-         * catalog holds, less the ones it was not permitted to search. Counting the catalog alone
-         * reports full coverage over a query that was shown nothing.</p>
+         * <p>The numerator is what this query read: the queryable segments the catalog holds,
+         * less the ones it was not permitted to search and the ones that produced no answer.
+         * Counting the catalog alone reports full coverage over a query that was shown nothing,
+         * or over one whose every segment timed out.</p>
          *
          * <p>The computed coverage is clamped to [0.0, 1.0] to ensure
          * domain correctness regardless of input values.</p>
@@ -441,7 +461,8 @@ public final class IndexCoverage {
             if (nonPurged <= 0) {
                 this.estimatedCorpusCoverage = 0.0;
             } else {
-                double raw = (double) (queryable() - segmentsExcluded) / nonPurged;
+                long unread = (long) segmentsExcluded + segmentsWithErrors + segmentsTimedOut;
+                double raw = (double) (queryable() - unread) / nonPurged;
                 // Clamp to [0.0, 1.0] - domain correctness guarantee
                 this.estimatedCorpusCoverage = Math.max(0.0, Math.min(1.0, raw));
             }

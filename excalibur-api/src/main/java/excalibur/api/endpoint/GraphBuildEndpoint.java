@@ -68,10 +68,11 @@ public class GraphBuildEndpoint implements HttpHandler {
 
         try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
             GraphBuildService.BuildOutcome outcome = lease.resource().buildService().build();
-            // The directory has been replaced, so the stack every other namespace-scoped request
-            // would take is describing what was there before. Dropping it makes the next request
-            // reopen what was just published.
-            tenants.invalidate(namespace);
+            // The build already installed the newly published stack into this tenant's holder,
+            // which is the one every namespace-scoped request reads - so there is nothing stale
+            // left to drop. What did change is what the tenant costs: a namespace that held no
+            // graph a moment ago now holds thirteen mappings, and the budget has to be told.
+            tenants.recost(namespace);
 
             ResponseBody.sendJson(exchange, 200,
                 "{"

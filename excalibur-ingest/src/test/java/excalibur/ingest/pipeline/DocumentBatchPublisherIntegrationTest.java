@@ -276,6 +276,44 @@ class DocumentBatchPublisherIntegrationTest {
         }
     }
 
+    @Test
+    void testBulkPublishCountsOnlyTheChunksItPublished() throws Exception {
+        // A document is published whole or not at all, so the chunks of one that was refused
+        // are not in the index. Counting them into the total reports a corpus larger than the
+        // one that exists, and pairs a document count of 1 with the chunk count of 2.
+        excalibur.filter.HierarchicalCuckooFilter refusingFilter =
+            org.mockito.Mockito.mock(excalibur.filter.HierarchicalCuckooFilter.class);
+        org.mockito.Mockito.when(refusingFilter.insert(
+                org.mockito.ArgumentMatchers.any(byte[].class),
+                org.mockito.ArgumentMatchers.eq("segment-1")))
+            .thenAnswer(invocation -> {
+                String term = new String((byte[]) invocation.getArgument(0),
+                    java.nio.charset.StandardCharsets.UTF_8);
+                return !term.contains("refused");
+            });
+
+        DocumentBatchPublisher filteredPublisher = new DocumentBatchPublisher(
+            tracker, docRegistry, refusingFilter, "segment-1", () -> { }, null);
+
+        DocumentBatchBuffer accepted = new DocumentBatchBuffer("kept", "source1");
+        accepted.addChunk("kept:0", new TextChunk("kept", "acceptedterm", 12, 0, 12, 0), 100);
+        accepted.addChunk("kept:1", new TextChunk("kept", "acceptedterm", 12, 0, 12, 1), 101);
+        accepted.seal();
+
+        DocumentBatchBuffer rejected = new DocumentBatchBuffer("dropped", "source1");
+        rejected.addChunk("dropped:0", new TextChunk("dropped", "refusedterm", 11, 0, 11, 0), 102);
+        rejected.addChunk("dropped:1", new TextChunk("dropped", "refusedterm", 11, 0, 11, 1), 103);
+        rejected.seal();
+
+        DocumentBatchPublisher.BulkPublicationResult result = filteredPublisher.publishBulk(
+            List.of(accepted, rejected),
+            List.of(createMetadata("kept"), createMetadata("dropped")));
+
+        assertEquals(1, result.documentCount(), "one of the two documents was published");
+        assertEquals(2, result.totalChunks(),
+            "the chunks of the document that was not published are not in the index");
+    }
+
     private TextChunk createChunk(String documentId, int chunkIndex) {
         return new TextChunk(
             documentId,

@@ -9,11 +9,20 @@ import java.util.Objects;
 /**
  * What a model can do with an ExcaliburDB node, and how each of those maps onto its HTTP API.
  *
- * <h2>Why these four</h2>
- * <p>They are the whole loop: point the node at documents, watch it index them, turn what was
- * extracted into a graph, then ask the graph questions. A model handed only the last of those can
- * query a corpus somebody else prepared; handed all four it can prepare one, which is the
- * difference between a retrieval endpoint and something an agent can actually be pointed at.</p>
+ * <h2>Why these five</h2>
+ * <p>They are the whole loop: point the node at documents, watch it index them, search them, turn
+ * what was extracted into a graph, then ask the graph questions. A model handed only the last of
+ * those can query a corpus somebody else prepared; handed all five it can prepare one, which is
+ * the difference between a retrieval endpoint and something an agent can actually be pointed at.
+ * </p>
+ *
+ * <h2>Why both searches</h2>
+ * <p>{@link #SEARCH_DOCUMENTS} and {@link #SEARCH_GRAPH} answer different questions and neither
+ * subsumes the other. The first names the chunks that match and needs nothing but an
+ * ingestion run; the second returns entities and the facts connecting them, and needs a graph to
+ * have been built out of extracted triples - which requires a chat model and
+ * {@code excalibur.graph.extraction-enabled}, off by default. A tool set with only the graph
+ * search leaves a model on an ordinary node with no way to reach the corpus at all.</p>
  *
  * <h2>What is deliberately not here</h2>
  * <p>Neither erasure route is a tool: not {@code POST /v1/erasure}, which removes a document from
@@ -40,6 +49,9 @@ import java.util.Objects;
  * @author ExcaliburDB
  */
 public final class McpTools {
+
+    /** Search the indexed documents. */
+    public static final String SEARCH_DOCUMENTS = "search_documents";
 
     /** Ask the graph a question. */
     public static final String SEARCH_GRAPH = "search_graph";
@@ -72,6 +84,28 @@ public final class McpTools {
     public static List<Object> catalogue() {
         List<Object> tools = new ArrayList<>();
 
+        tools.add(tool(SEARCH_DOCUMENTS,
+            "Search the documents this node has indexed and return the identifier of each "
+            + "matching chunk, best first. The reply carries identifiers and scores and no text: "
+            + "resolve a 'document_id' against the store the corpus was ingested from to read "
+            + "what it names. This is the plain retrieval call: it needs only that "
+            + "ingest_documents has run, and it does not require build_graph. Prefer it when the question is answered "
+            + "by the text of a document; prefer search_graph when the question is about how "
+            + "entities relate to each other. Read 'coverage' in the reply: it says what fraction "
+            + "of the index was actually searched, and a value below 1 means segments were still "
+            + "indexing or the deadline cut the search short, so the result may be incomplete. "
+            + "'timed_out' and 'cancelled' say which. Use the order of the results, not the "
+            + "'score' on them: 'retrieval' says which signals answered - 'vector' scores are "
+            + "similarities, 'lexical' are BM25 scores, 'hybrid' are fused rank sums near zero - "
+            + "and the three share no scale, so a score is comparable only with others from the "
+            + "same reply.",
+            schema(
+                required("query", "string",
+                    "What to search for, in natural language. The server embeds it with the same "
+                    + "model it indexed with."),
+                optional("top_k", "integer",
+                    "How many passages to return. Omit for the server's default.", null))));
+
         tools.add(tool(SEARCH_GRAPH,
             "Answer a question from the knowledge graph built out of the ingested documents. "
             + "Returns entities and facts to ground an answer on, not prose. Read the 'status' "
@@ -86,6 +120,12 @@ public final class McpTools {
                 optional("context_entities", "array",
                     "Entity names that disambiguate the question, normally the candidates a "
                     + "previous 'needs_input' answer returned.", "string"),
+                optional("as_of", "string",
+                    "Answer as the facts stood at this point in valid time: an ISO-8601 date "
+                    + "('2019-03-01'), an ISO-8601 instant ('2019-03-01T14:00:00Z'), or 'all' "
+                    + "for the whole history including facts that have since been superseded. "
+                    + "Omit to answer from what holds now, or from a date mentioned in the "
+                    + "question itself.", null),
                 optional("namespace", "string",
                     "Namespace to query. Omit for the shared one.", null))));
 
@@ -117,7 +157,10 @@ public final class McpTools {
 
         tools.add(tool(INGESTION_STATUS,
             "How far indexing has got, for one source or for all of them. 'idle' with no error "
-            + "means there is nothing left to do. 'unconfigured' means the server has no ingestion "
+            + "means the run finished and indexed everything it listed. 'idle' with an error "
+            + "means the run finished without indexing all of it - 'last_error' says how many "
+            + "documents were dropped, and those documents are not searchable. 'unconfigured' "
+            + "means the server has no ingestion "
             + "pipeline and indexed nothing at all, with 'last_error' naming what has to be set - "
             + "in that case do not call build_graph, because there will be nothing to build.",
             schema(
@@ -138,6 +181,7 @@ public final class McpTools {
         Map<String, Object> args = arguments != null ? arguments : Map.of();
         try {
             return switch (name) {
+                case SEARCH_DOCUMENTS -> searchDocuments(args);
                 case SEARCH_GRAPH -> searchGraph(args);
                 case BUILD_GRAPH -> buildGraph(args);
                 case INGEST_DOCUMENTS -> ingestDocuments(args);
@@ -157,6 +201,19 @@ public final class McpTools {
         }
     }
 
+    private ToolResult searchDocuments(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        Map<String, Object> body = Json.object();
+        body.put("query", requiredString(args, "query"));
+        // Omitted rather than defaulted here: the node has a configured default, and sending one
+        // of this adapter's own would quietly override whatever the operator set.
+        Integer topK = optionalInteger(args, "top_k");
+        if (topK != null) {
+            body.put("top_k", topK);
+        }
+        return answer(client.post("/v1/query", Json.write(body), null));
+    }
+
     private ToolResult searchGraph(Map<String, Object> args)
             throws IOException, InterruptedException {
         Map<String, Object> body = Json.object();
@@ -164,6 +221,12 @@ public final class McpTools {
         List<String> mentions = stringList(args, "context_entities");
         if (!mentions.isEmpty()) {
             body.put("context_entities", mentions);
+        }
+        // Omitted rather than defaulted: without one the node answers at the instant the
+        // question implies, and sending "today" here would silently overrule that.
+        String asOf = optionalString(args, "as_of");
+        if (asOf != null) {
+            body.put("as_of", asOf);
         }
         return answer(client.post("/v1/graph/query", Json.write(body), namespace(args)));
     }
@@ -233,6 +296,26 @@ public final class McpTools {
         }
         String trimmed = text.trim();
         return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    /**
+     * An integer argument, or null when it is absent or is not a whole number.
+     *
+     * <p>JSON has one number type, so a client that means 5 may send {@code 5.0}; both are the
+     * same value and both are accepted. A fractional one is not - it is not a count, and passing
+     * it through as a truncation would answer a question nobody asked.</p>
+     */
+    private static Integer optionalInteger(Map<String, Object> args, String field) {
+        Object value = args.get(field);
+        if (!(value instanceof Number number)) {
+            return null;
+        }
+        double exact = number.doubleValue();
+        if (exact != Math.rint(exact) || exact < Integer.MIN_VALUE || exact > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                "Argument '" + field + "' must be a whole number: " + value);
+        }
+        return (int) exact;
     }
 
     private static List<String> stringList(Map<String, Object> args, String field) {

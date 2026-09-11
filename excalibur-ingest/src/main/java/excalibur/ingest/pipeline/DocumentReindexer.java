@@ -553,7 +553,11 @@ public class DocumentReindexer {
             // The new segment is only usable if something was actually written to it. Guarding on
             // the document count alone lets a run in which every document failed fall through and
             // tombstone every populated old segment.
-            if (reindexResult.hasErrors() && reindexResult.getChunksCreated() == 0) {
+            // Skips count here as well as errors: a source whose every document turned out
+            // empty wrote nothing, and retiring populated old segments in favour of the empty
+            // new one would erase a corpus on the strength of a crawl that returned no bodies.
+            if (reindexResult.getChunksCreated() == 0
+                    && (reindexResult.hasErrors() || reindexResult.getDocumentsSkipped() > 0)) {
                 // Complete failure - mark segment for cleanup
                 LOG.error("Reindex failed completely for source {}, tombstoning new segment {}", sourceId, newSegmentId);
                 segmentCatalog.tombstone(newSegmentId, visibilityTracker.currentEpoch());
@@ -1374,6 +1378,20 @@ public class DocumentReindexer {
             return error != null && !error.isEmpty();
         }
 
+        /**
+         * Whether this document produced nothing and failed nothing.
+         *
+         * <p>An empty file, or one the chunker finds no text in, carries a reason so the run
+         * can account for it - and that reason is not a failure. Folding it in with the
+         * failures makes a run that indexed everything it could report itself as failed, and
+         * puts "Empty content" in front of an operator as the thing to investigate.</p>
+         *
+         * @return true if the document was skipped rather than failed
+         */
+        public boolean wasSkipped() {
+            return hasError() && totalChunks == 0 && failedChunks == 0;
+        }
+
         public boolean isSuccess() {
             return failedChunks == 0 && totalChunks > 0;
         }
@@ -1395,12 +1413,14 @@ public class DocumentReindexer {
         private final int chunksCreated;
         private final int chunksTombstoned;
         private final int chunksFailed;
+        private final int documentsSkipped;
         private final long elapsedMillis;
         private final List<OperationError> errors;
 
         private ReindexResult(Builder builder) {
             this.sourceId = builder.sourceId;
             this.documentsIndexed = builder.documentsIndexed;
+            this.documentsSkipped = builder.documentsSkipped;
             this.documentsTombstoned = builder.documentsTombstoned;
             this.chunksCreated = builder.chunksCreated;
             this.chunksTombstoned = builder.chunksTombstoned;
@@ -1433,6 +1453,18 @@ public class DocumentReindexer {
             return chunksFailed;
         }
 
+        /**
+         * Documents that produced nothing and failed nothing.
+         *
+         * <p>Reported separately from {@link #getErrorCount()} so a run that met an empty file
+         * is not a failed run. See {@link DocumentResult#wasSkipped()}.</p>
+         *
+         * @return How many documents were skipped
+         */
+        public int getDocumentsSkipped() {
+            return documentsSkipped;
+        }
+
         public long getElapsedMillis() {
             return elapsedMillis;
         }
@@ -1455,9 +1487,9 @@ public class DocumentReindexer {
 
         @Override
         public String toString() {
-            return String.format("ReindexResult[source=%s, indexed=%d, tombstoned=%d, " +
+            return String.format("ReindexResult[source=%s, indexed=%d, skipped=%d, tombstoned=%d, " +
                 "chunksCreated=%d, chunksTombstoned=%d, chunksFailed=%d, errors=%d, elapsed=%dms]",
-                sourceId, documentsIndexed, documentsTombstoned, chunksCreated, 
+                sourceId, documentsIndexed, documentsSkipped, documentsTombstoned, chunksCreated,
                 chunksTombstoned, chunksFailed, errors.size(), elapsedMillis);
         }
 
@@ -1468,6 +1500,7 @@ public class DocumentReindexer {
         public static final class Builder {
             private final String sourceId;
             private final long startTime = System.currentTimeMillis();
+            private int documentsSkipped = 0;
             private int documentsIndexed = 0;
             private int documentsTombstoned = 0;
             private int chunksCreated = 0;
@@ -1512,6 +1545,10 @@ public class DocumentReindexer {
              * count to decide whether the new segment is usable before it tombstones the old
              * ones, and counting total failures there would retire a populated segment in favour
              * of an empty one.</p>
+             *
+             * <p>A document that produced nothing and failed nothing is counted as skipped
+             * rather than as an error - see {@link DocumentResult#wasSkipped()}. The run still
+             * accounts for it; it just is not a run that failed.</p>
              */
             public Builder addDocumentResult(DocumentResult docResult) {
                 if (docResult.getSuccessfulChunks() > 0) {
@@ -1519,8 +1556,10 @@ public class DocumentReindexer {
                 }
                 chunksCreated += docResult.getSuccessfulChunks();
                 chunksFailed += docResult.getFailedChunks();
-                if (docResult.hasError()) {
-                    errors.add(new OperationError("document", docResult.getDocumentId(), 
+                if (docResult.wasSkipped()) {
+                    documentsSkipped++;
+                } else if (docResult.hasError()) {
+                    errors.add(new OperationError("document", docResult.getDocumentId(),
                         docResult.getError()));
                 }
                 return this;

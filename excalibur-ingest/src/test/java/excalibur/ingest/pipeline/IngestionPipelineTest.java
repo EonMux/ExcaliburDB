@@ -277,6 +277,44 @@ class IngestionPipelineTest {
         }
 
         @Test
+        @DisplayName("a crawled chunk's terms reach the membership filter, under the segment it landed in")
+        void crawledTermsPopulateTheMembershipFilter() {
+            // Stage 1 of the query pipeline prunes segments that cannot hold a query's terms.
+            // It was fed only by the reindex path, which targets a segment it chose itself, so
+            // a node that ingested and never reindexed ran every query against every segment.
+            excalibur.filter.HierarchicalCuckooFilter membership =
+                new excalibur.filter.HierarchicalCuckooFilter(1_000_000);
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.setMembershipFilter(membership);
+
+            ingest(orchestrator, new FakeSource("docs",
+                Map.of("a.txt", "Ada Lovelace wrote the first algorithm.")));
+
+            java.util.List<String> segments = membership.findCandidateSegments(
+                "lovelace".getBytes(StandardCharsets.UTF_8));
+            assertThat(segments)
+                .as("a term of an ingested chunk must be findable in the filter")
+                .isNotEmpty();
+            assertThat(membership.coversSegment(segments.get(0)))
+                .as("the segment the chunk landed in must now be prunable")
+                .isTrue();
+            assertThat(membership.findCandidateSegments(
+                "babbage".getBytes(StandardCharsets.UTF_8)))
+                .as("a term no ingested chunk holds must not be reported")
+                .isEmpty();
+        }
+
+        @Test
+        @DisplayName("ingestion without a membership filter still writes its chunks")
+        void noMembershipFilterIsNotAFailure() {
+            RecordingStatus status = ingest(orchestrator(),
+                new FakeSource("docs", Map.of("a.txt", "some text")));
+
+            assertThat(status.error).isNull();
+            assertThat(storedChunkExists("docs", "a.txt", 0)).isTrue();
+        }
+
+        @Test
         @DisplayName("chunks are written under the shared naming convention")
         void chunksUseTheSharedConvention() {
             // The key written here is the one excalibur-shard derives a document key from and
@@ -363,8 +401,11 @@ class IngestionPipelineTest {
 
             RecordingStatus status = ingest(orchestrator(), source);
 
-            assertThat(status.error).isNull();
             assertThat(status.state).isEqualTo("idle");
+            assertThat(status.error)
+                .as("the run finishes, but a document it was asked for is missing from it")
+                .isNotNull()
+                .contains("1 of 2");
             assertThat(storedChunkExists("docs", "present.txt", 0))
                 .as("the document that was there is indexed")
                 .isTrue();
@@ -379,11 +420,44 @@ class IngestionPipelineTest {
 
             RecordingStatus status = ingest(orchestrator(), source);
 
-            assertThat(status.error).isNull();
+            assertThat(status.error)
+                .as("half the corpus is absent from the index and the status has to say so")
+                .isNotNull()
+                .contains("1 of 2");
             assertThat(storedChunkExists("docs", "good.txt", 0)).isTrue();
             assertThat(storedChunkExists("docs", "bad.txt", 0))
                 .as("a document that could not be fetched leaves nothing behind")
                 .isFalse();
+        }
+
+        @Test
+        @DisplayName("a run that ingested everything it was asked for reports no error")
+        void aCleanRunReportsNoError() {
+            FakeSource source = new FakeSource("docs", Map.of(
+                "a.txt", "real text here",
+                "b.txt", "more real text"));
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.error).isNull();
+            assertThat(status.state).isEqualTo("idle");
+        }
+
+        @Test
+        @DisplayName("a run that ingested nothing at all is not reported as a clean finish")
+        void aRunThatDroppedEverythingSaysSo() {
+            // Otherwise this is indistinguishable from a source that had nothing to ingest:
+            // state idle, progress 1.0, nothing ingested, no error.
+            FakeSource source = new FakeSource("docs", Map.of(
+                "a.txt", "!fail",
+                "b.txt", "!fail"));
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.error)
+                .isNotNull()
+                .contains("2 of 2");
+            assertThat(status.ingested).isZero();
         }
 
         @Test

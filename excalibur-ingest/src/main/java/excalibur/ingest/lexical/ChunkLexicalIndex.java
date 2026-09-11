@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -26,8 +27,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Ranking and fusion are built on a {@code long} document id, while a chunk's real name is
  * {@code source:document:chunk:n}. The long is {@link XxHash64} of that string: stable across
  * restarts and reingestion without a counter or a dictionary to keep in step. The original string
- * is stored beside it, so a hit is reported under the name a caller can use, and so a collision is
- * something this class can see rather than a chunk quietly served under another's identity.</p>
+ * is stored beside it, so a hit is reported under the name a caller can use. Two names sharing an
+ * id costs one of the chunks, which {@link #refresh()} reports where it can prove that is what
+ * happened.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent {@link #add}: Lucene's {@code IndexWriter} is, and the counters here are
@@ -41,8 +43,20 @@ public final class ChunkLexicalIndex implements ChunkIndex {
     private final AtomicLong indexed = new AtomicLong();
     private final AtomicLong collisions = new AtomicLong();
 
-    private ChunkLexicalIndex(LexicalIndex index) {
+    /** Documents the index already held when this instance opened it. */
+    private final long documentsAtOpen;
+
+    /**
+     * Whether a chunk identifier written by this instance could have been written before.
+     *
+     * <p>Set by the first {@link #refresh()} and by any {@link #erase}. See
+     * {@link #countChunksLostToCollisions()} for what turns on it.</p>
+     */
+    private final AtomicBoolean identifiersMayRepeat = new AtomicBoolean();
+
+    private ChunkLexicalIndex(LexicalIndex index, long documentsAtOpen) {
         this.index = index;
+        this.documentsAtOpen = documentsAtOpen;
     }
 
     /**
@@ -55,7 +69,8 @@ public final class ChunkLexicalIndex implements ChunkIndex {
      */
     public static ChunkLexicalIndex open(Path directory, double ramBufferSizeMB) throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
-        return new ChunkLexicalIndex(LexicalIndex.open(directory, ramBufferSizeMB));
+        LexicalIndex index = LexicalIndex.open(directory, ramBufferSizeMB);
+        return new ChunkLexicalIndex(index, index.documentCount());
     }
 
     /** The engine id a chunk is indexed under. */
@@ -97,6 +112,30 @@ public final class ChunkLexicalIndex implements ChunkIndex {
     @Override
     public void refresh() throws IOException {
         index.refresh();
+        countChunksLostToCollisions();
+    }
+
+    /**
+     * Reports chunks the index does not hold, where that can only mean it lost them.
+     *
+     * <p>A document count below the number of chunks written is what a collision looks like, and
+     * it is also what a reindex, a reopened index and an erasure look like: all three write or
+     * remove an identifier the index already held, and none of them lose anything. The counter
+     * cannot tell them apart, so the alarm is confined to the case where nothing else can
+     * explain the shortfall - an index this instance opened empty, on its first pass over it,
+     * before any identifier could have been written twice.</p>
+     *
+     * <p>Within that pass every chunk name is minted once, so a document missing from the index
+     * is a chunk missing from the corpus, whether two names collided under the hash or ingestion
+     * minted one name twice. Both are worth the same alarm. Outside it the check is silent
+     * rather than wrong: a false alarm on every reindex would be read as one, and the real
+     * event - under one in a thousand across a hundred million chunks - would be read as one
+     * too.</p>
+     */
+    private void countChunksLostToCollisions() throws IOException {
+        if (identifiersMayRepeat.getAndSet(true) || documentsAtOpen != 0) {
+            return;
+        }
         long added = indexed.get();
         long stored = index.documentCount();
         if (stored < added) {
@@ -121,6 +160,9 @@ public final class ChunkLexicalIndex implements ChunkIndex {
     @Override
     public int erase(java.util.Set<String> chunkIds) throws IOException {
         java.util.Objects.requireNonNull(chunkIds, "chunkIds must not be null");
+        // A removed document leaves the index holding fewer than were written, which is what a
+        // lost chunk looks like to the count.
+        identifiersMayRepeat.set(true);
         for (String chunkId : chunkIds) {
             index.delete(idOf(chunkId));
         }
@@ -219,7 +261,12 @@ public final class ChunkLexicalIndex implements ChunkIndex {
         return indexed.get();
     }
 
-    /** How many chunks were dropped because their id collided. */
+    /**
+     * How many chunks were dropped because their id collided.
+     *
+     * <p>Counted only where a shortfall can mean nothing else - see
+     * {@link #countChunksLostToCollisions()} - so zero is "none seen", not "none happened".</p>
+     */
     public long collisionCount() {
         return collisions.get();
     }

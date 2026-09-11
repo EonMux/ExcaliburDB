@@ -371,6 +371,48 @@ class StatsEndpointTest {
         }
 
         @Test
+        @DisplayName("reports that a full membership filter has stopped pruning")
+        void reportsFilterSaturation() throws IOException {
+            // Saturation turns the pre-filter off rather than turning queries wrong, so it is
+            // invisible in the results: the node just gets slower. Nothing else in this
+            // response would tell an operator that the corpus capacity is now too small.
+            excalibur.filter.HierarchicalCuckooFilter filter =
+                new excalibur.filter.HierarchicalCuckooFilter(8L, 13, 1_000_000, 1_000_000);
+            filter.registerSegment("0", "default");
+            for (int i = 0; i < 4096 && !filter.isSaturated(); i++) {
+                filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), "0");
+            }
+            assertThat(filter.isSaturated())
+                .as("the corpus filter has to fill for this test to mean anything").isTrue();
+            when(indexOrchestrator.getHierarchicalCuckooFilter()).thenReturn(filter);
+
+            StatsEndpoint endpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            assertThat(response).contains("\"saturated\": true");
+            assertThat(response).contains("\"saturatedSegments\": 0");
+        }
+
+        @Test
+        @DisplayName("reports a healthy membership filter as unsaturated")
+        void reportsNoSaturationWhenTheFilterHasRoom() throws IOException {
+            StatsEndpoint endpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            assertThat(response).contains("\"saturated\": false");
+        }
+
+        @Test
         @DisplayName("returns visibility epoch")
         void returnsVisibilityEpoch() throws IOException {
             visibilityTracker.advanceEpoch();
@@ -423,9 +465,11 @@ class StatsEndpointTest {
         @Test
         @DisplayName("returns coverage for partial catalog")
         void returnsCoverageForPartialCatalog() throws IOException {
+            // Two of the three live segments are in a state a query reads; the third is
+            // stranded before indexing, so a third of the corpus is unreachable.
             addActiveSegment(segmentCatalog, 1);
             addIndexingSegment(segmentCatalog, 2);
-            addTombstonedSegment(segmentCatalog, 3);
+            addBootstrappingSegment(segmentCatalog, 3);
 
             StatsEndpoint endpoint = new StatsEndpoint(indexOrchestrator, storageEngine);
             HttpExchange exchange = createMockExchange("GET");
@@ -439,8 +483,11 @@ class StatsEndpointTest {
         }
 
         @Test
-        @DisplayName("includes tombstoned segments in coverage denominator")
-        void includesTombstonedInCoverageDenominator() throws IOException {
+        @DisplayName("a retired segment is not corpus this node is missing")
+        void aTombstonedSegmentLeavesTheDenominator() throws IOException {
+            // Compaction folds a segment into its successor and retires the original, and
+            // reclamation may legitimately never come. Counting it against the node reports a
+            // third of the corpus permanently gone on a node that has lost nothing.
             addActiveSegment(segmentCatalog, 1);
             addTombstonedSegment(segmentCatalog, 2);
 
@@ -452,7 +499,7 @@ class StatsEndpointTest {
             endpoint.handle(exchange);
 
             String response = baos.toString(StandardCharsets.UTF_8);
-            assertThat(response).contains("\"coverage\": 0.5000");
+            assertThat(response).contains("\"coverage\": 1.0000");
         }
 
         @Test
@@ -517,25 +564,27 @@ class StatsEndpointTest {
                 .doesNotThrowAnyException();
 
             // CuckooStats - all fields validated
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(-1, 0, 0.0, 0.0))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(-1, 0, 0.0, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, -1, 0.0, 0.0))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, -1, 0.0, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, -0.1, 0.0))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, -0.1, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, -0.1))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, -0.1, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 1.1, 0.0))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 1.1, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 1.1))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 1.1, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, Double.NaN, 0.0))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, Double.NaN, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, Double.NaN))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, Double.NaN, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0))
+            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0, false, 0))
                 .doesNotThrowAnyException();
-            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0, 1.0, 1.0))
+            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0, false, -1))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0, 1.0, 1.0, false, 0))
                 .doesNotThrowAnyException();
 
             // VisibilityStats - all fields validated
@@ -556,7 +605,7 @@ class StatsEndpointTest {
             StatsEndpoint.EntryStats entries = new StatsEndpoint.EntryStats(0);
             StatsEndpoint.VolumeStats volumes = new StatsEndpoint.VolumeStats(0, 0, 0);
             StatsEndpoint.HnswStats hnsw = new StatsEndpoint.HnswStats(0, 0, 0);
-            StatsEndpoint.CuckooStats cuckoo = new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0);
+            StatsEndpoint.CuckooStats cuckoo = new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0, false, 0);
             StatsEndpoint.VisibilityStats visibility = new StatsEndpoint.VisibilityStats(0, 0, 0);
 
             // Coverage validation
@@ -635,6 +684,11 @@ class StatsEndpointTest {
         metadata.transitionToWarming();
         metadata.transitionToActive();
         metadata.transitionToCompacting();
+    }
+
+    /** A segment whose file is registered but which no transition ever brought up. */
+    private void addBootstrappingSegment(SegmentCatalog catalog, long segmentId) {
+        catalog.registerFile(segmentId, Path.of("/tmp/segment" + segmentId));
     }
 
     private void addTombstonedSegment(SegmentCatalog catalog, long segmentId) {

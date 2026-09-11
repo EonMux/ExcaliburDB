@@ -136,13 +136,8 @@ public final class JsonText {
      * @return The decoded value, or null when absent
      */
     public static String string(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) {
-            return null;
-        }
-        start = json.indexOf('"', start + pattern.length() + 1);
-        if (start < 0) {
+        int start = valueStart(json, field);
+        if (start < 0 || json.charAt(start) != '"') {
             return null;
         }
         int end = closingQuote(json, start + 1);
@@ -179,37 +174,12 @@ public final class JsonText {
      * @return The object text including braces, or null when absent
      */
     public static String object(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) {
+        int start = valueStart(json, field);
+        if (start < 0 || json.charAt(start) != '{') {
             return null;
         }
-        start = json.indexOf('{', start);
-        if (start < 0) {
-            return null;
-        }
-        int depth = 1;
-        int end = start + 1;
-        boolean inString = false;
-        boolean escaped = false;
-        while (end < json.length() && depth > 0) {
-            char c = json.charAt(end);
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                inString = !inString;
-            } else if (!inString) {
-                if (c == '{') {
-                    depth++;
-                } else if (c == '}') {
-                    depth--;
-                }
-            }
-            end++;
-        }
-        return json.substring(start, end);
+        int end = endOfContainer(json, start);
+        return end < 0 ? null : json.substring(start, end);
     }
 
     /**
@@ -220,25 +190,24 @@ public final class JsonText {
      * @return The decoded values, or null when absent or malformed
      */
     public static String[] stringArray(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) {
+        int start = valueStart(json, field);
+        if (start < 0 || json.charAt(start) != '[') {
             return null;
         }
-        start = json.indexOf('[', start);
-        if (start < 0) {
+        int limit = endOfContainer(json, start);
+        if (limit < 0) {
             return null;
         }
         List<String> items = new ArrayList<>();
         int i = start + 1;
-        while (i < json.length()) {
+        while (i < limit) {
             char c = json.charAt(i);
             if (c == ']') {
                 return items.toArray(new String[0]);
             }
             if (c == '"') {
                 int closeQuote = closingQuote(json, i + 1);
-                if (closeQuote < 0) {
+                if (closeQuote < 0 || closeQuote >= limit) {
                     return null;
                 }
                 items.add(unescape(json.substring(i + 1, closeQuote)));
@@ -248,6 +217,21 @@ public final class JsonText {
             }
         }
         return null;
+    }
+
+    /**
+     * Whether a field is present at all.
+     *
+     * <p>The typed accessors take a default, so an absent field and one the caller set to the
+     * default value read the same. Where the answer changes what is reported back - a field
+     * this path cannot honour, say - the difference matters.</p>
+     *
+     * @param json  The JSON document
+     * @param field The field name
+     * @return true if the document carries the field
+     */
+    public static boolean has(String json, String field) {
+        return valueStart(json, field) >= 0;
     }
 
     /**
@@ -383,17 +367,135 @@ public final class JsonText {
         return fractional && (c == '.' || c == 'e' || c == 'E');
     }
 
+    /**
+     * Where the value of the top-level member named {@code field} begins.
+     *
+     * <p>Walks the members of the outermost object and compares each name, rather than searching
+     * the document for the quoted name and reading forward from the first hit. The difference is
+     * not cosmetic: the strings in these bodies are entity names, document ids and source ids
+     * chosen by the caller, so a search finds whichever of those happens to spell a field name
+     * first. A request carrying {@code "context_entities":["query"]} answered a different
+     * question than the one asked, and one carrying a document id of {@code source_id} erased a
+     * different source - silently in both cases, because a wrong value is not a parse error.
+     *
+     * <p>Nested members are deliberately not found. A field belongs to the object it is written
+     * in; a caller that wants one out of a sub-object asks for that object first.
+     *
+     * <p>Iterative, so a deeply nested body costs stack no matter how it is shaped.
+     *
+     * @param json  The document
+     * @param field The member name
+     * @return Index of the first character of its value, or -1 when there is no such member
+     */
     private static int valueStart(String json, String field) {
-        String pattern = "\"" + field + "\"";
-        int start = json.indexOf(pattern);
-        if (start < 0) {
+        if (json == null || field == null) {
             return -1;
         }
-        start += pattern.length();
-        while (start < json.length()
-            && (json.charAt(start) == ':' || Character.isWhitespace(json.charAt(start)))) {
-            start++;
+        int i = skipWhitespace(json, 0);
+        if (i >= json.length() || json.charAt(i) != '{') {
+            return -1;
         }
-        return start;
+        i++;
+        while (true) {
+            i = skipWhitespace(json, i);
+            if (i >= json.length() || json.charAt(i) != '"') {
+                return -1;
+            }
+            int nameEnd = closingQuote(json, i + 1);
+            if (nameEnd < 0) {
+                return -1;
+            }
+            String name = unescape(json.substring(i + 1, nameEnd));
+            i = skipWhitespace(json, nameEnd + 1);
+            if (i >= json.length() || json.charAt(i) != ':') {
+                return -1;
+            }
+            i = skipWhitespace(json, i + 1);
+            if (i >= json.length()) {
+                return -1;
+            }
+            if (name.equals(field)) {
+                return i;
+            }
+            i = endOfValue(json, i);
+            if (i < 0) {
+                return -1;
+            }
+            i = skipWhitespace(json, i);
+            if (i >= json.length() || json.charAt(i) != ',') {
+                return -1;
+            }
+            i++;
+        }
+    }
+
+    private static int skipWhitespace(String json, int from) {
+        int i = from;
+        while (i < json.length() && Character.isWhitespace(json.charAt(i))) {
+            i++;
+        }
+        return i;
+    }
+
+    /**
+     * Index just past the value starting at {@code from}, or -1 when it is malformed.
+     *
+     * @param json The document
+     * @param from Index of the value's first character
+     * @return Index just past it
+     */
+    private static int endOfValue(String json, int from) {
+        char c = json.charAt(from);
+        if (c == '"') {
+            int end = closingQuote(json, from + 1);
+            return end < 0 ? -1 : end + 1;
+        }
+        if (c == '{' || c == '[') {
+            return endOfContainer(json, from);
+        }
+        int i = from;
+        while (i < json.length()) {
+            char v = json.charAt(i);
+            if (v == ',' || v == '}' || v == ']' || Character.isWhitespace(v)) {
+                break;
+            }
+            i++;
+        }
+        return i == from ? -1 : i;
+    }
+
+    /**
+     * Index just past the object or array opening at {@code from}, or -1 when it is unterminated.
+     *
+     * @param json The document
+     * @param from Index of the opening brace or bracket
+     * @return Index just past the matching close
+     */
+    private static int endOfContainer(String json, int from) {
+        char open = json.charAt(from);
+        char close = open == '{' ? '}' : ']';
+        int depth = 0;
+        boolean inString = false;
+        boolean escaped = false;
+        for (int i = from; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (escaped) {
+                escaped = false;
+            } else if (inString && c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                inString = !inString;
+            } else if (!inString) {
+                if (c == open) {
+                    depth++;
+                } else if (c == close) {
+                    depth--;
+                    if (depth == 0) {
+                        return i + 1;
+                    }
+                }
+            }
+        }
+        return -1;
     }
 }

@@ -139,6 +139,14 @@ public class CuckooMaintenanceWorker {
     private final Set<Long> cleanedTombstonedSegments;
 
     /**
+     * Tombstoned segments the engine has not loaded, so their terms could not be removed.
+     *
+     * <p>Retried every cycle - nothing was deleted, so a retry cannot double-delete - and
+     * reported once, so a segment that never loads does not fill the log.</p>
+     */
+    private final Set<Long> unreachableTombstonedSegments = ConcurrentHashMap.newKeySet();
+
+    /**
      * Hierarchical Cuckoo filter for corpus → cluster → segment deletion propagation.
      * May be null if hierarchy is not configured.
      */
@@ -492,32 +500,63 @@ public class CuckooMaintenanceWorker {
      * same segment would be re-scanned and re-deleted on every cycle for the rest of the
      * process's life.</p>
      *
+     * <p>Marked once the attempt is over, not before it starts. A segment marked up front is
+     * marked whether or not anything was deleted, so a segment the engine had not loaded yet
+     * kept its terms in the filter for good - and was reported as processed with nothing
+     * removed, which reads like a segment that had nothing to remove. An attempt that threw is
+     * still marked: it may have deleted part of the segment's terms, and a Cuckoo delete
+     * removes the first slot whose fingerprint matches, so repeating it would evict a live
+     * term that happened to collide.</p>
+     *
      * <p>What is deleted are the same items that were inserted. The hierarchy is
      * populated with extracted terms (the ingestion pipeline inserts
      * {@code TermExtractor.extractTerms} of each chunk's text and the query pipeline looks
      * the same terms up), not with storage keys, so the terms are re-derived from each
      * live entry's chunk text.</p>
      *
+     * <p>Package-visible so one sweep can be driven directly, without a scheduler.</p>
+     *
      * @return Number of deletions performed
      */
-    private int processTombstonedSegments() {
+    int processTombstonedSegments() {
         int totalDeletions = 0;
 
         List<Long> tombstoned = catalog.getSegmentsByState(LifecycleState.TOMBSTONED);
         for (Long segmentId : tombstoned) {
-            if (!cleanedTombstonedSegments.add(segmentId)) {
+            if (cleanedTombstonedSegments.contains(segmentId)) {
                 continue; // Already cleaned; a Cuckoo delete is not idempotent.
             }
 
-            int segmentDeletions = cleanTombstonedSegment(segmentId);
+            Segment segment = storageEngine.getSegment(segmentId);
+            if (segment == null) {
+                // Nothing was deleted, so retrying is safe, and the terms are still in the
+                // filter until it is. Left marked, the segment would be reported as processed
+                // having removed nothing.
+                if (unreachableTombstonedSegments.add(segmentId)) {
+                    LOGGER.warn("Tombstoned segment {} is not loaded, so its terms are still in "
+                        + "the filter and every query they match still reaches it. The next "
+                        + "cycle will try again.", segmentId);
+                }
+                continue;
+            }
+            unreachableTombstonedSegments.remove(segmentId);
+
+            int segmentDeletions = cleanTombstonedSegment(segment, segmentId);
+            cleanedTombstonedSegments.add(segmentId);
 
             // Unregister the filter after cleanup
             unregisterFilter(segmentId);
             tombstonedSegmentsProcessed.incrementAndGet();
-            totalDeletions += segmentDeletions;
+            totalDeletions += Math.max(0, segmentDeletions);
 
-            LOGGER.info("Processed tombstoned segment {} - {} terms deleted from filter",
-                segmentId, segmentDeletions);
+            if (segmentDeletions < 0) {
+                LOGGER.error("Cleaning tombstoned segment {} failed partway. Its remaining terms "
+                    + "stay in the filter, because a Cuckoo delete repeated over terms already "
+                    + "removed would evict live ones that collide with them.", segmentId);
+            } else {
+                LOGGER.info("Processed tombstoned segment {} - {} terms deleted from filter",
+                    segmentId, segmentDeletions);
+            }
             listener.onSegmentFilterCleaned(segmentId);
         }
 
@@ -527,15 +566,11 @@ public class CuckooMaintenanceWorker {
     /**
      * Removes one tombstoned segment's terms from the filters.
      *
-     * @param segmentId The tombstoned segment
-     * @return Number of terms removed
+     * @param segment   The tombstoned segment, already resolved by the caller
+     * @param segmentId The tombstoned segment's id
+     * @return Number of terms removed, or -1 if the attempt failed partway
      */
-    private int cleanTombstonedSegment(long segmentId) {
-        Segment segment = storageEngine.getSegment(segmentId);
-        if (segment == null) {
-            return 0;
-        }
-
+    private int cleanTombstonedSegment(Segment segment, long segmentId) {
         try {
             List<byte[]> termsToDelete = collectSegmentTerms(segment);
             if (termsToDelete.isEmpty()) {
@@ -571,7 +606,7 @@ public class CuckooMaintenanceWorker {
         } catch (Exception e) {
             LOGGER.warn("Error iterating segment {} for filter cleanup: {}",
                 segmentId, e.getMessage());
-            return 0;
+            return -1;
         }
     }
 

@@ -166,6 +166,32 @@ class EmptyResultValidatorTest {
             assertThat(result.thresholdFiltering()).isTrue();
             assertThat(result.rawResultCount()).isEqualTo(1);
         }
+
+        @Test
+        @DisplayName("a fan-out no segment came back from is explained by the failures")
+        void noSegmentAnsweredIsLegitimate() throws IOException {
+            // Every segment timed out. There is nothing here for the diagnostics to find: the
+            // query has no evidence about the corpus at all, and calling that a suspected bug
+            // sends an operator looking for one on every request a slow shard serves.
+            long segmentId = storageEngine.addSegmentInState(LifecycleState.ACTIVE);
+            visibilityTracker.registerSegment(segmentId, visibilityTracker.currentEpoch());
+            visibilityTracker.advanceEpoch();
+            graphProvider.addGraphWithNodes(segmentId, 10);
+
+            List<SegmentQueryTask.SegmentQueryResult> segmentResults = List.of(
+                new SegmentQueryTask.SegmentQueryResult(
+                    segmentId, Collections.emptyList(), 0, 1, false, "Timeout"));
+
+            EmptyResultValidator.ValidationResult result = EmptyResultValidator.validate(
+                createEmptyResponse(), createTestRequest(), storageEngine, visibilityTracker,
+                segmentResults, graphProvider
+            );
+
+            assertThat(result.isLegitimate()).isTrue();
+            assertThat(result.reason())
+                .isEqualTo(EmptyResultValidator.ValidationResult.Reason.NO_SEGMENT_ANSWERED);
+            assertThat(result.segmentsSearched()).isZero();
+        }
     }
 
     @Nested

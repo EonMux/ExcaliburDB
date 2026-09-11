@@ -812,6 +812,26 @@ public class StorageEngine implements AutoCloseable {
      * @throws SegmentAtCapacityException if segment is at capacity and split cannot complete
      */
     public void put(byte[] key, byte[] value) {
+        putReportingSegment(key, value);
+    }
+
+    /**
+     * Writes a key and says which segment it landed in.
+     *
+     * <p>Identical to {@link #put(byte[], byte[])} in every effect; it differs only in telling
+     * the caller where the write went. The engine routes by key hash and may split the target
+     * mid-write, so a caller that keeps anything per segment - a membership filter, a
+     * per-segment index - cannot work that out for itself, and guessing would file the fact
+     * under a segment that does not hold the key.</p>
+     *
+     * @param key The key (must not be null)
+     * @param value The value (must not be null)
+     * @return The id of the segment the key was written to
+     * @throws NullPointerException if key or value is null
+     * @throws IllegalStateException if engine is not started
+     * @throws SegmentAtCapacityException if segment is at capacity and split cannot complete
+     */
+    public long putReportingSegment(byte[] key, byte[] value) {
         if (key == null || value == null) {
             throw new NullPointerException("Key and value cannot be null");
         }
@@ -850,14 +870,13 @@ public class StorageEngine implements AutoCloseable {
                 visibilityTracker.advanceEpoch();
 
                 statistics.incrementWriteOperations();
-                return;
+                return segment.segmentId();
             } catch (SegmentCapacityExceededException e) {
                 // Every capacity signal - load factor, exhausted data region, or an
                 // unsatisfiable probe chain - is handled the same way: split and retry.
                 // Classifying these by exception message would silently miss the data
                 // region case, which is the one vector payloads hit first.
-                putWithSplitHandling(key, value, keyHash, segment, segmentIndex);
-                return;
+                return putWithSplitHandling(key, value, keyHash, segment, segmentIndex);
             } catch (SegmentRetiredException e) {
                 // The split published while this write was in flight. The key belongs to one of
                 // the children now; writing it here would land in a file nothing can reach.
@@ -908,7 +927,7 @@ public class StorageEngine implements AutoCloseable {
      * @param segmentIndex The segment index
      * @throws SegmentAtCapacityException if split cannot complete in time
      */
-    private void putWithSplitHandling(byte[] key, byte[] value, long keyHash,
+    private long putWithSplitHandling(byte[] key, byte[] value, long keyHash,
                                        Segment segment, int segmentIndex) {
         if (splitWorker == null || !splitWorker.isRunning()) {
             // No split worker available - cannot handle capacity automatically
@@ -941,6 +960,7 @@ public class StorageEngine implements AutoCloseable {
 
         visibilityTracker.advanceEpoch();
         statistics.incrementWriteOperations();
+        return child.segmentId();
     }
 
     /**

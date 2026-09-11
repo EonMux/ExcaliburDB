@@ -115,13 +115,33 @@ public final class GraphRagPipeline {
     }
 
     /**
-     * Runs the whole pipeline.
+     * Runs the whole pipeline, at whatever instant the question implies.
      *
      * @param question the user's question
      * @param context  what has been mentioned so far, for coreference
      * @param trace    receives per-stage latency
      */
     public GraphRagResult answer(String question, ConversationContext context, QueryTrace trace) {
+        return answer(question, context, null, trace);
+    }
+
+    /**
+     * Runs the whole pipeline at an instant the caller names.
+     *
+     * <p>Valid time was otherwise reachable only through the date words
+     * {@link QueryClassifier} finds in the question, which is a guess at what the asker meant. A
+     * client replaying a decision, auditing a contract or comparing two dates knows the instant
+     * outright, and a question it phrases to suit the heuristic is a question it has had to
+     * distort. An {@code asOf} given here wins over one read out of the text, because one is
+     * stated and the other is inferred.</p>
+     *
+     * @param question the user's question
+     * @param context  what has been mentioned so far, for coreference
+     * @param asOf     the valid-time instant to answer at, or null to use the question's own
+     * @param trace    receives per-stage latency
+     */
+    public GraphRagResult answer(String question, ConversationContext context,
+                                 TemporalFilter asOf, QueryTrace trace) {
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("question must not be blank");
         }
@@ -133,7 +153,7 @@ public final class GraphRagPipeline {
         if (planning instanceof PlanningOutcome.AskUser ask) {
             return GraphRagResult.askUser(ask, trace);
         }
-        QueryPlan plan = ((PlanningOutcome.Planned) planning).plan();
+        QueryPlan plan = at(((PlanningOutcome.Planned) planning).plan(), asOf);
 
         long[] seeds = trace.time(Stage.LINK, () -> linkAll(plan));
         if (seeds.length == 0) {
@@ -204,6 +224,24 @@ public final class GraphRagPipeline {
             result[i] = seeds.get(i);
         }
         return result;
+    }
+
+    /**
+     * Puts a plan at the instant the caller named, replacing any the question implied.
+     *
+     * <p>A temporal plan cannot wrap another, so an inferred one is unwrapped first rather than
+     * nested: the question has one as-of instant and this is it.</p>
+     *
+     * @param plan the plan planning produced
+     * @param asOf the caller's instant, or null to leave the plan as it is
+     * @return the plan to traverse with
+     */
+    private static QueryPlan at(QueryPlan plan, TemporalFilter asOf) {
+        if (asOf == null) {
+            return plan;
+        }
+        QueryPlan core = plan instanceof QueryPlan.Temporal temporal ? temporal.inner() : plan;
+        return new QueryPlan.Temporal(core, asOf);
     }
 
     /**

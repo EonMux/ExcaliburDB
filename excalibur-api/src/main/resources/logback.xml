@@ -38,6 +38,18 @@
     -->
     <shutdownHook class="ch.qos.logback.core.hook.DefaultShutdownHook"/>
 
+    <!--
+        Push the configured level onto the java.util.logging loggers.
+
+        The storage engine logs through the JDK's logger, and ExcaliburApplication bridges those
+        records into this configuration. The bridge cannot see a record the JDK logger discarded
+        first, and the JDK's default level is INFO whatever is set here - so without this, raising
+        EXCALIBUR_LOG_LEVEL to DEBUG turns on debug logging for every component except the one
+        holding the data. resetJUL is deliberately off: it would drop the bridge handler along
+        with the JDK's own on every reconfiguration.
+    -->
+    <contextListener class="ch.qos.logback.classic.jul.LevelChangePropagator"/>
+
     <!-- Read log level from environment variable, default to INFO -->
     <property name="LOG_LEVEL" value="${EXCALIBUR_LOG_LEVEL:-INFO}" />
 

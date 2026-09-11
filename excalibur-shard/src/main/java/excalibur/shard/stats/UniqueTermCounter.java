@@ -19,15 +19,16 @@ import java.util.Objects;
  * enabling the query planner to understand data distribution and improve selectivity
  * estimates for query optimization.</p>
  *
- * <h2>Use Case in ExcaliburDB</h2>
- * <ul>
- *   <li>Estimating unique term counts per segment for selectivity estimation</li>
- *   <li>Aggregating unique counts across segments for corpus-wide statistics</li>
- *   <li>Exposing unique term metrics via the /v1/stats API</li>
- * </ul>
+ * <h2>What uses it</h2>
+ * <p>Nothing in the server does, today. Selectivity estimation is served by the Count-Min
+ * sketches {@code TermFrequencyTracker} builds during ingestion, which answer "how often" rather
+ * than "how many distinct", and {@code GET /v1/stats} reports no cardinality. This class is the
+ * distinct-count half, complete and tested, for an embedder that wants it or for a future stats
+ * field - so read it as a component, not as something the running node is doing.</p>
  *
  * <h2>Error Bounds</h2>
- * <p>Standard error depends on precision (configured via excalibur.shard.hyperloglog-precision):</p>
+ * <p>Standard error depends on the precision given to the constructor; there is no configuration
+ * key for it, because nothing in the server constructs one:</p>
  * <ul>
  *   <li>precision=10 (1024 registers): ~3.25% error</li>
  *   <li>precision=14 (16384 registers, default): ~1.625% error</li>

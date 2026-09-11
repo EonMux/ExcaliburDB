@@ -10,6 +10,7 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -41,7 +42,6 @@ class LLMClientConfigTest {
             assertEquals(Duration.ofSeconds(30), config.getTimeout());
             assertEquals(3, config.getMaxRetries());
             assertEquals(10, config.getMaxPromptsPerQuery());
-            assertEquals(0.3, config.getRelevancyThreshold(), 0.001);
             assertEquals(1536, config.getEmbeddingDimension());
             assertEquals(4000, config.getMaxBatchTokens());
         }
@@ -242,7 +242,6 @@ class LLMClientConfigTest {
                 .failureThreshold(10)
                 .cooldownPeriod(Duration.ofSeconds(120))
                 .maxPromptsPerQuery(20)
-                .relevancyThreshold(0.5)
                 .embeddingDimension(3072)
                 .maxBatchTokens(8000)
                 .build();
@@ -256,7 +255,6 @@ class LLMClientConfigTest {
             assertEquals(10, config.getFailureThreshold());
             assertEquals(Duration.ofSeconds(120), config.getCooldownPeriod());
             assertEquals(20, config.getMaxPromptsPerQuery());
-            assertEquals(0.5, config.getRelevancyThreshold(), 0.001);
             assertEquals(3072, config.getEmbeddingDimension());
             assertEquals(8000, config.getMaxBatchTokens());
         }
@@ -429,7 +427,6 @@ class LLMClientConfigTest {
             assertEquals(10, clientConfig.getFailureThreshold());
             assertEquals(Duration.ofMillis(90000), clientConfig.getCooldownPeriod());
             assertEquals(20, clientConfig.getMaxPromptsPerQuery());
-            assertEquals(0.5, clientConfig.getRelevancyThreshold(), 0.001);
             assertEquals(3072, clientConfig.getEmbeddingDimension());
             assertEquals(8000, clientConfig.getMaxBatchTokens());
         }
@@ -456,7 +453,6 @@ class LLMClientConfigTest {
             assertEquals(Config.Llm.DEFAULT_FAILURE_THRESHOLD, clientConfig.getFailureThreshold());
             assertEquals(Duration.ofMillis(Config.Llm.DEFAULT_COOLDOWN_PERIOD_MS), clientConfig.getCooldownPeriod());
             assertEquals(Config.Llm.DEFAULT_MAX_PROMPTS_PER_QUERY, clientConfig.getMaxPromptsPerQuery());
-            assertEquals(Config.Llm.DEFAULT_RELEVANCY_THRESHOLD, clientConfig.getRelevancyThreshold(), 0.001);
             assertEquals(Config.Llm.DEFAULT_EMBEDDINGS_DIMENSIONS, clientConfig.getEmbeddingDimension());
             assertEquals(Config.Llm.DEFAULT_MAX_BATCH_TOKENS, clientConfig.getMaxBatchTokens());
         }
@@ -521,49 +517,23 @@ class LLMClientConfigTest {
         }
 
         @Test
-        @DisplayName("relevancyThreshold is used as QueryRequest default")
-        void relevancyThresholdIsUsedAsDefault() {
-            // Verify that the config value is properly accessible
-            // Domain correctness: relevancyThreshold must be in range [0.0, 1.0]
-            LLMClientConfig config = LLMClientConfig.builder()
-                .baseUrl("https://api.test.com")
-                .relevancyThreshold(0.5)
-                .build();
-
-            assertEquals(0.5, config.getRelevancyThreshold(), 0.001,
-                "relevancyThreshold should be 0.5");
-
-            // Test boundary values
-            LLMClientConfig minConfig = LLMClientConfig.builder()
-                .baseUrl("https://api.test.com")
-                .relevancyThreshold(0.0)
-                .build();
-            assertEquals(0.0, minConfig.getRelevancyThreshold(), 0.001);
-
-            LLMClientConfig maxConfig = LLMClientConfig.builder()
-                .baseUrl("https://api.test.com")
-                .relevancyThreshold(1.0)
-                .build();
-            assertEquals(1.0, maxConfig.getRelevancyThreshold(), 0.001);
-        }
-
-        @Test
-        @DisplayName("Config.Llm relevancyThreshold maps to LLMClientConfig")
-        void configLlmRelevancyThresholdMapsToLLMClientConfig() {
-            // Create a Config.Llm with custom relevancy threshold
+        @DisplayName("the relevancy floor stays on the request, not on the client")
+        void theRelevancyFloorIsNotCarriedHere() {
+            // The client returns scores; the query pipeline applies the floor, from the request's
+            // own llm_threshold defaulted out of excalibur.llm.relevancy-threshold. This config
+            // used to carry a copy of that number and no reader ever consulted it. Making it
+            // reachable would have been worse than deleting it: a request asking for a lower
+            // floor than the configured default would silently have got the default instead.
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "https://api.test.com");
             props.put("excalibur.llm.relevancy-threshold", "0.75");
 
-            Config config = new Config(props);
-            Config.Llm llmConfig = config.llm();
+            Config.Llm llmConfig = new Config(props).llm();
 
-            // Verify Config.Llm has the correct value
             assertEquals(0.75, llmConfig.getRelevancyThreshold(), 0.001);
-
-            // Verify LLMClientConfig.fromConfig() maps it correctly
-            LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
-            assertEquals(0.75, clientConfig.getRelevancyThreshold(), 0.001);
+            assertThat(LLMClientConfig.fromConfig(llmConfig))
+                .extracting(Object::toString, org.assertj.core.api.InstanceOfAssertFactories.STRING)
+                .doesNotContain("relevancyThreshold");
         }
 
         @Test

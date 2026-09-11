@@ -124,6 +124,17 @@ public final class GraphErasureService {
                     "no graph has been built, so there is nothing to erase from yet");
             }
 
+            // Asked before the served stack is touched. A compaction rewrites only edges some
+            // outstanding request names, so with nothing outstanding there is nothing it could
+            // do - and closing the stack to find that out is an outage of /v1/graph/query for
+            // the length of a reopen, bought for no work. That was merely wasteful while an
+            // erasure request was the only caller; on the schedule that enforces the latency
+            // bound it would be a recurring one. A forced compaction still goes through: a
+            // caller who asked for one outright is answering a deadline, not an estimate.
+            if (!force && coordinator.outstandingCount() == 0) {
+                return new ErasureOutcome(false, 0, 0, "no outstanding erasure requests");
+            }
+
             boolean wasServing = holder.isPresent();
             if (wasServing) {
                 // The compaction replaces this directory. Closing first releases the mappings and

@@ -101,7 +101,8 @@ class ReindexEndpointTest {
 
         status.fail("Connection timeout");
 
-        assertEquals("idle", status.state());
+        assertEquals("failed", status.state(),
+            "a run that stopped without finishing is not idle");
         assertEquals("Connection timeout", status.lastError());
         assertFalse(status.isInProgress());
     }
@@ -182,8 +183,10 @@ class ReindexEndpointTest {
         statusRegistry.failReindex("test-source", "Test error");
 
         ReindexEndpoint.ReindexStatus status = statusRegistry.getStatus("test-source");
-        assertEquals("idle", status.state());
+        assertEquals("failed", status.state(),
+            "a run that stopped without finishing is not idle; /v1/reindex/status serves this");
         assertEquals("Test error", status.lastError());
+        assertFalse(status.isInProgress());
     }
 
     @Test

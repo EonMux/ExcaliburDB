@@ -32,6 +32,70 @@ class SegmentCatalogStatsFreshnessTest {
     }
 
     @Nested
+    @DisplayName("Estimated coverage")
+    class EstimatedCoverageTests {
+
+        @Test
+        @DisplayName("a retired segment is not part of the corpus a query could cover")
+        void aTombstonedSegmentLeavesTheDenominator() {
+            // PURGED is not a state the catalog ever holds - remove() sets it and drops the
+            // record in the same breath, and recovery skips it - so a denominator of
+            // "everything not purged" is really "everything", and a node that has compacted
+            // half its segments reports half coverage for good.
+            catalog.add(1L, Path.of("/tmp/segment1"));
+            catalog.completeIndexing(1L);
+            catalog.completeWarmup(1L);
+            catalog.add(2L, Path.of("/tmp/segment2"));
+            catalog.completeIndexing(2L);
+            catalog.completeWarmup(2L);
+            catalog.tombstone(2L);
+
+            assertEquals(1.0, catalog.getEstimatedCoverage(),
+                "the live corpus is the one segment left, and a query reads all of it");
+        }
+
+        @Test
+        @DisplayName("a segment still absorbing its write log is still read")
+        void anIndexingSegmentIsRead() {
+            // Coverage is what a query can read, not how much of it is finished: an indexing
+            // segment is queryable and is searched. A node ingesting into its only segment
+            // must not read as unready, or it drops out of rotation exactly while it is
+            // being loaded - and could not be loaded through.
+            catalog.add(1L, Path.of("/tmp/segment1"));
+            catalog.completeIndexing(1L);
+            catalog.completeWarmup(1L);
+            catalog.add(2L, Path.of("/tmp/segment2"));
+
+            assertEquals(1.0, catalog.getEstimatedCoverage());
+        }
+
+        @Test
+        @DisplayName("a segment stranded before indexing is corpus no query reaches")
+        void aBootstrappingSegmentIsNotRead() {
+            // registerFile() attaches a file without a transition, so a segment can sit in
+            // BOOTSTRAPPING: live, and in no state a query reads. That is the shortfall this
+            // number exists to surface.
+            catalog.add(1L, Path.of("/tmp/segment1"));
+            catalog.completeIndexing(1L);
+            catalog.completeWarmup(1L);
+            catalog.registerFile(2L, Path.of("/tmp/segment2"));
+
+            assertEquals(0.5, catalog.getEstimatedCoverage());
+        }
+
+        @Test
+        @DisplayName("a catalog holding nothing live covers nothing")
+        void nothingLiveCoversNothing() {
+            catalog.add(1L, Path.of("/tmp/segment1"));
+            catalog.completeIndexing(1L);
+            catalog.completeWarmup(1L);
+            catalog.tombstone(1L);
+
+            assertEquals(0.0, catalog.getEstimatedCoverage());
+        }
+    }
+
+    @Nested
     @DisplayName("Stats reflect current state")
     class CurrentStateTests {
 

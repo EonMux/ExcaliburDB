@@ -34,12 +34,33 @@ public final class RequestBody {
     }
 
     /**
+     * A body larger than {@link #MAX_REQUEST_SIZE}.
+     *
+     * <p>Endpoints validate their fields by throwing {@code IllegalArgumentException}, so a
+     * size failure that is only an {@code IllegalArgumentException} is caught by the same
+     * handler and answered 400 - which tells the caller its request was malformed and not to
+     * send it again, when the request was well-formed and the remedy is to split it. This type
+     * exists so one catch clause can separate the two and answer 413.</p>
+     *
+     * <p>It remains an {@code IllegalArgumentException}: an endpoint that has not been taught
+     * the difference still refuses the body rather than letting it through.</p>
+     */
+    public static final class TooLargeException extends IllegalArgumentException {
+
+        private static final long serialVersionUID = 1L;
+
+        TooLargeException(String message) {
+            super(message);
+        }
+    }
+
+    /**
      * Reads the body of {@code exchange} as UTF-8, refusing anything oversized.
      *
      * @param exchange The exchange
      * @return The body
-     * @throws IOException              if the body cannot be read
-     * @throws IllegalArgumentException if the body exceeds {@link #MAX_REQUEST_SIZE}
+     * @throws IOException          if the body cannot be read
+     * @throws TooLargeException    if the body exceeds {@link #MAX_REQUEST_SIZE}
      */
     public static String read(HttpExchange exchange) throws IOException {
         try (InputStream in = exchange.getRequestBody()) {
@@ -56,13 +77,13 @@ public final class RequestBody {
      *
      * @param in The stream, which this method does not close
      * @return The body
-     * @throws IOException              if the stream cannot be read
-     * @throws IllegalArgumentException if the body exceeds {@link #MAX_REQUEST_SIZE}
+     * @throws IOException       if the stream cannot be read
+     * @throws TooLargeException if the body exceeds {@link #MAX_REQUEST_SIZE}
      */
     public static String read(InputStream in) throws IOException {
         byte[] bytes = in.readNBytes(MAX_REQUEST_SIZE + 1);
         if (bytes.length > MAX_REQUEST_SIZE) {
-            throw new IllegalArgumentException(
+            throw new TooLargeException(
                 "Request body too large (max " + MAX_REQUEST_SIZE + " bytes)");
         }
         return new String(bytes, StandardCharsets.UTF_8);

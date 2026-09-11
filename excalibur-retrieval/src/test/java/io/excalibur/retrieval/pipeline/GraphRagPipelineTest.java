@@ -204,6 +204,61 @@ class GraphRagPipelineTest {
     }
 
     @Test
+    @DisplayName("an as-of given by the caller answers at that instant, whatever the question says")
+    void anExplicitAsOfIsHonoured() {
+        // Valid time was reachable only through date words in the question, so a client that
+        // knows the instant it wants - a replay, an audit, a "what did the contract say on
+        // this date" - had to phrase it and hope the classifier agreed. This is the instant
+        // said outright.
+        GraphRagResult result = pipeline().answer("Where does Ada Lovelace live?",
+            new ConversationContext(),
+            TemporalFilter.asOf(java.time.LocalDate.of(1820, 1, 1)),
+            new QueryTrace());
+
+        assertThat(result.hasAnswer()).isTrue();
+        assertThat(result.contextText())
+            .as("the question names no date; the caller does")
+            .contains("London")
+            .doesNotContain("Turin");
+    }
+
+    @Test
+    @DisplayName("an as-of given by the caller overrides one read out of the question")
+    void anExplicitAsOfBeatsTheInferredOne() {
+        // The heuristic is a guess at what the asker meant; an instant in the request is not.
+        GraphRagResult result = pipeline().answer("Where did Ada Lovelace live in 1820?",
+            new ConversationContext(),
+            TemporalFilter.asOf(java.time.LocalDate.of(2024, 1, 1)),
+            new QueryTrace());
+
+        assertThat(result.hasAnswer()).isTrue();
+        assertThat(result.contextText()).contains("Turin").doesNotContain("London");
+    }
+
+    @Test
+    @DisplayName("no as-of leaves the question's own dates in charge")
+    void noExplicitAsOfKeepsTheInference() {
+        GraphRagResult result = pipeline().answer("Where did Ada Lovelace live in 1820?",
+            new ConversationContext(), null, new QueryTrace());
+
+        assertThat(result.hasAnswer()).isTrue();
+        assertThat(result.contextText()).contains("London").doesNotContain("Turin");
+    }
+
+    @Test
+    @DisplayName("the whole history is reachable, not only a snapshot of it")
+    void theUnboundedFilterSeesSupersededFacts() {
+        GraphRagResult result = pipeline().answer("Where does Ada Lovelace live?",
+            new ConversationContext(), TemporalFilter.ALL, new QueryTrace());
+
+        assertThat(result.hasAnswer()).isTrue();
+        assertThat(result.contextText())
+            .as("a closed fact and the one that replaced it are both part of the history")
+            .contains("London")
+            .contains("Turin");
+    }
+
+    @Test
     @DisplayName("an unbound pronoun asks the user rather than guessing")
     void unboundPronounAsks() {
         GraphRagResult result = pipeline().answer(

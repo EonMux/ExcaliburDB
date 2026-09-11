@@ -66,7 +66,77 @@ class MappingBudgetTest {
             assertThat(budget.highWaterMark())
                 .as("a budget with no room for one namespace can only be a misread limit")
                 .isGreaterThan(0);
-            assertThat(budget.wouldExceedHighWater(1)).isFalse();
+            assertThat(budget.wouldExceedHighWater(1, 1)).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("The descriptor half of the budget")
+    class Descriptors {
+
+        @Test
+        @DisplayName("reads the process's open-file limit out of /proc/self/limits")
+        void readsTheDescriptorLimit() {
+            String limits = """
+                Limit                     Soft Limit           Hard Limit           Units
+                Max cpu time              unlimited            unlimited            seconds
+                Max open files            1024                 524288               files
+                Max locked memory         unlimited            unlimited            bytes
+                """;
+
+            assertThat(MappingBudget.readDescriptorLimit(limits)).isEqualTo(1024L);
+        }
+
+        @Test
+        @DisplayName("treats an unlimited soft limit as no descriptor bound to enforce")
+        void unlimitedIsNoBound() {
+            assertThat(MappingBudget.readDescriptorLimit(
+                "Max open files            unlimited            unlimited            files\n"))
+                .isEqualTo(0L);
+        }
+
+        @Test
+        @DisplayName("reports nothing rather than guessing when the line is absent")
+        void absentLineIsNotGuessed() {
+            assertThat(MappingBudget.readDescriptorLimit("Max cpu time  unlimited"))
+                .isEqualTo(0L);
+        }
+
+        @Test
+        @DisplayName("evicts on descriptors, not only on mappings")
+        void descriptorsDriveEviction() {
+            // A namespace is two Lucene indexes' worth of descriptors and thirteen mappings, and
+            // which limit binds first depends on the deployment. Counting descriptors and then
+            // never consulting them made the second half of the budget decorative.
+            MappingBudget budget = MappingBudget.of(1_000_000, 0.7, 100);
+
+            budget.acquire(1, 69);
+            assertThat(budget.isOverHighWater()).isFalse();
+            assertThat(budget.wouldExceedHighWater(1, 2)).isTrue();
+
+            budget.acquire(1, 2);
+            assertThat(budget.isOverHighWater())
+                .as("71 descriptors is past the 70 the high-water fraction allows")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("enforces no descriptor bound when the platform publishes none")
+        void noBoundWhenUnknown() {
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 0);
+
+            budget.acquire(0, 1_000_000);
+
+            assertThat(budget.maxDescriptors()).isZero();
+            assertThat(budget.isOverHighWater()).isFalse();
+            assertThat(budget.wouldExceedHighWater(1, 1_000_000)).isFalse();
+        }
+
+        @Test
+        @DisplayName("names both halves, so an operator can see which one bound")
+        void saysWhichLimitBound() {
+            assertThat(MappingBudget.of(1_000, 0.7, 500).toString())
+                .contains("fds=0/500");
         }
     }
 

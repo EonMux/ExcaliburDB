@@ -32,6 +32,12 @@ dependencies {
     // SLF4J API for logging
     implementation("org.slf4j:slf4j-api:2.0.16")
 
+    // The storage engine logs through java.util.logging. Without this bridge those records go
+    // to the JDK's own handler instead of the configured appender: they miss the JSON format
+    // every other line has, and anything below INFO is dropped before the log level is even
+    // consulted. Installed by ExcaliburApplication.
+    implementation("org.slf4j:jul-to-slf4j:2.0.16")
+
     // Logback for structured logging
     runtimeOnly("ch.qos.logback:logback-classic:1.5.12")
 

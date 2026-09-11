@@ -55,14 +55,16 @@ import java.util.Objects;
  *     "pendingDeletions": 100,
  *     "totalDeletions": 5000,
  *     "avgFpRate": 0.000500,
- *     "maxFpRate": 0.001000
+ *     "maxFpRate": 0.001000,
+ *     "saturated": false,
+ *     "saturatedSegments": 0
  *   },
  *   "visibility": {
  *     "epoch": 42,
  *     "registeredSegments": 1024,
  *     "visibleSegments": 1024
  *   },
- *   "coverage": 0.96,
+ *   "coverage": 1.0000,
  *   "lexical": {
  *     "engine": "native",
  *     "indexed": 15000000,
@@ -260,11 +262,15 @@ public class StatsEndpoint implements HttpHandler {
             indexOrchestrator.getTotalVectorsIntegrated()
         );
 
+        excalibur.filter.HierarchicalCuckooFilter membership =
+            indexOrchestrator.getHierarchicalCuckooFilter();
         CuckooStats cuckoo = new CuckooStats(
             indexOrchestrator.getPendingCuckooDeletions(),
             indexOrchestrator.getTotalCuckooDeletions(),
             FixedBucketHistogram.getInstance().getAverageFpRate(),
-            FixedBucketHistogram.getInstance().getMaxFpRate()
+            FixedBucketHistogram.getInstance().getMaxFpRate(),
+            membership != null && membership.isSaturated(),
+            membership == null ? 0 : membership.saturatedSegmentCount()
         );
 
         VisibilityTracker.VisibilityStats visStats = visibilityTracker.getStats();
@@ -384,24 +390,10 @@ public class StatsEndpoint implements HttpHandler {
      *
      * @param metadata The catalog metadata
      * @return Coverage ratio in range [0.0, 1.0]
+     * @see SegmentCatalog.CatalogMetadata#getEstimatedCoverage()
      */
     private double computeCoverage(SegmentCatalog.CatalogMetadata metadata) {
-        long totalSegments = metadata.getTotalSegments();
-        long purgedSegments = metadata.getPurgedSegments();
-        long nonPurgedSegments = totalSegments - purgedSegments;
-
-        if (nonPurgedSegments <= 0) {
-            return 0.0;
-        }
-
-        long queryableSegments = metadata.getActiveSegments() +
-                                 metadata.getIndexingSegments() +
-                                 metadata.getWarmSegments() +
-                                 metadata.getCompactingSegments();
-
-        double rawCoverage = (double) queryableSegments / nonPurgedSegments;
-
-        return Math.max(0.0, Math.min(1.0, rawCoverage));
+        return metadata.getEstimatedCoverage();
     }
 
     /**
@@ -465,7 +457,9 @@ public class StatsEndpoint implements HttpHandler {
         sb.append("\"pendingDeletions\": ").append(stats.cuckoo().pendingDeletions()).append(", ");
         sb.append("\"totalDeletions\": ").append(stats.cuckoo().totalDeletions()).append(", ");
         sb.append("\"avgFpRate\": ").append(JsonText.number(stats.cuckoo().avgFpRate(), 6)).append(", ");
-        sb.append("\"maxFpRate\": ").append(JsonText.number(stats.cuckoo().maxFpRate(), 6));
+        sb.append("\"maxFpRate\": ").append(JsonText.number(stats.cuckoo().maxFpRate(), 6)).append(", ");
+        sb.append("\"saturated\": ").append(stats.cuckoo().saturated()).append(", ");
+        sb.append("\"saturatedSegments\": ").append(stats.cuckoo().saturatedSegments());
         sb.append("}, ");
 
         sb.append("\"visibility\": {");
@@ -610,7 +604,9 @@ public class StatsEndpoint implements HttpHandler {
         int pendingDeletions,
         long totalDeletions,
         double avgFpRate,
-        double maxFpRate
+        double maxFpRate,
+        boolean saturated,
+        int saturatedSegments
     ) {
         public CuckooStats {
             if (pendingDeletions < 0) {
@@ -618,6 +614,9 @@ public class StatsEndpoint implements HttpHandler {
             }
             if (totalDeletions < 0) {
                 throw new IllegalArgumentException("Total deletions must be non-negative: " + totalDeletions);
+            }
+            if (saturatedSegments < 0) {
+                throw new IllegalArgumentException("Saturated segments must be non-negative: " + saturatedSegments);
             }
             if (Double.isNaN(avgFpRate) || avgFpRate < 0.0 || avgFpRate > 1.0) {
                 throw new IllegalArgumentException("Average FP rate must be in range [0.0, 1.0]: " + avgFpRate);

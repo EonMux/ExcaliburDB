@@ -1064,26 +1064,13 @@ public class SegmentCatalog {
     /**
      * Computes estimated corpus coverage.
      *
-     * <p>Coverage is computed as the ratio of queryable segments to total non-purged segments.
-     * The value is clamped to [0.0, 1.0] to ensure domain correctness.</p>
+     * <p>The share of the live corpus a query could read - see
+     * {@link CatalogMetadata#getEstimatedCoverage()}, which is where the rule lives.</p>
      *
      * @return Coverage ratio (0.0 to 1.0)
      */
     public double getEstimatedCoverage() {
-        CatalogMetadata snapshot = getCatalogMetadata();
-        long totalNonPurged = snapshot.getTotalSegments() - snapshot.getPurgedSegments();
-
-        if (totalNonPurged <= 0) {
-            return 0.0;
-        }
-
-        long queryableSegments = snapshot.getActiveSegments() +
-                                 snapshot.getIndexingSegments() +
-                                 snapshot.getWarmSegments() +
-                                 snapshot.getCompactingSegments();
-
-        double rawCoverage = (double) queryableSegments / totalNonPurged;
-        return Math.max(0.0, Math.min(1.0, rawCoverage));
+        return getCatalogMetadata().getEstimatedCoverage();
     }
 
     // ==================== Offset Tracking Methods ====================
@@ -2098,6 +2085,63 @@ public class SegmentCatalog {
         public void setPurgedSegments(long purgedSegments) { this.purgedSegments = purgedSegments; }
         public long getTotalEntryCount() { return totalEntryCount; }
         public void setTotalEntryCount(long totalEntryCount) { this.totalEntryCount = totalEntryCount; }
+
+        /**
+         * Segments in a state a query may read: INDEXING, WARMING, ACTIVE or COMPACTING.
+         *
+         * @return The count
+         */
+        public long getQueryableSegments() {
+            return activeSegments + indexingSegments + warmSegments + compactingSegments;
+        }
+
+        /**
+         * The live corpus: everything the catalog holds that is not retired.
+         *
+         * <p>Retired means TOMBSTONED or PURGED. Subtracting only the purged ones would leave
+         * a denominator that is really the whole catalog, because PURGED is not a state this
+         * catalog ever holds - {@link SegmentCatalog#remove(long)} sets it and drops the record
+         * in the same breath, and recovery skips any that was persisted. A tombstoned segment
+         * would then sit in the denominator and never in the numerator, so a node that had
+         * compacted a third of its segments would report a third of its corpus missing.</p>
+         *
+         * @return The count, which may be zero
+         */
+        public long getLiveSegments() {
+            return totalSegments - tombstonedSegments - purgedSegments;
+        }
+
+        /**
+         * The share of the live corpus a query can read, in [0, 1].
+         *
+         * <p>Both halves are the live corpus: the numerator is what a query may read, and the
+         * denominator what this node holds and has not retired. Counting retired segments in
+         * the denominator instead - as "everything not purged" does, PURGED being a state the
+         * catalog never holds - makes a healthy node that has compacted a third of its
+         * segments report a third of its corpus permanently gone, with no state it can reach
+         * to recover, because reclamation may legitimately never come.</p>
+         *
+         * <p>What this can and cannot say is worth being plain about, because it is the
+         * node-level readiness signal. Every state the catalog holds is either queryable or
+         * retired, so on a node whose segments are all accounted for this reads 1.0 - it
+         * detects a segment stranded in a state no query reads, and an index with no live
+         * corpus at all, and it is not a warm-up gauge. A segment still absorbing its write
+         * log is queryable and is searched, so it counts; the per-query
+         * {@code estimated_corpus_coverage} is where a partial answer shows up.</p>
+         *
+         * <p>Zero when there is no live corpus: an empty index has nothing to read, which is
+         * the reading that keeps "coverage is low, this node is not ready" true in every case
+         * it is consulted.</p>
+         *
+         * @return The ratio
+         */
+        public double getEstimatedCoverage() {
+            long live = getLiveSegments();
+            if (live <= 0) {
+                return 0.0;
+            }
+            return Math.max(0.0, Math.min(1.0, (double) getQueryableSegments() / live));
+        }
 
         @Override
         public String toString() {

@@ -77,15 +77,24 @@ class ClientRateLimiterTest {
     @Test
     @DisplayName("evicts idle clients before live ones")
     void evictsIdleFirst() {
-        ClientRateLimiter limiter = new ClientRateLimiter(10.0, 10.0, 10.0, 10.0, 2);
-        long now = 0L;
+        // One token each and effectively no refill, so "has this client kept its bucket" is
+        // observable: a client still tracked has spent its token and is refused, while one that
+        // was forgotten is indistinguishable from a newcomer and is allowed.
+        ClientRateLimiter limiter = new ClientRateLimiter(1e-6, 1.0, 1e-6, 1.0, 2);
+        long now = SECOND;
 
-        limiter.check("idle", false, now);
+        assertThat(limiter.check("idle", false, now).allowed()).isTrue();
         long later = now + ClientRateLimiter.IDLE_EVICTION_NANOS + SECOND;
-        limiter.check("active", false, later);
+        assertThat(limiter.check("active", false, later).allowed()).isTrue();
         limiter.check("newcomer", false, later);
 
         assertThat(limiter.trackedClients()).isLessThanOrEqualTo(2);
+        assertThat(limiter.check("active", false, later).allowed())
+            .as("the client seen a moment ago must keep the bucket it has already spent")
+            .isFalse();
+        assertThat(limiter.check("idle", false, later).allowed())
+            .as("the client idle past the threshold is the one that should have gone")
+            .isTrue();
     }
 
     @Test

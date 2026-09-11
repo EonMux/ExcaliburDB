@@ -99,6 +99,8 @@ public final class ApiSecurityConfig {
     public static final String KEY_MAX_QUERY_TIMEOUT_MS = "excalibur.api.max-query-timeout-ms";
     /** Configuration key bounding the length of {@code query} on the query endpoint. */
     public static final String KEY_MAX_QUERY_CHARS = "excalibur.api.max-query-chars";
+    /** Configuration key bounding {@code oversampling_factor} on the query endpoint. */
+    public static final String KEY_MAX_OVERSAMPLING_FACTOR = "excalibur.api.max-oversampling-factor";
     /** Configuration key listing the directories filesystem ingest may read. */
     public static final String KEY_ALLOWED_ROOTS = "excalibur.ingest.allowed-roots";
     /** Configuration key listing the hosts URL ingest may crawl. */
@@ -136,6 +138,16 @@ public final class ApiSecurityConfig {
      * provider error halfway through one.</p>
      */
     public static final int DEFAULT_MAX_QUERY_CHARS = 8_192;
+    /**
+     * Default upper bound on {@code oversampling_factor}.
+     *
+     * <p>The factor multiplies {@code top_k} to size the HNSW beam, and the beam is what bounds
+     * how much of a segment's graph a search walks. Unbounded, it is the cheapest way to make
+     * one small request scan every candidate segment end to end, so it is bounded like the other
+     * client-chosen widths. Sixteen is past where oversampling still buys recall - the beam is
+     * already {@code top_k} times this - and far below where the walk stops being a walk.</p>
+     */
+    public static final int DEFAULT_MAX_OVERSAMPLING_FACTOR = 16;
     /** Default bound on registered ingestion sources. */
     public static final int DEFAULT_MAX_SOURCES = 256;
 
@@ -152,6 +164,7 @@ public final class ApiSecurityConfig {
     private final int maxQueryChars;
     private final List<Path> allowedIngestRoots;
     private final Set<String> allowedIngestHosts;
+    private final int maxOversamplingFactor;
     private final int maxRegisteredSources;
     private final TlsConfig tls;
     private final boolean allowPlaintext;
@@ -171,6 +184,7 @@ public final class ApiSecurityConfig {
         this.maxQueryChars = builder.maxQueryChars;
         this.allowedIngestRoots = List.copyOf(builder.allowedIngestRoots);
         this.allowedIngestHosts = Set.copyOf(builder.allowedIngestHosts);
+        this.maxOversamplingFactor = builder.maxOversamplingFactor;
         this.maxRegisteredSources = builder.maxRegisteredSources;
         this.tls = builder.tls;
         this.allowPlaintext = builder.allowPlaintext;
@@ -218,6 +232,8 @@ public final class ApiSecurityConfig {
         builder.maxTopK((int) ConfigText.positiveLong(props, KEY_MAX_TOP_K, DEFAULT_MAX_TOP_K));
         builder.maxQueryTimeoutMs(ConfigText.positiveLong(props, KEY_MAX_QUERY_TIMEOUT_MS, DEFAULT_MAX_QUERY_TIMEOUT_MS));
         builder.maxQueryChars((int) ConfigText.positiveLong(props, KEY_MAX_QUERY_CHARS, DEFAULT_MAX_QUERY_CHARS));
+        builder.maxOversamplingFactor((int) ConfigText.positiveLong(
+            props, KEY_MAX_OVERSAMPLING_FACTOR, DEFAULT_MAX_OVERSAMPLING_FACTOR));
         builder.maxRegisteredSources((int) ConfigText.positiveLong(props, KEY_MAX_SOURCES, DEFAULT_MAX_SOURCES));
 
         for (String root : ConfigText.splitList(props.get(KEY_ALLOWED_ROOTS))) {
@@ -366,6 +382,11 @@ public final class ApiSecurityConfig {
         return maxTopK;
     }
 
+    /** @return upper bound accepted for {@code oversampling_factor} */
+    public int maxOversamplingFactor() {
+        return maxOversamplingFactor;
+    }
+
     /** @return upper bound accepted for {@code timeout_ms} */
     public long maxQueryTimeoutMs() {
         return maxQueryTimeoutMs;
@@ -444,6 +465,7 @@ public final class ApiSecurityConfig {
         private int maxQueryChars = DEFAULT_MAX_QUERY_CHARS;
         private final List<Path> allowedIngestRoots = new ArrayList<>();
         private final Set<String> allowedIngestHosts = new LinkedHashSet<>();
+        private int maxOversamplingFactor = DEFAULT_MAX_OVERSAMPLING_FACTOR;
         private int maxRegisteredSources = DEFAULT_MAX_SOURCES;
         private TlsConfig tls = TlsConfig.disabled();
         private boolean allowPlaintext;
@@ -524,6 +546,17 @@ public final class ApiSecurityConfig {
          */
         public Builder maxTopK(int maxTopK) {
             this.maxTopK = maxTopK;
+            return this;
+        }
+
+        /**
+         * Bounds {@code oversampling_factor}.
+         *
+         * @param maxOversamplingFactor Maximum accepted factor
+         * @return This builder
+         */
+        public Builder maxOversamplingFactor(int maxOversamplingFactor) {
+            this.maxOversamplingFactor = maxOversamplingFactor;
             return this;
         }
 

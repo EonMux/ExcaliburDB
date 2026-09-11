@@ -50,6 +50,7 @@ public final class QueryResponse {
     private final long queryTimeMs;
     private final boolean fromCache;
     private final boolean timedOut;
+    private final boolean cancelled;
 
     /**
      * Creates a new QueryResponse with all fields.
@@ -64,6 +65,24 @@ public final class QueryResponse {
      */
     public QueryResponse(String queryId, List<QueryResultItem> results, IndexCoverage coverage,
                          long queryTimeMs, boolean fromCache, boolean timedOut) {
+        this(queryId, results, coverage, queryTimeMs, fromCache, timedOut, false);
+    }
+
+    /**
+     * Creates a new QueryResponse, saying whether the caller cancelled it.
+     *
+     * @param queryId The unique query identifier for cancellation support
+     * @param results The query results (will be copied)
+     * @param coverage The index coverage metadata
+     * @param queryTimeMs The query execution time in milliseconds
+     * @param fromCache Whether results came from cache
+     * @param timedOut Whether the query timed out
+     * @param cancelled Whether the caller cancelled the query
+     * @throws NullPointerException if results or coverage is null
+     */
+    public QueryResponse(String queryId, List<QueryResultItem> results, IndexCoverage coverage,
+                         long queryTimeMs, boolean fromCache, boolean timedOut,
+                         boolean cancelled) {
         this.queryId = queryId;
         this.results = Collections.unmodifiableList(new ArrayList<>(
             Objects.requireNonNull(results, "Results cannot be null")));
@@ -71,6 +90,7 @@ public final class QueryResponse {
         this.queryTimeMs = queryTimeMs;
         this.fromCache = fromCache;
         this.timedOut = timedOut;
+        this.cancelled = cancelled;
     }
 
     /**
@@ -207,6 +227,24 @@ public final class QueryResponse {
     }
 
     /**
+     * Returns whether the caller cancelled the query.
+     *
+     * <p>A cancelled query answers with whatever it had reached, which is usually nothing.
+     * Without this flag that answer is an empty result list at HTTP 200 with
+     * {@link #timedOut()} false - the same shape as a query that searched the whole corpus
+     * and matched nothing. The two mean opposite things to whoever reads them.</p>
+     *
+     * <p>Separate from {@link #timedOut()} on purpose: a deadline the server missed and a
+     * request the caller withdrew are different events, and only one of them is the server's
+     * to answer for.</p>
+     *
+     * @return true if the query was cancelled before it finished
+     */
+    public boolean cancelled() {
+        return cancelled;
+    }
+
+    /**
      * Returns the query execution time in milliseconds.
      *
      * @return Query time in ms
@@ -239,7 +277,8 @@ public final class QueryResponse {
      * @return A new QueryResponse with fromCache=true
      */
     public QueryResponse withFromCache() {
-        return new QueryResponse(queryId, results, coverage, queryTimeMs, true, timedOut);
+        return new QueryResponse(queryId, results, coverage, queryTimeMs, true, timedOut,
+            cancelled);
     }
 
     /**
@@ -249,7 +288,8 @@ public final class QueryResponse {
      * @return A new QueryResponse with the updated time
      */
     public QueryResponse withQueryTimeMs(long newQueryTimeMs) {
-        return new QueryResponse(queryId, results, coverage, newQueryTimeMs, fromCache, timedOut);
+        return new QueryResponse(queryId, results, coverage, newQueryTimeMs, fromCache, timedOut,
+            cancelled);
     }
 
     /**
@@ -259,7 +299,19 @@ public final class QueryResponse {
      * @return A new QueryResponse with the timedOut flag
      */
     public QueryResponse withTimedOut(boolean timedOut) {
-        return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut);
+        return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
+            cancelled);
+    }
+
+    /**
+     * Creates a new QueryResponse with the cancelled flag.
+     *
+     * @param cancelled Whether the caller cancelled the query
+     * @return A new QueryResponse with the flag
+     */
+    public QueryResponse withCancelled(boolean cancelled) {
+        return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
+            cancelled);
     }
 
     /**
@@ -269,7 +321,8 @@ public final class QueryResponse {
      * @return A new QueryResponse with the query ID
      */
     public QueryResponse withQueryId(String queryId) {
-        return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut);
+        return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
+            cancelled);
     }
 
     @Override
@@ -280,6 +333,7 @@ public final class QueryResponse {
         return queryTimeMs == that.queryTimeMs &&
             fromCache == that.fromCache &&
             timedOut == that.timedOut &&
+            cancelled == that.cancelled &&
             Objects.equals(queryId, that.queryId) &&
             results.equals(that.results) &&
             coverage.equals(that.coverage);
@@ -287,15 +341,17 @@ public final class QueryResponse {
 
     @Override
     public int hashCode() {
-        return Objects.hash(queryId, results, coverage, queryTimeMs, fromCache, timedOut);
+        return Objects.hash(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
+            cancelled);
     }
 
     @Override
     public String toString() {
         return String.format(
-            "QueryResponse{queryId=%s, results=%d, coverage=%.1f%%, degraded=%s, time=%dms, cached=%s, timedOut=%s}",
+            "QueryResponse{queryId=%s, results=%d, coverage=%.1f%%, degraded=%s, time=%dms, "
+                + "cached=%s, timedOut=%s, cancelled=%s}",
             queryId != null ? queryId.substring(0, Math.min(8, queryId.length())) : "null",
             results.size(), coverage.estimatedCorpusCoverage() * 100,
-            isDegraded(), queryTimeMs, fromCache, timedOut);
+            isDegraded(), queryTimeMs, fromCache, timedOut, cancelled);
     }
 }

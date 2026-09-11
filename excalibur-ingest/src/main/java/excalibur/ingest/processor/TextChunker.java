@@ -187,9 +187,22 @@ public class TextChunker {
             }
             chunkStart += advance;
             chunkIndex++;
-            
-            while (chunkStart > 0 && chunkStart < textLength && !isAtWordBoundary(normalizedText, chunkStart)) {
-                chunkStart++;
+
+            // Nudge the next chunk to a word boundary so it does not begin mid-word - but never
+            // past the end of the chunk just emitted. The scan looks for whitespace, and text
+            // that has none within reach (Chinese and Japanese prose, minified JSON, a base64
+            // blob) used to send it running to the end of the document: everything between this
+            // chunk's end and wherever it stopped was then in no chunk at all, so it was never
+            // embedded, never stored and never indexed, while the chunk indices stayed
+            // contiguous and hid it. Coverage is worth more than alignment, so when there is no
+            // boundary to find inside this chunk the start stays where the overlap put it.
+            int aligned = chunkStart;
+            while (aligned > 0 && aligned < chunkEnd
+                && !isAtWordBoundary(normalizedText, aligned)) {
+                aligned++;
+            }
+            if (aligned < chunkEnd) {
+                chunkStart = aligned;
             }
         }
 

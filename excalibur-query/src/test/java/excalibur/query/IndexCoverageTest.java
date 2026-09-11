@@ -195,6 +195,51 @@ class IndexCoverageTest {
         }
 
         @Test
+        @DisplayName("a segment that did not answer in time is not part of what was read")
+        void aTimedOutSegmentIsNotCovered() {
+            // Coverage is what the answer rests on. A segment the query was allowed to read but
+            // never heard back from contributed nothing, and counting it says the answer is
+            // more complete than it is.
+            IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(4)
+                .activeSegments(4)
+                .segmentsSearched(3)
+                .segmentsTimedOut(1)
+                .computeCoverage()
+                .build();
+
+            assertThat(coverage.estimatedCorpusCoverage()).isEqualTo(0.75);
+        }
+
+        @Test
+        @DisplayName("a segment that failed is not part of what was read either")
+        void aFailedSegmentIsNotCovered() {
+            IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(4)
+                .activeSegments(4)
+                .segmentsSearched(3)
+                .segmentsWithErrors(1)
+                .computeCoverage()
+                .build();
+
+            assertThat(coverage.estimatedCorpusCoverage()).isEqualTo(0.75);
+        }
+
+        @Test
+        @DisplayName("a fan-out nothing came back from read none of the corpus")
+        void aFanOutThatAllTimedOutCoversNothing() {
+            IndexCoverage coverage = IndexCoverage.builder()
+                .totalSegments(4)
+                .activeSegments(4)
+                .segmentsSearched(0)
+                .segmentsTimedOut(4)
+                .computeCoverage()
+                .build();
+
+            assertThat(coverage.estimatedCorpusCoverage()).isZero();
+        }
+
+        @Test
         @DisplayName("produces correct partial coverage with tombstones")
         void partialCoverageWithTombstones() {
             IndexCoverage coverage = IndexCoverage.builder()

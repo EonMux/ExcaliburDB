@@ -704,8 +704,8 @@ class MBeanNotificationObserverTest {
             "HnswQueueDepthMBean should have attributes");
 
         // Verify expected attribute counts
-        assertEquals(9, Metrics.getQueryLatencyMBean().getAttributes().size(),
-            "QueryLatencyMBean should have 9 attributes");
+        assertEquals(10, Metrics.getQueryLatencyMBean().getAttributes().size(),
+            "QueryLatencyMBean should have 10 attributes");
         assertEquals(4, Metrics.getSystemHealthMBean().getAttributes().size(),
             "SystemHealthMBean should have 4 attributes");
         assertEquals(5, Metrics.getIngestionQueueMBean().getAttributes().size(),

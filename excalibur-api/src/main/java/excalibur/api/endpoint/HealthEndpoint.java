@@ -6,6 +6,7 @@ import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.ResponseBody;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.VisibilityTracker;
+import io.excalibur.metrics.Metrics;
 import io.excalibur.store.SegmentCatalog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,7 +28,7 @@ import java.util.Objects;
  *   "ready": true,
  *   "healthy": true,
  *   "epoch": 42,
- *   "coverage": 0.85,
+ *   "coverage": 1.0000,
  *   "latencyMs": 5
  * }
  * }</pre>
@@ -38,7 +39,10 @@ import java.util.Objects;
  *   <li>{@code ready} - true if coverage >= readiness threshold (default 0.5)</li>
  *   <li>{@code healthy} - true if coverage >= healthy threshold (default 0.9)</li>
  *   <li>{@code epoch} - Current visibility epoch (monotonically increasing)</li>
- *   <li>{@code coverage} - Estimated corpus coverage (0.0 to 1.0)</li>
+ *   <li>{@code coverage} - The share of this node's live segments that are in a state a query
+ *       reads, 0.0 to 1.0. Not a warm-up gauge: a segment still absorbing its write log is
+ *       searched, so it counts, and an empty segment counts as readily as a full one. See
+ *       {@link SegmentCatalog.CatalogMetadata#getEstimatedCoverage()}</li>
  *   <li>{@code latencyMs} - Time taken to compute health status in milliseconds</li>
  * </ul>
  *
@@ -50,7 +54,7 @@ import java.util.Objects;
  *   <li>{@code healthy} computed from coverage vs healthy threshold (higher bar for full health)</li>
  *   <li>{@code epoch} is current visibility epoch (non-negative)</li>
  *   <li>{@code coverage} is clamped to [0.0, 1.0]</li>
- *   <li>{@code latencyMs} is non-negative; if exceeds maxLatencyMs, system is degraded</li>
+ *   <li>{@code latencyMs} is non-negative; exceeding maxLatencyMs makes {@code healthy} false</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -129,7 +133,7 @@ public class HealthEndpoint implements HttpHandler {
         }
 
         this.visibilityTracker = indexOrchestrator.getVisibilityTracker();
-        this.segmentCatalog = getCatalogFromOrchestrator(indexOrchestrator);
+        this.segmentCatalog = indexOrchestrator.getCatalog();
         this.readinessThreshold = readinessThreshold;
         this.healthyThreshold = healthyThreshold;
         this.maxLatencyMs = maxLatencyMs;
@@ -197,9 +201,14 @@ public class HealthEndpoint implements HttpHandler {
     @Override
     public void handle(HttpExchange exchange) throws IOException {
         long startTime = System.currentTimeMillis();
+        // GET, like the documented contract and like every other read route on this server.
+        // Answering 200 to any method made a POST to this path look like agreement, and left
+        // a client that had the wrong verb with nothing to tell it so.
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendMethodNotAllowed(exchange);
+            return;
+        }
         try {
-            // Health endpoint always returns 200 if process is alive,
-            // regardless of HTTP method (useful for load balancers/K8s probes)
             HealthStatus status = computeHealthStatus(startTime);
             sendResponse(exchange, status);
         } catch (Exception e) {
@@ -218,9 +227,17 @@ public class HealthEndpoint implements HttpHandler {
      *   <li>{@code epoch} is current visibility epoch (non-negative)</li>
      *   <li>{@code coverage} is clamped to [0.0, 1.0]</li>
      *   <li>{@code ready} = coverage >= readinessThreshold</li>
-     *   <li>{@code healthy} = coverage >= healthyThreshold</li>
-     *   <li>{@code latencyMs} is non-negative; system is degraded if > maxLatencyMs</li>
+     *   <li>{@code healthy} = coverage >= healthyThreshold and latencyMs <= maxLatencyMs</li>
+     *   <li>{@code latencyMs} is non-negative</li>
      * </ul>
+     *
+     * <p>Latency is part of {@code healthy} rather than only reported beside it. A node that
+     * takes longer than the configured maximum to answer what it holds is not a healthy node,
+     * and leaving the comparison to whoever reads the field makes
+     * {@code excalibur.health.max-latency-ms} a setting that changes nothing on the server that
+     * carries it. Readiness is left on coverage alone: a probe that waited that long has
+     * already timed out, and taking the node out of rotation for a slow answer to this endpoint
+     * would be deciding on the strength of the one request that is not serving traffic.</p>
      *
      * @param startTime The start time of the health check (for latency calculation)
      * @return The current health status
@@ -229,19 +246,46 @@ public class HealthEndpoint implements HttpHandler {
         long epoch = visibilityTracker.currentEpoch();
         double coverage = computeCoverage();
         boolean ready = coverage >= readinessThreshold;
-        boolean healthy = coverage >= healthyThreshold;
         long latencyMs = System.currentTimeMillis() - startTime;
+        boolean healthy = coverage >= healthyThreshold && latencyMs <= maxLatencyMs;
+
+        publishHealthScore(coverage);
 
         return new HealthStatus(true, ready, healthy, epoch, coverage, latencyMs);
     }
 
     /**
+     * Publishes what this endpoint just measured to the {@code SystemHealth} MBean.
+     *
+     * <p>The MBean's score is otherwise the 0.5 the process starts at and never leaves, and
+     * its {@code isHealthy} attribute is derived from that score - so a JMX client watching a
+     * node through a total loss of its corpus sees a health score that never moves and a flag
+     * that never falls. Nothing else writes it: the latency-based updater it was designed
+     * around has no caller.</p>
+     *
+     * <p>The score is the coverage, which is the one health signal this endpoint measures on a
+     * scale the MBean can carry. The MBean's own threshold for {@code isHealthy} is a fixed
+     * 0.5, so it answers a coarser question than the configurable {@code healthy} in the
+     * response body; both are read off the same number.</p>
+     *
+     * @param coverage The coverage just computed, in [0, 1]
+     */
+    private void publishHealthScore(double coverage) {
+        try {
+            Metrics.setHealthScore(coverage);
+        } catch (RuntimeException e) {
+            // A metrics sink that cannot take the value must not turn a health check into a
+            // degraded response: the node's health does not depend on being able to report it.
+            LOGGER.debug("Could not publish the health score: {}", e.toString());
+        }
+    }
+
+    /**
      * Computes estimated corpus coverage from the segment catalog.
      *
-     * <p>Coverage is computed as the ratio of queryable segments to total non-purged segments.
-     * The value is clamped to [0.0, 1.0] to ensure domain correctness.</p>
-     *
-     * <p>Queryable segments are those in states: INDEXING, WARMING, ACTIVE, COMPACTING</p>
+     * <p>The share of the live corpus a query could read - see
+     * {@link SegmentCatalog.CatalogMetadata#getEstimatedCoverage()}, which is where the rule
+     * lives. Deriving it here as well is how the two came to disagree.</p>
      *
      * @return Coverage ratio in range [0.0, 1.0]
      */
@@ -249,45 +293,21 @@ public class HealthEndpoint implements HttpHandler {
         if (segmentCatalog == null) {
             return 0.0;
         }
-
-        SegmentCatalog.CatalogMetadata metadata = segmentCatalog.getCatalogMetadata();
-        
-        long totalSegments = metadata.getTotalSegments();
-        long purgedSegments = metadata.getPurgedSegments();
-        long nonPurgedSegments = totalSegments - purgedSegments;
-
-        if (nonPurgedSegments <= 0) {
-            return 0.0;
-        }
-
-        long queryableSegments = metadata.getActiveSegments() +
-                                 metadata.getIndexingSegments() +
-                                 metadata.getWarmSegments() +
-                                 metadata.getCompactingSegments();
-
-        double rawCoverage = (double) queryableSegments / nonPurgedSegments;
-
-        return Math.max(0.0, Math.min(1.0, rawCoverage));
+        return segmentCatalog.getCatalogMetadata().getEstimatedCoverage();
     }
 
     /**
-     * Extracts the segment catalog from the index orchestrator.
+     * Refuses a method this route does not serve.
      *
-     * <p>This uses reflection as a fallback since the catalog may not be
-     * directly exposed. Returns null if the catalog cannot be accessed.</p>
-     *
-     * @param orchestrator The index orchestrator
-     * @return The segment catalog, or null if not accessible
+     * <p>A liveness probe is a read: it must not be able to change anything, and a client that
+     * sent the wrong verb should learn that here rather than from a 200.</p>
      */
-    private SegmentCatalog getCatalogFromOrchestrator(IndexOrchestrator orchestrator) {
-        try {
-            java.lang.reflect.Field catalogField = IndexOrchestrator.class.getDeclaredField("catalog");
-            catalogField.setAccessible(true);
-            return (SegmentCatalog) catalogField.get(orchestrator);
-        } catch (Exception e) {
-            LOGGER.warn("Could not access catalog from orchestrator: {}", e.getMessage());
-            return null;
-        }
+    private static void sendMethodNotAllowed(HttpExchange exchange) throws IOException {
+        byte[] bytes = "{\"error\": \"Method Not Allowed - Use GET\"}"
+            .getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        exchange.getResponseHeaders().set("Allow", "GET");
+        ResponseBody.send(exchange, 405, bytes);
     }
 
     /**
@@ -308,15 +328,36 @@ public class HealthEndpoint implements HttpHandler {
      * It still returns HTTP 200 because the process is alive and responding - the
      * health endpoint's primary purpose is to indicate liveness.</p>
      *
-     * <p>The response indicates the process is live but not ready, with epoch 0 and
-     * coverage 0.0 to signal degraded state.</p>
+     * <p>The response indicates the process is live but not ready, with coverage 0.0 to
+     * signal the degraded state. The epoch is read again rather than reported as 0: what
+     * realistically fails here is the catalog, and the epoch is an atomic counter that is
+     * still perfectly readable in that case. A client watching the epoch for monotonicity
+     * reads a 0 as a restart that lost the node's visibility history, so reporting one the
+     * node has not had is worse than the missing coverage that prompted this response. Only
+     * a second failure - reading the counter itself - falls back to 0.</p>
      *
      * @param exchange The HTTP exchange
      * @param latencyMs The time taken before the error occurred
      */
     private void sendDegradedResponse(HttpExchange exchange, long latencyMs) throws IOException {
-        HealthStatus degraded = new HealthStatus(true, false, false, 0, 0.0, latencyMs);
+        HealthStatus degraded = new HealthStatus(true, false, false, readEpochOrZero(), 0.0, latencyMs);
         sendResponse(exchange, degraded);
+    }
+
+    /**
+     * The current visibility epoch, or 0 if even that cannot be read.
+     *
+     * @return A non-negative epoch
+     */
+    private long readEpochOrZero() {
+        try {
+            long epoch = visibilityTracker.currentEpoch();
+            return Math.max(0, epoch);
+        } catch (RuntimeException e) {
+            LOGGER.debug("Could not read the visibility epoch for the degraded response: {}",
+                e.toString());
+            return 0;
+        }
     }
 
     /**

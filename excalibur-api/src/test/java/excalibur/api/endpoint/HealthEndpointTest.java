@@ -60,6 +60,84 @@ class HealthEndpointTest {
         }
 
         @Test
+        @DisplayName("an endpoint built from the orchestrator reads the orchestrator's catalog")
+        void takesTheCatalogFromTheOrchestrator() throws IOException {
+            // Reaching around the orchestrator for its catalog - by reflection, or by any other
+            // route that can come up empty - leaves the endpoint with no catalog and reports a
+            // healthy node as covering none of its corpus, permanently and quietly.
+            addActiveSegment(segmentCatalog, 1);
+            when(indexOrchestrator.getCatalog()).thenReturn(segmentCatalog);
+            when(indexOrchestrator.getVisibilityTracker()).thenReturn(visibilityTracker);
+
+            HealthEndpoint endpoint = new HealthEndpoint(indexOrchestrator);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            assertThat(baos.toString(StandardCharsets.UTF_8)).contains("\"coverage\": 1.0000");
+        }
+
+        @Test
+        @DisplayName("the health MBean follows what the endpoint measured")
+        void theHealthScoreMBeanIsPublished() throws IOException {
+            // Nothing else writes it: the score is set once at startup and the latency-based
+            // updater has no caller, so a JMX client would watch a constant.
+            io.excalibur.metrics.Metrics.setHealthScore(0.5);
+            addActiveSegment(segmentCatalog, 1);
+            addBootstrappingSegment(segmentCatalog, 2);
+            HealthEndpoint endpoint = new HealthEndpoint(visibilityTracker, segmentCatalog, 0.5);
+            HttpExchange exchange = createMockExchange("GET");
+            when(exchange.getResponseBody()).thenReturn(new ByteArrayOutputStream());
+
+            endpoint.handle(exchange);
+
+            assertThat(io.excalibur.metrics.Metrics.getHealthScore()).isEqualTo(0.5);
+
+            addActiveSegment(segmentCatalog, 3);
+            addActiveSegment(segmentCatalog, 4);
+            HttpExchange second = createMockExchange("GET");
+            when(second.getResponseBody()).thenReturn(new ByteArrayOutputStream());
+
+            endpoint.handle(second);
+
+            assertThat(io.excalibur.metrics.Metrics.getHealthScore())
+                .as("three of the four live segments are readable")
+                .isEqualTo(0.75);
+        }
+
+        @Test
+        @DisplayName("a health check slower than the configured maximum is not healthy")
+        void latencyBeyondTheMaximumIsNotHealthy() throws IOException {
+            // Otherwise excalibur.health.max-latency-ms is a documented setting the server
+            // parses, validates, and never consults.
+            addActiveSegment(segmentCatalog, 1);
+            VisibilityTracker slowTracker = mock(VisibilityTracker.class);
+            when(slowTracker.currentEpoch()).thenAnswer(invocation -> {
+                Thread.sleep(20);
+                return 1L;
+            });
+            HealthEndpoint endpoint = new HealthEndpoint(
+                slowTracker, segmentCatalog, 0.5, 0.9, 1);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            assertThat(response).contains("\"coverage\": 1.0000");
+            assertThat(response)
+                .as("full coverage, but the node took longer than it is allowed to")
+                .contains("\"healthy\": false");
+            assertThat(response)
+                .as("readiness is coverage alone; a slow answer here is not a reason to "
+                    + "stop serving traffic")
+                .contains("\"ready\": true");
+        }
+
+        @Test
         @DisplayName("rejects null visibility tracker")
         void rejectsNullVisibilityTracker() {
             assertThatThrownBy(() -> new HealthEndpoint(null, segmentCatalog, 0.5))
@@ -125,19 +203,22 @@ class HealthEndpointTest {
         }
 
         @Test
-        @DisplayName("returns 200 for non-GET request (process is alive)")
-        void returns200ForNonGet() throws IOException {
+        @DisplayName("refuses a non-GET request rather than reading as agreement")
+        void refusesNonGet() throws IOException {
+            // This route answered 200 to every method, so a client with the wrong verb was told
+            // the node was healthy and never learned it had asked wrongly. Every other read
+            // route on this server answers 405, and the documented contract says so too.
             HealthEndpoint endpoint = new HealthEndpoint(visibilityTracker, segmentCatalog, 0.5);
             HttpExchange exchange = createMockExchange("POST");
 
             endpoint.handle(exchange);
 
-            verify(exchange).sendResponseHeaders(eq(200), anyLong());
+            verify(exchange).sendResponseHeaders(eq(405), anyLong());
         }
 
         @Test
-        @DisplayName("live is true even for non-GET request")
-        void liveIsTrueForNonGet() throws IOException {
+        @DisplayName("a refused method says which one this route serves")
+        void refusalNamesTheMethod() throws IOException {
             HealthEndpoint endpoint = new HealthEndpoint(visibilityTracker, segmentCatalog, 0.5);
             HttpExchange exchange = createMockExchange("POST");
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -145,8 +226,7 @@ class HealthEndpointTest {
 
             endpoint.handle(exchange);
 
-            String response = baos.toString(StandardCharsets.UTF_8);
-            assertThat(response).contains("\"live\": true");
+            assertThat(baos.toString(StandardCharsets.UTF_8)).contains("Use GET");
         }
 
         @Test
@@ -260,8 +340,9 @@ class HealthEndpointTest {
         @Test
         @DisplayName("custom threshold affects ready status")
         void customThresholdAffectsReadyStatus() throws IOException {
+            // Half the corpus is stranded before indexing -> coverage = 1/2 = 0.5
             addActiveSegment(segmentCatalog, 1);
-            addTombstonedSegment(segmentCatalog, 2);
+            addBootstrappingSegment(segmentCatalog, 2);
 
             HealthEndpoint endpoint = new HealthEndpoint(visibilityTracker, segmentCatalog, 0.9);
             HttpExchange exchange = createMockExchange("GET");
@@ -299,9 +380,9 @@ class HealthEndpointTest {
         @Test
         @DisplayName("healthy is true when coverage at healthy threshold")
         void healthyTrueWhenCoverageAtHealthyThreshold() throws IOException {
-            // Add 1 active segment, 1 tombstoned -> coverage = 1/2 = 0.5
+            // 1 segment a query reads, 1 stranded -> coverage = 1/2 = 0.5
             addActiveSegment(segmentCatalog, 1);
-            addTombstonedSegment(segmentCatalog, 2);
+            addBootstrappingSegment(segmentCatalog, 2);
 
             // Use healthy threshold of 0.5
             HealthEndpoint endpoint = new HealthEndpoint(
@@ -322,9 +403,9 @@ class HealthEndpointTest {
         @Test
         @DisplayName("custom healthy threshold affects healthy status")
         void customHealthyThresholdAffectsHealthyStatus() throws IOException {
-            // Add 1 active segment, 1 tombstoned -> coverage = 1/2 = 0.5
+            // 1 segment a query reads, 1 stranded -> coverage = 1/2 = 0.5
             addActiveSegment(segmentCatalog, 1);
-            addTombstonedSegment(segmentCatalog, 2);
+            addBootstrappingSegment(segmentCatalog, 2);
 
             // Use healthy threshold of 0.9 (coverage 0.5 is below it)
             HealthEndpoint endpoint = new HealthEndpoint(
@@ -349,7 +430,7 @@ class HealthEndpointTest {
             SegmentCatalog localCatalog = new SegmentCatalog();
             VisibilityTracker localTracker = new VisibilityTracker(localCatalog);
 
-            // Add segments: 5 active, 5 tombstoned -> coverage = 5/10 = 0.5
+            // Add segments: 5 a query reads, 5 stranded -> coverage = 5/10 = 0.5
             for (int i = 1; i <= 5; i++) {
                 var metadata = localCatalog.add(i, java.nio.file.Path.of("/tmp/segment" + i));
                 metadata.transitionToIndexing();
@@ -357,11 +438,7 @@ class HealthEndpointTest {
                 metadata.transitionToActive();
             }
             for (int i = 6; i <= 10; i++) {
-                var metadata = localCatalog.add(i, java.nio.file.Path.of("/tmp/segment" + i));
-                metadata.transitionToIndexing();
-                metadata.transitionToWarming();
-                metadata.transitionToActive();
-                metadata.transitionToTombstoned();
+                addBootstrappingSegment(localCatalog, i);
             }
 
             // readiness = 0.4, healthy = 0.8
@@ -387,18 +464,14 @@ class HealthEndpointTest {
             SegmentCatalog localCatalog = new SegmentCatalog();
             VisibilityTracker localTracker = new VisibilityTracker(localCatalog);
 
-            // Add segments: 3 active, 1 tombstoned -> coverage = 3/4 = 0.75
+            // Add segments: 3 a query reads, 1 stranded -> coverage = 3/4 = 0.75
             for (int i = 1; i <= 3; i++) {
                 var metadata = localCatalog.add(i, java.nio.file.Path.of("/tmp/segment" + i));
                 metadata.transitionToIndexing();
                 metadata.transitionToWarming();
                 metadata.transitionToActive();
             }
-            var tombstonedMeta = localCatalog.add(4, java.nio.file.Path.of("/tmp/segment4"));
-            tombstonedMeta.transitionToIndexing();
-            tombstonedMeta.transitionToWarming();
-            tombstonedMeta.transitionToActive();
-            tombstonedMeta.transitionToTombstoned();
+            addBootstrappingSegment(localCatalog, 4);
 
             // readiness = 0.5, healthy = 0.8, maxLatencyMs = 10000
             // coverage = 0.75 >= 0.5 -> ready=true
@@ -479,10 +552,13 @@ class HealthEndpointTest {
         @Test
         @DisplayName("coverage excludes tombstoned segments")
         void coverageExcludesTombstonedSegments() throws IOException {
+            // A retired segment is not corpus this node is missing, so a node that has
+            // compacted half its segments still reports full coverage - and stays ready even
+            // where readiness demands all of it.
             addActiveSegment(segmentCatalog, 1);
             addTombstonedSegment(segmentCatalog, 2);
 
-            HealthEndpoint endpoint = new HealthEndpoint(visibilityTracker, segmentCatalog, 0.5);
+            HealthEndpoint endpoint = new HealthEndpoint(visibilityTracker, segmentCatalog, 1.0);
             HttpExchange exchange = createMockExchange("GET");
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             when(exchange.getResponseBody()).thenReturn(baos);
@@ -511,6 +587,30 @@ class HealthEndpointTest {
             assertThat(response).contains("\"live\": true");
             assertThat(response).contains("\"ready\": false");
             assertThat(response).contains("\"epoch\": 0");
+            assertThat(response).contains("\"coverage\": 0.0000");
+        }
+
+        @Test
+        @DisplayName("a degraded response still reports the epoch it could read")
+        void aDegradedResponseStillReportsTheEpochItCouldRead() throws IOException {
+            // The realistic degraded trigger is the catalog, not the tracker: currentEpoch()
+            // reads an AtomicLong. Reporting 0 there tells a client watching for monotonicity
+            // that the node restarted and lost its visibility history, which it did not.
+            SegmentCatalog failingCatalog = mock(SegmentCatalog.class);
+            when(failingCatalog.getCatalogMetadata()).thenThrow(new IllegalStateException("no catalog"));
+            VisibilityTracker tracker = mock(VisibilityTracker.class);
+            when(tracker.currentEpoch()).thenReturn(4711L);
+
+            HealthEndpoint endpoint = new HealthEndpoint(tracker, failingCatalog, 0.5);
+            HttpExchange exchange = createMockExchange("GET");
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            when(exchange.getResponseBody()).thenReturn(baos);
+
+            endpoint.handle(exchange);
+
+            String response = baos.toString(StandardCharsets.UTF_8);
+            assertThat(response).contains("\"epoch\": 4711");
+            assertThat(response).contains("\"ready\": false");
             assertThat(response).contains("\"coverage\": 0.0000");
         }
     }
@@ -571,6 +671,11 @@ class HealthEndpointTest {
     private void addIndexingSegment(SegmentCatalog catalog, long segmentId) {
         var metadata = catalog.add(segmentId, java.nio.file.Path.of("/tmp/segment" + segmentId));
         metadata.transitionToIndexing();
+    }
+
+    /** A segment whose file is registered but which no transition ever brought up. */
+    private void addBootstrappingSegment(SegmentCatalog catalog, long segmentId) {
+        catalog.registerFile(segmentId, java.nio.file.Path.of("/tmp/segment" + segmentId));
     }
 
     private void addTombstonedSegment(SegmentCatalog catalog, long segmentId) {

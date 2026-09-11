@@ -411,6 +411,27 @@ class QueryPipelineTest {
             // Should complete quickly due to cancellation
             assertThat(response).isNotNull();
         }
+
+        @Test
+        @DisplayName("a cancelled query says it was cancelled")
+        void aCancelledQuerySaysItWasCancelled() throws Exception {
+            // Without this the answer is an empty result list with timed_out false, which is
+            // what a query that searched the whole corpus and matched nothing returns. The
+            // caller cancelled it and is told, in effect, that there was nothing to find.
+            QueryRequest request = QueryRequest.builder()
+                .queryVector(new float[]{0.1f, 0.2f, 0.3f})
+                .topK(10)
+                .build();
+            CancellationToken token = new CancellationToken();
+            token.cancel("Test cancellation");
+
+            QueryResponse response = pipeline.execute(request, token).get(5, TimeUnit.SECONDS);
+
+            assertThat(response.cancelled()).isTrue();
+            assertThat(response.timedOut())
+                .as("cancelled is not timed out; conflating them blames the deadline")
+                .isFalse();
+        }
     }
 
     @Nested

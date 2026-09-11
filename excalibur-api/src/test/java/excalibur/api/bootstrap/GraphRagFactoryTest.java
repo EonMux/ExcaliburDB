@@ -101,16 +101,25 @@ class GraphRagFactoryTest {
     }
 
     @Test
-    @DisplayName("an explicit path is used ahead of the data directory default")
-    void explicitPathWins(@TempDir Path dataDir, @TempDir Path elsewhere) throws Exception {
+    @DisplayName("opens a store at a directory named outright")
+    void opensAnExplicitDirectory(@TempDir Path elsewhere) throws Exception {
         buildGraph(elsewhere);
-        Config config = config(Map.of("excalibur.graph.path", elsewhere.toString()));
 
-        assertThat(GraphRagFactory.directoryFor(config, dataDir)).isEqualTo(elsewhere);
-        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config, dataDir)) {
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.openAt(config(Map.of()), elsewhere)) {
             assertThat(graph.directory()).isEqualTo(elsewhere);
             assertThat(graph.pipeline().answer("Who did Ada Lovelace collaborate with?")
                 .hasAnswer()).isTrue();
+        }
+    }
+
+    @Test
+    @DisplayName("ignores excalibur.graph.path, which names the namespace root and not a store")
+    void ignoresTheTenantRootKey(@TempDir Path dataDir, @TempDir Path elsewhere) throws Exception {
+        buildGraph(dataDir.resolve("graph"));
+        Config config = config(Map.of("excalibur.graph.path", elsewhere.toString()));
+
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config, dataDir)) {
+            assertThat(graph.directory()).isEqualTo(dataDir.resolve("graph"));
         }
     }
 

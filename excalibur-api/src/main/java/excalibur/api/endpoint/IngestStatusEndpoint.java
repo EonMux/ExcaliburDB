@@ -1,6 +1,7 @@
 package excalibur.api.endpoint;
 
 import excalibur.api.protocol.JsonText;
+import excalibur.api.protocol.QueryParams;
 import excalibur.api.protocol.ResponseBody;
 
 import java.util.Locale;
@@ -121,7 +122,7 @@ public class IngestStatusEndpoint implements HttpHandler {
                 // delimiter and the value silently truncated, and everything surviving that
                 // would then be decoded a second time below.
                 String query = exchange.getRequestURI().getRawQuery();
-                String sourceId = getQueryParam(query, "source_id");
+                String sourceId = QueryParams.value(query, "source_id");
 
                 LOGGER.debug("Ingest status request for source: {}", sourceId != null ? sourceId : "all");
 
@@ -151,43 +152,6 @@ public class IngestStatusEndpoint implements HttpHandler {
             }
         }
         // MDC context is automatically cleared when ctx.close() is called
-    }
-
-    /**
-     * Extracts a query parameter value from a <em>raw</em> query string.
-     *
-     * <p>Splitting has to happen before decoding. A {@code &} or {@code =} that arrived
-     * percent-encoded is part of a value, not a delimiter, and splitting a decoded string
-     * cannot tell the two apart any more.</p>
-     */
-    private String getQueryParam(String query, String param) {
-        if (query == null || query.isEmpty()) return null;
-
-        String[] pairs = query.split("&");
-        for (String pair : pairs) {
-            int eq = pair.indexOf("=");
-            if (eq > 0) {
-                String key = pair.substring(0, eq);
-                String value = pair.substring(eq + 1);
-                if (key.equals(param)) {
-                    return decodeUrl(value);
-                }
-            } else if (pair.equals(param)) {
-                return "";
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Decodes a URL-encoded string.
-     */
-    private String decodeUrl(String s) {
-        try {
-            return java.net.URLDecoder.decode(s, StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            return s;
-        }
     }
 
     /**
@@ -305,12 +269,21 @@ public class IngestStatusEndpoint implements HttpHandler {
         /**
          * Updates the status.
          *
+         * <p>An update to any state but {@code idle} says work is under way, which retires the
+         * error from the run before it. Nothing else does: {@code last_error} carries no run
+         * identity, so an error left over from a run that has since been retried successfully
+         * reads as a failure of the run that just finished. An update to {@code idle} is the
+         * end of a run, and keeps what that run reported.</p>
+         *
          * @param state Current state
          * @param progress Progress in range [0.0, 1.0]
          * @param entriesIngested Number of entries successfully ingested
          * @param entriesPending Number of entries waiting to be processed
          */
         public void update(String state, double progress, long entriesIngested, long entriesPending) {
+            if (!"idle".equals(state)) {
+                this.lastError = null;
+            }
             this.state = state;
             this.progress = clampProgress(progress);
             this.entriesIngested = Math.max(0, entriesIngested);

@@ -106,6 +106,28 @@ public class QueryPipeline {
     private static final int RERANK_CANDIDATE_MULTIPLIER = 2;
 
     /**
+     * The share of the remaining query budget Stage 3 leaves for a merge alone.
+     *
+     * <p>Stage 3 is the only stage that waits on work it did not do itself, so it is the only
+     * one that needs a deadline of its own - and that deadline has to end early enough for
+     * Stage 4 to still merge what came back. Reranking is bounded work over a bounded candidate
+     * set and holds no locks and does no I/O beyond reading vectors already mapped, so the
+     * margin it needs is small; what is held back is recall, and holding back more than the
+     * merge can use trades recall for nothing.</p>
+     */
+    private static final double MERGE_SHARE_HELD_BACK = 0.05;
+
+    /**
+     * The share Stage 3 leaves when Stage 5 will also run.
+     *
+     * <p>Relevancy scoring is a call to a model, so unlike the merge its cost is not a function
+     * of the candidate count and cannot be bounded from here. The wider margin buys it a
+     * realistic chance to answer; if it overruns anyway, the pipeline's own deadline fires and
+     * Stage 4's ranking is returned, which is the fallback this stage already has.</p>
+     */
+    private static final double SCORING_SHARE_HELD_BACK = 0.20;
+
+    /**
      * Minimum interval between two runs of the empty-result diagnostics.
      */
     private static final long EMPTY_RESULT_DIAGNOSTIC_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
@@ -520,6 +542,7 @@ public class QueryPipeline {
         Objects.requireNonNull(token, "CancellationToken cannot be null");
 
         long startTime = System.nanoTime();
+        QueryDeadline deadline = QueryDeadline.from(startTime, request.timeoutMs());
         String correlationId = request.correlationId();
 
         // Set correlation ID in MDC for structured logging
@@ -538,7 +561,7 @@ public class QueryPipeline {
         CompletableFuture<PipelineContext> pipelineFuture = new CompletableFuture<>();
         Future<?> pipelineTask = getPipelineExecutor().submit(() -> {
             try {
-                pipelineFuture.complete(runStages(request, token, partialContext));
+                pipelineFuture.complete(runStages(request, token, deadline, partialContext));
             } catch (Throwable t) {
                 pipelineFuture.completeExceptionally(t);
             }
@@ -583,12 +606,15 @@ public class QueryPipeline {
      *
      * @param request The query request
      * @param token The cancellation token
+     * @param deadline When this query is abandoned, which the stages that dispatch work of
+     *                 their own must finish inside of
      * @param partialContext Holder updated after each completed stage
      * @return The final pipeline context
      */
     private PipelineContext runStages(
             QueryRequest request,
             CancellationToken token,
+            QueryDeadline deadline,
             AtomicReference<PipelineContext> partialContext) {
 
         // Stage 0: Epoch Snapshot
@@ -608,7 +634,7 @@ public class QueryPipeline {
         partialContext.set(context);
 
         // Stage 3: HNSW Vector Search with Tail Scan
-        context = stage3_HnswVectorSearch(context, token);
+        context = stage3_HnswVectorSearch(context, token, deadline);
         partialContext.set(context);
 
         // Stage 4: Full Vector Rerank
@@ -719,8 +745,12 @@ public class QueryPipeline {
      * <ul>
      *   <li><strong>Segment prioritization:</strong> Segments with higher selectivity
      *       (more relevant terms) are searched first</li>
-     *   <li><strong>Early termination:</strong> Segments with very low selectivity
-     *       may be deprioritized to improve query latency</li>
+     *   <li><strong>Order only:</strong> every candidate segment is still searched. A low
+     *       selectivity moves a segment down the list, it does not take it off: the estimate
+     *       comes from a Count-Min sketch, which over-counts, and dropping a segment on an
+     *       over-count loses results that are in the corpus. What the ordering buys is that a
+     *       query which runs out of time has spent it on the segments most likely to
+     *       answer</li>
      *   <li><strong>Conservative defaults:</strong> Segments without frequency sketches
      *       are assigned default selectivity (1.0) to ensure no data loss</li>
      * </ul>
@@ -947,12 +977,14 @@ public class QueryPipeline {
         }
 
         // A segment is excluded only on the word of a filter that actually holds its terms.
-        // The filter is built in memory as documents are published and is not reloaded at
-        // startup, so on a fresh process it holds nothing at all -- and reading that silence as
-        // "this term is in no segment" makes every query with a text term return zero results
-        // until the corpus has been re-ingested. Nothing errors; the database simply answers
-        // that it knows nothing. This is the same rule stage 2 already applies to an LSH index
-        // that does not cover its segment: an index with no entries has no verdict to give.
+        // Two ways it does not. The filter is built in memory as documents are published and is
+        // not reloaded at startup, so on a fresh process it holds nothing at all; and a level
+        // that ran out of room refused terms it was asked to record, so it holds some of a
+        // segment and reads as though it held all of it. Reading either silence as "this term
+        // is in no segment" makes queries return zero results for documents sitting in storage.
+        // Nothing errors; the database simply answers that it knows nothing. This is the same
+        // rule stage 2 already applies to an LSH index that does not cover its segment: an
+        // index that cannot speak for a segment has no verdict to give.
         List<SegmentCandidate> passed = context.candidates.stream()
             .filter(c -> survivesTermFilter(hierarchicalFilter, c.segmentId(), candidateSegmentIds))
             .collect(Collectors.toList());
@@ -965,22 +997,19 @@ public class QueryPipeline {
     }
 
     /**
-     * Whether the hierarchical filter holds any terms for a segment.
+     * Whether the hierarchical filter holds everything a segment holds.
      *
-     * <p>Only a segment the filter has actually been populated for can be excluded by it. A
-     * segment with no registered filter, or with one holding nothing, is a segment the filter
-     * has no opinion about — which is not the same as one it has looked at and rejected.
+     * <p>Only a segment the filter has actually been populated for can be excluded by it, and
+     * only while the filter has had room for every term of it. A segment with no registered
+     * filter, one holding nothing, or one whose segment, cluster or corpus level has refused a
+     * term for want of room is a segment the filter has no opinion about — which is not the
+     * same as one it has looked at and rejected.
      *
      * @param segmentId The segment's id
      * @return true when the filter's silence about this segment is meaningful
      */
     static boolean filterCovers(HierarchicalCuckooFilter filter, long segmentId) {
-        if (filter == null) {
-            return false;
-        }
-        excalibur.filter.CuckooFilter segmentFilter =
-            filter.getSegmentFilter(String.valueOf(segmentId));
-        return segmentFilter != null && segmentFilter.count() > 0;
+        return filter != null && filter.coversSegment(String.valueOf(segmentId));
     }
 
     /**
@@ -1158,7 +1187,8 @@ public class QueryPipeline {
      * <p><strong>Offset Comparison:</strong> For each segment, compares
      * lastIntegratedOffset vs writeLogHead to determine if tail scanning is needed.</p>
      */
-    private PipelineContext stage3_HnswVectorSearch(PipelineContext context, CancellationToken token) {
+    private PipelineContext stage3_HnswVectorSearch(
+            PipelineContext context, CancellationToken token, QueryDeadline deadline) {
         token.checkCancelled("Stage 3 cancelled before HNSW search");
 
         LOGGER.trace("Stage 3: Running HNSW vector search with {} candidates", context.candidates.size());
@@ -1174,11 +1204,15 @@ public class QueryPipeline {
 
         long startTime = System.nanoTime();
 
-        // Build QueryOptions from request
+        // The fan-out gets what is left of the query's budget, less the share Stage 4 needs to
+        // merge the answers - not the request's timeout, which is measured from before Stage 0
+        // and so would always expire after the pipeline's own deadline. Handing it the full
+        // timeout means the pipeline is abandoned first and every segment that did answer is
+        // thrown away, which is how a partial result becomes an empty one.
         QueryOptions options = QueryOptions.builder()
             .topK(k)
             .oversamplingFactor(oversamplingFactor)
-            .timeout(java.time.Duration.ofMillis(context.request.timeoutMs()))
+            .timeout(deadline.budgetHoldingBack(searchShareHeldBack(context.request)))
             .includePartialSegments(context.request.includePartialSegments())
             .build();
 
@@ -1396,6 +1430,28 @@ public class QueryPipeline {
     }
 
     /**
+     * The epoch to bound the atomicity filter by.
+     *
+     * <p>The query's own captured epoch when the checker publishes on the clock that epoch came
+     * from, and {@link #DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED} otherwise. A rule rather than an
+     * inline condition because getting it wrong is silent in both directions: bounding by a
+     * foreign counter excludes documents arbitrarily, and never bounding gives up snapshot
+     * isolation without saying so.
+     *
+     * @param checker    The visibility checker the filter will consult
+     * @param queryEpoch The epoch captured in stage 0
+     * @return The bound to filter with
+     */
+    static long atomicityBoundFor(DocumentVisibilityChecker checker, long queryEpoch) {
+        if (checker == null || !checker.sharesNodeEpochClock()) {
+            return DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
+        }
+        // A negative epoch is not a snapshot anyone captured; the filter rejects it outright,
+        // so falling back keeps a malformed context from failing the whole query.
+        return queryEpoch >= 0 ? queryEpoch : DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
+    }
+
+    /**
      * Applies the document atomicity filter, if it can say anything useful.
      *
      * <p>The filter excludes results belonging to documents that are not yet fully
@@ -1421,28 +1477,6 @@ public class QueryPipeline {
      * @return The results that survive the filter, or the input unchanged when the filter
      *         is not configured or holds no document registrations
      */
-    /**
-     * The epoch to bound the atomicity filter by.
-     *
-     * <p>The query's own captured epoch when the checker publishes on the clock that epoch came
-     * from, and {@link #DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED} otherwise. A rule rather than an
-     * inline condition because getting it wrong is silent in both directions: bounding by a
-     * foreign counter excludes documents arbitrarily, and never bounding gives up snapshot
-     * isolation without saying so.
-     *
-     * @param checker    The visibility checker the filter will consult
-     * @param queryEpoch The epoch captured in stage 0
-     * @return The bound to filter with
-     */
-    static long atomicityBoundFor(DocumentVisibilityChecker checker, long queryEpoch) {
-        if (checker == null || !checker.sharesNodeEpochClock()) {
-            return DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
-        }
-        // A negative epoch is not a snapshot anyone captured; the filter rejects it outright,
-        // so falling back keeps a malformed context from failing the whole query.
-        return queryEpoch >= 0 ? queryEpoch : DOCUMENT_ATOMICITY_EPOCH_UNBOUNDED;
-    }
-
     private List<QueryResultItem> applyAtomicityFilter(List<QueryResultItem> results,
                                                        long queryEpoch) {
         if (visibilityChecker == null) {
@@ -1536,6 +1570,16 @@ public class QueryPipeline {
     }
 
     /**
+     * The share of the remaining budget Stage 3 must leave behind for the stages after it.
+     *
+     * @param request The query request
+     * @return The fraction to hold back
+     */
+    private double searchShareHeldBack(QueryRequest request) {
+        return llmScoringWillRun(request) ? SCORING_SHARE_HELD_BACK : MERGE_SHARE_HELD_BACK;
+    }
+
+    /**
      * Returns whether Stage 5 will actually score this request.
      *
      * <p>Stage 4 consults this to decide whether it may truncate to topK or must leave
@@ -1606,27 +1650,184 @@ public class QueryPipeline {
         // stages happened to accumulate is not an answer to the query - returning it would
         // present an arbitrary prefix of the pipeline as a successful (if degraded) result.
         boolean interrupted = timedOut || cancelled;
+        // Stage 4 leaves its ranking oversampled when Stage 5 is going to run, because Stage 5's
+        // threshold filter is meant to choose from it. If Stage 5 is what the interruption
+        // caught, that list goes to the caller as it stands - so it is cut here to the size the
+        // caller actually asked for.
         List<QueryResultItem> partialResults = (interrupted && partialContext != null)
-            ? partialContext.mergedResults
+            ? truncate(partialContext.mergedResults, request.topK())
             : Collections.emptyList();
         long partialTailScanEntries = (interrupted && partialContext != null)
             ? partialContext.totalTailScanEntries
             : 0L;
+        // A partial answer is still an answer about a corpus, and which segments contributed to
+        // it is the difference between "nothing matched" and "not everything was asked". The
+        // verdict is already settled - degraded - so these are the counts behind it, not inputs
+        // to it.
+        List<SegmentQueryTask.SegmentQueryResult> partialSegments =
+            (interrupted && partialContext != null)
+                ? partialContext.segmentResults
+                : List.of();
+        int partialSegmentsTimedOut = (interrupted && partialContext != null)
+            ? partialContext.segmentsTimedOut
+            : 0;
+        int partialSegmentsSearched = segmentsAnswering(partialSegments);
 
-        // Build degraded response
-        IndexCoverage coverage = IndexCoverage.builder()
+        // The census is reported even here: a response that says the index holds no segments,
+        // because the query was cut off before it could look, reads exactly like one served by
+        // an empty index. It is read defensively because the pipeline may have failed for
+        // precisely the reason the catalog cannot be read, and the caller is still owed the
+        // degraded response rather than a second failure in place of it.
+        SegmentCensus census;
+        try {
+            census = census();
+        } catch (RuntimeException e) {
+            LOGGER.warn("Catalog census unavailable for a degraded response: {}", e.toString());
+            census = new SegmentCensus(0, 0, 0, 0, 0, 0);
+        }
+
+        IndexCoverage coverage = census.onto(IndexCoverage.builder())
             .degraded(true)
             .tailScanEntries(partialTailScanEntries)
-            .computeCoverage()
+            .segmentsSearched(partialSegmentsSearched)
+            .segmentsExcluded(interrupted && partialContext != null
+                ? partialContext.segmentsExcluded : 0)
+            .segmentsWithErrors(segmentsFailing(partialSegments, partialSegmentsTimedOut))
+            .segmentsTimedOut(partialSegmentsTimedOut)
+            // Not computeCoverage(): a stage abandoned midway leaves segments that are neither
+            // searched nor counted as having failed, and subtracting only what is counted would
+            // report the rest as read. What was read is what answered.
+            .estimatedCorpusCoverage(census.nonPurged() <= 0 ? 0.0
+                : Math.min(1.0, (double) partialSegmentsSearched / census.nonPurged()))
             .build();
 
+        // Cancelled is reported separately from timedOut: the two produce the same shape of
+        // answer - degraded, usually empty - and only this flag tells the caller which of them
+        // happened, or that either did rather than the corpus holding no match.
         return new QueryResponse(
+            null,
             partialResults,
             coverage,
             durationMs,
             false,
-            timedOut
+            timedOut,
+            cancelled
         );
+    }
+
+    /**
+     * The catalog's count of segments in each lifecycle state, read at one instant.
+     *
+     * <p>Every response says what the index holds, including one cut short. A response that
+     * reports no segments at all - because the query was interrupted before it could look -
+     * is indistinguishable from one served by an empty index.</p>
+     *
+     * @param total      Segments the catalog holds
+     * @param active     Segments in the ACTIVE state
+     * @param indexing   Segments in the INDEXING state
+     * @param warming    Segments in the WARMING state
+     * @param compacting Segments in the COMPACTING state
+     * @param tombstoned Segments in the TOMBSTONED state
+     */
+    private record SegmentCensus(long total, long active, long indexing, long warming,
+                                 long compacting, long tombstoned) {
+
+        /** The live corpus: everything the catalog holds that has not been tombstoned. */
+        long nonPurged() {
+            return total - tombstoned;
+        }
+
+        IndexCoverage.Builder onto(IndexCoverage.Builder builder) {
+            return builder
+                .totalSegments(total)
+                .activeSegments(active)
+                .indexingSegments(indexing)
+                .warmingSegments(warming)
+                .compactingSegments(compacting)
+                .tombstonedSegments(tombstoned);
+        }
+    }
+
+    /**
+     * A coverage builder carrying what the index holds and nothing about any query.
+     *
+     * <p>For a caller that has to answer without a query having run - a request abandoned
+     * before it reached the pipeline, or one the pipeline never came back from. Such a response
+     * still has to say what the index holds: reporting no segments at all is indistinguishable
+     * from an empty index.</p>
+     *
+     * @return A builder with the segment-state counts filled in, for the caller to finish
+     */
+    public IndexCoverage.Builder segmentCensus() {
+        return census().onto(IndexCoverage.builder());
+    }
+
+    /**
+     * Reads the catalog's census of segment states.
+     *
+     * @return The counts, all zero for an empty catalog
+     */
+    private SegmentCensus census() {
+        // One snapshot, not two reads: a total taken separately from the states it is broken
+        // down into can disagree with them, and the disagreement shows up in the response.
+        Map<Long, SegmentCatalog.SegmentMetadata> segments = storageEngine.getCatalog().getAll();
+        long activeSegments = 0, indexingSegments = 0, warmingSegments = 0;
+        long compactingSegments = 0, tombstonedSegments = 0;
+
+        for (SegmentCatalog.SegmentMetadata metadata : segments.values()) {
+            switch (metadata.getLifecycleState()) {
+                case ACTIVE -> activeSegments++;
+                case INDEXING -> indexingSegments++;
+                case WARMING -> warmingSegments++;
+                case COMPACTING -> compactingSegments++;
+                case TOMBSTONED -> tombstonedSegments++;
+                default -> {}
+            }
+        }
+
+        return new SegmentCensus(segments.size(), activeSegments, indexingSegments,
+            warmingSegments, compactingSegments, tombstonedSegments);
+    }
+
+    /**
+     * How many segments came back with an answer.
+     *
+     * @param results The per-segment results, which may be empty
+     * @return The number that succeeded
+     */
+    private static int segmentsAnswering(List<SegmentQueryTask.SegmentQueryResult> results) {
+        int answered = 0;
+        for (SegmentQueryTask.SegmentQueryResult result : results) {
+            if (result.success()) {
+                answered++;
+            }
+        }
+        return answered;
+    }
+
+    /**
+     * How many segments failed for a reason other than running out of time.
+     *
+     * <p>The dispatcher reports a segment that did not answer in time as both an unsuccessful
+     * result and a timeout. Coverage subtracts the two counts separately and a client reads them
+     * as separate problems, so the timeouts come out of the failures here rather than being
+     * charged twice.</p>
+     *
+     * @param results    The per-segment results, which may be empty
+     * @param timedOut   How many of them did not answer in time
+     * @return The number that failed for some other reason
+     */
+    private static int segmentsFailing(
+            List<SegmentQueryTask.SegmentQueryResult> results, int timedOut) {
+        int failed = 0;
+        for (SegmentQueryTask.SegmentQueryResult result : results) {
+            if (!result.success()) {
+                failed++;
+            }
+        }
+        // An interrupted fan-out reports every segment as timed out and returns no results at
+        // all, so the subtraction can go negative.
+        return Math.max(0, failed - timedOut);
     }
 
     /**
@@ -1640,47 +1841,15 @@ public class QueryPipeline {
      * <p><strong>Empty results are ONLY acceptable when no documents match the query vector.</strong></p>
      */
     private QueryResponse buildResponse(PipelineContext context, long durationMs) {
-        // Build coverage from segment results
-        SegmentCatalog catalog = storageEngine.getCatalog();
-        long totalSegments = catalog.size();
-        long activeSegments = 0, indexingSegments = 0, warmingSegments = 0;
-        long compactingSegments = 0, tombstonedSegments = 0;
-
-        for (SegmentCatalog.SegmentMetadata metadata : catalog.getAll().values()) {
-            switch (metadata.getLifecycleState()) {
-                case ACTIVE -> activeSegments++;
-                case INDEXING -> indexingSegments++;
-                case WARMING -> warmingSegments++;
-                case COMPACTING -> compactingSegments++;
-                case TOMBSTONED -> tombstonedSegments++;
-                default -> {}
-            }
-        }
-
-        int segmentsSearched = 0, segmentsWithErrors = 0;
-        for (SegmentQueryTask.SegmentQueryResult result : context.segmentResults) {
-            if (result.success()) {
-                segmentsSearched++;
-            } else {
-                segmentsWithErrors++;
-            }
-        }
-
         // A response is degraded when coverage is below the threshold, when a segment errored or
         // timed out - all three of which computeDegraded reads off the numbers below - or when LLM
         // scoring was asked for and fell back to vector-only ranking, which is the one reason no
         // count records, so it is ORed in afterwards.
-        IndexCoverage coverage = IndexCoverage.builder()
-            .totalSegments(totalSegments)
-            .activeSegments(activeSegments)
-            .indexingSegments(indexingSegments)
-            .warmingSegments(warmingSegments)
-            .compactingSegments(compactingSegments)
-            .tombstonedSegments(tombstonedSegments)
+        IndexCoverage coverage = census().onto(IndexCoverage.builder())
             .tailScanEntries(context.totalTailScanEntries)
-            .segmentsSearched(segmentsSearched)
+            .segmentsSearched(segmentsAnswering(context.segmentResults))
             .segmentsExcluded(context.segmentsExcluded)
-            .segmentsWithErrors(segmentsWithErrors)
+            .segmentsWithErrors(segmentsFailing(context.segmentResults, context.segmentsTimedOut))
             .segmentsTimedOut(context.segmentsTimedOut)
             .computeCoverage()
             .computeDegraded(coverageThreshold)

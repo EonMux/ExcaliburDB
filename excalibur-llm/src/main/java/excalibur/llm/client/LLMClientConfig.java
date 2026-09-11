@@ -34,7 +34,6 @@ public final class LLMClientConfig {
     private final int failureThreshold;
     private final Duration cooldownPeriod;
     private final int maxPromptsPerQuery;
-    private final double relevancyThreshold;
     private final int embeddingDimension;
     private final int maxBatchTokens;
     private final Duration retryBaseDelay;
@@ -51,7 +50,6 @@ public final class LLMClientConfig {
         this.failureThreshold = validateFailureThreshold(builder.failureThreshold);
         this.cooldownPeriod = validateCooldownPeriod(builder.cooldownPeriod);
         this.maxPromptsPerQuery = validateMaxPromptsPerQuery(builder.maxPromptsPerQuery);
-        this.relevancyThreshold = validateRelevancyThreshold(builder.relevancyThreshold);
         this.embeddingDimension = validateEmbeddingDimension(builder.embeddingDimension);
         this.maxBatchTokens = validateMaxBatchTokens(builder.maxBatchTokens);
         this.retryBaseDelay = validateRetryBaseDelay(builder.retryBaseDelay);
@@ -107,10 +105,6 @@ public final class LLMClientConfig {
 
     public int getMaxPromptsPerQuery() {
         return maxPromptsPerQuery;
-    }
-
-    public double getRelevancyThreshold() {
-        return relevancyThreshold;
     }
 
     public int getEmbeddingDimension() {
@@ -246,14 +240,6 @@ public final class LLMClientConfig {
         return max;
     }
 
-    private static double validateRelevancyThreshold(double threshold) {
-        if (threshold < 0.0 || threshold > 1.0) {
-            throw new IllegalArgumentException(
-                "Relevancy threshold must be in range [0.0, 1.0], got: " + threshold);
-        }
-        return threshold;
-    }
-
     private static int validateEmbeddingDimension(int dimension) {
         if (dimension < 1 || dimension > 4096) {
             throw new IllegalArgumentException(
@@ -342,7 +328,6 @@ public final class LLMClientConfig {
             .failureThreshold(llmConfig.getFailureThreshold())
             .cooldownPeriod(Duration.ofMillis(llmConfig.getCooldownPeriodMs()))
             .maxPromptsPerQuery(llmConfig.getMaxPromptsPerQuery())
-            .relevancyThreshold(llmConfig.getRelevancyThreshold())
             .embeddingDimension(llmConfig.getEmbeddingsDimensions())
             .maxBatchTokens(llmConfig.getMaxBatchTokens())
             .retryBaseDelay(Duration.ofMillis(llmConfig.getRetryBaseDelayMs()))
@@ -373,7 +358,6 @@ public final class LLMClientConfig {
         private int failureThreshold = 5;
         private Duration cooldownPeriod = Duration.ofMillis(60000);
         private int maxPromptsPerQuery = 10;
-        private double relevancyThreshold = 0.3;
         private int embeddingDimension = 1536;
         private int maxBatchTokens = 4000;
         private Duration retryBaseDelay = Duration.ofMillis(500);
@@ -431,11 +415,6 @@ public final class LLMClientConfig {
 
         public Builder maxPromptsPerQuery(int maxPromptsPerQuery) {
             this.maxPromptsPerQuery = maxPromptsPerQuery;
-            return this;
-        }
-
-        public Builder relevancyThreshold(double relevancyThreshold) {
-            this.relevancyThreshold = relevancyThreshold;
             return this;
         }
 

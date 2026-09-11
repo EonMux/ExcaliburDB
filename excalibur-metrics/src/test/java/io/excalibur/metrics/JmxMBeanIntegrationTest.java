@@ -116,8 +116,9 @@ class JmxMBeanIntegrationTest {
 
         MBeanInfo info = mbeanServer.getMBeanInfo(objectName);
         assertNotNull(info, "MBeanInfo should not be null");
-        assertEquals("Ingestion Queue MBean", info.getDescription(),
-            "MBean description should match");
+        assertTrue(info.getDescription().contains("HnswQueueDepth"),
+            "the bean reports the HNSW integration backlog and must say so: "
+                + info.getDescription());
 
         assertAttributeExists(info, "depth");
         assertAttributeExists(info, "percent");

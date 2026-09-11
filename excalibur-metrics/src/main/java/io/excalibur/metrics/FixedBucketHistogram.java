@@ -24,11 +24,29 @@ import java.util.Arrays;
 public final class FixedBucketHistogram {
     
     private static final int NUM_BUCKETS = 10000;
+
+    /**
+     * Largest latency the buckets can place, in milliseconds.
+     *
+     * <p>One bucket per millisecond, so a sample of exactly this many milliseconds is already
+     * past the last of them. Anything at or above it is counted as overflow rather than
+     * folded into the top bucket - see {@link #getOverflowCount()}.</p>
+     */
+    public static final long RANGE_MS = NUM_BUCKETS;
+
     private static final FixedBucketHistogram histogram = new FixedBucketHistogram();
     
     private long[] buckets;
     private long totalEntries;
     private volatile long currentEpoch;
+
+    // Samples past the last bucket, kept as real numbers rather than clamped into it. The
+    // clamp made a 45-second query and a ten-second one the same measurement, so a tail
+    // getting steadily worse past ten seconds charted as a flat line at the top bucket.
+    private long overflowCount;
+    private long overflowSum;
+    private long overflowMin;
+    private long overflowMax;
 
     // FP rate metrics - per-epoch statistics
     private static final int NUM_FP_RATES = 10000;
@@ -44,6 +62,7 @@ public final class FixedBucketHistogram {
         this.totalEntries = 0;
         this.fpRateBuckets = new long[NUM_FP_RATES];
         this.fpRateEntries = 0;
+        this.overflowMin = Long.MAX_VALUE;
     }
     
     /**
@@ -52,10 +71,8 @@ public final class FixedBucketHistogram {
      * @param latencyMs Latency in milliseconds
      */
     public void record(long latencyMs) {
-        int bucketIndex = getBucketIndex(latencyMs);
         synchronized (this) {
-            buckets[bucketIndex]++;
-            totalEntries++;
+            place(latencyMs);
         }
     }
     
@@ -66,12 +83,25 @@ public final class FixedBucketHistogram {
      * @param epoch Current visibility epoch
      */
     public void record(long latencyMs, long epoch) {
-        int bucketIndex = getBucketIndex(latencyMs);
         synchronized (this) {
-            buckets[bucketIndex]++;
-            totalEntries++;
+            place(latencyMs);
             this.currentEpoch = epoch;
         }
+    }
+
+    /**
+     * Files one sample, in a bucket or in the overflow tally. Caller holds the lock.
+     */
+    private void place(long latencyMs) {
+        if (latencyMs >= RANGE_MS) {
+            overflowCount++;
+            overflowSum += latencyMs;
+            overflowMin = Math.min(overflowMin, latencyMs);
+            overflowMax = Math.max(overflowMax, latencyMs);
+        } else {
+            buckets[getBucketIndex(latencyMs)]++;
+        }
+        totalEntries++;
     }
     
     /**
@@ -126,9 +156,31 @@ public final class FixedBucketHistogram {
 
             double targetCount = totalEntries * percentile / 100.0;
             int bucketIndex = findBucketAtTarget(targetCount);
+            if (bucketIndex < 0) {
+                // The target lies among the samples the buckets could not place. Their exact
+                // spread is not recorded, so the honest answer is the edge of the range:
+                // "at least this". getOverflowCount() and getMaximum() say how far past it.
+                return RANGE_MS;
+            }
 
             // Convert bucket index back to latency value
             return (long) (bucketIndex * 10000L / NUM_BUCKETS);
+        }
+    }
+
+    /**
+     * How many recorded latencies were past the last bucket.
+     *
+     * <p>Percentiles cannot resolve these and report {@link #RANGE_MS} for any that falls
+     * among them, so this is the count that tells an operator a flat percentile is a ceiling
+     * rather than a measurement. {@link #getMaximum()} and {@link #getAverage()} do count
+     * them at their real size.</p>
+     *
+     * @return Samples at or above {@link #RANGE_MS} milliseconds
+     */
+    public long getOverflowCount() {
+        synchronized (this) {
+            return overflowCount;
         }
     }
 
@@ -155,7 +207,10 @@ public final class FixedBucketHistogram {
             for (int i = 0; i < NUM_BUCKETS; i++) {
                 sum += buckets[i] * (i * 10000L / NUM_BUCKETS);
             }
-            return (double) sum / totalEntries;
+            // Overflowing samples count at their real size. Folding them into the top bucket
+            // instead would pull the average toward the ceiling from above, which is the one
+            // direction that hides a bad tail.
+            return (double) (sum + overflowSum) / totalEntries;
         }
     }
 
@@ -165,7 +220,9 @@ public final class FixedBucketHistogram {
     public long getMinimum() {
         synchronized (this) {
             int firstBucket = findFirstNonZeroBucket();
-            if (firstBucket == NUM_BUCKETS) return 0;
+            if (firstBucket == NUM_BUCKETS) {
+                return overflowCount == 0 ? 0 : overflowMin;
+            }
             return (long) (firstBucket * 10000.0 / NUM_BUCKETS);
         }
     }
@@ -175,6 +232,9 @@ public final class FixedBucketHistogram {
      */
     public long getMaximum() {
         synchronized (this) {
+            if (overflowCount > 0) {
+                return overflowMax;
+            }
             int lastBucket = findLastNonZeroBucket();
             if (lastBucket == -1) return 0;
             return (long) (lastBucket * 10000.0 / NUM_BUCKETS);
@@ -296,6 +356,10 @@ public final class FixedBucketHistogram {
             Arrays.fill(fpRateBuckets, 0L);
             totalEntries = 0;
             fpRateEntries = 0;
+            overflowCount = 0;
+            overflowSum = 0;
+            overflowMin = Long.MAX_VALUE;
+            overflowMax = 0;
         }
     }
 
@@ -310,6 +374,7 @@ public final class FixedBucketHistogram {
         int index = (int) (latency * NUM_BUCKETS / 10000.0);
         return Math.max(0, Math.min(NUM_BUCKETS - 1, index));
     }
+
     
     /**
      * Finds the first non-zero bucket index.
@@ -340,7 +405,8 @@ public final class FixedBucketHistogram {
      * Correctly accumulates counts across buckets to find the percentile position.
      *
      * @param target Target cumulative count
-     * @return Bucket index where cumulative count reaches or exceeds target
+     * @return Bucket index where cumulative count reaches or exceeds target, or -1 when the
+     *         target lies past every bucket, among the overflowing samples
      */
     private int findBucketAtTarget(double target) {
         long cumulative = 0;
@@ -350,6 +416,6 @@ public final class FixedBucketHistogram {
                 return i;
             }
         }
-        return NUM_BUCKETS - 1;
+        return -1;
     }
 }

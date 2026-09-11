@@ -64,7 +64,7 @@ public class SourceDeregisterEndpoint implements HttpHandler {
         String body;
         try {
             body = RequestBody.read(exchange);
-        } catch (IllegalArgumentException e) {
+        } catch (RequestBody.TooLargeException e) {
             ResponseBody.sendJson(exchange, 413, "{\"error\": \"Request body too large\"}");
             return;
         }

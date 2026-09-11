@@ -37,7 +37,7 @@ class McpToolsTest {
     void theCatalogueIsWellFormed() {
         List<Object> catalogue = McpTools.catalogue();
 
-        assertThat(catalogue).hasSize(4);
+        assertThat(catalogue).hasSize(5);
         for (Object described : catalogue) {
             assertThat(Json.stringAt(described, "name")).isNotBlank();
             assertThat(Json.stringAt(described, "description"))
@@ -71,6 +71,64 @@ class McpToolsTest {
         assertThat(Json.stringAt(described, "description"))
             .as("a model must not turn an abstention into a guess")
             .contains("declined");
+    }
+
+    @Test
+    @DisplayName("search_documents requires a question and bounds how much comes back")
+    void searchDocumentsSchema() {
+        Object described = tool(McpTools.SEARCH_DOCUMENTS);
+        Map<String, Object> schema = Json.objectAt(described, "inputSchema");
+
+        assertThat(names(schema.get("required"))).containsExactly("query");
+        assertThat(Json.objectAt(schema, "properties")).containsKeys("query", "top_k");
+        assertThat(Json.stringAt(described, "description"))
+            .as("a model must know this works without a graph having been built")
+            .contains("build_graph");
+        assertThat(Json.stringAt(described, "description"))
+            .as("the score's scale depends on which signals answered, so a model told it is a "
+                + "similarity will compare numbers that share no scale")
+            .contains("'retrieval'");
+        assertThat(Json.stringAt(described, "description"))
+            .as("the reply carries document ids and scores and no text at all, so a model "
+                + "promised passages will wait for content that never arrives")
+            .doesNotContain("passage");
+        assertThat(Json.stringAt(described, "description"))
+            .as("a model has to know it must resolve the ids against its own document store")
+            .contains("identifier");
+    }
+
+    @Test
+    @DisplayName("a search reaches the query endpoint as the body it parses")
+    void searchDocumentsPostsTheQuestion() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            node.answerWith(200, "{\"results\":[],\"coverage\":{}}");
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            McpTools.ToolResult result = tools.call(McpTools.SEARCH_DOCUMENTS,
+                Map.of("query", "analytical engine", "top_k", 3));
+
+            StubNode.Received request = node.onlyRequest();
+            assertThat(request.method()).isEqualTo("POST");
+            assertThat(request.path()).isEqualTo("/v1/query");
+            Object body = Json.parse(request.body());
+            assertThat(Json.stringAt(body, "query")).isEqualTo("analytical engine");
+            assertThat(Json.at(body, "top_k")).isEqualTo(3L);
+            assertThat(result.isError()).isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("a search with no top_k lets the node apply its own default")
+    void searchDocumentsOmitsAnUnsetTopK() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            tools.call(McpTools.SEARCH_DOCUMENTS, Map.of("query", "analytical engine"));
+
+            assertThat(Json.at(Json.parse(node.onlyRequest().body()), "top_k"))
+                .as("the node's configured default must not be overridden by this adapter")
+                .isNull();
+        }
     }
 
     @Test
@@ -128,6 +186,31 @@ class McpToolsTest {
 
             assertThat(Json.at(Json.parse(node.onlyRequest().body()), "context_entities"))
                 .isEqualTo(List.of("Ada Lovelace", "Charles Babbage"));
+        }
+    }
+
+    @Test
+    @DisplayName("an as-of instant reaches the graph endpoint")
+    void asOfIsPassedThrough() throws IOException {
+        // The graph is bitemporal and the HTTP route takes an instant; without this the model
+        // could only ask about now, or hope the classifier read a date out of its wording.
+        try (StubNode node = StubNode.start()) {
+            new McpTools(node.client(Map.of())).call(McpTools.SEARCH_GRAPH, Map.of(
+                "query", "Where did Ada Lovelace live?", "as_of", "1843-01-01"));
+
+            assertThat(Json.stringAt(Json.parse(node.onlyRequest().body()), "as_of"))
+                .isEqualTo("1843-01-01");
+        }
+    }
+
+    @Test
+    @DisplayName("a query with no as-of omits the field, so the node decides")
+    void noAsOfIsOmitted() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            new McpTools(node.client(Map.of()))
+                .call(McpTools.SEARCH_GRAPH, Map.of("query", "anything"));
+
+            assertThat(Json.at(Json.parse(node.onlyRequest().body()), "as_of")).isNull();
         }
     }
 

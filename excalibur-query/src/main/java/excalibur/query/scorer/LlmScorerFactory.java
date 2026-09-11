@@ -172,7 +172,6 @@ public final class LlmScorerFactory {
             .failureThreshold(llmConfig.getFailureThreshold())
             .cooldownPeriod(java.time.Duration.ofMillis(llmConfig.getCooldownPeriodMs()))
             .maxPromptsPerQuery(llmConfig.getMaxPromptsPerQuery())
-            .relevancyThreshold(llmConfig.getRelevancyThreshold())
             .embeddingDimension(llmConfig.getEmbeddingsDimensions())
             .maxBatchTokens(llmConfig.getMaxBatchTokens())
             .retryBaseDelay(java.time.Duration.ofMillis(llmConfig.getRetryBaseDelayMs()))
