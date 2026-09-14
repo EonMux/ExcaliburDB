@@ -76,7 +76,7 @@ class AtomicityBoundTest {
     @Test
     @DisplayName("a shared clock means the query's own epoch bounds the filter")
     void sharedClockBoundsByTheQueryEpoch() {
-        assertThat(QueryPipeline.atomicityBoundFor(checker(true), 42L)).isEqualTo(42L);
+        assertThat(RerankStage.atomicityBoundFor(checker(true), 42L)).isEqualTo(42L);
     }
 
     @Test
@@ -84,19 +84,19 @@ class AtomicityBoundTest {
     void epochZeroIsABound() {
         // A fresh node serves queries at epoch 0; treating it as "no epoch" would silently
         // unbound the filter for the whole first tick of the process's life.
-        assertThat(QueryPipeline.atomicityBoundFor(checker(true), 0L)).isZero();
+        assertThat(RerankStage.atomicityBoundFor(checker(true), 0L)).isZero();
     }
 
     @Test
     @DisplayName("a foreign clock is not compared against")
     void foreignClockIsUnbounded() {
-        assertThat(QueryPipeline.atomicityBoundFor(checker(false), 42L)).isEqualTo(UNBOUNDED);
+        assertThat(RerankStage.atomicityBoundFor(checker(false), 42L)).isEqualTo(UNBOUNDED);
     }
 
     @Test
     @DisplayName("no checker means nothing to bound")
     void noCheckerIsUnbounded() {
-        assertThat(QueryPipeline.atomicityBoundFor(null, 42L)).isEqualTo(UNBOUNDED);
+        assertThat(RerankStage.atomicityBoundFor(null, 42L)).isEqualTo(UNBOUNDED);
     }
 
     @Test
@@ -104,6 +104,6 @@ class AtomicityBoundTest {
     void negativeEpochFallsBack() {
         // The filter rejects a negative epoch outright. Passing one through would turn a
         // malformed context into a failed query rather than a degraded filter.
-        assertThat(QueryPipeline.atomicityBoundFor(checker(true), -1L)).isEqualTo(UNBOUNDED);
+        assertThat(RerankStage.atomicityBoundFor(checker(true), -1L)).isEqualTo(UNBOUNDED);
     }
 }

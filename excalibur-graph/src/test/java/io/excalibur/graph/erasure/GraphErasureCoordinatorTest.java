@@ -532,4 +532,205 @@ class GraphErasureCoordinatorTest {
             }
         }
     }
+
+    @Nested
+    @DisplayName("staged facts")
+    class StagedFacts {
+
+        @Test
+        @DisplayName("an erasure removes the staged facts, so the next build cannot restore them")
+        void erasureClearsStaging(@TempDir Path dir) throws IOException {
+            // Rewriting the store removes the erased edges from the graph being served, and
+            // leaves the facts they were built from sitting in the staging log. The next
+            // POST /v1/graph/build replays that log and puts back exactly what was erased -
+            // and until it does, the data is still on disk, which for an erasure obligation
+            // is the whole point rather than a detail.
+            Path graphDir = dir.resolve("graph");
+            try (io.excalibur.graph.staging.GraphStagingStore staging =
+                     io.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"));
+                 ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+
+                int alice = staging.entityIdOf("alice");
+                int bob = staging.entityIdOf("bob");
+                staging.append(new io.excalibur.graph.staging.ExtractedTriple(
+                    "alice", "knows", "bob", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    new Provenance(SourceType.DOCUMENT, 555, 90, 1)));
+                staging.append(new io.excalibur.graph.staging.ExtractedTriple(
+                    "carol", "knows", "dave", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    new Provenance(SourceType.DOCUMENT, 777, 90, 1)));
+                staging.appendEntityText(alice, "Alice lives at 14 Elm Street");
+                staging.appendEntityText(bob, "Bob is unrelated to the request");
+                staging.flush();
+
+                writeStore(graphDir, staging);
+
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+                coordinator.submit(new ErasureScope.Entity(alice));
+                coordinator.compactNow(graphDir);
+
+                List<String> survivors = new ArrayList<>();
+                staging.forEach((subject, relation, object, from, to, provenance) ->
+                    survivors.add(subject + "-" + relation + "-" + object));
+                assertThat(survivors)
+                    .as("the erased entity's fact is gone from staging, not only from the store")
+                    .hasSize(1);
+
+                List<String> text = new ArrayList<>();
+                staging.forEachEntityText((entityId, snippet) -> text.add(snippet));
+                assertThat(text)
+                    .as("and the verbatim text recorded against them went with it")
+                    .containsExactly("Bob is unrelated to the request");
+            }
+        }
+
+        @Test
+        @DisplayName("withdrawing a document erases the prose copied out of it")
+        void sourceScopedErasureReachesSnippets(@TempDir Path dir) throws IOException {
+            // The finding: snippets carried no provenance, so a source scope matched none of
+            // them. Withdrawing a document removed its triples, left up to 2 KiB of its prose per
+            // mention to be re-indexed and re-embedded on the next build, and reported the
+            // obligation discharged.
+            Path graphDir = dir.resolve("graph");
+            try (io.excalibur.graph.staging.GraphStagingStore staging =
+                     io.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"));
+                 ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+
+                int alice = staging.entityIdOf("alice");
+                int bob = staging.entityIdOf("bob");
+                staging.append(new io.excalibur.graph.staging.ExtractedTriple(
+                    "alice", "knows", "bob", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 42)));
+                staging.appendEntityText(alice, "withdrawn prose from document 42",
+                    from(SourceType.DOCUMENT, 42));
+                staging.appendEntityText(bob, "prose from a document nobody withdrew",
+                    from(SourceType.DOCUMENT, 77));
+                staging.flush();
+                writeStore(graphDir, staging);
+
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+                coordinator.submit(new ErasureScope.Source(SourceType.DOCUMENT, 42));
+                CompactionOutcome outcome = coordinator.compactNow(graphDir);
+
+                assertThat(outcome.requestsSatisfied()).isEqualTo(1);
+                List<String> text = new ArrayList<>();
+                staging.forEachEntityText((entityId, snippet) -> text.add(snippet));
+                assertThat(text).containsExactly("prose from a document nobody withdrew");
+            }
+        }
+
+        @Test
+        @DisplayName("a source erasure it cannot fully reach is not reported as satisfied")
+        void anUnreachableSourceErasureStaysOutstanding(@TempDir Path dir) throws IOException {
+            // A snippet whose origin was never recorded cannot be matched against a source scope,
+            // and must not be removed on suspicion either. What must not happen is the third
+            // option: reporting the request discharged with the prose still on disk and about to
+            // be re-indexed. A lie about an erasure is worse than an admitted gap.
+            Path graphDir = dir.resolve("graph");
+            try (io.excalibur.graph.staging.GraphStagingStore staging =
+                     io.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"));
+                 ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+
+                int alice = staging.entityIdOf("alice");
+                staging.append(new io.excalibur.graph.staging.ExtractedTriple(
+                    "alice", "knows", "bob", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 42)));
+                staging.appendEntityText(alice, "prose whose origin was never recorded");
+                staging.flush();
+                writeStore(graphDir, staging);
+
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+                coordinator.submit(new ErasureScope.Source(SourceType.DOCUMENT, 42));
+                CompactionOutcome outcome = coordinator.compactNow(graphDir);
+
+                assertThat(outcome.requestsSatisfied())
+                    .as("the snippet is still there, so the obligation is not discharged")
+                    .isZero();
+                assertThat(outcome.requestsWithheld()).isEqualTo(1);
+                assertThat(outcome.reason()).contains("origin");
+                assertThat(coordinator.outstandingCount())
+                    .as("and it stays outstanding so an operator has to resolve it")
+                    .isEqualTo(1);
+            }
+        }
+
+        @Test
+        @DisplayName("an entity erasure is satisfied even beside prose of unrecorded origin")
+        void entityScopedErasureIsStillSatisfied(@TempDir Path dir) throws IOException {
+            // An entity scope matches on the entity id, which every snippet carries, so an
+            // unrecorded origin does not stop it reaching anything.
+            Path graphDir = dir.resolve("graph");
+            try (io.excalibur.graph.staging.GraphStagingStore staging =
+                     io.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"));
+                 ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+
+                int alice = staging.entityIdOf("alice");
+                staging.append(new io.excalibur.graph.staging.ExtractedTriple(
+                    "alice", "knows", "bob", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 42)));
+                staging.appendEntityText(alice, "prose whose origin was never recorded");
+                staging.flush();
+                writeStore(graphDir, staging);
+
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+                coordinator.submit(new ErasureScope.Entity(alice));
+                CompactionOutcome outcome = coordinator.compactNow(graphDir);
+
+                assertThat(outcome.requestsSatisfied()).isEqualTo(1);
+                assertThat(outcome.requestsWithheld()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("an erased entity's name does not survive into the next build")
+        void anErasedNameIsNotRepublished(@TempDir Path dir) throws IOException {
+            // The name is a person's name, and it lived in entities.labels, which the erasure
+            // never touched. The next build read it straight back out and published it into the
+            // searchable label index, where the person who asked to be forgotten was findable by
+            // searching for themselves.
+            String personal = "Jane Doe (DOB 1972-04-03, NHS 4857392)";
+            Path graphDir = dir.resolve("graph");
+            Path stagingDir = dir.resolve("staging");
+            try (io.excalibur.graph.staging.GraphStagingStore staging =
+                     io.excalibur.graph.staging.GraphStagingStore.open(stagingDir);
+                 ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+
+                int jane = staging.entityIdOf(personal);
+                staging.append(new io.excalibur.graph.staging.ExtractedTriple(
+                    personal, "treatedAt", "St Mary's", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 42)));
+                staging.flush();
+                writeStore(graphDir, staging);
+
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+                coordinator.submit(new ErasureScope.Entity(jane));
+                coordinator.compactNow(graphDir);
+
+                assertThat(staging.entityLabels())
+                    .as("what the next build writes into the dictionary and the label index")
+                    .doesNotContain(personal);
+                assertThat(staging.entityLabels())
+                    .as("and the id space is unchanged, because no id may move")
+                    .hasSize(2);
+            }
+
+            assertThat(new String(Files.readAllBytes(
+                stagingDir.resolve(io.excalibur.graph.staging.GraphStagingStore.ENTITY_LABELS)),
+                java.nio.charset.StandardCharsets.UTF_8))
+                .as("gone from the bytes, not merely from the view of them")
+                .doesNotContain("Jane Doe");
+        }
+
+        private void writeStore(Path graphDir, io.excalibur.graph.staging.GraphStagingStore staging)
+                throws IOException {
+            EdgeStoreWriter writer = new EdgeStoreWriter();
+            staging.forEach((subject, relation, object, from, to, provenance) ->
+                writer.add(subject, relation, object, from, to, provenance));
+            writer.build(graphDir, staging.entityCount());
+        }
+    }
 }

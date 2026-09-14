@@ -220,6 +220,49 @@ public final class JsonText {
     }
 
     /**
+     * Extracts an array of objects, each as raw JSON text.
+     *
+     * <p>The elements are returned unparsed because what is in them belongs to whoever asked:
+     * one reader wants two fields of each, another wants five, and a shape fixed here would have
+     * to be widened for every caller. Each element is bounded by brace matching that knows about
+     * strings, so a brace inside a text value does not split the array in the wrong place.</p>
+     *
+     * @param json  The JSON document
+     * @param field The field name
+     * @return One raw object per element, empty for an empty array, or null when the field is
+     *         absent, is not an array, or is never closed
+     */
+    public static String[] objectArray(String json, String field) {
+        int start = valueStart(json, field);
+        if (start < 0 || json.charAt(start) != '[') {
+            return null;
+        }
+        int limit = endOfContainer(json, start);
+        if (limit < 0) {
+            return null;
+        }
+        List<String> items = new ArrayList<>();
+        int i = start + 1;
+        while (i < limit) {
+            char c = json.charAt(i);
+            if (c == ']') {
+                return items.toArray(new String[0]);
+            }
+            if (c == '{') {
+                int end = endOfContainer(json, i);
+                if (end < 0 || end > limit) {
+                    return null;
+                }
+                items.add(json.substring(i, end));
+                i = end;
+            } else {
+                i++;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Whether a field is present at all.
      *
      * <p>The typed accessors take a default, so an absent field and one the caller set to the
@@ -344,6 +387,12 @@ public final class JsonText {
      * <p>A field that is present but does not hold a number is rejected rather than
      * silently replaced by the default: a client that sends {@code "top_k": "ten"}
      * has made a mistake, and answering as though it had sent nothing hides it.</p>
+     *
+     * <p>The token has to run all the way to the end of the value, not merely start there.
+     * Reading the leading digits and stopping turns {@code "timeout_ms": 3e4} into 3 and
+     * {@code "top_k": 1.5} into 1 - a request answered with 200 against numbers the caller
+     * never sent. Exponent form is not exotic: Python and JavaScript both emit it for large
+     * float values, so this arrives from ordinary clients.</p>
      */
     private static String numericToken(String json, String field, boolean fractional) {
         int start = valueStart(json, field);
@@ -354,7 +403,7 @@ public final class JsonText {
         while (end < json.length() && isNumericChar(json.charAt(end), fractional)) {
             end++;
         }
-        if (end == start) {
+        if (end == start || !endsValue(json, end)) {
             throw new IllegalArgumentException("Field '" + field + "' must be a number");
         }
         return json.substring(start, end);
@@ -365,6 +414,21 @@ public final class JsonText {
             return true;
         }
         return fractional && (c == '.' || c == 'e' || c == 'E');
+    }
+
+    /**
+     * Whether a JSON value may legally end at the given index.
+     *
+     * @param json  The document
+     * @param index The index just past the token
+     * @return true if what follows closes the value rather than continuing it
+     */
+    private static boolean endsValue(String json, int index) {
+        if (index >= json.length()) {
+            return true;
+        }
+        char c = json.charAt(index);
+        return c == ',' || c == '}' || c == ']' || Character.isWhitespace(c);
     }
 
     /**

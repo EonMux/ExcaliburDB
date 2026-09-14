@@ -3,9 +3,12 @@ package excalibur.ingest.source;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -16,8 +19,13 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class FilesystemSourceTest {
+
+    /** Every file setUp puts in the root, by document id. */
+    private static final List<String> FILES_IN_ROOT = List.of(
+        "file1.txt", "file2.md", "subdir/file3.txt", "subdir/file4.json", "subdir/deep/file5.txt");
 
     @TempDir
     Path tempDir;
@@ -82,6 +90,26 @@ class FilesystemSourceTest {
                 "subdir/file4.json",
                 "subdir/deep/file5.txt"
             );
+        }
+    }
+
+
+    @Test
+    void crawl_closedMidWalk_abortsRatherThanEndingShort() throws SourceException {
+        // A short listing is indistinguishable from a source that lost its files: change
+        // detection subtracts what the crawl listed from what the registry holds and tombstones
+        // the difference, so a crawl that simply stopped early deletes the rest of the corpus.
+        try (Stream<String> ids = source.crawl()) {
+            java.util.Iterator<String> walk = ids.iterator();
+            assertThat(walk.hasNext()).isTrue();
+            walk.next();
+
+            source.close();
+
+            assertThatThrownBy(() -> walk.forEachRemaining(id -> { }))
+                .isInstanceOf(IncompleteCrawlException.class)
+                .hasMessageContaining("test-source")
+                .hasMessageContaining("not the full contents");
         }
     }
 
@@ -428,4 +456,121 @@ class FilesystemSourceTest {
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("traversal");
     }
+
+    @Test
+    void aLinkOutOfTheRootIsNotCrawledWhenLinksAreFollowed() throws IOException, SourceException {
+        linkOrSkip(testRoot.resolve("escape.txt"), fileOutsideTheRoot());
+
+        try (FilesystemSource following = followingLinks();
+             Stream<String> ids = following.crawl()) {
+
+            assertThat(ids.toList())
+                .as("a link is only a way to name a file, not a way to make it part of the source")
+                .contains("file1.txt")
+                .doesNotContain("escape.txt");
+        }
+    }
+
+    @Test
+    void aLinkToAnotherFileInsideTheRootIsCrawledWhenLinksAreFollowed() throws IOException, SourceException {
+        linkOrSkip(testRoot.resolve("alias.txt"), testRoot.resolve("file1.txt"));
+
+        try (FilesystemSource following = followingLinks()) {
+            try (Stream<String> ids = following.crawl()) {
+                assertThat(ids.toList()).contains("alias.txt", "file1.txt");
+            }
+
+            assertThat(following.fetch("alias.txt").getText()).isEqualTo("Content of file 1");
+        }
+    }
+
+    @Test
+    void fetchRefusesADocumentWhoseLinkLeavesTheRoot() throws IOException {
+        linkOrSkip(testRoot.resolve("escape.txt"), fileOutsideTheRoot());
+
+        try (FilesystemSource following = followingLinks()) {
+            assertThatThrownBy(() -> following.fetch("escape.txt"))
+                .isInstanceOf(SourceException.class)
+                .hasMessageContaining("escape.txt")
+                .hasMessageContaining("source root");
+        }
+    }
+
+    @Test
+    void theCountAndSizeWalksIgnoreALinkOutOfTheRoot() throws IOException, SourceException {
+        linkOrSkip(testRoot.resolve("escape.txt"), fileOutsideTheRoot());
+
+        try (FilesystemSource following = followingLinks()) {
+            assertThat(following.getDocumentCount()).isEqualTo(FILES_IN_ROOT.size());
+            assertThat(following.getEstimatedTotalSize()).isEqualTo(bytesInRoot());
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void aSymlinkCycleAbortsTheCrawlWithAClearError() throws IOException {
+        linkOrSkip(testRoot.resolve("loop"), testRoot);
+
+        try (FilesystemSource following = followingLinks()) {
+            assertThatThrownBy(() -> drain(following))
+                .as("an aborted crawl must name the source and say it is not a complete listing, "
+                    + "because a caller that took it for one would tombstone the whole corpus")
+                .isInstanceOf(UncheckedIOException.class)
+                .hasMessageContaining("following-source")
+                .hasMessageContaining("aborted");
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void neitherKindOfLinkChangesAnythingWhenLinksAreNotFollowed() throws IOException, SourceException {
+        linkOrSkip(testRoot.resolve("escape.txt"), fileOutsideTheRoot());
+        linkOrSkip(testRoot.resolve("loop"), testRoot);
+
+        try (Stream<String> ids = source.crawl()) {
+            assertThat(ids.toList()).containsExactlyInAnyOrderElementsOf(FILES_IN_ROOT);
+        }
+
+        assertThat(source.getDocumentCount()).isEqualTo(FILES_IN_ROOT.size());
+        assertThat(source.getEstimatedTotalSize()).isEqualTo(bytesInRoot());
+    }
+
+    private long bytesInRoot() throws IOException {
+        long total = 0;
+        for (String documentId : FILES_IN_ROOT) {
+            total += Files.size(testRoot.resolve(documentId));
+        }
+        return total;
+    }
+
+    private FilesystemSource followingLinks() {
+        return FilesystemSource.builder()
+            .sourceId("following-source")
+            .rootPath(testRoot)
+            .followSymlinks(true)
+            .build();
+    }
+
+    private Path fileOutsideTheRoot() throws IOException {
+        Path outside = tempDir.resolve("outside");
+        Files.createDirectories(outside);
+        Path secret = outside.resolve("secret.txt");
+        Files.writeString(secret, "Content that lives outside every allowed root");
+        return secret;
+    }
+
+    private static void drain(FilesystemSource source) throws SourceException {
+        try (Stream<String> ids = source.crawl()) {
+            ids.forEach(id -> { });
+        }
+    }
+
+    private static void linkOrSkip(Path link, Path target) throws IOException {
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException | FileSystemException e) {
+            assumeTrue(false, "this filesystem does not support symbolic links: " + e.getMessage());
+        }
+    }
+
 }

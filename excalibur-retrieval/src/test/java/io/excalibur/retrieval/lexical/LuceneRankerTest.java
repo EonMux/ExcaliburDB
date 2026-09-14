@@ -26,6 +26,40 @@ class LuceneRankerTest {
     }
 
     @Test
+    @DisplayName("the BM25 pair an operator sets reaches the Lucene-backed index too")
+    void honoursConfiguredBm25Parameters(@TempDir Path root) throws IOException {
+        // Two documents holding the term once each, one of them much longer. b is the only thing
+        // that can separate them, so switching it off has to make them score alike - otherwise
+        // the same setting would mean one thing for the engine's own index and nothing here.
+        String[] texts = {
+            "consensus protocol",
+            "consensus alpha beta gamma delta epsilon zeta eta theta iota kappa"
+        };
+
+        try (LexicalIndex normalised = LexicalIndex.open(root.resolve("normalised"), 16.0);
+             LexicalIndex flat = LexicalIndex.open(root.resolve("flat"), 16.0,
+                 new Bm25Parameters(1.2, 0.0))) {
+            for (int i = 0; i < texts.length; i++) {
+                normalised.put(i, texts[i]);
+                flat.put(i, texts[i]);
+            }
+            normalised.refresh();
+            flat.refresh();
+
+            RetrievalQuery query = RetrievalQuery.ofText("consensus");
+            RankedList withNormalisation = new LuceneRanker(normalised).rank(query, 10);
+            RankedList withoutNormalisation = new LuceneRanker(flat).rank(query, 10);
+
+            assertThat(withNormalisation.documents().get(0).score())
+                .as("at b=0.75 the shorter document scores higher")
+                .isGreaterThan(withNormalisation.documents().get(1).score());
+            assertThat(withoutNormalisation.documents().get(0).score())
+                .as("at b=0 length stops mattering")
+                .isEqualTo(withoutNormalisation.documents().get(1).score());
+        }
+    }
+
+    @Test
     @DisplayName("BM25 ranks the document that actually contains the terms first")
     void ranksByTermMatch(@TempDir Path dir) throws IOException {
         try (LexicalIndex index = indexOf(dir,

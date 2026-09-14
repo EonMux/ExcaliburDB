@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Locale;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -152,79 +153,11 @@ public class ResultAggregator {
 
         // Phase 1: Collect all results, normalize scores, and deduplicate
         // Keep the best (highest normalized score) for each document
-        Map<String, QueryResultItem> bestResultsByDocId = new HashMap<>();
-
-        for (SegmentQueryTask.SegmentQueryResult segmentResult : segmentResults) {
-            if (!segmentResult.success()) {
-                LOGGER.debug("Skipping failed segment {} results", segmentResult.segmentId());
-                continue;
-            }
-
-            for (HnswSearchResult hnswResult : segmentResult.results()) {
-                // Drop non-finite distances at the source: they cannot be ranked and would
-                // otherwise abort the whole aggregation when QueryResultItem validates them.
-                if (!Float.isFinite(hnswResult.distance())) {
-                    LOGGER.debug("Skipping result with non-finite distance {}: nodeId={}, documentId={}",
-                        hnswResult.distance(), hnswResult.nodeId(), hnswResult.documentId());
-                    continue;
-                }
-
-                // distance() is an ordered dissimilarity (smaller is closer) for every metric,
-                // so it must be converted back to the metric's natural scale before normalizing.
-                float normalizedScore = DistanceValidator.validateClampAndNormalizeOrderedDistance(
-                    hnswResult.distance(), distanceFunction);
-
-                // Skip items with NaN scores - they cannot be properly ranked
-                if (Float.isNaN(normalizedScore)) {
-                    LOGGER.debug("Skipping result with NaN score: nodeId={}, documentId={}",
-                        hnswResult.nodeId(), hnswResult.documentId());
-                    continue;
-                }
-
-                // Apply threshold filter on normalized score (lower = worse, so filter out)
-                if (threshold > 0 && normalizedScore < threshold) {
-                    continue;
-                }
-
-                String documentIdStr = hnswResult.documentId();
-                long nodeId = hnswResult.nodeId();
-
-                // Create result item with normalized score. A tail-scan hit carries the
-                // chunk text the scan already read; a graph hit has none here and is
-                // resolved from storage later, once selection has narrowed the set.
-                QueryResultItem item = new QueryResultItem(
-                    nodeId,
-                    documentIdStr,
-                    normalizedScore,
-                    segmentResult.payload(nodeId),
-                    segmentResult.segmentId(),
-                    nodeId,
-                    hnswResult.generation()
-                );
-
-                // Keep the best (highest normalized score) result for each document
-                String dedupeKey = dedupeKey(documentIdStr, segmentResult.segmentId(), nodeId);
-                bestResultsByDocId.merge(dedupeKey, item, (existing, newItem) ->
-                    newItem.score() > existing.score() ? newItem : existing
-                );
-            }
-        }
+        Map<String, QueryResultItem> bestResultsByDocId =
+            bestPerDocument(segmentResults, distanceFunction);
 
         // Phase 2: Select top-k results using a min-heap
-        // Min-heap: keep smallest at top so we can remove the worst
-        PriorityQueue<QueryResultItem> topResults = new PriorityQueue<>(
-            heapCapacity(topK),
-            Comparator.comparingDouble(QueryResultItem::score)
-        );
-
-        for (QueryResultItem item : bestResultsByDocId.values()) {
-            if (topResults.size() < topK) {
-                topResults.add(item);
-            } else if (item.score() > topResults.peek().score()) {
-                topResults.poll();
-                topResults.add(item);
-            }
-        }
+        PriorityQueue<QueryResultItem> topResults = selectTopK(bestResultsByDocId.values());
 
         // Phase 3: Convert heap to sorted list (highest score first)
         List<QueryResultItem> results = new ArrayList<>(topResults);
@@ -234,6 +167,134 @@ public class ResultAggregator {
             results.size(), segmentResults.size(), bestResultsByDocId.size());
 
         return results;
+    }
+
+    /**
+     * Keeps one result per document, the best-scoring one wherever several segments hold it.
+     *
+     * <p>A failed segment contributes nothing at all. Its result carries whatever its task had
+     * recorded before it failed, and ranking a partial read alongside complete ones would put
+     * an arbitrary subset of a segment's documents into the answer.</p>
+     *
+     * @param segmentResults Results from each segment
+     * @param distanceFunction The distance function used, for normalization
+     * @return The best result for each document, keyed as {@link #dedupeKey} describes
+     */
+    private Map<String, QueryResultItem> bestPerDocument(
+            List<SegmentQueryTask.SegmentQueryResult> segmentResults,
+            DistanceFunction distanceFunction) {
+
+        Map<String, QueryResultItem> bestResultsByDocId = new HashMap<>();
+
+        for (SegmentQueryTask.SegmentQueryResult segmentResult : segmentResults) {
+            if (!segmentResult.success()) {
+                LOGGER.debug("Skipping failed segment {} results", segmentResult.segmentId());
+                continue;
+            }
+
+            for (HnswSearchResult hnswResult : segmentResult.results()) {
+                QueryResultItem item = rankable(segmentResult, hnswResult, distanceFunction);
+                if (item == null) {
+                    continue;
+                }
+
+                // Keep the best (highest normalized score) result for each document
+                String dedupeKey = dedupeKey(hnswResult.documentId(), segmentResult.segmentId(),
+                    hnswResult.nodeId());
+                bestResultsByDocId.merge(dedupeKey, item, (existing, newItem) ->
+                    newItem.score() > existing.score() ? newItem : existing
+                );
+            }
+        }
+
+        return bestResultsByDocId;
+    }
+
+    /**
+     * Puts one segment hit onto the common score scale, or drops it.
+     *
+     * <p>Every rejection here is a hit that cannot be compared with the others rather than one
+     * that compares badly: a distance that is not a number, a score that is not a number, or a
+     * score the caller's threshold excludes. Letting the first two through would abort the
+     * whole aggregation when {@link QueryResultItem} validates them, losing every other
+     * segment's answer along with the bad hit.</p>
+     *
+     * @param segmentResult The segment the hit came from, which also carries its chunk text
+     * @param hnswResult The hit as the segment reported it
+     * @param distanceFunction The distance function used, for normalization
+     * @return The hit on the common [0.0, 1.0] scale, or null when it cannot be ranked
+     */
+    private QueryResultItem rankable(SegmentQueryTask.SegmentQueryResult segmentResult,
+                                     HnswSearchResult hnswResult,
+                                     DistanceFunction distanceFunction) {
+        // Drop non-finite distances at the source: they cannot be ranked and would
+        // otherwise abort the whole aggregation when QueryResultItem validates them.
+        if (!Float.isFinite(hnswResult.distance())) {
+            LOGGER.debug("Skipping result with non-finite distance {}: nodeId={}, documentId={}",
+                hnswResult.distance(), hnswResult.nodeId(), hnswResult.documentId());
+            return null;
+        }
+
+        // distance() is an ordered dissimilarity (smaller is closer) for every metric,
+        // so it must be converted back to the metric's natural scale before normalizing.
+        float normalizedScore = DistanceValidator.validateClampAndNormalizeOrderedDistance(
+            hnswResult.distance(), distanceFunction);
+
+        // Skip items with NaN scores - they cannot be properly ranked
+        if (Float.isNaN(normalizedScore)) {
+            LOGGER.debug("Skipping result with NaN score: nodeId={}, documentId={}",
+                hnswResult.nodeId(), hnswResult.documentId());
+            return null;
+        }
+
+        // Apply threshold filter on normalized score (lower = worse, so filter out)
+        if (threshold > 0 && normalizedScore < threshold) {
+            return null;
+        }
+
+        String documentIdStr = hnswResult.documentId();
+        long nodeId = hnswResult.nodeId();
+
+        // Create result item with normalized score. A tail-scan hit carries the
+        // chunk text the scan already read; a graph hit has none here and is
+        // resolved from storage later, once selection has narrowed the set.
+        return new QueryResultItem(
+            nodeId,
+            documentIdStr,
+            normalizedScore,
+            segmentResult.payload(nodeId),
+            segmentResult.segmentId(),
+            nodeId,
+            hnswResult.generation()
+        );
+    }
+
+    /**
+     * Keeps the {@code topK} highest-scoring items, in a heap ordered worst-first.
+     *
+     * <p>A min-heap rather than a full sort: the deduplicated set is as large as every segment's
+     * oversampled answer put together, and only its best {@code topK} can reach the caller.</p>
+     *
+     * @param items The deduplicated results, in no particular order
+     * @return A heap holding at most {@code topK} items, the worst of them at its head
+     */
+    private PriorityQueue<QueryResultItem> selectTopK(Collection<QueryResultItem> items) {
+        // Min-heap: keep smallest at top so we can remove the worst
+        PriorityQueue<QueryResultItem> topResults = new PriorityQueue<>(
+            heapCapacity(topK),
+            Comparator.comparingDouble(QueryResultItem::score)
+        );
+
+        for (QueryResultItem item : items) {
+            if (topResults.size() < topK) {
+                topResults.add(item);
+            } else if (item.score() > topResults.peek().score()) {
+                topResults.poll();
+                topResults.add(item);
+            }
+        }
+
+        return topResults;
     }
 
     /**

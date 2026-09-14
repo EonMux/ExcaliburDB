@@ -183,9 +183,6 @@ public class Segment implements AutoCloseable {
     /** Size of each slot in the hash table (bytes). */
     private static final int SLOT_SIZE = 24;
 
-    /** The value a delete record carries, which is none. */
-    private static final byte[] EMPTY_VALUE = new byte[0];
-
     /** Size of entry header (key_hash + key_len + value_len + distance). */
     private static final int ENTRY_HEADER_SIZE = 17; // 8 + 4 + 4 + 1
 
@@ -753,13 +750,14 @@ public class Segment implements AutoCloseable {
      *       readable now and gone after a crash.</li>
      * </ol>
      *
-     * <p>Appending first satisfies the second and breaks the first: whether a Robin Hood
-     * insertion is admissible is discovered by attempting the placement, so the segment cannot
-     * say in advance that it will accept. Mutating first satisfies the first and breaks the
-     * second, which is what this used to do. The way to have both is to ask the log whether it
-     * could take the record before touching the segment, and append after: the reservation is
-     * the only part of an append that refuses a well-formed entry, so once it has passed the
-     * append cannot leave the segment holding a change the log has no record of.</p>
+     * <p>Which order gives both depends on which of the two can still refuse. An overwrite
+     * cannot: once the load factor and the data region have been checked there is nothing left
+     * to discover, so the record goes into the log first and the segment follows a step that
+     * cannot fail. An insertion can: whether a Robin Hood placement is admissible is
+     * discovered only by attempting it, so the placement goes first - and because the log can
+     * still fail at its fsync, the placement records what it changed so that it can be taken
+     * back. Taking the placement back is what makes mutating first safe, and it is possible
+     * only because a displacement moves slot metadata and copies no entry data.</p>
      *
      * <p>The load-factor guard is evaluated only for a genuine insert, because an overwrite
      * consumes no new slot and a segment at the boundary would otherwise reject updates it can
@@ -774,29 +772,91 @@ public class Segment implements AutoCloseable {
         long keyHash = computeHash(key);
         int existingSlot = findSlot(keyHash, key);
 
-        if (existingSlot < 0) {
-            if (isFull()) {
-                double loadFactor = (double) (entryCount + 1) / slotCount;
-                throw new SegmentCapacityExceededException(
-                    SegmentCapacityExceededException.Reason.LOAD_FACTOR,
-                    "Load factor " + loadFactor + " would reach or exceed threshold " + loadFactorThreshold);
-            }
-            requireDataSpace(ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE);
-        }
-
-        reserveLogSpace(LogEntry.OPCODE_PUT, key, value);
-
         if (existingSlot >= 0) {
-            updateEntry(existingSlot, key, value);
+            overwrite(existingSlot, key, value);
         } else {
-            insertEntry(keyHash, key, value);
+            insert(keyHash, key, value);
         }
+    }
 
-        // Before the append, not after: the bytes have already changed, so a slice handed out
-        // earlier is stale whether or not the record that follows reaches the log.
-        modificationEpoch++;
+    /**
+     * Replaces the value of an entry that is already present, logging the record first.
+     *
+     * <p>The data region check is hoisted out of {@link #updateEntry} deliberately: it is the
+     * only way an overwrite can still be refused, and it has to be answered before the record
+     * reaches the log so that a tail scan never reads a write the segment went on to reject.
+     * With it answered here, everything after the append is a write that cannot fail.</p>
+     *
+     * @param slotIndex The slot holding the entry
+     * @param key       The key (already validated)
+     * @param value     The replacement value (already validated)
+     */
+    private void overwrite(int slotIndex, byte[] key, byte[] value) {
+        requireDataSpace(overwriteDataSpaceNeeded(slotIndex, key, value));
 
         appendPutToLog(key, value);
+
+        // Before the bytes change, so that a slice handed out earlier is already stale by the
+        // time it could be read against the new contents.
+        modificationEpoch++;
+        updateEntry(slotIndex, key, value);
+    }
+
+    /**
+     * Adds an entry that is not present, logging the record once the placement has succeeded.
+     *
+     * @param keyHash The key's hash
+     * @param key     The key (already validated)
+     * @param value   The value (already validated)
+     */
+    private void insert(long keyHash, byte[] key, byte[] value) {
+        if (isFull()) {
+            double loadFactor = (double) (entryCount + 1) / slotCount;
+            throw new SegmentCapacityExceededException(
+                SegmentCapacityExceededException.Reason.LOAD_FACTOR,
+                "Load factor " + loadFactor + " would reach or exceed threshold " + loadFactorThreshold);
+        }
+        requireDataSpace(ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE);
+        reserveLogSpace(LogEntry.OPCODE_PUT, key, value);
+
+        RobinHoodPlacement placement = insertEntry(keyHash, key, value);
+        modificationEpoch++;
+
+        try {
+            appendPutToLog(key, value);
+        } catch (RuntimeException e) {
+            try {
+                undoInsert(placement);
+            } catch (RuntimeException undoFailure) {
+                // The caller needs to be told why the write failed, not why the tidying up
+                // afterwards did, but a segment left half-undone is the more serious of the
+                // two and must not disappear.
+                e.addSuppressed(undoFailure);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Returns the data region bytes an overwrite of this slot would consume.
+     *
+     * <p>A replacement value that is no longer than the one it replaces is written over the
+     * existing record and consumes nothing; a longer one is appended and the slot repointed at
+     * it, which is the only case the data region has to be able to take.</p>
+     *
+     * @param slotIndex The slot holding the entry
+     * @param key       The key
+     * @param value     The replacement value
+     * @return Bytes the overwrite needs in the data region, zero if it fits in place
+     */
+    private int overwriteDataSpaceNeeded(int slotIndex, byte[] key, byte[] value) {
+        long entryOffset = slotTableSize + readDataOffset(slotIndex);
+        int existingKeyLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_KEY_LEN_OFFSET);
+        int existingValueLen = segment.get(INT_LAYOUT, entryOffset + ENTRY_VALUE_LEN_OFFSET);
+        int existingSize = ENTRY_HEADER_SIZE + existingKeyLen + existingValueLen + ENTRY_TRAILER_SIZE;
+        int newSize = ENTRY_HEADER_SIZE + key.length + value.length + ENTRY_TRAILER_SIZE;
+
+        return newSize <= existingSize ? 0 : newSize;
     }
 
     /**
@@ -816,14 +876,12 @@ public class Segment implements AutoCloseable {
     }
 
     /**
-     * Appends a PUT record to the attached write-ahead log, if any.
+     * Asks the attached log whether it could record an insertion, before the segment makes it.
      *
-     * @param key   The key
-     * @param value The value
-     * @throws IllegalStateException if the log append fails
-     */
-    /**
-     * Asks the attached log whether it could record this mutation, before the segment makes it.
+     * <p>An insertion is the one mutation that runs before its record is logged, so this is
+     * what keeps a placement from being made and then taken back again over something as
+     * ordinary as a full log. What it cannot rule out is the device refusing the record at the
+     * fsync, which is why the placement is undoable as well.</p>
      *
      * <p>A segment with no log has already been warned about by {@link #warnUnlogged()} on the
      * append that follows, so this stays silent rather than warning twice per write.</p>
@@ -845,6 +903,13 @@ public class Segment implements AutoCloseable {
         }
     }
 
+    /**
+     * Appends a PUT record to the attached write-ahead log, if any.
+     *
+     * @param key   The key
+     * @param value The value
+     * @throws IllegalStateException if the log append fails
+     */
     private void appendPutToLog(byte[] key, byte[] value) {
         WriteLog log = this.writeLog;
         if (log == null) {
@@ -1142,17 +1207,16 @@ public class Segment implements AutoCloseable {
                 return false;
             }
 
-            // Both refusals are already behind us, so the log is asked before the segment is
-            // touched: a delete the log cannot record must not take effect here, or a reader is
-            // told the key is gone and a restart brings it back.
-            reserveLogSpace(LogEntry.OPCODE_DELETE, key, EMPTY_VALUE);
-
-            markAsTombstoned(slotIndex);
+            // Both refusals are already behind us and tombstoning cannot fail, so the record
+            // is logged first and the segment follows. Tombstoning first would mean a delete
+            // whose record the device refused had already taken effect: the caller is told the
+            // delete failed, a reader no longer finds the key, and a restart brings it back.
+            appendDeleteToLog(key);
 
             // Increment modification epoch to invalidate existing zero-copy slices
             modificationEpoch++;
 
-            appendDeleteToLog(key);
+            markAsTombstoned(slotIndex);
 
             // Note: entryCount is NOT decremented for tombstones - the slot stays
             // occupied until compaction. liveEntryCount is decremented instead.
@@ -1645,15 +1709,13 @@ public class Segment implements AutoCloseable {
             return false;
         }
 
-        // The log is asked before the segment is touched, for the reason delete() gives.
-        reserveLogSpace(LogEntry.OPCODE_DELETE, key, EMPTY_VALUE);
-
-        markAsTombstoned(slotIndex);
+        // The record is logged before the segment changes, for the reason delete() gives.
+        appendDeleteToLog(key);
 
         // Increment modification epoch to invalidate existing zero-copy slices
         modificationEpoch++;
 
-        appendDeleteToLog(key);
+        markAsTombstoned(slotIndex);
 
         return true;
     }
@@ -1721,8 +1783,10 @@ public class Segment implements AutoCloseable {
      * @param keyHash The 64-bit hash of the key
      * @param key The key bytes
      * @param value The value bytes
+     * @return What the placement changed, so that it can be taken back if the write-ahead log
+     *         then refuses the record for this entry
      */
-    private void insertEntry(long keyHash, byte[] key, byte[] value) {
+    private RobinHoodPlacement insertEntry(long keyHash, byte[] key, byte[] value) {
         // The incoming entry's record is appended to the data region exactly once.
         // A Robin Hood displacement then moves only slot metadata: the displaced
         // entry keeps the data-region record it already owns, so a probe chain of
@@ -1756,7 +1820,7 @@ public class Segment implements AutoCloseable {
                 writeSlotMetadata(slotIndex, carriedHash, distance, carriedFlags, carriedRecordOffset);
                 entryCount++;
                 liveEntryCount++;
-                return;
+                return new RobinHoodPlacement(slotIndex, newRecordOffset, displaced);
             }
 
             // Robin Hood swap condition: the occupant travelled less far than we have
@@ -1825,6 +1889,22 @@ public class Segment implements AutoCloseable {
         }
         // Nothing references the record we appended, so the space is reclaimed.
         dataOffset = recordOffset;
+    }
+
+    /**
+     * Takes back an insertion that completed but whose log record the device then refused.
+     *
+     * <p>The landing slot is cleared before the victims are restored. It cannot be one of
+     * them - see {@link RobinHoodPlacement} - but clearing it first means that if it ever
+     * were, the victim's own contents would be what survived, which is the safe way round.</p>
+     *
+     * @param placement What the insertion changed
+     */
+    private void undoInsert(RobinHoodPlacement placement) {
+        clearSlot(placement.landingSlot());
+        rollbackInsert(placement.displaced(), placement.recordOffset());
+        entryCount--;
+        liveEntryCount--;
     }
 
     /**
@@ -2218,12 +2298,23 @@ public class Segment implements AutoCloseable {
      */
     private void clearSlotTable() {
         for (int i = 0; i < slotCount; i++) {
-            long slotOffset = (long) i * SLOT_SIZE;
-            segment.set(LONG_LAYOUT, slotOffset + SLOT_KEY_HASH_OFFSET, 0L);
-            segment.set(BYTE_LAYOUT, slotOffset + SLOT_DISTANCE_OFFSET, (byte) 0);
-            segment.set(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET, (byte) 0);
-            // Data offset can remain uninitialized
+            clearSlot(i);
         }
+    }
+
+    /**
+     * Returns a slot to the state a never-used slot is in.
+     *
+     * <p>Clearing the occupied bit is what makes a probe stop here, so the data offset can be
+     * left as it is: nothing reads it while the slot is unoccupied.</p>
+     *
+     * @param slotIndex The slot to clear
+     */
+    private void clearSlot(int slotIndex) {
+        long slotOffset = (long) slotIndex * SLOT_SIZE;
+        segment.set(LONG_LAYOUT, slotOffset + SLOT_KEY_HASH_OFFSET, 0L);
+        segment.set(BYTE_LAYOUT, slotOffset + SLOT_DISTANCE_OFFSET, (byte) 0);
+        segment.set(BYTE_LAYOUT, slotOffset + SLOT_FLAGS_OFFSET, (byte) 0);
     }
 
     // ==================== Utility Methods ====================
@@ -2869,6 +2960,13 @@ public class Segment implements AutoCloseable {
      * the in-memory hash map. It should be called during initialization
      * before any concurrent operations are allowed.</p>
      *
+     * <p>Opening the log has already established that every record up to its head reads
+     * cleanly, so a record that will not read during the replay means the log changed while it
+     * was being read. Whatever the cause, the segment then holds some prefix of the state its
+     * log describes and there is no way to tell which - so this fails rather than returning,
+     * and the engine treats that as a reason not to start.</p>
+     *
+     * @throws CorruptLogException if the log could not be replayed in full
      * @throws IOException if reading the log fails
      * @throws IllegalStateException if no write log is attached or segment is closed
      */
@@ -2881,7 +2979,7 @@ public class Segment implements AutoCloseable {
         lock.writeLock().lock();
         try {
             // Replay all entries from the log
-            writeLog.recover(entry -> {
+            boolean complete = writeLog.recover(entry -> {
                 byte[] key = entry.key();
                 byte[] value = entry.value();
 
@@ -2893,6 +2991,14 @@ public class Segment implements AutoCloseable {
                     deleteInternal(key);
                 }
             });
+
+            if (!complete) {
+                throw new CorruptLogException(writeLog.path(), writeLog.firstCorruptOffset(),
+                    "Write-ahead log " + writeLog.path() + " could not be replayed in full for "
+                    + "segment " + path + ": " + writeLog.corruptEntriesFound() + " record(s) "
+                    + "were unreadable, the first at offset " + writeLog.firstCorruptOffset()
+                    + ". The segment's committed state cannot be reconstructed.");
+            }
         } finally {
             lock.writeLock().unlock();
         }
@@ -3321,21 +3427,6 @@ public class Segment implements AutoCloseable {
             this.modificationEpoch = modificationEpoch;
         }
     }
-
-    /**
-     * Slot metadata captured before a Robin Hood displacement overwrites it.
-     *
-     * <p>The displaced entry keeps its data region record, so restoring the slot
-     * restores the entry completely.</p>
-     *
-     * @param slotIndex        The slot that was overwritten
-     * @param keyHash          The displaced entry's key hash
-     * @param distance         The displaced entry's distance from its ideal slot
-     * @param flags            The displaced entry's slot flags (including tombstone)
-     * @param dataRegionOffset Offset of the displaced entry's record in the data region
-     */
-    private record SlotSnapshot(int slotIndex, long keyHash, int distance,
-                                byte flags, long dataRegionOffset) {}
 
     /**
      * Snapshot of segment state for copy-on-write splitting.

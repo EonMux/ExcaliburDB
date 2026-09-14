@@ -158,7 +158,7 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
      *
      * <p><strong>Atomicity:</strong> This operation atomically makes the document
      * visible at the specified epoch. Queries with epoch >= visibleEpoch will see
-     * the document; queries with epoch < visibleEpoch will not.</p>
+     * the document; queries with epoch &lt; visibleEpoch will not.</p>
      *
      * @param documentId The document ID (must not be null)
      * @param chunkIds The set of chunk IDs belonging to this document (must not be null)
@@ -213,7 +213,7 @@ public final class DocumentVisibilityRegistry implements DocumentVisibilityCheck
      * <p>A document is visible at epoch E if:</p>
      * <ul>
      *   <li>The document is registered in this registry</li>
-     *   <li>The document's visibleEpoch <= E</li>
+     *   <li>The document's visibleEpoch &lt;= E</li>
      * </ul>
      *
      * <p><strong>Atomicity guarantee:</strong> If this method returns true, the query

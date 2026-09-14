@@ -43,6 +43,7 @@ public final class LexicalQueryService {
 
     private final ChunkIndex chunks;
     private final HybridRetriever retriever;
+    private final int rrfK;
 
     /**
      * Creates the service.
@@ -53,7 +54,25 @@ public final class LexicalQueryService {
      */
     public LexicalQueryService(ChunkIndex chunks, QueryExpander expander,
                                List<Ranker> extra) {
+        this(chunks, expander, extra, ReciprocalRankFusion.DEFAULT_K,
+            HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH);
+    }
+
+    /**
+     * Creates the service with the fusion settings this node is configured for.
+     *
+     * @param chunks             The lexical index over ingested chunks
+     * @param expander           Query expander, or null for plain BM25
+     * @param extra              Additional signals to fuse (vector, graph), possibly empty
+     * @param rrfK               Reciprocal rank fusion's rank offset,
+     *                           {@code excalibur.query.rrf-k}
+     * @param perSignalOverFetch How many times the limit each signal contributes,
+     *                           {@code excalibur.query.per-signal-over-fetch}
+     */
+    public LexicalQueryService(ChunkIndex chunks, QueryExpander expander,
+                               List<Ranker> extra, int rrfK, int perSignalOverFetch) {
         this.chunks = Objects.requireNonNull(chunks, "chunks must not be null");
+        this.rrfK = rrfK;
         List<Ranker> rankers = new ArrayList<>();
         // The index supplies its own signal: the two engines search differently enough that
         // asking either to expose the other's query type would mean writing a translation layer
@@ -64,10 +83,24 @@ public final class LexicalQueryService {
         }
         // Reciprocal rank fusion: signals score on scales that are not comparable, so their
         // ranks are fused rather than their scores.
-        this.retriever = new HybridRetriever(rankers, new ReciprocalRankFusion(),
-            HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH);
-        LOGGER.info("Lexical query service ready with {} signal(s) over the {} engine",
-            rankers.size(), chunks.engine());
+        this.retriever = new HybridRetriever(rankers, new ReciprocalRankFusion(rrfK),
+            perSignalOverFetch);
+        LOGGER.info("Lexical query service ready with {} signal(s) over the {} engine "
+            + "(rrf k={}, per-signal over-fetch={})",
+            rankers.size(), chunks.engine(), rrfK, perSignalOverFetch);
+    }
+
+    /**
+     * Reciprocal rank fusion's rank offset, as this node is configured.
+     *
+     * <p>Read back so that the two-signal fusion on the query route uses the same offset as
+     * the fusion inside this service; two different offsets would rank the same pair of
+     * signals two different ways depending on which path answered.</p>
+     *
+     * @return the configured offset
+     */
+    public int rrfK() {
+        return rrfK;
     }
 
     /**

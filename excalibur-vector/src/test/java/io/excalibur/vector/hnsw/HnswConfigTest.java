@@ -1,6 +1,10 @@
 package io.excalibur.vector.hnsw;
 
+import io.excalibur.config.Config;
 import org.junit.jupiter.api.Test;
+
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -137,5 +141,41 @@ class HnswConfigTest {
         assertThat(str).contains("dimension=128");
         assertThat(str).contains("maxConnections=");
         assertThat(str).contains("efConstruction=");
+    }
+
+    @Test
+    void shouldReadConnectivityFromShardConfig() {
+        Map<String, String> props = new HashMap<>();
+        props.put("excalibur.shard.default-max-connections", "32");
+        props.put("excalibur.shard.default-max-connections-layer0", "96");
+
+        Config config = new Config("test", Map.of(), props);
+        HnswConfig hnsw = HnswConfig.fromShardConfig(256, config.shard());
+
+        assertThat(hnsw.maxConnections()).isEqualTo(32);
+        assertThat(hnsw.maxConnectionsLayer0()).isEqualTo(96);
+        assertThat(hnsw.mL()).isEqualTo(HnswConfig.mLFor(32));
+    }
+
+    @Test
+    void shouldUseShardDefaultsForConnectivityWhenUnset() {
+        Config config = new Config("test", Map.of(), new HashMap<>());
+        HnswConfig hnsw = HnswConfig.fromShardConfig(256, config.shard());
+
+        assertThat(hnsw.maxConnections()).isEqualTo(Config.Shard.DEFAULT_MAX_CONNECTIONS);
+        assertThat(hnsw.maxConnectionsLayer0())
+            .isEqualTo(2 * Config.Shard.DEFAULT_MAX_CONNECTIONS);
+    }
+
+    @Test
+    void shouldDeriveMlFromMaxConnections() {
+        assertThat(HnswConfig.mLFor(HnswConfig.DEFAULT_MAX_CONNECTIONS))
+            .isEqualTo(HnswConfig.DEFAULT_ML);
+        assertThat(HnswConfig.mLFor(32)).isEqualTo(1.0 / Math.log(32));
+
+        // At M=2 the reciprocal logarithm exceeds the (0, 1] range mL is defined over,
+        // so the smallest permitted M still has to yield a usable factor.
+        assertThat(HnswConfig.mLFor(HnswConfig.MIN_CONNECTIONS)).isEqualTo(1.0);
+        assertThat(new HnswConfig(2, 4, 64, 64, HnswConfig.mLFor(2), 8).mL()).isEqualTo(1.0);
     }
 }

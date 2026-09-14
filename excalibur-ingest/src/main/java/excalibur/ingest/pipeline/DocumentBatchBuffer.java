@@ -278,7 +278,7 @@ public final class DocumentBatchBuffer {
     /**
      * Returns the offset range for all chunks in this buffer.
      *
-     * <p>Domain constraint: startOffset <= endOffset, both non-negative if chunks exist.</p>
+     * <p>Domain constraint: {@code startOffset <= endOffset}, both non-negative if chunks exist.</p>
      *
      * @return Array of [startOffset, endOffset], or null if no chunks
      */

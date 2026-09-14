@@ -81,6 +81,7 @@ class ConfiguredLoadFactorInheritanceTest {
             CompactionWorker worker = new CompactionWorker(arena, (oldSegment, newSegment) -> {
                 replacement.set(newSegment);
                 swapped.countDown();
+                return CompactionOutcome.INSTALLED;
             });
 
             worker.requestCompaction(segment);

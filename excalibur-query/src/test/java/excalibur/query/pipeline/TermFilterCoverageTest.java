@@ -38,9 +38,9 @@ class TermFilterCoverageTest {
         // The restart case. Every segment must survive, or the node answers nothing at all.
         HierarchicalCuckooFilter empty = new HierarchicalCuckooFilter(10_000L, 13, 1_000, 100);
 
-        assertThat(QueryPipeline.filterCovers(empty, 0L)).isFalse();
-        assertThat(QueryPipeline.survivesTermFilter(empty, 0L, Set.of())).isTrue();
-        assertThat(QueryPipeline.survivesTermFilter(empty, 7L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.filterCovers(empty, 0L)).isFalse();
+        assertThat(TermFilterCascade.survivesTermFilter(empty, 0L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.survivesTermFilter(empty, 7L, Set.of())).isTrue();
     }
 
     @Test
@@ -49,8 +49,8 @@ class TermFilterCoverageTest {
         // Registration allocates the per-segment filter; it says nothing about the terms in it.
         HierarchicalCuckooFilter filter = filterWith(0L);
 
-        assertThat(QueryPipeline.filterCovers(filter, 0L)).isFalse();
-        assertThat(QueryPipeline.survivesTermFilter(filter, 0L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.filterCovers(filter, 0L)).isFalse();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 0L, Set.of())).isTrue();
     }
 
     @Test
@@ -60,8 +60,8 @@ class TermFilterCoverageTest {
         // are the query's.
         HierarchicalCuckooFilter filter = filterWith(0L, "invoice", "quarterly");
 
-        assertThat(QueryPipeline.filterCovers(filter, 0L)).isTrue();
-        assertThat(QueryPipeline.survivesTermFilter(filter, 0L, Set.of())).isFalse();
+        assertThat(TermFilterCascade.filterCovers(filter, 0L)).isTrue();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 0L, Set.of())).isFalse();
     }
 
     @Test
@@ -69,7 +69,7 @@ class TermFilterCoverageTest {
     void populatedSegmentIsKeptOnAHit() {
         HierarchicalCuckooFilter filter = filterWith(0L, "invoice");
 
-        assertThat(QueryPipeline.survivesTermFilter(filter, 0L, Set.of("0"))).isTrue();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 0L, Set.of("0"))).isTrue();
     }
 
     @Test
@@ -79,9 +79,9 @@ class TermFilterCoverageTest {
         // recovered ones must not disappear because a newer one happens to be in the filter.
         HierarchicalCuckooFilter filter = filterWith(0L, "invoice");
 
-        assertThat(QueryPipeline.survivesTermFilter(filter, 0L, Set.of())).isFalse();
-        assertThat(QueryPipeline.survivesTermFilter(filter, 1L, Set.of())).isTrue();
-        assertThat(QueryPipeline.survivesTermFilter(filter, 99L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 0L, Set.of())).isFalse();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 1L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 99L, Set.of())).isTrue();
     }
 
     @Test
@@ -100,8 +100,8 @@ class TermFilterCoverageTest {
         assertThat(refused).as("the segment filter has to fill for this test to mean anything")
             .isTrue();
 
-        assertThat(QueryPipeline.filterCovers(filter, 0L)).isFalse();
-        assertThat(QueryPipeline.survivesTermFilter(filter, 0L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.filterCovers(filter, 0L)).isFalse();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 0L, Set.of())).isTrue();
     }
 
     @Test
@@ -120,14 +120,14 @@ class TermFilterCoverageTest {
         assertThat(refused).as("the corpus filter has to fill for this test to mean anything")
             .isTrue();
 
-        assertThat(QueryPipeline.survivesTermFilter(filter, 0L, Set.of())).isTrue();
-        assertThat(QueryPipeline.survivesTermFilter(filter, 1L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 0L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.survivesTermFilter(filter, 1L, Set.of())).isTrue();
     }
 
     @Test
     @DisplayName("no filter at all excludes nothing")
     void nullFilterHasNoVerdict() {
-        assertThat(QueryPipeline.filterCovers(null, 0L)).isFalse();
-        assertThat(QueryPipeline.survivesTermFilter(null, 0L, Set.of())).isTrue();
+        assertThat(TermFilterCascade.filterCovers(null, 0L)).isFalse();
+        assertThat(TermFilterCascade.survivesTermFilter(null, 0L, Set.of())).isTrue();
     }
 }

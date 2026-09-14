@@ -6,7 +6,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -102,10 +103,16 @@ public class HnswCompactionWorker {
     // ==================== Instance Fields ====================
 
     /**
-     * List of graphs registered for compaction monitoring.
-     * Uses CopyOnWriteArrayList for thread-safe iteration during registration/unregistration.
+     * Graphs registered for compaction monitoring.
+     *
+     * <p>A set rather than a list: registration only ever asks whether a graph is already
+     * being monitored, and nothing reads the registry by position or depends on its order.
+     * Membership is decided by the one atomic add, so two threads registering the same graph
+     * cannot both conclude it is absent, and the cost of a registration does not grow with the
+     * number of graphs a deployment holds. Iteration is weakly consistent, which is what a
+     * sweep needs: it may unregister a graph it is part-way through examining.</p>
      */
-    private final CopyOnWriteArrayList<HnswGraph> registeredGraphs;
+    private final Set<HnswGraph> registeredGraphs;
 
     /**
      * Flag indicating if the worker is currently running.
@@ -176,7 +183,7 @@ public class HnswCompactionWorker {
                 " and " + MAX_TOMBSTONE_THRESHOLD + ", got: " + tombstoneThreshold);
         }
 
-        this.registeredGraphs = new CopyOnWriteArrayList<>();
+        this.registeredGraphs = ConcurrentHashMap.newKeySet();
         this.intervalMs = intervalMs;
         this.tombstoneThreshold = tombstoneThreshold;
 
@@ -195,10 +202,8 @@ public class HnswCompactionWorker {
      * @param graph The HNSW graph to register (null values are ignored)
      */
     public void registerGraph(HnswGraph graph) {
-        if (graph != null && !registeredGraphs.contains(graph)) {
-            registeredGraphs.add(graph);
-            LOGGER.debug("Registered HNSW graph for compaction monitoring: {} nodes",
-                graph.nodeCount());
+        if (graph != null && registeredGraphs.add(graph)) {
+            LOGGER.debug("Registered HNSW graph for compaction monitoring: {}", graph.path());
         }
     }
 
@@ -371,7 +376,7 @@ public class HnswCompactionWorker {
                     }
 
                     try {
-                        checkAndCompact(graph);
+                        compactGraph(graph, false, true);
                     } catch (Exception e) {
                         LOGGER.error("Error checking graph for compaction: {}", e.getMessage(), e);
                     }
@@ -394,34 +399,114 @@ public class HnswCompactionWorker {
     }
 
     /**
-     * Checks a graph's tombstone ratio and triggers compaction if needed.
+     * Compacts every registered graph the threshold selects, on the calling thread.
      *
-     * @param graph The graph to check
+     * <p>The same work the scheduled loop performs, for a caller that wants it now rather than
+     * at the next interval. Safe to call while the loop is running: {@code HnswGraph.compact}
+     * takes the graph's own write lock, so one graph is never rebuilt twice at once, and a
+     * graph the loop is already rebuilding simply makes this call wait for it.</p>
+     *
+     * <p>A graph that fails is counted and reported, never rethrown - one unusable graph must
+     * not cost the caller the rest of the run. Nor does a stale registration: a graph that has
+     * already been closed is retired and counted as skipped, so the graphs behind it are still
+     * considered.</p>
+     *
+     * <p>Forcing overrides the tombstone-ratio policy, not the question of whether there is
+     * anything to reclaim. A graph with no tombstones is skipped either way, so the rebuilt
+     * count always means graphs where space actually came back.</p>
+     *
+     * @param force true to rebuild every registered graph regardless of its tombstone ratio
+     * @return What the run examined, rebuilt and failed on
      */
-    private void checkAndCompact(HnswGraph graph) {
-        long total = graph.nodeCount();
-        long tombstones = graph.tombstoneCount();
+    public GraphCompactionSummary compactNow(boolean force) {
+        int considered = 0;
+        int compacted = 0;
+        int failed = 0;
 
-        // Skip empty graphs
-        if (total == 0) {
-            return;
+        for (HnswGraph graph : registeredGraphs) {
+            considered++;
+            switch (compactGraph(graph, force, false)) {
+                case COMPACTED -> compacted++;
+                case FAILED -> failed++;
+                case SKIPPED -> { }
+            }
+        }
+
+        LOGGER.info("On-demand HNSW compaction: {} graph(s) considered, {} compacted, {} failed",
+            considered, compacted, failed);
+        return new GraphCompactionSummary(considered, compacted, failed);
+    }
+
+    /**
+     * What one graph's compaction attempt came to.
+     */
+    private enum GraphOutcome {
+        /** The graph was left as it was. */
+        SKIPPED,
+        /** The graph was rebuilt. */
+        COMPACTED,
+        /** The rebuild raised an error, which has been logged and reported. */
+        FAILED
+    }
+
+    /**
+     * Compacts one graph if it is worth it, or unconditionally when forced.
+     *
+     * @param graph     The graph to consider
+     * @param force     true to rebuild regardless of the tombstone ratio
+     * @param scheduled true when this is the background loop, which must not start a rebuild
+     *                  after a stop has been requested
+     * @return What happened to the graph
+     */
+    private GraphOutcome compactGraph(HnswGraph graph, boolean force, boolean scheduled) {
+        long total;
+        long tombstones;
+        try {
+            if (graph.isClosed()) {
+                retireClosedGraph(graph);
+                return GraphOutcome.SKIPPED;
+            }
+            total = graph.nodeCount();
+            tombstones = graph.tombstoneCount();
+        } catch (IllegalStateException refused) {
+            if (!graph.isClosed()) {
+                // Not the close race: something else refused to let the graph be measured,
+                // and a graph nobody can even measure is a failure, not one with no work.
+                handleCompactionFailure(graph, refused);
+                return GraphOutcome.FAILED;
+            }
+            // The graph was closed between the check above and the read. Same situation as
+            // above, and reaching it through an exception does not make it a failure.
+            retireClosedGraph(graph);
+            return GraphOutcome.SKIPPED;
+        }
+
+        // Nothing to reclaim: an empty graph, or one whose nodes are all live. Forcing
+        // overrides the ratio policy, not arithmetic. Rebuilding here would copy every node
+        // to produce the graph that is already there, and reporting it as a compaction would
+        // tell an operator that space was reclaimed when none was.
+        if (total == 0 || tombstones == 0) {
+            LOGGER.debug("HNSW graph {} has no tombstoned nodes; nothing to reclaim.",
+                graph.path());
+            return GraphOutcome.SKIPPED;
         }
 
         double ratio = (double) tombstones / total;
 
-        if (ratio < tombstoneThreshold) {
+        if (!force && ratio < tombstoneThreshold) {
             LOGGER.trace("Graph tombstone ratio ({}) below threshold ({}). Skipping compaction.",
                 String.format("%.2f%%", ratio * 100),
                 String.format("%.2f%%", tombstoneThreshold * 100));
-            return;
+            return GraphOutcome.SKIPPED;
         }
 
-        // A compaction cannot be abandoned once started, so never begin one after a stop.
-        if (!running.get() || stopped.get()) {
-            return;
+        // A compaction cannot be abandoned once started, so the loop never begins one after a
+        // stop. A caller asking explicitly has said it wants this one to happen.
+        if (scheduled && (!running.get() || stopped.get())) {
+            return GraphOutcome.SKIPPED;
         }
 
-        LOGGER.info("Graph tombstone ratio ({}) exceeds threshold ({}). Starting compaction. " +
+        LOGGER.info("Graph tombstone ratio ({}) against threshold ({}). Starting compaction. " +
             "Total nodes: {}, Tombstones: {}",
             String.format("%.2f%%", ratio * 100),
             String.format("%.2f%%", tombstoneThreshold * 100),
@@ -432,6 +517,14 @@ public class HnswCompactionWorker {
             // swap, so there is nothing here to stage or clean up. The graph's own
             // directory is passed because the parameter is retained for compatibility.
             long removed = graph.compact(compactionScratchDir(graph));
+            if (removed == 0) {
+                // The tombstones were reclaimed by another caller between the check and the
+                // rebuild, so HnswGraph.compact left the graph exactly as it was. No node was
+                // renumbered and no space came back; counting it would inflate the run.
+                LOGGER.debug("HNSW graph {} was already free of tombstones when the rebuild "
+                    + "reached it.", graph.path());
+                return GraphOutcome.SKIPPED;
+            }
 
             compactionCount.incrementAndGet();
             totalNodesRemoved.addAndGet(removed);
@@ -441,10 +534,28 @@ public class HnswCompactionWorker {
                 removed, compactionCount.get(), totalNodesRemoved.get());
 
             notifyCompacted(graph, removed);
+            return GraphOutcome.COMPACTED;
 
         } catch (IOException | RuntimeException e) {
             handleCompactionFailure(graph, e);
+            return GraphOutcome.FAILED;
         }
+    }
+
+    /**
+     * What an on-demand graph compaction run came to.
+     *
+     * <p>A considered graph that is neither compacted nor failed was skipped: it had no
+     * tombstones to reclaim, its ratio was under the threshold on an unforced run, it was
+     * already closed, or a shutdown reached the loop first.</p>
+     *
+     * @param graphsConsidered registered graphs the run examined
+     * @param graphsCompacted  graphs actually rebuilt, each having reclaimed at least one
+     *                         tombstoned node
+     * @param graphsFailed     graphs whose rebuild raised an error
+     */
+    public record GraphCompactionSummary(int graphsConsidered, int graphsCompacted,
+                                         int graphsFailed) {
     }
 
     /**
@@ -457,6 +568,23 @@ public class HnswCompactionWorker {
         Path graphPath = graph.path();
         Path parent = graphPath != null ? graphPath.getParent() : null;
         return parent != null ? parent : Path.of(".");
+    }
+
+    /**
+     * Drops a registration whose graph has already been closed.
+     *
+     * <p>A closed graph cannot be examined, let alone rebuilt, and every later sweep would
+     * meet the same wall. Left registered, it also aborted whichever sweep reached it, so the
+     * graphs behind it in the iteration were never considered at all. Retiring it keeps the
+     * run going, and the warning is what makes the lifecycle leak that left it registered
+     * visible rather than silent.</p>
+     *
+     * @param graph The closed graph to retire
+     */
+    private void retireClosedGraph(HnswGraph graph) {
+        LOGGER.warn("HNSW graph {} is closed but was still registered for compaction; "
+            + "unregistering it. Nothing was reclaimed for it.", graph.path());
+        unregisterGraph(graph);
     }
 
     /**

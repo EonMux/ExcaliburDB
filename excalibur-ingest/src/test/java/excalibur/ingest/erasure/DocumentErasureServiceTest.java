@@ -1,6 +1,8 @@
 package excalibur.ingest.erasure;
 
+import excalibur.ingest.lexical.ChunkIndex;
 import excalibur.ingest.lexical.NativeChunkIndex;
+import excalibur.ingest.registry.DocumentLocks;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
 import excalibur.ingest.registry.UpsertHandler;
@@ -598,6 +600,241 @@ class DocumentErasureServiceTest {
                 .as("nothing was retired, and the reply must not claim otherwise")
                 .isZero();
             assertThat(storage).isEmpty();
+        }
+    }
+
+    @Nested
+    @DisplayName("When the content will not go")
+    class Shortfall {
+
+        /** Storage that refuses, the way a segment a split retired but never purged does. */
+        private final UpsertHandler.StorageAdapter refusing = key -> {
+            throw new IllegalStateException("segment is not writable");
+        };
+
+        /** An index that publishes and ranks normally but will not accept an erasure. */
+        private ChunkIndex refusingErase(ChunkIndex delegate) {
+            return new ForwardingChunkIndex(delegate) {
+                @Override
+                public int erase(java.util.Set<String> chunkIds) throws IOException {
+                    throw new IOException("index directory is read-only");
+                }
+            };
+        }
+
+        @Test
+        @DisplayName("a document whose chunks stayed in storage keeps its registry entry")
+        void storageRefusalKeepsTheEntry() throws Exception {
+            // The registry entry is the only map from a document to its chunk ids. Dropping it
+            // over chunks that are still in storage does not erase them - it makes them
+            // permanently unerasable, because nothing left can name them.
+            open(never());
+            ingest("docs", "secret.md", "confidential incident postmortem", "second half");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            DocumentErasureService.Outcome outcome =
+                new DocumentErasureService(registry, refusing, index, storage::get)
+                    .erase("docs", List.of("secret.md"), false);
+
+            assertThat(registry.contains("docs", "secret.md"))
+                .as("what still holds content must still be nameable, or it can never be erased")
+                .isTrue();
+            assertThat(outcome.documentsErased())
+                .as("a document still in storage has not been erased")
+                .isZero();
+            assertThat(outcome.documentsIncomplete()).isEqualTo(1);
+            assertThat(outcome.chunksNotRemoved()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("a document whose chunks stayed in storage keeps its visibility entry")
+        void storageRefusalKeepsVisibility() throws Exception {
+            open(never());
+            excalibur.ingest.visibility.DocumentVisibilityTracker tracker =
+                new excalibur.ingest.visibility.DocumentVisibilityTracker(registry);
+            ingest("docs", "secret.md", "confidential");
+            index.refresh();
+            epoch.incrementAndGet();
+            tracker.registerFromMetadata(registry.get("docs", "secret.md"), 1);
+
+            new DocumentErasureService(registry, refusing, index, storage::get, tracker)
+                .erase("docs", List.of("secret.md"), false);
+
+            assertThat(tracker.isDocumentTracked("docs:secret.md"))
+                .as("the document is still here, so the state describing it has to stay too")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("an index that refuses the erasure keeps the registry entry too")
+        void indexRefusalKeepsTheEntry() throws Exception {
+            // Chunks out of storage but still in the index are still answering queries under the
+            // document's name. Dropping the entry would leave nothing able to retry the erase.
+            open(never());
+            ingest("docs", "secret.md", "confidential incident postmortem");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            DocumentErasureService.Outcome outcome =
+                new DocumentErasureService(registry, adapter, refusingErase(index), storage::get)
+                    .erase("docs", List.of("secret.md"), false);
+
+            assertThat(registry.contains("docs", "secret.md")).isTrue();
+            assertThat(outcome.documentsErased()).isZero();
+            assertThat(outcome.documentsIncomplete()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("the request can be repeated once storage accepts the delete")
+        void isRepeatableAfterAFailure() throws Exception {
+            open(never());
+            ingest("docs", "secret.md", "confidential incident postmortem", "second half");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            new DocumentErasureService(registry, refusing, index, storage::get)
+                .erase("docs", List.of("secret.md"), false);
+            DocumentErasureService.Outcome retry =
+                service().erase("docs", List.of("secret.md"), false);
+
+            assertThat(retry.documentsErased())
+                .as("the whole point of keeping the entry is that the request can be re-run")
+                .isEqualTo(1);
+            assertThat(retry.documentsIncomplete()).isZero();
+            assertThat(storage).isEmpty();
+            assertThat(registry.contains("docs", "secret.md")).isFalse();
+        }
+
+        @Test
+        @DisplayName("one document that will not go does not stop the rest of the batch")
+        void oneFailureDoesNotStopTheBatch() throws Exception {
+            open(never());
+            ingest("docs", "stuck.md", "confidential");
+            ingest("docs", "free.md", "also confidential");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            UpsertHandler.StorageAdapter stuckOnOne = key -> {
+                String chunkId = new String(key, StandardCharsets.UTF_8);
+                if (chunkId.startsWith("docs:stuck.md:")) {
+                    throw new IllegalStateException("segment is not writable");
+                }
+                return storage.remove(chunkId) != null;
+            };
+
+            DocumentErasureService.Outcome outcome =
+                new DocumentErasureService(registry, stuckOnOne, index, storage::get)
+                    .eraseSource("docs", 100, false);
+
+            assertThat(outcome.documentsErased()).isEqualTo(1);
+            assertThat(outcome.documentsIncomplete()).isEqualTo(1);
+            assertThat(registry.contains("docs", "free.md")).isFalse();
+            assertThat(registry.contains("docs", "stuck.md")).isTrue();
+        }
+
+        @Test
+        @DisplayName("an erasure holds the document's lock while it works")
+        void erasureExcludesConcurrentPublication() throws Exception {
+            // Publication and erasure both rewrite the registry, the visibility entry and the
+            // chunks. Interleaved, one of them resurrects what the other removed; the order that
+            // looks harmless is worse, because it leaves chunks nothing can name.
+            open(never());
+            ingest("docs", "secret.md", "confidential", "second half");
+            index.refresh();
+            epoch.incrementAndGet();
+
+            java.util.concurrent.CountDownLatch entered =
+                new java.util.concurrent.CountDownLatch(1);
+            UpsertHandler.StorageAdapter probing = key -> {
+                Thread contender = new Thread(() -> DocumentLocks.shared()
+                    .inDocument("docs:secret.md", entered::countDown));
+                contender.setDaemon(true);
+                contender.start();
+                try {
+                    assertThat(entered.await(250, java.util.concurrent.TimeUnit.MILLISECONDS))
+                        .as("nothing else may touch the document while it is being erased")
+                        .isFalse();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+                return storage.remove(new String(key, StandardCharsets.UTF_8)) != null;
+            };
+
+            new DocumentErasureService(registry, probing, index, storage::get)
+                .erase("docs", List.of("secret.md"), false);
+
+            assertThat(entered.await(30, java.util.concurrent.TimeUnit.SECONDS))
+                .as("and it is released again once the erasure is done")
+                .isTrue();
+        }
+    }
+
+    /** A ChunkIndex that behaves like another, so a test can replace one thing it does. */
+    private abstract static class ForwardingChunkIndex implements ChunkIndex {
+
+        private final ChunkIndex delegate;
+
+        ForwardingChunkIndex(ChunkIndex delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void add(String chunkId, String text) throws IOException {
+            delegate.add(chunkId, text);
+        }
+
+        @Override
+        public void refresh() throws IOException {
+            delegate.refresh();
+        }
+
+        @Override
+        public int erase(java.util.Set<String> chunkIds) throws IOException {
+            return delegate.erase(chunkIds);
+        }
+
+        @Override
+        public String chunkIdOf(long id) throws IOException {
+            return delegate.chunkIdOf(id);
+        }
+
+        @Override
+        public long indexedCount() {
+            return delegate.indexedCount();
+        }
+
+        @Override
+        public io.excalibur.retrieval.lexical.native_.CompactionResult compactIfDue(
+                java.util.function.Function<String, String> textOf) throws IOException {
+            return delegate.compactIfDue(textOf);
+        }
+
+        @Override
+        public io.excalibur.retrieval.lexical.native_.CompactionResult compactNow(
+                java.util.function.Function<String, String> textOf) throws IOException {
+            return delegate.compactNow(textOf);
+        }
+
+        @Override
+        public io.excalibur.retrieval.rank.Ranker ranker(QueryExpander expander) {
+            return delegate.ranker(expander);
+        }
+
+        @Override
+        public String engine() {
+            return delegate.engine();
+        }
+
+        @Override
+        public excalibur.ingest.lexical.ChunkIndexStats stats() {
+            return delegate.stats();
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
         }
     }
 }

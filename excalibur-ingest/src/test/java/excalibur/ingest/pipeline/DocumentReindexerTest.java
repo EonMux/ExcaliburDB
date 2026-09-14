@@ -766,6 +766,118 @@ class DocumentReindexerTest {
         }
     }
 
+
+    @Nested
+    @DisplayName("A reindex that failed partway")
+    class PartialWriteRollbackTests {
+
+        private static final String SOURCE = "test-source";
+        private static final String DOCUMENT = "growing-doc";
+
+        private FetchedDocument documentOf(String content) {
+            return new FetchedDocument(DOCUMENT, content.getBytes(StandardCharsets.UTF_8),
+                "text/plain", System.currentTimeMillis());
+        }
+
+        private String chunkId(int index) {
+            return SOURCE + ":" + DOCUMENT + ":chunk:" + index;
+        }
+
+        @Test
+        @DisplayName("a new document that failed partway leaves none of its chunks in storage")
+        void newDocumentLeavesNothingBehind() {
+            // Nothing names these chunk ids: the document was never registered, so a later
+            // erasure reading the registry cannot find them and they stay for good.
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+            llmClient.setFailAfterCalls(2);
+
+            DocumentReindexer.DocumentResult result = reindexer.reindexDocument(
+                SOURCE, DOCUMENT, documentOf("This is a test document. ".repeat(400)));
+
+            assertTrue(result.getTotalChunks() > 2, "the document must chunk more than twice");
+            assertFalse(registry.contains(SOURCE, DOCUMENT));
+            assertNull(storageWriter.textOf(chunkId(0)),
+                "a chunk no registry entry names is content nothing can ever erase");
+            assertNull(storageWriter.textOf(chunkId(1)));
+        }
+
+        @Test
+        @DisplayName("a grown document that failed partway leaves no chunk past its old length")
+        void surplusChunksAreRemoved() {
+            // The previous version's ids are overwritten in place and stay named by the entry
+            // that survives the failure. The ids past them are the orphans.
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+
+            DocumentReindexer.DocumentResult first = reindexer.reindexDocument(
+                SOURCE, DOCUMENT, documentOf("Original content. ".repeat(120)));
+            int oldChunks = first.getTotalChunks();
+            assertTrue(oldChunks > 0);
+
+            llmClient.setFailAfterCalls(llmClient.getEmbeddingCallCount() + oldChunks + 1);
+            DocumentReindexer.DocumentResult second = reindexer.reindexDocument(
+                SOURCE, DOCUMENT, documentOf("Replacement content. ".repeat(600)));
+
+            assertTrue(second.getTotalChunks() > oldChunks + 1,
+                "the replacement must be long enough to write past the old version");
+            assertEquals(oldChunks, registry.get(SOURCE, DOCUMENT).getChunkCount(),
+                "the previous entry is what survives a failed reindex");
+            assertNull(storageWriter.textOf(chunkId(oldChunks)),
+                "a chunk written past the surviving entry is named by nothing");
+            for (int i = 0; i < oldChunks; i++) {
+                assertNotNull(storageWriter.textOf(chunkId(i)),
+                    "the ids the surviving entry still names must not be deleted");
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("Vectors of documents a reindex removes")
+    class DeletedDocumentVectorTests {
+
+        @Test
+        @DisplayName("a document the source stopped listing has its graph nodes retired")
+        void deletedDocumentsVectorsAreRetired() throws SourceException {
+            // Storage tombstones the chunks and the registry entry goes, but a graph node is
+            // attributed to a document rather than to a chunk: nothing else reaches it, so the
+            // document stays rankable by vector search with its name and a distance.
+            List<String> retired = new ArrayList<>();
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+            reindexer.setVectorEraser(documentKey -> {
+                retired.add(documentKey);
+                return 2;
+            });
+
+            MockSource both = new MockSource("test-source");
+            both.addDocument("doc-1", "kept content. ".repeat(20));
+            both.addDocument("doc-2", "removed content. ".repeat(20));
+            reindexer.reindexAll(both);
+
+            MockSource shrunk = new MockSource("test-source");
+            shrunk.addDocument("doc-1", "kept content. ".repeat(20));
+            DocumentReindexer.ReindexResult result = reindexer.reindexAll(shrunk);
+
+            assertEquals(1, result.getDocumentsTombstoned());
+            assertEquals(List.of("test-source:doc-2"), retired,
+                "nodes are attributed by source and document, and must be asked for that way");
+        }
+
+        @Test
+        @DisplayName("a reindexer with no vector index reindexes exactly as before")
+        void aVectorEraserIsOptional() throws SourceException {
+            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
+                upsertHandler, registry, storageWriter);
+            reindexer.setVectorEraser(null);
+
+            MockSource source = new MockSource("test-source");
+            source.addDocument("doc-1", "ordinary content. ".repeat(20));
+
+            assertEquals(1, reindexer.reindexAll(source).getDocumentsIndexed());
+        }
+    }
+
     private static class MockSource implements Source {
         private final String sourceId;
         private final Map<String, String> documents = new HashMap<>();

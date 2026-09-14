@@ -8,6 +8,7 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 
+import io.excalibur.graph.file.Durability;
 import io.excalibur.graph.provenance.Provenance;
 import io.excalibur.graph.store.EdgeStoreWriter;
 import io.excalibur.graph.store.MappedEdgeStore;
@@ -35,6 +36,13 @@ import org.slf4j.LoggerFactory;
  * <p>A crash before the move leaves the original untouched and a stray temporary directory; a crash
  * after it leaves the compacted store, which is the intended outcome. There is no window in which
  * the store is neither.
+ *
+ * <h2>Why this one writes through the page cache</h2>
+ * <p>Nothing else in this module fsyncs, and rightly: a build whose bytes were still in the page
+ * cache when the power failed is a build to run again from the staging log that outlived it. This
+ * method has no such fallback, because its last act is to delete the original it replaced. So the
+ * replacement is forced to the device, and its name after that, before the retired copy goes — see
+ * {@link io.excalibur.graph.file.Durability}.
  */
 public final class EdgeStoreCompactor {
 
@@ -102,8 +110,24 @@ public final class EdgeStoreCompactor {
      */
     public static long compact(MappedEdgeStore store, Path directory, RoaringBitmap tombstoned)
             throws IOException {
-        if (store == null || directory == null || tombstoned == null) {
-            throw new IllegalArgumentException("store, directory and tombstoned are all required");
+        return compact(store, directory, tombstoned, Durability.DEVICE);
+    }
+
+    /**
+     * As above, with the durability of the replacement under the caller's control.
+     *
+     * @param store       the open store, which this closes
+     * @param directory   where it lives
+     * @param tombstoned  forward edge indices to drop
+     * @param durability  how the replacement is forced to the device before the original goes
+     * @return how many edges were removed
+     * @throws IOException if the rewrite, the sync or either rename fails
+     */
+    static long compact(MappedEdgeStore store, Path directory, RoaringBitmap tombstoned,
+                        Durability durability) throws IOException {
+        if (store == null || directory == null || tombstoned == null || durability == null) {
+            throw new IllegalArgumentException(
+                "store, directory, tombstoned and durability are all required");
         }
         long entityCount = store.entityCount();
         long before = store.edgeCount();
@@ -129,6 +153,23 @@ public final class EdgeStoreCompactor {
         // space: renumbering entities here would invalidate every id held anywhere else.
         writer.build(temp, entityCount);
 
+        // The rebuild writes the edge store's column files and nothing else, but this directory
+        // holds more than the edge store: the label dictionaries, the two Lucene indexes and the
+        // entity vectors all live beside it, and all of them are read back by whoever reopens the
+        // directory after the swap. The swap replaces the directory whole, so anything not carried
+        // across here is deleted with the retired copy - and a compaction is the one operation
+        // that must not lose data, being the one an erasure obligation is discharged by.
+        carryOver(directory, temp);
+
+        // Forced to the device before anything is renamed, and therefore while the original is
+        // still the store being served. Nothing else this module writes needs it - a build whose
+        // bytes were lost is a build to run again from the staging log - but this method deletes
+        // the retired original at the end, so from that point the replacement is the only copy
+        // there is. A rename that outran its own contents would leave a present descriptor over
+        // short or empty columns, which MappedColumns.open refuses: a graph that will not open,
+        // with nothing to fall back to. A failure here costs the erasure a retry and no data.
+        durability.fsyncTree(temp);
+
         // The old mapping stays live until the directories have swapped, so a reader mid-query is
         // reading a store that still exists.
         Path retired = directory.resolveSibling(directory.getFileName() + ".retired");
@@ -140,6 +181,14 @@ public final class EdgeStoreCompactor {
             // Put the original back rather than leaving no store at all.
             Files.move(retired, directory, StandardCopyOption.ATOMIC_MOVE);
             throw e;
+        }
+
+        // Both renames happened in the parent, and a synced file whose name is not yet durable
+        // can come back with no directory entry pointing at it. Forced before the retired copy is
+        // deleted, so the replacement is reachable by name before the fallback stops existing.
+        Path parent = directory.getParent();
+        if (parent != null) {
+            durability.fsyncDirectory(parent);
         }
 
         store.close();
@@ -164,6 +213,47 @@ public final class EdgeStoreCompactor {
         return requests.stream()
             .map(ErasureRequest::requestedAt)
             .min(Comparator.naturalOrder());
+    }
+
+    /**
+     * Links everything the rebuild did not write into the replacement directory.
+     *
+     * <p>Compaction rewrites the edge store; the directory it lives in holds more than the edge
+     * store, and none of the rest is changed by removing an edge. So whatever the rebuild did not
+     * produce is carried across as it stands, matched by name so that a file the graph gains later
+     * is preserved without this having to be told about it.</p>
+     *
+     * <p>By hard link rather than by move, which is what keeps the crash guarantee the class
+     * javadoc makes: the original directory stays complete and readable right up to the atomic
+     * swap, and deleting the retired copy afterwards removes only that copy's names. A filesystem
+     * that cannot link is copied instead, which costs the bytes and keeps the guarantee.</p>
+     *
+     * @param source Where the entry lives now
+     * @param target Where it should also be reachable
+     * @throws IOException if an entry can be neither linked nor copied
+     */
+    private static void carryOver(Path source, Path target) throws IOException {
+        if (Files.isDirectory(source)) {
+            Files.createDirectories(target);
+            try (var entries = Files.list(source)) {
+                for (Path entry : entries.toList()) {
+                    Path child = target.resolve(entry.getFileName().toString());
+                    // A file the rebuild already wrote is the current version of it and is left
+                    // alone. A directory is descended into rather than skipped, so a sidecar tree
+                    // survives even if the rebuild ever writes one of its own beside it.
+                    if (Files.isDirectory(entry) || !Files.exists(child)) {
+                        carryOver(entry, child);
+                    }
+                }
+            }
+            return;
+        }
+        try {
+            Files.createLink(target, source);
+        } catch (IOException | UnsupportedOperationException e) {
+            LOGGER.debug("no hard link for {} ({}); copying instead", source, e.toString());
+            Files.copy(source, target, StandardCopyOption.COPY_ATTRIBUTES);
+        }
     }
 
     private static void deleteRecursively(Path path) throws IOException {

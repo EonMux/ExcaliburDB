@@ -117,4 +117,144 @@ class DocumentRegistryPersistenceTest {
             .chunkIds(List.of(chunkIds))
             .build();
     }
+
+    /**
+     * The registry is the node's record of which chunks belong to which document. Losing it
+     * loses erasure and reindexing for every document it named, so the window in which the file
+     * is neither the old registry nor the new one must not exist. Writing in place opens exactly
+     * that window: a crash between the truncate and the last line leaves a file that parses
+     * cleanly and is missing documents the node is still serving.
+     *
+     * <p>A reader that opened the file before the save is what makes the difference observable
+     * without crashing anything. An in-place rewrite is seen through that handle, because it is
+     * the same file being overwritten. A replacement published by rename is not: the handle
+     * still refers to the registry as it was, whole, which is the property that makes a crash
+     * during the save survivable.</p>
+     */
+    @Test
+    @DisplayName("a save replaces the registry rather than rewriting it in place")
+    void saveReplacesRatherThanRewrites(@TempDir Path tempDir) throws IOException {
+        Path file = tempDir.resolve("registry.dat");
+        DocumentRegistry registry = new DocumentRegistry(file);
+        registry.register(metadata("src", "a.md", "a.md:chunk:0"));
+        registry.persist();
+        byte[] before = Files.readAllBytes(file);
+
+        try (java.io.InputStream openedBeforeTheSave = Files.newInputStream(file)) {
+            DocumentRegistry second = new DocumentRegistry(file);
+            second.register(metadata("src", "a.md", "a.md:chunk:0"));
+            second.register(metadata("src", "b.md", "b.md:chunk:0"));
+            second.persist();
+
+            assertThat(openedBeforeTheSave.readAllBytes())
+                .as("the save publishes a new file; it does not overwrite the one a reader "
+                    + "already has open, which is what a half-finished save would corrupt")
+                .isEqualTo(before);
+        }
+
+        assertThat(new DocumentRegistry(file).size())
+            .as("and the published registry is the new one")
+            .isEqualTo(2);
+    }
+
+    /**
+     * A temporary file left behind is read as a registry by nothing, but it accumulates once per
+     * save for the life of the node.
+     */
+    @Test
+    @DisplayName("a save leaves no scratch file behind")
+    void saveLeavesNoTemporaryFile(@TempDir Path tempDir) throws IOException {
+        Path file = tempDir.resolve("registry.dat");
+        DocumentRegistry registry = new DocumentRegistry(file);
+        registry.register(metadata("src", "a.md", "a.md:chunk:0"));
+        registry.persist();
+
+        try (var entries = Files.list(tempDir)) {
+            assertThat(entries.toList())
+                .as("only the registry itself survives a save")
+                .containsExactly(file);
+        }
+    }
+
+    /**
+     * Four callers persist this registry - an ingest run, an erasure, a reindex and shutdown -
+     * and the inline-document route now reaches it from HTTP threads, so two saves genuinely
+     * overlap. Sharing one replacement path between them means the second writer's open handle
+     * ends up pointing at the file the first has just published, and its remaining writes land
+     * in the live registry: the truncation the write-and-rename was added to eliminate.
+     */
+    @Test
+    @DisplayName("concurrent saves never corrupt the published registry")
+    void concurrentSavesDoNotCorrupt(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("registry.dat");
+        DocumentRegistry registry = new DocumentRegistry(file);
+        for (int i = 0; i < 400; i++) {
+            registry.register(metadata("src", "doc" + i, "doc" + i + ":chunk:0"));
+        }
+
+        int savers = 8;
+        java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+        java.util.List<Thread> threads = new java.util.ArrayList<>();
+        java.util.List<Throwable> failures =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        for (int t = 0; t < savers; t++) {
+            final int id = t;
+            Thread thread = new Thread(() -> {
+                try {
+                    go.await();
+                    for (int i = 0; i < 20; i++) {
+                        // A real registration, which is what marks the registry modified and is
+                        // what an ingest run does just before it saves.
+                        registry.register(metadata("src", "extra-" + id + "-" + i,
+                            "extra-" + id + "-" + i + ":chunk:0"));
+                        registry.persist();
+                    }
+                } catch (Throwable e) {
+                    failures.add(e);
+                }
+            });
+            thread.start();
+            threads.add(thread);
+        }
+        go.countDown();
+        for (Thread thread : threads) {
+            thread.join(60_000);
+        }
+
+        assertThat(failures).as("a save must not fail because another was running").isEmpty();
+        assertThat(new DocumentRegistry(file).size())
+            .as("the published registry holds every record, not an interleaving of two writers")
+            .isEqualTo(400 + savers * 20);
+        try (var entries = Files.list(tempDir)) {
+            assertThat(entries.toList()).containsExactly(file);
+        }
+    }
+
+    /**
+     * The modified flag is cleared after the write. A registration that lands while a save is
+     * iterating is not in that file, and clearing the flag over it means the registration's own
+     * later save sees nothing to do and returns. Its documents are then searchable and absent
+     * from the on-disk registry, so after a restart they can be neither erased nor reindexed.
+     */
+    @Test
+    @DisplayName("a registration racing a save is not lost by the save clearing the flag")
+    void aRegistrationDuringASaveIsNotLost(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("registry.dat");
+        DocumentRegistry registry = new DocumentRegistry(file);
+        registry.register(metadata("src", "first.md", "first.md:chunk:0"));
+
+        java.util.concurrent.CountDownLatch registered = new java.util.concurrent.CountDownLatch(1);
+        Thread writer = new Thread(() -> {
+            registry.register(metadata("src", "second.md", "second.md:chunk:0"));
+            registered.countDown();
+        });
+        writer.start();
+        registered.await(30, java.util.concurrent.TimeUnit.SECONDS);
+        writer.join(30_000);
+
+        registry.persist();
+        registry.persist();
+
+        assertThat(new DocumentRegistry(file).size()).isEqualTo(2);
+    }
 }

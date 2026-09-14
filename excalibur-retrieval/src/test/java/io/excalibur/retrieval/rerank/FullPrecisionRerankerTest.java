@@ -153,6 +153,35 @@ class FullPrecisionRerankerTest {
     }
 
     @Test
+    @DisplayName("a configured over-fetch factor is what the delegate is asked for")
+    void configuredOverFetchFactorIsUsed() {
+        // Every extra candidate costs a full-precision vector read, so how many to consider is a
+        // deployment's decision rather than a constant here.
+        int[] observed = new int[1];
+        FullPrecisionReranker reranker = new FullPrecisionReranker(
+            new ApproximateRanker("pq", List.of(1L), observed),
+            vectors(Map.of(1L, new float[] { 1f })), L2Distance.getInstance(), 9);
+
+        reranker.rank(RetrievalQuery.ofEmbedding(new float[] { 0f }), 4);
+
+        assertThat(reranker.overFetchFactor()).isEqualTo(9);
+        assertThat(observed[0]).isEqualTo(36);
+    }
+
+    @Test
+    @DisplayName("a factor of one asks for exactly the limit, over-fetching nothing")
+    void factorOfOneDisablesOverFetch() {
+        int[] observed = new int[1];
+        FullPrecisionReranker reranker = new FullPrecisionReranker(
+            new ApproximateRanker("pq", List.of(1L), observed),
+            vectors(Map.of(1L, new float[] { 1f })), L2Distance.getInstance(), 1);
+
+        reranker.rank(RetrievalQuery.ofEmbedding(new float[] { 0f }), 6);
+
+        assertThat(observed[0]).isEqualTo(6);
+    }
+
+    @Test
     @DisplayName("an over-fetch factor below one is refused")
     void overFetchFactorMustBeAtLeastOne() {
         assertThatThrownBy(() -> new FullPrecisionReranker(

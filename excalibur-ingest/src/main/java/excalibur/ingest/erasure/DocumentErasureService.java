@@ -1,6 +1,7 @@
 package excalibur.ingest.erasure;
 
 import excalibur.ingest.lexical.ChunkIndex;
+import excalibur.ingest.registry.DocumentLocks;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
 import excalibur.ingest.registry.UpsertHandler;
@@ -43,8 +44,12 @@ import java.util.function.Function;
  *       than everything it happens to have made searchable. Erasing then records a durable
  *       obligation and hides the chunk immediately; a compaction removes it from disk.</li>
  *   <li><strong>The registry</strong> holds the list of chunk ids the first two steps need, so it
- *       is removed last. That is what makes the request re-runnable: until the registry entry is
- *       gone, repeating the request finishes whatever an interruption left undone.</li>
+ *       is removed last, and only for a document whose chunks the first two steps actually
+ *       released. That is what makes the request re-runnable: until the registry entry is gone,
+ *       repeating the request finishes whatever an interruption left undone. Dropping the entry
+ *       over content that is still there would do the opposite - the entry is the only map from
+ *       a document to its chunk ids, so what remains would become content no request can name.
+ *       </li>
  * </ol>
  *
  * <h2>What it deliberately does not touch</h2>
@@ -71,7 +76,11 @@ import java.util.function.Function;
  *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use; the components it calls carry their own guarantees. Two requests for
- * the same document are safe and the second finds nothing left to do.</p>
+ * the same document are safe and the second finds nothing left to do. Each document is removed
+ * under its {@link DocumentLocks} entry, which is also what ingestion publishes under: without
+ * that, a publication landing in the middle of an erasure either restores the registry and
+ * visibility entries for chunks that are gone, or leaves its own chunks in storage with no entry
+ * naming them.</p>
  */
 public final class DocumentErasureService {
 
@@ -80,21 +89,32 @@ public final class DocumentErasureService {
     /**
      * What an erasure removed.
      *
-     * @param documentsErased    Documents found and removed
-     * @param documentsNotFound  Documents this node has no record of
-     * @param documentsRemaining Documents of this source still held, for a request that was
-     *                           bounded rather than exhaustive
-     * @param chunksTombstoned   Chunks removed from storage
-     * @param chunksUnindexed    Chunks removed from the lexical index
-     * @param vectorsHidden      Graph nodes retired, so no search ranks the document again
-     * @param compacted          Whether the index was rewritten, so the chunks are off disk
-     * @param chunksReclaimed    Chunks physically removed by that rewrite
-     * @param outstanding        Erasure requests this node still owes, including this one
-     * @param detail             Why the compaction ran, or why it did not
+     * @param documentsErased     Documents this node held and no longer holds any part of
+     * @param documentsIncomplete Documents this node still holds part of: something refused to
+     *                            release their content, so their registry entry was kept and the
+     *                            request can be repeated
+     * @param documentsNotFound   Documents this node has no record of
+     * @param documentsRemaining  Documents of this source still held, for a request that was
+     *                            bounded rather than exhaustive
+     * @param chunksTombstoned    Chunks removed from storage
+     * @param chunksUnindexed     Chunks removed from the lexical index
+     * @param chunksNotRemoved    Chunks storage would not release, so their content is still
+     *                            on disk
+     * @param chunksStillSearchable Chunks the lexical index still matches. Counted apart from
+     *                            {@code chunksNotRemoved} rather than folded into it, because a
+     *                            chunk can be in both states at once and one number for the two
+     *                            reports twice as much content left behind as there is
+     * @param vectorsHidden       Graph nodes retired, so no search ranks the document again
+     * @param compacted           Whether the index was rewritten, so the chunks are off disk
+     * @param chunksReclaimed     Chunks physically removed by that rewrite
+     * @param outstanding         Erasure requests this node still owes, including this one
+     * @param detail              Why the compaction ran, or why it did not
      */
-    public record Outcome(int documentsErased, int documentsNotFound, int documentsRemaining,
-                          int chunksTombstoned, int chunksUnindexed, int vectorsHidden,
-                          boolean compacted, int chunksReclaimed, int outstanding, String detail) {
+    public record Outcome(int documentsErased, int documentsIncomplete, int documentsNotFound,
+                          int documentsRemaining, int chunksTombstoned, int chunksUnindexed,
+                          int chunksNotRemoved, int chunksStillSearchable, int vectorsHidden,
+                          boolean compacted, int chunksReclaimed, int outstanding,
+                          String detail) {
 
         public Outcome {
             Objects.requireNonNull(detail, "detail must not be null");
@@ -120,6 +140,14 @@ public final class DocumentErasureService {
          */
         int erase(String documentKey);
     }
+
+    /**
+     * Where a document's erasure is serialised against its publication.
+     *
+     * <p>The table is the process's, because so is what it guards: one storage engine, one
+     * registry, one visibility tracker.</p>
+     */
+    private final DocumentLocks locks = DocumentLocks.shared();
 
     private final DocumentRegistry registry;
     private final UpsertHandler.StorageAdapter storage;
@@ -282,37 +310,125 @@ public final class DocumentErasureService {
         return remove(sourceId, batch, 0, remaining, compactNow);
     }
 
-    /** Removes documents the registry is known to hold, in the order the class javadoc gives. */
+    /**
+     * Removes documents the registry is known to hold, in the order the class javadoc gives.
+     *
+     * <p>Document by document, each under its own lock rather than as one batch of storage
+     * deletes. The registry entry a document is dropped from is also the list this reads to know
+     * what to delete, so the read and the removal have to be one step that no publication can
+     * land in the middle of.</p>
+     */
     private Outcome remove(String sourceId, List<String> documentIds, int notFound, int remaining,
                            boolean compactNow) {
-        List<String> chunkIds = new ArrayList<>();
-        for (String documentId : documentIds) {
-            DocumentMetadata metadata = registry.get(sourceId, documentId);
-            if (metadata != null) {
-                chunkIds.addAll(metadata.getChunkIds());
-            }
-        }
+        // Published once for the whole request, before anything is removed. A chunk still sitting
+        // in a run's buffer is in no segment yet, and an erasure that could not see it would
+        // report the document gone while the next refresh made it searchable again.
+        boolean indexReachable = publishBufferedChunks();
 
-        int tombstoned = tombstone(chunkIds);
-        int unindexed = unindex(chunkIds);
-        int hidden = 0;
+        Removed removed = Removed.NOTHING;
         for (String documentId : documentIds) {
-            String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
-            hidden += hideVectors(documentKey);
-            registry.remove(sourceId, documentId);
-            if (visibility != null) {
-                visibility.removeDocument(documentKey);
-            }
+            removed = removed.and(removeOne(sourceId, documentId, indexReachable));
         }
         persistRegistry();
 
         CompactionResult compaction = reclaim(compactNow);
-        LOGGER.info("Erased {} document(s) of source {}: {} chunk(s) removed from storage, {} from "
-                + "the lexical index, {} graph node(s) retired, {} not found, {} still held",
-            documentIds.size(), sourceId, tombstoned, unindexed, hidden, notFound, remaining);
-        return new Outcome(documentIds.size(), notFound, remaining, tombstoned, unindexed, hidden,
+        report(sourceId, removed, notFound, remaining);
+        return new Outcome(removed.documents(), removed.incomplete(),
+            notFound + removed.notFound(), remaining, removed.tombstoned(), removed.unindexed(),
+            removed.notRemoved(), removed.stillSearchable(), removed.vectorsHidden(),
             compaction.performed(), compaction.documentsRemoved(), outstanding(),
             compaction.reason());
+    }
+
+    /**
+     * Removes one document, with nothing else able to rewrite it while this runs.
+     *
+     * <p>The registry and visibility entries go only for a document whose content actually left
+     * storage and the index. Removing them over chunks that are still there does not erase those
+     * chunks - it makes them unreachable, because the entry is the only thing that names them -
+     * and the reply would have counted the document as erased.</p>
+     */
+    private Removed removeOne(String sourceId, String documentId, boolean indexReachable) {
+        String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
+        return locks.inDocument(documentKey, () -> {
+            DocumentMetadata metadata = registry.get(sourceId, documentId);
+            if (metadata == null) {
+                // Removed by a request that overlapped this one. Counted as never held rather
+                // than as erased, so two concurrent requests cannot both claim the same document.
+                return Removed.NOT_FOUND;
+            }
+
+            List<String> chunkIds = metadata.getChunkIds();
+            Tombstoned stored = tombstone(chunkIds);
+            Unindexed lexical = unindex(chunkIds, indexReachable);
+            int vectors = hideVectors(documentKey);
+
+            if (!stored.failed().isEmpty() || !lexical.complete()) {
+                // The two counts measure different things and are deliberately not added up: a
+                // chunk storage released but the index could not is out of storage and still
+                // searchable, so it belongs in the second and not the first. Folding them into
+                // one number made a 12-chunk document report 24 chunks left behind.
+                int held = stored.failed().size();
+                int searchable = lexical.complete() ? 0 : chunkIds.size();
+                LOGGER.error("Document {} has not been erased: of its {} chunk(s), {} are still "
+                        + "in storage and {} are still searchable, so its registry entry is kept "
+                        + "and the request can be repeated",
+                    documentKey, chunkIds.size(), held, searchable);
+                return new Removed(0, 1, 0, stored.removed(), lexical.erased(), held, searchable,
+                    vectors);
+            }
+
+            registry.remove(sourceId, documentId);
+            if (visibility != null) {
+                visibility.removeDocument(documentKey);
+            }
+            return new Removed(1, 0, 0, stored.removed(), lexical.erased(), 0, 0, vectors);
+        });
+    }
+
+    /** Says what left, and as plainly what did not. */
+    private void report(String sourceId, Removed removed, int notFound, int remaining) {
+        LOGGER.info("Erased {} document(s) of source {}: {} chunk(s) removed from storage, {} from "
+                + "the lexical index, {} graph node(s) retired, {} not found, {} still held",
+            removed.documents(), sourceId, removed.tombstoned(), removed.unindexed(),
+            removed.vectorsHidden(), notFound + removed.notFound(), remaining);
+        if (removed.incomplete() > 0) {
+            LOGGER.error("{} document(s) of source {} were not erased: {} chunk(s) remain in "
+                    + "storage and {} remain searchable, and their registry entries are kept so "
+                    + "the request can be repeated",
+                removed.incomplete(), sourceId, removed.notRemoved(), removed.stillSearchable());
+        }
+    }
+
+    /**
+     * What removing documents achieved, so the reply is assembled from what happened rather than
+     * from what was asked for.
+     *
+     * @param documents     Documents no part of which this node still holds
+     * @param incomplete    Documents something refused to release, whose entries were kept
+     * @param notFound      Documents that were gone before this request reached them
+     * @param tombstoned    Chunks storage had and no longer has
+     * @param unindexed     Chunks the lexical index found and removed
+     * @param notRemoved    Chunks storage would not release, so their content is still on disk
+     * @param stillSearchable Chunks the lexical index still matches, whether or not storage
+     *                      released them. Counted apart from {@code notRemoved} because a chunk
+     *                      can be in both states and adding the two would double it
+     * @param vectorsHidden Graph nodes retired
+     */
+    private record Removed(int documents, int incomplete, int notFound, int tombstoned,
+                           int unindexed, int notRemoved, int stillSearchable,
+                           int vectorsHidden) {
+
+        static final Removed NOTHING = new Removed(0, 0, 0, 0, 0, 0, 0, 0);
+        static final Removed NOT_FOUND = new Removed(0, 0, 1, 0, 0, 0, 0, 0);
+
+        Removed and(Removed other) {
+            return new Removed(documents + other.documents, incomplete + other.incomplete,
+                notFound + other.notFound, tombstoned + other.tombstoned,
+                unindexed + other.unindexed, notRemoved + other.notRemoved,
+                stillSearchable + other.stillSearchable,
+                vectorsHidden + other.vectorsHidden);
+        }
     }
 
     /**
@@ -328,9 +444,10 @@ public final class DocumentErasureService {
         try {
             return vectorEraser.erase(documentKey);
         } catch (RuntimeException e) {
-            // Reported by the count rather than thrown, for the same reason a chunk that will not
-            // delete does not stop the rest: the content leaving storage is the half of the
-            // promise this node can always keep, and losing it here would be the worse outcome.
+            // Reported by the count rather than thrown, and deliberately not a reason to keep the
+            // registry entry: the entry exists to name chunks, and a node is attributed to a
+            // document, so keeping it would not help a later attempt reach the graph. The content
+            // leaving storage is the half of the promise this node can always keep.
             LOGGER.warn("Vectors of document {} stay searchable: {}", documentKey, e.getMessage());
             return 0;
         }
@@ -351,40 +468,85 @@ public final class DocumentErasureService {
         }
     }
 
-    /** Removes each chunk from storage, which is the only place its content lives. */
-    private int tombstone(List<String> chunkIds) {
+    /**
+     * What removing a document's chunks from storage achieved.
+     *
+     * @param removed Chunks storage had and no longer has
+     * @param failed  Chunks storage refused to release, which are therefore still there
+     */
+    private record Tombstoned(int removed, Set<String> failed) {}
+
+    /**
+     * Removes each chunk from storage, which is the only place its content lives.
+     *
+     * <p>A delete that reports nothing to delete counts as success: the chunk is not in storage,
+     * which is the state being asked for, and that is what a repeat of a request that got partway
+     * looks like. Only a delete that threw leaves the chunk where it was.</p>
+     */
+    private Tombstoned tombstone(List<String> chunkIds) {
         int removed = 0;
+        Set<String> failed = new LinkedHashSet<>();
         for (String chunkId : chunkIds) {
             try {
                 if (storage.delete(chunkId.getBytes(StandardCharsets.UTF_8))) {
                     removed++;
                 }
             } catch (RuntimeException e) {
-                // Reported by the shortfall between the counts rather than thrown: one chunk that
-                // will not delete must not stop the rest of the document from being erased.
+                // Collected rather than thrown: one chunk that will not delete must not stop the
+                // rest of the document, and the document's entry is kept so the rest of the work
+                // can be finished by repeating the request.
                 LOGGER.warn("Chunk {} could not be removed from storage: {}",
                     chunkId, e.getMessage());
+                failed.add(chunkId);
             }
         }
-        return removed;
+        return new Tombstoned(removed, failed);
     }
 
+    /**
+     * What removing a document's chunks from the lexical index achieved.
+     *
+     * @param erased   Chunks the index found and removed
+     * @param complete Whether the index accepted the erasure at all. Nothing erased is not the
+     *                 same answer: the index holds only what a refresh published, so a chunk it
+     *                 never had is already in the state being asked for
+     */
+    private record Unindexed(int erased, boolean complete) {}
+
     /** Records the obligation and hides the chunks from search. */
-    private int unindex(List<String> chunkIds) {
+    private Unindexed unindex(List<String> chunkIds, boolean indexReachable) {
         if (lexicalIndex == null || chunkIds.isEmpty()) {
-            return 0;
+            return new Unindexed(0, true);
+        }
+        if (!indexReachable) {
+            return new Unindexed(0, false);
         }
         try {
-            // Published first, so everything the index holds can be reached. A chunk still sitting
-            // in a run's buffer is not in any segment yet, and an erasure that could not see it
-            // would report the document gone while the next refresh made it searchable.
-            lexicalIndex.refresh();
-            Set<String> keys = new LinkedHashSet<>(chunkIds);
-            return lexicalIndex.erase(keys);
+            return new Unindexed(lexicalIndex.erase(new LinkedHashSet<>(chunkIds)), true);
         } catch (IOException e) {
-            LOGGER.error("{} erased chunk(s) remain lexically searchable: {}",
+            LOGGER.error("{} chunk(s) of an erased document remain lexically searchable: {}",
                 chunkIds.size(), e.getMessage());
-            return 0;
+            return new Unindexed(0, false);
+        }
+    }
+
+    /**
+     * Makes everything the index has taken in reachable, so an erasure can remove all of it.
+     *
+     * @return false when the index could not be published, in which case nothing in this request
+     *         can be said to have left it
+     */
+    private boolean publishBufferedChunks() {
+        if (lexicalIndex == null) {
+            return true;
+        }
+        try {
+            lexicalIndex.refresh();
+            return true;
+        } catch (IOException e) {
+            LOGGER.error("The lexical index could not be published, so this erasure cannot reach "
+                + "what it has buffered: {}", e.getMessage());
+            return false;
         }
     }
 
@@ -398,8 +560,13 @@ public final class DocumentErasureService {
                 ? lexicalIndex.compactNow(storedText)
                 : lexicalIndex.compactIfDue(storedText);
         } catch (IOException e) {
-            LOGGER.warn("Erased chunks stay on disk until the next compaction: {}", e.getMessage());
-            return CompactionResult.declined("compaction failed: " + e.getMessage());
+            // Logged with the cause, reported without it. This text is the erasure response's
+            // "detail" field, and an IOException from the index is usually an absolute path -
+            // the layout of the node's disk, which a client asking for its own document to be
+            // removed has no business being told.
+            LOGGER.warn("Erased chunks stay on disk until the next compaction", e);
+            return CompactionResult.declined(
+                "compaction failed; see the node's log for the reason");
         }
     }
 

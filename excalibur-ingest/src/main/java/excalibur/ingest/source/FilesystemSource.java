@@ -6,7 +6,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.DirectoryStream;
+import java.nio.file.FileSystemLoopException;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -19,6 +19,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.Spliterator;
+import java.util.Spliterators;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
@@ -42,7 +45,8 @@ import java.util.stream.StreamSupport;
  *   <li>Root path must be an existing, readable directory</li>
  *   <li>File extensions are case-insensitive (e.g., ".TXT" == ".txt")</li>
  *   <li>Maximum file size: 2GB (configurable)</li>
- *   <li>Symlinks are not followed by default (configurable)</li>
+ *   <li>Symlinks are not followed by default (configurable). When they are followed, a path
+ *       whose real location lies outside the root is not part of the source</li>
  *   <li>Hidden files are excluded by default (configurable)</li>
  *   <li>Directory modification times are used for change detection</li>
  * </ul>
@@ -102,6 +106,7 @@ public class FilesystemSource implements Source {
 
     private final String sourceId;
     private final Path rootPath;
+    private final Path realRootPath;
     private final Set<String> includedExtensions;
     private final Set<String> excludedDirectories;
     private final boolean followSymlinks;
@@ -128,6 +133,12 @@ public class FilesystemSource implements Source {
             throw new IllegalArgumentException(
                 "Root path must be an existing directory: " + rootPath
             );
+        }
+
+        try {
+            this.realRootPath = rootPath.toRealPath();
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Root path could not be resolved: " + rootPath, e);
         }
 
         this.includedExtensions = builder.includedExtensions.isEmpty()
@@ -164,13 +175,11 @@ public class FilesystemSource implements Source {
 
         LOG.info("Starting crawl for source {}: {}", sourceId, rootPath);
 
-        LinkOption[] linkOptions = followSymlinks
-            ? new LinkOption[0]
-            : new LinkOption[]{LinkOption.NOFOLLOW_LINKS};
+        LinkOption[] linkOptions = linkOptions();
 
         try {
-            return Files.walk(rootPath, maxDepth, followSymlinks ? new FileVisitOption[]{FileVisitOption.FOLLOW_LINKS} : new FileVisitOption[0])
-                .filter(path -> !closed)
+            return walk()
+                .map(this::stillListing)
                 .filter(path -> shouldProcessFile(path, linkOptions))
                 .map(this::toDocumentId)
                 .filter(Objects::nonNull)
@@ -238,22 +247,8 @@ public class FilesystemSource implements Source {
             throw new IllegalArgumentException("documentId must not be empty");
         }
 
-        Path filePath = toFilePath(documentId);
-        LinkOption[] linkOptions = followSymlinks
-            ? new LinkOption[0]
-            : new LinkOption[]{LinkOption.NOFOLLOW_LINKS};
-
-        if (!Files.exists(filePath, linkOptions)) {
-            throw new DocumentNotFoundException(documentId, sourceId);
-        }
-
-        if (!Files.isRegularFile(filePath, linkOptions)) {
-            throw new SourceException(
-                "Document is not a regular file: " + documentId,
-                sourceId,
-                false
-            );
-        }
+        Path filePath = resolveForFetch(documentId);
+        LinkOption[] linkOptions = linkOptions();
 
         try {
             BasicFileAttributes attrs = Files.readAttributes(filePath, BasicFileAttributes.class, linkOptions);
@@ -292,10 +287,8 @@ public class FilesystemSource implements Source {
     public long getDocumentCount() throws SourceException {
         ensureOpen();
 
-        try (Stream<Path> paths = Files.walk(rootPath, maxDepth)) {
-            LinkOption[] linkOptions = followSymlinks
-                ? new LinkOption[0]
-                : new LinkOption[]{LinkOption.NOFOLLOW_LINKS};
+        try (Stream<Path> paths = walk()) {
+            LinkOption[] linkOptions = linkOptions();
 
             long count = paths
                 .filter(path -> shouldProcessFile(path, linkOptions))
@@ -311,6 +304,8 @@ public class FilesystemSource implements Source {
                 true,
                 e
             );
+        } catch (UncheckedIOException e) {
+            throw new SourceException(e.getMessage(), sourceId, false, e.getCause());
         }
     }
 
@@ -318,10 +313,8 @@ public class FilesystemSource implements Source {
     public long getEstimatedTotalSize() throws SourceException {
         ensureOpen();
 
-        try (Stream<Path> paths = Files.walk(rootPath, maxDepth)) {
-            LinkOption[] linkOptions = followSymlinks
-                ? new LinkOption[0]
-                : new LinkOption[]{LinkOption.NOFOLLOW_LINKS};
+        try (Stream<Path> paths = walk()) {
+            LinkOption[] linkOptions = linkOptions();
 
             long totalSize = paths
                 .filter(path -> shouldProcessFile(path, linkOptions))
@@ -344,6 +337,8 @@ public class FilesystemSource implements Source {
                 true,
                 e
             );
+        } catch (UncheckedIOException e) {
+            throw new SourceException(e.getMessage(), sourceId, false, e.getCause());
         }
     }
 
@@ -387,6 +382,156 @@ public class FilesystemSource implements Source {
         }
     }
 
+    private LinkOption[] linkOptions() {
+        return followSymlinks
+            ? new LinkOption[0]
+            : new LinkOption[]{LinkOption.NOFOLLOW_LINKS};
+    }
+
+    /**
+     * Walks the tree the way this source is configured to see it.
+     *
+     * <p>The crawl, the document count and the size estimate all have to describe the same set
+     * of files, so they all come through here rather than each deciding for itself whether links
+     * are part of the tree.</p>
+     */
+    private Stream<Path> walk() throws IOException {
+        FileVisitOption[] visitOptions = followSymlinks
+            ? new FileVisitOption[]{FileVisitOption.FOLLOW_LINKS}
+            : new FileVisitOption[0];
+        return abortingClearly(Files.walk(rootPath, maxDepth, visitOptions));
+    }
+
+    /**
+     * Wraps a walk so a failure that surfaces while it is being consumed arrives as one clear
+     * error instead of an anonymous one from wherever the stream happened to be pulled.
+     *
+     * <p>{@code Files.walk} is lazy, and with links followed it reports a symlink cycle as an
+     * {@link UncheckedIOException} raised mid-traversal rather than from the call that started
+     * the walk. The walk must still fail: a caller handed a short listing would take every
+     * document the walk never reached as deleted and tombstone it. So the error is re-thrown,
+     * carrying the source it belongs to and saying that the listing is incomplete.</p>
+     */
+    private <T> Stream<T> abortingClearly(Stream<T> walk) {
+        Spliterator<T> elements = walk.spliterator();
+        Spliterator<T> guarded = new Spliterators.AbstractSpliterator<>(
+            elements.estimateSize(), elements.characteristics()) {
+
+            @Override
+            public boolean tryAdvance(Consumer<? super T> action) {
+                try {
+                    return elements.tryAdvance(action);
+                } catch (UncheckedIOException e) {
+                    throw walkAborted(e);
+                }
+            }
+        };
+        return StreamSupport.stream(guarded, false).onClose(walk::close);
+    }
+
+    /**
+     * Checks, as the walk is consumed, that the source has not been closed underneath it.
+     *
+     * <p>Filtering the closed case out instead ends the stream normally, and a listing that ends
+     * normally is read as the source's whole contents: change detection subtracts it from the
+     * registry and the reindex tombstones the difference, so a walk stopped near its start
+     * deletes most of the corpus. Deregistering a source closes it while its crawl may still be
+     * running, which is the ordinary way this happens.</p>
+     */
+    private Path stillListing(Path path) {
+        if (closed) {
+            LOG.error("Walk of source {} under {} aborted: the source was closed while the crawl "
+                + "was still running", sourceId, rootPath);
+            throw new IncompleteCrawlException(
+                "Walk of source " + sourceId + " aborted at " + rootPath + ": the source was "
+                    + "closed while the crawl was still running. What it listed is not the full "
+                    + "contents of the source and must not be read as one: the documents it "
+                    + "never reached still exist.");
+        }
+        return path;
+    }
+
+    private UncheckedIOException walkAborted(UncheckedIOException cause) {
+        IOException reason = cause.getCause();
+        String what = reason instanceof FileSystemLoopException loop
+            ? "a symlink cycle at " + loop.getFile()
+            : reason.toString();
+        LOG.error("Walk of source {} under {} aborted: {}", sourceId, rootPath, what);
+        return new UncheckedIOException(
+            "Walk of source " + sourceId + " aborted at " + rootPath + ": " + what
+                + ". What it listed is not the full contents of the source and must not be read "
+                + "as one: the documents it never reached still exist.",
+            reason);
+    }
+
+    /**
+     * Resolves a document id to the file to read, refusing one that is not part of this source.
+     *
+     * @param documentId The document id to resolve
+     * @return The file to read
+     * @throws DocumentNotFoundException if nothing exists at the resolved path
+     * @throws SourceException if the path is not a regular file, or leaves the source root
+     */
+    private Path resolveForFetch(String documentId)
+            throws SourceException, DocumentNotFoundException {
+        Path filePath = toFilePath(documentId);
+        LinkOption[] linkOptions = linkOptions();
+
+        if (!Files.exists(filePath, linkOptions)) {
+            throw new DocumentNotFoundException(documentId, sourceId);
+        }
+
+        if (!Files.isRegularFile(filePath, linkOptions)) {
+            throw new SourceException(
+                "Document is not a regular file: " + documentId,
+                sourceId,
+                false
+            );
+        }
+
+        if (followSymlinks && !staysInsideRoot(filePath)) {
+            throw new SourceException(
+                "Document " + documentId + " is reached through a link that leaves the source "
+                    + "root " + rootPath,
+                sourceId,
+                false
+            );
+        }
+
+        return filePath;
+    }
+
+    /**
+     * Decides whether a path reached by following links is still part of this source.
+     *
+     * <p>Containment is a property of the file, not of the name it was reached by. A deployment
+     * confines a source to an allowed root by canonicalising that root, and a link inside it
+     * would otherwise pull in a file from anywhere on the machine under a document id that
+     * relativises cleanly against the root - the textual path stays inside while the bytes come
+     * from outside. Comparing real path against real root is what actually closes that.</p>
+     *
+     * <p>A path whose real location cannot be read is refused too. That is not the transient
+     * error {@link #shouldProcessFile} deliberately keeps: a file that cannot be shown to lie
+     * inside the source may lie outside it, and indexing the contents of an unknown file is
+     * worse than leaving one file out of the crawl.</p>
+     */
+    private boolean staysInsideRoot(Path path) {
+        try {
+            Path realPath = path.toRealPath();
+            if (realPath.startsWith(realRootPath)) {
+                return true;
+            }
+            LOG.warn("Skipping {}: it resolves to {}, so the link leaves the source root {}.",
+                path, realPath, realRootPath);
+            return false;
+
+        } catch (IOException e) {
+            LOG.warn("Skipping {}: its real location could not be resolved ({}), so it cannot be "
+                + "shown to lie inside the source root {}.", path, e.getMessage(), realRootPath);
+            return false;
+        }
+    }
+
     private boolean shouldProcessFile(Path path, LinkOption[] linkOptions) {
         try {
             if (!Files.isRegularFile(path, linkOptions)) {
@@ -412,6 +557,10 @@ public class FilesystemSource implements Source {
                 }
             }
 
+            if (followSymlinks && !staysInsideRoot(path)) {
+                return false;
+            }
+
             long size = Files.size(path);
             if (size > maxFileSize) {
                 LOG.debug("Skipping file exceeding max size: {} ({} > {})", path, size, maxFileSize);
@@ -421,8 +570,16 @@ public class FilesystemSource implements Source {
             return true;
 
         } catch (IOException e) {
-            LOG.debug("Skipping file due to access error: {} - {}", path, e.getMessage());
-            return false;
+            // Kept in the crawl, not skipped. What this filter emits is also what tells a
+            // re-crawl which documents still exist: a registered document absent from the crawl
+            // is taken as deleted and its chunks are tombstoned. A file that was genuinely
+            // deleted never reaches this method - it is not in the directory listing to begin
+            // with - so every path that does reach it exists, and reading a transient
+            // permission or network error as a deletion destroys live data over a blip.
+            // Keeping it costs at most one failed fetch, which the run already reports.
+            LOG.warn("Could not inspect {}: {}. Keeping it in the crawl: a file this node "
+                + "cannot read is not a file that has been deleted.", path, e.getMessage());
+            return true;
         }
     }
 

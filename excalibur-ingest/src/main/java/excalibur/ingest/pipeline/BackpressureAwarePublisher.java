@@ -116,7 +116,8 @@ public class BackpressureAwarePublisher {
      * @param buffer   The sealed buffer to publish
      * @param metadata The document metadata to register
      * @return Publication result with epoch and chunk count
-     * @throws PublicationException if backpressure timeout is exceeded or publication fails
+     * @throws DocumentBatchPublisher.PublicationException if backpressure timeout is exceeded
+     *         or publication fails
      * @throws IllegalStateException if buffer is not sealed
      * @throws NullPointerException if buffer or metadata is null
      */
@@ -157,7 +158,8 @@ public class BackpressureAwarePublisher {
      * @param buffers       The sealed buffers to publish
      * @param metadataList  The corresponding document metadata
      * @return Bulk publication result with total chunks and epoch
-     * @throws PublicationException if backpressure timeout is exceeded or publication fails
+     * @throws DocumentBatchPublisher.PublicationException if backpressure timeout is exceeded
+     *         or publication fails
      * @throws IllegalStateException if any buffer is not sealed
      */
     public DocumentBatchPublisher.BulkPublicationResult publishBulk(

@@ -110,7 +110,8 @@ class ExcaliburMcpServerTest {
             assertThat(tools).isInstanceOf(List.class);
             assertThat(((List<?>) tools).stream().map(t -> Json.stringAt(t, "name")).toList())
                 .containsExactlyInAnyOrder(McpTools.SEARCH_DOCUMENTS, McpTools.SEARCH_GRAPH,
-                    McpTools.BUILD_GRAPH, McpTools.INGEST_DOCUMENTS, McpTools.INGESTION_STATUS);
+                    McpTools.BUILD_GRAPH, McpTools.INGEST_DOCUMENTS, McpTools.ADD_DOCUMENTS,
+                    McpTools.INGESTION_STATUS);
         }
     }
 

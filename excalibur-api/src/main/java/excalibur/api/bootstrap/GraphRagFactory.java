@@ -12,7 +12,7 @@ import io.excalibur.llm.client.LLMHttpClient;
 import excalibur.llm.client.LLMClientConfig;
 import io.excalibur.retrieval.rerank.EmbeddingGatedRanker;
 import io.excalibur.retrieval.rerank.FullPrecisionReranker;
-import io.excalibur.vector.distance.CosineSimilarity;
+import io.excalibur.vector.distance.DistanceFunctions;
 import excalibur.llm.embedding.EmbeddingClient;
 import io.excalibur.retrieval.HybridRetriever;
 import io.excalibur.retrieval.abstain.ThresholdAbstentionPolicy;
@@ -182,7 +182,10 @@ public final class GraphRagFactory {
                 new QueryClassifier(),
                 new LexicalEntityLinker(labels),
                 edges,
-                new HybridRetriever(List.of(rankerFor(config, documents, entityVectors))),
+                new HybridRetriever(List.of(rankerFor(config, documents, entityVectors)),
+                    new io.excalibur.retrieval.fusion.ReciprocalRankFusion(
+                        config.query().getRrfK()),
+                    config.query().getPerSignalOverFetch()),
                 new TripleSubgraphSerializer(entityNames, relationNames),
                 new ThresholdAbstentionPolicy(
                     settings.getMinScore(),
@@ -245,7 +248,9 @@ public final class GraphRagFactory {
         // unavailable and a missing embedding must degrade the answer rather than fail it.
         if (vectors != null) {
             ranked = new EmbeddingGatedRanker(
-                new FullPrecisionReranker(ranked, vectors::vectorOf, CosineSimilarity.getInstance()),
+                new FullPrecisionReranker(ranked, vectors::vectorOf,
+                    DistanceFunctions.byName(config.query().getDistanceMetric()),
+                    config.graph().getRerankOverFetch()),
                 ranked);
         }
 

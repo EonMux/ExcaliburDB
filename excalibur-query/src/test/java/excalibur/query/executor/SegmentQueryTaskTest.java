@@ -384,4 +384,38 @@ class SegmentQueryTaskTest {
                 .contains("9").contains("success=false");
         }
     }
+
+    @Nested
+    @DisplayName("Completeness")
+    class Completeness {
+
+        @Test
+        @DisplayName("a segment that answered in full says so")
+        void completeByDefault() {
+            SegmentQueryTask.SegmentQueryResult result = new SegmentQueryTask.SegmentQueryResult(
+                1L, java.util.List.of(), 0L, 5L, true, null);
+
+            assertThat(result.complete())
+                .as("a result built without the flag is a whole answer, as every existing "
+                    + "caller means it to be")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("a segment whose tail scan stopped early is not a whole answer")
+        void partialIsReported() {
+            // The write-log tail scan stops at the backpressure limit or on cancellation. The
+            // results it did gather are real and are kept, so the segment is not a failure -
+            // a failed segment's results are discarded wholesale. But it searched part of the
+            // segment, and reporting that as a complete answer tells a caller the whole corpus
+            // was covered when it was not.
+            SegmentQueryTask.SegmentQueryResult result = new SegmentQueryTask.SegmentQueryResult(
+                1L, java.util.List.of(), 120L, 5L, true, null, java.util.Map.of(), false);
+
+            assertThat(result.complete()).isFalse();
+            assertThat(result.success())
+                .as("still a success: its results are kept and merged")
+                .isTrue();
+        }
+    }
 }

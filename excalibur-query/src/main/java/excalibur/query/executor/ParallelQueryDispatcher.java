@@ -190,10 +190,35 @@ public class ParallelQueryDispatcher {
             QueryOptions options,
             DistanceFunction distanceFunction) {
 
+        return dispatchToSpecificSegments(segmentsToSearch, queryVector, options,
+            distanceFunction, PqSearchSettings.DISABLED);
+    }
+
+    /**
+     * Dispatches a query that may be answered from each segment's product quantizer.
+     *
+     * @param segmentsToSearch The segments to search, each with the graph to search it in and the
+     *                         node ids a pre-filter narrowed it to, or a null set for a whole-graph
+     *                         search
+     * @param queryVector The query vector
+     * @param options Query options
+     * @param distanceFunction The distance function
+     * @param pqSearch Whether a segment holding a trained quantizer may be searched through it,
+     *                 and how widely
+     * @return DispatchResult with the raw per-segment results and coverage
+     */
+    public DispatchResult dispatchToSpecificSegments(
+            List<SegmentInfo> segmentsToSearch,
+            float[] queryVector,
+            QueryOptions options,
+            DistanceFunction distanceFunction,
+            PqSearchSettings pqSearch) {
+
         Objects.requireNonNull(segmentsToSearch, "Segments to search cannot be null");
         Objects.requireNonNull(queryVector, "Query vector cannot be null");
         Objects.requireNonNull(options, "Query options cannot be null");
         Objects.requireNonNull(distanceFunction, "Distance function cannot be null");
+        Objects.requireNonNull(pqSearch, "PQ search settings cannot be null");
 
         long startTime = System.nanoTime();
 
@@ -204,7 +229,49 @@ public class ParallelQueryDispatcher {
 
         LOGGER.trace("Dispatching query to {} specific segments", segmentsToSearch.size());
 
-        // Create tasks for each segment
+        List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks =
+            searchTasks(segmentsToSearch, queryVector, options, distanceFunction, pqSearch);
+
+        // Dispatch tasks in parallel with timeout
+        List<Future<SegmentQueryTask.SegmentQueryResult>> futures;
+        try {
+            futures = executor.invokeAll(tasks, options.timeout().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.warn("Query dispatch interrupted");
+            return nothingSearched(segmentsToSearch.size(), startTime);
+        }
+
+        SegmentAnswers answers = collectAnswers(futures, segmentsToSearch, options);
+
+        long tailScanEntries = tailScanEntries(answers.results());
+        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+
+        LOGGER.trace("Query completed: {} segments, {}ms, {} timed out",
+            answers.results().size(), durationMs, answers.segmentsTimedOut());
+
+        return new DispatchResult(answers.results(), tailScanEntries,
+            answers.segmentsTimedOut(), durationMs);
+    }
+
+    /**
+     * Builds one search task per segment.
+     *
+     * @param segmentsToSearch The segments to search, each with the graph to search it in and
+     *                         the node ids a pre-filter narrowed it to
+     * @param queryVector The query vector
+     * @param options Query options
+     * @param distanceFunction The distance function
+     * @param pqSearch Whether a segment holding a trained quantizer may be searched through it
+     * @return The tasks to run in parallel
+     */
+    private static List<Callable<SegmentQueryTask.SegmentQueryResult>> searchTasks(
+            List<SegmentInfo> segmentsToSearch,
+            float[] queryVector,
+            QueryOptions options,
+            DistanceFunction distanceFunction,
+            PqSearchSettings pqSearch) {
+
         List<Callable<SegmentQueryTask.SegmentQueryResult>> tasks = new ArrayList<>();
         for (SegmentInfo info : segmentsToSearch) {
             SegmentQueryTask task = new SegmentQueryTask(
@@ -215,30 +282,34 @@ public class ParallelQueryDispatcher {
                 options.topK(),
                 options.oversamplingFactor(),
                 distanceFunction,
-                info.lshCandidates()
+                info.lshCandidates(),
+                pqSearch
             );
             tasks.add(task);
         }
+        return tasks;
+    }
 
-        // Dispatch tasks in parallel with timeout
+    /**
+     * Gathers what each segment returned, standing in for the ones that did not answer.
+     *
+     * <p>Every future is accounted for, in the order the segments were dispatched in, so that a
+     * segment which errored or ran out of time is reported as unanswered rather than dropped.
+     * A dropped segment is indistinguishable from one that was searched and held nothing.</p>
+     *
+     * @param futures The futures {@code invokeAll} returned, one per dispatched segment
+     * @param segmentsToSearch The segments, in the same order as the futures
+     * @param options Query options, for the timeout to report against a segment that hit it
+     * @return One result per segment, and how many of them ran out of time
+     */
+    private static SegmentAnswers collectAnswers(
+            List<Future<SegmentQueryTask.SegmentQueryResult>> futures,
+            List<SegmentInfo> segmentsToSearch,
+            QueryOptions options) {
+
         List<SegmentQueryTask.SegmentQueryResult> segmentResults = new ArrayList<>();
-        List<Future<SegmentQueryTask.SegmentQueryResult>> futures;
-
-        try {
-            futures = executor.invokeAll(tasks, options.timeout().toMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            LOGGER.warn("Query dispatch interrupted");
-            // Every segment is reported as unanswered rather than as searched-and-empty: an
-            // interrupted fan-out has no evidence about the corpus, and saying nothing matched
-            // would be the one reading the caller cannot tell from a real empty result.
-            return new DispatchResult(
-                List.of(), 0L, segmentsToSearch.size(),
-                (System.nanoTime() - startTime) / 1_000_000);
-        }
-
-        // Collect results
         int segmentsTimedOut = 0;
+
         for (int i = 0; i < futures.size(); i++) {
             Future<SegmentQueryTask.SegmentQueryResult> future = futures.get(i);
             SegmentInfo segmentInfo = segmentsToSearch.get(i);
@@ -262,52 +333,90 @@ public class ParallelQueryDispatcher {
                 }
             } catch (ExecutionException e) {
                 LOGGER.warn("Segment {} query failed: {}", segmentInfo.segmentId(), e.getCause().getMessage());
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId(),
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    e.getCause().getMessage()
-                ));
+                segmentResults.add(unanswered(segmentInfo, e.getCause().getMessage()));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 segmentsTimedOut++;
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId(),
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    "Interrupted"
-                ));
+                segmentResults.add(unanswered(segmentInfo, "Interrupted"));
             } catch (java.util.concurrent.CancellationException e) {
                 // Future was cancelled due to invokeAll timeout
                 segmentsTimedOut++;
-                segmentResults.add(new SegmentQueryTask.SegmentQueryResult(
-                    segmentInfo.segmentId(),
-                    List.of(),
-                    0,
-                    0,
-                    false,
-                    "Timeout"
-                ));
+                segmentResults.add(unanswered(segmentInfo, "Timeout"));
             }
         }
 
+        return new SegmentAnswers(segmentResults, segmentsTimedOut);
+    }
+
+    /**
+     * A stand-in for a segment that did not answer.
+     *
+     * <p>Marked as a failure rather than returned as an empty answer: a segment that errored,
+     * was interrupted or was cancelled has said nothing about the corpus, and the stages
+     * downstream drop a failed segment's results instead of reading its silence as a segment
+     * searched and found to hold nothing.</p>
+     *
+     * @param segmentInfo The segment that did not answer
+     * @param errorMessage Why it did not
+     * @return The stand-in result
+     */
+    private static SegmentQueryTask.SegmentQueryResult unanswered(SegmentInfo segmentInfo,
+                                                                  String errorMessage) {
+        return new SegmentQueryTask.SegmentQueryResult(
+            segmentInfo.segmentId(),
+            List.of(),
+            0,
+            0,
+            false,
+            errorMessage
+        );
+    }
+
+    /**
+     * The dispatch result for a fan-out that never got to run.
+     *
+     * <p>Every segment is reported as unanswered rather than as searched-and-empty: an
+     * interrupted fan-out has no evidence about the corpus, and saying nothing matched
+     * would be the one reading the caller cannot tell from a real empty result.</p>
+     *
+     * @param segmentCount How many segments were to be searched
+     * @param startTime When the dispatch began, in nanoseconds
+     * @return A result reporting every segment as unanswered
+     */
+    private static DispatchResult nothingSearched(int segmentCount, long startTime) {
+        return new DispatchResult(
+            List.of(), 0L, segmentCount,
+            (System.nanoTime() - startTime) / 1_000_000);
+    }
+
+    /**
+     * Totals the write-log entries the tail scans read.
+     *
+     * <p>Counted only for the segments that answered: a failed segment's result carries
+     * whatever its task had recorded before it failed, which is not work the query can claim
+     * to have covered the corpus with.</p>
+     *
+     * @param segmentResults The per-segment results
+     * @return The total entries scanned
+     */
+    private static long tailScanEntries(List<SegmentQueryTask.SegmentQueryResult> segmentResults) {
         long tailScanEntries = 0;
         for (SegmentQueryTask.SegmentQueryResult result : segmentResults) {
             if (result.success()) {
                 tailScanEntries += result.tailScanEntries();
             }
         }
+        return tailScanEntries;
+    }
 
-        long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-
-        LOGGER.trace("Query completed: {} segments, {}ms, {} timed out",
-            segmentResults.size(), durationMs, segmentsTimedOut);
-
-        return new DispatchResult(segmentResults, tailScanEntries, segmentsTimedOut, durationMs);
+    /**
+     * What the fan-out came back with.
+     *
+     * @param results One result per dispatched segment, in dispatch order
+     * @param segmentsTimedOut How many of them ran out of time or were cancelled
+     */
+    private record SegmentAnswers(List<SegmentQueryTask.SegmentQueryResult> results,
+                                  int segmentsTimedOut) {
     }
 
     /**

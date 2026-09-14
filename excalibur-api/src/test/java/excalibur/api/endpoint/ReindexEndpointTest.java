@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpExchange;
 
 import excalibur.ingest.source.Source;
 
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.BeforeEach;
@@ -28,13 +29,20 @@ import static org.mockito.Mockito.when;
  */
 class ReindexEndpointTest {
 
-    private ReindexEndpoint.InMemorySourceRegistry sourceRegistry;
+    private InMemorySourceRegistry sourceRegistry;
     private ReindexEndpoint.InMemoryReindexStatusRegistry statusRegistry;
 
     @BeforeEach
     void setUp() {
-        sourceRegistry = new ReindexEndpoint.InMemorySourceRegistry();
+        sourceRegistry = new InMemorySourceRegistry();
         statusRegistry = new ReindexEndpoint.InMemoryReindexStatusRegistry();
+    }
+
+    /** A source that is nothing but its id, which is all the registry reads here. */
+    private static Source sourceNamed(String sourceId) {
+        Source source = mock(Source.class);
+        when(source.getSourceId()).thenReturn(sourceId);
+        return source;
     }
 
     @Test
@@ -126,19 +134,19 @@ class ReindexEndpointTest {
     }
 
     @Test
-    @DisplayName("InMemorySourceRegistry should register and check sources")
+    @DisplayName("the source registry registers and reports what it holds")
     void testSourceRegistryRegisterAndCheck() {
         assertFalse(sourceRegistry.isRegistered("test-source"));
 
-        sourceRegistry.register("test-source");
+        sourceRegistry.register(sourceNamed("test-source"));
         assertTrue(sourceRegistry.isRegistered("test-source"));
     }
 
     @Test
-    @DisplayName("InMemorySourceRegistry should unregister sources")
+    @DisplayName("a removed source is no longer registered")
     void testSourceRegistryUnregister() {
-        sourceRegistry.register("test-source");
-        sourceRegistry.unregister("test-source");
+        sourceRegistry.register(sourceNamed("test-source"));
+        sourceRegistry.remove("test-source");
 
         assertFalse(sourceRegistry.isRegistered("test-source"));
     }
@@ -258,5 +266,117 @@ class ReindexEndpointTest {
         ArgumentCaptor<Integer> status = ArgumentCaptor.forClass(Integer.class);
         verify(exchange).sendResponseHeaders(status.capture(), anyLong());
         return new Response(status.getValue(), responseBody.toString(StandardCharsets.UTF_8));
+    }
+
+    @Nested
+    @DisplayName("Cancelling a reindex")
+    class Cancelling {
+
+        /**
+         * A rolling replacement that hangs holds its source's claim for the life of the process,
+         * and every later reindex of that source is answered 409 forever. Without a way to stop
+         * it, the only recovery is restarting the node.
+         */
+        @Test
+        @DisplayName("asks a running reindex to stop")
+        void cancelsARunningReindex() throws IOException {
+            excalibur.api.reindex.ReindexCoordinator coordinator =
+                new excalibur.api.reindex.ReindexCoordinator();
+            sourceRegistry.register(sourceNamed("docs"));
+            coordinator.tryAcquire("docs");
+            ReindexEndpoint endpoint =
+                new ReindexEndpoint(sourceRegistry, statusRegistry, coordinator);
+            java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+
+            endpoint.handle(exchange("DELETE", "{\"source_id\": \"docs\"}", body));
+
+            assertThat(body.toString(java.nio.charset.StandardCharsets.UTF_8))
+                .contains("\"cancelled\": true");
+        }
+
+        @Test
+        @DisplayName("reports that nothing was running for a source with no reindex in flight")
+        void nothingToCancel() throws IOException {
+            excalibur.api.reindex.ReindexCoordinator coordinator =
+                new excalibur.api.reindex.ReindexCoordinator();
+            sourceRegistry.register(sourceNamed("docs"));
+            ReindexEndpoint endpoint =
+                new ReindexEndpoint(sourceRegistry, statusRegistry, coordinator);
+            java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+
+            endpoint.handle(exchange("DELETE", "{\"source_id\": \"docs\"}", body));
+
+            assertThat(body.toString(java.nio.charset.StandardCharsets.UTF_8))
+                .contains("\"cancelled\": false");
+        }
+
+        /**
+         * The claim used to be released by the submitted task's own finally. A virtual-thread
+         * executor skips the task body entirely when the future is cancelled before the thread
+         * is scheduled, so that finally never ran and the claim was never released: every later
+         * reindex of the source answered 409 for the life of the process. That is the exact
+         * condition this endpoint's DELETE exists to clear, produced by using it.
+         */
+        @Test
+        @DisplayName("a reindex cancelled before it starts still releases its claim")
+        void cancellingBeforeTheRunStartsReleasesTheClaim() throws Exception {
+            excalibur.api.reindex.ReindexCoordinator coordinator =
+                new excalibur.api.reindex.ReindexCoordinator();
+            sourceRegistry.register(sourceNamed("docs"));
+            ReindexEndpoint endpoint = new ReindexEndpoint(sourceRegistry, statusRegistry,
+                org.mockito.Mockito.mock(excalibur.ingest.pipeline.DocumentReindexer.class),
+                org.mockito.Mockito.mock(excalibur.ingest.source.SourceResolver.class),
+                null, null, coordinator);
+
+            // Repeated, because the leak depends on the cancel landing before the run thread is
+            // scheduled. One iteration would pass by luck; twenty will not.
+            for (int attempt = 0; attempt < 20; attempt++) {
+                endpoint.handle(exchange("POST", "{\"source_id\": \"docs\"}",
+                    new java.io.ByteArrayOutputStream()));
+                endpoint.handle(exchange("DELETE", "{\"source_id\": \"docs\"}",
+                    new java.io.ByteArrayOutputStream()));
+
+                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+                while (coordinator.isRunning("docs") && System.nanoTime() < deadline) {
+                    Thread.sleep(2);
+                }
+                assertThat(coordinator.isRunning("docs"))
+                    .as("attempt %d left the source claimed with nothing running", attempt)
+                    .isFalse();
+            }
+            endpoint.close();
+        }
+
+        @Test
+        @DisplayName("refuses a method that is neither POST nor DELETE")
+        void refusesOtherMethods() throws IOException {
+            ReindexEndpoint endpoint = new ReindexEndpoint(sourceRegistry, statusRegistry);
+            java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+
+            endpoint.handle(exchange("PUT", "{}", body));
+
+            org.mockito.Mockito.verify(lastExchange)
+                .sendResponseHeaders(org.mockito.ArgumentMatchers.eq(405),
+                    org.mockito.ArgumentMatchers.anyLong());
+        }
+    }
+
+    private com.sun.net.httpserver.HttpExchange lastExchange;
+
+    private com.sun.net.httpserver.HttpExchange exchange(
+            String method, String requestBody, java.io.ByteArrayOutputStream responseBody) {
+        com.sun.net.httpserver.HttpExchange exchange =
+            org.mockito.Mockito.mock(com.sun.net.httpserver.HttpExchange.class);
+        org.mockito.Mockito.when(exchange.getRequestMethod()).thenReturn(method);
+        org.mockito.Mockito.when(exchange.getRequestURI())
+            .thenReturn(java.net.URI.create("/v1/reindex"));
+        org.mockito.Mockito.when(exchange.getRequestBody()).thenReturn(
+            new java.io.ByteArrayInputStream(
+                requestBody.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        org.mockito.Mockito.when(exchange.getResponseBody()).thenReturn(responseBody);
+        org.mockito.Mockito.when(exchange.getResponseHeaders())
+            .thenReturn(new com.sun.net.httpserver.Headers());
+        this.lastExchange = exchange;
+        return exchange;
     }
 }

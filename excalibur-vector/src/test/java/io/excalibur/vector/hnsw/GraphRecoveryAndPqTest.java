@@ -2,6 +2,8 @@ package io.excalibur.vector.hnsw;
 
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.DistanceFunction;
+import io.excalibur.vector.quantization.PQDistanceTable;
+import io.excalibur.vector.quantization.ProductQuantizer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -27,7 +29,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * entry point, so the graph navigates from a corrupted vector.</p>
  *
  * <p>Separately, PQ codes are keyed by node id, and compaction renumbers node ids. Codes left
- * behind describe a different vector than the node they are now attached to.</p>
+ * behind describe a different vector than the node they are now attached to, and codes simply
+ * dropped leave the segment holding a quantizer with nothing to quantise against.</p>
  */
 @DisplayName("Graph recovery and PQ")
 class GraphRecoveryAndPqTest {
@@ -96,8 +99,8 @@ class GraphRecoveryAndPqTest {
     }
 
     @Test
-    @DisplayName("compaction does not leave PQ codes keyed by the old numbering")
-    void compactionDropsStalePqCodes() throws IOException {
+    @DisplayName("compaction re-keys PQ codes to the numbering it produced")
+    void compactionRekeysPqCodes() throws IOException {
         try (HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 1000)) {
             for (int i = 0; i < 40; i++) {
                 graph.insert(randomVector());
@@ -115,14 +118,19 @@ class GraphRecoveryAndPqTest {
 
             assertThat(graph.compact(tempDir)).isEqualTo(10);
 
-            assertThat(graph.encodedVectorCount())
-                .as("codes describing the old numbering would score every node against another "
-                    + "vector's quantisation")
-                .isZero();
+            float[] query = randomVector();
+            ProductQuantizer quantizer = graph.getProductQuantizer();
+            PQDistanceTable table = quantizer.createDistanceTable(query, distanceFunction);
 
-            // Search still answers, falling back to full precision for nodes with no codes.
-            List<HnswSearchResult> results = graph.searchWithPQ(randomVector(), 5);
+            List<HnswSearchResult> results = graph.searchWithPQ(query, 5);
             assertThat(results).isNotEmpty();
+            for (HnswSearchResult result : results) {
+                assertThat(result.distance())
+                    .as("node %d must be scored against its own quantisation, not against "
+                        + "whichever vector held its id before the renumbering", result.nodeId())
+                    .isEqualTo(table.lookup(
+                        quantizer.encode(graph.readNode(result.nodeId()).vector())));
+            }
         }
     }
 

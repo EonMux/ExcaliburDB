@@ -135,6 +135,59 @@ class HnswConfigFactoryTest {
     }
 
     @Test
+    void shouldReadConnectivityFromShardConfig() {
+        Map<String, String> props = new HashMap<>();
+        props.put("excalibur.shard.default-max-connections", "24");
+        props.put("excalibur.shard.default-max-connections-layer0", "64");
+
+        Config config = new Config("test", Map.of(), props);
+        HnswConfigFactory factory = HnswConfigFactory.fromShardConfig(config.shard());
+
+        assertThat(factory.getMaxConnections()).isEqualTo(24);
+        assertThat(factory.getMaxConnectionsLayer0()).isEqualTo(64);
+
+        HnswConfig created = factory.create(128);
+        assertThat(created.maxConnections()).isEqualTo(24);
+        assertThat(created.maxConnectionsLayer0()).isEqualTo(64);
+        assertThat(created.mL()).isEqualTo(HnswConfig.mLFor(24));
+    }
+
+    @Test
+    void shouldResolveLayer0ToTwiceMaxConnectionsWhenUnset() {
+        Map<String, String> props = new HashMap<>();
+        props.put("excalibur.shard.default-max-connections", "20");
+
+        Config config = new Config("test", Map.of(), props);
+        HnswConfigFactory factory = HnswConfigFactory.fromShardConfig(config.shard());
+
+        assertThat(factory.getMaxConnectionsLayer0()).isEqualTo(40);
+        assertThat(factory.create(64).maxConnectionsLayer0()).isEqualTo(40);
+    }
+
+    @Test
+    void shouldCarryConnectivityThroughTheEfOverrides() {
+        Map<String, String> props = new HashMap<>();
+        props.put("excalibur.shard.default-max-connections", "12");
+
+        Config config = new Config("test", Map.of(), props);
+        HnswConfigFactory factory = HnswConfigFactory.fromShardConfig(config.shard());
+
+        assertThat(factory.createWithEfSearch(64, 99).maxConnections()).isEqualTo(12);
+        assertThat(factory.createWithEfSearch(64, 99).maxConnectionsLayer0()).isEqualTo(24);
+        assertThat(factory.createWithEfConstruction(64, 99).maxConnections()).isEqualTo(12);
+        assertThat(factory.createWithEfConstruction(64, 99).maxConnectionsLayer0()).isEqualTo(24);
+    }
+
+    @Test
+    void shouldKeepTheHnswDefaultsWhenConnectivityIsNotGiven() {
+        HnswConfigFactory factory = new HnswConfigFactory(200, 100);
+
+        assertThat(factory.getMaxConnections()).isEqualTo(HnswConfig.DEFAULT_MAX_CONNECTIONS);
+        assertThat(factory.getMaxConnectionsLayer0())
+            .isEqualTo(HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0);
+    }
+
+    @Test
     void shouldProduceConsistentConfigs() {
         // Verify that the factory produces configs that are equivalent to
         // HnswConfig.fromShardConfig()

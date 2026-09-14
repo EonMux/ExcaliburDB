@@ -27,6 +27,18 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>HALF_OPEN → OPEN: On failed request (cooldown resets)</li>
  * </ul>
  *
+ * <h2>Probing is rationed</h2>
+ * <p>Half-opening admits a bounded number of callers - one by default - and keeps failing the
+ * rest fast until a probe settles the state. Admitting everyone who happens to be waiting
+ * would hand the provider its entire backlog in a single burst at the exact moment it is least
+ * able to take it, which is the stampede the breaker exists to prevent; spread over a cooldown
+ * those requests were at least arriving one at a time.</p>
+ *
+ * <p>A probe that never reports back - a caller killed, or stuck in a read that outlives every
+ * timeout - would otherwise hold the only permit forever and leave the endpoint unreachable
+ * for good. The permits are therefore reissued once a probe has had a full cooldown period to
+ * answer, which bounds the damage of a lost caller at one extra cooldown.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe. All state transitions are atomic and can be safely
  * called from concurrent threads. The implementation uses:</p>
@@ -78,6 +90,30 @@ public final class CircuitBreaker {
     public static final int MAX_FAILURE_THRESHOLD = 100;
 
     /**
+     * Default number of callers admitted as probes when the circuit half-opens.
+     *
+     * <p>One. A single answer is all that is needed to tell a recovered provider from one that
+     * is still down, and every additional probe is load applied to something that has just
+     * demonstrated it cannot take load.</p>
+     */
+    public static final int DEFAULT_HALF_OPEN_PROBES = 1;
+
+    /**
+     * Smallest useful probe allowance.
+     *
+     * <p>Zero would mean a circuit that opens once and never reopens.</p>
+     */
+    public static final int MIN_HALF_OPEN_PROBES = 1;
+
+    /**
+     * Largest accepted probe allowance.
+     *
+     * <p>Bounded so that a misconfiguration cannot turn the half-open state back into the
+     * unlimited admission this replaces.</p>
+     */
+    public static final int MAX_HALF_OPEN_PROBES = 100;
+
+    /**
      * Default cooldown period before transitioning from OPEN to HALF_OPEN.
      * Domain correctness: 60 seconds is a reasonable default for LLM service recovery.
      */
@@ -110,42 +146,62 @@ public final class CircuitBreaker {
         final CircuitBreakerState state;
         final int failureCount;
         final long openedAtMillis;
+        /** Probes still admissible in HALF_OPEN; meaningless in the other states. */
+        final int probePermits;
+        /** When the current half-open window began, used to reissue permits a probe abandoned. */
+        final long halfOpenAtMillis;
 
-        InternalState(CircuitBreakerState state, int failureCount, long openedAtMillis) {
+        InternalState(CircuitBreakerState state, int failureCount, long openedAtMillis,
+                      int probePermits, long halfOpenAtMillis) {
             this.state = state;
             this.failureCount = failureCount;
             this.openedAtMillis = openedAtMillis;
+            this.probePermits = probePermits;
+            this.halfOpenAtMillis = halfOpenAtMillis;
         }
 
         /** Initial state: CLOSED with 0 failures */
         static InternalState initial() {
-            return new InternalState(CircuitBreakerState.CLOSED, 0, 0);
+            return new InternalState(CircuitBreakerState.CLOSED, 0, 0, 0, 0);
         }
 
         /** Create a new state with updated failure count */
         InternalState withFailureCount(int newFailureCount) {
-            return new InternalState(this.state, newFailureCount, this.openedAtMillis);
+            return new InternalState(this.state, newFailureCount, this.openedAtMillis,
+                this.probePermits, this.halfOpenAtMillis);
         }
 
         /** Create a new state in OPEN with new timestamp */
         InternalState asOpenWithNewTimestamp(long timestamp) {
-            return new InternalState(CircuitBreakerState.OPEN, this.failureCount, timestamp);
+            return new InternalState(CircuitBreakerState.OPEN, this.failureCount, timestamp, 0, 0);
         }
 
         /** Create a new state in CLOSED with reset counters */
         InternalState asClosed() {
-            return new InternalState(CircuitBreakerState.CLOSED, 0, 0);
+            return new InternalState(CircuitBreakerState.CLOSED, 0, 0, 0, 0);
         }
 
-        /** Create a new state in HALF_OPEN (preserves openedAtMillis for timing queries) */
-        InternalState asHalfOpen() {
-            return new InternalState(CircuitBreakerState.HALF_OPEN, 0, this.openedAtMillis);
+        /**
+         * Opens a half-open window holding {@code permits} probes.
+         *
+         * <p>openedAtMillis is preserved so callers can still ask how long the circuit has been
+         * unhealthy; it is cleared only on the way to CLOSED.</p>
+         */
+        InternalState asHalfOpen(int permits, long now) {
+            return new InternalState(CircuitBreakerState.HALF_OPEN, 0, this.openedAtMillis,
+                permits, now);
+        }
+
+        /** Consumes one probe permit, leaving the half-open window otherwise untouched. */
+        InternalState withProbeConsumed() {
+            return new InternalState(this.state, this.failureCount, this.openedAtMillis,
+                this.probePermits - 1, this.halfOpenAtMillis);
         }
 
         @Override
         public String toString() {
             return "InternalState{state=" + state + ", failureCount=" + failureCount +
-                   ", openedAtMillis=" + openedAtMillis + '}';
+                   ", openedAtMillis=" + openedAtMillis + ", probePermits=" + probePermits + '}';
         }
     }
 
@@ -160,6 +216,9 @@ public final class CircuitBreaker {
 
     /** Name of this circuit breaker (for logging and metrics) */
     private final String name;
+
+    /** How many callers may probe a half-open circuit before the rest fail fast again */
+    private final int halfOpenProbes;
 
     /**
      * Creates a new CircuitBreaker with default settings.
@@ -185,6 +244,32 @@ public final class CircuitBreaker {
      * @throws IllegalArgumentException if parameters are outside valid ranges
      */
     public CircuitBreaker(int failureThreshold, Duration cooldownPeriod, String name) {
+        this(failureThreshold, cooldownPeriod, name, DEFAULT_HALF_OPEN_PROBES);
+    }
+
+    /**
+     * Creates a circuit breaker that admits a chosen number of probes when it half-opens.
+     *
+     * <p>Raise the allowance above one only for a provider whose health cannot be read from a
+     * single request - one behind a load balancer with a partially failed pool, say, where one
+     * success proves only that one backend is up. It is load applied to a service that has just
+     * failed, so the burden is on the reason for raising it.</p>
+     *
+     * @param failureThreshold Consecutive failures that open the circuit, in [1, 100]
+     * @param cooldownPeriod   How long to stay open before probing, in [100ms, 1h]
+     * @param name             Name for logging and identification
+     * @param halfOpenProbes   Callers admitted per half-open window, in [1, 100]
+     * @throws IllegalArgumentException if any parameter is outside its valid range
+     */
+    public CircuitBreaker(int failureThreshold, Duration cooldownPeriod, String name,
+                          int halfOpenProbes) {
+        if (halfOpenProbes < MIN_HALF_OPEN_PROBES || halfOpenProbes > MAX_HALF_OPEN_PROBES) {
+            throw new IllegalArgumentException(
+                "Half-open probe allowance must be in range [" + MIN_HALF_OPEN_PROBES + ", "
+                    + MAX_HALF_OPEN_PROBES + "], got: " + halfOpenProbes);
+        }
+        this.halfOpenProbes = halfOpenProbes;
+
         // Domain correctness: validate failure threshold is positive and in range
         if (failureThreshold < MIN_FAILURE_THRESHOLD || failureThreshold > MAX_FAILURE_THRESHOLD) {
             throw new IllegalArgumentException(
@@ -207,57 +292,98 @@ public final class CircuitBreaker {
         this.name = name != null ? name : "unnamed";
         this.internalState = new AtomicReference<>(InternalState.initial());
 
-        LOG.debug("CircuitBreaker '{}' initialized with failureThreshold={}, cooldownPeriod={}ms",
-                this.name, failureThreshold, cooldownPeriod.toMillis());
+        LOG.debug("CircuitBreaker '{}' initialized with failureThreshold={}, cooldownPeriod={}ms, "
+                + "halfOpenProbes={}",
+                this.name, failureThreshold, cooldownPeriod.toMillis(), halfOpenProbes);
     }
 
     /**
-     * Checks if a request is allowed to proceed.
+     * Reports whether this caller may reach the provider, and reserves its place if so.
      *
-     * <p>If the circuit is OPEN, checks if the cooldown period has elapsed
-     * and transitions to HALF_OPEN if so.</p>
+     * <p>Not a pure query: in HALF_OPEN a {@code true} result consumes one of the probe
+     * permits, so every call that returns true must be followed by exactly one
+     * {@link #recordSuccess()} or {@link #recordFailure()}. A caller that asks and then does
+     * not go costs the circuit one probe window.</p>
      *
-     * <p><strong>Thread Safety:</strong> This method is lock-free and thread-safe.
-     * State transitions use CAS to ensure atomicity.</p>
+     * <p><strong>Thread Safety:</strong> lock-free. Every transition is a compare-and-set on
+     * one immutable state object, so two threads racing to half-open the circuit, or to take
+     * the last probe permit, cannot both win.</p>
      *
-     * @return true if the request should proceed, false if the circuit is open
+     * @return true if the request should proceed, false if the circuit is refusing traffic
      */
     public boolean allowRequest() {
-        InternalState current = internalState.get();
+        while (true) {
+            InternalState current = internalState.get();
 
-        switch (current.state) {
-            case CLOSED:
-                return true;
+            switch (current.state) {
+                case CLOSED:
+                    return true;
 
-            case OPEN:
-                // Check if cooldown period has elapsed
-                long elapsedMillis = Instant.now().toEpochMilli() - current.openedAtMillis;
-
-                if (elapsedMillis >= cooldownPeriod.toMillis()) {
-                    // Try to transition to HALF_OPEN atomically
-                    InternalState halfOpenState = current.asHalfOpen();
-                    if (internalState.compareAndSet(current, halfOpenState)) {
-                        LOG.info("CircuitBreaker '{}' transitioned from OPEN to HALF_OPEN after {}ms cooldown",
-                                name, elapsedMillis);
+                case OPEN: {
+                    long now = Instant.now().toEpochMilli();
+                    long elapsedMillis = now - current.openedAtMillis;
+                    if (elapsedMillis < cooldownPeriod.toMillis()) {
+                        LOG.debug("CircuitBreaker '{}' is OPEN, rejecting request "
+                                + "({}ms remaining in cooldown)",
+                            name, cooldownPeriod.toMillis() - elapsedMillis);
+                        return false;
+                    }
+                    // This caller becomes the first probe, so the window opens one permit short.
+                    if (internalState.compareAndSet(current,
+                            current.asHalfOpen(halfOpenProbes - 1, now))) {
+                        LOG.info("CircuitBreaker '{}' transitioned from OPEN to HALF_OPEN after "
+                                + "{}ms cooldown; admitting up to {} probe(s)",
+                            name, elapsedMillis, halfOpenProbes);
                         return true;
                     }
-                    // Another thread beat us to the transition - re-read and check
-                    InternalState newState = internalState.get();
-                    return newState.state == CircuitBreakerState.HALF_OPEN;
+                    continue;
                 }
 
-                LOG.debug("CircuitBreaker '{}' is OPEN, rejecting request ({}ms remaining in cooldown)",
-                        name, cooldownPeriod.toMillis() - elapsedMillis);
-                return false;
+                case HALF_OPEN: {
+                    if (current.probePermits > 0) {
+                        if (internalState.compareAndSet(current, current.withProbeConsumed())) {
+                            return true;
+                        }
+                        continue;
+                    }
+                    if (reissueProbes(current)) {
+                        return true;
+                    }
+                    LOG.debug("CircuitBreaker '{}' is HALF_OPEN with no probe permit left, "
+                        + "rejecting request", name);
+                    return false;
+                }
 
-            case HALF_OPEN:
-                // In HALF_OPEN, we allow requests through to test the waters
-                return true;
-
-            default:
-                LOG.warn("CircuitBreaker '{}' in unknown state: {}", name, current.state);
-                return false;
+                default:
+                    LOG.warn("CircuitBreaker '{}' in unknown state: {}", name, current.state);
+                    return false;
+            }
         }
+    }
+
+    /**
+     * Starts a fresh half-open window if the outstanding probes have had their chance.
+     *
+     * <p>Guards against a probe that never reports: its caller may have been killed, or be
+     * blocked in a read that outlived every timeout, and nothing else will ever settle the
+     * state on its behalf. Without this the first such caller would hold the last permit for
+     * the lifetime of the process and the circuit would never reopen for anyone. A probe is
+     * given a full cooldown period to answer before its permit is written off.</p>
+     *
+     * @param current The half-open state observed by the caller
+     * @return true if this caller was admitted as a probe in a new window
+     */
+    private boolean reissueProbes(InternalState current) {
+        long now = Instant.now().toEpochMilli();
+        if (now - current.halfOpenAtMillis < cooldownPeriod.toMillis()) {
+            return false;
+        }
+        if (!internalState.compareAndSet(current, current.asHalfOpen(halfOpenProbes - 1, now))) {
+            return false;
+        }
+        LOG.warn("CircuitBreaker '{}' reissuing probes; the previous probe never reported within "
+            + "{}ms", name, cooldownPeriod.toMillis());
+        return true;
     }
 
     /**
@@ -414,6 +540,18 @@ public final class CircuitBreaker {
     }
 
     /**
+     * Returns how many callers this breaker admits per half-open window.
+     *
+     * <p>Exposed for monitoring and for tests that need to know how many probes to expect
+     * before the circuit starts refusing again.</p>
+     *
+     * @return Probe allowance, in [1, 100]
+     */
+    public int getHalfOpenProbeAllowance() {
+        return halfOpenProbes;
+    }
+
+    /**
      * Returns the name of this circuit breaker.
      *
      * @return Name (never null)
@@ -472,7 +610,7 @@ public final class CircuitBreaker {
      */
     public void trip() {
         long now = Instant.now().toEpochMilli();
-        InternalState openState = new InternalState(CircuitBreakerState.OPEN, 0, now);
+        InternalState openState = new InternalState(CircuitBreakerState.OPEN, 0, now, 0, 0);
         internalState.set(openState);
         LOG.warn("CircuitBreaker '{}' manually tripped to OPEN", name);
     }

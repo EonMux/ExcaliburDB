@@ -12,6 +12,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.foreign.Arena;
 import java.nio.file.Path;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -101,6 +102,26 @@ class IndexOrchestratorCompactionArenaTest {
                 orchestrator.stop();
                 orchestrator.close();
             }).doesNotThrowAnyException();
+        }
+
+        @Test
+        @DisplayName("a run reports the segments it cannot compact as failures, not as skips")
+        void compactionOnDemandReportsFailuresRatherThanSkips() {
+            StorageEngine engine = mock(StorageEngine.class);
+            when(engine.arena()).thenReturn(null);
+            when(engine.getSegments()).thenReturn(Map.of(0L, mock(Segment.class)));
+            orchestrator = new IndexOrchestrator(mock(SegmentCatalog.class), engine);
+
+            CompactionReport report = orchestrator.compactNow(true);
+
+            assertThat(report.segmentsConsidered()).isEqualTo(1);
+            assertThat(report.segmentsFailed())
+                .as("the caller asked for every segment to be rewritten and none could be")
+                .isEqualTo(1);
+            assertThat(report.segmentsSkipped())
+                .as("a skip means the policy declined a segment, which nothing here did")
+                .isZero();
+            assertThat(report.hasFailures()).isTrue();
         }
 
         @Test

@@ -1,14 +1,16 @@
 package excalibur.api.bootstrap;
 
 import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.shard.CompactionSettings;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
+import excalibur.shard.allocator.VolumePlacements;
 import io.excalibur.config.Config;
 import io.excalibur.core.memory.MemorySegmentFactory;
 import io.excalibur.store.Segment;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
-import io.excalibur.vector.distance.CosineSimilarity;
+import io.excalibur.vector.distance.DistanceFunctions;
 import io.excalibur.vector.hnsw.HnswConfigFactory;
 import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.TailOffsetTracker;
@@ -60,6 +62,18 @@ public record CoreComponents(Arena arena,
     /** Distinct terms one segment's filter is sized for when nothing says otherwise. */
     public static final int DEFAULT_SEGMENT_CAPACITY = 10_000;
 
+    /** Property setting how many bits of each term the membership filter keeps. */
+    public static final String KEY_FINGERPRINT_BITS = "excalibur.filter.fingerprint-bits";
+
+    /** Bits kept per term when nothing says otherwise, for roughly a 0.1% false positive rate. */
+    public static final int DEFAULT_FINGERPRINT_BITS = 13;
+
+    /** Fewest bits a fingerprint may be kept at. */
+    public static final int MIN_FINGERPRINT_BITS = 4;
+
+    /** Most bits a fingerprint may be kept at. */
+    public static final int MAX_FINGERPRINT_BITS = 16;
+
     /**
      * Builds and starts the storage stack.
      *
@@ -75,10 +89,12 @@ public record CoreComponents(Arena arena,
 
         // Resolved before anything is allocated. Every other misconfiguration in this server
         // fails before the resource it would govern exists -- the port before the socket, the
-        // keystore before the listener -- and a capacity rejected halfway through leaves an open
-        // Arena and a started storage engine behind with nothing left holding them.
+        // keystore before the listener -- and a value rejected halfway through leaves an open
+        // Arena and a started storage engine behind with nothing left holding them, at a point
+        // where the shutdown hook is not registered yet and storage closes non-durably.
         long corpusCapacity = corpusCapacity(config);
         int segmentCapacity = segmentCapacity(config);
+        int fingerprintBits = fingerprintBits(config);
 
         boolean panamaAvailable = MemorySegmentFactory.isPanamaAvailable();
         Arena arena = panamaAvailable ? Arena.ofShared() : null;
@@ -87,11 +103,19 @@ public record CoreComponents(Arena arena,
 
         StorageEngine storageEngine = createStorageEngine(config, dataDir, arena, hnswConfigFactory);
         VolumeManager volumeManager = createVolumeManager(storageEngine);
+
+        // Before start(). Start is where the engine scans for what is on disk and creates
+        // whatever the base keyspace is missing, and both depend on knowing the volume set;
+        // a placement installed afterwards would have it scan one set of directories and
+        // write to another.
+        VolumePlacements.install(storageEngine, volumeManager, config.shard().getVolumes());
+        startStorageEngine(storageEngine);
+
         IndexOrchestrator indexOrchestrator =
             createIndexOrchestrator(config, dataDir, storageEngine, volumeManager);
         shareTheVisibilityClock(storageEngine, indexOrchestrator);
         HierarchicalCuckooFilter hierarchicalFilter =
-            createHierarchicalCuckooFilter(corpusCapacity, segmentCapacity);
+            createHierarchicalCuckooFilter(corpusCapacity, segmentCapacity, fingerprintBits);
         indexOrchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
 
         wireCompactionCallback(storageEngine, indexOrchestrator);
@@ -104,8 +128,12 @@ public record CoreComponents(Arena arena,
     /**
      * Creates the storage engine.
      *
+     * <p>The engine is configured but not started: {@link #create} installs the segment
+     * placement first, and start() is where the engine scans the directories that placement
+     * names.</p>
+     *
      * @param dataDir Data directory path
-     * @return Initialized storage engine
+     * @return Configured storage engine, not yet started
      */
     private static StorageEngine createStorageEngine(Config config, Path dataDir, Arena arena,
                                                     HnswConfigFactory hnswConfigFactory) {
@@ -128,10 +156,17 @@ public record CoreComponents(Arena arena,
         // returns null for every segment returns nothing at all.
         engine.setHnswInitializer(createHnswInitializer(config, hnswConfigFactory, arena));
 
-        engine.start();
-
-        LOGGER.info("Storage engine initialized with {} segments", engine.getSegmentCount());
         return engine;
+    }
+
+    /**
+     * Starts the storage engine, once everything start() depends on has been installed.
+     *
+     * @param engine The configured, not yet started engine
+     */
+    private static void startStorageEngine(StorageEngine engine) {
+        engine.start();
+        LOGGER.info("Storage engine initialized with {} segments", engine.getSegmentCount());
     }
 
     /**
@@ -185,7 +220,11 @@ public record CoreComponents(Arena arena,
             IndexOrchestrator.DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,
             IndexOrchestrator.DEFAULT_REINDEX_CHECK_INTERVAL_MS,
             config.visibility().getEpochTickMs(),
-            resumeEpoch
+            resumeEpoch,
+            // Both compaction workers are built in the constructor and never reconfigured, so
+            // the configured policy has to arrive with the rest of the arguments rather than
+            // through a setter afterwards.
+            CompactionSettings.fromConfig(config.shard())
         );
 
         // The configured delay before compaction's first check, matching what
@@ -207,7 +246,8 @@ public record CoreComponents(Arena arena,
      * <ul>
      *   <li>Corpus capacity: {@value #DEFAULT_CORPUS_CAPACITY} entries, or
      *       {@code excalibur.filter.corpus-capacity}</li>
-     *   <li>Fingerprint bits: 13 (provides ~0.1% false positive rate)</li>
+     *   <li>Fingerprint bits: {@value #DEFAULT_FINGERPRINT_BITS}, or
+     *       {@code excalibur.filter.fingerprint-bits}</li>
      *   <li>Cluster capacity: the corpus capacity, because every segment shares one cluster</li>
      *   <li>Segment capacity: {@value #DEFAULT_SEGMENT_CAPACITY} distinct terms, or
      *       {@code excalibur.filter.segment-capacity}</li>
@@ -215,14 +255,13 @@ public record CoreComponents(Arena arena,
      *
      * @param corpusCapacity  Entries the corpus level is sized for, already validated
      * @param segmentCapacity Distinct terms each segment's level is sized for, already validated
+     * @param fingerprintBits Bits kept per term, already validated
      * @return Initialized hierarchical Cuckoo filter
      */
     private static HierarchicalCuckooFilter createHierarchicalCuckooFilter(long corpusCapacity,
-                                                                           int segmentCapacity) {
+                                                                           int segmentCapacity,
+                                                                           int fingerprintBits) {
         LOGGER.info("Initializing hierarchical Cuckoo filter...");
-
-        // Default parameters tuned for ~0.1% false positive rate
-        int fingerprintBits = 13;
 
         // Every segment is registered into a single "default" cluster, so the cluster level does
         // not partition anything: it holds the whole corpus's terms. Sized at a fraction of the
@@ -278,6 +317,38 @@ public record CoreComponents(Arena arena,
     private static int segmentCapacity(Config config) {
         long parsed = positiveCapacity(config, KEY_SEGMENT_CAPACITY, DEFAULT_SEGMENT_CAPACITY);
         return (int) Math.min(parsed, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Resolves how many bits of each term the membership filter keeps.
+     *
+     * <p>This is the accuracy-for-memory trade the filter makes. Each extra bit halves the
+     * chance that two unrelated terms look alike, and so halves the segments a query scans for
+     * nothing; each costs one more bit per slot, and the filter has about twice as many slots
+     * as the corpus capacity. Below the floor the filter stops ruling anything out; above the
+     * ceiling a fingerprint no longer fits the slot the format gives it.</p>
+     *
+     * @param config The application configuration
+     * @return The configured bit width, or {@link #DEFAULT_FINGERPRINT_BITS}
+     * @throws IllegalArgumentException if a value is configured and is outside the range
+     */
+    private static int fingerprintBits(Config config) {
+        String value = config.getEffectiveProperties().get(KEY_FINGERPRINT_BITS);
+        if (value == null || value.isBlank()) {
+            return DEFAULT_FINGERPRINT_BITS;
+        }
+        int parsed;
+        try {
+            parsed = Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                KEY_FINGERPRINT_BITS + " must be a whole number, got: " + value, e);
+        }
+        if (parsed < MIN_FINGERPRINT_BITS || parsed > MAX_FINGERPRINT_BITS) {
+            throw new IllegalArgumentException(KEY_FINGERPRINT_BITS + " must be between "
+                + MIN_FINGERPRINT_BITS + " and " + MAX_FINGERPRINT_BITS + ", got: " + parsed);
+        }
+        return parsed;
     }
 
     /**
@@ -364,14 +435,15 @@ public record CoreComponents(Arena arena,
         io.excalibur.store.HnswInitializer initializer =
             new io.excalibur.store.HnswInitializer(
                 hnswConfigFactory,
-                CosineSimilarity.getInstance(),
+                DistanceFunctions.byName(config.query().getDistanceMetric()),
                 dimension,
                 io.excalibur.store.HnswInitializer.DEFAULT_MAX_NODES,
                 arena  // May be null for ByteBuffer fallback
             );
 
-        LOGGER.info("HNSW initializer created: dimension={}, maxNodes={}",
-            initializer.getDimension(), initializer.getMaxNodes());
+        LOGGER.info("HNSW initializer created: dimension={}, maxNodes={}, metric={}",
+            initializer.getDimension(), initializer.getMaxNodes(),
+            config.query().getDistanceMetric());
         return initializer;
     }
 

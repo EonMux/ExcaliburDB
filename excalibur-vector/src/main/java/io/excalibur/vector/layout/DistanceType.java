@@ -1,5 +1,10 @@
 package io.excalibur.vector.layout;
 
+import io.excalibur.vector.distance.CosineSimilarity;
+import io.excalibur.vector.distance.DistanceFunction;
+import io.excalibur.vector.distance.InnerProduct;
+import io.excalibur.vector.distance.L2Distance;
+
 /**
  * Enumeration of supported distance/similarity metrics for batch vector operations.
  *
@@ -81,5 +86,24 @@ public enum DistanceType {
      * <p>For similarity search where smaller = more similar, use the negated
      * value: distance = -inner_product</p>
      */
-    INNER_PRODUCT
+    INNER_PRODUCT;
+
+    /**
+     * Returns the {@link DistanceFunction} that computes this metric.
+     *
+     * <p>The batch operations in this package name their metric with this enum while
+     * the index and the query path name it with a {@code DistanceFunction}. Both
+     * describe the same three metrics, so this method is the single place the two
+     * vocabularies are tied together: a metric added to one has to be given a mapping
+     * here before it can be used from the other.</p>
+     *
+     * @return The shared singleton implementing this metric, never null
+     */
+    public DistanceFunction toDistanceFunction() {
+        return switch (this) {
+            case COSINE -> CosineSimilarity.getInstance();
+            case L2 -> L2Distance.getInstance();
+            case INNER_PRODUCT -> InnerProduct.getInstance();
+        };
+    }
 }

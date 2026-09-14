@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Configuration data class representing all ExcaliburDB settings.
@@ -318,6 +319,18 @@ public final class Config {
         /** Chunk index segments tolerated before the smallest are merged. */
         public static final int DEFAULT_LEXICAL_MAX_SEGMENTS = 16;
 
+        /** Tokens one chunk aims for. */
+        public static final int DEFAULT_CHUNK_TARGET_TOKENS = 512;
+
+        /** Tokens a chunk repeats from the one before it. */
+        public static final int DEFAULT_CHUNK_OVERLAP_TOKENS = 64;
+
+        /** BM25's term-frequency saturation point. */
+        public static final double DEFAULT_BM25_K1 = 1.2;
+
+        /** How much BM25 discounts a match for the length of the chunk it was found in. */
+        public static final double DEFAULT_BM25_B = 0.75;
+
         // All fields final for immutability
         private final int documentTimeoutMs;
         private final boolean documentAtomicity;
@@ -326,6 +339,10 @@ public final class Config {
         private final double lexicalTombstoneRatio;
         private final long lexicalMaxLatencySeconds;
         private final int lexicalMaxSegments;
+        private final int chunkTargetTokens;
+        private final int chunkOverlapTokens;
+        private final double bm25K1;
+        private final double bm25B;
 
         /**
          * Creates an Ingest config from properties.
@@ -367,6 +384,75 @@ public final class Config {
                 throw new IllegalArgumentException("excalibur.ingest.lexical-max-segments must be "
                     + "at least 1, got: " + lexicalMaxSegments);
             }
+            this.chunkTargetTokens = PropertyParser.parseInt(props,
+                "excalibur.ingest.chunk-target-tokens", DEFAULT_CHUNK_TARGET_TOKENS);
+            if (chunkTargetTokens < 1) {
+                throw new IllegalArgumentException("excalibur.ingest.chunk-target-tokens must be "
+                    + "at least 1, got: " + chunkTargetTokens);
+            }
+            this.chunkOverlapTokens = PropertyParser.parseInt(props,
+                "excalibur.ingest.chunk-overlap-tokens", DEFAULT_CHUNK_OVERLAP_TOKENS);
+            if (chunkOverlapTokens < 0) {
+                throw new IllegalArgumentException("excalibur.ingest.chunk-overlap-tokens must be "
+                    + "non-negative, got: " + chunkOverlapTokens);
+            }
+            // Refused at startup rather than at the first document. An overlap at or past the
+            // target makes every chunk begin where the last one began, so chunking never
+            // advances; the chunker itself rejects it, and finding that out mid-ingestion means
+            // a crawl that registered cleanly and then failed document by document.
+            if (chunkOverlapTokens >= chunkTargetTokens) {
+                throw new IllegalArgumentException("excalibur.ingest.chunk-overlap-tokens must be "
+                    + "less than excalibur.ingest.chunk-target-tokens, got: " + chunkOverlapTokens
+                    + " >= " + chunkTargetTokens);
+            }
+            this.bm25K1 = PropertyParser.parseDouble(props,
+                "excalibur.ingest.bm25-k1", DEFAULT_BM25_K1);
+            if (Double.isNaN(bm25K1) || bm25K1 < 0) {
+                throw new IllegalArgumentException("excalibur.ingest.bm25-k1 must be "
+                    + "non-negative, got: " + bm25K1);
+            }
+            this.bm25B = PropertyParser.parseDouble(props,
+                "excalibur.ingest.bm25-b", DEFAULT_BM25_B);
+            if (Double.isNaN(bm25B) || bm25B < 0 || bm25B > 1) {
+                throw new IllegalArgumentException("excalibur.ingest.bm25-b must be in [0, 1], "
+                    + "got: " + bm25B);
+            }
+        }
+
+        /** Tokens one chunk aims for. */
+        public int getChunkTargetTokens() {
+            return chunkTargetTokens;
+        }
+
+        /** Tokens a chunk repeats from the one before it. */
+        public int getChunkOverlapTokens() {
+            return chunkOverlapTokens;
+        }
+
+        /**
+         * BM25's term-frequency saturation point.
+         *
+         * <p>Higher values keep rewarding a term that appears again; 0 reduces term frequency
+         * to a yes-or-no. It is recorded in the index at build time, because the per-block
+         * score bounds that let a search skip blocks are computed from it: a scorer using one
+         * value against bounds written with another can prune a chunk it should have kept.</p>
+         *
+         * @return the k1 parameter, non-negative
+         */
+        public double getBm25K1() {
+            return bm25K1;
+        }
+
+        /**
+         * How much BM25 discounts a match for the length of the chunk it was found in.
+         *
+         * <p>1 normalises fully by length, 0 not at all. Recorded in the index for the same
+         * reason as {@link #getBm25K1()}.</p>
+         *
+         * @return the b parameter, in [0, 1]
+         */
+        public double getBm25B() {
+            return bm25B;
         }
 
         /** Which engine indexes chunk text: {@code native} or {@code lucene}. */
@@ -523,6 +609,12 @@ public final class Config {
      *       built may contribute results (default: true)</li>
      *   <li><code>excalibur.query.hybrid-retrieval</code> - Whether a node holding both signals
      *       fuses them on {@code /v1/query} (default: true)</li>
+     *   <li><code>excalibur.query.distance-metric</code> - Which distance the vector index is
+     *       built and searched with (default: cosine)</li>
+     *   <li><code>excalibur.query.rrf-k</code> - Reciprocal rank fusion's rank offset
+     *       (default: 60)</li>
+     *   <li><code>excalibur.query.per-signal-over-fetch</code> - How many times top_k each
+     *       signal contributes to a fusion (default: 3)</li>
      * </ul>
      */
     public static final class Query {
@@ -548,6 +640,33 @@ public final class Config {
         // Default LLM timeout
         public static final int DEFAULT_LLM_TIMEOUT_MS = 60000;
 
+        /** Cosine similarity: the default, and what an unnormalised embedding model wants. */
+        public static final String METRIC_COSINE = "cosine";
+
+        /** Euclidean (L2) distance. */
+        public static final String METRIC_L2 = "l2";
+
+        /** Inner product, for models whose vectors carry magnitude that means something. */
+        public static final String METRIC_INNER_PRODUCT = "inner_product";
+
+        /** Metrics a vector index may be built and searched with. */
+        public static final Set<String> METRICS =
+            Set.of(METRIC_COSINE, METRIC_L2, METRIC_INNER_PRODUCT);
+
+        /** The metric an index is built and searched with unless one is named. */
+        public static final String DEFAULT_DISTANCE_METRIC = METRIC_COSINE;
+
+        // Reciprocal rank fusion's rank offset. 60 is the value the method was published with
+        // and the one every published comparison is against. Raising it flattens the weight
+        // curve, so a document ranked tenth by one signal counts for nearly as much as one
+        // ranked first; lowering it makes the top of each list dominate.
+        public static final int DEFAULT_RRF_K = 60;
+
+        // How many times top_k each signal contributes before fusion. A document has to be in
+        // a signal's list to be fused at all, so this is what lets a result that is second-rate
+        // on one signal and excellent on the other survive to be ranked.
+        public static final int DEFAULT_PER_SIGNAL_OVER_FETCH = 3;
+
         // Minimum and maximum values for validation (used by ConfigValidation)
         public static final int MIN_TOP_K = 1;
         public static final int MAX_TOP_K = 10000;
@@ -565,6 +684,9 @@ public final class Config {
         private final int llmTimeoutMs;
         private final boolean includePartialSegments;
         private final boolean hybridRetrieval;
+        private final String distanceMetric;
+        private final int rrfK;
+        private final int perSignalOverFetch;
 
         /**
          * Creates a Query config from properties.
@@ -578,6 +700,27 @@ public final class Config {
             this.llmTimeoutMs = PropertyParser.parseInt(props, "excalibur.query.llm-timeout-ms", DEFAULT_LLM_TIMEOUT_MS);
             this.includePartialSegments = PropertyParser.parseBoolean(props, "excalibur.query.include-partial-segments", true);
             this.hybridRetrieval = PropertyParser.parseBoolean(props, "excalibur.query.hybrid-retrieval", DEFAULT_HYBRID_RETRIEVAL);
+            this.distanceMetric = PropertyParser.parseString(props,
+                "excalibur.query.distance-metric", DEFAULT_DISTANCE_METRIC)
+                .trim().toLowerCase(java.util.Locale.ROOT);
+            if (!METRICS.contains(distanceMetric)) {
+                // Refused rather than fallen back from. A node that silently searched by cosine
+                // after being told to use l2 would answer every query, and every answer would be
+                // ranked by a measure the operator did not choose.
+                throw new IllegalArgumentException("excalibur.query.distance-metric must be one "
+                    + "of " + new java.util.TreeSet<>(METRICS) + ", got: " + distanceMetric);
+            }
+            this.rrfK = PropertyParser.parseInt(props, "excalibur.query.rrf-k", DEFAULT_RRF_K);
+            if (rrfK < 1) {
+                throw new IllegalArgumentException("excalibur.query.rrf-k must be at least 1, "
+                    + "got: " + rrfK);
+            }
+            this.perSignalOverFetch = PropertyParser.parseInt(props,
+                "excalibur.query.per-signal-over-fetch", DEFAULT_PER_SIGNAL_OVER_FETCH);
+            if (perSignalOverFetch < 1) {
+                throw new IllegalArgumentException("excalibur.query.per-signal-over-fetch must "
+                    + "be at least 1, got: " + perSignalOverFetch);
+            }
         }
 
         /**
@@ -628,12 +771,39 @@ public final class Config {
             return hybridRetrieval;
         }
 
+        /**
+         * Which distance the vector index is built and searched with.
+         *
+         * <p>The choice belongs to the embedding model: cosine for the usual normalised
+         * models, inner product where a vector's magnitude carries meaning, l2 where the
+         * model was trained against Euclidean distance. It is recorded in each graph's
+         * header at creation, and a graph built with one metric refuses to open under
+         * another rather than returning a silently worse ranking.</p>
+         *
+         * @return one of {@code cosine}, {@code l2} or {@code inner_product}
+         */
+        public String getDistanceMetric() {
+            return distanceMetric;
+        }
+
+        /** @return reciprocal rank fusion's rank offset */
+        public int getRrfK() {
+            return rrfK;
+        }
+
+        /** @return how many times top_k each signal contributes to a fusion */
+        public int getPerSignalOverFetch() {
+            return perSignalOverFetch;
+        }
+
         @Override
         public String toString() {
             return "Query{defaultTopK=" + defaultTopK +
                    ", threshold=" + threshold + ", vectorDimensions=" + vectorDimensions +
                    ", llmTimeoutMs=" + llmTimeoutMs + ", includePartialSegments=" + includePartialSegments +
-                   ", hybridRetrieval=" + hybridRetrieval + '}';
+                   ", hybridRetrieval=" + hybridRetrieval
+                   + ", distanceMetric='" + distanceMetric + "', rrfK=" + rrfK
+                   + ", perSignalOverFetch=" + perSignalOverFetch + '}';
         }
     }
 
@@ -917,12 +1087,96 @@ public final class Config {
         // Default HNSW integration queue depth limit
         public static final int DEFAULT_HNSW_QUEUE_LIMIT = 100000;
 
+        /** Neighbours an HNSW node keeps above layer 0. */
+        public static final int DEFAULT_MAX_CONNECTIONS = 16;
+
+        /** Layer 0 neighbours, which carry the exhaustive part of the walk. Zero means 2*M. */
+        public static final int DEFAULT_MAX_CONNECTIONS_LAYER0 = 0;
+
+        /** Most neighbours a node may keep above layer 0, the graph format's own ceiling. */
+        public static final int MAX_MAX_CONNECTIONS = 256;
+
+        /** Most neighbours a node may keep at layer 0. */
+        public static final int MAX_MAX_CONNECTIONS_LAYER0 = 512;
+
+        /** How often the segment compactor looks for work. */
+        public static final long DEFAULT_COMPACTION_INTERVAL_MS = 5000L;
+
+        /** Tombstoned fraction of a segment at which a rewrite repays itself. */
+        public static final double DEFAULT_COMPACTION_TOMBSTONE_RATIO = 0.2;
+
+        /** Write log size at which a segment is compacted whatever its tombstone ratio. */
+        public static final int DEFAULT_COMPACTION_WRITE_LOG_MB = 32;
+
+        /** Segments compacted at once. */
+        public static final int DEFAULT_COMPACTION_MAX_CONCURRENT = 4;
+
+        /** How often the HNSW compactor looks for work. */
+        public static final long DEFAULT_HNSW_COMPACTION_INTERVAL_MS = 60000L;
+
+        /** Deleted fraction of a graph at which its nodes are worth renumbering. */
+        public static final double DEFAULT_HNSW_COMPACTION_TOMBSTONE_RATIO = 0.2;
+
+        /** Hash tables in a segment's LSH index. */
+        public static final int DEFAULT_LSH_HASH_TABLES = 15;
+
+        /** Hash functions concatenated into one LSH bucket key. */
+        public static final int DEFAULT_LSH_HASH_FUNCTIONS = 16;
+
+        /** Neighbouring LSH buckets probed beside the query's own. */
+        public static final int DEFAULT_LSH_PROBES = 3;
+
+        /**
+         * Most hash functions one LSH bucket key may concatenate.
+         *
+         * <p>The key is packed into a long, one bit per function, which is where the 63 comes
+         * from. It is the index format's own ceiling, restated here because this module has no
+         * dependency on the one that enforces it - and a value the index will refuse has to be
+         * refused at startup, against the property that carried it, rather than turning every
+         * segment into a warning about its on-disk shape.</p>
+         */
+        public static final int MAX_LSH_HASH_FUNCTIONS = 63;
+
+        /**
+         * Most hash tables one segment's LSH index may hold.
+         *
+         * <p>Each table allocates {@code hashFunctions * dimensions} floats of hyperplanes per
+         * segment, so this number multiplies the two beside it and then multiplies again by
+         * every segment on the node. Unbounded, a mistyped value asks for terabytes and the
+         * resulting OutOfMemoryError kills an ingestion thread rather than the startup that
+         * caused it.</p>
+         */
+        public static final int MAX_LSH_HASH_TABLES = 256;
+
+        /** Most neighbouring buckets one query may probe beside its own. */
+        public static final int MAX_LSH_PROBES = 64;
+
+        /** Whether a segment's product quantiser answers the first pass of a search. */
+        public static final boolean DEFAULT_PQ_SEARCH_ENABLED = false;
+
+        /** Candidates the quantised pass collects per result, for exact rescoring. */
+        public static final int DEFAULT_PQ_OVERSAMPLE = 4;
+
         // All fields final for immutability
         private final double loadFactor;
         private final int efConstruction;
         private final int efSearch;
         private final int compactDelayMs;
         private final int hnswQueueLimit;
+        private final int maxConnections;
+        private final int maxConnectionsLayer0;
+        private final long compactionIntervalMs;
+        private final double compactionTombstoneRatio;
+        private final int compactionWriteLogMb;
+        private final int compactionMaxConcurrent;
+        private final long hnswCompactionIntervalMs;
+        private final double hnswCompactionTombstoneRatio;
+        private final int lshHashTables;
+        private final int lshHashFunctions;
+        private final int lshProbes;
+        private final List<String> volumes;
+        private final boolean pqSearchEnabled;
+        private final int pqOversample;
 
         /**
          * Creates a Shard config from properties.
@@ -968,6 +1222,106 @@ public final class Config {
                     "hnswQueueLimit must be at least 1, got: " + parsedHnswQueueLimit);
             }
             this.hnswQueueLimit = parsedHnswQueueLimit;
+
+            // The ceilings are the graph format's, not a preference: a wider node than this is
+            // refused when the first graph is built. Checked here so that refusal is a startup
+            // message about a setting rather than a failure on the first document indexed.
+            this.maxConnections = inRange(props, "excalibur.shard.default-max-connections",
+                DEFAULT_MAX_CONNECTIONS, 2, MAX_MAX_CONNECTIONS);
+            int parsedLayer0 = PropertyParser.parseInt(props,
+                "excalibur.shard.default-max-connections-layer0",
+                DEFAULT_MAX_CONNECTIONS_LAYER0);
+            if (parsedLayer0 > MAX_MAX_CONNECTIONS_LAYER0) {
+                throw new IllegalArgumentException(
+                    "excalibur.shard.default-max-connections-layer0 must be at most "
+                        + MAX_MAX_CONNECTIONS_LAYER0 + ", got: " + parsedLayer0);
+            }
+            if (parsedLayer0 != 0 && parsedLayer0 < maxConnections) {
+                // Layer 0 is where the walk becomes exhaustive, so it is given at least as many
+                // neighbours as the layers above it. A smaller value is a typo rather than a
+                // tuning choice, and it degrades recall at the layer that decides the answer.
+                throw new IllegalArgumentException(
+                    "excalibur.shard.default-max-connections-layer0 must be 0, meaning twice "
+                        + "excalibur.shard.default-max-connections, or at least that value ("
+                        + maxConnections + "), got: " + parsedLayer0);
+            }
+            this.maxConnectionsLayer0 = parsedLayer0 == 0
+                ? Math.min(maxConnections * 2, MAX_MAX_CONNECTIONS_LAYER0)
+                : parsedLayer0;
+
+            this.compactionIntervalMs = atLeastLong(props,
+                "excalibur.shard.compaction-interval-ms", DEFAULT_COMPACTION_INTERVAL_MS, 100L);
+            this.compactionTombstoneRatio = unitRatio(props,
+                "excalibur.shard.compaction-tombstone-ratio",
+                DEFAULT_COMPACTION_TOMBSTONE_RATIO);
+            this.compactionWriteLogMb = atLeast(props,
+                "excalibur.shard.compaction-write-log-mb", DEFAULT_COMPACTION_WRITE_LOG_MB, 1);
+            this.compactionMaxConcurrent = atLeast(props,
+                "excalibur.shard.compaction-max-concurrent",
+                DEFAULT_COMPACTION_MAX_CONCURRENT, 1);
+            this.hnswCompactionIntervalMs = atLeastLong(props,
+                "excalibur.shard.hnsw-compaction-interval-ms",
+                DEFAULT_HNSW_COMPACTION_INTERVAL_MS, 100L);
+            this.hnswCompactionTombstoneRatio = unitRatio(props,
+                "excalibur.shard.hnsw-compaction-tombstone-ratio",
+                DEFAULT_HNSW_COMPACTION_TOMBSTONE_RATIO);
+
+            this.lshHashTables = inRange(props, "excalibur.shard.lsh-hash-tables",
+                DEFAULT_LSH_HASH_TABLES, 1, MAX_LSH_HASH_TABLES);
+            this.lshHashFunctions = inRange(props, "excalibur.shard.lsh-hash-functions",
+                DEFAULT_LSH_HASH_FUNCTIONS, 1, MAX_LSH_HASH_FUNCTIONS);
+            this.lshProbes = inRange(props, "excalibur.shard.lsh-probes", DEFAULT_LSH_PROBES,
+                1, MAX_LSH_PROBES);
+
+            this.volumes = Arrays.stream(
+                    PropertyParser.parseString(props, "excalibur.shard.volumes", "").split(","))
+                .map(String::trim)
+                .filter(value -> !value.isEmpty())
+                .toList();
+
+            this.pqSearchEnabled = PropertyParser.parseBoolean(props,
+                "excalibur.shard.pq-search-enabled", DEFAULT_PQ_SEARCH_ENABLED);
+            this.pqOversample = atLeast(props, "excalibur.shard.pq-oversample",
+                DEFAULT_PQ_OVERSAMPLE, 1);
+        }
+
+        private static int inRange(Map<String, String> props, String key, int fallback,
+                                   int minimum, int maximum) {
+            int value = atLeast(props, key, fallback, minimum);
+            if (value > maximum) {
+                throw new IllegalArgumentException(
+                    key + " must be at most " + maximum + ", got: " + value);
+            }
+            return value;
+        }
+
+        private static int atLeast(Map<String, String> props, String key, int fallback,
+                                   int minimum) {
+            int value = PropertyParser.parseInt(props, key, fallback);
+            if (value < minimum) {
+                throw new IllegalArgumentException(
+                    key + " must be at least " + minimum + ", got: " + value);
+            }
+            return value;
+        }
+
+        private static long atLeastLong(Map<String, String> props, String key, long fallback,
+                                        long minimum) {
+            long value = PropertyParser.parseLong(props, key, fallback);
+            if (value < minimum) {
+                throw new IllegalArgumentException(
+                    key + " must be at least " + minimum + ", got: " + value);
+            }
+            return value;
+        }
+
+        private static double unitRatio(Map<String, String> props, String key, double fallback) {
+            double value = PropertyParser.parseDouble(props, key, fallback);
+            if (Double.isNaN(value) || value <= 0 || value > 1) {
+                throw new IllegalArgumentException(
+                    key + " must be in (0, 1], got: " + value);
+            }
+            return value;
         }
 
         /**
@@ -1005,11 +1359,125 @@ public final class Config {
             return hnswQueueLimit;
         }
 
+        /**
+         * Neighbours an HNSW node keeps above layer 0, the graph's {@code M}.
+         *
+         * <p>More neighbours mean better recall, a larger graph file and a slower build. The
+         * value is written into each graph's header when it is created, and a graph already on
+         * disk keeps the value it was built with: changing this affects new graphs only.</p>
+         *
+         * @return the connection bound, at least 2
+         */
+        public int getMaxConnections() {
+            return maxConnections;
+        }
+
+        /**
+         * Neighbours an HNSW node keeps at layer 0, where the walk becomes exhaustive.
+         *
+         * @return the layer 0 bound, resolved to twice {@link #getMaxConnections()} by default
+         */
+        public int getMaxConnectionsLayer0() {
+            return maxConnectionsLayer0;
+        }
+
+        /** @return how often the segment compactor looks for work, in milliseconds */
+        public long getCompactionIntervalMs() {
+            return compactionIntervalMs;
+        }
+
+        /** @return tombstoned fraction of a segment at which a rewrite repays itself */
+        public double getCompactionTombstoneRatio() {
+            return compactionTombstoneRatio;
+        }
+
+        /** @return write log size, in MiB, that triggers a compaction on its own */
+        public int getCompactionWriteLogMb() {
+            return compactionWriteLogMb;
+        }
+
+        /** @return how many segments are compacted at once */
+        public int getCompactionMaxConcurrent() {
+            return compactionMaxConcurrent;
+        }
+
+        /** @return how often the HNSW compactor looks for work, in milliseconds */
+        public long getHnswCompactionIntervalMs() {
+            return hnswCompactionIntervalMs;
+        }
+
+        /** @return deleted fraction of a graph at which its nodes are worth renumbering */
+        public double getHnswCompactionTombstoneRatio() {
+            return hnswCompactionTombstoneRatio;
+        }
+
+        /** @return hash tables in a segment's LSH index */
+        public int getLshHashTables() {
+            return lshHashTables;
+        }
+
+        /** @return hash functions concatenated into one LSH bucket key */
+        public int getLshHashFunctions() {
+            return lshHashFunctions;
+        }
+
+        /** @return neighbouring LSH buckets probed beside the query's own */
+        public int getLshProbes() {
+            return lshProbes;
+        }
+
+        /**
+         * Directories segments may be placed across, beyond the data directory.
+         *
+         * <p>Empty, the default, keeps every segment in the data directory. Naming volumes
+         * spreads new segments over them and the data directory together, by a consistent hash
+         * of the segment id, so a volume added later moves as few existing segments as
+         * possible. Every named volume has to be present at startup, and stay present: a
+         * segment placed on a volume that is not mounted on the next start is a segment the
+         * node cannot read.</p>
+         *
+         * @return the configured volume paths, in the order given, possibly empty
+         */
+        public List<String> getVolumes() {
+            return volumes;
+        }
+
+        /**
+         * Whether a segment's product quantiser answers the first pass of a vector search.
+         *
+         * <p>Off by default. On, a search scores candidates from their quantised codes, which
+         * is several times cheaper per candidate and less accurate, then rescores the
+         * survivors against their full-precision vectors so the ranking it returns is exact.
+         * What the approximation can still cost is a document the first pass never shortlisted;
+         * {@link #getPqOversample()} is what buys that back.</p>
+         *
+         * @return true when the quantised first pass is used
+         */
+        public boolean isPqSearchEnabled() {
+            return pqSearchEnabled;
+        }
+
+        /** @return candidates the quantised pass collects per result it is asked for */
+        public int getPqOversample() {
+            return pqOversample;
+        }
+
         @Override
         public String toString() {
             return "Shard{loadFactor=" + loadFactor + ", efConstruction=" + efConstruction +
                    ", efSearch=" + efSearch + ", compactDelayMs=" + compactDelayMs +
-                   ", hnswQueueLimit=" + hnswQueueLimit + '}';
+                   ", hnswQueueLimit=" + hnswQueueLimit + ", maxConnections=" + maxConnections +
+                   ", maxConnectionsLayer0=" + maxConnectionsLayer0 +
+                   ", compactionIntervalMs=" + compactionIntervalMs +
+                   ", compactionTombstoneRatio=" + compactionTombstoneRatio +
+                   ", compactionWriteLogMb=" + compactionWriteLogMb +
+                   ", compactionMaxConcurrent=" + compactionMaxConcurrent +
+                   ", hnswCompactionIntervalMs=" + hnswCompactionIntervalMs +
+                   ", hnswCompactionTombstoneRatio=" + hnswCompactionTombstoneRatio +
+                   ", lshHashTables=" + lshHashTables +
+                   ", lshHashFunctions=" + lshHashFunctions + ", lshProbes=" + lshProbes +
+                   ", volumes=" + volumes + ", pqSearchEnabled=" + pqSearchEnabled +
+                   ", pqOversample=" + pqOversample + '}';
         }
     }
 
@@ -1076,6 +1544,9 @@ public final class Config {
         /** Documents each retrieval signal contributes before fusion. */
         public static final int DEFAULT_TOP_K = 10;
 
+        /** Candidates the full-precision reranker reads per result it returns. */
+        public static final int DEFAULT_RERANK_OVER_FETCH = 4;
+
         /** Lucene RAM buffer, in megabytes, for the read-only indexes. */
         public static final double DEFAULT_RAM_BUFFER_MB = 16.0;
 
@@ -1135,6 +1606,7 @@ public final class Config {
         private final int maxAmbiguousCandidates;
         private final int contextTokenBudget;
         private final int topK;
+        private final int rerankOverFetch;
         private final double ramBufferMb;
         private final boolean extractionEnabled;
         private final int extractorVersion;
@@ -1218,6 +1690,9 @@ public final class Config {
                 "context-token-budget");
             this.topK = requirePositive(PropertyParser.parseInt(
                 props, "excalibur.graph.top-k", DEFAULT_TOP_K), "top-k");
+            this.rerankOverFetch = requirePositive(PropertyParser.parseInt(
+                props, "excalibur.graph.rerank-over-fetch", DEFAULT_RERANK_OVER_FETCH),
+                "rerank-over-fetch");
             double buffer = PropertyParser.parseDouble(
                 props, "excalibur.graph.ram-buffer-mb", DEFAULT_RAM_BUFFER_MB);
             if (Double.isNaN(buffer) || buffer <= 0) {
@@ -1276,6 +1751,19 @@ public final class Config {
         /** @return tokens of serialised subgraph an answer may carry */
         public int getContextTokenBudget() {
             return contextTokenBudget;
+        }
+
+        /**
+         * Candidates the full-precision reranker reads per result it returns.
+         *
+         * <p>Reranking can only reorder what it is given, so this is what lets a document
+         * that term overlap ranked poorly be rescued by its vector. Each extra candidate is
+         * one more full-precision vector read.</p>
+         *
+         * @return the over-fetch multiplier, at least 1
+         */
+        public int getRerankOverFetch() {
+            return rerankOverFetch;
         }
 
         /** @return documents each retrieval signal contributes before fusion */
@@ -1343,9 +1831,9 @@ public final class Config {
         }
 
         /**
-         * Tombstoned fraction of the store at which an erasure compaction becomes worthwhile.
+         * Whether ingestion extracts facts from the documents it publishes.
          *
-         * @return The ratio, in [0, 1]
+         * @return true when each ingested document is passed to the chat model for extraction
          */
         public boolean isExtractionEnabled() {
             return extractionEnabled;
@@ -1372,7 +1860,8 @@ public final class Config {
                 + ", minMeanConfidence=" + minMeanConfidence
                 + ", maxAmbiguousCandidates=" + maxAmbiguousCandidates
                 + ", contextTokenBudget=" + contextTokenBudget
-                + ", topK=" + topK + "}";
+                + ", topK=" + topK
+                + ", rerankOverFetch=" + rerankOverFetch + "}";
         }
 
         @Override
@@ -1390,6 +1879,7 @@ public final class Config {
                 && maxAmbiguousCandidates == other.maxAmbiguousCandidates
                 && contextTokenBudget == other.contextTokenBudget
                 && topK == other.topK
+                && rerankOverFetch == other.rerankOverFetch
                 && Double.compare(ramBufferMb, other.ramBufferMb) == 0
                 && extractionEnabled == other.extractionEnabled
                 && extractorVersion == other.extractorVersion
@@ -1406,7 +1896,7 @@ public final class Config {
         @Override
         public int hashCode() {
             return Objects.hash(path, minScore, minSeparation, minMeanConfidence,
-                maxAmbiguousCandidates, contextTokenBudget, topK, ramBufferMb,
+                maxAmbiguousCandidates, contextTokenBudget, topK, rerankOverFetch, ramBufferMb,
                 extractionEnabled, extractorVersion, entityVectorsEnabled, maxOpenNamespaces,
                 erasureTombstoneRatio, erasureMaxLatencySeconds, singleValuedRelations,
                 hotNamespaces, coldNamespaces);

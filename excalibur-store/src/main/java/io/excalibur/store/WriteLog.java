@@ -52,9 +52,12 @@ import java.util.logging.Logger;
  *
  * <h2>Durability Guarantees</h2>
  * <ul>
- *   <li>Every append fsyncs the file before returning the LSN</li>
+ *   <li>An append publishes the record only once the fsync that makes it durable has
+ *       returned, so a record the caller was told did not land is not in the log</li>
  *   <li>Recovery replays entries in LSN order</li>
- *   <li>Corrupted entries (CRC32 mismatch) are skipped during recovery</li>
+ *   <li>Opening a log that is damaged anywhere but its tail fails with
+ *       {@link CorruptLogException} rather than ending the log at the damage, because every
+ *       record past it was acknowledged; a tail torn by a crash ends the log and is logged</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -128,6 +131,14 @@ public class WriteLog implements AutoCloseable {
      * Number of corrupt entries found during recovery.
      */
     private final AtomicLong corruptEntriesFound = new AtomicLong(0);
+
+    /**
+     * Offset of the first record a recovery could not read, or -1 if there was none.
+     *
+     * <p>The count alone does not let a caller say where the log stopped being trustworthy,
+     * which is the first thing an operator needs and the first thing a failure has to carry.
+     */
+    private final AtomicLong firstCorruptOffset = new AtomicLong(-1);
 
     /**
      * Last integrated offset (for tail scan tracking).
@@ -316,12 +327,41 @@ public class WriteLog implements AutoCloseable {
         openFileChannel(MAX_FILE_SIZE);
 
         if (hasExistingEntries) {
-            // Scan to find the highest LSN and write offset
-            scanExistingEntries();
+            try {
+                // Scan to find the highest LSN and write offset
+                scanExistingEntries();
+            } catch (IOException | RuntimeException e) {
+                // The constructor is about to fail, so nothing will ever call close() on this
+                // log: the mapping and the descriptor are released here or not at all.
+                releaseOnFailedOpen(e);
+                throw e;
+            }
         }
 
         LOGGER.log(Level.INFO, "WriteLog initialized at {0}, nextLSN={1}, writeOffset={2}",
             new Object[] { logFilePath, nextLsn.get(), writeOffset.get() });
+    }
+
+    /**
+     * Gives back the mapping and the descriptor of a log that never finished opening.
+     *
+     * <p>Whatever goes wrong here is secondary to the failure that brought us in, so it is
+     * attached to that one rather than replacing it - the caller needs to be told the log is
+     * corrupt, not that closing a channel afterwards also failed.</p>
+     *
+     * @param failure The failure that is about to be thrown from the constructor
+     */
+    private void releaseOnFailedOpen(Exception failure) {
+        try {
+            releaseMapping();
+            mappedSegment = null;
+            mappedSegmentWrapper = null;
+            if (fileChannel != null) {
+                fileChannel.close();
+            }
+        } catch (IOException | RuntimeException e) {
+            failure.addSuppressed(e);
+        }
     }
 
     /**
@@ -383,76 +423,26 @@ public class WriteLog implements AutoCloseable {
     }
 
     /**
-     * Whether the slot at this offset has never been written to.
+     * Reads an existing log to find where it ends and which LSN comes next.
      *
-     * <p>The log is mapped at its maximum size and filled sparsely, so everything past the last
-     * entry reads as zeroes. Zero is not an opcode, which makes an unwritten slot the end of the
-     * log rather than a damaged entry - and the distinction has to be drawn before the checksum
-     * is consulted, because a zeroed slot fails that check for the same reason real corruption
-     * does. Reporting it as corruption made a clean start of a node with routed logs warn once
-     * per log, which is what a genuine emergency looks like.</p>
-     *
-     * @param offset Where the entry would begin
-     * @return true when nothing has been written there
+     * @throws CorruptLogException if the log is damaged anywhere but its tail
      */
-    private boolean isUnwritten(long offset) {
-        return mappedSegmentWrapper.getByte(offset + LogEntry.OPCODE_OFFSET) == 0;
-    }
+    private void scanExistingEntries() throws CorruptLogException {
+        LogScan scan = LogScan.of(mappedSegmentWrapper, logFilePath);
 
-    /**
-     * Scans existing entries to determine the next LSN and write offset.
-     *
-     * <p>This method reads through the log file from the beginning, validating
-     * CRC32 checksums and tracking the highest LSN seen.</p>
-     */
-    private void scanExistingEntries() {
-        long offset = 0;
-        long maxLsn = -1;
-        long fileSize = mappedSegmentWrapper.byteSize();
-
-        while (offset < fileSize) {
-            // Check if we have enough bytes for a header
-            if (offset + LogEntry.HEADER_SIZE > fileSize) {
-                break;
-            }
-
-            if (isUnwritten(offset)) {
-                break;
-            }
-
-            try {
-                // Read key_len and value_len to determine entry size
-                int entrySize = LogEntry.sizeAt(mappedSegmentWrapper, offset);
-
-                // Check if we have enough bytes for the full entry
-                if (offset + entrySize > fileSize) {
-                    break;
-                }
-
-                // Validate CRC32
-                if (!LogEntry.validateCrc32(mappedSegmentWrapper, offset)) {
-                    // Corrupted entry, stop scanning
-                    LOGGER.log(Level.WARNING,
-                        "Corrupted log entry found at offset {0}, stopping scan", offset);
-                    break;
-                }
-
-                // Read the entry to get the LSN
-                LogEntry entry = LogEntry.readFromUnchecked(mappedSegmentWrapper, offset);
-                maxLsn = Math.max(maxLsn, entry.lsn());
-
-                offset += entrySize;
-            } catch (Exception e) {
-                // Invalid entry format, stop scanning
-                LOGGER.log(Level.WARNING,
-                    "Invalid log entry at offset " + offset + ", stopping scan", e);
-                break;
-            }
+        if (scan.tornTail() != null) {
+            // Loud but not fatal: the records the tail lost were never acknowledged, so the
+            // log genuinely ends here - but an operator still needs to know the process did
+            // not shut down cleanly, and where.
+            LOGGER.log(Level.WARNING,
+                "Write-ahead log {0} ends in a corrupt or partly written record at offset "
+                + "{1}: {2}. Nothing was written after it, so this is a tail torn by a crash "
+                + "and the log ends before it; those bytes were never acknowledged.",
+                new Object[] { logFilePath, scan.endOffset(), scan.tornTail() });
         }
 
-        // Set next LSN to max + 1 (or 0 if no entries)
-        nextLsn.set(maxLsn + 1);
-        writeOffset.set(offset);
+        nextLsn.set(scan.nextLsn());
+        writeOffset.set(scan.endOffset());
     }
 
     // ==================== Append Operations ====================
@@ -504,21 +494,58 @@ public class WriteLog implements AutoCloseable {
             // Ensure we have space
             ensureCapacity(entrySize);
 
-            // Write entry to memory-mapped file
             long offset = writeOffset.get();
-            entry.writeTo(mappedSegmentWrapper, offset);
+            try {
+                entry.writeTo(mappedSegmentWrapper, offset);
+                fsync(offset, entrySize);
+            } catch (IOException | RuntimeException e) {
+                discardUnsyncedRecord(offset, e);
+                throw e;
+            }
 
-            // Update write offset and statistics
+            // Published only now. The head is what a tail scan reads up to and what the next
+            // append writes after, so advancing it before the fsync returns would make a
+            // record visible - and, if the device then refused it, would make a write the
+            // caller is about to be told failed indistinguishable from one that succeeded.
             writeOffset.set(offset + entrySize);
             totalBytesWritten.addAndGet(entrySize);
             totalEntriesAppended.incrementAndGet();
 
-            // Fsync for durability
-            fsync(offset, entrySize);
-
             return lsn;
         } finally {
             appendLock.unlock();
+        }
+    }
+
+    /**
+     * Takes back a record that was written into the mapping but never made durable.
+     *
+     * <p>Leaving the head where it was is not enough on its own: the head is not stored
+     * anywhere, it is derived by reading the file back, so a record whose bytes reached the
+     * device despite the failed fsync would be read as part of the log on the next open and
+     * replayed - committing a write whose caller was told it had failed. Clearing the opcode
+     * is what makes the scan read that offset as never written, and it is safe to do because
+     * an append holds the append lock and writes at the head, so this record is the last one
+     * and nothing sound follows it.</p>
+     *
+     * <p>If clearing the opcode cannot be made durable either, the log is no worse off than
+     * before - the next successful append writes over the same offset and supersedes it - but
+     * the caller has to know that until then a restart may still find the record, so the
+     * second failure is attached to the first rather than dropped.</p>
+     *
+     * @param offset  Where the record was written
+     * @param failure The failure that is about to be reported to the caller
+     */
+    private void discardUnsyncedRecord(long offset, Exception failure) {
+        try {
+            mappedSegmentWrapper.setByte(offset + LogEntry.OPCODE_OFFSET, (byte) 0);
+            fsync(offset, LogEntry.OPCODE_SIZE);
+        } catch (IOException | RuntimeException e) {
+            failure.addSuppressed(e);
+            LOGGER.log(Level.SEVERE,
+                "Write-ahead log " + logFilePath + " could not take back the record at offset "
+                + offset + " that its fsync rejected. Until another append overwrites that "
+                + "offset, a restart may replay a write the caller was told had failed.", e);
         }
     }
 
@@ -594,8 +621,13 @@ public class WriteLog implements AutoCloseable {
      * CRC32 checksums, and passes valid entries to the handler. Entries are
      * processed in LSN order.</p>
      *
-     * <p>Corrupted entries (CRC32 mismatch) are skipped with a warning log.
-     * Recovery continues until the end of valid data is reached.</p>
+     * <p>Corrupted entries (CRC32 mismatch) are skipped with a warning log and recovery
+     * continues, so that a caller who can salvage a partial replay is able to. It returns
+     * false when that happened, and a caller who cannot salvage one - a segment being brought
+     * back to the state its log describes, for instance - has to treat that as fatal rather
+     * than as a successful recovery. Opening the log has already established that every record
+     * up to the head reads cleanly, so reaching one that does not means the log changed while
+     * it was being read.</p>
      *
      * <p>A failure thrown by {@code handler} is <strong>not</strong> a corruption: it is
      * wrapped in a {@link LogReplayException} and propagated, because the remaining log
@@ -624,6 +656,7 @@ public class WriteLog implements AutoCloseable {
         int entriesRecovered = 0;
         int entriesSkipped = 0;
         boolean domainCorrect = true;
+        firstCorruptOffset.set(-1);
 
         LOGGER.log(Level.INFO, "Starting log recovery from {0} (endOffset={1})",
             new Object[] { logFilePath, endOffset });
@@ -654,6 +687,7 @@ public class WriteLog implements AutoCloseable {
                     // Corrupted entry, skip
                     entriesSkipped++;
                     domainCorrect = false;
+                    firstCorruptOffset.compareAndSet(-1, offset);
                     LOGGER.log(Level.WARNING,
                         "Skipping corrupted log entry at offset {0}", offset);
 
@@ -669,6 +703,7 @@ public class WriteLog implements AutoCloseable {
                 LOGGER.log(Level.WARNING,
                     "Invalid log entry at offset " + offset + ", stopping recovery", e);
                 domainCorrect = false;
+                firstCorruptOffset.compareAndSet(-1, offset);
                 break;
             }
 
@@ -811,11 +846,15 @@ public class WriteLog implements AutoCloseable {
      * flush pages dirtied through a mapping. Only the range just written is forced, so
      * the cost does not scale with the size of the log.</p>
      *
+     * <p>Package-private rather than private so that a test can stand in for a device that
+     * rejects the write, which is the one failure of an append that cannot be provoked through
+     * the public surface and is also the only one that can leave a record behind.</p>
+     *
      * @param offset Offset of the range to persist
      * @param length Length of the range to persist
      * @throws IOException if fsync fails
      */
-    private void fsync(long offset, int length) throws IOException {
+    void fsync(long offset, int length) throws IOException {
         MemorySegment mapping = this.mappedSegment;
         if (mapping != null) {
             mapping.asSlice(offset, length).force();
@@ -1069,6 +1108,15 @@ public class WriteLog implements AutoCloseable {
      */
     public long corruptEntriesFound() {
         return corruptEntriesFound.get();
+    }
+
+    /**
+     * Returns where the last recovery first failed to read a record.
+     *
+     * @return The byte offset, or -1 if the last recovery read every record
+     */
+    public long firstCorruptOffset() {
+        return firstCorruptOffset.get();
     }
 
     /**

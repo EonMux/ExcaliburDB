@@ -62,6 +62,9 @@ public final class McpTools {
     /** Register a directory and start indexing it. */
     public static final String INGEST_DOCUMENTS = "ingest_documents";
 
+    /** Index documents supplied in the call itself. */
+    public static final String ADD_DOCUMENTS = "add_documents";
+
     /** Report indexing progress. */
     public static final String INGESTION_STATUS = "ingestion_status";
 
@@ -85,10 +88,12 @@ public final class McpTools {
         List<Object> tools = new ArrayList<>();
 
         tools.add(tool(SEARCH_DOCUMENTS,
-            "Search the documents this node has indexed and return the identifier of each "
-            + "matching chunk, best first. The reply carries identifiers and scores and no text: "
-            + "resolve a 'document_id' against the store the corpus was ingested from to read "
-            + "what it names. This is the plain retrieval call: it needs only that "
+            "Search the documents this node has indexed and return the matching passages, best "
+            + "first. Each result carries the passage in 'text', its 'document_id', and a score; "
+            + "'text' is null when the node no longer holds that chunk, and 'text_truncated' is "
+            + "true when the passage was clipped to the node's per-result limit - quote such a "
+            + "result as a fragment rather than as the whole passage. This is the plain "
+            + "retrieval call: it needs only that "
             + "ingest_documents has run, and it does not require build_graph. Prefer it when the question is answered "
             + "by the text of a document; prefer search_graph when the question is about how "
             + "entities relate to each other. Read 'coverage' in the reply: it says what fraction "
@@ -138,7 +143,9 @@ public final class McpTools {
             + "extraction disabled.",
             schema(
                 optional("namespace", "string",
-                    "Namespace to build. Omit for the shared one.", null))));
+                    "Namespace to build. Omit for the shared one, which is what you want: "
+                    + "ingestion stages every fact it extracts under the shared namespace, so "
+                    + "building a named one finds nothing staged and publishes nothing.", null))));
 
         tools.add(tool(INGEST_DOCUMENTS,
             "Register a local directory as a source and start indexing the documents in it. "
@@ -153,7 +160,35 @@ public final class McpTools {
                     "Absolute path of the directory to index."),
                 optional("included_extensions", "array",
                     "File extensions to index, e.g. ['.md', '.txt']. Omit to accept the "
-                    + "server's default.", "string"))));
+                    + "server's default.", "string"),
+                optional("excluded_directories", "array",
+                    "Directory names to skip anywhere under the root, e.g. ['node_modules', "
+                    + "'target']. Omit to keep the server's default skip list.", "string"),
+                optional("max_depth", "integer",
+                    "How many directory levels below the root to descend. Omit for the "
+                    + "server's default.", null))));
+
+        tools.add(tool(ADD_DOCUMENTS,
+            "Index documents by sending their text directly, for content you are holding rather "
+            + "than a directory on the server. Prefer this over ingest_documents unless the "
+            + "content is already in a directory the server is configured to read: a server with "
+            + "no allowed roots refuses ingest_documents outright, and this call needs none. The "
+            + "documents are indexed before the call returns, so they are searchable immediately "
+            + "and there is no status to poll - unlike ingest_documents, which only starts a "
+            + "crawl. Sending a 'document_id' that was sent before replaces what is indexed "
+            + "under it. Use a 'source_id' that no crawl is using; one that is already a "
+            + "registered crawl source is refused, because the next crawl of it would delete "
+            + "these documents.",
+            schema(
+                required("source_id", "string",
+                    "A stable name for this batch's documents, used later to erase or re-index "
+                    + "them. Reusing it adds to the same source."),
+                requiredObjectArray("documents",
+                    "The documents to index; at most 256 per call.",
+                    required("document_id", "string",
+                        "Names the document within its source. Sending the same one again "
+                        + "replaces what is indexed under it."),
+                    required("text", "string", "The document's text. Must not be empty.")))));
 
         tools.add(tool(INGESTION_STATUS,
             "How far indexing has got, for one source or for all of them. 'idle' with no error "
@@ -185,6 +220,7 @@ public final class McpTools {
                 case SEARCH_GRAPH -> searchGraph(args);
                 case BUILD_GRAPH -> buildGraph(args);
                 case INGEST_DOCUMENTS -> ingestDocuments(args);
+                case ADD_DOCUMENTS -> addDocuments(args);
                 case INGESTION_STATUS -> ingestionStatus(args);
                 default -> ToolResult.error("No such tool: " + name);
             };
@@ -205,6 +241,10 @@ public final class McpTools {
             throws IOException, InterruptedException {
         Map<String, Object> body = Json.object();
         body.put("query", requiredString(args, "query"));
+        // Always on for this caller. A model cannot resolve a chunk identifier against the store
+        // the corpus was ingested from - it has no access to it - so a search that answered with
+        // identifiers alone would give it nothing it could read. HTTP clients still opt in.
+        body.put("include_text", true);
         // Omitted rather than defaulted here: the node has a configured default, and sending one
         // of this adapter's own would quietly override whatever the operator set.
         Integer topK = optionalInteger(args, "top_k");
@@ -245,11 +285,55 @@ public final class McpTools {
         if (!extensions.isEmpty()) {
             sourceConfig.put("included_extensions", extensions);
         }
+        List<String> excluded = stringList(args, "excluded_directories");
+        if (!excluded.isEmpty()) {
+            sourceConfig.put("excluded_directories", excluded);
+        }
+        Integer maxDepth = wholeNumber(args, "max_depth");
+        if (maxDepth != null) {
+            sourceConfig.put("max_depth", maxDepth);
+        }
 
         Map<String, Object> body = Json.object();
         body.put("source_type", "filesystem");
         body.put("config", sourceConfig);
         return answer(client.post("/v1/ingest", Json.write(body), null));
+    }
+
+    private ToolResult addDocuments(Map<String, Object> args)
+            throws IOException, InterruptedException {
+        Map<String, Object> body = Json.object();
+        body.put("source_id", requiredString(args, "source_id"));
+        // Refused here rather than sent on. The node would answer 400 anyway, and a round trip
+        // to be told what this call already knows is a slower way to say the same thing.
+        List<Object> documents = objectList(args, "documents");
+        if (documents.isEmpty()) {
+            return ToolResult.error(
+                "'documents' is required and must carry at least one document.");
+        }
+        body.put("documents", documents);
+        return answer(client.post("/v1/documents", Json.write(body), null));
+    }
+
+    /**
+     * Reads a list-of-objects argument.
+     *
+     * @param args  The call's arguments
+     * @param field The field name
+     * @return The elements, empty when the field is absent or is not a list
+     */
+    private static List<Object> objectList(Map<String, Object> args, String field) {
+        Object value = args.get(field);
+        if (!(value instanceof List<?> list)) {
+            return List.of();
+        }
+        List<Object> items = new ArrayList<>(list.size());
+        for (Object element : list) {
+            if (element != null) {
+                items.add(element);
+            }
+        }
+        return List.copyOf(items);
     }
 
     private ToolResult ingestionStatus(Map<String, Object> args)
@@ -318,6 +402,34 @@ public final class McpTools {
         return (int) exact;
     }
 
+    /**
+     * Reads an optional whole number, or null when the caller did not send one.
+     *
+     * <p>A model sends numbers as whatever its JSON layer produced, so a value that arrived as
+     * a double with no fractional part is taken as the integer it is. Anything else is refused
+     * here rather than forwarded, because the node's refusal would arrive one round trip later
+     * saying the same thing.</p>
+     */
+    private static Integer wholeNumber(Map<String, Object> args, String field) {
+        Object value = args.get(field);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number number && number.doubleValue() == Math.rint(number.doubleValue())) {
+            return number.intValue();
+        }
+        if (value instanceof String text) {
+            try {
+                return Integer.valueOf(text.trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(
+                    "Field '" + field + "' must be a whole number, got: " + text, e);
+            }
+        }
+        throw new IllegalArgumentException(
+            "Field '" + field + "' must be a whole number, got: " + value);
+    }
+
     private static List<String> stringList(Map<String, Object> args, String field) {
         Object value = args.get(field);
         List<String> out = new ArrayList<>();
@@ -350,6 +462,26 @@ public final class McpTools {
 
     private static Property required(String name, String type, String description) {
         return new Property(name, propertySchema(type, description, null), true);
+    }
+
+    /**
+     * An array-of-objects property, with the shape of one element spelled out.
+     *
+     * <p>A model given a bare {@code array} guesses the field names of what goes in it, and the
+     * guess is wrong often enough that the call fails on its first attempt.</p>
+     *
+     * @param name           The field name
+     * @param description    What the array is for
+     * @param itemProperties The properties of one element
+     * @return The property
+     */
+    private static Property requiredObjectArray(String name, String description,
+                                                Property... itemProperties) {
+        Map<String, Object> schema = Json.object();
+        schema.put("type", "array");
+        schema.put("description", description);
+        schema.put("items", schema(itemProperties));
+        return new Property(name, schema, true);
     }
 
     private static Property optional(String name, String type, String description,

@@ -117,6 +117,10 @@ public class GraphErasureEndpoint implements HttpHandler {
                     + "\"compacted\": " + outcome.ran() + ", "
                     + "\"edges_removed\": " + outcome.edgesRemoved() + ", "
                     + "\"requests_satisfied\": " + outcome.requestsSatisfied() + ", "
+                    // Reported beside the satisfied count, never folded into it: a request this
+                    // could not fully honour stays outstanding, and a caller under an obligation
+                    // has to be able to see that rather than read the silence as completion.
+                    + "\"requests_withheld\": " + outcome.requestsWithheld() + ", "
                     + "\"outstanding\": " + erasureService.outstandingCount() + ", "
                     + "\"namespace\": \"" + JsonText.escape(namespace.value()) + "\", "
                     + "\"detail\": \"" + JsonText.escape(outcome.reason()) + "\""

@@ -1,6 +1,7 @@
 package io.excalibur.retrieval.lexical.native_;
 
 import io.excalibur.core.hash.XxHash64;
+import io.excalibur.retrieval.lexical.Bm25Parameters;
 
 import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
@@ -37,8 +38,8 @@ public final class StreamingIndexWriter implements AutoCloseable {
 
     private final Path directory;
     private final int[] docLengths;
-    private final long totalTokens;
     private final double averageDocLength;
+    private final Bm25Parameters bm25;
 
     private final DataOutputStream dict;
     private final DataOutputStream blocks;
@@ -61,14 +62,25 @@ public final class StreamingIndexWriter implements AutoCloseable {
      * @param docLengths Length of every document, in id order
      */
     public StreamingIndexWriter(Path directory, int[] docLengths) throws IOException {
+        this(directory, docLengths, Bm25Parameters.DEFAULT);
+    }
+
+    /**
+     * @param directory  Where the index is written
+     * @param docLengths Length of every document, in id order
+     * @param bm25       The pair recorded in the finished index, and therefore the only pair it
+     *                   will open under
+     */
+    public StreamingIndexWriter(Path directory, int[] docLengths, Bm25Parameters bm25)
+            throws IOException {
         this.directory = Objects.requireNonNull(directory, "directory");
         this.docLengths = Objects.requireNonNull(docLengths, "docLengths");
+        this.bm25 = Objects.requireNonNull(bm25, "bm25");
         Files.createDirectories(directory);
         long tokens = 0;
         for (int length : docLengths) {
             tokens += length;
         }
-        this.totalTokens = tokens;
         this.averageDocLength = docLengths.length == 0 ? 1.0 : (double) tokens / docLengths.length;
         this.dict = stream(directory.resolve("terms.dict"));
         this.blocks = stream(directory.resolve("post.blk"));
@@ -108,7 +120,7 @@ public final class StreamingIndexWriter implements AutoCloseable {
             int previous = firstDoc;
             int maxGap = 0;
             int maxFreq = 0;
-            float maxSaturation = 0f;
+            int minLength = Integer.MAX_VALUE;
             for (int i = 0; i < size; i++) {
                 int doc = docs[start + i];
                 int gap = i == 0 ? 0 : doc - previous;
@@ -118,10 +130,7 @@ public final class StreamingIndexWriter implements AutoCloseable {
                 int tf = freqs[start + i];
                 freqScratch[i] = tf;
                 maxFreq = Math.max(maxFreq, tf);
-                double norm = PostingsIndex.K1 * (1 - PostingsIndex.B
-                    + PostingsIndex.B * docLengths[doc] / averageDocLength);
-                maxSaturation = Math.max(maxSaturation,
-                    (float) ((tf * (PostingsIndex.K1 + 1)) / (tf + norm)));
+                minLength = Math.min(minLength, docLengths[doc]);
             }
             int docBits = BitPack.bitsFor(maxGap);
             int tfBits = BitPack.bitsFor(maxFreq);
@@ -131,7 +140,7 @@ public final class StreamingIndexWriter implements AutoCloseable {
 
             blocks.writeInt(firstDoc);
             blocks.writeInt(docs[start + size - 1]);
-            blocks.writeFloat(maxSaturation);
+            BlockLayout.writeImpactFields(blocks, maxFreq, minLength);
             blocks.writeLong(dataCursor);
             blocks.writeShort(size);
             blocks.write(docBits);
@@ -168,13 +177,8 @@ public final class StreamingIndexWriter implements AutoCloseable {
             Math.max(16, (int) Math.min(Integer.MAX_VALUE / 2, termCount / HASH_LOAD))) * 2;
         writeHash(slots);
 
-        try (DataOutputStream meta = stream(directory.resolve("index.meta"))) {
-            meta.writeInt(termCount);
-            meta.writeInt(docLengths.length);
-            meta.writeInt(slots);
-            meta.writeInt(0);
-            meta.writeDouble(averageDocLength);
-        }
+        IndexMeta.current(termCount, docLengths.length, slots, averageDocLength, bm25)
+            .write(directory);
     }
 
     /** Builds the term hash by reading back the dictionary, so no term strings are retained. */

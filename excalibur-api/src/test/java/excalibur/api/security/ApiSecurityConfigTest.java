@@ -226,20 +226,73 @@ class ApiSecurityConfigTest {
         }
 
         @Test
-        @DisplayName("falls back to defaults for unparseable or non-positive values")
-        void ignoresBadValues() {
+        @DisplayName("refuses an unparseable rate rather than serving the shipped one")
+        void refusesUnparseableRate() {
             Map<String, String> props = new HashMap<>();
             props.put(ApiSecurityConfig.KEY_READ_RATE, "not-a-number");
+
+            assertThatThrownBy(() -> ApiSecurityConfig.fromProperties(props))
+                .as("these keys are the node's rate limits; falling back to the shipped "
+                    + "default leaves an operator believing a policy is in force that is not")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(ApiSecurityConfig.KEY_READ_RATE)
+                .hasMessageContaining("not-a-number");
+        }
+
+        @Test
+        @DisplayName("refuses a bound of zero rather than serving the shipped one")
+        void refusesZeroBound() {
+            Map<String, String> props = new HashMap<>();
             props.put(ApiSecurityConfig.KEY_MAX_TOP_K, "0");
+
+            assertThatThrownBy(() -> ApiSecurityConfig.fromProperties(props))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(ApiSecurityConfig.KEY_MAX_TOP_K);
+        }
+
+        @Test
+        @DisplayName("refuses a negative bound rather than serving the shipped one")
+        void refusesNegativeBound() {
+            Map<String, String> props = new HashMap<>();
             props.put(ApiSecurityConfig.KEY_MAX_QUERY_CHARS, "-1");
 
-            ApiSecurityConfig config = ApiSecurityConfig.fromProperties(props);
+            assertThatThrownBy(() -> ApiSecurityConfig.fromProperties(props))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(ApiSecurityConfig.KEY_MAX_QUERY_CHARS);
+        }
+
+        @Test
+        @DisplayName("refuses a decimal where a whole number belongs")
+        void refusesDecimalCount() {
+            Map<String, String> props = new HashMap<>();
+            props.put(ApiSecurityConfig.KEY_MAX_TOP_K, "10.5");
+
+            assertThatThrownBy(() -> ApiSecurityConfig.fromProperties(props))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("whole number");
+        }
+
+        @Test
+        @DisplayName("refuses a flag that is neither true nor false")
+        void refusesUnreadableFlag() {
+            Map<String, String> props = new HashMap<>();
+            props.put(ApiSecurityConfig.KEY_ALLOW_PLAINTEXT, "yes");
+
+            assertThatThrownBy(() -> ApiSecurityConfig.fromProperties(props))
+                .as("a flag whose whole job is to relax a safety check must not read a typo "
+                    + "as a value")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(ApiSecurityConfig.KEY_ALLOW_PLAINTEXT);
+        }
+
+        @Test
+        @DisplayName("an absent value is how a deployment says the default is fine")
+        void absentValuesKeepTheDefaults() {
+            ApiSecurityConfig config = ApiSecurityConfig.fromProperties(new HashMap<>());
 
             assertThat(config.readRatePerSecond()).isEqualTo(ApiSecurityConfig.DEFAULT_READ_RATE);
             assertThat(config.maxTopK()).isEqualTo(ApiSecurityConfig.DEFAULT_MAX_TOP_K);
             assertThat(config.maxQueryChars())
-                .as("a bound of zero would refuse every query, so it is not a bound this "
-                    + "accepts from a typo")
                 .isEqualTo(ApiSecurityConfig.DEFAULT_MAX_QUERY_CHARS);
         }
 

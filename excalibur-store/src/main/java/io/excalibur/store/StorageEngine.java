@@ -9,9 +9,14 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
@@ -118,13 +123,29 @@ public class StorageEngine implements AutoCloseable {
     // ==================== Instance Fields ====================
 
     /**
-     * Path to the data directory containing segment files.
+     * Path to the data directory containing the catalog and the routing directory.
      *
-     * <p>All segment files are stored under this directory with naming convention
-     * "segment_&lt;index&gt;.dat" to ensure deterministic placement based on
-     * the segment index (not a random unique ID).</p>
+     * <p>Segment files are named "segment_&lt;index&gt;.dat" so that placement follows the
+     * segment index rather than a random unique ID. Which directory holds each of them is
+     * {@link #placement}'s answer, and its answer is this directory for every segment until a
+     * deployment names volumes to spread them over.</p>
      */
     private final Path dataDir;
+
+    /**
+     * Which directory each segment's files live in, and everywhere a restart has to look.
+     *
+     * <p>Defaults to the data directory alone, which is what a store spanning one disk wants
+     * and what every path in this engine resolved to before placement existed. Replaced only
+     * by {@link #withSegmentPlacement(SegmentPlacement)}, and only before {@link #start()}.</p>
+     */
+    private volatile SegmentPlacement placement;
+
+    /**
+     * Where each segment index's files actually are, which is not always where the placement
+     * would put them: the volume set is configuration, and it can change between runs.
+     */
+    private final SegmentLocations locations = new SegmentLocations();
 
     /**
      * Arena for memory allocation.
@@ -310,6 +331,7 @@ public class StorageEngine implements AutoCloseable {
         }
 
         this.dataDir = dataDir;
+        this.placement = SegmentPlacement.singleDirectory(dataDir);
         this.usingPanama = MemorySegmentFactory.isPanamaAvailable();
         if (!usingPanama) {
             throw new IllegalStateException(
@@ -359,6 +381,7 @@ public class StorageEngine implements AutoCloseable {
         }
 
         this.dataDir = dataDir;
+        this.placement = SegmentPlacement.singleDirectory(dataDir);
         this.arena = arena;
         this.ownsArena = false;
         this.usingPanama = true;
@@ -494,8 +517,12 @@ public class StorageEngine implements AutoCloseable {
 
         // DISCOVER EXISTING SEGMENTS - This is the critical fix for data persistence
         // Without this, existing segment files would be ignored and data would be lost
-        SegmentDiscovery discovery = new SegmentDiscovery(dataDir);
+        SegmentDiscovery discovery = SegmentDiscovery.across(placement.directories());
         java.util.List<SegmentDiscovery.DiscoveredSegment> discoveredSegments = discovery.scanDirectory();
+
+        // Before anything is opened, and well before the routing rebuild starts creating empty
+        // segments over indices it did not find.
+        refuseIfAnyVolumeIsMissing(discoveredSegments);
 
         // Track the highest segment index found for proper routing
         int maxSegmentIndex = -1;
@@ -512,6 +539,9 @@ public class StorageEngine implements AutoCloseable {
                     Segment.openExisting(discovered.path(), arena, loadFactorThreshold);
 
                 long segmentIndex = discovered.segmentIndex();
+                // Where this segment is, not where the volume set would now put it: every
+                // name derived from the index from here on has to follow the file.
+                locations.adopt(segmentIndex, discovered.path());
                 segments.put(segmentIndex, segment);
                 canonicalIndex.put(segment, segmentIndex);
 
@@ -532,7 +562,7 @@ public class StorageEngine implements AutoCloseable {
                 // crash in between leaves an absent or zero-length file.
                 Path walPath = discovered.walPath() != null
                     ? discovered.walPath()
-                    : writeLogPath(segmentIndex);
+                    : walPathFor(discovered.path());
                 WriteLog writeLog = new WriteLog(walPath);
                 segment.attachWriteLog(writeLog);
 
@@ -615,6 +645,97 @@ public class StorageEngine implements AutoCloseable {
         java.util.logging.Logger.getLogger(StorageEngine.class.getName()).info(
             String.format("StorageEngine started: discovered=%d, total=%d segments, ready for operations",
                 discoveredSegments.size(), segments.size()));
+    }
+
+    /**
+     * Refuses to start when the catalog names segments that no scanned directory produced.
+     *
+     * <p>A volume that failed to mount, or that was dropped from the configuration, takes its
+     * segments with it. Nothing further on in startup would notice: discovery would simply
+     * return fewer segments, the routing rebuild would create empty files over the indices it
+     * did not find, and the node would come up serving a corpus with a hole in it and no error
+     * anywhere. So the catalog - which records where every segment was last written - is the
+     * check, and a gap is fatal rather than a warning.</p>
+     *
+     * <p>The check runs only for a store that has actually used a volume other than the data
+     * directory, whether it still has it registered or not. A single-directory store has no
+     * volume that can go missing, and a segment file absent from it is a deleted file, which
+     * this engine has always tolerated.</p>
+     *
+     * @param discovered Everything the scan found
+     * @throws IllegalStateException if the catalog knows a live segment nothing produced
+     */
+    private void refuseIfAnyVolumeIsMissing(List<SegmentDiscovery.DiscoveredSegment> discovered) {
+        Map<Long, SegmentCatalog.SegmentMetadata> known = catalog.getAll();
+        if (known.isEmpty()) {
+            return;
+        }
+
+        List<Path> scanned = placement.directories();
+        if (scanned.size() <= 1 && !usesDirectoryOutside(known, scanned)) {
+            return;
+        }
+
+        Set<Long> found = new HashSet<>();
+        for (SegmentDiscovery.DiscoveredSegment segment : discovered) {
+            found.add(segment.segmentIndex());
+        }
+
+        SortedMap<Path, List<Long>> gaps = new TreeMap<>();
+        for (Map.Entry<Long, SegmentCatalog.SegmentMetadata> entry : known.entrySet()) {
+            SegmentCatalog.SegmentMetadata metadata = entry.getValue();
+            Path recorded = metadata.getVolumePath();
+            if (recorded == null || found.contains(entry.getKey())) {
+                continue;
+            }
+            if (isRetired(metadata.getLifecycleState())) {
+                continue;
+            }
+            Path directory = recorded.getParent() != null ? recorded.getParent() : recorded;
+            gaps.computeIfAbsent(directory, key -> new ArrayList<>()).add(entry.getKey());
+        }
+
+        if (gaps.isEmpty()) {
+            return;
+        }
+        throw new IllegalStateException(
+            "Refusing to start: the catalog records segments that no scanned directory holds. "
+                + "Missing by directory: " + gaps + ". Directories scanned: " + scanned
+                + ". Restore or remount the volume, or remove those segments from the catalog "
+                + "deliberately; starting without them would silently create empty segments "
+                + "over their indices.");
+    }
+
+    /**
+     * Whether the catalog remembers a segment written outside the directories now scanned.
+     *
+     * @param known   The recovered catalog entries
+     * @param scanned The directories this start scans
+     * @return true if any recorded segment sits outside the scanned set
+     */
+    private static boolean usesDirectoryOutside(Map<Long, SegmentCatalog.SegmentMetadata> known,
+                                                List<Path> scanned) {
+        for (SegmentCatalog.SegmentMetadata metadata : known.values()) {
+            Path recorded = metadata.getVolumePath();
+            if (recorded == null) {
+                continue;
+            }
+            Path directory = recorded.getParent() != null ? recorded.getParent() : recorded;
+            if (!scanned.contains(directory)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether a segment in this state is allowed to have no file.
+     *
+     * @param state The recorded lifecycle state, possibly null
+     * @return true if reclamation has removed, or is entitled to remove, the file
+     */
+    private static boolean isRetired(LifecycleState state) {
+        return state == LifecycleState.TOMBSTONED || state == LifecycleState.PURGED;
     }
 
     /**
@@ -1026,10 +1147,11 @@ public class StorageEngine implements AutoCloseable {
             Path segmentPath = segmentPath(segmentIndex);
             try {
                 Segment segment = new Segment(segmentPath, 1024 * 1024, arena, loadFactorThreshold);
+                locations.adopt(segmentIndex, segmentPath);
 
                 // Create and attach WriteLog for crash recovery. Every mutation is
                 // recorded in the log so a crash does not lose committed writes.
-                segment.attachWriteLog(new WriteLog(writeLogPath(segmentIndex)));
+                segment.attachWriteLog(new WriteLog(walPathFor(segmentPath)));
 
                 initializeHnswGraph(segment, segmentIndex);
                 initializeVectorPrefilter(segment, segmentIndex);
@@ -1057,21 +1179,108 @@ public class StorageEngine implements AutoCloseable {
     /**
      * Returns the canonical file path for a segment index.
      *
+     * <p>Every segment file this engine creates, renames onto or looks for goes through here,
+     * so the location decision is made in exactly one place. For a segment that already has a
+     * file, that decision is the file: see {@link SegmentLocations} for why a placement cannot
+     * be trusted to name it once the volume set has changed.</p>
+     *
      * @param segmentIndex The directory index
-     * @return {@code <dataDir>/segment_<index>.dat}
+     * @return The {@code segment_<index>.dat} path, in the directory the segment occupies
+     * @throws IllegalStateException if the index is new and another volume already holds a
+     *                               file under that name
      */
-    private Path segmentPath(long segmentIndex) {
-        return dataDir.resolve("segment_" + segmentIndex + ".dat");
+    Path segmentPath(long segmentIndex) {
+        return locations.segmentFile(segmentIndex, placement);
     }
 
     /**
      * Returns the canonical write log path for a segment index.
      *
+     * <p>Beside the segment file, wherever that turned out to be - a log on a different volume
+     * from the segment it logs is lost to the segment the moment either volume moves.</p>
+     *
      * @param segmentIndex The directory index
-     * @return {@code <dataDir>/segment_<index>.wal}
+     * @return The {@code segment_<index>.wal} path beside the segment's own file
      */
-    private Path writeLogPath(long segmentIndex) {
-        return dataDir.resolve("segment_" + segmentIndex + ".wal");
+    Path writeLogPath(long segmentIndex) {
+        return walPathFor(segmentPath(segmentIndex));
+    }
+
+    /**
+     * Returns the write log path that belongs beside a segment file.
+     *
+     * <p>Derived from the file rather than from the index, so a segment that ended up
+     * somewhere other than its placement directory still keeps its log beside it.</p>
+     *
+     * @param segmentFile The segment file
+     * @return The {@code segment_<index>.wal} path in the same directory
+     */
+    private static Path walPathFor(Path segmentFile) {
+        String name = segmentFile.getFileName().toString();
+        String base = name.endsWith(".dat") ? name.substring(0, name.length() - 4) : name;
+        return segmentFile.resolveSibling(base + ".wal");
+    }
+
+    /**
+     * Returns the placement deciding where this engine writes its segments.
+     *
+     * @return The placement, never null
+     */
+    public SegmentPlacement segmentPlacement() {
+        return placement;
+    }
+
+    /**
+     * Spreads this engine's segments over more than one directory.
+     *
+     * <p>Must be called before {@link #start()}. Start is where the engine discovers what is
+     * already on disk and creates whatever the base keyspace is missing, and both of those
+     * answers depend on the placement: installing one afterwards would mean a restart had
+     * already scanned the wrong set of directories and created empty files over the segments it
+     * did not find.</p>
+     *
+     * <p>This module has no configuration dependency; the volume set comes from
+     * {@code excalibur.shard.volumes} via whoever constructs the engine.</p>
+     *
+     * @param placement Where each segment belongs, and every directory a restart must scan
+     * @return this engine, for chaining
+     * @throws NullPointerException     if placement is null
+     * @throws IllegalStateException    if the engine has already started
+     * @throws IllegalArgumentException if the placement omits the data directory or names a
+     *                                  directory that is not there
+     */
+    public StorageEngine withSegmentPlacement(SegmentPlacement placement) {
+        Objects.requireNonNull(placement, "placement cannot be null");
+        if (started) {
+            throw new IllegalStateException(
+                "Segment placement must be installed before start(): start() has already "
+                    + "discovered segments and created the base keyspace under "
+                    + this.placement.directories());
+        }
+
+        List<Path> directories = placement.directories();
+        if (directories == null || directories.isEmpty()) {
+            throw new IllegalArgumentException("Placement must name at least one directory");
+        }
+        if (!directories.contains(dataDir)) {
+            throw new IllegalArgumentException(
+                "Placement must include the data directory " + dataDir
+                    + ", which holds the catalog and the routing directory; got " + directories);
+        }
+        for (Path directory : directories) {
+            if (!java.nio.file.Files.isDirectory(directory)) {
+                throw new IllegalArgumentException(
+                    "Volume directory does not exist: " + directory
+                        + ". A volume that is not mounted holds segments this node cannot read.");
+            }
+        }
+
+        this.placement = placement;
+        // Anything the single-directory default was already asked about was answered for a
+        // directory set this engine is no longer using.
+        locations.forgetAll();
+        LOGGER.log(Level.INFO, "Segment placement installed over {0}", directories);
+        return this;
     }
 
     /**
@@ -2328,30 +2537,21 @@ public class StorageEngine implements AutoCloseable {
      * @throws IllegalStateException if the child cannot be moved into place
      */
     private void prepareSplitChild(Segment child, long segmentIndex) {
-        Path target = segmentPath(segmentIndex);
         Path source = child.path();
-        if (!source.equals(target)) {
-            try {
-                java.nio.file.Files.move(source, target,
-                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-            } catch (IOException e) {
-                throw new IllegalStateException(
-                    "Failed to move split child " + source + " to " + target, e);
-            }
-            child.renamedTo(target);
-        }
+        Path target = installSplitChild(child, segmentIndex);
 
         if (child.writeLog() == null) {
             try {
                 // The parent's log is fully integrated into the children's files, so the
-                // child starts from an empty log at its own canonical name.
-                Path logPath = writeLogPath(segmentIndex);
+                // child starts from an empty log at its own canonical name, beside the file
+                // it actually ended up at.
+                Path logPath = walPathFor(target);
                 java.nio.file.Files.deleteIfExists(logPath);
                 child.attachWriteLog(new WriteLog(logPath));
             } catch (IOException e) {
                 throw new IllegalStateException(
-                    "Failed to create write log for split child at index " + segmentIndex, e);
+                    "Failed to create write log for split child " + source
+                        + " at index " + segmentIndex, e);
             }
         }
 
@@ -2363,6 +2563,70 @@ public class StorageEngine implements AutoCloseable {
     }
 
     /**
+     * Renames a split child onto its canonical name and returns where it landed.
+     *
+     * <p>A child is built beside its parent, so a placement that puts the child's index on
+     * another volume asks for a rename across file stores. That rename cannot be atomic, and
+     * copy-then-delete is not an option either: the child is mapped, and the mapping follows
+     * the inode, so a copy would leave every subsequent write going to the file that was
+     * deleted. The child therefore stays on its parent's volume, which is always a directory
+     * a restart scans, and the placement's preference is logged as unmet rather than
+     * silently obeyed.</p>
+     *
+     * @param child        The child segment, still under its build name
+     * @param segmentIndex The directory index the child will occupy
+     * @return The path the child now lives at
+     * @throws IllegalStateException if the child cannot be renamed at all
+     */
+    private Path installSplitChild(Segment child, long segmentIndex) {
+        Path source = child.path();
+        Path target = segmentPath(segmentIndex);
+        if (source.equals(target)) {
+            locations.adopt(segmentIndex, target);
+            return target;
+        }
+
+        try {
+            moveIntoPlace(source, target);
+        } catch (java.nio.file.AtomicMoveNotSupportedException crossStore) {
+            Path beside = source.resolveSibling(SegmentLocations.fileName(segmentIndex));
+            LOGGER.log(Level.WARNING,
+                "Split child {0} cannot be moved to {1} atomically because they are on "
+                    + "different file stores; keeping it beside its parent at {2}",
+                new Object[] { source, target, beside });
+            try {
+                moveIntoPlace(source, beside);
+            } catch (IOException e) {
+                throw new IllegalStateException(
+                    "Failed to move split child " + source + " to " + beside, e);
+            }
+            child.renamedTo(beside);
+            locations.adopt(segmentIndex, beside);
+            return beside;
+        } catch (IOException e) {
+            throw new IllegalStateException(
+                "Failed to move split child " + source + " to " + target, e);
+        }
+
+        child.renamedTo(target);
+        locations.adopt(segmentIndex, target);
+        return target;
+    }
+
+    /**
+     * Renames a file onto a canonical name, replacing whatever is there.
+     *
+     * @param source The current path
+     * @param target The canonical path
+     * @throws IOException if the rename fails
+     */
+    private static void moveIntoPlace(Path source, Path target) throws IOException {
+        java.nio.file.Files.move(source, target,
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /**
      * Removes the graph file the child would otherwise inherit.
      *
      * <p>The left child takes the parent's canonical name, and the graph file is derived from
@@ -2370,6 +2634,10 @@ public class StorageEngine implements AutoCloseable {
      * it holds nodes for every entry that moved to the right child, and its header carries a
      * checkpoint into a write log that no longer exists. Half of the split's own point is that
      * the children hold different entries, so there is nothing in that graph worth keeping.</p>
+     *
+     * <p>Its sidecars go with it. The document mapping names the parent's nodes, and the
+     * product-quantisation codebook was trained on the parent's vectors; a child left holding
+     * either would describe its own contents with the parent's answers.</p>
      *
      * @param child The child being prepared
      * @param segmentIndex The child's canonical index
@@ -2384,6 +2652,8 @@ public class StorageEngine implements AutoCloseable {
             java.nio.file.Files.deleteIfExists(graphPath);
             java.nio.file.Files.deleteIfExists(Path.of(graphPath.toString()
                 + io.excalibur.vector.hnsw.HnswGraph.DOCUMENT_MAPPING_SUFFIX));
+            java.nio.file.Files.deleteIfExists(Path.of(graphPath.toString()
+                + io.excalibur.vector.hnsw.HnswGraph.PRODUCT_QUANTIZER_SUFFIX));
         } catch (IOException e) {
             LOGGER.log(Level.WARNING,
                 "Could not remove the graph a split child would inherit at "

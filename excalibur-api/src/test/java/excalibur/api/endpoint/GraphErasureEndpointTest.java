@@ -199,6 +199,11 @@ class GraphErasureEndpointTest {
             assertThat(Json.at(json, "request_id")).isInstanceOf(Long.class);
             assertThat(Json.at(json, "edges_removed")).isInstanceOf(Long.class);
             assertThat(Json.at(json, "requests_satisfied")).isInstanceOf(Long.class);
+            assertThat(Json.at(json, "requests_withheld"))
+                .as("a request the node could not reach stays outstanding, and a caller under "
+                    + "an obligation has to be able to see that rather than read the silence "
+                    + "as completion")
+                .isInstanceOf(Long.class);
             assertThat(Json.at(json, "outstanding")).isInstanceOf(Long.class);
             assertThat(Json.at(json, "accepted")).isInstanceOf(Boolean.class);
             assertThat(Json.at(json, "compacted")).isInstanceOf(Boolean.class);

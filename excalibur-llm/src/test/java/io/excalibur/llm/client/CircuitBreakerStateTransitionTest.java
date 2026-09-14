@@ -249,19 +249,21 @@ class CircuitBreakerStateTransitionTest {
     class HalfOpenProbeTests {
 
         @Test
-        @DisplayName("Multiple allowRequest calls in HALF_OPEN state all succeed")
-        void multipleAllowRequestCallsInHalfOpenSucceed() throws InterruptedException {
+        @DisplayName("Callers after the probe allowance keep failing fast in HALF_OPEN")
+        void callersPastTheProbeAllowanceStillFailFast() throws InterruptedException {
             CircuitBreaker cb = new CircuitBreaker(SINGLE_FAILURE_THRESHOLD, SHORT_COOLDOWN, "probe-test");
 
             // Trip and wait for cooldown
             cb.recordFailure();
             Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
-            assertTrue(cb.allowRequest());
+            assertTrue(cb.allowRequest(), "The first caller after cooldown is the probe");
 
-            // Multiple allowRequest calls should all succeed in HALF_OPEN
+            // Everyone behind the probe is still refused: the provider has given no sign of
+            // recovery yet, and letting the backlog through is the burst the breaker is for.
             for (int i = 0; i < 10; i++) {
-                assertTrue(cb.allowRequest(),
-                    "allowRequest() must return true in HALF_OPEN state (call " + (i + 1) + ")");
+                assertFalse(cb.allowRequest(),
+                    "allowRequest() must return false once the probe allowance is spent (call "
+                        + (i + 1) + ")");
             }
             assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
         }
@@ -311,8 +313,6 @@ class CircuitBreakerStateTransitionTest {
 
             cb.recordFailure();
             Thread.sleep(SHORT_COOLDOWN.toMillis() + 5);
-            assertTrue(cb.allowRequest());
-            assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
 
             int numThreads = 50;
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
@@ -339,9 +339,11 @@ class CircuitBreakerStateTransitionTest {
             assertTrue(doneLatch.await(5, TimeUnit.SECONDS));
             executor.shutdown();
 
-            // All probe requests should be allowed in HALF_OPEN
-            assertEquals(numThreads, allowedCount.get(),
-                "All probe requests must be allowed in HALF_OPEN state");
+            // Exactly one, however many arrive together. The compare-and-set on the probe
+            // permit is what makes the winner unique; without it all fifty went through.
+            assertEquals(1, allowedCount.get(),
+                "Only the probe allowance may be admitted, even when the backlog arrives at once");
+            assertEquals(CircuitBreakerState.HALF_OPEN, cb.getState());
         }
     }
 

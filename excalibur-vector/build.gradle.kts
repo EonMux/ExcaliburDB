@@ -34,3 +34,10 @@ tasks.withType<JavaExec> {
     jvmArgs("--add-modules=jdk.incubator.vector")
     jvmArgs("--enable-preview")
 }
+
+// The doclet resolves imports like the compiler does, so it needs the incubator module too;
+// without it every file importing jdk.incubator.vector fails with "package is not visible".
+tasks.withType<Javadoc> {
+    (options as StandardJavadocDocletOptions)
+        .addStringOption("-add-modules", "jdk.incubator.vector")
+}

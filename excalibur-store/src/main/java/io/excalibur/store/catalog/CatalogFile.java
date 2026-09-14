@@ -215,8 +215,11 @@ public class CatalogFile implements AutoCloseable {
     /**
      * Writes a segment metadata record to the catalog file.
      *
-     * <p>If a record with the same segment ID already exists, it is updated.
+     * <p>If a record with the same segment ID already exists, it is updated in place.
      * Otherwise, a new record is appended.</p>
+     *
+     * <p>The two cases differ in durability, and deliberately so. See
+     * {@link #appendSegment(SegmentCatalog.SegmentMetadata)}.</p>
      *
      * @param metadata The segment metadata to write
      * @throws IOException if the write fails
@@ -229,22 +232,51 @@ public class CatalogFile implements AutoCloseable {
             throw new IllegalArgumentException("Metadata cannot be null");
         }
 
-        // Find existing record or determine position for new record
         long position = findRecordPosition(metadata.getSegmentId());
         if (position < 0) {
-            // New record - append at end
-            position = HEADER_SIZE + (long) segmentCount * RECORD_SIZE;
-            segmentCount++;
-
-            // Ensure we have space
-            ensureCapacity(segmentCount);
+            appendSegment(metadata);
+            return;
         }
 
-        // Write the record
+        // An update to a row that already exists. Entry-count deltas come through here on
+        // every put, so this path stays asynchronous: the mapping is msynced by an explicit
+        // flush(), by close(), or by the next append.
         writeRecordAt(position, metadata);
-
-        // Update header
         updateHeader();
+    }
+
+    /**
+     * Appends a record for a segment the catalog has never seen, and makes it durable.
+     *
+     * <p>An append is the moment a segment file becomes something this store knows it owns.
+     * The file itself is already on the device by the time it is registered; the row naming it
+     * is not, because the row lives in a memory mapping that the kernel writes back whenever it
+     * pleases. A host that loses power in that window comes back with a segment file and no row
+     * for it, which is the one inconsistency startup cannot repair - it either adopts the file
+     * as a brand new empty segment, losing everything in it, or refuses to start. Appends are
+     * rare, so paying an msync for each one is affordable in a way that paying one per put
+     * would not be.</p>
+     *
+     * <p>The record is forced before the count that claims it, so a crash between the two
+     * leaves a record no header counts rather than a header counting a record the device never
+     * received. And the capacity is grown before the count moves at all: a growth that fails
+     * on a full disk must leave the catalog exactly as it was, not counting an entry no write
+     * ever made room for.</p>
+     *
+     * @param metadata The segment metadata to append
+     * @throws IOException if the file cannot be grown or written
+     */
+    private void appendSegment(SegmentCatalog.SegmentMetadata metadata) throws IOException {
+        int appended = segmentCount + 1;
+        ensureCapacity(appended);
+
+        long position = HEADER_SIZE + (long) segmentCount * RECORD_SIZE;
+        writeRecordAt(position, metadata);
+        mappedFile.flush();
+
+        segmentCount = appended;
+        updateHeader();
+        mappedFile.flush();
     }
 
     /**

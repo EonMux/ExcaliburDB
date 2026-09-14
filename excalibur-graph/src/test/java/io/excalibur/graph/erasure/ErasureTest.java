@@ -5,9 +5,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
+import io.excalibur.graph.file.Durability;
 import io.excalibur.graph.format.EdgeColumn;
 import io.excalibur.graph.provenance.Provenance;
 import io.excalibur.graph.provenance.SourceType;
@@ -22,6 +24,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.roaringbitmap.RoaringBitmap;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ErasureTest {
 
@@ -138,6 +141,49 @@ class ErasureTest {
     @Nested
     @DisplayName("compaction")
     class Compaction {
+
+        @Test
+        @DisplayName("everything else in the graph directory survives the rewrite")
+        void sidecarsSurvive(@TempDir Path parent) throws IOException {
+            // The compaction rebuilds the edge store's columns and swaps the directory those
+            // columns live in. That directory also holds the label dictionaries, the two Lucene
+            // indexes and the entity vectors - everything GraphRagFactory.openAt reads back - and
+            // rebuilding only the columns once meant the swap deleted the rest. A compaction is
+            // the one operation that must not lose data: it is how an erasure obligation is
+            // discharged, and the retired copy is deleted afterwards, so the loss was final.
+            Path dir = parent.resolve("store");
+            MappedEdgeStore store = build(dir, 3, w -> w
+                .add(0, KNOWS, 1, Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 555, 1))
+                .add(0, KNOWS, 2, Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 777, 1)));
+
+            Files.writeString(dir.resolve("entity_dictionary.dat"), "alice\nbob\n");
+            Files.writeString(dir.resolve("entity_dictionary.idx"), "0 6\n");
+            Path lucene = Files.createDirectories(dir.resolve("documents"));
+            Files.writeString(lucene.resolve("segments_1"), "lucene segment");
+            Path nested = Files.createDirectories(lucene.resolve("sub"));
+            Files.writeString(nested.resolve("deeper"), "still here");
+
+            EdgeStoreCompactor.compact(store, dir, EdgeStoreCompactor.resolve(store,
+                List.of(new ErasureRequest(1,
+                    new ErasureScope.Source(SourceType.DOCUMENT, 777), Instant.now()))));
+
+            assertThat(dir.resolve("entity_dictionary.dat"))
+                .as("the entity dictionary is not rebuilt by a compaction, so it has to be kept")
+                .hasContent("alice\nbob\n");
+            assertThat(dir.resolve("entity_dictionary.idx")).hasContent("0 6\n");
+            assertThat(lucene.resolve("segments_1")).hasContent("lucene segment");
+            assertThat(nested.resolve("deeper"))
+                .as("carried across a whole tree, not just its top level")
+                .hasContent("still here");
+
+            try (MappedEdgeStore reopened = MappedEdgeStore.open(dir)) {
+                assertThat(reopened.edgeCount())
+                    .as("and the compaction still did its own job")
+                    .isEqualTo(1);
+            }
+        }
 
         @Test
         @DisplayName("erased data is gone from the files, not merely hidden")
@@ -322,6 +368,116 @@ class ErasureTest {
             assertThat(CompactionPolicy.never().shouldCompact(
                 new CompactionPolicy.CompactionStats(
                     100, 100, Optional.of(Instant.EPOCH), 100), now)).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("compaction durability")
+    class Durable {
+
+        /** Records what was synced, and can be told to fail at a chosen call. */
+        private static final class Recording implements Durability {
+
+            private final List<Path> files = new ArrayList<>();
+            private final List<Path> directories = new ArrayList<>();
+            private final int failAtFile;
+
+            Recording(int failAtFile) {
+                this.failAtFile = failAtFile;
+            }
+
+            @Override
+            public void fsyncFile(Path file) throws IOException {
+                files.add(file);
+                if (files.size() == failAtFile) {
+                    throw new IOException("simulated device failure syncing " + file);
+                }
+                Durability.super.fsyncFile(file);
+            }
+
+            @Override
+            public void fsyncDirectory(Path directory) throws IOException {
+                directories.add(directory);
+                Durability.super.fsyncDirectory(directory);
+            }
+        }
+
+        private MappedEdgeStore twoEdges(Path dir) throws IOException {
+            return build(dir, 3, w -> w
+                .add(0, KNOWS, 1, Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 555, 1))
+                .add(0, KNOWS, 2, Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    from(SourceType.DOCUMENT, 777, 1)));
+        }
+
+        private RoaringBitmap eraseDocument777(MappedEdgeStore store) {
+            return EdgeStoreCompactor.resolve(store, List.of(new ErasureRequest(1,
+                new ErasureScope.Source(SourceType.DOCUMENT, 777), Instant.now())));
+        }
+
+        @Test
+        @DisplayName("the replacement is forced to the device before the original is destroyed")
+        void theReplacementIsForcedBeforeTheOriginalGoes(@TempDir Path parent) throws IOException {
+            // Compaction deletes the retired original, so the replacement is the only copy from
+            // that moment on. Nothing in the rewrite was ever fsynced, so a power loss between
+            // the rename and writeback left a present descriptor over short or empty columns -
+            // and MappedColumns.open refuses those, leaving a graph that will not open at all.
+            Path dir = parent.resolve("store");
+            MappedEdgeStore store = twoEdges(dir);
+            Recording durability = new Recording(0);
+
+            EdgeStoreCompactor.compact(store, dir, eraseDocument777(store), durability);
+
+            List<String> syncedNames = durability.files.stream()
+                .map(path -> path.getFileName().toString())
+                .toList();
+            List<String> present;
+            try (var entries = Files.list(dir)) {
+                present = entries.filter(Files::isRegularFile)
+                    .map(path -> path.getFileName().toString()).sorted().toList();
+            }
+            assertThat(syncedNames)
+                .as("every file of the replacement store has to be on the device")
+                .containsAll(present);
+            assertThat(durability.directories)
+                .as("and the directory entry naming them, or the files can come back unreferenced")
+                .contains(dir.getParent());
+        }
+
+        @Test
+        @DisplayName("a failed sync leaves the original store in place and openable")
+        void aFailedSyncKeepsTheOriginal(@TempDir Path parent) throws IOException {
+            // The sync has to happen while the original is still the store being served. If it
+            // were attempted after the swap, a device error would have already cost the only
+            // durable copy.
+            Path dir = parent.resolve("store");
+            MappedEdgeStore store = twoEdges(dir);
+            RoaringBitmap tombstoned = eraseDocument777(store);
+
+            assertThatThrownBy(() ->
+                EdgeStoreCompactor.compact(store, dir, tombstoned, new Recording(1)))
+                .isInstanceOf(IOException.class);
+
+            store.close();
+            try (MappedEdgeStore reopened = MappedEdgeStore.open(dir)) {
+                assertThat(reopened.edgeCount())
+                    .as("nothing was erased, and nothing was lost either")
+                    .isEqualTo(2);
+            }
+        }
+
+        @Test
+        @DisplayName("the retired original is removed only once the replacement is durable")
+        void theRetiredCopyGoesLast(@TempDir Path parent) throws IOException {
+            Path dir = parent.resolve("store");
+            MappedEdgeStore store = twoEdges(dir);
+
+            EdgeStoreCompactor.compact(store, dir, eraseDocument777(store), new Recording(0));
+
+            try (var entries = Files.list(parent)) {
+                assertThat(entries.map(path -> path.getFileName().toString()))
+                    .containsExactly("store");
+            }
         }
     }
 }

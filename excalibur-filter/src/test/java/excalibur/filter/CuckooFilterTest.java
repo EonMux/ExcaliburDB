@@ -554,4 +554,44 @@ class CuckooFilterTest {
         assertTrue(filter.loadFactor() > 0);
         System.out.println("Filter stats: " + filter);
     }
+
+    @org.junit.jupiter.api.Nested
+    @org.junit.jupiter.api.DisplayName("Sizing")
+    class Sizing {
+
+        @Test
+        @DisplayName("a filter accepts the capacity it was created for")
+        void acceptsItsStatedCapacity() {
+            // The bucket count was rounded down to a power of two after being doubled, which
+            // cancelled the doubling: capacity 1000 got 256 buckets, 1024 slots, and the filter
+            // sat at 98% full at its own documented capacity. A cuckoo insert gives up after a
+            // bounded displacement chain, so that is where inserts start being refused - and a
+            // filter that has refused a term stops being trusted to rule a segment out, which
+            // turns pruning off for the whole node.
+            int capacity = 1000;
+            CuckooFilter filter = CuckooFilter.create(capacity);
+
+            int accepted = 0;
+            for (int i = 0; i < capacity; i++) {
+                if (filter.insert(("key-" + i).getBytes(StandardCharsets.UTF_8))) {
+                    accepted++;
+                }
+            }
+
+            assertEquals(capacity, accepted,
+                "every key up to the stated capacity has to fit, or the capacity is a fiction");
+            assertTrue(filter.loadFactor() < 0.6,
+                "and it should still be comfortably below the load where inserts start failing, "
+                    + "not scraping in at the last slot: was " + filter.loadFactor());
+        }
+
+        @Test
+        @DisplayName("a tiny capacity still gets the floor of four buckets")
+        void tinyCapacitiesGetTheFloor() {
+            CuckooFilter filter = CuckooFilter.create(1);
+
+            assertTrue(filter.insert("only".getBytes(StandardCharsets.UTF_8)));
+            assertTrue(filter.contains("only".getBytes(StandardCharsets.UTF_8)));
+        }
+    }
 }

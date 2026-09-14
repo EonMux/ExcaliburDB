@@ -56,19 +56,27 @@ public class LshIngestionService implements io.excalibur.store.VectorPrefilter {
     private static final Logger LOGGER = LoggerFactory.getLogger(LshIngestionService.class);
 
     /**
-     * Default number of hash tables for LSH.
+     * Where a deployment's vector dimensionality comes from.
+     *
+     * <p>Ingestion never reads the configuration file - the parameters are handed to the
+     * constructor - but a value this service will not accept is the operator's typing, and the
+     * only thing they can act on is the name of the line they typed it on. Naming it is the
+     * difference between a startup failure they can fix and one that reads as a defect.</p>
+     *
+     * <p>Two lines can carry it, because the dimensionality falls back to the embedding model's
+     * when the query side does not state one, so both are named rather than guessing.</p>
      */
-    public static final int DEFAULT_NUM_HASH_TABLES = 15;
+    private static final String DIMENSIONS_PROPERTY = "excalibur.query.vector-dimensions, "
+        + "or excalibur.llm.embeddings-dimensions when that is unset";
 
-    /**
-     * Default number of hash functions per table.
-     */
-    public static final int DEFAULT_NUM_HASH_FUNCTIONS = 16;
+    /** The deployment property carrying the hash-table count. */
+    private static final String HASH_TABLES_PROPERTY = "excalibur.shard.lsh-hash-tables";
 
-    /**
-     * Default number of multi-probe candidates.
-     */
-    public static final int DEFAULT_NUM_PROBES = 3;
+    /** The deployment property carrying the hash-function count. */
+    private static final String HASH_FUNCTIONS_PROPERTY = "excalibur.shard.lsh-hash-functions";
+
+    /** The deployment property carrying the multi-probe count. */
+    private static final String PROBES_PROPERTY = "excalibur.shard.lsh-probes";
 
     private final int vectorDimensions;
     private final int numHashTables;
@@ -81,37 +89,78 @@ public class LshIngestionService implements io.excalibur.store.VectorPrefilter {
     private final ReentrantLock initializationLock = new ReentrantLock();
 
     /**
-     * Creates a new LshIngestionService with the specified vector dimensions.
+     * A service on the LSH defaults, for a caller that has no configured parameters of its own.
+     *
+     * <p>The defaults are {@link LshConfig}'s, not a second set: a pre-filter built here and one
+     * built straight from an {@code LshConfig} have to describe the same index, or a segment
+     * would be read back through hyperplanes it was not written with.</p>
      *
      * @param vectorDimensions The dimensionality of vectors to be indexed
      * @throws IllegalArgumentException if vectorDimensions is not positive
      */
     public LshIngestionService(int vectorDimensions) {
-        this(vectorDimensions, DEFAULT_NUM_HASH_TABLES, DEFAULT_NUM_HASH_FUNCTIONS, DEFAULT_NUM_PROBES);
+        this(vectorDimensions,
+            LshConfig.DEFAULT_NUM_HASH_TABLES,
+            LshConfig.DEFAULT_NUM_HASH_FUNCTIONS,
+            LshConfig.DEFAULT_NUM_PROBES);
     }
 
     /**
-     * Creates a new LshIngestionService with custom LSH parameters.
+     * A service on the LSH parameters a deployment chose.
+     *
+     * <p>The parameters arrive as arguments rather than being read here: ingestion does not know
+     * about the configuration file, and the module that does supplies them when it builds the
+     * pre-filter.</p>
+     *
+     * <p>They are properties of an index at the moment it is built, so a change here reaches
+     * segment indexes built afterwards. Every table a segment persists records the dimensions
+     * and the hash-function count it was written with, refuses to re-open under different ones,
+     * and hashes with the seed in its own header rather than the configured one. Changing these
+     * values under segments whose tables are already on disk is therefore a rebuild rather than
+     * a reconfiguration: a different hash-function count is rejected when the index is opened,
+     * and a smaller table count quietly leaves the persisted tables it no longer covers
+     * unread.</p>
+     *
+     * <p>A value outside what an index can represent is refused here, naming the property it
+     * arrives from. Left to the moment a segment's index is built it would surface as the same
+     * exception a set of tables on disk throws when its recorded shape does not match, and an
+     * operator whose only mistake was a number in a file would be told their index was
+     * corrupt.</p>
      *
      * @param vectorDimensions The dimensionality of vectors to be indexed
-     * @param numHashTables Number of hash tables (more = higher recall)
-     * @param numHashFunctions Number of hash functions per table
-     * @param numProbes Number of multi-probe candidates
-     * @throws IllegalArgumentException if any parameter is invalid
+     * @param numHashTables Number of hash tables, at least 1 (more = higher recall)
+     * @param numHashFunctions Number of hash functions per table, 1 to
+     *     {@link LshConfig#MAX_HASH_FUNCTIONS}
+     * @param numProbes Number of multi-probe candidates, at least 1
+     * @throws IllegalArgumentException if any parameter is one no index will accept
      */
     public LshIngestionService(int vectorDimensions, int numHashTables,
                                int numHashFunctions, int numProbes) {
         if (vectorDimensions <= 0) {
-            throw new IllegalArgumentException("vectorDimensions must be positive: " + vectorDimensions);
+            throw new IllegalArgumentException("vectorDimensions must be positive: "
+                + vectorDimensions + " (configured by " + DIMENSIONS_PROPERTY + ")");
         }
         if (numHashTables <= 0) {
-            throw new IllegalArgumentException("numHashTables must be positive: " + numHashTables);
+            throw new IllegalArgumentException("numHashTables must be positive: " + numHashTables
+                + " (configured by " + HASH_TABLES_PROPERTY + ")");
         }
         if (numHashFunctions <= 0) {
-            throw new IllegalArgumentException("numHashFunctions must be positive: " + numHashFunctions);
+            throw new IllegalArgumentException("numHashFunctions must be positive: "
+                + numHashFunctions + " (configured by " + HASH_FUNCTIONS_PROPERTY + ")");
+        }
+        if (numHashFunctions > LshConfig.MAX_HASH_FUNCTIONS) {
+            // Refused here rather than when a segment's index is built, where the same
+            // IllegalArgumentException arrives from LshConfig indistinguishable from the one a
+            // set of tables on disk throws when its recorded shape does not match. An operator
+            // who typed an impossible number would be told their index was the wrong shape and
+            // sent to reindex a corpus that is fine.
+            throw new IllegalArgumentException("numHashFunctions must be at most "
+                + LshConfig.MAX_HASH_FUNCTIONS + " because a bucket key is packed into a long: "
+                + numHashFunctions + " (configured by " + HASH_FUNCTIONS_PROPERTY + ")");
         }
         if (numProbes <= 0) {
-            throw new IllegalArgumentException("numProbes must be positive: " + numProbes);
+            throw new IllegalArgumentException("numProbes must be positive: " + numProbes
+                + " (configured by " + PROBES_PROPERTY + ")");
         }
 
         this.vectorDimensions = vectorDimensions;
@@ -159,31 +208,73 @@ public class LshIngestionService implements io.excalibur.store.VectorPrefilter {
                 return;
             }
 
+            // Built outside the open below, and deliberately not guarded. Every bound LshConfig
+            // enforces is one the constructor has already refused against the property that
+            // carried it, so this cannot fail; were it ever to, the fault would be the
+            // deployment's configuration, which says nothing about what is on disk and must not
+            // be reported as though it did.
             LshConfig config = configForSegment(segment);
             Path directory = lshDirectory(segment);
 
-            LshIndex lshIndex;
-            if (directory != null) {
-                lshIndex = LshIndex.open(config, directory);
-            } else {
-                // A segment with no backing path (in-memory fixtures) has nowhere to persist to.
-                lshIndex = new LshIndex(config);
+            LshIndex lshIndex = openIndex(segment, config, directory);
+            if (lshIndex == null) {
+                return;
             }
             segment.attachLshIndex(lshIndex);
 
             LOGGER.debug("Initialized LSH index for segment {} with dimensions {} at {}",
                 segment.segmentId(), vectorDimensions, directory);
-        } catch (IOException e) {
-            LOGGER.warn("Failed to open persistent LSH index for segment {}: {}",
-                segment.segmentId(), e.getMessage());
         } finally {
             initializationLock.unlock();
         }
     }
 
     /**
+     * Opens a segment's persisted tables, or builds an unbacked index for a segment with no file.
+     *
+     * <p>The only place an {@link IllegalArgumentException} may be read as a statement about what
+     * is on disk, because it is the only place anything on disk is read. The configuration the
+     * open is given was validated at construction, so what remains here is the tables' own
+     * refusal to re-open under a shape they were not written with.</p>
+     *
+     * @param segment   The segment being made searchable
+     * @param config    The shape this node is configured for
+     * @param directory The segment's table directory, or null if it has no backing file
+     * @return The index, or null if the segment must be searched without a pre-filter
+     */
+    private LshIndex openIndex(Segment segment, LshConfig config, Path directory) {
+        if (directory == null) {
+            // A segment with no backing path (in-memory fixtures) has nowhere to persist to.
+            return new LshIndex(config);
+        }
+        try {
+            return LshIndex.open(config, directory);
+        } catch (IOException e) {
+            LOGGER.warn("Failed to open persistent LSH index for segment {}: {}",
+                segment.segmentId(), e.getMessage());
+            return null;
+        } catch (IllegalArgumentException e) {
+            // The tables on disk record the shape they were built with and refuse to open under
+            // another. That is right - hyperplanes from a different shape put a vector in the
+            // wrong bucket - but it must not stop the segment being used: LSH only narrows the
+            // candidates a search considers, so a segment without it is searched in full and
+            // answers correctly, just more slowly. Said plainly here because the alternative is
+            // an operator who changed the shape, kept correct answers, and lost the prefilter on
+            // every existing segment with nothing telling them why the node got slower.
+            LOGGER.warn("Segment {} has an LSH index built with a different shape than this "
+                + "node is configured for ({}). It is being searched without the prefilter, "
+                + "which is slower and still correct. Reindex the corpus to build the index "
+                + "the new configuration describes.", segment.segmentId(), e.getMessage());
+            return null;
+        }
+    }
+
+    /**
      * Builds the LSH configuration for one segment, seeded from its id so the hyperplanes are
      * reproducible across restarts.
+     *
+     * <p>Only a segment whose index is being created is configured from here. One that already
+     * has tables on disk is rebuilt from the parameters in its own header.</p>
      */
     private LshConfig configForSegment(Segment segment) {
         return LshConfig.builder(vectorDimensions)

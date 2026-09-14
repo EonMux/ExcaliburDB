@@ -87,7 +87,7 @@ public final class TermExtractor {
      *
      * @param minTermLength Minimum term length (must be >= 1)
      * @param filterStopWords Whether to filter common stop words
-     * @throws IllegalArgumentException if minTermLength < 1
+     * @throws IllegalArgumentException if {@code minTermLength < 1}
      */
     public TermExtractor(int minTermLength, boolean filterStopWords) {
         if (minTermLength < 1) {

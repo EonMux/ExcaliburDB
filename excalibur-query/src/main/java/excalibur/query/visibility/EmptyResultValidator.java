@@ -1,6 +1,5 @@
 package excalibur.query.visibility;
 
-import excalibur.query.IndexCoverage;
 import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
 import excalibur.query.executor.SegmentQueryTask;
@@ -245,157 +244,364 @@ public final class EmptyResultValidator {
             );
         }
 
+        Probe probe = new Probe(response, request, allMetadata, visibilityTracker,
+            segmentResults, graphProvider, diagnosticDetails);
+
+        return diagnoseSegmentVisibility(probe);
+    }
+
+    /**
+     * Everything the stages of an empty-result diagnosis read, carried together.
+     *
+     * <p>The stages run as a cascade, each ruling out one explanation before the next is
+     * allowed to look for its own, so they all need the same inputs and differ only in what
+     * they have concluded so far. {@code diagnosticDetails} is the running narrative every
+     * stage appends its findings to, and it is the one member the stages write through.</p>
+     *
+     * @param response The query response being explained
+     * @param request The original query request
+     * @param allMetadata Every segment the catalog holds, by id
+     * @param visibilityTracker The visibility tracker, which may be absent
+     * @param segmentResults The results from segment searches, which may be absent
+     * @param graphProvider Provider for HNSW graphs, which may be absent
+     * @param diagnosticDetails The findings collected so far
+     */
+    private record Probe(
+        QueryResponse response,
+        QueryRequest request,
+        Map<Long, SegmentCatalog.SegmentMetadata> allMetadata,
+        excalibur.shard.VisibilityTracker visibilityTracker,
+        List<SegmentQueryTask.SegmentQueryResult> segmentResults,
+        HnswGraphProvider graphProvider,
+        List<String> diagnosticDetails
+    ) {
+    }
+
+    /**
+     * Rules out the query having had nothing it was allowed to read.
+     *
+     * <p>Queryable and visible are separate conditions and fail differently. A corpus with
+     * nothing queryable in it is a legitimately empty answer; one that is queryable and
+     * invisible is not, because the documents are there and something in visibility tracking
+     * is keeping the query from them.</p>
+     *
+     * @param probe The inputs to this diagnosis
+     * @return The explanation for the empty result
+     */
+    private static ValidationResult diagnoseSegmentVisibility(Probe probe) {
+        SegmentCensus census = takeSegmentCensus(probe);
+
+        // Check 2: No queryable segments
+        if (census.queryableSegments() == 0) {
+            probe.diagnosticDetails().add(
+                "No segments in queryable states (INDEXING, WARMING, ACTIVE, COMPACTING)");
+            return new ValidationResult(
+                true, ValidationResult.Reason.NO_QUERYABLE_SEGMENTS,
+                census.catalogSegments(), 0, census.visibleSegments(),
+                0, 0, 0, 0, 0, false, probe.diagnosticDetails()
+            );
+        }
+
+        // Check 3: No visible segments (visibility tracking issue)
+        if (probe.visibilityTracker() != null && census.visibleSegments() == 0
+                && census.queryableSegments() > 0) {
+            probe.diagnosticDetails().add(
+                "Segments are queryable but not visible - check visibility tracking");
+            return new ValidationResult(
+                false, ValidationResult.Reason.VISIBILITY_BUG,
+                census.catalogSegments(), census.queryableSegments(), 0,
+                0, 0, 0, 0, 0, false, probe.diagnosticDetails()
+            );
+        }
+
+        return diagnoseGraphContents(probe, census);
+    }
+
+    /**
+     * Counts the segments the query was entitled to read, and records the count.
+     *
+     * <p>A deployment with no visibility tracker reports epoch 0 and no visible segments
+     * rather than guessing: nothing is tracking visibility, so there is no epoch the answer
+     * was taken at and nothing to attribute a missing segment to.</p>
+     *
+     * @param probe The inputs to this diagnosis
+     * @return What the catalog and the visibility tracker say about the corpus
+     */
+    private static SegmentCensus takeSegmentCensus(Probe probe) {
         // Count queryable and visible segments
         int queryableSegments = 0;
         int visibleSegments = 0;
-        long queryEpoch = visibilityTracker != null ? visibilityTracker.currentEpoch() : 0;
+        long queryEpoch = probe.visibilityTracker() != null
+            ? probe.visibilityTracker().currentEpoch() : 0;
 
-        if (visibilityTracker != null) {
-            Set<Long> visible = visibilityTracker.visibleSegments(queryEpoch);
+        if (probe.visibilityTracker() != null) {
+            Set<Long> visible = probe.visibilityTracker().visibleSegments(queryEpoch);
             visibleSegments = visible.size();
         }
 
-        for (SegmentCatalog.SegmentMetadata metadata : allMetadata.values()) {
+        for (SegmentCatalog.SegmentMetadata metadata : probe.allMetadata().values()) {
             if (metadata.getLifecycleState().isQueryable()) {
                 queryableSegments++;
             }
         }
 
-        diagnosticDetails.add(String.format("Catalog has %d segments: %d queryable, %d visible at epoch %d",
-            catalogSegments, queryableSegments, visibleSegments, queryEpoch));
+        int catalogSegments = probe.allMetadata().size();
+        probe.diagnosticDetails().add(
+            String.format("Catalog has %d segments: %d queryable, %d visible at epoch %d",
+                catalogSegments, queryableSegments, visibleSegments, queryEpoch));
 
-        // Check 2: No queryable segments
-        if (queryableSegments == 0) {
-            diagnosticDetails.add("No segments in queryable states (INDEXING, WARMING, ACTIVE, COMPACTING)");
+        return new SegmentCensus(catalogSegments, queryableSegments, visibleSegments);
+    }
+
+    /**
+     * How much corpus the query had to work with.
+     *
+     * @param catalogSegments Number of segments in catalog
+     * @param queryableSegments Number of segments in queryable states
+     * @param visibleSegments Number of segments visible at query epoch
+     */
+    private record SegmentCensus(int catalogSegments, int queryableSegments, int visibleSegments) {
+    }
+
+    /**
+     * Rules out the visible segments having held no vectors to match against.
+     *
+     * <p>Legitimate rather than a bug: segments are created before they are filled, so a
+     * corpus that has been registered but not yet indexed genuinely has nothing to return.</p>
+     *
+     * @param probe The inputs to this diagnosis
+     * @param census What the catalog and the visibility tracker said about the corpus
+     * @return The explanation for the empty result
+     */
+    private static ValidationResult diagnoseGraphContents(Probe probe, SegmentCensus census) {
+        GraphCensus graphs = countGraphVectors(probe);
+
+        // Check 4: Segments have no vectors
+        if (graphs.activeVectors() == 0) {
+            probe.diagnosticDetails().add("No active vectors in any HNSW graph");
+            // This is legitimate - segments exist but have no data yet
             return new ValidationResult(
-                true, ValidationResult.Reason.NO_QUERYABLE_SEGMENTS,
-                catalogSegments, 0, visibleSegments, 0, 0, 0, 0, 0, false, diagnosticDetails
+                true, ValidationResult.Reason.NO_VECTOR_MATCH,
+                census.catalogSegments(), census.queryableSegments(), census.visibleSegments(),
+                graphs.totalVectors(), 0, 0, 0, 0, false, probe.diagnosticDetails()
             );
         }
 
-        // Check 3: No visible segments (visibility tracking issue)
-        if (visibilityTracker != null && visibleSegments == 0 && queryableSegments > 0) {
-            diagnosticDetails.add("Segments are queryable but not visible - check visibility tracking");
-            return new ValidationResult(
-                false, ValidationResult.Reason.VISIBILITY_BUG,
-                catalogSegments, queryableSegments, 0, 0, 0, 0, 0, 0, false, diagnosticDetails
-            );
+        return diagnoseSearchOutcome(probe, census, graphs);
+    }
+
+    /**
+     * Counts the vectors the catalog's graphs hold, describing each non-empty one.
+     *
+     * <p>Every catalog segment is counted, not only the visible ones: the point of the count
+     * is to establish whether there was anything in the corpus to find, which an earlier stage
+     * has already separated from the question of what this query was allowed to see.</p>
+     *
+     * @param probe The inputs to this diagnosis
+     * @return The total and active vector counts across the graphs
+     */
+    private static GraphCensus countGraphVectors(Probe probe) {
+        if (probe.graphProvider() == null) {
+            return new GraphCensus(0, 0);
         }
 
         // Count vectors in graphs
         long totalVectorsInGraphs = 0;
         long activeVectorsInGraphs = 0;
 
-        if (graphProvider != null) {
-            for (Long segmentId : allMetadata.keySet()) {
-                HnswGraph graph = graphProvider.getGraph(segmentId);
-                if (graph != null) {
-                    totalVectorsInGraphs += graph.nodeCount();
-                    activeVectorsInGraphs += graph.activeNodeCount();
+        for (Long segmentId : probe.allMetadata().keySet()) {
+            HnswGraph graph = probe.graphProvider().getGraph(segmentId);
+            if (graph == null) {
+                continue;
+            }
 
-                    if (graph.nodeCount() > 0) {
-                        diagnosticDetails.add(String.format(
-                            "Segment %d: graph has %d nodes (%d active), entryPoint=%d",
-                            segmentId, graph.nodeCount(), graph.activeNodeCount(), graph.entryPoint()));
-                    }
-                }
+            totalVectorsInGraphs += graph.nodeCount();
+            activeVectorsInGraphs += graph.activeNodeCount();
+
+            if (graph.nodeCount() > 0) {
+                probe.diagnosticDetails().add(String.format(
+                    "Segment %d: graph has %d nodes (%d active), entryPoint=%d",
+                    segmentId, graph.nodeCount(), graph.activeNodeCount(), graph.entryPoint()));
             }
         }
 
-        // Check 4: Segments have no vectors
-        if (activeVectorsInGraphs == 0) {
-            diagnosticDetails.add("No active vectors in any HNSW graph");
-            // This is legitimate - segments exist but have no data yet
+        return new GraphCensus(totalVectorsInGraphs, activeVectorsInGraphs);
+    }
+
+    /**
+     * How many vectors the corpus holds.
+     *
+     * @param totalVectors Total vectors across all HNSW graphs
+     * @param activeVectors Active (non-tombstoned) vectors in graphs
+     */
+    private record GraphCensus(long totalVectors, long activeVectors) {
+    }
+
+    /**
+     * Rules out the search itself having failed to reach or return anything.
+     *
+     * @param probe The inputs to this diagnosis
+     * @param census What the catalog and the visibility tracker said about the corpus
+     * @param graphs How many vectors the corpus holds
+     * @return The explanation for the empty result
+     */
+    private static ValidationResult diagnoseSearchOutcome(
+            Probe probe, SegmentCensus census, GraphCensus graphs) {
+
+        SearchTally tally = tallySegmentAnswers(probe);
+
+        // Check 5: The query was dispatched but nothing came back from it
+        if (probe.segmentResults() != null && !probe.segmentResults().isEmpty()
+                && tally.segmentsSearched() == 0) {
+            // The emptiness is already accounted for: no segment produced evidence either way.
+            // Reading it as a suspected bug would flag every query a timing-out shard serves.
+            probe.diagnosticDetails().add("No segment answered - all " + probe.segmentResults().size()
+                + " failed or timed out");
             return new ValidationResult(
-                true, ValidationResult.Reason.NO_VECTOR_MATCH,
-                catalogSegments, queryableSegments, visibleSegments,
-                totalVectorsInGraphs, 0, 0, 0, 0, false, diagnosticDetails
+                true, ValidationResult.Reason.NO_SEGMENT_ANSWERED,
+                census.catalogSegments(), census.queryableSegments(), census.visibleSegments(),
+                graphs.totalVectors(), graphs.activeVectors(),
+                0, 0, 0, false, probe.diagnosticDetails()
             );
         }
 
+        // Check 6: Segments were searched but returned no results
+        if (tally.segmentsSearched() > 0 && tally.segmentsWithResults() == 0
+                && graphs.activeVectors() > 0) {
+            probe.diagnosticDetails().add(
+                "Segments were searched with active vectors but HNSW returned empty");
+            return new ValidationResult(
+                false, ValidationResult.Reason.HNSW_EMPTY_BUG,
+                census.catalogSegments(), census.queryableSegments(), census.visibleSegments(),
+                graphs.totalVectors(), graphs.activeVectors(),
+                tally.segmentsSearched(), 0, 0, false, probe.diagnosticDetails()
+            );
+        }
+
+        return diagnoseResultLoss(probe, census, graphs, tally);
+    }
+
+    /**
+     * Counts what came back from the segments, and records the tally.
+     *
+     * <p>Only a segment that reported success is counted as searched. One that failed or timed
+     * out has said nothing about its contents, and counting it as searched-and-empty is what
+     * would turn a partial answer into evidence that the corpus holds no match.</p>
+     *
+     * @param probe The inputs to this diagnosis
+     * @return What the segment searches returned
+     */
+    private static SearchTally tallySegmentAnswers(Probe probe) {
         // Analyze segment search results
         int segmentsSearched = 0;
         int segmentsWithResults = 0;
         int rawResultCount = 0;
 
-        if (segmentResults != null) {
-            for (SegmentQueryTask.SegmentQueryResult result : segmentResults) {
-                if (result.success()) {
-                    segmentsSearched++;
-                    if (!result.results().isEmpty()) {
-                        segmentsWithResults++;
-                        rawResultCount += result.results().size();
-                    }
+        if (probe.segmentResults() != null) {
+            for (SegmentQueryTask.SegmentQueryResult result : probe.segmentResults()) {
+                if (!result.success()) {
+                    continue;
+                }
+
+                segmentsSearched++;
+                if (!result.results().isEmpty()) {
+                    segmentsWithResults++;
+                    rawResultCount += result.results().size();
                 }
             }
         }
 
-        // Check coverage from response
-        IndexCoverage coverage = response.coverage();
-        boolean thresholdFiltering = request.threshold() > 0;
-
-        diagnosticDetails.add(String.format(
+        probe.diagnosticDetails().add(String.format(
             "Search: %d segments searched, %d with results, %d raw results, threshold=%.2f",
-            segmentsSearched, segmentsWithResults, rawResultCount, request.threshold()));
+            segmentsSearched, segmentsWithResults, rawResultCount, probe.request().threshold()));
 
-        // Check 5: The query was dispatched but nothing came back from it
-        if (segmentResults != null && !segmentResults.isEmpty() && segmentsSearched == 0) {
-            // The emptiness is already accounted for: no segment produced evidence either way.
-            // Reading it as a suspected bug would flag every query a timing-out shard serves.
-            diagnosticDetails.add("No segment answered - all " + segmentResults.size()
-                + " failed or timed out");
-            return new ValidationResult(
-                true, ValidationResult.Reason.NO_SEGMENT_ANSWERED,
-                catalogSegments, queryableSegments, visibleSegments,
-                totalVectorsInGraphs, activeVectorsInGraphs,
-                0, 0, 0, false, diagnosticDetails
-            );
-        }
+        return new SearchTally(segmentsSearched, segmentsWithResults, rawResultCount);
+    }
 
-        // Check 6: Segments were searched but returned no results
-        if (segmentsSearched > 0 && segmentsWithResults == 0 && activeVectorsInGraphs > 0) {
-            diagnosticDetails.add("Segments were searched with active vectors but HNSW returned empty");
-            return new ValidationResult(
-                false, ValidationResult.Reason.HNSW_EMPTY_BUG,
-                catalogSegments, queryableSegments, visibleSegments,
-                totalVectorsInGraphs, activeVectorsInGraphs,
-                segmentsSearched, 0, 0, false, diagnosticDetails
-            );
-        }
+    /**
+     * What the segment searches returned.
+     *
+     * @param segmentsSearched Number of segments that were searched
+     * @param segmentsWithResults Number of segments that returned results
+     * @param rawResultCount Raw results before aggregation
+     */
+    private record SearchTally(int segmentsSearched, int segmentsWithResults, int rawResultCount) {
+    }
+
+    /**
+     * Accounts for results the segments returned that the caller never saw.
+     *
+     * <p>Threshold filtering is checked before aggregation, because a configured threshold
+     * explains the loss on its own and reporting an aggregation bug for results the query
+     * explicitly asked to discard would send an operator after nothing. What is left when
+     * neither explains it is recorded as unknown rather than guessed at.</p>
+     *
+     * @param probe The inputs to this diagnosis
+     * @param census What the catalog and the visibility tracker said about the corpus
+     * @param graphs How many vectors the corpus holds
+     * @param tally What the segment searches returned
+     * @return The explanation for the empty result
+     */
+    private static ValidationResult diagnoseResultLoss(
+            Probe probe, SegmentCensus census, GraphCensus graphs, SearchTally tally) {
+
+        boolean thresholdFiltering = probe.request().threshold() > 0;
 
         // Check 7: Raw results existed but were filtered out by threshold
-        if (rawResultCount > 0 && thresholdFiltering) {
-            diagnosticDetails.add(String.format(
+        if (tally.rawResultCount() > 0 && thresholdFiltering) {
+            probe.diagnosticDetails().add(String.format(
                 "Threshold filtering: %d raw results removed by threshold %.2f",
-                rawResultCount, request.threshold()));
-            return new ValidationResult(
-                true, ValidationResult.Reason.THRESHOLD_FILTERING,
-                catalogSegments, queryableSegments, visibleSegments,
-                totalVectorsInGraphs, activeVectorsInGraphs,
-                segmentsSearched, segmentsWithResults, rawResultCount, true, diagnosticDetails
-            );
+                tally.rawResultCount(), probe.request().threshold()));
+            return lossResult(ValidationResult.Reason.THRESHOLD_FILTERING, true,
+                probe, census, graphs, tally, true);
         }
 
         // Check 8: Raw results existed but were lost during aggregation
-        if (rawResultCount > 0 && response.isEmpty()) {
-            diagnosticDetails.add(String.format(
+        if (tally.rawResultCount() > 0 && probe.response().isEmpty()) {
+            probe.diagnosticDetails().add(String.format(
                 "Results lost: %d raw results but final response is empty - aggregation bug?",
-                rawResultCount));
-            return new ValidationResult(
-                false, ValidationResult.Reason.AGGREGATION_BUG,
-                catalogSegments, queryableSegments, visibleSegments,
-                totalVectorsInGraphs, activeVectorsInGraphs,
-                segmentsSearched, segmentsWithResults, rawResultCount, false, diagnosticDetails
-            );
+                tally.rawResultCount()));
+            return lossResult(ValidationResult.Reason.AGGREGATION_BUG, false,
+                probe, census, graphs, tally, false);
         }
 
         // Default: unknown cause
-        diagnosticDetails.add("Unable to determine specific cause of empty results");
+        probe.diagnosticDetails().add("Unable to determine specific cause of empty results");
+        return lossResult(ValidationResult.Reason.UNKNOWN, false,
+            probe, census, graphs, tally, false);
+    }
+
+    /**
+     * Assembles a result for the stage that has everything the diagnosis measured.
+     *
+     * <p>The last three explanations differ only in their verdict, so they are built from one
+     * place: every count the diagnosis gathered is carried into all of them, and a caller
+     * comparing two of them is comparing the reason rather than which numbers were filled in.</p>
+     *
+     * @param reason Why the results were empty
+     * @param legitimate Whether that reason is an expected outcome rather than a bug
+     * @param probe The inputs to this diagnosis
+     * @param census What the catalog and the visibility tracker said about the corpus
+     * @param graphs How many vectors the corpus holds
+     * @param tally What the segment searches returned
+     * @param thresholdFiltering Whether threshold filtering removed the results
+     * @return The diagnosis
+     */
+    private static ValidationResult lossResult(
+            ValidationResult.Reason reason,
+            boolean legitimate,
+            Probe probe,
+            SegmentCensus census,
+            GraphCensus graphs,
+            SearchTally tally,
+            boolean thresholdFiltering) {
+
         return new ValidationResult(
-            false, ValidationResult.Reason.UNKNOWN,
-            catalogSegments, queryableSegments, visibleSegments,
-            totalVectorsInGraphs, activeVectorsInGraphs,
-            segmentsSearched, segmentsWithResults, rawResultCount, false, diagnosticDetails
+            legitimate, reason,
+            census.catalogSegments(), census.queryableSegments(), census.visibleSegments(),
+            graphs.totalVectors(), graphs.activeVectors(),
+            tally.segmentsSearched(), tally.segmentsWithResults(), tally.rawResultCount(),
+            thresholdFiltering, probe.diagnosticDetails()
         );
     }
 

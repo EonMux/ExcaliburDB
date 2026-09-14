@@ -252,9 +252,10 @@ class ResponseSanitizerTest {
 
         String result = sanitizer.sanitize(input);
 
-        // Non-greedy regex matches from first [ to first ]
-        // For "[[1, 2], [3, 4]]", it matches "[[1, 2]" (outer [ + inner content up to first ])
-        assertEquals("[[1, 2]", result);
+        // The whole outer array, because brackets are matched by depth. The previous non-greedy
+        // pattern stopped at the first closing bracket and returned "[[1, 2]", which is not
+        // valid JSON and only ever parsed to nothing.
+        assertEquals("[[1, 2], [3, 4]]", result);
     }
 
     // ============= Complex Real-World LLM Responses =============

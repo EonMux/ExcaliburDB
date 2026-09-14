@@ -1,5 +1,7 @@
 package io.excalibur.retrieval.lexical.native_;
 
+import io.excalibur.retrieval.lexical.Bm25Parameters;
+
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -38,6 +40,9 @@ class WandExactnessTest {
             totalTokens += length;
         }
         double average = docCount == 0 ? 1.0 : (double) totalTokens / docCount;
+        // The index's own pair, so this stays a check on skipping rather than on which constants
+        // the scorer happens to hold.
+        Bm25Parameters bm25 = index.bm25();
 
         for (int t = 0; t < terms.length; t++) {
             int termId = index.termId(terms[t]);
@@ -53,9 +58,8 @@ class WandExactnessTest {
             for (int i = 0; i < df; i++) {
                 int doc = row.docs()[i];
                 int tf = row.freqs()[i];
-                double norm = PostingsIndex.K1
-                    * (1 - PostingsIndex.B + PostingsIndex.B * lengths[doc] / average);
-                scores[doc] += weights[t] * idf * (tf * (PostingsIndex.K1 + 1)) / (tf + norm);
+                scores[doc] += weights[t] * idf
+                    * bm25.saturation(tf, bm25.lengthNorm(lengths[doc], average));
             }
         }
         List<double[]> ranked = new ArrayList<>();
@@ -131,6 +135,68 @@ class WandExactnessTest {
                 // comparison would fail on a difference that is not an error. The score at each
                 // rank is the thing that must be identical: if it is, the optimised search found
                 // a document just as good, and if it is not, it missed one.
+                assertThat(fast.length)
+                    .as("trial %d, terms %s", trial, String.join(",", terms))
+                    .isEqualTo(slow.size());
+                for (int i = 0; i < fast.length; i++) {
+                    assertThat(fast[i].score())
+                        .as("trial %d rank %d, terms %s", trial, i, String.join(",", terms))
+                        .isCloseTo(slow.get(i)[1], org.assertj.core.data.Offset.offset(1e-9));
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("skipping stays exact under a BM25 pair an operator chose")
+    void matchesBruteForceUnderTunedParameters(@TempDir Path root) throws Exception {
+        // The trap this whole parameterisation has to avoid. Block bounds are computed from k1
+        // and b at build time and the scorer prunes against them, so a pair that reached one
+        // half and not the other would prune blocks holding real results - quietly, and only on
+        // some queries. Exhaustive scoring under the same pair is what catches that.
+        Bm25Parameters tuned = new Bm25Parameters(2.5, 0.2);
+        Random random = new Random(4242);
+        String[] common = {"the", "of", "and", "to", "a"};
+        String[] mid = {"memory", "process", "system", "kernel", "patient", "journal"};
+        String[] rare = {"sigkill", "enomem", "transhydrogenase", "nephilengys", "apocolocyntosis"};
+
+        PostingsWriter writer = new PostingsWriter(tuned);
+        for (int i = 0; i < 600; i++) {
+            StringBuilder sb = new StringBuilder();
+            for (int w = 0; w < 20 + random.nextInt(90); w++) {
+                double roll = random.nextDouble();
+                if (roll < 0.6) {
+                    sb.append(common[random.nextInt(common.length)]);
+                } else if (roll < 0.95) {
+                    sb.append(mid[random.nextInt(mid.length)]);
+                } else {
+                    sb.append(rare[random.nextInt(rare.length)]);
+                }
+                sb.append(' ');
+            }
+            writer.add(sb.toString());
+        }
+        writer.write(root);
+
+        try (PostingsIndex index = PostingsIndex.open(root, tuned)) {
+            List<String> pool = new ArrayList<>();
+            pool.addAll(List.of(common));
+            pool.addAll(List.of(mid));
+            pool.addAll(List.of(rare));
+
+            for (int trial = 0; trial < 200; trial++) {
+                int termCount = 1 + random.nextInt(5);
+                String[] terms = new String[termCount];
+                double[] weights = new double[termCount];
+                for (int i = 0; i < termCount; i++) {
+                    terms[i] = pool.get(random.nextInt(pool.size()));
+                    weights[i] = 0.2 + random.nextDouble();
+                }
+                int limit = 1 + random.nextInt(15);
+
+                PostingsIndex.Hit[] fast = index.search(terms, weights, limit);
+                List<double[]> slow = bruteForce(index, terms, weights, limit);
+
                 assertThat(fast.length)
                     .as("trial %d, terms %s", trial, String.join(",", terms))
                     .isEqualTo(slow.size());

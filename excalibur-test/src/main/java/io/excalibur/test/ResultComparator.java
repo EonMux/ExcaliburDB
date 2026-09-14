@@ -40,11 +40,11 @@ public class ResultComparator {
     private final boolean strictMode;
     
     /**
-     * Create a new ResultComparator.
-     * 
-     * @param tolerance  Absolute tolerance for numeric comparisons (default: 1e-6)
-     * @param relativeTolerance  Relative tolerance for large values (default: 1e-6)
-     * @param strictMode  Whether to fail on exact type match (default: true)
+     * Create a new ResultComparator that applies one tolerance to both absolute and relative
+     * numeric comparisons and runs in strict mode.
+     *
+     * @param tolerance  Tolerance for numeric comparisons, used as both the absolute and the
+     *                   relative bound
      */
     public ResultComparator(double tolerance) {
         this(tolerance, tolerance, true);

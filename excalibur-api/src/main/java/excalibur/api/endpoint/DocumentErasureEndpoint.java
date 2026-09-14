@@ -64,6 +64,19 @@ import java.util.Objects;
  * rank it - without content, because that is resolved from storage, but under its identifier. The
  * reply does not claim otherwise.</p>
  *
+ * <h3>When the node could not finish</h3>
+ * <p>A document whose chunks would not all come out of storage or out of the index is counted in
+ * {@code documents_incomplete}, and the reply is a 500 rather than a 200.
+ * {@code chunks_not_removed} says how many are still in storage and
+ * {@code chunks_still_searchable} how many the lexical index still matches; they are separate
+ * numbers rather than one total because a chunk can be in both states, and adding them would
+ * report twice as much content left behind as there is. It is a failure and not a partial success: the caller
+ * asked for content to be gone, some of it is not, and the remedy is to repeat the request - which
+ * is safe, because the registry entry is kept for exactly the documents that fell short, so the
+ * repeat can still name their chunks. A caller looping a source erasure until
+ * {@code documents_remaining} reaches zero has to watch this too, or it will loop forever over
+ * documents the node keeps failing to erase.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Stateless; the service it calls is safe for concurrent use.</p>
  */
@@ -88,6 +101,7 @@ public class DocumentErasureEndpoint implements HttpHandler {
 
     private final DocumentErasureService erasureService;
     private final SourceRegistry sourceRegistry;
+    private final InlineSourceIds suppliedSources;
 
     /**
      * Creates the endpoint.
@@ -111,9 +125,26 @@ public class DocumentErasureEndpoint implements HttpHandler {
      */
     public DocumentErasureEndpoint(DocumentErasureService erasureService,
                                    SourceRegistry sourceRegistry) {
+        this(erasureService, sourceRegistry, null);
+    }
+
+    /**
+     * Creates the endpoint, able to release an erased source's id for reuse.
+     *
+     * @param erasureService  The service that performs the removal
+     * @param sourceRegistry  The registered ingestion sources, or null on a node that keeps none
+     * @param suppliedSources The ids documents have been supplied directly under, so that a
+     *                        source erased down to nothing stops refusing a crawl under its id,
+     *                        or null on a node that takes no supplied documents
+     * @throws NullPointerException if the service is null
+     */
+    public DocumentErasureEndpoint(DocumentErasureService erasureService,
+                                   SourceRegistry sourceRegistry,
+                                   InlineSourceIds suppliedSources) {
         this.erasureService = Objects.requireNonNull(erasureService,
             "erasureService cannot be null");
         this.sourceRegistry = sourceRegistry;
+        this.suppliedSources = suppliedSources;
     }
 
     @Override
@@ -160,29 +191,18 @@ public class DocumentErasureEndpoint implements HttpHandler {
                 // shows it.
                 deregistered = sourceRegistry != null && sourceRegistry.remove(sourceId);
                 outcome = erasureService.eraseSource(sourceId, MAX_DOCUMENTS, compactNow);
+                // After the erasure, not before it: until the documents are gone, a crawl
+                // registered under this id would still delete them. Released afterwards so the
+                // id can be reused - the supplied half of that guard has no other way to be
+                // told that what it was protecting is gone.
+                if (suppliedSources != null) {
+                    suppliedSources.forget(sourceId);
+                }
             } else {
                 outcome = erasureService.erase(sourceId, documentIds, compactNow);
             }
 
-            // 200, not 202: unlike the graph's erasure this is not a queued obligation. The
-            // content is out of storage and out of the index by the time this replies; only the
-            // index's own reclamation may still be pending, and the response says which.
-            ResponseBody.sendJson(exchange, 200,
-                "{"
-                    + "\"source_id\": \"" + JsonText.escape(sourceId) + "\", "
-                    + "\"scope\": \"" + scope + "\", "
-                    + "\"documents_erased\": " + outcome.documentsErased() + ", "
-                    + "\"documents_not_found\": " + outcome.documentsNotFound() + ", "
-                    + "\"documents_remaining\": " + outcome.documentsRemaining() + ", "
-                    + "\"source_deregistered\": " + deregistered + ", "
-                    + "\"chunks_erased\": " + outcome.chunksTombstoned() + ", "
-                    + "\"chunks_unindexed\": " + outcome.chunksUnindexed() + ", "
-                    + "\"vectors_hidden\": " + outcome.vectorsHidden() + ", "
-                    + "\"compacted\": " + outcome.compacted() + ", "
-                    + "\"chunks_reclaimed\": " + outcome.chunksReclaimed() + ", "
-                    + "\"outstanding\": " + outcome.outstanding() + ", "
-                    + "\"detail\": \"" + JsonText.escape(outcome.detail()) + "\""
-                    + "}");
+            sendOutcome(exchange, sourceId, scope, deregistered, outcome);
         } catch (SourceCatalogException e) {
             // Nothing has been erased: the source comes off the crawl before its documents go,
             // and that is the step that failed. A 500 would be true and would not say that the
@@ -197,6 +217,55 @@ public class DocumentErasureEndpoint implements HttpHandler {
                 documentIds.size(), sourceId, e);
             ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
         }
+    }
+
+    /**
+     * Answers with what the erasure actually did.
+     *
+     * <p>200 and not 202: unlike the graph's erasure this is not a queued obligation. The content
+     * is out of storage and out of the index by the time this replies; only the index's own
+     * reclamation may still be pending, and the response says which. The exception is a document
+     * the node could not finish, which is a 500 carrying the same counts - see the class
+     * documentation for why that is a failure rather than a partial success.</p>
+     *
+     * @param exchange     The request to answer
+     * @param sourceId     The source the request named
+     * @param scope        What it asked to erase
+     * @param deregistered Whether the source was taken out of the crawl
+     * @param outcome      What the service reports it did
+     * @throws IOException if the response cannot be written
+     */
+    private static void sendOutcome(HttpExchange exchange, String sourceId, String scope,
+                                    boolean deregistered,
+                                    DocumentErasureService.Outcome outcome) throws IOException {
+        boolean incomplete = outcome.documentsIncomplete() > 0;
+        if (incomplete) {
+            LOGGER.error("Erasure of source {} left {} document(s) unfinished: {} chunk(s) "
+                    + "still in storage, {} still searchable: {}", sourceId,
+                outcome.documentsIncomplete(), outcome.chunksNotRemoved(),
+                outcome.chunksStillSearchable(), outcome.detail());
+        }
+        ResponseBody.sendJson(exchange, incomplete ? 500 : 200,
+            "{"
+                + (incomplete ? "\"error\": \"Some documents could not be fully erased; "
+                    + "repeat the request\", " : "")
+                + "\"source_id\": \"" + JsonText.escape(sourceId) + "\", "
+                + "\"scope\": \"" + scope + "\", "
+                + "\"documents_erased\": " + outcome.documentsErased() + ", "
+                + "\"documents_incomplete\": " + outcome.documentsIncomplete() + ", "
+                + "\"documents_not_found\": " + outcome.documentsNotFound() + ", "
+                + "\"documents_remaining\": " + outcome.documentsRemaining() + ", "
+                + "\"source_deregistered\": " + deregistered + ", "
+                + "\"chunks_erased\": " + outcome.chunksTombstoned() + ", "
+                + "\"chunks_unindexed\": " + outcome.chunksUnindexed() + ", "
+                + "\"chunks_not_removed\": " + outcome.chunksNotRemoved() + ", "
+                + "\"chunks_still_searchable\": " + outcome.chunksStillSearchable() + ", "
+                + "\"vectors_hidden\": " + outcome.vectorsHidden() + ", "
+                + "\"compacted\": " + outcome.compacted() + ", "
+                + "\"chunks_reclaimed\": " + outcome.chunksReclaimed() + ", "
+                + "\"outstanding\": " + outcome.outstanding() + ", "
+                + "\"detail\": \"" + JsonText.escape(outcome.detail()) + "\""
+                + "}");
     }
 
     /**

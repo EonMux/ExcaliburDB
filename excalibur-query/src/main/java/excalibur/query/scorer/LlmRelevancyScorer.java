@@ -125,34 +125,90 @@ public final class LlmRelevancyScorer implements LlmScorer {
             return List.copyOf(results);
         }
 
+        List<RelevancyScore> scores = askModel(queryText, candidates);
+        Map<Integer, RelevancyScore> scoreByIndex = byCandidateIndex(scores, results.size());
+
+        List<QueryResultItem> scoredResults =
+            applyScores(results, candidates, scoreByIndex, clampedThreshold);
+
+        LOGGER.debug("LLM scoring complete: {} results passed threshold of {}",
+            scoredResults.size(), clampedThreshold);
+
+        // Sort by score descending (highest relevance first)
+        scoredResults.sort((a, b) -> Float.compare(b.score(), a.score()));
+
+        return scoredResults;
+    }
+
+    /**
+     * Puts the scoring question to the model.
+     *
+     * <p>The call goes through the circuit breaker so that a run of failures opens it instead
+     * of every query paying the timeout again. A failure is rethrown rather than turned into
+     * an empty answer: the pipeline's fallback is to keep the vector ranking, and it can only
+     * choose that if it is told the scoring did not happen.</p>
+     *
+     * @param queryText The query text to score against
+     * @param candidates The candidate texts, one per result and in result order
+     * @return The scores the model answered with, which need not cover every candidate
+     * @throws LLMException if the LLM call fails
+     */
+    private List<RelevancyScore> askModel(String queryText, List<String> candidates) {
         // Call LLM for relevancy scoring with circuit breaker protection
         // This ensures failures are tracked and the circuit opens after consecutive failures
-        List<RelevancyScore> scores;
         try {
-            scores = llmClient.scoreRelevancyWithCircuitBreaker(queryText, candidates, null);
+            return llmClient.scoreRelevancyWithCircuitBreaker(queryText, candidates, null);
         } catch (LLMException e) {
             LOGGER.warn("LLM relevancy scoring failed: {}", e.getMessage());
             throw e;
         }
+    }
 
-        // Index the response so the walk below can go over the candidates rather than over the
-        // scores. A model that answers about fewer candidates than it was asked about is not
-        // unusual: the batching layer caps how many prompts one query may send, and the parser
-        // keeps only the score objects it recognised.
+    /**
+     * Indexes the model's answer by the candidate each score is about.
+     *
+     * <p>Indexing the response lets the walk that follows go over the candidates rather than
+     * over the scores. A model that answers about fewer candidates than it was asked about is
+     * not unusual: the batching layer caps how many prompts one query may send, and the parser
+     * keeps only the score objects it recognised. A score naming a candidate that was never
+     * sent is dropped, since there is no result for it to be about.</p>
+     *
+     * @param scores The scores the model answered with
+     * @param candidateCount How many candidates the model was asked about
+     * @return The scores keyed by candidate index
+     */
+    private static Map<Integer, RelevancyScore> byCandidateIndex(List<RelevancyScore> scores,
+                                                                 int candidateCount) {
         Map<Integer, RelevancyScore> scoreByIndex = new HashMap<>();
         for (RelevancyScore rs : scores) {
-            if (rs.getIndex() < 0 || rs.getIndex() >= results.size()) {
+            if (rs.getIndex() < 0 || rs.getIndex() >= candidateCount) {
                 LOGGER.warn("LLM returned invalid index {}, skipping", rs.getIndex());
                 continue;
             }
             scoreByIndex.put(rs.getIndex(), rs);
         }
 
-        if (scoreByIndex.size() != results.size()) {
+        if (scoreByIndex.size() != candidateCount) {
             LOGGER.warn("LLM scored {} of {} candidates; the rest keep their vector ranking",
-                scoreByIndex.size(), results.size());
+                scoreByIndex.size(), candidateCount);
         }
 
+        return scoreByIndex;
+    }
+
+    /**
+     * Rebuilds the result list from the model's verdict on each candidate.
+     *
+     * @param results The results as vector search ranked them
+     * @param candidates The candidate texts, one per result and in result order
+     * @param scoreByIndex The model's scores, keyed by candidate index
+     * @param clampedThreshold The minimum score a judged result must reach to be kept
+     * @return The surviving results, still in vector-search order
+     */
+    private static List<QueryResultItem> applyScores(List<QueryResultItem> results,
+                                                     List<String> candidates,
+                                                     Map<Integer, RelevancyScore> scoreByIndex,
+                                                     float clampedThreshold) {
         // Every candidate, not every score. Iterating the scores dropped whatever the model did
         // not mention - silently, and without any threshold decision having been made about it.
         // A model that answered nothing at all emptied a result set that vector search had
@@ -176,12 +232,6 @@ public final class LlmRelevancyScorer implements LlmScorer {
                 scoredResults.add(original.withScore((float) rs.getScore()));
             }
         }
-
-        LOGGER.debug("LLM scoring complete: {} results passed threshold of {}",
-            scoredResults.size(), clampedThreshold);
-
-        // Sort by score descending (highest relevance first)
-        scoredResults.sort((a, b) -> Float.compare(b.score(), a.score()));
 
         return scoredResults;
     }

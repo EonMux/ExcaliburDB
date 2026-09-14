@@ -20,7 +20,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *
  * <p>The {@code lastIntegratedOffset} represents "all entries up to but not including
  * this position are integrated". This aligns with how the
- * {@link excalibur.shard.worker.HnswIntegrationWorker} passes offsets.</p>
+ * {@code HnswIntegrationWorker} passes offsets.</p>
  *
  * <h2>Purpose</h2>
  * <p>This offset is critical for the live-indexing tail scan (Phase 6):
@@ -175,7 +175,7 @@ public class TailOffsetTracker {
      *
      * <p><strong>Offset semantics:</strong> The writeLogOffset should be the END offset
      * (the first byte position after the entry). This aligns with how
-     * {@link excalibur.shard.worker.HnswIntegrationWorker} passes offsets.</p>
+     * {@code HnswIntegrationWorker} passes offsets.</p>
      *
      * @param vector The vector to integrate
      * @param writeLogOffset The END offset for this vector (first byte after entry)
@@ -197,7 +197,7 @@ public class TailOffsetTracker {
      *
      * <p><strong>Offset semantics:</strong> The writeLogOffsets should contain END offsets
      * (the first byte position after each entry). This aligns with how
-     * {@link excalibur.shard.worker.HnswIntegrationWorker} passes offsets from its
+     * {@code HnswIntegrationWorker} passes offsets from its
      * integration loop.</p>
      *
      * @param vectors The vectors to integrate
@@ -293,13 +293,13 @@ public class TailOffsetTracker {
      * that the offset is both atomically updated in memory AND persisted to disk
      * before returning. The implementation guarantees:</p>
      * <ul>
-     *   <li>Persisted value is always <= in-memory value</li>
+     *   <li>Persisted value is always &lt;= in-memory value</li>
      *   <li>On crash recovery, entries between persisted and in-memory values will be replayed</li>
      *   <li>Monotonic increase is guaranteed (offset never decreases)</li>
      * </ul>
      *
      * @param newOffset The new offset value (must be >= 0)
-     * @return true if the offset was updated, false if newOffset <= current
+     * @return true if the offset was updated, false if {@code newOffset <= current}
      * @throws IllegalArgumentException if newOffset is negative
      */
     public boolean setLastIntegratedOffset(long newOffset) {
@@ -338,7 +338,7 @@ public class TailOffsetTracker {
      * ensure thread-safe updates without blocking readers.</p>
      *
      * <p><strong>Persistence ordering:</strong> After successful CAS, the offset
-     * is persisted to the graph. The ordering ensures persisted <= in-memory.</p>
+     * is persisted to the graph. The ordering ensures persisted &lt;= in-memory.</p>
      *
      * @param newOffset The new offset value
      * @return true if the offset was updated

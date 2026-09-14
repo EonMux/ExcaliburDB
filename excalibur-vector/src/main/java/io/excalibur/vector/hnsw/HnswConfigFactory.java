@@ -31,14 +31,16 @@ import java.util.Objects;
  * <ul>
  *   <li>{@code excalibur.shard.default-ef-construction} - efConstruction parameter (default: 128)</li>
  *   <li>{@code excalibur.shard.default-ef-search} - efSearch parameter (default: 64)</li>
+ *   <li>{@code excalibur.shard.default-max-connections} - connections above layer 0 (default: 16)</li>
+ *   <li>{@code excalibur.shard.default-max-connections-layer0} - layer 0 connections (default: 2x M)</li>
  * </ul>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>efConstruction and efSearch must be at least 1 (enforced by Config.Shard validation)</li>
- *   <li>maxConnections uses default (16) from HNSW paper recommendations</li>
- *   <li>maxConnectionsLayer0 uses default (32) = 2x maxConnections</li>
- *   <li>mL uses default (1/ln(M)) for proper level distribution</li>
+ *   <li>maxConnections and maxConnectionsLayer0 fix the on-disk adjacency layout, so they
+ *       reach a graph only when it is created</li>
+ *   <li>mL follows maxConnections rather than being configured on its own</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -79,13 +81,39 @@ public final class HnswConfigFactory {
     private final int efSearch;
 
     /**
-     * Creates a new HnswConfigFactory with the specified parameters.
+     * Neighbours a node keeps above layer 0, the graph's {@code M}.
+     * Fixes the adjacency layout of every graph this factory creates.
+     */
+    private final int maxConnections;
+
+    /**
+     * Neighbours a node keeps at layer 0, where the walk becomes exhaustive.
+     */
+    private final int maxConnectionsLayer0;
+
+    /**
+     * Creates a new HnswConfigFactory with the HNSW paper's connection bounds.
      *
      * @param efConstruction The efConstruction parameter
      * @param efSearch The efSearch parameter
      * @throws IllegalArgumentException if parameters are invalid
      */
     public HnswConfigFactory(int efConstruction, int efSearch) {
+        this(efConstruction, efSearch,
+            HnswConfig.DEFAULT_MAX_CONNECTIONS, HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0);
+    }
+
+    /**
+     * Creates a new HnswConfigFactory with the specified parameters.
+     *
+     * @param efConstruction The efConstruction parameter
+     * @param efSearch The efSearch parameter
+     * @param maxConnections Neighbours per node above layer 0
+     * @param maxConnectionsLayer0 Neighbours per node at layer 0
+     * @throws IllegalArgumentException if parameters are invalid
+     */
+    public HnswConfigFactory(int efConstruction, int efSearch,
+                             int maxConnections, int maxConnectionsLayer0) {
         if (efConstruction < 1) {
             throw new IllegalArgumentException(
                 "efConstruction must be at least 1, got: " + efConstruction);
@@ -97,9 +125,12 @@ public final class HnswConfigFactory {
 
         this.efConstruction = efConstruction;
         this.efSearch = efSearch;
+        this.maxConnections = maxConnections;
+        this.maxConnectionsLayer0 = maxConnectionsLayer0;
 
-        LOGGER.debug("HnswConfigFactory created with efConstruction={}, efSearch={}",
-            efConstruction, efSearch);
+        LOGGER.debug("HnswConfigFactory created with efConstruction={}, efSearch={}, "
+            + "maxConnections={}, maxConnectionsLayer0={}",
+            efConstruction, efSearch, maxConnections, maxConnectionsLayer0);
     }
 
     /**
@@ -123,12 +154,16 @@ public final class HnswConfigFactory {
     public static HnswConfigFactory fromShardConfig(Config.Shard shard) {
         Objects.requireNonNull(shard, "shard config cannot be null");
 
-        LOGGER.info("Creating HnswConfigFactory from Config.Shard: efConstruction={}, efSearch={}",
-            shard.getEfConstruction(), shard.getEfSearch());
+        LOGGER.info("Creating HnswConfigFactory from Config.Shard: efConstruction={}, efSearch={}, "
+            + "maxConnections={}, maxConnectionsLayer0={}",
+            shard.getEfConstruction(), shard.getEfSearch(),
+            shard.getMaxConnections(), shard.getMaxConnectionsLayer0());
 
         return new HnswConfigFactory(
             shard.getEfConstruction(),
-            shard.getEfSearch()
+            shard.getEfSearch(),
+            shard.getMaxConnections(),
+            shard.getMaxConnectionsLayer0()
         );
     }
 
@@ -152,11 +187,11 @@ public final class HnswConfigFactory {
      *
      * <p>The created config uses:</p>
      * <ul>
-     *   <li>maxConnections = 16 (from HNSW paper for good recall/performance tradeoff)</li>
-     *   <li>maxConnectionsLayer0 = 32 (2x maxConnections for better base layer connectivity)</li>
+     *   <li>maxConnections = from this factory (from Config.Shard)</li>
+     *   <li>maxConnectionsLayer0 = from this factory (from Config.Shard)</li>
      *   <li>efConstruction = from this factory (from Config.Shard)</li>
      *   <li>efSearch = from this factory (from Config.Shard)</li>
-     *   <li>mL = 1/ln(M) (normalization factor for level generation)</li>
+     *   <li>mL = 1/ln(M), derived from the configured maxConnections</li>
      * </ul>
      *
      * @param dimension The vector dimension (must be in range [1, 4096])
@@ -168,11 +203,11 @@ public final class HnswConfigFactory {
             dimension, efConstruction, efSearch);
 
         return new HnswConfig(
-            HnswConfig.DEFAULT_MAX_CONNECTIONS,           // Keep default: 16
-            HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0,    // Keep default: 32
-            efConstruction,                               // From Config.Shard
-            efSearch,                                     // From Config.Shard
-            HnswConfig.DEFAULT_ML,                        // Keep default: 1/ln(M)
+            maxConnections,
+            maxConnectionsLayer0,
+            efConstruction,
+            efSearch,
+            HnswConfig.mLFor(maxConnections),   // mL follows M rather than being its own key
             dimension
         );
     }
@@ -198,11 +233,11 @@ public final class HnswConfigFactory {
             dimension, efConstruction, customEfSearch);
 
         return new HnswConfig(
-            HnswConfig.DEFAULT_MAX_CONNECTIONS,
-            HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0,
+            maxConnections,
+            maxConnectionsLayer0,
             efConstruction,
             customEfSearch,
-            HnswConfig.DEFAULT_ML,
+            HnswConfig.mLFor(maxConnections),
             dimension
         );
     }
@@ -228,11 +263,11 @@ public final class HnswConfigFactory {
             dimension, customEfConstruction, efSearch);
 
         return new HnswConfig(
-            HnswConfig.DEFAULT_MAX_CONNECTIONS,
-            HnswConfig.DEFAULT_MAX_CONNECTIONS_LAYER0,
+            maxConnections,
+            maxConnectionsLayer0,
             customEfConstruction,
             efSearch,
-            HnswConfig.DEFAULT_ML,
+            HnswConfig.mLFor(maxConnections),
             dimension
         );
     }
@@ -255,11 +290,31 @@ public final class HnswConfigFactory {
         return efSearch;
     }
 
+    /**
+     * Returns the connection bound above layer 0 used by this factory.
+     *
+     * @return The graph's {@code M}
+     */
+    public int getMaxConnections() {
+        return maxConnections;
+    }
+
+    /**
+     * Returns the layer 0 connection bound used by this factory.
+     *
+     * @return The layer 0 connection bound
+     */
+    public int getMaxConnectionsLayer0() {
+        return maxConnectionsLayer0;
+    }
+
     @Override
     public String toString() {
         return "HnswConfigFactory{" +
             "efConstruction=" + efConstruction +
             ", efSearch=" + efSearch +
+            ", maxConnections=" + maxConnections +
+            ", maxConnectionsLayer0=" + maxConnectionsLayer0 +
             '}';
     }
 
@@ -269,11 +324,13 @@ public final class HnswConfigFactory {
         if (o == null || getClass() != o.getClass()) return false;
         HnswConfigFactory that = (HnswConfigFactory) o;
         return efConstruction == that.efConstruction &&
-               efSearch == that.efSearch;
+               efSearch == that.efSearch &&
+               maxConnections == that.maxConnections &&
+               maxConnectionsLayer0 == that.maxConnectionsLayer0;
     }
 
     @Override
     public int hashCode() {
-        return 31 * efConstruction + efSearch;
+        return Objects.hash(efConstruction, efSearch, maxConnections, maxConnectionsLayer0);
     }
 }

@@ -41,6 +41,10 @@ public final class FullPrecisionReranker implements Ranker {
      * mis-ranked are in the candidate set for reranking to reach them; well above it, the extra
      * candidates are increasingly documents the approximation was right to reject, and each one
      * still costs a full-precision vector read.
+     *
+     * <p>A deployment that has measured the trade for its own corpus sets it with
+     * {@code excalibur.graph.rerank-over-fetch} and passes the value to the four-argument
+     * constructor.
      */
     public static final int DEFAULT_OVER_FETCH_FACTOR = 4;
 
@@ -56,6 +60,13 @@ public final class FullPrecisionReranker implements Ranker {
         this(delegate, vectors, distanceFunction, DEFAULT_OVER_FETCH_FACTOR);
     }
 
+    /**
+     * @param delegate         The approximate ranker whose ordering is being corrected
+     * @param vectors          Where the uncompressed vectors are read from
+     * @param distanceFunction The metric the vectors are compared under
+     * @param overFetchFactor  Multiplies the limit to give the candidate set, from
+     *                         {@code excalibur.graph.rerank-over-fetch}
+     */
     public FullPrecisionReranker(Ranker delegate, VectorSource vectors,
                                  DistanceFunction distanceFunction, int overFetchFactor) {
         if (delegate == null) {

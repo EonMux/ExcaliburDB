@@ -57,10 +57,13 @@ public final class GraphErasureService {
      * @param ran               whether a compaction actually ran
      * @param edgesRemoved      how many edges were rewritten out of the store
      * @param requestsSatisfied how many obligations that discharged
+     * @param requestsWithheld  how many it could not reach and deliberately left outstanding
+     *                          rather than reporting as done; carried up to the response
+     *                          because a caller under an obligation has to see it
      * @param reason            why it ran or did not
      */
     public record ErasureOutcome(boolean ran, long edgesRemoved, int requestsSatisfied,
-                                 String reason) {
+                                 int requestsWithheld, String reason) {
     }
 
     /**
@@ -120,7 +123,7 @@ public final class GraphErasureService {
         try {
             java.nio.file.Path directory = holder.directory();
             if (!java.nio.file.Files.isDirectory(directory)) {
-                return new ErasureOutcome(false, 0, 0,
+                return new ErasureOutcome(false, 0, 0, 0,
                     "no graph has been built, so there is nothing to erase from yet");
             }
 
@@ -132,7 +135,7 @@ public final class GraphErasureService {
             // bound it would be a recurring one. A forced compaction still goes through: a
             // caller who asked for one outright is answering a deadline, not an estimate.
             if (!force && coordinator.outstandingCount() == 0) {
-                return new ErasureOutcome(false, 0, 0, "no outstanding erasure requests");
+                return new ErasureOutcome(false, 0, 0, 0, "no outstanding erasure requests");
             }
 
             boolean wasServing = holder.isPresent();
@@ -147,7 +150,7 @@ public final class GraphErasureService {
                     : coordinator.compactIfDue(directory);
 
                 return new ErasureOutcome(outcome.ran(), outcome.edgesRemoved(),
-                    outcome.requestsSatisfied(), outcome.reason());
+                    outcome.requestsSatisfied(), outcome.requestsWithheld(), outcome.reason());
             } finally {
                 if (wasServing) {
                     // Reopened whether the compaction ran or not, and whether it failed or not:

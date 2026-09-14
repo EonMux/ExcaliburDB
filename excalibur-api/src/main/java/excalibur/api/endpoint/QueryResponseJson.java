@@ -1,6 +1,7 @@
 package excalibur.api.endpoint;
 
 import excalibur.api.protocol.JsonText;
+import excalibur.api.retrieval.ChunkTextResolver;
 import excalibur.api.retrieval.HybridFusion;
 import excalibur.api.retrieval.LexicalQueryService;
 import excalibur.query.IndexCoverage;
@@ -25,6 +26,12 @@ import java.util.List;
  * and on {@code "hybrid"} a sum of reciprocal ranks - a small number near zero that orders results
  * and means nothing in absolute terms. A threshold tuned against cosine scores does not transfer
  * to a fused one, which is why the field that says so is not optional.</p>
+ *
+ * <h2>Text on a result</h2>
+ * <p>Absent unless the request asked for it, and then present on every result of that answer -
+ * {@code null} included, for a chunk storage no longer holds. A field that appears on some
+ * results of one answer and not others cannot be read without checking for it each time, so the
+ * request decides whether it is there and nothing else does.</p>
  */
 public final class QueryResponseJson {
 
@@ -47,6 +54,17 @@ public final class QueryResponseJson {
      * @return The response body
      */
     public static String vector(QueryResponse response) {
+        return vector(response, null);
+    }
+
+    /**
+     * Renders an answer from vector search alone, optionally carrying each result's text.
+     *
+     * @param response What the query pipeline produced
+     * @param text     Reads the text behind an identifier, or null when none was asked for
+     * @return The response body
+     */
+    public static String vector(QueryResponse response, ChunkTextResolver text) {
         StringBuilder sb = new StringBuilder(256);
         appendQueryId(sb, response.queryId());
 
@@ -62,8 +80,9 @@ public final class QueryResponseJson {
             QueryResultItem item = results.get(i);
             sb.append("{\"document_id\": \"").append(JsonText.escape(item.externalId()))
                 .append("\", \"score\": ").append(JsonText.number(item.score(), 6))
-                .append(", \"segment_id\": ").append(item.segmentId())
-                .append("}");
+                .append(", \"segment_id\": ").append(item.segmentId());
+            appendText(sb, text, item.externalId());
+            sb.append("}");
         }
         sb.append("], ");
         sb.append("\"retrieval\": \"").append(VECTOR).append("\", ");
@@ -73,7 +92,7 @@ public final class QueryResponseJson {
     }
 
     /**
-     * Renders an answer both signals contributed to.
+     * Renders an answer both signals contributed to, optionally carrying each result's text.
      *
      * <p>Coverage is the vector pipeline's, unchanged: it measures how much of the segment
      * catalog the query reached, which is a question about the vector index and is not made
@@ -81,9 +100,11 @@ public final class QueryResponseJson {
      *
      * @param response What the query pipeline produced, for its coverage and timings
      * @param fused    The fused ranking, best first
+     * @param text     Reads the text behind an identifier, or null when none was asked for
      * @return The response body
      */
-    public static String hybrid(QueryResponse response, List<HybridFusion.Result> fused) {
+    public static String hybrid(QueryResponse response, List<HybridFusion.Result> fused,
+                                ChunkTextResolver text) {
         StringBuilder sb = new StringBuilder(256);
         appendQueryId(sb, response.queryId());
 
@@ -107,7 +128,9 @@ public final class QueryResponseJson {
                 }
                 sb.append('"').append(JsonText.escape(signals.get(s))).append('"');
             }
-            sb.append("]}");
+            sb.append("]");
+            appendText(sb, text, result.documentId());
+            sb.append("}");
         }
         sb.append("], ");
         sb.append("\"retrieval\": \"").append(HYBRID).append("\", ");
@@ -117,7 +140,7 @@ public final class QueryResponseJson {
     }
 
     /**
-     * Renders an answer from the lexical index alone.
+     * Renders an answer from the lexical index alone, optionally carrying each result's text.
      *
      * @param queryId     The identifier this query was registered under
      * @param hits        What BM25 returned, best first
@@ -127,12 +150,13 @@ public final class QueryResponseJson {
      * @param timedOut    Whether the request's budget ran out
      * @param cancelled   Whether the caller withdrew the request
      * @param durationMs  How long the request took
+     * @param text        Reads the text behind an identifier, or null when none was asked for
      * @return The response body
      */
     public static String lexical(String queryId, List<LexicalQueryService.Hit> hits,
                                  IndexCoverage coverage, String requestBody,
                                  List<String> unhonoured, boolean timedOut, boolean cancelled,
-                                 long durationMs) {
+                                 long durationMs, ChunkTextResolver text) {
         StringBuilder sb = new StringBuilder(256);
         appendQueryId(sb, queryId);
 
@@ -143,8 +167,9 @@ public final class QueryResponseJson {
             }
             sb.append("{\"document_id\": \"")
               .append(JsonText.escape(hits.get(i).chunkId()))
-              .append("\", \"score\": ").append(JsonText.number(hits.get(i).score(), 6))
-              .append("}");
+              .append("\", \"score\": ").append(JsonText.number(hits.get(i).score(), 6));
+            appendText(sb, text, hits.get(i).chunkId());
+            sb.append("}");
         }
         sb.append("], ");
         sb.append("\"retrieval\": \"").append(LEXICAL).append("\", ");
@@ -152,6 +177,33 @@ public final class QueryResponseJson {
         appendIgnoredFields(sb, requestBody, unhonoured);
         appendTail(sb, timedOut, cancelled, durationMs);
         return sb.toString();
+    }
+
+    /**
+     * Appends a result's text, when the request asked for any.
+     *
+     * <p>Emitted for every result of an answer that asked, including the ones storage could not
+     * supply: {@code null} says the text is not there, which is a different thing from a caller
+     * having to guess whether the field was omitted because there was none or because it never
+     * asked. {@code text_truncated} rides alongside because a clipped passage that does not say
+     * so gets quoted as the whole one.</p>
+     *
+     * @param sb      The response under construction
+     * @param text    The resolver, or null when the request did not ask for text
+     * @param chunkId The identifier of the result being rendered
+     */
+    private static void appendText(StringBuilder sb, ChunkTextResolver text, String chunkId) {
+        if (text == null) {
+            return;
+        }
+        ChunkTextResolver.Resolved resolved = text.resolve(chunkId);
+        sb.append(", \"text\": ");
+        if (resolved.text() == null) {
+            sb.append("null");
+        } else {
+            sb.append('"').append(JsonText.escape(resolved.text())).append('"');
+        }
+        sb.append(", \"text_truncated\": ").append(resolved.truncated());
     }
 
     /**

@@ -12,8 +12,8 @@ import java.util.Set;
  * <h2>Visibility Rules</h2>
  * <p>A segment is visible at epoch E if:</p>
  * <ul>
- *   <li>creationEpoch <= E (segment existed at query start)</li>
- *   <li>E < tombstoneEpoch (segment was not tombstoned before query started)</li>
+ *   <li>{@code creationEpoch <= E} (segment existed at query start)</li>
+ *   <li>{@code E < tombstoneEpoch} (segment was not tombstoned before query started)</li>
  *   <li>Lifecycle state is queryable (INDEXING, WARMING, ACTIVE, COMPACTING)</li>
  * </ul>
  *

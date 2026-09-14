@@ -65,4 +65,21 @@ public final class ResponseBody {
         exchange.getResponseHeaders().set("Content-Type", "application/json");
         send(exchange, statusCode, json.getBytes(StandardCharsets.UTF_8));
     }
+
+    /**
+     * Sends the common error envelope.
+     *
+     * <p>The message is escaped rather than trusted: an error naming a field the caller
+     * supplied carries the caller's own text back out, and an unescaped quote in it would
+     * produce a body no client can parse.</p>
+     *
+     * @param exchange   The exchange to answer
+     * @param statusCode The HTTP status
+     * @param message    The reason, in a form a client can act on
+     * @throws IOException if the response cannot be written
+     */
+    public static void sendError(HttpExchange exchange, int statusCode, String message)
+            throws IOException {
+        sendJson(exchange, statusCode, "{\"error\": \"" + JsonText.escape(message) + "\"}");
+    }
 }

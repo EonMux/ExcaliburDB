@@ -10,6 +10,9 @@ import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * Configuration loader that reads properties files and applies environment variable overrides.
  *
@@ -44,6 +47,8 @@ import java.util.Map;
  * @author ExcaliburDB
  */
 public final class ConfigLoader {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(ConfigLoader.class);
 
     /**
      * Loads configuration from a properties file with environment variable overrides.
@@ -120,6 +125,34 @@ public final class ConfigLoader {
 
         // The Config constructor overlays the environment onto the file properties,
         // so every construction path resolves overrides identically.
-        return new Config(configPath, envOverrides, properties);
+        Config config = new Config(configPath, envOverrides, properties);
+
+        // Over the effective map rather than the file: the same typo is as easy to make in a
+        // deployment manifest as in a properties file, and a key that arrived as
+        // EXCALIBUR_INGEST_CHUNK_TARGET_TOKNS is exactly as silently ignored.
+        reportUnrecognisedKeys(configPath, config.getEffectiveProperties());
+        return config;
+    }
+
+    /**
+     * Warns about a key in a section this module parses that no setting answers to.
+     *
+     * <p>Such a key is not an error, it is silence: it is parsed, stored, and never consulted,
+     * and the node starts on the shipped default with nothing anywhere saying the setting did
+     * not take. A deployment can run for a year on a queue limit it believes it changed.</p>
+     *
+     * @param configPath Where the properties came from, for the message
+     * @param properties The effective settings, file and environment overlaid
+     */
+    public static void reportUnrecognisedKeys(String configPath, Map<String, String> properties) {
+        for (String key : properties.keySet()) {
+            if (!ConfigKeys.isOwned(key) || ConfigKeys.isKnown(key)) {
+                continue;
+            }
+            String nearest = ConfigKeys.nearest(key);
+            LOGGER.warn("No setting named {} in the configuration for {}; it is being ignored{}",
+                key, configPath,
+                nearest == null ? "" : ". Did you mean " + nearest + "?");
+        }
     }
 }

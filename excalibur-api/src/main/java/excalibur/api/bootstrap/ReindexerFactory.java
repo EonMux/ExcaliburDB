@@ -1,6 +1,7 @@
 package excalibur.api.bootstrap;
 
 import excalibur.filter.HierarchicalCuckooFilter;
+import excalibur.ingest.erasure.SegmentVectorEraser;
 import excalibur.ingest.lexical.ChunkIndex;
 import excalibur.ingest.lexical.StoredChunkText;
 import excalibur.ingest.pipeline.DocumentBatchPublisher;
@@ -73,7 +74,11 @@ public final class ReindexerFactory {
         Objects.requireNonNull(indexOrchestrator, "indexOrchestrator cannot be null");
         Objects.requireNonNull(registry, "registry cannot be null");
 
-        TextChunker chunker = new TextChunker();
+        // The same sizing ingestion used. A reindex that chunked differently would republish
+        // every document under chunk ids the original pass never wrote, leaving the corpus
+        // split between two chunkings of the same text.
+        TextChunker chunker = new TextChunker(config.ingest().getChunkTargetTokens(),
+            config.ingest().getChunkOverlapTokens());
 
         LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
         LLMHttpClient llmClient = new LLMHttpClient(llmClientConfig);
@@ -127,6 +132,11 @@ public final class ReindexerFactory {
             // so what compaction rebuilds a segment from is what a query would have resolved.
             reindexer.setLexicalIndex(chunkIndex, StoredChunkText.of(storageEngine));
         }
+
+        // The counterpart of the lexical retirement above, for the vector signal. A reindex that
+        // finds a document deleted at the source tombstones its chunks and retires its terms; a
+        // graph node left behind still answers with the document's name and a distance.
+        reindexer.setVectorEraser(SegmentVectorEraser.of(storageEngine));
         return reindexer;
     }
 }

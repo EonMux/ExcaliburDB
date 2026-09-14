@@ -330,41 +330,112 @@ public final class QuerySnapshot {
                 return cachedStats;
             }
 
-            // Calculate segment breakdown by lifecycle state
-            int indexing = 0, warming = 0, active = 0, compacting = 0, tombstoned = 0;
-
-            for (Long segmentId : visibleSegmentIds) {
-                SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
-                if (metadata != null) {
-                    LifecycleState state = metadata.getLifecycleState();
-                    switch (state) {
-                        case INDEXING -> indexing++;
-                        case WARMING -> warming++;
-                        case ACTIVE -> active++;
-                        case COMPACTING -> compacting++;
-                        case TOMBSTONED -> tombstoned++;
-                        default -> {} // BOOTSTRAPPING, PURGED not visible
-                    }
-                }
-            }
-
-            int totalQueryable = indexing + warming + active + compacting;
-            int totalCatalog = catalog.size();
-            double coverage = totalCatalog > 0 ? (double) totalQueryable / totalCatalog : 0.0;
-
-            cachedStats = new SnapshotStats(
-                epoch,
-                visibleSegmentIds.size(),
-                totalQueryable,
-                indexing,
-                warming,
-                active,
-                compacting,
-                tombstoned,
-                coverage
-            );
+            cachedStats = measureSnapshot();
 
             return cachedStats;
+        }
+    }
+
+    /**
+     * Measures the snapshot the caller is holding the monitor for.
+     *
+     * <p>Coverage is the queryable share of the whole catalog, not of the segments this
+     * snapshot can see, so a query answered from half a corpus reports half rather than one.
+     * A catalog with nothing in it has no share to report and answers zero.</p>
+     *
+     * @return The statistics to cache for this snapshot
+     */
+    private SnapshotStats measureSnapshot() {
+        // Calculate segment breakdown by lifecycle state
+        LifecycleBreakdown breakdown = visibleSegmentsByLifecycle();
+
+        int totalQueryable = breakdown.queryable();
+        int totalCatalog = catalog.size();
+        double coverage = totalCatalog > 0 ? (double) totalQueryable / totalCatalog : 0.0;
+
+        return new SnapshotStats(
+            epoch,
+            visibleSegmentIds.size(),
+            totalQueryable,
+            breakdown.indexing(),
+            breakdown.warming(),
+            breakdown.active(),
+            breakdown.compacting(),
+            breakdown.tombstoned(),
+            coverage
+        );
+    }
+
+    /**
+     * Counts this snapshot's visible segments by the lifecycle state the catalog holds for them.
+     *
+     * <p>A visible id the catalog no longer knows is counted nowhere rather than counted as
+     * some default state: the snapshot's id list is a point-in-time copy, and a segment purged
+     * from the catalog since is not in any state to attribute it to.</p>
+     *
+     * @return The per-state counts across the visible segments
+     */
+    private LifecycleBreakdown visibleSegmentsByLifecycle() {
+        LifecycleBreakdown breakdown = LifecycleBreakdown.NONE;
+
+        for (Long segmentId : visibleSegmentIds) {
+            SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentId);
+            if (metadata != null) {
+                breakdown = breakdown.counting(metadata.getLifecycleState());
+            }
+        }
+
+        return breakdown;
+    }
+
+    /**
+     * How many of a snapshot's visible segments sit in each lifecycle state.
+     *
+     * @param indexing   INDEXING state count
+     * @param warming    WARMING state count
+     * @param active     ACTIVE state count
+     * @param compacting COMPACTING state count
+     * @param tombstoned TOMBSTONED state count, visible because the query's epoch predates
+     *                   the tombstone
+     */
+    private record LifecycleBreakdown(
+        int indexing,
+        int warming,
+        int active,
+        int compacting,
+        int tombstoned
+    ) {
+        /** The breakdown of no segments at all, which counting starts from. */
+        static final LifecycleBreakdown NONE = new LifecycleBreakdown(0, 0, 0, 0, 0);
+
+        /**
+         * Returns this breakdown with one more segment counted against {@code state}.
+         *
+         * @param state The lifecycle state of the segment being counted
+         * @return A new breakdown, or this one unchanged for a state no query sees
+         */
+        LifecycleBreakdown counting(LifecycleState state) {
+            return switch (state) {
+                case INDEXING -> new LifecycleBreakdown(indexing + 1, warming, active, compacting, tombstoned);
+                case WARMING -> new LifecycleBreakdown(indexing, warming + 1, active, compacting, tombstoned);
+                case ACTIVE -> new LifecycleBreakdown(indexing, warming, active + 1, compacting, tombstoned);
+                case COMPACTING -> new LifecycleBreakdown(indexing, warming, active, compacting + 1, tombstoned);
+                case TOMBSTONED -> new LifecycleBreakdown(indexing, warming, active, compacting, tombstoned + 1);
+                default -> this; // BOOTSTRAPPING, PURGED not visible
+            };
+        }
+
+        /**
+         * The segments a query may actually be answered from.
+         *
+         * <p>Tombstoned segments are left out: they are in the snapshot because the query's
+         * epoch predates their removal, not because they are corpus the query should be
+         * measured against.</p>
+         *
+         * @return The count of segments in a queryable state
+         */
+        int queryable() {
+            return indexing + warming + active + compacting;
         }
     }
 

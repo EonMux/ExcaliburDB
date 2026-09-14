@@ -130,6 +130,7 @@ public final class LabelDictionary implements AutoCloseable, LongFunction<String
             }
 
             long dataBytes = Files.size(dataPath);
+            requirePaired(indexPath, dataPath, index, count, dataBytes);
             MemorySegment data = dataBytes == 0
                 ? MemorySegment.ofArray(new byte[0])
                 : dataChannel.map(FileChannel.MapMode.READ_ONLY, 0, dataBytes, arena);
@@ -140,6 +141,46 @@ public final class LabelDictionary implements AutoCloseable, LongFunction<String
         } catch (IOException | RuntimeException e) {
             arena.close();
             throw e;
+        }
+    }
+
+    /**
+     * Refuses an index and a data file that were not written by the same build.
+     *
+     * <p>The dictionary is published as two renames, and two renames are not one atomic act: a
+     * crash between them leaves the previous index beside the new text. Every offset in the old
+     * index still lands inside the larger new blob, so the per-entry bounds check in
+     * {@link #apply} passes and returns a slice of a different entity's name — silently, which
+     * for the mapping that puts names back on an answer is the worst available failure, and worse
+     * still just after an erasure.
+     *
+     * <p>The text is written as one concatenation in id order, so the last entry ends exactly at
+     * the end of the file. Comparing those two numbers catches every mismatched pair but one, at
+     * the cost of a single index read rather than a scan: two dictionaries whose text happens to
+     * be the same total length. Refusing to open is the right answer here, unlike in
+     * {@link #apply} — an operator can restore or rebuild a dictionary, and cannot notice a wrong
+     * name.
+     *
+     * @param indexPath The index, named in the failure
+     * @param dataPath  The text
+     * @param index     The mapped index
+     * @param count     How many entries it declares
+     * @param dataBytes How long the text actually is
+     * @throws IOException if the two do not describe each other
+     */
+    private static void requirePaired(Path indexPath, Path dataPath, MemorySegment index,
+                                      int count, long dataBytes) throws IOException {
+        long implied = 0;
+        if (count > 0) {
+            long last = HEADER_BYTES + (long) (count - 1) * ENTRY_BYTES;
+            implied = Integer.toUnsignedLong(index.get(INT, last + 8))
+                + Integer.toUnsignedLong(index.get(INT, last + 12));
+        }
+        if (implied != dataBytes) {
+            throw new IOException(indexPath + " describes " + implied + " bytes of text but "
+                + dataPath + " holds " + dataBytes + "; the two files are from different builds, "
+                + "which is what a crash between their two renames leaves behind. Reading them "
+                + "together would return one entity's name for another.");
         }
     }
 

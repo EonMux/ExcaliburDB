@@ -32,8 +32,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * <h2>Visibility Rules</h2>
  * <p>A segment is visible at epoch E if:</p>
  * <ul>
- *   <li>creationEpoch <= E (segment existed at query start)</li>
- *   <li>E < tombstoneEpoch (segment was not tombstoned before query started)</li>
+ *   <li>{@code creationEpoch <= E} (segment existed at query start)</li>
+ *   <li>{@code E < tombstoneEpoch} (segment was not tombstoned before query started)</li>
  *   <li>Lifecycle state is queryable (INDEXING, WARMING, ACTIVE, COMPACTING)</li>
  * </ul>
  *
@@ -48,7 +48,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Epoch starts at 0 and monotonically increases</li>
- *   <li>Creation epoch is always <= current epoch</li>
+ *   <li>Creation epoch is always &lt;= current epoch</li>
  *   <li>Tombstone epoch is Long.MAX_VALUE for non-tombstoned segments</li>
  *   <li>visibleSegments returns immutable sets</li>
  *   <li>Epoch overflow is detected and logged</li>
@@ -161,8 +161,8 @@ public class VisibilityTracker implements io.excalibur.store.VisibilityTracker {
      * <p><strong>Visibility Contract:</strong> A query capturing epoch E
      * will see all segments where:</p>
      * <ul>
-     *   <li>creationEpoch <= E</li>
-     *   <li>E < tombstoneEpoch (or tombstoneEpoch == Long.MAX_VALUE)</li>
+     *   <li>{@code creationEpoch <= E}</li>
+     *   <li>{@code E < tombstoneEpoch} (or {@code tombstoneEpoch == Long.MAX_VALUE})</li>
      *   <li>Lifecycle state is queryable</li>
      * </ul>
      *
@@ -294,7 +294,7 @@ public class VisibilityTracker implements io.excalibur.store.VisibilityTracker {
      *
      * <p>The tombstone epoch determines when a segment becomes invisible
      * to new queries. A segment tombstoned at epoch E will be visible to
-     * queries that captured epoch < E, but invisible to queries that
+     * queries that captured epoch &lt; E, but invisible to queries that
      * captured epoch >= E.</p>
      *
      * <p>This method also updates the catalog's segment metadata with
@@ -345,8 +345,8 @@ public class VisibilityTracker implements io.excalibur.store.VisibilityTracker {
      *
      * <p>A segment is visible at epoch E if:</p>
      * <ul>
-     *   <li>creationEpoch <= E (segment existed at query start)</li>
-     *   <li>E < tombstoneEpoch (segment was not tombstoned before query started)</li>
+     *   <li>{@code creationEpoch <= E} (segment existed at query start)</li>
+     *   <li>{@code E < tombstoneEpoch} (segment was not tombstoned before query started)</li>
      *   <li>Lifecycle state is queryable (INDEXING, WARMING, ACTIVE, COMPACTING)</li>
      * </ul>
      *

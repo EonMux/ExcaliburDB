@@ -89,6 +89,24 @@ public final class HybridFusion {
     public static List<Result> fuse(List<QueryResultItem> dense,
                                     List<LexicalQueryService.Hit> lexical,
                                     int limit) {
+        return fuse(dense, lexical, limit, ReciprocalRankFusion.DEFAULT_K);
+    }
+
+    /**
+     * Fuses a vector ranking and a lexical ranking into one, with a given rank offset.
+     *
+     * @param dense   Vector search results, best first, or null if that signal did not run
+     * @param lexical BM25 results, best first, or null if that signal did not run
+     * @param limit   Most results to return
+     * @param rrfK    Reciprocal rank fusion's rank offset, from
+     *                {@code excalibur.query.rrf-k}
+     * @return The fused ranking, best first, never null
+     * @throws IllegalArgumentException if limit is negative or the offset is not positive
+     */
+    public static List<Result> fuse(List<QueryResultItem> dense,
+                                    List<LexicalQueryService.Hit> lexical,
+                                    int limit,
+                                    int rrfK) {
         if (limit < 0) {
             throw new IllegalArgumentException("limit must not be negative, got " + limit);
         }
@@ -134,7 +152,7 @@ public final class HybridFusion {
         lists.add(new RankedList(DENSE_SIGNAL, denseDocuments));
         lists.add(new RankedList(LEXICAL_SIGNAL, lexicalDocuments));
 
-        List<FusedDocument> fused = new ReciprocalRankFusion().fuse(lists, limit);
+        List<FusedDocument> fused = new ReciprocalRankFusion(rrfK).fuse(lists, limit);
         List<Result> results = new ArrayList<>(fused.size());
         for (FusedDocument document : fused) {
             String documentId = byId.get((int) document.documentId());

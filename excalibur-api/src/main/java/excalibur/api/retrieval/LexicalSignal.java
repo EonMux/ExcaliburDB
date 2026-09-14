@@ -11,7 +11,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -39,24 +38,6 @@ import java.util.concurrent.TimeoutException;
 public final class LexicalSignal {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(LexicalSignal.class);
-
-    /**
-     * How many BM25 searches may be in flight across all requests at once.
-     *
-     * <p>The vector half of a query stops when its deadline passes, because every stage of the
-     * pipeline polls the cancellation token. This half does not: it is a search inside the
-     * lexical engine, and interrupting it is neither reliable nor safe. So a caller sending
-     * {@code timeout_ms: 1} gets an immediate answer and leaves a full search running, and at
-     * the request rate the guard allows that work accumulates faster than it drains.</p>
-     *
-     * <p>This is the bound on what can accumulate. Sized to the cores available because the
-     * search is CPU-bound: more concurrent searches than cores finish no sooner and only hold
-     * memory.</p>
-     */
-    public static final int MAX_CONCURRENT = Math.max(2, Runtime.getRuntime().availableProcessors());
-
-    /** Permits for {@link #MAX_CONCURRENT}, shared by every request on this node. */
-    private static final Semaphore PERMITS = new Semaphore(MAX_CONCURRENT);
 
     private final LexicalQueryService service;
     private final Future<List<LexicalQueryService.Hit>> pending;
@@ -92,7 +73,7 @@ public final class LexicalSignal {
         if (service == null || executor == null) {
             return null;
         }
-        if (!PERMITS.tryAcquire()) {
+        if (!LexicalSearchPermits.tryAcquire()) {
             LOGGER.debug("No permit for the BM25 signal; answering from the other signal alone");
             return null;
         }
@@ -101,14 +82,11 @@ public final class LexicalSignal {
                 try {
                     return service.search(query, limit);
                 } finally {
-                    // Released when the search stops, not when the request stops waiting for
-                    // it. Releasing at the call site would let abandoned searches pile up
-                    // behind a permit count that says they are not there.
-                    PERMITS.release();
+                    LexicalSearchPermits.release();
                 }
             }));
         } catch (RejectedExecutionException e) {
-            PERMITS.release();
+            LexicalSearchPermits.release();
             LOGGER.warn("Could not start the BM25 signal; answering from the other signal "
                 + "alone: {}", e.getMessage());
             return null;
@@ -198,7 +176,7 @@ public final class LexicalSignal {
             return null;
         }
         try {
-            return HybridFusion.fuse(dense, hits, topK);
+            return HybridFusion.fuse(dense, hits, topK, service.rrfK());
         } catch (RuntimeException e) {
             LOGGER.warn("Could not fuse the two signals; answering from vector search alone: {}",
                 e.getMessage(), e);

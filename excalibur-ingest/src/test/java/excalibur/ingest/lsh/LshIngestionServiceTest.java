@@ -1,10 +1,17 @@
 package excalibur.ingest.lsh;
 
+import excalibur.filter.lsh.LshConfig;
+import excalibur.filter.lsh.LshIndex;
 import io.excalibur.store.Segment;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
+
+import java.io.IOException;
+import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.mock;
@@ -26,9 +33,9 @@ class LshIngestionServiceTest {
             LshIngestionService service = new LshIngestionService(128);
 
             assertThat(service.getVectorDimensions()).isEqualTo(128);
-            assertThat(service.getNumHashTables()).isEqualTo(LshIngestionService.DEFAULT_NUM_HASH_TABLES);
-            assertThat(service.getNumHashFunctions()).isEqualTo(LshIngestionService.DEFAULT_NUM_HASH_FUNCTIONS);
-            assertThat(service.getNumProbes()).isEqualTo(LshIngestionService.DEFAULT_NUM_PROBES);
+            assertThat(service.getNumHashTables()).isEqualTo(LshConfig.DEFAULT_NUM_HASH_TABLES);
+            assertThat(service.getNumHashFunctions()).isEqualTo(LshConfig.DEFAULT_NUM_HASH_FUNCTIONS);
+            assertThat(service.getNumProbes()).isEqualTo(LshConfig.DEFAULT_NUM_PROBES);
         }
 
         @Test
@@ -222,15 +229,110 @@ class LshIngestionServiceTest {
     }
 
     @Nested
-    @DisplayName("Default constants")
-    class DefaultConstants {
+    @DisplayName("Per-segment configuration")
+    class PerSegmentConfiguration {
+
+        private static final long SEGMENT_ID = 7L;
 
         @Test
-        @DisplayName("default constants are reasonable values")
-        void defaultConstantsAreReasonable() {
-            assertThat(LshIngestionService.DEFAULT_NUM_HASH_TABLES).isGreaterThan(0);
-            assertThat(LshIngestionService.DEFAULT_NUM_HASH_FUNCTIONS).isGreaterThan(0);
-            assertThat(LshIngestionService.DEFAULT_NUM_PROBES).isGreaterThan(0);
+        @DisplayName("a segment's index is built with the parameters the service was given")
+        void segmentIndexCarriesTheConfiguredParameters() {
+            LshIngestionService service = new LshIngestionService(64, 20, 12, 5);
+
+            LshConfig config = configOfIndexAttachedBy(service);
+
+            assertThat(config.dimensions()).isEqualTo(64);
+            assertThat(config.numHashTables()).isEqualTo(20);
+            assertThat(config.numHashFunctions()).isEqualTo(12);
+            assertThat(config.numProbes()).isEqualTo(5);
+            assertThat(config.seed())
+                .as("the seed is the segment id, so segments opened together do not share hyperplanes")
+                .isEqualTo(SEGMENT_ID);
+        }
+
+        @Test
+        @DisplayName("the dimensions-only constructor builds a segment on the shared LSH defaults")
+        void dimensionsOnlyConstructorUsesTheSharedDefaults() {
+            LshIngestionService service = new LshIngestionService(64);
+
+            LshConfig config = configOfIndexAttachedBy(service);
+
+            assertThat(config.dimensions()).isEqualTo(64);
+            assertThat(config.numHashTables()).isEqualTo(LshConfig.DEFAULT_NUM_HASH_TABLES);
+            assertThat(config.numHashFunctions()).isEqualTo(LshConfig.DEFAULT_NUM_HASH_FUNCTIONS);
+            assertThat(config.numProbes()).isEqualTo(LshConfig.DEFAULT_NUM_PROBES);
+        }
+
+        private LshConfig configOfIndexAttachedBy(LshIngestionService service) {
+            Segment segment = mock(Segment.class);
+            when(segment.segmentId()).thenReturn(SEGMENT_ID);
+            when(segment.lshIndex()).thenReturn(null);
+            when(segment.path()).thenReturn(null);
+
+            service.initializeLshIndex(segment);
+
+            ArgumentCaptor<LshIndex> attached = ArgumentCaptor.forClass(LshIndex.class);
+            Mockito.verify(segment).attachLshIndex(attached.capture());
+            return attached.getValue().config();
+        }
+    }
+
+    @Nested
+    @DisplayName("Configuration errors against index errors")
+    class ConfigurationErrorsAgainstIndexErrors {
+
+        private static final long SEGMENT_ID = 11L;
+
+        @Test
+        @DisplayName("a hash-function count no index will accept is refused against its property")
+        void anImpossibleHashFunctionCountIsRefusedAgainstItsProperty() {
+            // A bucket key is packed into a long, so 64 concatenated hash functions is one past
+            // what any LSH index can represent. The value is the operator's, not the disk's, and
+            // a service that takes it and then blames the index on disk sends them to delete a
+            // corpus that is fine.
+            assertThatThrownBy(() -> new LshIngestionService(128, 15, 64, 3))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("excalibur.shard.lsh-hash-functions")
+                .hasMessageContaining("64");
+        }
+
+        @Test
+        @DisplayName("every service that can be built can build an index for a fresh segment")
+        void anAcceptedConfigurationAlwaysYieldsAnIndex(@TempDir Path directory) {
+            LshIngestionService service =
+                new LshIngestionService(8, 2, LshConfig.MAX_HASH_FUNCTIONS, 1);
+            Segment segment = segmentAt(directory.resolve("segment-1.dat"));
+
+            service.initializeLshIndex(segment);
+
+            Mockito.verify(segment).attachLshIndex(Mockito.any(LshIndex.class));
+        }
+
+        @Test
+        @DisplayName("an index on disk of another shape is tolerated, not thrown")
+        void aGenuineOnDiskMismatchIsStillTolerated(@TempDir Path directory) throws IOException {
+            Path data = directory.resolve("segment-1.dat");
+            Path tables = directory.resolve("segment-1.lsh");
+            LshIndex existing = LshIndex.open(
+                LshConfig.builder(8).numHashTables(2).numHashFunctions(12).numProbes(1)
+                    .seed(SEGMENT_ID).build(),
+                tables);
+            existing.close();
+
+            // Same segment, a hash-function count the tables on disk were not written with.
+            LshIngestionService service = new LshIngestionService(8, 2, 14, 1);
+            Segment segment = segmentAt(data);
+
+            assertThatCode(() -> service.initializeLshIndex(segment)).doesNotThrowAnyException();
+            Mockito.verify(segment, Mockito.never()).attachLshIndex(Mockito.any());
+        }
+
+        private Segment segmentAt(Path dataPath) {
+            Segment segment = mock(Segment.class);
+            when(segment.segmentId()).thenReturn(SEGMENT_ID);
+            when(segment.lshIndex()).thenReturn(null);
+            when(segment.path()).thenReturn(dataPath);
+            return segment;
         }
     }
 }

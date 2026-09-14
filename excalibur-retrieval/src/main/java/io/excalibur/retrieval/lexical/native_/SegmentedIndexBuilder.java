@@ -1,5 +1,7 @@
 package io.excalibur.retrieval.lexical.native_;
 
+import io.excalibur.retrieval.lexical.Bm25Parameters;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,18 +49,35 @@ public final class SegmentedIndexBuilder implements AutoCloseable {
 
     private final Path workDirectory;
     private final long postingsBudget;
+    private final Bm25Parameters bm25;
     private final List<Path> pieces = new ArrayList<>();
 
-    private PostingsWriter current = new PostingsWriter();
+    private PostingsWriter current;
     private long postingsHeld;
     private int documents;
 
     public SegmentedIndexBuilder(Path workDirectory) throws IOException {
-        this(workDirectory, DEFAULT_POSTINGS_BUDGET);
+        this(workDirectory, DEFAULT_POSTINGS_BUDGET, Bm25Parameters.DEFAULT);
     }
 
     public SegmentedIndexBuilder(Path workDirectory, long postingsBudget) throws IOException {
+        this(workDirectory, postingsBudget, Bm25Parameters.DEFAULT);
+    }
+
+    /** A builder whose pieces, merges and finished index all use one BM25 pair. */
+    public SegmentedIndexBuilder(Path workDirectory, Bm25Parameters bm25) throws IOException {
+        this(workDirectory, DEFAULT_POSTINGS_BUDGET, bm25);
+    }
+
+    /**
+     * @param workDirectory  Where intermediate pieces are written
+     * @param postingsBudget Postings held before a piece is flushed
+     * @param bm25           The pair every piece and the finished index is built with
+     */
+    public SegmentedIndexBuilder(Path workDirectory, long postingsBudget, Bm25Parameters bm25)
+            throws IOException {
         this.workDirectory = Objects.requireNonNull(workDirectory, "workDirectory");
+        this.bm25 = Objects.requireNonNull(bm25, "bm25");
         if (postingsBudget < 1) {
             // Only a non-positive budget is actually invalid. A small one merely means many
             // small pieces and more merging, which is the arrangement a constrained heap
@@ -67,6 +86,7 @@ public final class SegmentedIndexBuilder implements AutoCloseable {
             throw new IllegalArgumentException("postingsBudget must be positive: " + postingsBudget);
         }
         this.postingsBudget = postingsBudget;
+        this.current = new PostingsWriter(bm25);
         Files.createDirectories(workDirectory);
     }
 
@@ -108,7 +128,7 @@ public final class SegmentedIndexBuilder implements AutoCloseable {
         current.write(piece);
         pieces.add(piece);
         LOGGER.info("Flushed piece {} with {} documents", pieces.size() - 1, current.docCount());
-        current = new PostingsWriter();
+        current = new PostingsWriter(bm25);
         postingsHeld = 0;
     }
 
@@ -121,7 +141,7 @@ public final class SegmentedIndexBuilder implements AutoCloseable {
     public void build(Path destination) throws IOException {
         flush();
         if (pieces.isEmpty()) {
-            new PostingsWriter().write(destination);
+            new PostingsWriter(bm25).write(destination);
             return;
         }
         if (pieces.size() == 1) {
@@ -142,14 +162,14 @@ public final class SegmentedIndexBuilder implements AutoCloseable {
                     continue;
                 }
                 Path merged = workDirectory.resolve("merge-" + generation + "-" + i);
-                PostingsMerger.merge(group, merged);
+                PostingsMerger.merge(group, merged, bm25);
                 next.add(merged);
             }
             LOGGER.info("Merge round {}: {} pieces to {}", generation, round.size(), next.size());
             round = next;
             generation++;
         }
-        PostingsMerger.merge(round, destination);
+        PostingsMerger.merge(round, destination, bm25);
     }
 
     private static void moveDirectory(Path from, Path to) throws IOException {

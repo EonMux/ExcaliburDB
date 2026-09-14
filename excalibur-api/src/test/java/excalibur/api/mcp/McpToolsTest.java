@@ -37,7 +37,7 @@ class McpToolsTest {
     void theCatalogueIsWellFormed() {
         List<Object> catalogue = McpTools.catalogue();
 
-        assertThat(catalogue).hasSize(5);
+        assertThat(catalogue).hasSize(6);
         for (Object described : catalogue) {
             assertThat(Json.stringAt(described, "name")).isNotBlank();
             assertThat(Json.stringAt(described, "description"))
@@ -89,12 +89,32 @@ class McpToolsTest {
                 + "similarity will compare numbers that share no scale")
             .contains("'retrieval'");
         assertThat(Json.stringAt(described, "description"))
-            .as("the reply carries document ids and scores and no text at all, so a model "
-                + "promised passages will wait for content that never arrives")
-            .doesNotContain("passage");
+            .as("the reply carries the passage text, and a model told otherwise will go looking "
+                + "for content it was already given")
+            .contains("text");
         assertThat(Json.stringAt(described, "description"))
-            .as("a model has to know it must resolve the ids against its own document store")
-            .contains("identifier");
+            .as("a passage past the node's bound is clipped, and a model that cannot tell a "
+                + "clipped passage from a whole one will quote the clipped one as the whole one")
+            .contains("text_truncated");
+    }
+
+    /**
+     * A search that answers with bare identifiers is half an answer to a model: the identifiers
+     * name chunks in a store it has no way to read. The adapter asks for the text because the
+     * model cannot ask for it afterwards.
+     */
+    @Test
+    @DisplayName("a search asks the node for the passage text, not just the identifiers")
+    void searchDocumentsAsksForText() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            node.answerWith(200, "{\"results\":[],\"coverage\":{}}");
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            tools.call(McpTools.SEARCH_DOCUMENTS, Map.of("query", "analytical engine"));
+
+            assertThat(Json.at(Json.parse(node.onlyRequest().body()), "include_text"))
+                .isEqualTo(Boolean.TRUE);
+        }
     }
 
     @Test
@@ -395,5 +415,65 @@ class McpToolsTest {
         org.assertj.core.api.Assertions.assertThatThrownBy(
             () -> ExcaliburClient.fromEnvironment(Map.of("EXCALIBUR_MCP_TIMEOUT_SECONDS", "0")))
             .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /**
+     * {@code ingest_documents} registers a directory to crawl, and a crawl target must be inside
+     * an allow-listed root. A model that holds the text and has no allow-listed directory to put
+     * it in cannot index anything at all through that tool - which on a default node is every
+     * model. This is the other direction.
+     */
+    @Test
+    @DisplayName("add_documents describes supplying content rather than a directory to crawl")
+    void addDocumentsSchema() {
+        Object described = tool(McpTools.ADD_DOCUMENTS);
+        Map<String, Object> schema = Json.objectAt(described, "inputSchema");
+
+        assertThat(names(schema.get("required"))).containsExactlyInAnyOrder("source_id", "documents");
+        Map<String, Object> documents = Json.objectAt(Json.objectAt(schema, "properties"), "documents");
+        assertThat(Json.stringAt(documents, "type")).isEqualTo("array");
+        assertThat(Json.objectAt(Json.objectAt(documents, "items"), "properties"))
+            .as("a model has to be told what one document looks like, or it will guess the fields")
+            .containsKeys("document_id", "text");
+        assertThat(Json.stringAt(described, "description"))
+            .as("the call indexes inside the request, so a model must not poll for it the way "
+                + "ingest_documents requires")
+            .contains("searchable");
+    }
+
+    @Test
+    @DisplayName("adding documents reaches the supply route as the body it parses")
+    void addDocumentsPostsTheBatch() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            node.answerWith(200, "{\"documents_ingested\":1}");
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            McpTools.ToolResult result = tools.call(McpTools.ADD_DOCUMENTS, Map.of(
+                "source_id", "notes",
+                "documents", java.util.List.of(
+                    Map.of("document_id", "a.md", "text", "alpha"))));
+
+            StubNode.Received request = node.onlyRequest();
+            assertThat(request.method()).isEqualTo("POST");
+            assertThat(request.path()).isEqualTo("/v1/documents");
+            Object body = Json.parse(request.body());
+            assertThat(Json.stringAt(body, "source_id")).isEqualTo("notes");
+            assertThat(request.body()).contains("a.md").contains("alpha");
+            assertThat(result.isError()).isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("adding documents refuses a batch with no documents rather than calling the node")
+    void addDocumentsRefusesAnEmptyBatch() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            McpTools.ToolResult result = tools.call(McpTools.ADD_DOCUMENTS,
+                Map.of("source_id", "notes", "documents", java.util.List.of()));
+
+            assertThat(result.isError()).isTrue();
+            assertThat(result.text()).contains("documents");
+        }
     }
 }

@@ -405,15 +405,25 @@ class CuckooFilterFullCapacityTest {
 
             long countBeforeFailures = filter.count();
 
-            // Cause many failed insertions
+            // Cause many failed insertions. The count is checked after every one rather than
+            // once at the end: a filter this full refuses nearly everything, but "nearly" is not
+            // "all", and asserting that 500 attempts changed nothing would be asserting that the
+            // filter is saturated rather than that a refused insert leaves the count alone.
+            long expected = countBeforeFailures;
+            long refused = 0;
             for (int i = 0; i < 500; i++) {
-                filter.insert(("doomed-" + i).getBytes(StandardCharsets.UTF_8));
+                if (filter.insert(("doomed-" + i).getBytes(StandardCharsets.UTF_8))) {
+                    expected++;
+                } else {
+                    refused++;
+                }
+                assertThat(filter.count())
+                    .as("Count should not change from a failed insertion")
+                    .isEqualTo(expected);
             }
-
-            // Count should not have changed
-            assertThat(filter.count())
-                .as("Count should not change from failed insertions")
-                .isEqualTo(countBeforeFailures);
+            assertThat(refused)
+                .as("A filter at capacity should have refused most of these")
+                .isGreaterThan(400);
 
             // All previously inserted items should still be found
             for (byte[] item : insertedItems) {
@@ -423,6 +433,7 @@ class CuckooFilterFullCapacityTest {
             }
 
             System.out.println("Count before failures: " + countBeforeFailures);
+            System.out.println("Insertions refused: " + refused);
             System.out.println("Count after failures: " + filter.count());
             System.out.println("Items verified: " + insertedItems.size());
             System.out.println("✓ Filter state remained consistent");

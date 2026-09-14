@@ -5,7 +5,7 @@
  * <ul>
  *   <li>{@link excalibur.ingest.registry.DocumentMetadata} - Metadata for an indexed document</li>
  *   <li>{@link excalibur.ingest.registry.DocumentRegistry} - Registry tracking all indexed documents</li>
- *   <li>{@link excalibur.ingest.registry.CrawlDiff} - Result of comparing a crawl against the registry</li>
+ *   <li>{@link excalibur.ingest.registry.ChangeSet} - Result of comparing a crawl against the registry</li>
  * </ul>
  *
  * <h2>Change Detection</h2>
@@ -20,11 +20,11 @@
  * <p>All classes in this package are thread-safe:</p>
  * <ul>
  *   <li>{@code DocumentMetadata} - Immutable</li>
- *   <li>{@code CrawlDiff} - Immutable</li>
+ *   <li>{@code ChangeSet} - Immutable</li>
  *   <li>{@code DocumentRegistry} - Read-write locked</li>
  * </ul>
  *
  * @see excalibur.ingest.registry.DocumentRegistry
- * @see excalibur.ingest.registry.CrawlDiff
+ * @see excalibur.ingest.registry.ChangeSet
  */
 package excalibur.ingest.registry;

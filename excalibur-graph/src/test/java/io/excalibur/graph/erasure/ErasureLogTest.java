@@ -38,6 +38,29 @@ class ErasureLogTest {
         }
     }
 
+
+    /**
+     * Byte offsets at which each record frame starts, by walking the framing the log writes.
+     *
+     * <p>Computed rather than assumed, so a test that damages "the second record" damages the
+     * second record whatever the scope encodings happen to be sized at.
+     */
+    private static List<Integer> frameOffsets(Path file) throws IOException {
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(Files.readAllBytes(file));
+        buffer.position(ErasureLog.HEADER_BYTES);
+        List<Integer> offsets = new ArrayList<>();
+        while (buffer.remaining() >= Integer.BYTES) {
+            int start = buffer.position();
+            int length = buffer.getInt();
+            if (length <= 0 || buffer.remaining() < length + Integer.BYTES) {
+                break;
+            }
+            buffer.position(buffer.position() + length + Integer.BYTES);
+            offsets.add(start);
+        }
+        return offsets;
+    }
+
     @Nested
     @DisplayName("durability across a reopen")
     class Reopen {
@@ -427,6 +450,96 @@ class ErasureLogTest {
 
             try (ErasureLog reopened = ErasureLog.open(file)) {
                 assertThat(reopened.outstandingCount()).isEqualTo(threads * each);
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("damage in the middle of the log")
+    class MidLogDamage {
+
+        @Test
+        @DisplayName("a request recorded after a damaged one is not truncated away in silence")
+        void obligationsAfterDamageAreNotLost(@TempDir Path dir) throws IOException {
+            // The failure this guards: submit() writes the body and then flushes, so one failed
+            // flush - a full disk, a quota, an EIO - leaves a partial record. Every submit after
+            // it appends past the damage and is told the request was accepted. Replaying to the
+            // first bad record and truncating there then erases those acceptances entirely:
+            // outstandingCount() is zero, the file looks healthy, and nobody is told that an
+            // erasure obligation was dropped.
+            Path file = logFile(dir);
+            try (ErasureLog log = ErasureLog.open(file)) {
+                log.submit(new ErasureScope.Entity(1), WHEN);
+                log.submit(new ErasureScope.Entity(2), WHEN);
+                log.submit(new ErasureScope.Entity(3), WHEN);
+            }
+
+            byte[] all = Files.readAllBytes(file);
+            all[frameOffsets(file).get(0) + Integer.BYTES + 1] ^= 0x40;
+            Files.write(file, all);
+
+            assertThatThrownBy(() -> ErasureLog.open(file))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("intact record");
+        }
+
+        @Test
+        @DisplayName("a partial record that misaligns the requests after it also fails the open")
+        void misalignedRequestsAfterDamageFailTheOpen(@TempDir Path dir) throws IOException {
+            // A body cut short leaves the records appended after it at offsets no framing points
+            // at, so recognising them means scanning byte offsets and not frame boundaries.
+            Path file = logFile(dir);
+            try (ErasureLog log = ErasureLog.open(file)) {
+                log.submit(new ErasureScope.Entity(1), WHEN);
+                log.submit(new ErasureScope.Source(SourceType.DOCUMENT, 42), WHEN);
+                log.submit(new ErasureScope.ExtractorVersion(9), WHEN);
+            }
+
+            byte[] all = Files.readAllBytes(file);
+            int second = frameOffsets(file).get(1);
+            byte[] spliced = new byte[all.length + 7];
+            System.arraycopy(all, 0, spliced, 0, second);
+            System.arraycopy(all, second, spliced, second + 7, all.length - second);
+            java.nio.ByteBuffer.wrap(spliced).putInt(second, 512);
+            Files.write(file, spliced);
+
+            assertThatThrownBy(() -> ErasureLog.open(file))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("intact record");
+        }
+
+        @Test
+        @DisplayName("the failed open leaves the damaged log on disk rather than repairing it")
+        void theDamagedLogIsNotTouched(@TempDir Path dir) throws IOException {
+            Path file = logFile(dir);
+            try (ErasureLog log = ErasureLog.open(file)) {
+                log.submit(new ErasureScope.Entity(1), WHEN);
+                log.submit(new ErasureScope.Entity(2), WHEN);
+            }
+            byte[] all = Files.readAllBytes(file);
+            all[frameOffsets(file).get(0) + Integer.BYTES + 1] ^= 0x40;
+            Files.write(file, all);
+            byte[] damaged = Files.readAllBytes(file);
+
+            assertThatThrownBy(() -> ErasureLog.open(file)).isInstanceOf(IOException.class);
+
+            assertThat(Files.readAllBytes(file)).isEqualTo(damaged);
+        }
+
+        @Test
+        @DisplayName("a genuine torn tail is still trimmed and the requests before it survive")
+        void aTornTailIsStillTolerated(@TempDir Path dir) throws IOException {
+            Path file = logFile(dir);
+            long kept;
+            try (ErasureLog log = ErasureLog.open(file)) {
+                kept = log.submit(new ErasureScope.Entity(1), WHEN);
+                log.submit(new ErasureScope.Entity(2), WHEN);
+            }
+            tear(file, 4);
+
+            try (ErasureLog reopened = ErasureLog.open(file)) {
+                assertThat(reopened.outstanding()).extracting(ErasureRequest::id)
+                    .containsExactly(kept);
             }
         }
     }

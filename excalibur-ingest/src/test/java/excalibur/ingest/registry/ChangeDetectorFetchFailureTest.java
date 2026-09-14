@@ -76,6 +76,53 @@ class ChangeDetectorFetchFailureTest {
         assertThat(changeSet.getDeletedCount()).isZero();
     }
 
+    @Test
+    @DisplayName("a crawl that fails partway through deletes nothing")
+    void anAbortedCrawlDeletesNothing() {
+        // The deletion pass takes every registered document the crawl did not list as gone, so
+        // a crawl that stopped early would tombstone almost the whole corpus if it were allowed
+        // to produce a ChangeSet at all. It has to fail instead of returning a short list, and
+        // a source must never answer a read error by quietly omitting the file: a file this
+        // node cannot read is not a file that has been deleted.
+        Source aborting = new Source() {
+            @Override
+            public String getSourceId() {
+                return SOURCE_ID;
+            }
+
+            @Override
+            public String getSourceType() {
+                return "aborting";
+            }
+
+            @Override
+            public Stream<String> crawl() {
+                return Stream.of("other-doc").peek(id -> {
+                    throw new java.io.UncheckedIOException(
+                        new java.io.IOException("network went away mid-walk"));
+                });
+            }
+
+            @Override
+            public boolean hasChanged(Instant since) {
+                return true;
+            }
+
+            @Override
+            public FetchedDocument fetch(String documentId) {
+                return null;
+            }
+        };
+
+        org.assertj.core.api.Assertions
+            .assertThatThrownBy(() -> detector.detectChanges(aborting))
+            .isInstanceOf(java.io.UncheckedIOException.class);
+
+        assertThat(registry.getDocumentIds(SOURCE_ID))
+            .as("the registered document is still registered: nothing was tombstoned")
+            .contains(DOCUMENT_ID);
+    }
+
     /**
      * Crawls exactly one document and fails its fetch with a caller-supplied exception.
      */

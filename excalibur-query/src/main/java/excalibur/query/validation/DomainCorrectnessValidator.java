@@ -428,45 +428,71 @@ public final class DomainCorrectnessValidator {
         }
 
         // Validate coverage
-        IndexCoverage coverage = response.coverage();
-        if (coverage == null) {
-            builder.addError("Coverage is null");
-        } else {
-            if (!isValidCoverage(coverage.estimatedCorpusCoverage())) {
-                builder.addError("Coverage out of range [0.0, 1.0]: " +
-                    coverage.estimatedCorpusCoverage());
-            }
-        }
+        collectCoverageErrors(response.coverage(), builder);
 
         // Validate results
-        List<QueryResultItem> results = response.results();
+        collectResultErrors(response.results(), builder);
+
+        return builder.build();
+    }
+
+    /**
+     * Records what is wrong with a response's coverage, if anything.
+     *
+     * <p>A missing coverage block is reported in its own right rather than skipped. Coverage is
+     * what tells a caller how much of the corpus the answer was drawn from, and a response that
+     * omits it is not a response with full coverage.</p>
+     *
+     * @param coverage The coverage the response carried, which may be null
+     * @param builder  The builder collecting this validation's failures
+     */
+    private static void collectCoverageErrors(IndexCoverage coverage, ValidationResult.Builder builder) {
+        if (coverage == null) {
+            builder.addError("Coverage is null");
+        } else if (!isValidCoverage(coverage.estimatedCorpusCoverage())) {
+            builder.addError("Coverage out of range [0.0, 1.0]: " +
+                coverage.estimatedCorpusCoverage());
+        }
+    }
+
+    /**
+     * Records every way a response's result list breaks the ranking contract.
+     *
+     * <p>Every item is checked before the list as a whole is, and no failure stops the rest:
+     * this is the reporting counterpart to {@link #validateResponse(QueryResponse)}, and a
+     * caller reading the report wants the full set of faults, not the first one found.</p>
+     *
+     * @param results The results the response carried, which may be null
+     * @param builder The builder collecting this validation's failures
+     */
+    private static void collectResultErrors(List<QueryResultItem> results,
+                                            ValidationResult.Builder builder) {
         if (results == null) {
             builder.addError("Results list is null");
-        } else {
-            // Check each result
-            for (int i = 0; i < results.size(); i++) {
-                QueryResultItem item = results.get(i);
-                if (item == null) {
-                    builder.addError("Result at index " + i + " is null");
-                } else if (!isValidScore(item.score())) {
-                    builder.addError("Result at index " + i + " has invalid score: " +
-                        item.score());
-                }
-            }
+            return;
+        }
 
-            // Check ordering
-            if (!isSortedDescending(results)) {
-                builder.addError("Results are not sorted in descending order by score");
-            }
-
-            // Check duplicates
-            Set<Long> duplicates = findDuplicateDocumentIds(results);
-            if (!duplicates.isEmpty()) {
-                builder.addError("Results contain duplicate document IDs: " + duplicates);
+        // Check each result
+        for (int i = 0; i < results.size(); i++) {
+            QueryResultItem item = results.get(i);
+            if (item == null) {
+                builder.addError("Result at index " + i + " is null");
+            } else if (!isValidScore(item.score())) {
+                builder.addError("Result at index " + i + " has invalid score: " +
+                    item.score());
             }
         }
 
-        return builder.build();
+        // Check ordering
+        if (!isSortedDescending(results)) {
+            builder.addError("Results are not sorted in descending order by score");
+        }
+
+        // Check duplicates
+        Set<Long> duplicates = findDuplicateDocumentIds(results);
+        if (!duplicates.isEmpty()) {
+            builder.addError("Results contain duplicate document IDs: " + duplicates);
+        }
     }
 
     /**

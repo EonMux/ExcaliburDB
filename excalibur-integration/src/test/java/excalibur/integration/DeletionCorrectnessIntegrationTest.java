@@ -356,8 +356,6 @@ class DeletionCorrectnessIntegrationTest {
                 }
             }
 
-            System.out.println("Inserted " + insertedKeys.size() + " keys at high load");
-
             // Delete half
             Set<String> toDelete = new HashSet<>();
             int count = 0;
@@ -367,11 +365,14 @@ class DeletionCorrectnessIntegrationTest {
                 count++;
             }
 
-            int deleteSuccess = 0;
             for (String key : toDelete) {
-                if (filter.delete(key.getBytes(StandardCharsets.UTF_8))) {
-                    deleteSuccess++;
-                }
+                byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+                assertThat(filter.contains(keyBytes))
+                    .as("An inserted key must be reported present before it is deleted: " + key)
+                    .isTrue();
+                assertThat(filter.delete(keyBytes))
+                    .as("Deleting an inserted key must succeed even at high load: " + key)
+                    .isTrue();
             }
 
             // Verify deleted keys are gone
@@ -392,9 +393,6 @@ class DeletionCorrectnessIntegrationTest {
                 .as("False positives from fingerprint collisions at high load factor " +
                     "(inherent to Cuckoo filter design, not a bug)")
                 .isLessThan(5); // Allow small number due to inherent fingerprint collision rate
-
-            System.out.println("High load deletion: " + deleteSuccess + "/" + toDelete.size() +
-                " deleted, " + falsePositives + " false positives");
         }
     }
 

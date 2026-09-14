@@ -42,10 +42,12 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * <h2>Entry State</h2>
  * <p>The catalog tracks the state of entries within each segment:
  * <ul>
- *   <li>{@link EntryState#NONE} - No entries yet</li>
- *   <li>{@link EntryState#INDEXING} - Entries being written</li>
- *   <li>{@link EntryState#ACTIVE} - Fully indexed and optimized</li>
- *   <li>{@link EntryState#DELETED} - All entries deleted (tombstoned)</li>
+ *   <li>{@link #ENTRY_STATE_NONE} - No entries yet</li>
+ *   <li>{@link #ENTRY_STATE_INDEXING} - Entries being written</li>
+ *   <li>{@link #ENTRY_STATE_WARMING} - Entries written, being warmed up</li>
+ *   <li>{@link #ENTRY_STATE_ACTIVE} - Fully indexed and optimized</li>
+ *   <li>{@link #ENTRY_STATE_DELETED} - All entries deleted (tombstoned)</li>
+ *   <li>{@link #ENTRY_STATE_COMPACTING} - Entries being rewritten by compaction</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>
@@ -87,7 +89,7 @@ public class SegmentCatalog {
     public static final int ENTRY_STATE_DELETED = 4;
 
     /**
-     * Compactable segments.
+     * Tombstones being cleaned; a frozen snapshot serves queries meanwhile.
      */
     public static final int ENTRY_STATE_COMPACTING = 5;
 
@@ -1126,7 +1128,7 @@ public class SegmentCatalog {
      * Gets the write log head offset for a segment.
      *
      * <p>The write log head is the offset of the next byte to be written.
-     * All entries with offset < writeLogHead have been persisted to the write log.</p>
+     * All entries with offset &lt; writeLogHead have been persisted to the write log.</p>
      *
      * <p><strong>Domain Constraints:</strong></p>
      * <ul>
@@ -1877,7 +1879,7 @@ public class SegmentCatalog {
          * Gets the epoch at which this segment was created.
          *
          * <p>The creation epoch is the visibility epoch value at the time
-         * the segment was first registered. Queries with epoch < creationEpoch
+         * the segment was first registered. Queries with epoch &lt; creationEpoch
          * cannot see this segment.</p>
          *
          * @return The creation epoch, or -1 if not set
@@ -1962,8 +1964,8 @@ public class SegmentCatalog {
          *
          * <p>A segment is visible at epoch E if:</p>
          * <ul>
-         *   <li>creationEpoch <= E (segment existed at query start)</li>
-         *   <li>E < tombstoneEpoch (segment was not tombstoned before query started)</li>
+         *   <li>{@code creationEpoch <= E} (segment existed at query start)</li>
+         *   <li>{@code E < tombstoneEpoch} (segment was not tombstoned before query started)</li>
          * </ul>
          *
          * <p><strong>Note:</strong> This method only checks epoch visibility, not lifecycle state.

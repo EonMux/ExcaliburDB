@@ -138,6 +138,42 @@ class JsonTextTest {
                 .isInstanceOf(IllegalArgumentException.class);
         }
 
+        /**
+         * Python's and JavaScript's JSON encoders both emit exponent form for large float
+         * values, so this arrives from ordinary clients, not only from hostile ones. Reading
+         * the leading digits and discarding the exponent turns {@code 3e4} into {@code 3} and
+         * answers 200 to a request nobody made.
+         */
+        @Test
+        @DisplayName("refuses a number whose token does not end where the value does")
+        void rejectsATruncatedNumber() {
+            assertThatThrownBy(() -> JsonText.integer("{\"timeout_ms\": 3e4}", "timeout_ms", 1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("timeout_ms");
+            assertThatThrownBy(() -> JsonText.integer("{\"top_k\": 1.5}", "top_k", 10))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("top_k");
+            assertThatThrownBy(() -> JsonText.longValue("{\"max_file_bytes\": 5e8}",
+                "max_file_bytes", 1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max_file_bytes");
+            assertThatThrownBy(() -> JsonText.doubleValue("{\"threshold\": 0.5x}",
+                "threshold", 0.0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("threshold");
+        }
+
+        @Test
+        @DisplayName("accepts a number wherever a JSON value may legally end")
+        void acceptsEveryTerminator() {
+            assertThat(JsonText.integer("{\"top_k\": 7}", "top_k", 1)).isEqualTo(7);
+            assertThat(JsonText.integer("{\"top_k\": 7 }", "top_k", 1)).isEqualTo(7);
+            assertThat(JsonText.integer("{\"top_k\": 7, \"q\": \"a\"}", "top_k", 1))
+                .isEqualTo(7);
+            assertThat(JsonText.doubleValue("{\"threshold\": 1.5e-3}", "threshold", 0.0))
+                .isEqualTo(1.5e-3);
+        }
+
         @Test
         @DisplayName("parses numbers under a comma-decimal default locale")
         void parsesNumbersLocaleIndependently() {
@@ -206,6 +242,68 @@ class JsonTextTest {
         void numbersComeFromTheirOwnMember() {
             String body = "{\"label\":\"top_k\",\"top_k\":7}";
             assertThat(JsonText.integer(body, "top_k", -1)).isEqualTo(7);
+        }
+    }
+
+    @Nested
+    @DisplayName("objectArray")
+    class ObjectArrays {
+
+        @Test
+        @DisplayName("returns each element of an array of objects as raw JSON")
+        void readsEachElement() {
+            String[] items = JsonText.objectArray(
+                "{\"documents\": [{\"id\": \"a\"}, {\"id\": \"b\"}]}", "documents");
+
+            assertThat(items).hasSize(2);
+            assertThat(JsonText.string(items[0], "id")).isEqualTo("a");
+            assertThat(JsonText.string(items[1], "id")).isEqualTo("b");
+        }
+
+        /**
+         * A brace inside a string is not a nesting level, and a parser that counts it as one
+         * splits the array in the wrong place and silently drops the rest of it.
+         */
+        @Test
+        @DisplayName("is not confused by braces or brackets inside a string value")
+        void ignoresBracesInsideStrings() {
+            String[] items = JsonText.objectArray(
+                "{\"documents\": [{\"text\": \"a } and a ] and a {\"}, {\"text\": \"b\"}]}",
+                "documents");
+
+            assertThat(items).hasSize(2);
+            assertThat(JsonText.string(items[0], "text")).isEqualTo("a } and a ] and a {");
+            assertThat(JsonText.string(items[1], "text")).isEqualTo("b");
+        }
+
+        @Test
+        @DisplayName("reads objects nested inside an element")
+        void readsNestedObjects() {
+            String[] items = JsonText.objectArray(
+                "{\"d\": [{\"meta\": {\"k\": \"v\"}, \"id\": \"a\"}]}", "d");
+
+            assertThat(items).hasSize(1);
+            assertThat(JsonText.string(items[0], "id")).isEqualTo("a");
+        }
+
+        @Test
+        @DisplayName("returns an empty array for an empty one")
+        void readsAnEmptyArray() {
+            assertThat(JsonText.objectArray("{\"documents\": []}", "documents")).isEmpty();
+        }
+
+        @Test
+        @DisplayName("returns null when the field is absent or is not an array")
+        void nullWhenAbsentOrWrongType() {
+            assertThat(JsonText.objectArray("{\"a\": 1}", "documents")).isNull();
+            assertThat(JsonText.objectArray("{\"documents\": \"text\"}", "documents")).isNull();
+        }
+
+        @Test
+        @DisplayName("returns null for an array that is never closed")
+        void nullWhenUnterminated() {
+            assertThat(JsonText.objectArray("{\"documents\": [{\"id\": \"a\"}", "documents"))
+                .isNull();
         }
     }
 }

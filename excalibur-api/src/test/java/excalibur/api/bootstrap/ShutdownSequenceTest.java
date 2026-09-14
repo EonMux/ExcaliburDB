@@ -58,11 +58,42 @@ class ShutdownSequenceTest {
         List<String> order = new ArrayList<>();
 
         new ShutdownSequence()
-            .addIfPresent("close arena", null, () -> order.add("close arena"))
-            .addIfPresent("close storage", "engine", () -> order.add("close storage"))
+            .addIfPresent("close arena", null, target -> order.add("close arena"))
+            .addIfPresent("close storage", "engine", target -> order.add("close storage"))
             .run();
 
         assertThat(order).containsExactly("close storage");
+    }
+
+    @Test
+    @DisplayName("an absent target cannot take the rest of the sequence down with it")
+    void anAbsentTargetDoesNotBreakTheBuild() {
+        // The action receives the target rather than closing over it, so there is no receiver
+        // to bind before the null check. With the no-argument form a caller writing
+        // target::close threw while the argument list was being evaluated, and the sequence
+        // was never built - so on the one shutdown where a collaborator was absent, not one
+        // step ran and storage was never closed durably.
+        List<String> order = new ArrayList<>();
+        AutoCloseable absent = null;
+
+        new ShutdownSequence()
+            .addIfPresent("close absent", absent, AutoCloseable::close)
+            .add("close storage", () -> order.add("close storage"))
+            .run();
+
+        assertThat(order).containsExactly("close storage");
+    }
+
+    @Test
+    @DisplayName("a present target is handed to the action")
+    void thePresentTargetReachesTheAction() {
+        List<String> closed = new ArrayList<>();
+
+        new ShutdownSequence()
+            .addIfPresent("close engine", "engine", closed::add)
+            .run();
+
+        assertThat(closed).containsExactly("engine");
     }
 
     @Test

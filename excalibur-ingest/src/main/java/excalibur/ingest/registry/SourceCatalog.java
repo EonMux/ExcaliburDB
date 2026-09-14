@@ -7,10 +7,12 @@ import org.slf4j.LoggerFactory;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -39,10 +41,20 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code =}, and the line terminators escaped. Roots and URLs are caller-supplied text and
  * contain all of those, so escaping is not optional.</p>
  *
+ * <p>A last line, {@code \#end|count}, closes the file. Without it a catalog that lost its tail
+ * is a catalog of whole, well-formed records that simply omits sources - which reads exactly like
+ * a catalog those sources were never registered in, and is the one failure a registry of promises
+ * must not be able to make quietly. The marker cannot collide with a record: {@link
+ * #escape(String)} doubles every backslash, so no formatted record begins with a single one.</p>
+ *
  * <h2>Durability</h2>
- * <p>Every mutation rewrites the whole file and replaces it by an atomic move. The file holds at
- * most a few hundred short records, so a rewrite costs nothing worth optimising, and a caller that
- * has been told its source is registered must not be able to lose it to a crash a moment later.</p>
+ * <p>Every mutation rewrites the whole file into a sibling, forces it, and renames it over the
+ * catalog; the directory is forced afterwards, because a rename is a directory change and is no
+ * more durable on its own than the contents were. Renaming an unforced replacement publishes a
+ * correctly named catalog whose contents may still be only in the page cache - the same loss the
+ * rename exists to prevent, reached from the other end. The file holds at most a few hundred
+ * short records, so a rewrite costs nothing worth optimising, and a caller that has been told its
+ * source is registered must not be able to lose it to a crash a moment later.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe. Reads are lock-free; a mutation holds a lock for the rewrite, so concurrent
@@ -67,9 +79,53 @@ public final class SourceCatalog {
     /** Fields before the configuration pairs: the type and the id. */
     private static final int FIXED_FIELDS = 2;
 
+    /** Suffix of the sibling a rewrite is assembled in before it is published. */
+    private static final String REPLACEMENT_SUFFIX = ".tmp";
+
+    /** Opens the last line, which states how many records precede it. */
+    private static final String END_MARKER = "\\#end";
+
     private final Path file;
+    private final CatalogWriter writer;
     private final Map<String, SourceDescriptor> sources = new ConcurrentHashMap<>();
     private final Object writeLock = new Object();
+
+    /**
+     * The disk operations that publish a rewritten catalog.
+     *
+     * <p>Durability here is an ordering rather than any single call: the replacement's contents
+     * have to reach the platter before the rename that names it the catalog, and the rename
+     * itself is a directory change that is no more durable than the contents were. A test cannot
+     * cut the power between two of those steps, so the ordering is pinned by recording the steps
+     * as they are taken; that is what this seam exists for, and it is why the three operations
+     * are named separately rather than being one {@code publish} call.</p>
+     */
+    interface CatalogWriter {
+
+        /**
+         * Forces a written file's contents to the underlying device.
+         *
+         * @param path The file to force
+         * @throws IOException if the contents cannot be made durable
+         */
+        void force(Path path) throws IOException;
+
+        /**
+         * Renames a finished replacement over the live catalog.
+         *
+         * @param replacement The file holding the new contents
+         * @param target      The catalog path
+         * @throws IOException if the replacement cannot be published
+         */
+        void publish(Path replacement, Path target) throws IOException;
+
+        /**
+         * Forces the directory entry a rename has just changed.
+         *
+         * @param directory The directory holding the catalog
+         */
+        void forceDirectory(Path directory);
+    }
 
     /**
      * Thrown when a catalog exists but cannot be read.
@@ -86,6 +142,10 @@ public final class SourceCatalog {
 
         CatalogLoadException(Path path, IOException cause) {
             super("Failed to load source catalog from " + path, cause);
+        }
+
+        CatalogLoadException(Path path, String reason) {
+            super("Failed to load source catalog from " + path + ": " + reason);
         }
     }
 
@@ -110,7 +170,36 @@ public final class SourceCatalog {
      * @throws CatalogLoadException if the file exists and cannot be read
      */
     public SourceCatalog(Path file) {
+        this(file, fileSystemWriter());
+    }
+
+    /**
+     * Returns the operations as the filesystem performs them.
+     *
+     * <p>The production writer, named so a test that needs the real steps to happen underneath
+     * its recording can reach them rather than reimplementing an fsync of its own.</p>
+     *
+     * @return A writer that forces and renames for real
+     */
+    static CatalogWriter fileSystemWriter() {
+        return new FileSystemWriter();
+    }
+
+    /**
+     * Opens the catalog against an explicit set of disk operations.
+     *
+     * <p>Exists so a test can observe the order the contents and the rename are made durable in,
+     * which is the whole of the crash-safety this class claims and is otherwise only visible to a
+     * power cut.</p>
+     *
+     * @param file   The catalog file, which need not exist yet
+     * @param writer The operations that publish a rewrite
+     * @throws NullPointerException if either argument is null
+     * @throws CatalogLoadException if the file exists and cannot be read
+     */
+    SourceCatalog(Path file, CatalogWriter writer) {
         this.file = Objects.requireNonNull(file, "file must not be null");
+        this.writer = Objects.requireNonNull(writer, "writer must not be null");
         if (Files.exists(file)) {
             load();
         }
@@ -191,7 +280,15 @@ public final class SourceCatalog {
      * Rewrites the whole file and replaces the old one in a single step.
      *
      * <p>Written to a sibling and moved over, so a crash mid-write leaves the previous catalog
-     * intact rather than a truncated one that loads as a shorter list of sources.</p>
+     * intact rather than a truncated one that loads as a shorter list of sources. The sibling is
+     * forced before the rename and the directory after it, because a rename that is durable
+     * while its contents are not reproduces the very truncation the rename is here to avoid.</p>
+     *
+     * <p>Forcing the contents is not best effort: {@link #record(SourceDescriptor)} answers
+     * "registered" on the strength of it, so a failure has to reach the caller and put memory
+     * back the way the file has it. Forcing the directory is best effort, because a platform that
+     * will not open a directory channel is not a reason to fail a registration that is otherwise
+     * on disk.</p>
      */
     private void persist() throws IOException {
         Path parent = file.getParent();
@@ -199,19 +296,82 @@ public final class SourceCatalog {
             Files.createDirectories(parent);
         }
 
-        Path temporary = file.resolveSibling(file.getFileName() + ".tmp");
-        try (BufferedWriter writer = Files.newBufferedWriter(temporary)) {
+        Path replacement = file.resolveSibling(file.getFileName() + REPLACEMENT_SUFFIX);
+        try {
+            write(replacement);
+            writer.force(replacement);
+            writer.publish(replacement, file);
+        } catch (IOException e) {
+            // The published catalog is still the old one, so the only thing to undo is the
+            // half-written sibling. Suppressed rather than thrown, because losing the real cause
+            // to a tidy-up failure is the worse trade.
+            try {
+                Files.deleteIfExists(replacement);
+            } catch (IOException cleanupFailure) {
+                e.addSuppressed(cleanupFailure);
+            }
+            throw e;
+        }
+
+        if (parent != null) {
+            writer.forceDirectory(parent);
+        }
+    }
+
+    /**
+     * Writes every record and the end marker that proves the file is whole.
+     *
+     * <p>The count is taken from the same pass that writes the records rather than from
+     * {@code sources.size()}, so it states what actually reached the file.</p>
+     */
+    private void write(Path replacement) throws IOException {
+        try (BufferedWriter out = Files.newBufferedWriter(replacement)) {
+            int written = 0;
             for (SourceDescriptor descriptor : sources.values()) {
-                writer.write(format(descriptor));
-                writer.newLine();
+                out.write(format(descriptor));
+                out.newLine();
+                written++;
+            }
+            out.write(END_MARKER);
+            out.write(FIELD_SEPARATOR);
+            out.write(Integer.toString(written));
+            out.newLine();
+        }
+    }
+
+    /**
+     * The operations as the filesystem performs them.
+     */
+    private static final class FileSystemWriter implements CatalogWriter {
+
+        @Override
+        public void force(Path path) throws IOException {
+            try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+                channel.force(true);
             }
         }
 
-        try {
-            Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
+        @Override
+        public void publish(Path replacement, Path target) throws IOException {
+            try {
+                Files.move(replacement, target, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                LOGGER.warn("This filesystem cannot rename atomically; the source catalog is "
+                    + "published with a plain replace and a crash during it can truncate it");
+                Files.move(replacement, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+
+        @Override
+        public void forceDirectory(Path directory) {
+            try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+                channel.force(true);
+            } catch (IOException e) {
+                LOGGER.warn("Could not force the directory entry for the source catalog at {}; "
+                    + "a host crash immediately after a registration can lose the rename that "
+                    + "published it: {}", directory, e.getMessage());
+            }
         }
     }
 
@@ -224,7 +384,7 @@ public final class SourceCatalog {
             throw new CatalogLoadException(file, e);
         }
 
-        for (String line : lines) {
+        for (String line : records(lines)) {
             SourceDescriptor descriptor = parse(line);
             if (descriptor == null) {
                 skipped++;
@@ -237,6 +397,57 @@ public final class SourceCatalog {
             LOGGER.warn("Skipped {} unparseable record(s) while loading the source catalog from "
                 + "{}; those sources will not be re-crawled until they are registered again",
                 skipped, file);
+        }
+    }
+
+    /**
+     * Strips the end marker and checks that the file in front of it is all there.
+     *
+     * <p>A catalog that lost its tail keeps whole records, so nothing about the lines themselves
+     * says anything is missing; only the marker and the count it carries can. Refusing to load is
+     * the same stance the class takes on a catalog it cannot read at all - a node that starts on
+     * a short catalog re-crawls fewer sources than it was asked to and overwrites the rest at the
+     * next registration, with nothing on the way saying so.</p>
+     *
+     * @param lines Every line of the file
+     * @return The record lines, marker removed
+     * @throws CatalogLoadException if the marker is missing or disagrees with what is there
+     */
+    private List<String> records(List<String> lines) {
+        if (lines.isEmpty()) {
+            throw new CatalogLoadException(file,
+                "the file is empty, so the write that created it never reached the disk");
+        }
+
+        List<String> records = lines.subList(0, lines.size() - 1);
+        int declared = declaredCount(lines.get(lines.size() - 1));
+        if (declared < 0) {
+            throw new CatalogLoadException(file,
+                "it does not end with a record count, so it was cut short before the write that "
+                    + "published it finished, or it was written by hand");
+        }
+        if (declared != records.size()) {
+            throw new CatalogLoadException(file, "it declares " + declared
+                + " record(s) and carries " + records.size());
+        }
+        return records;
+    }
+
+    /**
+     * Reads the count out of a candidate end marker.
+     *
+     * @return The declared record count, or -1 if the line is not an end marker
+     */
+    private static int declaredCount(String line) {
+        String prefix = END_MARKER + FIELD_SEPARATOR;
+        if (!line.startsWith(prefix)) {
+            return -1;
+        }
+        try {
+            int count = Integer.parseInt(line.substring(prefix.length()));
+            return count < 0 ? -1 : count;
+        } catch (NumberFormatException e) {
+            return -1;
         }
     }
 

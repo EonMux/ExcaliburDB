@@ -873,9 +873,9 @@ class BatchHandlerTest {
      * Counts candidates in the request body by counting numbered lines.
      */
     private int countCandidatesInRequest(String body) {
-        // Count occurrences of patterns like "1. ", "2. ", etc.
+        // Candidates are listed from zero, matching the index the reply is parsed against.
         int count = 0;
-        for (int i = 1; i <= 100; i++) {
+        for (int i = 0; i < 100; i++) {
             if (body.contains(i + ". ")) {
                 count++;
             }

@@ -58,7 +58,7 @@ class OversizedRequestBodyTest {
     @DisplayName("is refused with 413 by the reindex endpoint")
     void reindexEndpoint() throws IOException {
         ReindexEndpoint endpoint = new ReindexEndpoint(
-            new ReindexEndpoint.InMemorySourceRegistry(),
+            new InMemorySourceRegistry(),
             new ReindexEndpoint.InMemoryReindexStatusRegistry());
 
         endpoint.handle(post("/v1/reindex"));

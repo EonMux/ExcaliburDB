@@ -1,6 +1,7 @@
 package excalibur.ingest.lexical;
 
 import io.excalibur.retrieval.expand.QueryExpander;
+import io.excalibur.retrieval.lexical.Bm25Parameters;
 import io.excalibur.retrieval.lexical.native_.CompactionPlan;
 import io.excalibur.retrieval.lexical.native_.CompactionPlanner;
 import io.excalibur.retrieval.lexical.native_.CompactionResult;
@@ -115,14 +116,34 @@ public final class NativeChunkIndex implements ChunkIndex {
      */
     public static NativeChunkIndex open(Path directory, LongSupplier epochs, long readerLagEpochs,
                                         CompactionPlanner planner) throws IOException {
+        return open(directory, epochs, readerLagEpochs, planner, Bm25Parameters.DEFAULT);
+    }
+
+    /**
+     * Opens the index under a directory, scoring it with a given BM25 pair.
+     *
+     * <p>The pair is recorded in what the store writes and checked against what it reads, so an
+     * index built under one pair refuses to open under another rather than being scored against
+     * block bounds computed from the other.</p>
+     *
+     * @param directory       Where the store lives
+     * @param epochs          The node's current visibility epoch
+     * @param readerLagEpochs How many epochs behind a live reader may be
+     * @param planner         Decides when and what to compact
+     * @param bm25            The scoring parameters this node is configured for
+     */
+    public static NativeChunkIndex open(Path directory, LongSupplier epochs, long readerLagEpochs,
+                                        CompactionPlanner planner, Bm25Parameters bm25)
+            throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
         Objects.requireNonNull(epochs, "epochs must not be null");
         Objects.requireNonNull(planner, "planner must not be null");
+        Objects.requireNonNull(bm25, "bm25 must not be null");
         if (readerLagEpochs < 0) {
             throw new IllegalArgumentException(
                 "readerLagEpochs must not be negative: " + readerLagEpochs);
         }
-        LexicalStore store = LexicalStore.open(directory, planner, Clock.systemUTC());
+        LexicalStore store = LexicalStore.open(directory, planner, Clock.systemUTC(), bm25);
         store.warm();
         return new NativeChunkIndex(store, epochs, readerLagEpochs, DEFAULT_BUFFER_CHUNKS,
             DEFAULT_NAME_CACHE);

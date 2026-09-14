@@ -253,4 +253,56 @@ class LabelDictionaryTest {
         assertThat(Files.readAllBytes(dir.resolve("entities.dat")))
             .isEqualTo("firstsecond".getBytes(StandardCharsets.UTF_8));
     }
+
+    @Nested
+    @DisplayName("A crash between the two renames")
+    class MismatchedPair {
+
+        @Test
+        @DisplayName("an old index over a new data file is refused, not answered wrongly")
+        void anOldIndexOverNewDataIsRefused(@TempDir Path dir) throws IOException {
+            // The dictionary is two files published by two renames, and two renames cannot be one
+            // atomic act. A crash between them pairs the previous .idx with the new .dat. Every
+            // offset in the old index still lands inside the larger new blob, so the bounds check
+            // passes and apply() hands back a slice of somebody else's name - silently, which for
+            // a dictionary that names people after an erasure is the worst way to be wrong.
+            new LabelDictionaryWriter().put(0, "alice").put(1, "bob").write(dir, "entities");
+            byte[] oldIndex = Files.readAllBytes(dir.resolve("entities.idx"));
+
+            new LabelDictionaryWriter()
+                .put(0, "christopher").put(1, "bartholomew").put(2, "wilhelmina")
+                .write(dir, "entities");
+            Files.write(dir.resolve("entities.idx"), oldIndex);
+
+            assertThatThrownBy(() -> LabelDictionary.open(dir, "entities", "E"))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("entities.dat");
+        }
+
+        @Test
+        @DisplayName("a new index over an old data file is refused as well")
+        void aNewIndexOverOldDataIsRefused(@TempDir Path dir) throws IOException {
+            new LabelDictionaryWriter().put(0, "alice").put(1, "bob").write(dir, "entities");
+            byte[] oldData = Files.readAllBytes(dir.resolve("entities.dat"));
+
+            new LabelDictionaryWriter()
+                .put(0, "christopher").put(1, "bartholomew").put(2, "wilhelmina")
+                .write(dir, "entities");
+            Files.write(dir.resolve("entities.dat"), oldData);
+
+            assertThatThrownBy(() -> LabelDictionary.open(dir, "entities", "E"))
+                .isInstanceOf(IOException.class);
+        }
+
+        @Test
+        @DisplayName("a matched pair opens as it always did")
+        void aMatchedPairIsFine(@TempDir Path dir) throws IOException {
+            new LabelDictionaryWriter().put(0, "alice").put(7, "bob").write(dir, "entities");
+
+            try (LabelDictionary dictionary = LabelDictionary.open(dir, "entities", "E")) {
+                assertThat(dictionary.apply(0)).isEqualTo("alice");
+                assertThat(dictionary.apply(7)).isEqualTo("bob");
+            }
+        }
+    }
 }

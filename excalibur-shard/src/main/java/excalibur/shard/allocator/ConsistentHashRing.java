@@ -58,7 +58,7 @@ public class ConsistentHashRing {
      *
      * <p>Domain justification: 150 virtual nodes provides a good balance between
      * distribution quality and memory overhead. With this value, the standard
-     * deviation of segment distribution is typically < 10% of the mean.</p>
+     * deviation of segment distribution is typically &lt; 10% of the mean.</p>
      */
     public static final int DEFAULT_VIRTUAL_NODES = 150;
 

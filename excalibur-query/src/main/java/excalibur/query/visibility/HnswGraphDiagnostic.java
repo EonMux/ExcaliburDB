@@ -2,7 +2,6 @@ package excalibur.query.visibility;
 
 import io.excalibur.vector.hnsw.HnswGraph;
 import io.excalibur.vector.hnsw.HnswInvariantVerifier;
-import io.excalibur.vector.hnsw.HnswSearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,7 +41,7 @@ import java.util.Set;
  *
  * <h2>Domain Correctness</h2>
  * <ul>
- *   <li>lastIntegratedOffset should be <= writeLogHead (never ahead of write log)</li>
+ *   <li>lastIntegratedOffset should be &lt;= writeLogHead (never ahead of write log)</li>
  *   <li>lastIntegratedOffset should equal nodeCount if all vectors are integrated</li>
  *   <li>Entry point must be valid and not tombstoned</li>
  *   <li>All active nodes must be reachable from entry point</li>
@@ -247,272 +246,132 @@ public final class HnswGraphDiagnostic {
 
         List<GraphDiagnosticIssue> issues = new ArrayList<>();
 
-        // Capture graph state
-        long nodeCount = graph.nodeCount();
-        long activeNodeCount = graph.activeNodeCount();
-        long entryPoint = graph.entryPoint();
-        int maxLevel = graph.maxLevel();
-        long lastIntegratedOffset = graph.getLastIntegratedOffset();
-        long edgeCount = 0;
-        int reachableNodes = 0;
-        int searchResultCount = 0;
+        GraphState state = GraphState.capture(graph);
 
         // === Check 1: Empty graph ===
-        if (nodeCount == 0) {
-            issues.add(GraphDiagnosticIssue.warning(
-                "EMPTY_GRAPH",
-                "Graph has no nodes",
-                "Insert vectors into the graph before querying"
-            ));
-
-            return new GraphDiagnosticResult(
-                nodeCount, activeNodeCount, entryPoint, maxLevel,
-                lastIntegratedOffset, writeLogHead, edgeCount, reachableNodes,
-                searchResultCount, Collections.unmodifiableList(issues)
-            );
+        if (state.nodeCount() == 0) {
+            return emptyGraphResult(state, writeLogHead, issues);
         }
 
         // === Check 2: Invalid entry point ===
-        if (entryPoint < 0) {
-            issues.add(GraphDiagnosticIssue.critical(
-                "INVALID_ENTRY_POINT",
-                "Graph has nodes but no valid entry point (entryPoint=" + entryPoint + ")",
-                "Entry point should be set to the highest-level node. Check graph initialization."
-            ));
-        } else if (graph.isTombstoned(entryPoint)) {
-            issues.add(GraphDiagnosticIssue.critical(
-                "TOMBSTONED_ENTRY_POINT",
-                "Entry point " + entryPoint + " is tombstoned",
-                "Find a new active entry point from the highest-level nodes"
-            ));
-        } else {
-            HnswGraph.NodeView entryNode = graph.readNode(entryPoint);
-            if (entryNode == null) {
-                issues.add(GraphDiagnosticIssue.critical(
-                    "UNREADABLE_ENTRY_POINT",
-                    "Entry point " + entryPoint + " cannot be read",
-                    "Graph file may be corrupted. Verify disk storage."
-                ));
-            }
-        }
+        HnswGraphChecks.reportEntryPoint(graph, state.entryPoint(), issues);
 
         // === Check 3: lastIntegratedOffset consistency ===
-        // lastIntegratedOffset should never exceed writeLogHead
-        if (lastIntegratedOffset > writeLogHead && writeLogHead > 0) {
-            issues.add(GraphDiagnosticIssue.critical(
-                "OFFSET_AHEAD_OF_WRITELOG",
-                "lastIntegratedOffset (" + lastIntegratedOffset + ") > writeLogHead (" + writeLogHead + ")",
-                "Offset tracking is corrupted. Reset lastIntegratedOffset to writeLogHead."
-            ));
-        }
-
-        // lastIntegratedOffset should approximately equal nodeCount if fully integrated
-        // (allowing for concurrent operations)
-        if (lastIntegratedOffset < nodeCount - 1 && writeLogHead >= nodeCount) {
-            // Only warn if writeLogHead indicates more entries should exist
-            issues.add(GraphDiagnosticIssue.warning(
-                "OFFSET_BEHIND_NODECOUNT",
-                "lastIntegratedOffset (" + lastIntegratedOffset + ") < nodeCount (" + nodeCount + ")",
-                "Not all vectors have been integrated. Tail scan will be needed for queries."
-            ));
-        }
+        HnswGraphChecks.reportIntegrationOffset(
+            state.lastIntegratedOffset(), writeLogHead, state.nodeCount(), issues);
 
         // === Check 4: Graph connectivity ===
-        HnswInvariantVerifier.VerificationResult connectivityResult =
-            HnswInvariantVerifier.verifyConnectivity(graph);
-
-        if (!connectivityResult.isValid()) {
-            for (String violation : connectivityResult.violations()) {
-                issues.add(GraphDiagnosticIssue.critical(
-                    "DISCONNECTED_GRAPH",
-                    "Graph connectivity issue: " + violation,
-                    "Rebuild the graph or check for insertion bugs"
-                ));
-            }
-        } else {
-            reachableNodes = connectivityResult.edgesChecked(); // edgesChecked is actually reachable count
-        }
+        int reachableNodes = HnswGraphChecks.reportConnectivity(graph, issues);
 
         // === Check 5: Edge bidirectionality ===
-        HnswInvariantVerifier.VerificationResult invariantResult =
-            HnswInvariantVerifier.verifyAllInvariants(graph);
+        HnswGraphChecks.reportEdgeInvariants(graph, issues);
 
-        if (!invariantResult.isValid()) {
-            // Count the violations first, then report each kind once. Reporting inside the
-            // loop emitted one issue per violation, each quoting the running count, so a
-            // graph with N unidirectional edges produced N issues claiming 1, 2, ... N.
-            int unidirectionalEdges = 0;
-            List<String> otherViolations = new ArrayList<>();
-
-            for (String violation : invariantResult.violations()) {
-                if (violation.contains("unidirectional")) {
-                    unidirectionalEdges++;
-                } else {
-                    otherViolations.add(violation);
-                }
-            }
-
-            // Only a warning: some unidirectional edges can occur during concurrent updates
-            if (unidirectionalEdges > 0) {
-                issues.add(GraphDiagnosticIssue.warning(
-                    "UNIDIRECTIONAL_EDGES",
-                    "Found " + unidirectionalEdges + " unidirectional edges",
-                    "This may be temporary during concurrent updates. If persistent, check edge management."
-                ));
-            }
-
-            for (String violation : otherViolations) {
-                issues.add(GraphDiagnosticIssue.warning(
-                    "INVARIANT_VIOLATION",
-                    "Graph invariant violated: " + violation,
-                    "Inspect the graph's insertion and pruning paths."
-                ));
-            }
-        }
-
-        edgeCount = HnswInvariantVerifier.countBidirectionalEdges(graph, 0);
+        long edgeCount = HnswInvariantVerifier.countBidirectionalEdges(graph, 0);
 
         // === Check 6: Self-search test ===
-        // Try to search the graph using one of its own vectors
-        if (activeNodeCount > 0 && entryPoint >= 0) {
-            SelfSearch selfSearch = testSelfSearch(graph);
-            searchResultCount = selfSearch.results();
-            if (!selfSearch.ran()) {
-                // The probe did not get an answer to judge. Compaction renumbers node ids and
-                // closes the graph while it swaps, and search() checks the closed flag before
-                // taking the read lock, so a diagnostic landing in that window fails here with
-                // the graph entirely intact. Calling that broken traversal sends an operator
-                // after a fault that does not exist.
-                issues.add(GraphDiagnosticIssue.warning(
-                    "SELF_SEARCH_UNAVAILABLE",
-                    "Self-search probe could not run: " + selfSearch.reason(),
-                    "Usually a compaction that closed or renumbered the graph between choosing "
-                        + "the probe node and reading it, which is routine and clears itself. "
-                        + "The probe failed, not the graph. Investigate only if it persists "
-                        + "across runs while nothing is compacting."
-                ));
-            } else if (searchResultCount == 0) {
-                issues.add(GraphDiagnosticIssue.critical(
-                    "SELF_SEARCH_EMPTY",
-                    "Self-search test returned 0 results (graph has " + activeNodeCount + " active nodes)",
-                    "Graph traversal is broken. Check search algorithm and node data."
-                ));
-            } else if (searchResultCount < Math.min(5, activeNodeCount)) {
-                issues.add(GraphDiagnosticIssue.warning(
-                    "SELF_SEARCH_FEW_RESULTS",
-                    "Self-search test returned only " + searchResultCount + " results",
-                    "Graph may have poor connectivity or search parameters are too restrictive."
-                ));
-            }
-        }
+        int searchResultCount = HnswGraphChecks.reportSelfSearch(
+            graph, state.activeNodeCount(), state.entryPoint(), issues);
 
         // === Check 7: Average edge count per node ===
-        if (activeNodeCount > 0 && edgeCount > 0) {
-            double avgEdgesPerNode = (double) edgeCount * 2 / activeNodeCount;
-            if (avgEdgesPerNode < 2.0) {
-                issues.add(GraphDiagnosticIssue.warning(
-                    "LOW_EDGE_DENSITY",
-                    "Average edges per node is low: " + String.format("%.1f", avgEdgesPerNode),
-                    "Graph may have poor recall. Consider increasing efConstruction."
-                ));
-            }
+        HnswGraphChecks.reportEdgeDensity(state.activeNodeCount(), edgeCount, issues);
+
+        GraphDiagnosticResult result = new GraphDiagnosticResult(
+            state.nodeCount(), state.activeNodeCount(), state.entryPoint(), state.maxLevel(),
+            state.lastIntegratedOffset(), writeLogHead, edgeCount, reachableNodes,
+            searchResultCount, Collections.unmodifiableList(issues)
+        );
+
+        logDiagnostic(result);
+
+        return result;
+    }
+
+    /**
+     * The graph's headline counters, read once at the start of a diagnostic.
+     *
+     * <p>Read together and then passed around rather than re-read per check, so that every
+     * issue the diagnostic raises and the result it returns describe one reading of a graph
+     * other threads are still writing to.</p>
+     *
+     * @param nodeCount Total nodes in the graph
+     * @param activeNodeCount Active (non-tombstoned) nodes
+     * @param entryPoint Current entry point node ID
+     * @param maxLevel Maximum level in the graph
+     * @param lastIntegratedOffset Current lastIntegratedOffset value
+     */
+    private record GraphState(
+        long nodeCount,
+        long activeNodeCount,
+        long entryPoint,
+        int maxLevel,
+        long lastIntegratedOffset
+    ) {
+        /**
+         * Captures the graph state a diagnostic runs against.
+         *
+         * @param graph The graph to read
+         * @return The counters as they stand
+         */
+        static GraphState capture(HnswGraph graph) {
+            return new GraphState(
+                graph.nodeCount(),
+                graph.activeNodeCount(),
+                graph.entryPoint(),
+                graph.maxLevel(),
+                graph.getLastIntegratedOffset()
+            );
         }
 
-        // Log results
-        LOGGER.info("HNSW graph diagnostic complete: {} nodes, {} active, {} edges, {} reachable, {} search results, {} issues",
-            nodeCount, activeNodeCount, edgeCount, reachableNodes, searchResultCount, issues.size());
+    }
 
-        for (GraphDiagnosticIssue issue : issues) {
-            LOGGER.debug("Graph diagnostic issue: {}", issue);
-        }
+    /**
+     * Reports a graph with nothing in it, and returns the diagnostic there is no more to add to.
+     *
+     * <p>Only a warning: an empty graph is what a segment looks like before anything has been
+     * ingested into it, and every check after this one asks a question about nodes there are
+     * none of. Edges, reachability and self-search therefore report zero because nothing
+     * looked, not because something looked and found none.</p>
+     *
+     * @param state The graph counters this diagnostic captured
+     * @param writeLogHead Current write log head position
+     * @param issues The list collecting this diagnostic's findings
+     * @return The diagnostic result for an empty graph
+     */
+    private static GraphDiagnosticResult emptyGraphResult(
+            GraphState state,
+            long writeLogHead,
+            List<GraphDiagnosticIssue> issues) {
+
+        issues.add(GraphDiagnosticIssue.warning(
+            "EMPTY_GRAPH",
+            "Graph has no nodes",
+            "Insert vectors into the graph before querying"
+        ));
 
         return new GraphDiagnosticResult(
-            nodeCount, activeNodeCount, entryPoint, maxLevel,
-            lastIntegratedOffset, writeLogHead, edgeCount, reachableNodes,
-            searchResultCount, Collections.unmodifiableList(issues)
+            state.nodeCount(), state.activeNodeCount(), state.entryPoint(), state.maxLevel(),
+            state.lastIntegratedOffset(), writeLogHead, 0L, 0,
+            0, Collections.unmodifiableList(issues)
         );
     }
 
     /**
-     * What a self-search probe found, or why it could not look.
+     * Logs what the diagnostic found.
      *
-     * <p>The distinction is the whole point of the type. A search that ran and returned
-     * nothing says the graph cannot find its own vectors, which is a fault. A probe that
-     * never ran says nothing about the graph at all, and folding both into the number 0 made
-     * a routine compaction indistinguishable from broken traversal.</p>
+     * <p>The summary goes out at info because an operator running a diagnostic wants its
+     * headline without turning debug on; the issues themselves stay at debug because the
+     * caller already has them in the result and is expected to act on them there.</p>
      *
-     * @param ran     Whether a search actually completed
-     * @param results How many it returned, 0 when it did not run
-     * @param reason  Why it did not run, empty when it did
+     * @param result The completed diagnostic result
      */
-    private record SelfSearch(boolean ran, int results, String reason) {
+    private static void logDiagnostic(GraphDiagnosticResult result) {
+        LOGGER.info("HNSW graph diagnostic complete: {} nodes, {} active, {} edges, {} reachable, {} search results, {} issues",
+            result.nodeCount(), result.activeNodeCount(), result.edgeCount(),
+            result.reachableNodes(), result.searchResultCount(), result.issues().size());
 
-        static SelfSearch completed(int results) {
-            return new SelfSearch(true, results, "");
+        for (GraphDiagnosticIssue issue : result.issues()) {
+            LOGGER.debug("Graph diagnostic issue: {}", issue);
         }
-
-        static SelfSearch couldNotRun(String reason) {
-            return new SelfSearch(false, 0, reason);
-        }
-    }
-
-    /**
-     * Tests if the graph can find results by searching with one of its own vectors.
-     *
-     * <p>This is a basic sanity check: if a graph with nodes cannot find results
-     * when searching with one of its own vectors, something is fundamentally broken.</p>
-     *
-     * @param graph The graph to test
-     * @return What the probe found, or why it could not look
-     */
-    private static SelfSearch testSelfSearch(HnswGraph graph) {
-        try {
-            // Find an active node to use as the query vector
-            long queryNodeId = findFirstActiveNode(graph);
-            if (queryNodeId < 0) {
-                LOGGER.debug("Self-search test: no active nodes found");
-                return SelfSearch.couldNotRun("no active node to query with");
-            }
-
-            HnswGraph.NodeView queryNode = graph.readNode(queryNodeId);
-            if (queryNode == null) {
-                LOGGER.debug("Self-search test: could not read node {}", queryNodeId);
-                return SelfSearch.couldNotRun("node " + queryNodeId + " could not be read");
-            }
-
-            float[] queryVector = queryNode.vector();
-            if (queryVector == null || queryVector.length == 0) {
-                LOGGER.debug("Self-search test: node {} has no vector", queryNodeId);
-                return SelfSearch.couldNotRun("node " + queryNodeId + " carries no vector");
-            }
-
-            // Search with k=10
-            List<HnswSearchResult> results = graph.search(queryVector, 10);
-
-            LOGGER.debug("Self-search test: found {} results using node {} as query",
-                results.size(), queryNodeId);
-
-            return SelfSearch.completed(results.size());
-        } catch (Exception e) {
-            LOGGER.debug("Self-search test failed with exception: {}", e.getMessage());
-            return SelfSearch.couldNotRun(e.toString());
-        }
-    }
-
-    /**
-     * Finds the first active (non-tombstoned) node in the graph.
-     *
-     * @param graph The graph to search
-     * @return First active node ID, or -1 if none found
-     */
-    private static long findFirstActiveNode(HnswGraph graph) {
-        long nodeCount = graph.nodeCount();
-        for (long nodeId = 0; nodeId < nodeCount; nodeId++) {
-            if (!graph.isTombstoned(nodeId)) {
-                return nodeId;
-            }
-        }
-        return -1;
     }
 
     /**
@@ -521,7 +380,7 @@ public final class HnswGraphDiagnostic {
      * <p>This checks if the offset is within valid bounds:</p>
      * <ul>
      *   <li>Offset must be >= 0</li>
-     *   <li>Offset must be <= writeLogHead</li>
+     *   <li>Offset must be &lt;= writeLogHead</li>
      * </ul>
      *
      * @param graph The HNSW graph
@@ -564,7 +423,7 @@ public final class HnswGraphDiagnostic {
         if (graph.activeNodeCount() == 0) {
             return true; // Empty graph is trivially OK
         }
-        SelfSearch probe = testSelfSearch(graph);
+        HnswGraphChecks.SelfSearch probe = HnswGraphChecks.probeSelfSearch(graph);
         return !probe.ran() || probe.results() > 0;
     }
 

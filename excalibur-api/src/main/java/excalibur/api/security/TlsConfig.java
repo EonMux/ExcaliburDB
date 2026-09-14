@@ -265,9 +265,11 @@ public final class TlsConfig {
         builder.truststorePassword(charsOf(ConfigText.value(props, KEY_TRUSTSTORE_PASSWORD)));
         builder.truststoreType(ConfigText.value(props, KEY_TRUSTSTORE_TYPE));
 
-        String explicit = ConfigText.value(props, KEY_ENABLED);
-        if (explicit != null) {
-            builder.enabled(ConfigText.flag(props, KEY_ENABLED, true));
+        // Null when the key is absent, which means "decide from whether key material was
+        // configured" - and the builder has already done that.
+        Boolean enabled = ConfigText.flagOrNull(props, KEY_ENABLED);
+        if (enabled != null) {
+            builder.enabled(enabled);
         }
         return builder.build();
     }

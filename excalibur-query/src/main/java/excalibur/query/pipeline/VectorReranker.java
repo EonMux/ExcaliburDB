@@ -121,74 +121,9 @@ public class VectorReranker {
         List<QueryResultItem> reranked = new ArrayList<>();
 
         for (QueryResultItem candidate : candidates) {
-            long nodeId = candidate.nodeId();
-
-            // Tail scan results have no node in the graph, so there is nothing to
-            // re-measure. Their score was already normalized by the aggregator on the
-            // same scale as every other candidate, so it passes through untouched.
-            if (TailScanner.isTailScanResult(nodeId)) {
-                reranked.add(candidate);
-                continue;
-            }
-
-            try {
-                // Fetch the full-precision vector from the HNSW graph. The generation
-                // check rejects a node ID invalidated by a concurrent compaction rather
-                // than letting it resolve to whatever vector now holds that ID.
-                NodeView nodeView = graph.readNode(nodeId, candidate.generation());
-
-                if (nodeView == null) {
-                    LOGGER.trace("Node {} not found in graph (generation {}), skipping",
-                        nodeId, candidate.generation());
-                    continue;
-                }
-
-                // Skip tombstoned nodes
-                if (nodeView.isTombstoned()) {
-                    LOGGER.trace("Node {} is tombstoned, skipping", nodeId);
-                    continue;
-                }
-
-                // Get the full-precision vector
-                float[] storedVector = nodeView.vector();
-
-                if (storedVector == null || storedVector.length == 0) {
-                    LOGGER.trace("Node {} has no vector, skipping", nodeId);
-                    continue;
-                }
-
-                // Validate dimension match
-                if (storedVector.length != queryVector.length) {
-                    LOGGER.trace("Node {} dimension mismatch: expected {}, got {}, skipping",
-                        nodeId, queryVector.length, storedVector.length);
-                    continue;
-                }
-
-                // Compute the exact dissimilarity (smaller is closer for every metric)
-                float exactDistance = distanceFunction.distance(queryVector, storedVector);
-
-                if (!Float.isFinite(exactDistance)) {
-                    LOGGER.trace("Node {} produced non-finite distance {}, skipping",
-                        nodeId, exactDistance);
-                    continue;
-                }
-
-                // Validate, clamp, and normalize to [0.0, 1.0] score range
-                // This ensures all scores are in the valid [0.0, 1.0] range for ranking
-                float normalizedScore = DistanceValidator.validateClampAndNormalizeOrderedDistance(
-                    exactDistance, distanceFunction);
-
-                if (Float.isNaN(normalizedScore)) {
-                    LOGGER.trace("Node {} produced NaN score, skipping", nodeId);
-                    continue;
-                }
-
-                // Create new result with normalized score
-                reranked.add(candidate.withScore(normalizedScore));
-
-            } catch (Exception e) {
-                LOGGER.debug("Error reranking node {}: {}", nodeId, e.getMessage());
-                // Skip this candidate on error
+            QueryResultItem remeasured = remeasure(candidate, queryVector, graph);
+            if (remeasured != null) {
+                reranked.add(remeasured);
             }
         }
 
@@ -204,6 +139,118 @@ public class VectorReranker {
         LOGGER.trace("Reranked to {} results", reranked.size());
 
         return reranked;
+    }
+
+    /**
+     * Measures one candidate against the query on the vector the graph holds now.
+     *
+     * <p>Everything that can go wrong here ends the same way, with the candidate dropped
+     * rather than kept at its old score: a node that is gone, tombstoned, empty, of the wrong
+     * dimension, or that measures to a value that cannot be ranked. Keeping it would mean
+     * ranking it on stage 3's reading of a node that no longer answers to it.</p>
+     *
+     * @param candidate The candidate to re-measure
+     * @param queryVector The query vector
+     * @param graph The HNSW graph containing the full-precision vectors
+     * @return The candidate carrying its recomputed score, the candidate unchanged when it
+     *         came from the write-log tail and has no node to re-read, or null to drop it
+     */
+    private QueryResultItem remeasure(QueryResultItem candidate, float[] queryVector, HnswGraph graph) {
+        long nodeId = candidate.nodeId();
+
+        // Tail scan results have no node in the graph, so there is nothing to
+        // re-measure. Their score was already normalized by the aggregator on the
+        // same scale as every other candidate, so it passes through untouched.
+        if (TailScanner.isTailScanResult(nodeId)) {
+            return candidate;
+        }
+
+        try {
+            float[] storedVector = storedVector(candidate, graph, queryVector.length);
+
+            if (storedVector == null) {
+                return null;
+            }
+
+            // Compute the exact dissimilarity (smaller is closer for every metric)
+            float exactDistance = distanceFunction.distance(queryVector, storedVector);
+
+            if (!Float.isFinite(exactDistance)) {
+                LOGGER.trace("Node {} produced non-finite distance {}, skipping",
+                    nodeId, exactDistance);
+                return null;
+            }
+
+            // Validate, clamp, and normalize to [0.0, 1.0] score range
+            // This ensures all scores are in the valid [0.0, 1.0] range for ranking
+            float normalizedScore = DistanceValidator.validateClampAndNormalizeOrderedDistance(
+                exactDistance, distanceFunction);
+
+            if (Float.isNaN(normalizedScore)) {
+                LOGGER.trace("Node {} produced NaN score, skipping", nodeId);
+                return null;
+            }
+
+            // Create new result with normalized score
+            return candidate.withScore(normalizedScore);
+
+        } catch (Exception e) {
+            LOGGER.debug("Error reranking node {}: {}", nodeId, e.getMessage());
+            // Skip this candidate on error
+            return null;
+        }
+    }
+
+    /**
+     * Re-reads a candidate's full-precision vector, if the graph still holds one for it.
+     *
+     * <p>Read under the generation the candidate was found at, so a node id a compaction has
+     * since given to another node is refused rather than resolving to that node's vector. The
+     * dimension is checked here too: a stored vector of another width cannot be measured
+     * against this query at all, and it means the segment was written under a different
+     * embedding model rather than that this one candidate is bad.</p>
+     *
+     * @param candidate The candidate, which carries the generation it was found at
+     * @param graph The HNSW graph containing the full-precision vectors
+     * @param dimension The query vector's dimension, which the stored vector must match
+     * @return The stored vector, or null when this candidate can no longer be measured
+     */
+    private static float[] storedVector(QueryResultItem candidate, HnswGraph graph, int dimension) {
+        long nodeId = candidate.nodeId();
+
+        // Fetch the full-precision vector from the HNSW graph. The generation
+        // check rejects a node ID invalidated by a concurrent compaction rather
+        // than letting it resolve to whatever vector now holds that ID.
+        NodeView nodeView = graph.readNode(nodeId, candidate.generation());
+
+        if (nodeView == null) {
+            LOGGER.trace("Node {} not found in graph (generation {}), skipping",
+                nodeId, candidate.generation());
+            return null;
+        }
+
+        // Skip tombstoned nodes
+        if (nodeView.isTombstoned()) {
+            LOGGER.trace("Node {} is tombstoned, skipping", nodeId);
+            return null;
+        }
+
+        // Get the full-precision vector
+        float[] storedVector = nodeView.vector();
+
+        if (storedVector == null || storedVector.length == 0) {
+            LOGGER.trace("Node {} has no vector, skipping", nodeId);
+            return null;
+        }
+
+        // Validate dimension match
+        if (storedVector.length != dimension) {
+            LOGGER.trace("Node {} dimension mismatch: expected {}, got {}, skipping",
+                nodeId, dimension, storedVector.length);
+            return null;
+        }
+
+        return storedVector;
     }
 
     /**

@@ -3,12 +3,16 @@ package io.excalibur.graph.erasure;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.Collection;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
 import io.excalibur.graph.erasure.CompactionPolicy.CompactionStats;
+import io.excalibur.graph.provenance.Provenance;
+import io.excalibur.graph.staging.GraphStagingStore;
+import io.excalibur.graph.staging.StagedErasure;
 import io.excalibur.graph.store.MappedEdgeStore;
 
 import org.roaringbitmap.RoaringBitmap;
@@ -68,6 +72,7 @@ public final class GraphErasureCoordinator {
     private final CompactionPolicy policy;
     private final Clock clock;
     private final StoreOpener opener;
+    private final GraphStagingStore staging;
     private final Object compactionLock = new Object();
 
     /**
@@ -81,7 +86,26 @@ public final class GraphErasureCoordinator {
      * @throws NullPointerException if any argument is null
      */
     public GraphErasureCoordinator(ErasureLog log, CompactionPolicy policy, Clock clock) {
-        this(log, policy, clock, MappedEdgeStore::open);
+        this(log, policy, clock, MappedEdgeStore::open, null);
+    }
+
+    /**
+     * As above, and also erasing the staged facts the served graph was built from.
+     *
+     * <p>Without the staging store this coordinator removes an erased edge from the graph and
+     * leaves the fact it was built from in the staging log, so the next build puts it straight
+     * back - and the fact sits on disk in the meantime, which for an erasure obligation is the
+     * point rather than a detail.</p>
+     *
+     * @param log     Where requests are recorded
+     * @param policy  Decides whether a due compaction is worth running
+     * @param clock   Read for "now"
+     * @param staging The staged facts to erase alongside the store, or null for a coordinator
+     *                with no staging behind it
+     */
+    public GraphErasureCoordinator(ErasureLog log, CompactionPolicy policy, Clock clock,
+                                   GraphStagingStore staging) {
+        this(log, policy, clock, MappedEdgeStore::open, staging);
     }
 
     /**
@@ -99,10 +123,178 @@ public final class GraphErasureCoordinator {
      */
     GraphErasureCoordinator(ErasureLog log, CompactionPolicy policy, Clock clock,
                             StoreOpener opener) {
+        this(log, policy, clock, opener, null);
+    }
+
+    GraphErasureCoordinator(ErasureLog log, CompactionPolicy policy, Clock clock,
+                            StoreOpener opener, GraphStagingStore staging) {
         this.log = Objects.requireNonNull(log, "log must not be null");
         this.policy = Objects.requireNonNull(policy, "policy must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.opener = Objects.requireNonNull(opener, "opener must not be null");
+        this.staging = staging;
+    }
+
+    /**
+     * Removes the staged facts, snippets and labels an erasure covers.
+     *
+     * <p>Run before the requests are marked discharged and on every path that discharges them,
+     * including the one where nothing in the served store matched: a fact staged but never
+     * built is in no store to be found, and is exactly the fact a build would publish next.
+     *
+     * @param requests The outstanding requests
+     * @return What was removed, and what could not be judged
+     * @throws IOException if the staging logs cannot be rewritten
+     */
+    private GraphStagingStore.EraseResult eraseStaged(Collection<ErasureRequest> requests)
+            throws IOException {
+        if (staging == null || requests.isEmpty()) {
+            return NOTHING_STAGED;
+        }
+        GraphStagingStore.EraseResult result = staging.erase(new RequestBatch(requests));
+        if (result.removed() > 0) {
+            LOGGER.info("erased {} staged record(s) so the next build cannot republish them: "
+                + "{} fact(s), {} snippet(s), {} label(s)", result.removed(),
+                result.factsRemoved(), result.snippetsRemoved(), result.labelsTombstoned());
+        }
+        return result;
+    }
+
+    /** What a coordinator with no staging behind it removed from staging. */
+    private static final GraphStagingStore.EraseResult NOTHING_STAGED =
+        new GraphStagingStore.EraseResult(0, 0, 0, 0);
+
+    /**
+     * One batch of requests, as the staging store asks about it.
+     *
+     * @param requests The batch
+     */
+    private record RequestBatch(Collection<ErasureRequest> requests) implements StagedErasure {
+
+        @Override
+        public boolean erasesFact(int subject, int relation, int object, int validFrom,
+                                  int validTo, Provenance provenance) {
+            for (ErasureRequest request : requests) {
+                if (coversStaged(request.scope(), subject, object, provenance)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public boolean erasesSnippet(int entityId, Provenance provenance) {
+            for (ErasureRequest request : requests) {
+                if (coversStaged(request.scope(), entityId, entityId, provenance)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public boolean erasesLabel(int entityId) {
+            for (ErasureRequest request : requests) {
+                // Only an entity scope replaces a name. A withdrawn document must not take the
+                // names of everyone it happened to mention with it: those people did not ask to
+                // be forgotten, and their ids are referenced by facts from other sources.
+                if (request.scope() instanceof ErasureScope.Entity entity
+                        && entity.entityId() == entityId) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Whether an erasure scope covers one staged record.
+     *
+     * @param scope      The scope
+     * @param subject    Subject entity id, or the entity a snippet belongs to
+     * @param object     Object entity id, or the entity a snippet belongs to
+     * @param provenance Where the record came from
+     * @return true when the record must be removed
+     */
+    private static boolean coversStaged(ErasureScope scope, int subject, int object,
+                                        Provenance provenance) {
+        return switch (scope) {
+            // Both endpoints, for the same reason the store's own matcher takes both: keeping
+            // the incoming edges leaves the erased entity reconstructible from its neighbours.
+            case ErasureScope.Entity entity ->
+                subject == entity.entityId() || object == entity.entityId();
+            case ErasureScope.Source source ->
+                provenance.sourceType() == source.sourceType()
+                    && provenance.sourceId() == source.sourceId();
+            case ErasureScope.ExtractorVersion version ->
+                provenance.extractorVersion() == version.version();
+        };
+    }
+
+    /**
+     * The requests this pass may honestly mark discharged.
+     *
+     * <p>A scope that selects by provenance can only be answered against records that carry
+     * some. Snippets recorded before origins were kept carry none, and there is no third option
+     * that is not a lie: removing them would destroy prose nobody asked to erase, and completing
+     * the request would report an erasure that had not happened. So the request stays
+     * outstanding and says why.
+     *
+     * @param requests The batch
+     * @param staged   What the staging pass could and could not reach
+     * @return The subset that has actually been satisfied
+     */
+    private static List<ErasureRequest> satisfiedBy(List<ErasureRequest> requests,
+                                                    GraphStagingStore.EraseResult staged) {
+        if (staged.snippetsOfUnknownOrigin() == 0) {
+            return requests;
+        }
+        List<ErasureRequest> satisfied = new ArrayList<>(requests.size());
+        for (ErasureRequest request : requests) {
+            if (request.scope() instanceof ErasureScope.Entity) {
+                satisfied.add(request);
+            }
+        }
+        return satisfied;
+    }
+
+    /**
+     * Records the completions this pass has earned, and reports the ones it has not.
+     *
+     * @param requests The batch
+     * @param staged   What the staging pass could and could not reach
+     * @return How many requests were marked discharged
+     * @throws IOException if the completions cannot be recorded
+     */
+    private int completeWhatWasSatisfied(List<ErasureRequest> requests,
+                                         GraphStagingStore.EraseResult staged) throws IOException {
+        List<ErasureRequest> satisfied = satisfiedBy(requests, staged);
+        log.complete(idsOf(satisfied));
+        int withheld = requests.size() - satisfied.size();
+        if (withheld > 0) {
+            LOGGER.error("{} erasure request(s) select by provenance but {} staged snippet(s) "
+                + "carry no recorded origin, so the prose they may have come from is still on "
+                + "disk and will be re-indexed by the next build. Those requests are left "
+                + "outstanding rather than reported as discharged; they cannot be satisfied "
+                + "until the snippets of unrecorded origin are removed or re-ingested.",
+                withheld, staged.snippetsOfUnknownOrigin());
+        }
+        return satisfied.size();
+    }
+
+    /**
+     * Why some of a batch could not be discharged, for an operator's log.
+     *
+     * @param withheld How many were withheld
+     * @param staged   What the staging pass could not reach
+     * @return A sentence, or an empty string when nothing was withheld
+     */
+    private static String withheldReason(int withheld, GraphStagingStore.EraseResult staged) {
+        if (withheld == 0) {
+            return "";
+        }
+        return "; " + withheld + " request(s) withheld because " + staged.snippetsOfUnknownOrigin()
+            + " staged snippet(s) carry no recorded origin to match a provenance scope against";
     }
 
     /** How a graph directory is turned into an open store. */
@@ -142,13 +334,18 @@ public final class GraphErasureCoordinator {
      * files were rewritten. A request that matched no edges is satisfied without a rewrite, so
      * {@code requestsSatisfied} can be non-zero while {@code ran} is false.
      *
-     * @param requestsSatisfied How many outstanding requests this marked complete
+     * @param requestsSatisfied How many outstanding requests this marked complete. Only requests
+     *                          whose data this pass actually reached are counted: a request it
+     *                          could not fully honour is left outstanding and counted in
+     *                          {@code requestsWithheld} instead, because reporting an erasure
+     *                          that did not happen is the worst outcome this mechanism has.
+     * @param requestsWithheld  How many were deliberately left outstanding as unsatisfiable
      * @param edgesRemoved      How many edges the rewrite dropped
      * @param ran               Whether the store was rewritten
      * @param reason            Why, in a form fit for an operator's log
      */
     public record CompactionOutcome(boolean ran, long edgesRemoved, int requestsSatisfied,
-                                    String reason) {
+                                    int requestsWithheld, String reason) {
 
         /**
          * @throws IllegalArgumentException if a count is negative
@@ -162,6 +359,10 @@ public final class GraphErasureCoordinator {
             if (requestsSatisfied < 0) {
                 throw new IllegalArgumentException("requestsSatisfied must not be negative, got "
                     + requestsSatisfied);
+            }
+            if (requestsWithheld < 0) {
+                throw new IllegalArgumentException("requestsWithheld must not be negative, got "
+                    + requestsWithheld);
             }
             Objects.requireNonNull(reason, "reason must not be null");
         }
@@ -221,7 +422,7 @@ public final class GraphErasureCoordinator {
                     if (!policy.shouldCompact(stats, now)) {
                         String reason = "policy declined: " + describe(stats);
                         LOGGER.debug("compaction of {} not due: {}", graphDirectory, reason);
-                        return new CompactionOutcome(false, 0, 0, reason);
+                        return new CompactionOutcome(false, 0, 0, 0, reason);
                     }
                 }
 
@@ -230,11 +431,14 @@ public final class GraphErasureCoordinator {
                     // with no edges, a source already compacted away - and leaving them
                     // outstanding would make the oldest-request condition fire on every call from
                     // here to the end of time, rewriting the store repeatedly to remove nothing.
-                    log.complete(idsOf(requests));
-                    return new CompactionOutcome(false, 0, requests.size(),
+                    GraphStagingStore.EraseResult staged = eraseStaged(requests);
+                    int satisfied = completeWhatWasSatisfied(requests, staged);
+                    int withheld = requests.size() - satisfied;
+                    return new CompactionOutcome(false, 0, satisfied, withheld,
                         requests.isEmpty() ? "no outstanding erasure requests"
                             : requests.size() + " outstanding request(s) matched no edge; "
-                                + "marked satisfied");
+                                + satisfied + " marked satisfied"
+                                + withheldReason(withheld, staged));
                 }
 
                 long removed = EdgeStoreCompactor.compact(store, graphDirectory, tombstoned);
@@ -246,13 +450,15 @@ public final class GraphErasureCoordinator {
                 // Completed after the rewrite, never before. A crash in this gap repeats an
                 // erasure that has already removed everything it names, which costs a scan; the
                 // other order would record the obligation as discharged with the data still there.
-                log.complete(idsOf(requests));
+                GraphStagingStore.EraseResult staged = eraseStaged(requests);
+                int satisfied = completeWhatWasSatisfied(requests, staged);
+                int withheld = requests.size() - satisfied;
 
                 LOGGER.info("compacted {}: {} edges removed for {} erasure request(s)",
                     graphDirectory, removed, requests.size());
-                return new CompactionOutcome(true, removed, requests.size(),
+                return new CompactionOutcome(true, removed, satisfied, withheld,
                     "compacted: " + removed + " edge(s) removed for " + requests.size()
-                        + " request(s)");
+                        + " request(s)" + withheldReason(withheld, staged));
             } finally {
                 if (ours) {
                     store.close();

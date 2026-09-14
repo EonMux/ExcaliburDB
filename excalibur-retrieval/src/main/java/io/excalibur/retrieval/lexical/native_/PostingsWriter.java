@@ -1,6 +1,7 @@
 package io.excalibur.retrieval.lexical.native_;
 
 import io.excalibur.core.hash.XxHash64;
+import io.excalibur.retrieval.lexical.Bm25Parameters;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,6 +19,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Builds a {@link PostingsIndex} from documents, in two passes over an in-memory term map.
@@ -44,14 +46,29 @@ public final class PostingsWriter {
     /** Bytes per term-hash slot: a 32-bit hash tag and a 32-bit term id. */
     static final int SLOT_BYTES = 8;
 
-    /** BM25 constants, duplicated here so block impact bounds match the scorer exactly. */
-    private static final double K1_LOCAL = PostingsIndex.K1;
-    private static final double B_LOCAL = PostingsIndex.B;
-
     /** Postings per term, keyed by term. Values are (docId, tf) pairs held as parallel lists. */
     private final Map<String, TermPostings> terms = new HashMap<>();
     private final List<Integer> docLengths = new ArrayList<>();
+    private final Bm25Parameters bm25;
     private long totalTokens;
+
+    /** A writer producing an index scored with the default BM25 pair. */
+    public PostingsWriter() {
+        this(Bm25Parameters.DEFAULT);
+    }
+
+    /**
+     * A writer producing an index scored with a chosen BM25 pair.
+     *
+     * <p>The pair is recorded in the index and is the only one it will open under. Changing it
+     * changes every score and therefore every ranking the corpus can produce, including the
+     * thresholds a deployment has calibrated against them, so it is a property of the corpus
+     * rather than a query-time preference - and an index that opened silently under a different
+     * pair would answer differently with nothing to show for it.
+     */
+    public PostingsWriter(Bm25Parameters bm25) {
+        this.bm25 = Objects.requireNonNull(bm25, "bm25 must not be null");
+    }
 
     private static final class TermPostings {
         int[] docs = new int[4];
@@ -173,7 +190,6 @@ public final class PostingsWriter {
         // Postings are emitted as fixed-count blocks, each carrying enough metadata to be
         // skipped without being read. See BlockLayout for the record shape and why each field
         // is there.
-        double averageForImpact = docLengths.isEmpty() ? 1.0 : (double) totalTokens / docLengths.size();
         long[] blockStarts = new long[termCount + 1];
         try (DataOutputStream blocks = stream(directory.resolve("post.blk"));
              DataOutputStream data = stream(directory.resolve("post.dat"))) {
@@ -192,7 +208,7 @@ public final class PostingsWriter {
                     int previous = firstDoc;
                     int maxGap = 0;
                     int maxFreq = 0;
-                    float maxSaturation = 0f;
+                    int minLength = Integer.MAX_VALUE;
                     for (int i = 0; i < count; i++) {
                         int doc = postings.docs[start + i];
                         int gap = i == 0 ? 0 : doc - previous;
@@ -202,13 +218,11 @@ public final class PostingsWriter {
                         int tf = postings.freqs[start + i] & 0xFF;
                         freqs[i] = tf;
                         maxFreq = Math.max(maxFreq, tf);
-                        // The query-independent half of the BM25 term score. Multiplied by the
-                        // query's weight and idf it bounds this block's contribution, which is
-                        // what lets a whole block be skipped without decoding it.
-                        double norm = K1_LOCAL * (1 - B_LOCAL
-                            + B_LOCAL * docLengths.get(doc) / averageForImpact);
-                        float saturation = (float) ((tf * (K1_LOCAL + 1)) / (tf + norm));
-                        maxSaturation = Math.max(maxSaturation, saturation);
+                        // The two ingredients the scorer's impact bound is computed from. They
+                        // are stored rather than the bound itself because the bound depends on
+                        // the mean document length of the collection, which a segment written on
+                        // its own does not know; see BlockLayout.
+                        minLength = Math.min(minLength, docLengths.get(doc));
                     }
                     int docBits = BitPack.bitsFor(maxGap);
                     int tfBits = BitPack.bitsFor(maxFreq);
@@ -218,7 +232,7 @@ public final class PostingsWriter {
 
                     blocks.writeInt(firstDoc);
                     blocks.writeInt(postings.docs[start + count - 1]);
-                    blocks.writeFloat(maxSaturation);
+                    BlockLayout.writeImpactFields(blocks, maxFreq, minLength);
                     blocks.writeLong(dataOffset);
                     blocks.writeShort(count);
                     blocks.write(docBits);
@@ -256,13 +270,7 @@ public final class PostingsWriter {
         writeTermHash(directory.resolve("terms.hash"), sorted, hashSlots);
 
         double averageDocLength = docCount == 0 ? 1.0 : (double) totalTokens / docCount;
-        try (DataOutputStream meta = stream(directory.resolve("index.meta"))) {
-            meta.writeInt(termCount);
-            meta.writeInt(docCount);
-            meta.writeInt(hashSlots);
-            meta.writeInt(0);
-            writeDouble(meta, averageDocLength);
-        }
+        IndexMeta.current(termCount, docCount, hashSlots, averageDocLength, bm25).write(directory);
 
         LOGGER.info("Wrote lexical index: {} terms, {} docs, {} postings, {} hash slots",
             termCount, docCount, postingCount, hashSlots);
@@ -302,9 +310,5 @@ public final class PostingsWriter {
     // one-byte term and an out-of-bounds read on the first lookup.
     private static void writeLong(DataOutputStream out, long value) throws IOException {
         out.writeLong(value);
-    }
-
-    private static void writeDouble(DataOutputStream out, double value) throws IOException {
-        out.writeDouble(value);
     }
 }

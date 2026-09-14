@@ -345,6 +345,32 @@ class QueryEndpointTest {
         }
 
         @Test
+        @DisplayName("answers a withdrawn query 200 with cancelled, not an empty match")
+        void reportsACancelledQuery() throws Exception {
+            ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody(
+                "POST", "{\"query\": \"test\", \"top_k\": 10}", responseBody);
+
+            CompletableFuture<QueryResponse> withdrawn = new CompletableFuture<>();
+            withdrawn.cancel(true);
+            when(queryPipeline.execute(any(QueryRequest.class), any(CancellationToken.class)))
+                .thenReturn(withdrawn);
+
+            endpoint.handle(exchange);
+
+            // 200 with nothing found and 200 with the request withdrawn are different answers.
+            // Without `cancelled` the caller reads an empty result list as a corpus that holds
+            // nothing matching, and stops looking.
+            verify(exchange).sendResponseHeaders(eq(200), anyLong());
+            String response = responseBody.toString(StandardCharsets.UTF_8);
+            assertThat(response).contains("\"cancelled\": true");
+            assertThat(response).contains("\"timed_out\": false");
+            assertThat(response)
+                .as("a query that was withdrawn covered none of the corpus and says so")
+                .contains("\"degraded\": true");
+        }
+
+        @Test
         @DisplayName("does not leak internal failure detail to the client")
         void doesNotLeakFailureDetail() throws Exception {
             String json = "{\"query\": \"test\", \"top_k\": 10}";
@@ -419,6 +445,115 @@ class QueryEndpointTest {
             endpointWithExecutor.shutdown();
 
             assertThat(executor.isShutdown()).isTrue();
+        }
+    }
+
+    @Nested
+    @DisplayName("Result text")
+    class ResultText {
+
+        /** A corpus of one chunk, keyed the way a result names it. */
+        private final java.util.function.Function<String, String> corpus =
+            java.util.Map.of("docs:guide.md:chunk:0", "the passage itself")::get;
+
+        private QueryEndpoint endpointOverCorpus(int maxChars) {
+            QueryEndpoint over = new QueryEndpoint(queryPipeline, null, null, null,
+                embeddingClient, excalibur.api.security.ApiSecurityConfig.builder()
+                    .maxResultTextChars(maxChars).build());
+            over.setChunkText(corpus);
+            return over;
+        }
+
+        private QueryResponse oneHit() {
+            return new QueryResponse(
+                java.util.List.of(new QueryResultItem(
+                    "docs:guide.md:chunk:0", 0.9f, null, 3L, 7L)),
+                IndexCoverage.builder().totalSegments(1).activeSegments(1)
+                    .estimatedCorpusCoverage(1.0).build(),
+                12L, false, false);
+        }
+
+        private String answer(QueryEndpoint target, String requestJson) throws IOException {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody("POST", requestJson, body);
+            when(queryPipeline.execute(any(QueryRequest.class), any(CancellationToken.class)))
+                .thenReturn(CompletableFuture.completedFuture(oneHit()));
+            target.handle(exchange);
+            return body.toString(StandardCharsets.UTF_8);
+        }
+
+        /**
+         * The identifier-only answer is what every existing client parses. Adding text to it
+         * unasked would double the size of every response those clients already handle, for a
+         * field none of them read.
+         */
+        @Test
+        @DisplayName("omits text unless the request asks for it")
+        void omitsTextByDefault() throws IOException {
+            String json = answer(endpointOverCorpus(4096), "{\"query\": \"log4j\"}");
+
+            assertThat(json).doesNotContain("\"text\"");
+            assertThat(json).contains("docs:guide.md:chunk:0");
+        }
+
+        /**
+         * Without this a search is only half an answer: the caller is handed identifiers it can
+         * resolve only against the store the corpus was ingested from, which on a crawled corpus
+         * it does not have.
+         */
+        @Test
+        @DisplayName("returns the stored passage when the request asks for it")
+        void returnsTextWhenAsked() throws IOException {
+            String json = answer(endpointOverCorpus(4096),
+                "{\"query\": \"log4j\", \"include_text\": true}");
+
+            assertThat(json).contains("\"text\": \"the passage itself\"");
+            assertThat(json)
+                .as("a caller has to be able to tell a whole chunk from a clipped one")
+                .contains("\"text_truncated\": false");
+        }
+
+        @Test
+        @DisplayName("clips a passage past the bound and says that it did")
+        void clipsPastTheBound() throws IOException {
+            String json = answer(endpointOverCorpus(3),
+                "{\"query\": \"log4j\", \"include_text\": true}");
+
+            assertThat(json).contains("\"text\": \"the\"");
+            assertThat(json).contains("\"text_truncated\": true");
+        }
+
+        /**
+         * A result the index still ranks whose text storage no longer holds. Null is the honest
+         * answer, and the identifier and score are still worth returning.
+         */
+        @Test
+        @DisplayName("reports null text for a chunk storage no longer holds")
+        void nullTextForAMissingChunk() throws IOException {
+            QueryEndpoint over = new QueryEndpoint(queryPipeline, null, null, null,
+                embeddingClient, excalibur.api.security.ApiSecurityConfig.builder().build());
+            over.setChunkText(id -> null);
+
+            String json = answer(over, "{\"query\": \"log4j\", \"include_text\": true}");
+
+            assertThat(json).contains("\"text\": null");
+        }
+
+        /**
+         * Silently ranking without the text the caller asked for would have it quote passages it
+         * never received. A node with no chunk storage cannot honour the field, and says so.
+         */
+        @Test
+        @DisplayName("refuses include_text on a node that keeps no chunk storage, and says why")
+        void refusesTextWhenNoStorage() throws IOException {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody(
+                "POST", "{\"query\": \"log4j\", \"include_text\": true}", body);
+
+            endpoint.handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(400), anyLong());
+            assertThat(body.toString(StandardCharsets.UTF_8)).contains("include_text");
         }
     }
 
@@ -625,6 +760,32 @@ class QueryEndpointTest {
             assertThat(json)
                 .as("the hit is named by a chunk id a caller can resolve")
                 .contains("kb:oom.txt:chunk:0");
+        }
+
+        @Test
+        @DisplayName("refuses include_text before searching, not after")
+        void refusesTextBeforeSearching(
+                @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+            // The point of resolving the reader first. Refusing after the search has run spends
+            // a full BM25 pass on an answer that is thrown away, and on a node with no chunk
+            // storage that is every request that asks for text.
+            ExecutorService searches = mock(ExecutorService.class);
+            excalibur.ingest.lexical.ChunkLexicalIndex index =
+                excalibur.ingest.lexical.ChunkLexicalIndex.open(dir, 8.0);
+            index.add("kb:oom.txt:chunk:0", "the kernel OOM killer sent SIGKILL");
+            index.refresh();
+            QueryEndpoint endpoint = new QueryEndpoint(queryPipeline, null, searches, null, null);
+            endpoint.setLexicalQueryService(new excalibur.api.retrieval.LexicalQueryService(
+                index, null, java.util.List.of()));
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            HttpExchange exchange = createMockExchangeWithBody(
+                "POST", "{\"query\": \"OOM killer\", \"include_text\": true}", body);
+
+            endpoint.handle(exchange);
+
+            verify(exchange).sendResponseHeaders(eq(400), anyLong());
+            assertThat(body.toString(StandardCharsets.UTF_8)).contains("include_text");
+            verify(searches, never()).submit(any(java.util.concurrent.Callable.class));
         }
 
         @Test

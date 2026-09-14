@@ -1,6 +1,7 @@
 package io.excalibur.retrieval.lexical.native_;
 
 import io.excalibur.graph.erasure.CompactionPolicy.CompactionStats;
+import io.excalibur.retrieval.lexical.Bm25Parameters;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -134,6 +135,7 @@ public final class LexicalStore implements AutoCloseable {
     private final Path directory;
     private final CompactionPlanner planner;
     private final Clock clock;
+    private final Bm25Parameters bm25;
     private final DocumentErasureLog erasureLog;
     private SegmentManifest manifest;
     private final Map<String, PostingsIndex> open = new LinkedHashMap<>();
@@ -143,11 +145,12 @@ public final class LexicalStore implements AutoCloseable {
         new java.util.concurrent.atomic.AtomicLong();
 
     private LexicalStore(Path directory, SegmentManifest manifest, CompactionPlanner planner,
-                         Clock clock, DocumentErasureLog erasureLog) {
+                         Clock clock, Bm25Parameters bm25, DocumentErasureLog erasureLog) {
         this.directory = directory;
         this.manifest = manifest;
         this.planner = planner;
         this.clock = clock;
+        this.bm25 = bm25;
         this.erasureLog = erasureLog;
         long next = 0;
         for (SegmentManifest.Entry entry : manifest.entries()) {
@@ -157,9 +160,26 @@ public final class LexicalStore implements AutoCloseable {
         nextSegment.set(next);
     }
 
-    /** Opens a store with the default compaction policy, creating it if absent. */
+    /** Opens a store with the default compaction policy and BM25 pair, creating it if absent. */
     public static LexicalStore open(Path directory) throws IOException {
-        return open(directory, CompactionPlanner.standard(), Clock.systemUTC());
+        return open(directory, CompactionPlanner.standard(), Clock.systemUTC(),
+            Bm25Parameters.DEFAULT);
+    }
+
+    /** Opens a store with the default compaction policy, scored with a chosen BM25 pair. */
+    public static LexicalStore open(Path directory, Bm25Parameters bm25) throws IOException {
+        return open(directory, CompactionPlanner.standard(), Clock.systemUTC(), bm25);
+    }
+
+    /**
+     * Opens a store with the default BM25 pair, creating it if absent.
+     *
+     * @param planner Decides when and what to compact
+     * @param clock   Reads the time erasures are promised and compaction is judged against
+     */
+    public static LexicalStore open(Path directory, CompactionPlanner planner, Clock clock)
+            throws IOException {
+        return open(directory, planner, clock, Bm25Parameters.DEFAULT);
     }
 
     /**
@@ -167,18 +187,47 @@ public final class LexicalStore implements AutoCloseable {
      *
      * @param planner Decides when and what to compact
      * @param clock   Reads the time erasures are promised and compaction is judged against
+     * @param bm25    What every segment this store writes is built with, and what every segment
+     *                it already holds must have been built with
+     * @throws Bm25MismatchException if a segment was built with a different pair
      */
-    public static LexicalStore open(Path directory, CompactionPlanner planner, Clock clock)
-            throws IOException {
+    public static LexicalStore open(Path directory, CompactionPlanner planner, Clock clock,
+                                    Bm25Parameters bm25) throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
         Objects.requireNonNull(planner, "planner must not be null");
         Objects.requireNonNull(clock, "clock must not be null");
+        Objects.requireNonNull(bm25, "bm25 must not be null");
         Files.createDirectories(directory);
         LexicalStore store = new LexicalStore(directory, SegmentManifest.read(directory), planner,
-            clock, DocumentErasureLog.open(directory));
+            clock, bm25, DocumentErasureLog.open(directory));
         store.removeUnreferenced();
+        store.requireSegmentsMatchBm25();
         store.reapplyErasures();
         return store;
+    }
+
+    /**
+     * Refuses the whole store when any segment disagrees with the configured BM25 pair.
+     *
+     * <p>Checked here rather than left to the first query that touches a segment. Segments are
+     * opened lazily, but writing one is not: a store that opened under a changed pair would go on
+     * accepting documents and end up holding segments built two different ways, with only the
+     * older ones failing and only when something searched them.</p>
+     *
+     * <p>A segment whose metadata cannot be read is left to the reader that needs it, which
+     * reports what is actually wrong with it. This is a check on the values, not a fsck.</p>
+     */
+    private void requireSegmentsMatchBm25() throws IOException {
+        for (SegmentManifest.Entry entry : manifest.entries()) {
+            Path segment = directory.resolve(entry.name());
+            if (!Files.exists(segment.resolve(IndexMeta.FILE_NAME))) {
+                continue;
+            }
+            Bm25Parameters persisted = IndexMeta.read(segment).bm25();
+            if (!persisted.equals(bm25)) {
+                throw new Bm25MismatchException(segment, persisted, bm25);
+            }
+        }
     }
 
     /**
@@ -220,7 +269,7 @@ public final class LexicalStore implements AutoCloseable {
             DocumentKeys.require(key);
         }
         String name = SEGMENT_PREFIX + nextSegment.getAndIncrement();
-        PostingsWriter writer = new PostingsWriter();
+        PostingsWriter writer = new PostingsWriter(bm25);
         try (SegmentKeys.Writer names = new SegmentKeys.Writer(directory, name)) {
             for (Map.Entry<String, String> document : documents.entrySet()) {
                 names.add(document.getKey());
@@ -724,7 +773,7 @@ public final class LexicalStore implements AutoCloseable {
         String name = SEGMENT_PREFIX + nextSegment.getAndIncrement();
         Path scratch = directory.resolve(SCRATCH_PREFIX + name);
         int survivors;
-        try (SegmentedIndexBuilder builder = new SegmentedIndexBuilder(scratch);
+        try (SegmentedIndexBuilder builder = new SegmentedIndexBuilder(scratch, bm25);
              SegmentKeys.Writer names = new SegmentKeys.Writer(directory, name)) {
             for (int at = 0; at < entries.size(); at++) {
                 SegmentKeys segmentKeys = group.keys().get(at);
@@ -943,7 +992,7 @@ public final class LexicalStore implements AutoCloseable {
     private PostingsIndex openSegment(String name) throws IOException {
         PostingsIndex index = open.get(name);
         if (index == null) {
-            index = PostingsIndex.open(directory.resolve(name));
+            index = PostingsIndex.open(directory.resolve(name), bm25);
             open.put(name, index);
             openKeys(name);
             for (SegmentManifest.Entry entry : manifest.entries()) {

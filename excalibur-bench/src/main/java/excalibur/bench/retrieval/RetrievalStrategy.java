@@ -5,7 +5,8 @@ package excalibur.bench.retrieval;
  *
  * <p>The question these exist to answer is not which stack is most sophisticated. It is whether
  * query-side semantic expansion over a lexical index reaches the same documents as embedding the
- * whole corpus, at a fraction of the indexing cost. Every strategy that includes {@link #VECTOR}
+ * whole corpus, at a fraction of the indexing cost. Every strategy that includes
+ * {@link #usesVector() dense retrieval}
  * carries that indexing cost; every one that does not is free of it. A result is only interesting
  * if it is read alongside what each strategy costs to build.
  *

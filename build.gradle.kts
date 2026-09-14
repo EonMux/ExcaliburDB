@@ -154,6 +154,21 @@ subprojects {
         options.forkOptions.memoryMaximumSize = "2g"
     }
 
+    // Javadoc has to be told about preview the same way javac is. Without it every file that
+    // touches the Panama FFM API - which is most of the storage and filter code - fails with
+    // "Arena is a preview API and is disabled by default", and the task has no output at all.
+    // -source rather than --release: the doclet needs the language level, and --release would
+    // hide the preview classes it is being asked to document.
+    tasks.withType<Javadoc> {
+        val options = options as StandardJavadocDocletOptions
+        options.encoding = "UTF-8"
+        options.source = "21"
+        options.addBooleanOption("-enable-preview", true)
+        // A missing @param on a private helper is not worth failing a build over, and the
+        // preview machinery emits notes of its own that nothing can silence.
+        options.addStringOption("Xdoclint:none", "-quiet")
+    }
+
     // Configure test execution for speed and reliability
     tasks.withType<Test> {
         useJUnitPlatform {
@@ -227,11 +242,10 @@ subprojects {
 
     // Coverage floors, enforced as part of `check`.
     //
-    // The project target is 80%, and eleven modules meet it. The six below are held at their
+    // The project target is 80%, and fourteen modules meet it. The three below are held at their
     // measured level instead, so this is a ratchet rather than a lowered bar: coverage cannot
     // slide backwards, and each floor is a visible debt to be raised towards 0.80 rather than a
-    // number chosen to make the build pass. Previously this rule declared 80% and was wired into
-    // nothing, so it never ran and the figure was aspirational.
+    // number chosen to make the build pass.
     //
     // Each floor sits about a point under the module's measured coverage. The headroom is for
     // the concurrency tests, whose branch mix varies slightly between runs; without it the
@@ -246,13 +260,10 @@ subprojects {
     // Measured with generated code excluded; JMH's harness classes are machine-written and
     // counting them measures code generation rather than testing.
     val coverageFloors = mapOf(
-        "excalibur-vector" to "0.79",
         "excalibur-test" to "0.78",
-        "excalibur-api" to "0.74",
-        "excalibur-shard" to "0.70",
-        "excalibur-ingest" to "0.67",
-        "excalibur-query" to "0.67",
-        "excalibur-bench" to "0.38"
+        "excalibur-shard" to "0.74",
+        "excalibur-ingest" to "0.73",
+        "excalibur-bench" to "0.40"
     )
 
     tasks.jacocoTestCoverageVerification {

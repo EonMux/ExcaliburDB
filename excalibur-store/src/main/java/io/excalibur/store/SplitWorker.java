@@ -31,7 +31,7 @@ import java.util.logging.Logger;
  *   <li>Call {@link Segment#beginSplit()} to create an immutable snapshot</li>
  *   <li>Create two new child segment files (left and right)</li>
  *   <li>Partition entries from the snapshot into children based on hash bit</li>
- *   <li>Call {@link Segment#completeSplit(Segment, Segment)} to commit the split</li>
+ *   <li>Call {@link Segment#completeSplit(Segment, Segment, int)} to commit the split</li>
  *   <li>Notify listener to update routing to use the new children</li>
  * </ol>
  *
@@ -100,7 +100,7 @@ import java.util.logging.Logger;
  * @since 2.0
  * @see Segment
  * @see Segment#beginSplit()
- * @see Segment#completeSplit(Segment, Segment)
+ * @see Segment#completeSplit(Segment, Segment, int)
  */
 public class SplitWorker {
 

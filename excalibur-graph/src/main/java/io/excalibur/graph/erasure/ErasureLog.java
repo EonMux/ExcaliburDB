@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.zip.CRC32;
 
+import io.excalibur.graph.file.TailIntegrity;
 import io.excalibur.graph.provenance.SourceType;
 
 import org.slf4j.Logger;
@@ -52,10 +53,18 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Append-only and replayed to the end on open, exactly like
  * {@link io.excalibur.graph.staging.LabelInterner}: a record whose length is implausible, whose
- * body runs past the end of the file, or whose checksum does not match ends the replay. That is a
- * process killed mid-append, and the records before it are still precisely what was promised.
- * Failing the open instead would leave an operator with a graph that will not start and a
- * compliance deadline running.</p>
+ * body runs past the end of the file, or whose checksum does not match ends the replay. When
+ * nothing readable follows, that is a process killed mid-append; the records before it are still
+ * precisely what was promised, and failing the open instead would leave an operator with a graph
+ * that will not start and a compliance deadline running.</p>
+ *
+ * <p>When something readable does follow, the file is not torn but damaged, and the two must not
+ * be confused. {@link #submit} writes the body and then flushes, so a flush that fails for a
+ * reason the file outlives leaves a partial record; the next submit appends past it and hands
+ * back an id, which is a promise that the erasure was accepted. Replaying to the damage and
+ * truncating there would revoke every one of those promises at once, leaving nothing outstanding
+ * and nothing logged. That case fails the open instead - see
+ * {@link io.excalibur.graph.file.TailIntegrity}.</p>
  *
  * <p>Completion is recorded by appending a record rather than by rewriting the file. Rewriting
  * would put every outstanding request through a window in which the file is neither the old one nor
@@ -121,6 +130,9 @@ public final class ErasureLog implements AutoCloseable {
      */
     private static final int COMPLETIONS_PER_RECORD = 4096;
 
+    /** Stands in for the file name while probing candidate offsets, whose errors are discarded. */
+    private static final Path SCANNING = Path.of("<scan>");
+
     private final Path path;
     private final FileChannel channel;
     private final DataOutputStream out;
@@ -180,6 +192,14 @@ public final class ErasureLog implements AutoCloseable {
         boolean fresh = !exists || shortOfHeader;
         long keep = fresh ? 0L : replay.validBytes();
         if (Files.exists(file) && Files.size(file) > keep) {
+            // Only a tail may be dropped. Records following damage were written by a submit that
+            // appended past it and returned an id, so whoever asked for those erasures was told
+            // they were accepted; truncating to the damage would discharge them by forgetting
+            // them, leaving no outstanding count and no error to notice.
+            if (!fresh) {
+                TailIntegrity.requireTornTail(file, "erasure log", replay.contents(), keep,
+                    ErasureLog::recordStartsAt);
+            }
             long torn = Files.size(file) - keep;
             try (FileChannel truncating = FileChannel.open(file, StandardOpenOption.WRITE)) {
                 truncating.truncate(keep);
@@ -427,7 +447,47 @@ public final class ErasureLog implements AutoCloseable {
      *                    never handed out again and an audit of the file stays unambiguous
      * @param validBytes  Length of the file up to the end of the last intact record
      */
-    private record Replay(Map<Long, ErasureRequest> outstanding, long nextId, long validBytes) {
+    private record Replay(Map<Long, ErasureRequest> outstanding, long nextId, long validBytes,
+                          byte[] contents) {
+    }
+
+    /**
+     * Whether a complete, checksum-clean record this build understands begins at {@code offset}.
+     *
+     * <p>The body has to parse as well as checksum. A length and checksum that agree by accident
+     * are improbable but not impossible over a byte-by-byte scan, and calling such an accident
+     * corruption would refuse to open a log that was merely torn.
+     *
+     * @param contents The whole file
+     * @param offset   Where to look
+     * @return true when a record starts exactly there
+     */
+    private static boolean recordStartsAt(byte[] contents, int offset) {
+        if (offset + Integer.BYTES > contents.length) {
+            return false;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(contents, offset, contents.length - offset);
+        int length = buffer.getInt();
+        if (length <= 0 || length > MAX_RECORD_BYTES
+            || buffer.remaining() < length + Integer.BYTES) {
+            return false;
+        }
+        byte[] body = new byte[length];
+        buffer.get(body);
+        CRC32 crc = new CRC32();
+        crc.update(body);
+        if (buffer.getInt() != (int) crc.getValue()) {
+            return false;
+        }
+        try {
+            applyRecord(SCANNING, body, new LinkedHashMap<>());
+            return true;
+        } catch (IOException e) {
+            // An intact record this build cannot interpret. Reported by the replay itself when it
+            // reaches the record legitimately; here it only means the scan has not found a frame
+            // it can vouch for.
+            return false;
+        }
     }
 
     /**
@@ -465,10 +525,11 @@ public final class ErasureLog implements AutoCloseable {
     private static Replay replay(Path path) throws IOException {
         Map<Long, ErasureRequest> outstanding = new LinkedHashMap<>();
         if (!Files.exists(path) || Files.size(path) < HEADER_BYTES) {
-            return new Replay(outstanding, FIRST_ID, HEADER_BYTES);
+            return new Replay(outstanding, FIRST_ID, HEADER_BYTES, new byte[0]);
         }
 
-        ByteBuffer buffer = ByteBuffer.wrap(Files.readAllBytes(path));
+        byte[] contents = Files.readAllBytes(path);
+        ByteBuffer buffer = ByteBuffer.wrap(contents);
         long magic = buffer.getLong();
         if (magic != MAGIC) {
             throw new IOException("not an erasure log (magic 0x"
@@ -505,7 +566,7 @@ public final class ErasureLog implements AutoCloseable {
             nextId = Math.max(nextId, applyRecord(path, body, outstanding));
             validBytes = buffer.position();
         }
-        return new Replay(outstanding, nextId, validBytes);
+        return new Replay(outstanding, nextId, validBytes, contents);
     }
 
     /**

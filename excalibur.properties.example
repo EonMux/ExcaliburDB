@@ -19,17 +19,35 @@ excalibur.ingest.document-atomicity=true
 # failed run, and the corpus stays as it was first crawled.
 excalibur.ingest.reindex-interval-ms=3600000
 
+# How a document is split before it is indexed. The target is what one chunk aims for and the
+# overlap is what it repeats from the chunk before it, both counted in tokens. Larger chunks carry
+# more surrounding context into a single result; smaller ones rank more precisely, because a
+# chunk's score is diluted by everything in it that the question did not ask about. The overlap is
+# what keeps an answer that straddles a boundary from being split across two chunks that each hold
+# half of it. Changing either only affects what is ingested or re-indexed afterwards: chunks
+# already written keep the shape they were written with until their source is re-indexed.
+excalibur.ingest.chunk-target-tokens=512
+excalibur.ingest.chunk-overlap-tokens=64
+
 # Membership Filter
 # Entries the hierarchical Cuckoo filter is sized for. SIZE THIS TO YOUR CORPUS. The filter is
 # what prunes segments that cannot hold a query's terms, and a filter with no room left cannot
 # record a new term. A level that has refused one is no longer trusted to rule anything out, so
 # pruning switches off for its scope and every query scans it: results stay correct and queries
 # get slower. /v1/stats reports it as cuckoo.saturated. The only cost of over-sizing is memory.
+# About twice this many slots are allocated, rounded up to a power of two: a cuckoo filter
+# refuses inserts before its slots are full, so a filter sized to exactly its capacity would
+# saturate at the corpus it was configured for.
 excalibur.filter.corpus-capacity=10000000
 # Distinct terms one segment's own level is sized for. Separate from the corpus capacity: that
 # level holds every term on the node, this one holds a single segment's vocabulary. A segment
 # that outgrows it stops being pruned, which /v1/stats counts as cuckoo.saturatedSegments.
 excalibur.filter.segment-capacity=10000
+# Bits of each term the filter keeps. This is the accuracy-for-memory trade it makes: every extra
+# bit halves the chance two unrelated terms look alike, and so halves the segments a query opens
+# for nothing, at one more bit per slot. 4 to 16; below that the filter stops ruling anything out,
+# above it a fingerprint no longer fits the slot the format gives it.
+excalibur.filter.fingerprint-bits=13
 
 # API Server Configuration
 # Port to listen on. EXCALIBUR_PORT in the environment overrides this; a value that is not a
@@ -68,6 +86,13 @@ excalibur.api.max-query-chars=8192
 # beam width, and the beam is what bounds how much of a segment a search walks, so leaving it
 # unbounded lets one small request scan every candidate segment end to end.
 excalibur.api.max-oversampling-factor=16
+
+# Longest text returned for one chunk, whether by include_text on a query or by /v1/documents.
+# A search asked for text returns top_k chunks in one body, and chunk size is set at ingestion
+# (excalibur.ingest.chunk-target-tokens) rather than per request, so without this the response
+# size is chosen by whoever ingested the corpus. Text past the bound is clipped and the reply
+# says that it was.
+excalibur.api.max-result-text-chars=4096
 
 # Transport Security
 # Setting a keystore turns TLS on. The keystore holds the server certificate and its
@@ -111,6 +136,10 @@ excalibur.api.max-oversampling-factor=16
 # serialised subgraph must fit into.
 excalibur.graph.top-k=10
 excalibur.graph.context-token-budget=2000
+# Candidates the full-precision reranker reads per result it returns. Reranking can only reorder
+# what it is given, so this is what lets an entity that term overlap ranked poorly be rescued by
+# its vector. Each extra candidate is one more full-precision vector read.
+excalibur.graph.rerank-over-fetch=4
 # Abstention thresholds. Below these the endpoint declines rather than answering from evidence
 # it does not trust -- an empty "answered" reads to a client as "nothing found", which is a
 # different statement from "found something and did not believe it".
@@ -118,6 +147,9 @@ excalibur.graph.min-score=0.005
 excalibur.graph.min-separation=0.001
 excalibur.graph.min-mean-confidence=0.3
 excalibur.graph.max-ambiguous-candidates=5
+# Lucene RAM buffer per index. Named for the graph, but the ingestion pipeline's chunk index is
+# sized from it too when that runs on the lucene engine, so a node with no graph still pays it -
+# once per open index, not once per node.
 excalibur.graph.ram-buffer-mb=16
 
 # Extracting facts from ingested documents. Off by default: it is one chat-model call per
@@ -163,7 +195,9 @@ excalibur.ingest.allowed-roots=
 # URL ingest may only crawl these hosts, and only over http/https. Hosts resolving to
 # loopback, private, link-local or multicast addresses are refused regardless.
 excalibur.ingest.allowed-hosts=
-# Bound on concurrently registered ingestion sources.
+# Bound on concurrently registered ingestion sources. It bounds the source ids that documents
+# may be supplied directly under as well: an id holding supplied documents is an id no crawl can
+# be registered under, so an unbounded set of them would let one caller deny every likely id.
 excalibur.ingest.max-sources=256
 
 # Chunk Lexical Index
@@ -184,6 +218,18 @@ excalibur.ingest.lexical-max-latency-seconds=3600
 # Segments tolerated before the smallest are merged. Every segment is a set of mappings and a
 # search that must visit it, so the count is bounded rather than left to grow with the corpus.
 excalibur.ingest.lexical-max-segments=16
+# How BM25 scores a match. k1 is where a repeated term stops earning more: higher keeps rewarding
+# repetition, 0 reduces term frequency to a yes-or-no. b is how much a match is discounted for the
+# length of the chunk it was found in: 1 normalises fully by length, 0 not at all.
+#
+# What changing them costs depends on lexical-engine above. The native engine records both in the
+# index and REFUSES to open one built under a different pair: the pair changes every score the
+# corpus can produce, and with it every ranking and every threshold a deployment has calibrated
+# against those rankings, so changing either means reingesting the corpus. The lucene engine
+# applies them at query time and records nothing, so a change takes effect on the next query,
+# over the index already on disk.
+excalibur.ingest.bm25-k1=1.2
+excalibur.ingest.bm25-b=0.75
 
 # Health Configuration
 excalibur.health.readiness-threshold=0.5
@@ -208,6 +254,22 @@ excalibur.query.llm-timeout-ms=60000
 # by similarity, and the response says so in `retrieval`. Set it to false to get vector-only
 # ranking back - which is what a deployment with a threshold tuned against cosine scores wants.
 excalibur.query.hybrid-retrieval=true
+# Which distance the vector index is built and searched with: cosine, l2 or inner_product. The
+# choice belongs to the embedding model - cosine for the usual normalised models, inner_product
+# where a vector's magnitude means something, l2 for a model trained against Euclidean distance.
+# It is written into each graph's header when the graph is created, and a graph built under one
+# metric refuses to open under another: the edges encode the neighbourhood the old metric saw, so
+# searching them under a new one returns a quietly worse ranking rather than an error. Changing it
+# means reindexing.
+excalibur.query.distance-metric=cosine
+# How the two signals are fused. The rank offset is what flattens the weight curve: raise it and a
+# document ranked tenth by one signal counts nearly as much as one ranked first; lower it and the
+# top of each list dominates. 60 is the value the method was published with. The over-fetch is how
+# many times top_k each signal contributes before fusion - a document has to be in a signal's list
+# to be fused at all, so this is what lets a result that is mediocre on one signal and excellent on
+# the other survive to be ranked.
+excalibur.query.rrf-k=60
+excalibur.query.per-signal-over-fetch=3
 
 # LLM Configuration
 # The API root. The clients append the OpenAI paths themselves (/v1/embeddings,
@@ -241,3 +303,67 @@ excalibur.shard.default-ef-construction=128
 excalibur.shard.default-ef-search=64
 excalibur.shard.compaction-delay-ms=10000
 excalibur.shard.hnsw-integration-queue-depth-limit=100000
+# Neighbours an HNSW node keeps. More means better recall, a larger graph file and a slower build.
+# Layer 0 is where the walk stops descending and becomes exhaustive, so it is given more; 0 means
+# twice the value above it. Both are written into a graph's header when it is created and a graph
+# already on disk keeps what it was built with, so these govern graphs built from here on.
+excalibur.shard.default-max-connections=16
+excalibur.shard.default-max-connections-layer0=0
+
+# When a segment is worth rewriting, and how often the question is asked. A segment is compacted
+# once this fraction of it is tombstoned, or once its write log passes the size below - the second
+# is what keeps a segment that is appended to but never deleted from from accumulating an unbounded
+# log. The concurrency bound is what stops a burst of eligible segments from spending the whole
+# machine on rewrites; it is 1 to 16, and a value outside that is refused at startup against the
+# property name rather than aborting the boot with a message naming no key.
+excalibur.shard.compaction-interval-ms=5000
+excalibur.shard.compaction-tombstone-ratio=0.2
+excalibur.shard.compaction-write-log-mb=32
+excalibur.shard.compaction-max-concurrent=4
+# The same question for the vector graph, which reclaims deleted nodes by renumbering rather than
+# by rewriting a log, and is therefore asked less often.
+excalibur.shard.hnsw-compaction-interval-ms=60000
+excalibur.shard.hnsw-compaction-tombstone-ratio=0.2
+
+# The shape of each segment's LSH index, which narrows the candidates a vector search considers.
+# More tables and more probes find more of the true neighbours and read more buckets; more hash
+# functions make each bucket narrower. The shape is recorded in the tables a segment writes: a
+# segment built under one shape is searched without the prefilter under another - slower, still
+# correct - and the node says so in its log. Reindex to apply a new shape to an existing corpus.
+# Bounded: at most 256 tables (each one allocates hash-functions x dimensions floats, per
+# segment), at most 63 hash functions (the bucket key is packed into a long) and at most 64
+# probes. A value past those is refused at startup rather than per segment, so a configuration
+# mistake is not reported as a problem with what is already on disk.
+excalibur.shard.lsh-hash-tables=15
+excalibur.shard.lsh-hash-functions=16
+excalibur.shard.lsh-probes=3
+
+# Directories segments are placed across, beyond the data directory. Empty, the default, keeps
+# every segment in the data directory. Naming volumes spreads new segments over them and the data
+# directory together by a consistent hash of the segment id, so adding a volume later moves as few
+# existing segments as possible. Every volume named here has to exist as a directory before the
+# node starts, and has to stay mounted. A volume the node cannot find is refused rather than
+# created: an unmounted volume silently replaced by an empty directory on the root filesystem is
+# how a node loses part of its corpus and reports nothing. On restart the node also checks the
+# catalog against what it actually scanned, and refuses to start when a segment the catalog
+# records is on none of the volumes it can see.
+#
+# Two entries that name the same directory - a symlink, a relative path, one written with a
+# ".." that walks out and back in - are refused at startup, naming both spellings: the ring
+# would hand the same directory two shares and the spread would be silently wrong. A volume
+# that resolves to the data directory is folded into it instead, because that one is always
+# entry 0 and always takes a share anyway.
+#
+# Changing the set re-weights the ring for NEW segments only. Segments already on disk stay
+# where they are, with their write-ahead logs and split children beside them; this engine does
+# not rebalance an existing corpus across a changed volume set.
+#excalibur.shard.volumes=/mnt/fast-1,/mnt/fast-2
+
+# Whether a segment's product quantiser answers the first pass of a vector search. Off by default.
+# On, candidates are scored from their quantised codes - several times cheaper per candidate and
+# less accurate - and the survivors are then rescored against their full-precision vectors, so the
+# ranking returned is exact. What the approximation can still cost is a document the first pass
+# never shortlisted, and the oversample is what buys that back: it is how many candidates the
+# quantised pass collects per result asked for.
+excalibur.shard.pq-search-enabled=false
+excalibur.shard.pq-oversample=4

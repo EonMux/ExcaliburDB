@@ -1,5 +1,7 @@
 package io.excalibur.llm.client;
 
+import excalibur.llm.client.CorrelationId;
+import excalibur.llm.client.SafeUrl;
 import excalibur.llm.client.LLMClientConfig;
 import io.excalibur.llm.LLMException;
 import io.excalibur.llm.LLMException.ErrorType;
@@ -17,14 +19,10 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.random.RandomGenerator;
 import java.util.random.RandomGeneratorFactory;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * HTTP client for LLM API operations.
@@ -38,7 +36,7 @@ import java.util.regex.Pattern;
  *
  * <h3>Sanitized Response Handling (CRITICAL)</h3>
  * <p>When an LLM response contains markdown fences or commentary but valid JSON
- * inside (e.g., {@code ```json\n[{"score": 0.5}]\n```}), the {@link ResponseSanitizer}
+ * inside (e.g., {@code ```json\n[{"score": 0.5}]\n```}), the {@link ChatResponseParser}
  * extracts the valid JSON. This is counted as a <strong>SUCCESS</strong>, not a failure.</p>
  *
  * <p>The circuit breaker only counts actual failures:</p>
@@ -67,7 +65,7 @@ import java.util.regex.Pattern;
  *
  * @see HttpStatus
  * @see CircuitBreaker
- * @see ResponseSanitizer
+ * @see ChatResponseParser
  */
 public class LLMHttpClient {
 
@@ -108,25 +106,6 @@ public class LLMHttpClient {
     /** Minimum embedding dimension */
     private static final int MIN_EMBEDDING_DIMENSION = 1;
 
-    /**
-     * Pattern to extract individual score objects from a JSON array.
-     *
-     * <p>One object at a time, with its fields read separately, because a model's key order and
-     * extra keys are not something to depend on. A single pattern that required
-     * {@code {"index": N, "score": X}} in that order and nothing else matched nothing at all for
-     * a reply that transposed the two fields or added a "reason" - and a reply that parsed to no
-     * scores used to be indistinguishable from one that scored nothing highly.</p>
-     */
-    private static final Pattern SCORE_OBJECT_PATTERN = Pattern.compile("\\{[^{}]*\\}");
-
-    /** The {@code index} field of a score object. */
-    private static final Pattern SCORE_INDEX_FIELD = Pattern.compile(
-            "\"index\"\\s*:\\s*(-?\\d+)");
-
-    /** The {@code score} field of a score object. */
-    private static final Pattern SCORE_VALUE_FIELD = Pattern.compile(
-            "\"score\"\\s*:\\s*(-?[0-9]*\\.?[0-9]+(?:[eE][+-]?[0-9]+)?)");
-
     // ==================== Retry with Exponential Backoff Configuration ====================
 
     // Note: Base delay is now configurable via config.getRetryBaseDelay()
@@ -158,7 +137,23 @@ public class LLMHttpClient {
     private final HttpClient httpClient;
     private final LLMClientConfig config;
     private final CircuitBreaker circuitBreaker;
-    private final ResponseSanitizer responseSanitizer;
+
+    /**
+     * Guards {@code /v1/embeddings}, separately from the breaker guarding chat completions.
+     *
+     * <p>They are different endpoints, usually different models and often different
+     * deployments behind one base URL, and either can be saturated, reloading or missing while
+     * the other serves normally. One breaker across both would couple the failure domains in
+     * both directions: a reranker that fell over would stop ingestion, and an embedding model
+     * being swapped would stop reranking. Each outage would become two.</p>
+     *
+     * <p>The cost of separating them is that a base URL which is wholly unreachable has to be
+     * discovered twice, once per endpoint. That is a few failed requests, against an outage
+     * that would otherwise be twice as wide.</p>
+     */
+    private final CircuitBreaker embeddingCircuitBreaker;
+
+    private final ChatResponseParser responseParser;
 
     /**
      * Lazy-initialized batch handler for splitting large candidate sets.
@@ -201,17 +196,18 @@ public class LLMHttpClient {
         this.config = Objects.requireNonNull(config, "Configuration cannot be null");
         this.httpClient = createHttpClient(config.getTimeout());
 
-        // Initialize circuit breaker from config
+        // Initialize circuit breakers from config, one per endpoint
         this.circuitBreaker = new CircuitBreaker(
             config.getFailureThreshold(),
             config.getCooldownPeriod(),
-            "llm-client"
+            "llm-chat"
         );
+        this.embeddingCircuitBreaker = newEmbeddingCircuitBreaker(config);
 
-        this.responseSanitizer = new ResponseSanitizer();
+        this.responseParser = new ChatResponseParser();
 
         LOG.debug("LLMHttpClient initialized with baseUrl={}, embeddingModel={}, circuitBreaker={}",
-                config.getBaseUrl(), config.getEmbeddingModel(), circuitBreaker);
+                SafeUrl.redact(config.getBaseUrl()), config.getEmbeddingModel(), circuitBreaker);
     }
 
     /**
@@ -220,18 +216,23 @@ public class LLMHttpClient {
      * <p>Use this constructor when you need to share a circuit breaker across
      * multiple client instances or provide a custom circuit breaker configuration.</p>
      *
+     * <p>The supplied breaker guards chat completions only. Embeddings keep a breaker of their
+     * own, built from the configuration, because sharing one across two endpoints that fail
+     * independently makes each outage twice as wide.</p>
+     *
      * @param config Client configuration (must not be null)
-     * @param circuitBreaker Circuit breaker for resilience (must not be null)
+     * @param circuitBreaker Circuit breaker guarding chat completions (must not be null)
      * @throws IllegalArgumentException if config or circuitBreaker is null
      */
     public LLMHttpClient(LLMClientConfig config, CircuitBreaker circuitBreaker) {
         this.config = Objects.requireNonNull(config, "Configuration cannot be null");
         this.circuitBreaker = Objects.requireNonNull(circuitBreaker, "CircuitBreaker cannot be null");
+        this.embeddingCircuitBreaker = newEmbeddingCircuitBreaker(config);
         this.httpClient = createHttpClient(config.getTimeout());
-        this.responseSanitizer = new ResponseSanitizer();
+        this.responseParser = new ChatResponseParser();
 
         LOG.debug("LLMHttpClient initialized with baseUrl={}, embeddingModel={}, providedCircuitBreaker",
-                config.getBaseUrl(), config.getEmbeddingModel());
+                SafeUrl.redact(config.getBaseUrl()), config.getEmbeddingModel());
     }
 
     /**
@@ -285,26 +286,55 @@ public class LLMHttpClient {
             throw new IllegalArgumentException("Text cannot be empty");
         }
 
+        if (!embeddingCircuitBreaker.allowRequest()) {
+            LOG.warn("Circuit breaker '{}' is {}, failing fast (correlationId={})",
+                    embeddingCircuitBreaker.getName(), embeddingCircuitBreaker.getState(),
+                    correlationId);
+            throw new LLMException(
+                "Circuit breaker is open - the embeddings endpoint appears unavailable",
+                ErrorType.CIRCUIT_OPEN);
+        }
+
+        try {
+            float[] embedding = generateEmbeddingUnguarded(text, correlationId);
+            embeddingCircuitBreaker.recordSuccess();
+            return embedding;
+        } catch (LLMException e) {
+            if (shouldCountAsFailure(e)) {
+                embeddingCircuitBreaker.recordFailure();
+                LOG.debug("Recorded embedding circuit breaker failure: {} (correlationId={})",
+                        e.getErrorType(), correlationId);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Generates an embedding without consulting the circuit breaker.
+     *
+     * <p>Split out so that the breaker's bookkeeping reads as one thing and the call as
+     * another; every caller reaches this through {@link #generateEmbedding(String, String)}.</p>
+     *
+     * @param text          The text to embed
+     * @param correlationId Correlation id for tracing, or null
+     * @return The embedding vector
+     * @throws LLMException if the call fails or the reply cannot be read
+     */
+    private float[] generateEmbeddingUnguarded(String text, String correlationId) {
         LOG.debug("Generating embedding for text of length {} characters, correlationId={}",
                 text.length(), correlationId);
 
-        // Build request body
         String requestBody = buildEmbeddingRequestBody(text, config.getEmbeddingModel());
         String url = config.getBaseUrl() + EMBEDDINGS_PATH;
 
-        // Make HTTP request with optional correlation ID
         HttpResponse<String> response = executeRequest(url, requestBody, correlationId);
-
-        // Validate HTTP status
         validateHttpStatus(response.statusCode());
 
-        // Parse embedding from response
         float[] embedding = parseEmbeddingResponse(response.body());
-
-        // Validate embedding domain constraints
         validateEmbedding(embedding);
 
-        LOG.debug("Generated embedding of dimension {}, correlationId={}", embedding.length, correlationId);
+        LOG.debug("Generated embedding of dimension {}, correlationId={}",
+                embedding.length, correlationId);
         return embedding;
     }
 
@@ -423,7 +453,7 @@ public class LLMHttpClient {
         validateHttpStatus(response.statusCode());
 
         // Parse relevancy scores from response
-        List<RelevancyScore> scores = parseRelevancyResponse(response.body(), candidates);
+        List<RelevancyScore> scores = responseParser.parseRelevancyResponse(response.body(), candidates);
 
         LOG.debug("Scored {} candidates (unbatched), correlationId={}", scores.size(), correlationId);
         return scores;
@@ -476,7 +506,7 @@ public class LLMHttpClient {
         HttpResponse<String> response = executeRequest(
             config.getBaseUrl() + CHAT_COMPLETIONS_PATH, requestBody, correlationId);
         validateHttpStatus(response.statusCode());
-        return extractMessageContent(response.body());
+        return responseParser.extractMessageContent(response.body());
     }
 
     /**
@@ -520,7 +550,7 @@ public class LLMHttpClient {
     }
 
     /**
-     * Returns the circuit breaker used by this client.
+     * Returns the circuit breaker guarding chat completions.
      *
      * <p>Useful for monitoring circuit breaker state via JMX or metrics.</p>
      *
@@ -528,6 +558,36 @@ public class LLMHttpClient {
      */
     public CircuitBreaker getCircuitBreaker() {
         return circuitBreaker;
+    }
+
+    /**
+     * Returns the circuit breaker guarding the embeddings endpoint.
+     *
+     * <p>Distinct from {@link #getCircuitBreaker()}: a deployment watching for provider trouble
+     * has to watch both, because either endpoint can be down while the other is healthy.</p>
+     *
+     * @return Circuit breaker instance (never null)
+     */
+    public CircuitBreaker getEmbeddingCircuitBreaker() {
+        return embeddingCircuitBreaker;
+    }
+
+    /**
+     * Builds the breaker guarding the embeddings endpoint.
+     *
+     * <p>Configured from the same thresholds as the chat breaker, because the question they
+     * answer - how many consecutive failures mean this endpoint is down - has the same answer
+     * for both. Only the counting is separate.</p>
+     *
+     * @param config Client configuration
+     * @return A breaker for the embeddings endpoint
+     */
+    private static CircuitBreaker newEmbeddingCircuitBreaker(LLMClientConfig config) {
+        return new CircuitBreaker(
+            config.getFailureThreshold(),
+            config.getCooldownPeriod(),
+            "llm-embeddings"
+        );
     }
 
     /**
@@ -540,7 +600,7 @@ public class LLMHttpClient {
      *
      * <h3>Sanitized Response Handling (CRITICAL)</h3>
      * <p>When the LLM returns a response with markdown fences or commentary
-     * but valid JSON inside, the {@link ResponseSanitizer} extracts the JSON.
+     * but valid JSON inside, the {@link ChatResponseParser} extracts the JSON.
      * This is counted as a <strong>SUCCESS</strong> for circuit breaker purposes.</p>
      *
      * <p>Only the following are counted as failures:</p>
@@ -757,9 +817,11 @@ public class LLMHttpClient {
                     requestBuilder.header(AUTHORIZATION_HEADER, "Bearer " + apiKey);
                 }
 
-                // Add correlation ID header if provided and non-blank
-                if (correlationId != null && !correlationId.isBlank()) {
-                    requestBuilder.header(CORRELATION_ID_HEADER, correlationId);
+                // Validated at the point of use: the id came from the API boundary, and an
+                // unchecked value here is a header-injection attempt or an unbounded write.
+                String safeCorrelationId = CorrelationId.sanitize(correlationId);
+                if (safeCorrelationId != null) {
+                    requestBuilder.header(CORRELATION_ID_HEADER, safeCorrelationId);
                 }
 
                 HttpRequest request = requestBuilder.build();
@@ -813,7 +875,8 @@ public class LLMHttpClient {
             } catch (HttpTimeoutException e) {
                 // Domain correctness: timeout is a network-level failure (retryable)
                 lastException = new LLMException(
-                        "LLM API request timed out after " + config.getTimeout().toMillis() + "ms to " + url,
+                        "LLM API request timed out after " + config.getTimeout().toMillis()
+                            + "ms to " + SafeUrl.redact(url),
                         ErrorType.NETWORK, e);
                 LOG.warn("Request timeout on attempt {}/{} (correlationId={})",
                         attempt + 1, maxRetries + 1, correlationId);
@@ -821,7 +884,8 @@ public class LLMHttpClient {
             } catch (IOException e) {
                 // Domain correctness: IO error is a network-level failure (retryable)
                 lastException = new LLMException(
-                        "IO error during LLM API call to " + url + ": " + e.getMessage(),
+                        "IO error during LLM API call to " + SafeUrl.redact(url) + ": "
+                            + e.getMessage(),
                         ErrorType.NETWORK, e);
                 LOG.warn("IO error on attempt {}/{}: {} (correlationId={})",
                         attempt + 1, maxRetries + 1, e.getMessage(), correlationId);
@@ -850,7 +914,7 @@ public class LLMHttpClient {
 
         // All retries exhausted
         LOG.error("All {} retry attempts exhausted for request to {} (correlationId={})",
-                maxRetries + 1, url, correlationId);
+                maxRetries + 1, SafeUrl.redact(url), correlationId);
 
         // Domain correctness: ensure we always throw a documented exception
         // This should never be null in practice, but defensive programming ensures
@@ -956,7 +1020,8 @@ public class LLMHttpClient {
     private void logRequest(String url, HttpRequest request, String requestBody, String correlationId) {
         StringBuilder logMsg = new StringBuilder(512);
         logMsg.append("LLM API Request [correlationId=").append(correlationId).append("]:\n");
-        logMsg.append("  ").append(request.method()).append(" ").append(url).append("\n");
+        logMsg.append("  ").append(request.method()).append(" ")
+              .append(SafeUrl.redact(url)).append("\n");
         logMsg.append("  Headers:\n");
 
         // Log headers, masking sensitive values
@@ -1285,20 +1350,26 @@ public class LLMHttpClient {
      */
     private String buildRelevancyRequestBody(String query, List<String> candidates, String model) {
         // Build the prompt with numbered candidates
+        // Numbered from zero, because that is what the reply is read as. The list used to be
+        // numbered from one while the worked example below showed {"index": 0}, so a model that
+        // followed the numbering it could see scored every passage one place to the left: the
+        // first candidate was never scored, and the last index fell out of range and was
+        // dropped. The bound check on the way back catches the overflow and nothing else.
         StringBuilder candidatesText = new StringBuilder();
         for (int i = 0; i < candidates.size(); i++) {
             if (i > 0) {
                 candidatesText.append('\n');
             }
             String escaped = escapeForPrompt(candidates.get(i));
-            candidatesText.append(i + 1).append(". ").append(escaped);
+            candidatesText.append(i).append(". ").append(escaped);
         }
 
         // Format the prompt using the Phase 7 specification template
         String prompt = String.format(
                 "You are a relevancy judge. Given a user query and a list of candidate passages, " +
                 "score each passage from 0.0 to 1.0 based on how relevant it is to answering the query. " +
-                "Return ONLY a JSON array of objects: [{\"index\": 0, \"score\": 0.85}, ...]. " +
+                "Return ONLY a JSON array of objects: [{\"index\": 0, \"score\": 0.85}, ...], " +
+                "where index is the number the candidate is listed under below. " +
                 "Do not explain. Do not add commentary.\n\n" +
                 "Query: %s\n\nCandidates:\n%s",
                 query, candidatesText.toString());
@@ -1327,232 +1398,4 @@ public class LLMHttpClient {
         return text.replaceAll("[\\p{Cntrl}&&[^\\n\\r\\t]]", "");
     }
 
-    /**
-     * Parses the relevancy scores from an API response.
-     *
-     * <p>Extracts the JSON array of scores from the chat completion response,
-     * handling markdown code fences and other response artifacts.</p>
-     *
-     * <p>Expected content format:
-     * <pre>{@code
-     * [{"index": 0, "score": 0.85}, {"index": 1, "score": 0.42}, ...]
-     * }</pre>
-     *
-     * @param responseBody JSON response body
-     * @param candidates Original candidate list for validation
-     * @return List of RelevancyScore objects
-     * @throws LLMException if parsing fails
-     */
-    private List<RelevancyScore> parseRelevancyResponse(String responseBody, List<String> candidates) {
-        if (responseBody == null || responseBody.isEmpty()) {
-            throw new LLMException("Empty response body from relevancy API", ErrorType.PARSE_ERROR);
-        }
-
-        // Extract the content from the chat completion response
-        String content = extractMessageContent(responseBody);
-
-        // Sanitize: strip markdown fences and extract JSON array
-        String sanitized = responseSanitizer.sanitize(content);
-
-        if (sanitized == null || sanitized.isBlank()) {
-            LOG.error("Could not extract JSON array from response: {}", truncate(responseBody, 500));
-            throw new LLMException("Could not extract JSON array from response", ErrorType.PARSE_ERROR);
-        }
-
-        // Parse the JSON array of scores
-        return parseScoreArray(sanitized, candidates);
-    }
-
-    /**
-     * Extracts the message content from a chat completion response.
-     *
-     * <p>Parses the OpenAI response format to extract the "content" field from
-     * the first choice's message.</p>
-     *
-     * @param responseBody Full JSON response
-     * @return Extracted content string
-     * @throws LLMException if content cannot be found
-     */
-    private String extractMessageContent(String responseBody) {
-        // Find "content" field in the response
-        // Format: "content":"..."
-        String contentKey = "\"content\"";
-        int contentIndex = responseBody.indexOf(contentKey);
-        if (contentIndex < 0) {
-            throw new LLMException("No 'content' field in response", ErrorType.PARSE_ERROR);
-        }
-
-        // Find the opening quote of the content value
-        int startQuote = responseBody.indexOf('"', contentIndex + contentKey.length());
-        if (startQuote < 0) {
-            throw new LLMException("Malformed content field", ErrorType.PARSE_ERROR);
-        }
-
-        // Find the closing quote (handling escaped quotes)
-        int endQuote = findClosingQuote(responseBody, startQuote + 1);
-        if (endQuote < 0) {
-            throw new LLMException("Unclosed content string", ErrorType.PARSE_ERROR);
-        }
-
-        // Extract and unescape the content
-        String rawContent = responseBody.substring(startQuote + 1, endQuote);
-        return unescapeJsonString(rawContent);
-    }
-
-    /**
-     * Finds the closing quote of a JSON string, handling escaped characters.
-     *
-     * @param json JSON string
-     * @param start Starting position after opening quote
-     * @return Position of closing quote, or -1 if not found
-     */
-    private int findClosingQuote(String json, int start) {
-        boolean escaped = false;
-        for (int i = start; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    /**
-     * Unescapes a JSON string value.
-     *
-     * <p>Handles standard JSON escape sequences including quotes, backslash,
-     * newline, carriage return, tab, backspace, form feed, and unicode escapes.</p>
-     *
-     * @param escaped Escaped JSON string
-     * @return Unescaped string
-     */
-    private String unescapeJsonString(String escaped) {
-        if (escaped == null) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder(escaped.length());
-        for (int i = 0; i < escaped.length(); i++) {
-            char c = escaped.charAt(i);
-            if (c == '\\' && i + 1 < escaped.length()) {
-                char next = escaped.charAt(i + 1);
-                switch (next) {
-                    case '"' -> { sb.append('"'); i++; }
-                    case '\\' -> { sb.append('\\'); i++; }
-                    case 'n' -> { sb.append('\n'); i++; }
-                    case 'r' -> { sb.append('\r'); i++; }
-                    case 't' -> { sb.append('\t'); i++; }
-                    case 'b' -> { sb.append('\b'); i++; }
-                    case 'f' -> { sb.append('\f'); i++; }
-                    case 'u' -> {
-                        if (i + 5 < escaped.length()) {
-                            String hex = escaped.substring(i + 2, i + 6);
-                            try {
-                                sb.append((char) Integer.parseInt(hex, 16));
-                                i += 5;
-                            } catch (NumberFormatException e) {
-                                sb.append(c);
-                            }
-                        } else {
-                            sb.append(c);
-                        }
-                    }
-                    default -> sb.append(c);
-                }
-            } else {
-                sb.append(c);
-            }
-        }
-        return sb.toString();
-    }
-
-    /**
-     * Parses a JSON array of score objects.
-     *
-     * <p>Expected format: {@code [{"index": 0, "score": 0.85}, {"index": 1, "score": 0.42}]}</p>
-     *
-     * <p>Domain Correctness:</p>
-     * <ul>
-     *   <li>Scores are clamped to [0.0, 1.0] by {@link RelevancyScore} constructor</li>
-     *   <li>Out-of-range indices are DISCARDED, not clamped: clamping index 999 to the last
-     *       candidate would attribute the model's score to a document it never scored</li>
-     *   <li>Candidate text is associated with each score</li>
-     * </ul>
-     *
-     * @param jsonArray JSON array string
-     * @param candidates Original candidate list for validation and text lookup
-     * @return List of parsed RelevancyScore objects
-     * @throws LLMException if parsing fails
-     */
-    private List<RelevancyScore> parseScoreArray(String jsonArray, List<String> candidates) {
-        List<RelevancyScore> scores = new ArrayList<>();
-
-        // Remove outer brackets
-        String content = jsonArray.trim();
-        if (!content.startsWith("[") || !content.endsWith("]")) {
-            throw new LLMException("Response is not a JSON array", ErrorType.PARSE_ERROR);
-        }
-
-        content = content.substring(1, content.length() - 1).trim();
-
-        if (content.isEmpty()) {
-            return scores;
-        }
-
-        // One object at a time, reading each field on its own, so key order and any extra keys
-        // the model added do not decide whether the reply is understood at all.
-        boolean anyObjectRead = false;
-        Matcher matcher = SCORE_OBJECT_PATTERN.matcher(content);
-        while (matcher.find()) {
-            String object = matcher.group();
-            Matcher indexField = SCORE_INDEX_FIELD.matcher(object);
-            Matcher scoreField = SCORE_VALUE_FIELD.matcher(object);
-            if (!indexField.find() || !scoreField.find()) {
-                LOG.warn("Score object carries no index/score pair: {}", object);
-                continue;
-            }
-
-            try {
-                int index = Integer.parseInt(indexField.group(1));
-                double score = Double.parseDouble(scoreField.group(1));
-                anyObjectRead = true;
-
-                // Domain correctness: skip invalid indices instead of clamping,
-                // which would silently attribute scores to wrong candidates
-                if (index < 0 || index >= candidates.size()) {
-                    LOG.warn("LLM returned invalid score index {} (candidates size {}), skipping",
-                        index, candidates.size());
-                    continue;
-                }
-
-                // Index is in range: the guard above skipped every other case.
-                String candidateText = candidates.get(index);
-
-                // RelevancyScore constructor clamps score to [0.0, 1.0]
-                scores.add(new RelevancyScore(index, score, candidateText));
-            } catch (NumberFormatException e) {
-                LOG.warn("Failed to parse score object: {}", object);
-                // Continue parsing other objects
-            }
-        }
-
-        // A non-empty array in which nothing at all could be read is a reply that was not
-        // understood, and saying so is what lets the caller fall back to the vector ranking.
-        // Returning an empty list instead reported success, counted a success on the circuit
-        // breaker, and answered the query with nothing.
-        //
-        // An object that was read and then discarded for naming a candidate that does not exist
-        // is a different case: the reply was understood, and discarding is the documented
-        // handling - clamping would attribute the model's score to a document it never saw.
-        if (!anyObjectRead) {
-            throw new LLMException(
-                "Response is a JSON array but contains no readable score objects: " + content,
-                ErrorType.PARSE_ERROR);
-        }
-
-        return scores;
-    }
 }

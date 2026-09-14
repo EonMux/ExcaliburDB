@@ -69,7 +69,10 @@ class CompactionWorkerTest {
         AtomicBoolean callbackInvoked = new AtomicBoolean(false);
         CompactionWorker worker = new CompactionWorker(
             arena,
-            (oldSeg, newSeg) -> callbackInvoked.set(true),
+            (oldSeg, newSeg) -> {
+                callbackInvoked.set(true);
+                return CompactionOutcome.INSTALLED;
+            },
             1000,  // 1 second interval
             0.15,  // 15% tombstone threshold
             16 * 1024 * 1024L,  // 16 MB write log threshold
@@ -85,7 +88,7 @@ class CompactionWorkerTest {
 
     @Test
     void constructor_withNullArena_throwsNPE() {
-        assertThatThrownBy(() -> new CompactionWorker(null, (o, n) -> {}))
+        assertThatThrownBy(() -> new CompactionWorker(null, (o, n) -> CompactionOutcome.INSTALLED))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("Arena");
     }
@@ -100,7 +103,7 @@ class CompactionWorkerTest {
     @Test
     void constructor_withTooSmallInterval_throwsIAE() {
         assertThatThrownBy(() -> new CompactionWorker(
-            arena, (o, n) -> {}, 50, 0.2, 32 * 1024 * 1024L, 4))
+            arena, (o, n) -> CompactionOutcome.INSTALLED, 50, 0.2, 32 * 1024 * 1024L, 4))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("Compaction interval");
     }
@@ -108,12 +111,12 @@ class CompactionWorkerTest {
     @Test
     void constructor_withInvalidTombstoneThreshold_throwsIAE() {
         assertThatThrownBy(() -> new CompactionWorker(
-            arena, (o, n) -> {}, 1000, -0.1, 32 * 1024 * 1024L, 4))
+            arena, (o, n) -> CompactionOutcome.INSTALLED, 1000, -0.1, 32 * 1024 * 1024L, 4))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("Tombstone ratio threshold");
 
         assertThatThrownBy(() -> new CompactionWorker(
-            arena, (o, n) -> {}, 1000, 1.5, 32 * 1024 * 1024L, 4))
+            arena, (o, n) -> CompactionOutcome.INSTALLED, 1000, 1.5, 32 * 1024 * 1024L, 4))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("Tombstone ratio threshold");
     }
@@ -122,13 +125,13 @@ class CompactionWorkerTest {
     void constructor_withInvalidWriteLogThreshold_throwsIAE() {
         // Too small
         assertThatThrownBy(() -> new CompactionWorker(
-            arena, (o, n) -> {}, 1000, 0.2, 1024, 4))
+            arena, (o, n) -> CompactionOutcome.INSTALLED, 1000, 0.2, 1024, 4))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("Write log size threshold");
 
         // Too large
         assertThatThrownBy(() -> new CompactionWorker(
-            arena, (o, n) -> {}, 1000, 0.2, 2L * 1024 * 1024 * 1024, 4))
+            arena, (o, n) -> CompactionOutcome.INSTALLED, 1000, 0.2, 2L * 1024 * 1024 * 1024, 4))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("Write log size threshold");
     }
@@ -136,12 +139,12 @@ class CompactionWorkerTest {
     @Test
     void constructor_withInvalidMaxConcurrent_throwsIAE() {
         assertThatThrownBy(() -> new CompactionWorker(
-            arena, (o, n) -> {}, 1000, 0.2, 32 * 1024 * 1024L, 0))
+            arena, (o, n) -> CompactionOutcome.INSTALLED, 1000, 0.2, 32 * 1024 * 1024L, 0))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("Max concurrent compactions");
 
         assertThatThrownBy(() -> new CompactionWorker(
-            arena, (o, n) -> {}, 1000, 0.2, 32 * 1024 * 1024L, 20))
+            arena, (o, n) -> CompactionOutcome.INSTALLED, 1000, 0.2, 32 * 1024 * 1024L, 20))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("Max concurrent compactions");
     }
@@ -150,7 +153,7 @@ class CompactionWorkerTest {
 
     @Test
     void start_startsBackgroundThread() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         assertThat(worker.start()).isTrue();
         assertThat(worker.isRunning()).isTrue();
@@ -163,7 +166,7 @@ class CompactionWorkerTest {
 
     @Test
     void stop_terminatesBackgroundThread() throws InterruptedException {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         worker.start();
         assertThat(worker.isRunning()).isTrue();
@@ -177,7 +180,7 @@ class CompactionWorkerTest {
 
     @Test
     void stop_whenNotRunning_doesNothing() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         // Should not throw
         assertThatCode(worker::stop).doesNotThrowAnyException();
@@ -187,7 +190,7 @@ class CompactionWorkerTest {
 
     @Test
     void registerSegment_addsToMonitoringList() throws IOException {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
         Segment segment = createTestSegment("test-segment");
 
         worker.registerSegment(segment);
@@ -197,7 +200,7 @@ class CompactionWorkerTest {
 
     @Test
     void registerSegment_nullSegment_throwsNPE() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         assertThatThrownBy(() -> worker.registerSegment(null))
             .isInstanceOf(NullPointerException.class);
@@ -205,7 +208,7 @@ class CompactionWorkerTest {
 
     @Test
     void registerSegment_duplicateSegment_doesNotDuplicate() throws IOException {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
         Segment segment = createTestSegment("test-segment");
 
         worker.registerSegment(segment);
@@ -216,7 +219,7 @@ class CompactionWorkerTest {
 
     @Test
     void unregisterSegment_removesFromMonitoringList() throws IOException {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
         Segment segment = createTestSegment("test-segment");
 
         worker.registerSegment(segment);
@@ -237,6 +240,7 @@ class CompactionWorkerTest {
         CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
             oldSegmentRef.set(oldSeg);
             newSegmentRef.set(newSeg);
+            return CompactionOutcome.INSTALLED;
         });
 
         Segment segment = createTestSegment("test-segment");
@@ -272,7 +276,10 @@ class CompactionWorkerTest {
     void compactNow_refusesASplittingSegment() throws IOException {
         AtomicReference<Segment> newSegmentRef = new AtomicReference<>();
         CompactionWorker worker = new CompactionWorker(arena,
-            (oldSeg, newSeg) -> newSegmentRef.set(newSeg));
+            (oldSeg, newSeg) -> {
+                newSegmentRef.set(newSeg);
+                return CompactionOutcome.INSTALLED;
+            });
 
         Segment segment = createTestSegment("splitting-segment");
         segment.put("test-key".getBytes(), "test-value".getBytes());
@@ -307,7 +314,10 @@ class CompactionWorkerTest {
         CountDownLatch compactionLatch = new CountDownLatch(1);
 
         CompactionWorker worker = new CompactionWorker(arena,
-            (oldSeg, newSeg) -> compactionLatch.countDown());
+            (oldSeg, newSeg) -> {
+                compactionLatch.countDown();
+                return CompactionOutcome.INSTALLED;
+            });
 
         Segment segment = createTestSegment("dispatch-segment");
         segment.put("test-key".getBytes(), "test-value".getBytes());
@@ -330,19 +340,19 @@ class CompactionWorkerTest {
 
     @Test
     void getCompactionCount_initiallyZero() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
         assertThat(worker.getCompactionCount()).isZero();
     }
 
     @Test
     void getBytesReclaimed_initiallyZero() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
         assertThat(worker.getBytesReclaimed()).isZero();
     }
 
     @Test
     void getLastCompactionTime_initiallyZero() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
         assertThat(worker.getLastCompactionTime()).isZero();
     }
 
@@ -350,7 +360,7 @@ class CompactionWorkerTest {
 
     @Test
     void setCompactionIntervalMs_validValue_updates() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         worker.setCompactionIntervalMs(2000);
         assertThat(worker.getCompactionIntervalMs()).isEqualTo(2000);
@@ -358,7 +368,7 @@ class CompactionWorkerTest {
 
     @Test
     void setCompactionIntervalMs_invalidValue_throws() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         assertThatThrownBy(() -> worker.setCompactionIntervalMs(50))
             .isInstanceOf(IllegalArgumentException.class);
@@ -366,7 +376,7 @@ class CompactionWorkerTest {
 
     @Test
     void setTombstoneRatioThreshold_validValue_updates() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         worker.setTombstoneRatioThreshold(0.5);
         assertThat(worker.getTombstoneRatioThreshold()).isEqualTo(0.5);
@@ -374,7 +384,7 @@ class CompactionWorkerTest {
 
     @Test
     void setWriteLogSizeThreshold_validValue_updates() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         worker.setWriteLogSizeThreshold(64 * 1024 * 1024L);
         assertThat(worker.getWriteLogSizeThreshold()).isEqualTo(64 * 1024 * 1024L);
@@ -382,7 +392,7 @@ class CompactionWorkerTest {
 
     @Test
     void setMaxConcurrentCompactions_validValue_updates() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         worker.setMaxConcurrentCompactions(8);
         assertThat(worker.getMaxConcurrentCompactions()).isEqualTo(8);
@@ -402,6 +412,7 @@ class CompactionWorkerTest {
             (oldSeg, newSeg) -> {
                 compactionOccurred.set(true);
                 compactionLatch.countDown();
+                return CompactionOutcome.INSTALLED;
             },
             100,  // Check every 100ms
             0.05, // 5% tombstone threshold (very aggressive)
@@ -445,6 +456,7 @@ class CompactionWorkerTest {
                 Thread.currentThread().interrupt();
             }
             compactionComplete.countDown();
+            return CompactionOutcome.INSTALLED;
         });
 
         Segment segment = createTestSegment("non-blocking-test");
@@ -478,7 +490,7 @@ class CompactionWorkerTest {
 
     @Test
     void toString_containsRelevantInfo() {
-        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> {});
+        CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
         String str = worker.toString();
 
@@ -493,7 +505,10 @@ class CompactionWorkerTest {
     @Test
     void compaction_leavesLiveDataAtTheCanonicalSegmentName() throws IOException, InterruptedException {
         CountDownLatch compactionLatch = new CountDownLatch(1);
-        CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> compactionLatch.countDown());
+        CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
+                compactionLatch.countDown();
+                return CompactionOutcome.INSTALLED;
+            });
 
         Path segmentPath = tempDir.resolve("segment_0.dat");
         Path walPath = tempDir.resolve("segment_0.wal");
@@ -534,6 +549,7 @@ class CompactionWorkerTest {
         CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
             replacement.set(newSeg);
             latch.countDown();
+            return CompactionOutcome.INSTALLED;
         });
 
         Segment segment = createTestSegment("segment_slots");

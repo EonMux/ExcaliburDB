@@ -1,8 +1,9 @@
 package excalibur.api.reindex;
 
+import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The single mutual-exclusion primitive for reindex operations.
@@ -34,7 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class ReindexCoordinator {
 
-    private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
+    private final Map<String, Lease> inFlight = new ConcurrentHashMap<>();
 
     /**
      * Attempts to claim exclusive reindex rights for a source.
@@ -45,10 +46,38 @@ public final class ReindexCoordinator {
      */
     public Lease tryAcquire(String sourceId) {
         Objects.requireNonNull(sourceId, "sourceId cannot be null");
-        if (!inFlight.add(sourceId)) {
+        Lease lease = new Lease(sourceId);
+        if (inFlight.putIfAbsent(sourceId, lease) != null) {
             return null;
         }
-        return new Lease(sourceId);
+        return lease;
+    }
+
+    /**
+     * Asks a running reindex to stop.
+     *
+     * <h3>What this does not do</h3>
+     * <p>It does not release the claim. A rolling replacement that has been asked to stop is
+     * still running until it stops, and handing the source to a second replacement in the
+     * meantime is the concurrent-replacement data loss this coordinator exists to prevent - each
+     * tombstones the segments the other has just published. The run releases its own claim when
+     * it actually ends, cancelled or not.</p>
+     *
+     * <p>Stopping is a request rather than a guarantee, for the same reason cancelling any
+     * running work is: the run stops at its next checkpoint, and how long that takes depends on
+     * what it is doing.</p>
+     *
+     * @param sourceId The source whose reindex should stop
+     * @return true when a reindex of this source was running and has been asked to stop
+     */
+    public boolean cancel(String sourceId) {
+        Objects.requireNonNull(sourceId, "sourceId cannot be null");
+        Lease lease = inFlight.get(sourceId);
+        if (lease == null) {
+            return false;
+        }
+        lease.cancel();
+        return true;
     }
 
     /**
@@ -58,7 +87,7 @@ public final class ReindexCoordinator {
      * @return true when a lease is held
      */
     public boolean isRunning(String sourceId) {
-        return inFlight.contains(sourceId);
+        return inFlight.containsKey(sourceId);
     }
 
     /**
@@ -79,10 +108,56 @@ public final class ReindexCoordinator {
     public final class Lease implements AutoCloseable {
 
         private final String sourceId;
-        private volatile boolean released;
+        private final AtomicBoolean released = new AtomicBoolean();
+        private final AtomicBoolean cancelled = new AtomicBoolean();
+        private final AtomicBoolean cancellerRun = new AtomicBoolean();
+        private volatile Runnable canceller;
 
         private Lease(String sourceId) {
             this.sourceId = sourceId;
+        }
+
+        /**
+         * Registers how this reindex is stopped.
+         *
+         * <p>Set by whoever starts the run, once it has something to interrupt. A cancellation
+         * that arrives before then is remembered rather than lost: {@link #isCancelled()} is
+         * already true, and the canceller registered afterwards is run immediately.</p>
+         *
+         * @param canceller Asks the run to stop; must be safe to call from another thread
+         */
+        public void onCancel(Runnable canceller) {
+            Objects.requireNonNull(canceller, "canceller cannot be null");
+            this.canceller = canceller;
+            // Only if cancel() did not already run one. Without the claim, a cancellation that
+            // raced this registration is run by both sides, and a canceller that is not
+            // idempotent is then run twice for one cancellation.
+            if (cancelled.get() && cancellerRun.compareAndSet(false, true)) {
+                canceller.run();
+            }
+        }
+
+        /**
+         * Whether this reindex has been asked to stop.
+         *
+         * <p>A run that checks this between documents stops promptly without needing to be
+         * interruptible at whatever it happens to be blocked on.</p>
+         *
+         * @return true once cancellation has been requested
+         */
+        public boolean isCancelled() {
+            return cancelled.get();
+        }
+
+        /** Asks the run to stop. The canceller is run at most once for the lease's life. */
+        private void cancel() {
+            if (!cancelled.compareAndSet(false, true)) {
+                return;
+            }
+            Runnable toRun = canceller;
+            if (toRun != null && cancellerRun.compareAndSet(false, true)) {
+                toRun.run();
+            }
         }
 
         /**
@@ -98,9 +173,10 @@ public final class ReindexCoordinator {
          * Releases the claim.
          */
         public void release() {
-            if (!released) {
-                released = true;
-                inFlight.remove(sourceId);
+            if (released.compareAndSet(false, true)) {
+                // Keyed removal: a later reindex of the same source holds a different lease, and
+                // a stale release must not drop a claim it does not own.
+                inFlight.remove(sourceId, this);
             }
         }
 

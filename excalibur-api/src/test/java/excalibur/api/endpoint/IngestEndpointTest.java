@@ -361,6 +361,232 @@ class IngestEndpointTest {
         }
     }
 
+    @Nested
+    @DisplayName("Filesystem walk filters")
+    class WalkFilters {
+
+        @Test
+        @DisplayName("keeps them on a filesystem source")
+        void keepsThemOnAFilesystemSource(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"included_extensions\": [\".md\"], "
+                + "\"excluded_directories\": [\".git\"]}}");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registry.isRegistered("docs")).isTrue();
+        }
+
+        @Test
+        @DisplayName("refuses included_extensions on an HTTP crawl rather than dropping it")
+        void refusesIncludedExtensionsOnACrawl(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"included_extensions\": [\".md\"]}}");
+
+            assertThat(response.status())
+                .as("accepted and silently discarded, the caller reads 200 registered and then "
+                    + "gets the whole site crawled with nothing saying the filter was dropped")
+                .isEqualTo(400);
+            assertThat(response.body()).contains("included_extensions").contains("filesystem");
+            assertThat(registry.isRegistered("site")).isFalse();
+        }
+
+        @Test
+        @DisplayName("refuses excluded_directories on an HTTP crawl")
+        void refusesExcludedDirectoriesOnACrawl(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"excluded_directories\": [\"drafts\"]}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("excluded_directories");
+            assertThat(registry.isRegistered("site")).isFalse();
+        }
+
+        @Test
+        @DisplayName("leaves an HTTP crawl that sends neither alone")
+        void acceptsACrawlWithoutFilters(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\"}}");
+
+            assertThat(response.status()).isNotEqualTo(400);
+        }
+    }
+
+    @Nested
+    @DisplayName("Crawl tunables")
+    class CrawlTunables {
+
+        @Test
+        @DisplayName("a filesystem walk accepts the settings that shape it")
+        void filesystemSettingsAreAccepted(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"max_depth\": 3, \"follow_symlinks\": false, "
+                + "\"include_hidden\": true, \"max_file_bytes\": 1048576}}");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registry.isRegistered("docs")).isTrue();
+        }
+
+        @Test
+        @DisplayName("an HTTP crawl accepts the settings that shape it")
+        void crawlSettingsAreAccepted(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"max_depth\": 2, \"max_documents\": 500, "
+                + "\"max_response_bytes\": 1048576, \"timeout_seconds\": 15, "
+                + "\"included_path_patterns\": [\"/docs\"], "
+                + "\"excluded_path_patterns\": [\"/admin\"], "
+                + "\"user_agent\": \"AcmeBot/1.0\"}}");
+
+            assertThat(response.status()).isNotEqualTo(400);
+        }
+
+        /**
+         * The list is recorded and restored comma-separated, so an element containing a comma
+         * would come back as two: {@code ["/a,b/"]} would exclude {@code /a} and {@code b/},
+         * far more of the crawl than was asked for, and the caller would be told the source
+         * registered fine.
+         */
+        @Test
+        @DisplayName("a comma inside a list element is refused, not silently split")
+        void listElementsCannotCarryACommma(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"excluded_path_patterns\": [\"/a,b/\"]}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("excluded_path_patterns");
+        }
+
+        @Test
+        @DisplayName("a depth past the bound this node allows is refused, not clamped")
+        void depthIsBounded(@TempDir Path root) throws IOException {
+            // Clamping would answer 200 and crawl to a depth the caller did not ask for, which
+            // reads back as a crawl that stopped early for no stated reason.
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"max_depth\": 100000}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("max_depth").contains("1000");
+            assertThat(registry.isRegistered("docs")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a file size bound of zero is refused")
+        void fileSizeHasAFloor(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"max_file_bytes\": 0}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("max_file_bytes");
+        }
+
+        @Test
+        @DisplayName("a User-Agent carrying a newline is refused as header forgery")
+        void userAgentCannotForgeAHeader(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"user_agent\": \"Acme\\r\\nX-Injected: yes\"}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("user_agent");
+            assertThat(registry.isRegistered("site")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a crawl setting on a filesystem walk is refused rather than dropped")
+        void crawlSettingsAreRefusedOnAWalk(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"timeout_seconds\": 5}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("timeout_seconds");
+            assertThat(registry.isRegistered("docs")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a walk setting on an HTTP crawl is refused rather than dropped")
+        void walkSettingsAreRefusedOnACrawl(@TempDir Path root) throws IOException {
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"follow_symlinks\": true}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("follow_symlinks");
+            assertThat(registry.isRegistered("site")).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("Crawling over supplied documents")
+    class SuppliedDocuments {
+
+        @Test
+        @DisplayName("refuses a crawl registered over an id documents were supplied under")
+        void refusesCrawlOverSuppliedSource(@TempDir Path root) throws IOException {
+            InlineSourceIds supplied = new InlineSourceIds(256);
+            supplied.remember("notes");
+
+            Response response = register(root, "notes", supplied);
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(response.body()).contains("notes");
+            // Not registered: a crawl that was refused must not be crawling.
+            assertThat(registry.isRegistered("notes")).isFalse();
+        }
+
+        @Test
+        @DisplayName("undoes a registration that raced a supplied batch and won")
+        void undoesARegistrationThatRacedASuppliedBatch(@TempDir Path root) throws IOException {
+            // The pre-check sees nothing; the batch records its claim; the post-check sees it.
+            // Without the second read the crawl would stay registered and delete the documents
+            // on its first pass, which is the loss both halves of this guard exist to prevent.
+            InlineSourceIds supplied = new InlineSourceIds(256);
+            // The batch claims the id while this registration is inside register(), which is
+            // exactly the window the pre-check cannot see.
+            registry = new InMemorySourceRegistry() {
+                @Override
+                public void register(Source source,
+                        excalibur.ingest.source.SourceDescriptor descriptor) {
+                    supplied.remember(source.getSourceId());
+                    super.register(source, descriptor);
+                }
+            };
+
+            Response response = register(root, "notes", supplied);
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(registry.isRegistered("notes"))
+                .as("a registration that is refused must not be left crawling")
+                .isFalse();
+        }
+
+        @Test
+        @DisplayName("registers an id nothing was supplied under")
+        void registersUnrelatedSource(@TempDir Path root) throws IOException {
+            InlineSourceIds supplied = new InlineSourceIds(256);
+            supplied.remember("notes");
+
+            Response response = register(root, "articles", supplied);
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registry.isRegistered("articles")).isTrue();
+        }
+    }
+
     /** One captured HTTP response. */
     private record Response(int status, String body) {}
 
@@ -368,11 +594,24 @@ class IngestEndpointTest {
      * Posts a filesystem registration for {@code root}, which the endpoint under test allows.
      */
     private Response register(Path root, String sourceId) throws IOException {
-        IngestEndpoint endpoint = new IngestEndpoint(registry, null, null,
-            new IngestTargetValidator(ApiSecurityConfig.builder().allowIngestRoot(root).build()));
-        String requestBody = "{\"source_type\": \"filesystem\", \"config\": {"
+        return register(root, sourceId, null);
+    }
+
+    private Response register(Path root, String sourceId, InlineSourceIds supplied)
+            throws IOException {
+        return post(root, supplied, "{\"source_type\": \"filesystem\", \"config\": {"
             + "\"source_id\": \"" + sourceId + "\", "
-            + "\"root_path\": \"" + root + "\"}}";
+            + "\"root_path\": \"" + root + "\"}}");
+    }
+
+    /**
+     * Posts {@code requestBody} to an endpoint whose allow-list holds {@code root}.
+     */
+    private Response post(Path root, InlineSourceIds supplied, String requestBody)
+            throws IOException {
+        IngestEndpoint endpoint = new IngestEndpoint(registry, null, null,
+            new IngestTargetValidator(ApiSecurityConfig.builder().allowIngestRoot(root).build()),
+            supplied);
 
         HttpExchange exchange = mock(HttpExchange.class);
         ByteArrayOutputStream responseBody = new ByteArrayOutputStream();

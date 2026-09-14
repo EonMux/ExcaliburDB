@@ -5,6 +5,7 @@ import excalibur.ingest.lexical.ChunkLexicalIndex;
 import excalibur.ingest.lexical.NativeChunkIndex;
 
 import io.excalibur.config.Config;
+import io.excalibur.retrieval.lexical.Bm25Parameters;
 import io.excalibur.retrieval.lexical.native_.CompactionPlanner;
 
 import org.slf4j.Logger;
@@ -53,9 +54,11 @@ public final class ChunkIndexFactory {
         Objects.requireNonNull(config, "config must not be null");
         Objects.requireNonNull(dataDirectory, "dataDirectory must not be null");
         Objects.requireNonNull(epochs, "epochs must not be null");
+        Bm25Parameters bm25 = new Bm25Parameters(
+            config.ingest().getBm25K1(), config.ingest().getBm25B());
         if (Config.Ingest.LEXICAL_ENGINE_LUCENE.equals(config.ingest().getLexicalEngine())) {
             return ChunkLexicalIndex.open(dataDirectory.resolve(LUCENE_DIRECTORY),
-                config.graph().getRamBufferMb());
+                config.graph().getRamBufferMb(), bm25);
         }
         long lag = readerLagEpochs(config);
         LOGGER.info("Chunk index compaction floor is {} epoch(s) behind current "
@@ -65,7 +68,8 @@ public final class ChunkIndexFactory {
             CompactionPlanner.standard(
                 config.ingest().getLexicalTombstoneRatio(),
                 Duration.ofSeconds(config.ingest().getLexicalMaxLatencySeconds()),
-                config.ingest().getLexicalMaxSegments()));
+                config.ingest().getLexicalMaxSegments()),
+            bm25);
     }
 
     /**

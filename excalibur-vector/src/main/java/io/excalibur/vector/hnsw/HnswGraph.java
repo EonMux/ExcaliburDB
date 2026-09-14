@@ -1,9 +1,11 @@
 package io.excalibur.vector.hnsw;
 
+import io.excalibur.vector.durability.DurableFiles;
 import io.excalibur.core.mapped.MappedFile;
 import io.excalibur.core.memory.MemorySegmentFactory;
 import io.excalibur.core.memory.Segment;
 import io.excalibur.vector.distance.DistanceFunction;
+import io.excalibur.vector.quantization.PQCodebookFile;
 import io.excalibur.vector.quantization.PQDistanceTable;
 import io.excalibur.vector.quantization.ProductQuantizer;
 import org.slf4j.Logger;
@@ -47,6 +49,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * | - maxLevel (4B)        |
  * | - lastIntegratedOffset (8B) |
  * | - config fields...     |
+ * | - distance metric (4B) |
  * +------------------------+
  * | Node Index Table       |
  * | - offset to node data  |
@@ -102,7 +105,12 @@ public class HnswGraph implements AutoCloseable {
     private static final long MAGIC = 0x484E535747525048L;
 
     // Current file format version
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
+
+    // The version written before the header recorded a distance metric. Cosine was the
+    // only metric a graph could be built under at the time, so a file at this version
+    // is read as cosine and is left at this version rather than being rewritten.
+    private static final int VERSION_WITHOUT_METRIC = 1;
 
     // Header size (4KB aligned)
     private static final int HEADER_SIZE = 4096;
@@ -135,6 +143,8 @@ public class HnswGraph implements AutoCloseable {
     private static final long OFFSET_CONFIG_ML = 56;
     private static final long OFFSET_CONFIG_EF_SEARCH = 64;
     private static final long OFFSET_MAX_NODES = 68;
+    // OFFSET_MAX_NODES holds a long, so the metric code starts at 76.
+    private static final long OFFSET_METRIC = 76;
 
     // Configuration.
     // These are reassigned by reopenAfterCompaction() while lock-free readers
@@ -190,6 +200,9 @@ public class HnswGraph implements AutoCloseable {
     /** Suffix of the file holding a graph's node-to-document mapping. */
     public static final String DOCUMENT_MAPPING_SUFFIX = ".docmap";
 
+    /** Suffix of the file holding a graph's trained product quantizer codebook. */
+    public static final String PRODUCT_QUANTIZER_SUFFIX = PQCodebookFile.SUFFIX;
+
     private volatile NodeDocumentMapping nodeDocumentMapping;
 
     /**
@@ -242,11 +255,34 @@ public class HnswGraph implements AutoCloseable {
         // node: nodeCount/entryPoint/maxLevel/lastIntegratedOffset would be reset
         // and the next insert would overwrite node 0's record. Adopt the persisted
         // layout instead and only initialize a genuinely new file.
-        PersistedLayout existing = readPersistedLayout(path);
-        if (existing != null) {
-            adoptPersistedLayout(existing, config, maxNodes);
-        } else {
-            initializeNewFile();
+        attachOrInitialize(config, maxNodes);
+    }
+
+    /**
+     * Brings the backing file into use, adopting an existing one or creating a new one.
+     *
+     * @param requestedConfig The configuration the caller asked for
+     * @param requestedMaxNodes The capacity the caller asked for
+     * @throws IOException if the file exists and cannot be used as requested
+     */
+    private void attachOrInitialize(HnswConfig requestedConfig, long requestedMaxNodes)
+            throws IOException {
+        boolean attached = false;
+        try {
+            PersistedLayout existing = readPersistedLayout(path);
+            if (existing != null) {
+                adoptPersistedLayout(existing, requestedConfig, requestedMaxNodes);
+            } else {
+                initializeNewFile();
+            }
+            attached = true;
+        } finally {
+            if (!attached) {
+                // A refused header (wrong dimension, wrong metric, unreadable) must not
+                // strand the shared arena and whatever mapping was already made: the
+                // constructor never returns, so nobody is left to close them.
+                closeQuietly(mappedFile, arena);
+            }
         }
     }
 
@@ -285,7 +321,8 @@ public class HnswGraph implements AutoCloseable {
      * written back to the header.</p>
      *
      * <p>A different dimension is rejected outright: it means the file holds vectors
-     * from a different embedding space, which no amount of re-reading can fix.</p>
+     * from a different embedding space, which no amount of re-reading can fix. So is a
+     * different distance metric, for the reason given on {@link #requireMatchingMetric}.</p>
      *
      * @param existing The layout read from the file header
      * @param requestedConfig The configuration the caller asked for
@@ -300,6 +337,8 @@ public class HnswGraph implements AutoCloseable {
                 ": file holds " + persisted.dimension() +
                 ", requested " + requestedConfig.dimension());
         }
+
+        requireMatchingMetric(existing.distanceMetric(), distanceFunction, path);
 
         warnOnIgnoredLayoutChange("maxConnections", persisted.maxConnections(),
             requestedConfig.maxConnections());
@@ -326,6 +365,8 @@ public class HnswGraph implements AutoCloseable {
         mappedFile.writeInt(OFFSET_CONFIG_EF_SEARCH, config.efSearch());
         mappedFile.writeLong(OFFSET_CONFIG_ML, Double.doubleToLongBits(config.mL()));
 
+        restorePersistedQuantizer();
+
         LOGGER.info("Re-attached to existing HNSW graph at {} with {} nodes, dimension={}, maxNodes={}",
             path, nodeCount, config.dimension(), maxNodes);
     }
@@ -344,7 +385,63 @@ public class HnswGraph implements AutoCloseable {
     /**
      * Layout and configuration recovered from an existing graph file header.
      */
-    private record PersistedLayout(HnswConfig config, long maxNodes) {}
+    private record PersistedLayout(HnswConfig config, long maxNodes, String distanceMetric) {}
+
+    /**
+     * Reports whether this build can interpret a header at the given version.
+     */
+    private static boolean isSupportedVersion(int version) {
+        return version == VERSION || version == VERSION_WITHOUT_METRIC;
+    }
+
+    /**
+     * Returns the metric a persisted header describes.
+     *
+     * @param version The header's format version, already known to be supported
+     * @param metricCode The value at {@code OFFSET_METRIC}, ignored for a header
+     *                   written before the field existed
+     * @param path The graph file, for the error message
+     * @return The canonical metric name the graph was built with
+     * @throws IOException if the header names a metric this build cannot provide
+     */
+    private static String persistedMetric(int version, int metricCode, Path path) throws IOException {
+        if (version == VERSION_WITHOUT_METRIC) {
+            return PersistedMetric.LEGACY_METRIC;
+        }
+        try {
+            return PersistedMetric.nameFor(metricCode);
+        } catch (IllegalArgumentException e) {
+            throw new IOException("HNSW graph " + path + " records a distance metric this build "
+                + "does not know (header code " + metricCode + "): " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Refuses a graph whose edges were built under a metric other than the requested one.
+     *
+     * <p>Every edge in the graph was chosen because it was the closest candidate under
+     * the metric in force when its node was inserted. Under a different metric those
+     * edges are no longer monotone, so greedy descent walks away from the true
+     * neighbours and the search returns a plausible but wrong answer, with the scores
+     * clamped into the new metric's range on the way out. Nothing about the result
+     * shows that it happened, which is why this is an error and not a warning.</p>
+     *
+     * @param persistedMetric The metric recorded in the header
+     * @param distanceFunction The metric the caller is configured for
+     * @param path The graph file, for the error message
+     * @throws IOException if the two metrics differ
+     */
+    private static void requireMatchingMetric(String persistedMetric,
+                                              DistanceFunction distanceFunction,
+                                              Path path) throws IOException {
+        String requested = distanceFunction.name();
+        if (!persistedMetric.equals(requested)) {
+            throw new IOException("HNSW graph " + path + " was built with the distance metric '"
+                + persistedMetric + "' but this node is configured for '" + requested
+                + "'. A graph's edges only rank correctly under the metric that chose them, "
+                + "so the corpus has to be reindexed to change it.");
+        }
+    }
 
     /**
      * Reads the layout of an existing graph file without mapping it read-write.
@@ -370,9 +467,11 @@ public class HnswGraph implements AutoCloseable {
             }
 
             int version = probe.readInt(OFFSET_VERSION);
-            if (version != VERSION) {
+            if (!isSupportedVersion(version)) {
                 throw new IOException("Unsupported HNSW version " + version + " in " + path);
             }
+
+            String metric = persistedMetric(version, probe.readInt(OFFSET_METRIC), path);
 
             long persistedMaxNodes = probe.readLong(OFFSET_MAX_NODES);
             if (persistedMaxNodes <= 0) {
@@ -391,7 +490,7 @@ public class HnswGraph implements AutoCloseable {
                 Double.longBitsToDouble(probe.readLong(OFFSET_CONFIG_ML)),
                 probe.readInt(OFFSET_DIMENSION));
 
-            return new PersistedLayout(persistedConfig, persistedMaxNodes);
+            return new PersistedLayout(persistedConfig, persistedMaxNodes, metric);
         }
     }
 
@@ -506,7 +605,7 @@ public class HnswGraph implements AutoCloseable {
      * @return A mapping, never null
      */
     private static NodeDocumentMapping openDocumentMapping(Path graphPath, boolean loadExisting) {
-        Path mappingPath = Path.of(graphPath.toString() + DOCUMENT_MAPPING_SUFFIX);
+        Path mappingPath = documentMappingPath(graphPath);
         try {
             return NodeDocumentMapping.createOrLoad(mappingPath, loadExisting);
         } catch (IOException e) {
@@ -515,6 +614,30 @@ public class HnswGraph implements AutoCloseable {
                 mappingPath, e.toString());
             return new NodeDocumentMapping();
         }
+    }
+
+    /**
+     * Returns the path of the node-to-document mapping that belongs beside a graph file.
+     *
+     * @param graphPath The graph file
+     * @return The sidecar path, which is the graph path plus {@link #DOCUMENT_MAPPING_SUFFIX}
+     */
+    private static Path documentMappingPath(Path graphPath) {
+        return Path.of(graphPath.toString() + DOCUMENT_MAPPING_SUFFIX);
+    }
+
+    /**
+     * Returns the path a compaction builds the replacement graph at.
+     *
+     * <p>Beside the live file, so the swap is a rename within one filesystem, and under a name
+     * derived from it, so a crash leaves an artefact the next open can attribute to this graph
+     * rather than an orphan in a scratch directory.</p>
+     *
+     * @param graphPath The graph being compacted
+     * @return The staging path for the compacted graph
+     */
+    private static Path compactionStagingPath(Path graphPath) {
+        return graphPath.resolveSibling(graphPath.getFileName() + COMPACT_SUFFIX);
     }
 
     /**
@@ -528,6 +651,8 @@ public class HnswGraph implements AutoCloseable {
     public static HnswGraph open(Path path, DistanceFunction distanceFunction) throws IOException {
         Objects.requireNonNull(path, "Path cannot be null");
         Objects.requireNonNull(distanceFunction, "DistanceFunction cannot be null");
+
+        finishInterruptedCompaction(path);
 
         // Open the file to read size
         long fileSize = java.nio.file.Files.size(path);
@@ -545,9 +670,13 @@ public class HnswGraph implements AutoCloseable {
             }
 
             int version = mappedFile.readInt(OFFSET_VERSION);
-            if (version != VERSION) {
+            if (!isSupportedVersion(version)) {
                 throw new IOException("Unsupported HNSW version: " + version);
             }
+
+            requireMatchingMetric(
+                persistedMetric(version, mappedFile.readInt(OFFSET_METRIC), path),
+                distanceFunction, path);
 
             int dimension = mappedFile.readInt(OFFSET_DIMENSION);
 
@@ -578,6 +707,7 @@ public class HnswGraph implements AutoCloseable {
 
             // Restore state from persisted data
             graph.restoreStateFromHeader();
+            graph.restorePersistedQuantizer();
 
             LOGGER.info("Opened HNSW graph at {} with {} nodes, dimension={}",
                 path, graph.nodeCount, dimension);
@@ -723,6 +853,17 @@ public class HnswGraph implements AutoCloseable {
             }
 
             int version = segment.getInt(OFFSET_VERSION);
+            if (!isSupportedVersion(version)) {
+                // The remaining fields may sit at other offsets in a version this build
+                // does not know, so reporting them would be reporting noise.
+                LOGGER.debug("Segment holds an HNSW header at unsupported version {}", version);
+                return null;
+            }
+
+            String distanceMetric = version == VERSION_WITHOUT_METRIC
+                ? PersistedMetric.LEGACY_METRIC
+                : PersistedMetric.nameFor(segment.getInt(OFFSET_METRIC));
+
             int dimension = segment.getInt(OFFSET_DIMENSION);
             long nodeCount = segment.getLong(OFFSET_NODE_COUNT);
             long entryPoint = segment.getLong(OFFSET_ENTRY_POINT);
@@ -735,7 +876,7 @@ public class HnswGraph implements AutoCloseable {
             int efSearch = segment.getInt(OFFSET_CONFIG_EF_SEARCH);
 
             return new HeaderInfo(version, dimension, nodeCount, entryPoint, maxLevel,
-                lastIntegrated, maxConn, maxConn0, efConstruction, efSearch, mL);
+                lastIntegrated, maxConn, maxConn0, efConstruction, efSearch, mL, distanceMetric);
         } catch (Exception e) {
             LOGGER.debug("Failed to read header info from segment: {}", e.getMessage());
             return null;
@@ -758,7 +899,8 @@ public class HnswGraph implements AutoCloseable {
         int maxConnectionsLayer0,
         int efConstruction,
         int efSearch,
-        double mL
+        double mL,
+        String distanceMetric
     ) {
         /**
          * Creates an HnswConfig from this header info.
@@ -803,6 +945,7 @@ public class HnswGraph implements AutoCloseable {
             mappedFile.writeInt(OFFSET_CONFIG_EF_SEARCH, config.efSearch());
             mappedFile.writeLong(OFFSET_CONFIG_ML, Double.doubleToLongBits(config.mL()));
             mappedFile.writeLong(OFFSET_MAX_NODES, maxNodes);
+            mappedFile.writeInt(OFFSET_METRIC, PersistedMetric.codeFor(distanceFunction.name()));
 
             this.dataWriteOffset = 0;
         } finally {
@@ -950,7 +1093,7 @@ public class HnswGraph implements AutoCloseable {
      * @param candidateIds Set of node IDs to search within (null = full search)
      * @return List of search results sorted by distance (closest first)
      * @throws IllegalStateException if graph is closed
-     * @throws IllegalArgumentException if query is null or wrong dimension, or k <= 0
+     * @throws IllegalArgumentException if query is null or wrong dimension, or {@code k <= 0}
      * @since 1.2
      */
     public List<HnswSearchResult> search(float[] query, int k, Set<Long> candidateIds) {
@@ -1972,14 +2115,22 @@ public class HnswGraph implements AutoCloseable {
             // temp directory can live on a different filesystem, which makes the
             // final ATOMIC_MOVE fail after the live mapping has been torn down.
             Path originalPath = this.path;
-            Path compactPath = originalPath.resolveSibling(originalPath.getFileName() + COMPACT_SUFFIX);
+            Path compactPath = compactionStagingPath(originalPath);
             Files.deleteIfExists(compactPath);
+            Files.deleteIfExists(documentMappingPath(compactPath));
 
             LOGGER.info("Starting HNSW compaction: {} tombstoned nodes to remove", removed);
 
-            NodeDocumentMapping compactedMapping = buildCompactedGraph(compactPath);
-            swapInCompactedGraph(compactPath, originalPath);
-            installCompactedMapping(compactedMapping, originalPath);
+            // Both replacement files are made durable before either becomes visible, and the
+            // graph is renamed first. A crash then leaves a state the next open can read: the
+            // staged mapping still beside the staged graph means the swap never started, and
+            // beside no staged graph means the graph swap completed and only the mapping
+            // rename is outstanding. Writing the mapping after the graph instead leaves the
+            // two indistinguishable, and a compacted graph reading a pre-compaction mapping
+            // answers every query with the wrong documents.
+            CompactedState compacted = buildCompactedGraph(compactPath);
+            swapInCompactedGraph(compactPath, originalPath, compacted.pqCodes());
+            promoteCompactedMapping(compactPath, originalPath, compacted.documentMapping());
 
             LOGGER.info("Compacted HNSW graph: removed {} tombstoned nodes", removed);
             return removed;
@@ -1993,9 +2144,8 @@ public class HnswGraph implements AutoCloseable {
      * Writes a tombstone-free copy of this graph to {@code compactPath}.
      *
      * <p>Must be called with the write lock held. The copy carries over the
-     * node-to-document mapping, the product quantizer and its codes, and the
-     * write-log integration checkpoint, so nothing has to be re-derived after the
-     * swap.</p>
+     * node-to-document mapping, the product quantizer codes, and the write-log integration
+     * checkpoint, so nothing has to be re-derived after the swap.</p>
      *
      * <p>The mapping is rebuilt rather than shared. Compaction renumbers nodes, so
      * registering the new IDs into the live mapping would leave it holding the old
@@ -2003,23 +2153,22 @@ public class HnswGraph implements AutoCloseable {
      * to whichever document held it before, and the next insert to take that ID would
      * inherit that document.</p>
      *
+     * <p>It is rebuilt onto disk, at the sidecar path belonging to {@code compactPath},
+     * rather than only in memory. The compacted numbering is meaningless without it, so it
+     * has to be durable before the graph that uses that numbering is renamed into place.</p>
+     *
      * @param compactPath Destination for the compacted graph
-     * @return The node-to-document mapping in the compacted numbering
+     * @return The state of the compacted numbering, to be installed after the swap
      * @throws IOException if the compacted graph cannot be written
      */
-    private NodeDocumentMapping buildCompactedGraph(Path compactPath) throws IOException {
-        ProductQuantizer oldPq = this.pq;
+    private CompactedState buildCompactedGraph(Path compactPath) throws IOException {
         java.util.concurrent.ConcurrentHashMap<Long, byte[]> oldPqCodes = this.pqCodes;
-        NodeDocumentMapping compactedMapping = new NodeDocumentMapping();
+        CompactedState state;
 
         try (HnswGraph compacted = new HnswGraph(compactPath, config, distanceFunction, maxNodes)) {
-            // Document identity is re-registered below against the new node IDs.
-            compacted.setNodeDocumentMapping(compactedMapping);
-
-            // Copy PQ if enabled
-            if (oldPq != null) {
-                compacted.setProductQuantizer(oldPq);
-            }
+            // The replacement graph opens its own sidecar beside itself; document identity is
+            // re-registered into it below, against the new node IDs.
+            NodeDocumentMapping compactedMapping = compacted.getNodeDocumentMapping();
 
             // Re-insert all active nodes with their original vectors
             Map<Long, Long> oldToNewId = new java.util.HashMap<>();
@@ -2042,50 +2191,170 @@ public class HnswGraph implements AutoCloseable {
                 }
             }
 
-            // Copy PQ codes if enabled - re-encode with new node IDs
-            if (oldPq != null && oldPqCodes != null) {
-                for (Map.Entry<Long, Long> entry : oldToNewId.entrySet()) {
-                    byte[] codes = oldPqCodes.get(entry.getKey());
-                    if (codes != null) {
-                        // Get the vector from the new graph and encode
-                        NodeView newNode = compacted.readNode(entry.getValue());
-                        if (newNode != null) {
-                            compacted.encodeAndStorePQCode(entry.getValue(), newNode.vector());
-                        }
-                    }
-                }
-            }
-
             // Carry the write-log integration checkpoint across. Losing it would
             // make the integration worker rescan the write log from byte 0 and
             // re-insert every entry as a duplicate node.
             compacted.setLastIntegratedOffset(this.lastIntegratedOffset.get());
 
+            // Forces the graph's pages and writes the sidecar through its own
+            // stage-force-rename.
             compacted.flush();
+            state = new CompactedState(compactedMapping.getAllMappings(),
+                rekeyPqCodes(oldPqCodes, oldToNewId));
         }
 
-        return compactedMapping;
+        // Both staged names are forced once the files behind them are closed and on storage.
+        // Without this the graph swap could be durable while the mapping staged beside it is
+        // not, and the next open would see a completed swap with nothing left to finish.
+        DurableFiles.syncContainingDirectory(compactPath);
+        return state;
     }
 
     /**
-     * Adopts the compacted numbering's node-to-document mapping and writes it beside
-     * the swapped-in graph.
+     * Re-keys the PQ codes from the old numbering to the compacted one.
      *
-     * <p>Called after the rename, so the mapping on disk is never ahead of the graph
-     * it describes: a crash between the two leaves the previous mapping in place, which
-     * matches the previous graph file that the rename did not replace.</p>
+     * <p>A compacted node holds the same vector it held before, so its codes are still the
+     * right quantisation of it and only the id they are filed under has moved. Re-keying is
+     * therefore exact, and it is what keeps a compaction from quietly switching quantisation
+     * off for the segment: the codebook is unaffected, but codes dropped here would only ever
+     * come back from another full encoding pass, and nothing triggers one on an active
+     * segment.</p>
      *
-     * @param compactedMapping The mapping produced by {@link #buildCompactedGraph}
-     * @param graphPath The canonical path the graph is served from
+     * @param oldCodes The codes in the pre-compaction numbering, possibly null
+     * @param oldToNewId Which new node each surviving old node became
+     * @return The codes in the compacted numbering, never null
      */
-    private void installCompactedMapping(NodeDocumentMapping compactedMapping, Path graphPath) {
+    private static Map<Long, byte[]> rekeyPqCodes(
+            Map<Long, byte[]> oldCodes, Map<Long, Long> oldToNewId) {
+
+        if (oldCodes == null || oldCodes.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, byte[]> rekeyed = new java.util.HashMap<>(oldToNewId.size());
+        for (Map.Entry<Long, Long> entry : oldToNewId.entrySet()) {
+            byte[] codes = oldCodes.get(entry.getKey());
+            if (codes != null) {
+                rekeyed.put(entry.getValue(), codes);
+            }
+        }
+        return rekeyed;
+    }
+
+    /**
+     * What a compaction produced, in the compacted numbering, for installation after the swap.
+     *
+     * @param documentMapping The node-to-document mapping, already staged on disk beside the
+     *                        compacted graph; carried in memory too so the live graph can
+     *                        adopt it without reading the file back
+     * @param pqCodes The product quantizer codes, empty when the segment has none
+     */
+    private record CompactedState(Map<Long, String> documentMapping, Map<Long, byte[]> pqCodes) {}
+
+    /**
+     * Renames the already-staged mapping over the live one and adopts it.
+     *
+     * <p>The contents were forced to storage before the graph was swapped, so this is a
+     * rename and nothing more. If it fails, the staged file is deliberately left where it is:
+     * it is the only record that the graph on disk is the compacted one, and
+     * {@link #finishInterruptedCompaction(Path)} completes the swap from it at the next open.
+     * The live graph adopts the compacted mapping regardless, so this process keeps answering
+     * correctly while the on-disk pair is still half swapped.</p>
+     *
+     * @param compactPath      The staging path the compacted graph was built at
+     * @param graphPath        The canonical path the graph is served from
+     * @param compactedMapping The mapping in the compacted numbering
+     */
+    private void promoteCompactedMapping(Path compactPath, Path graphPath,
+                                         Map<Long, String> compactedMapping) {
+        Path stagedMapping = documentMappingPath(compactPath);
+        Path livePath = documentMappingPath(graphPath);
+        try {
+            Files.move(stagedMapping, livePath,
+                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            DurableFiles.syncContainingDirectory(livePath);
+        } catch (IOException e) {
+            LOGGER.error("Could not install the compacted node-to-document mapping at {}: {}. "
+                + "The staged copy at {} is left in place and the next open of this graph "
+                + "will finish the swap from it.", livePath, e.toString(), stagedMapping, e);
+        }
+
         NodeDocumentMapping installed = openDocumentMapping(graphPath, false);
         installed.clear();
-        for (Map.Entry<Long, String> entry : compactedMapping.getAllMappings().entrySet()) {
+        for (Map.Entry<Long, String> entry : compactedMapping.entrySet()) {
             installed.register(entry.getKey(), entry.getValue());
         }
         this.nodeDocumentMapping = installed;
-        persistDocumentMapping();
+    }
+
+    /**
+     * Resolves whatever a compaction that did not run to completion left on disk.
+     *
+     * <p>A compaction replaces two files and cannot rename both at once, so a crash can land
+     * between them. The staged mapping is what distinguishes the two outcomes, because it is
+     * written and forced before either rename happens:</p>
+     * <ul>
+     *   <li>The staged graph is still there, so its rename never happened. The live graph and
+     *       the mapping beside it are the pre-compaction pair and agree with each other;
+     *       both staged files are stale and are removed.</li>
+     *   <li>The staged graph is gone, so its rename completed and the live graph carries the
+     *       compacted numbering. The mapping beside it still describes the old numbering, and
+     *       the staged mapping is the one that matches - finishing its rename is what keeps
+     *       node IDs resolving to the documents they actually hold.</li>
+     * </ul>
+     *
+     * <p>A failure to finish that second case is raised rather than logged. Opening anyway
+     * would serve a compacted graph through a pre-compaction mapping, which returns confident
+     * answers naming the wrong documents; refusing to open says so instead.</p>
+     *
+     * @param graphPath The graph about to be opened
+     * @throws IOException if a completed graph swap's mapping cannot be installed
+     */
+    private static void finishInterruptedCompaction(Path graphPath) throws IOException {
+        Path compactPath = compactionStagingPath(graphPath);
+        Path stagedMapping = documentMappingPath(compactPath);
+        if (!Files.exists(stagedMapping)) {
+            return;
+        }
+
+        if (Files.exists(compactPath)) {
+            LOGGER.warn("Discarding the remains of an HNSW compaction of {} that never "
+                + "swapped its graph into place.", graphPath);
+            deleteQuietly(compactPath);
+            deleteQuietly(stagedMapping);
+            return;
+        }
+
+        Path livePath = documentMappingPath(graphPath);
+        LOGGER.warn("An HNSW compaction of {} swapped its graph in and did not install the "
+            + "matching node-to-document mapping. Completing the swap from {}.",
+            graphPath, stagedMapping);
+        try {
+            Files.move(stagedMapping, livePath,
+                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            throw new IOException("HNSW graph " + graphPath + " holds a compacted numbering "
+                + "whose node-to-document mapping is still staged at " + stagedMapping
+                + " and could not be installed. Opening it would attribute every result to "
+                + "the wrong document.", e);
+        }
+        DurableFiles.syncContainingDirectory(livePath);
+    }
+
+    /**
+     * Removes a leftover compaction artefact, reporting rather than raising a failure.
+     *
+     * <p>The pair that remains on disk is already consistent at this point, so a stray file
+     * costs space and a confusing directory listing, not correctness.</p>
+     *
+     * @param path The artefact to remove
+     */
+    private static void deleteQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            LOGGER.warn("Could not remove the abandoned compaction artefact {}: {}",
+                path, e.toString());
+        }
     }
 
     /**
@@ -2098,9 +2367,11 @@ public class HnswGraph implements AutoCloseable {
      *
      * @param compactPath The compacted graph built by {@link #buildCompactedGraph}
      * @param originalPath The canonical path the graph is served from
+     * @param rekeyedPqCodes The PQ codes in the compacted numbering
      * @throws IOException if the swap fails
      */
-    private void swapInCompactedGraph(Path compactPath, Path originalPath) throws IOException {
+    private void swapInCompactedGraph(Path compactPath, Path originalPath,
+                                      Map<Long, byte[]> rekeyedPqCodes) throws IOException {
         // Release the current mapping before renaming over it.
         this.closed = true;
         if (mappedFile != null) {
@@ -2131,11 +2402,11 @@ public class HnswGraph implements AutoCloseable {
 
             // The PQ code map is keyed by node ID and describes the old numbering: new node k
             // is the (k+1)-th survivor, whose old id is larger than k as soon as anything below
-            // it was tombstoned. Left in place, every PQ distance scores a node against another
-            // vector's codes. Dropping the map is enough - computeDistanceWithPQ falls back to
-            // full precision for a node it has no codes for, and the codes are rebuilt by the
-            // next encodeAllVectors.
-            this.pqCodes = new java.util.concurrent.ConcurrentHashMap<>();
+            // it was tombstoned. Left as it was, every PQ distance would score a node against
+            // another vector's codes; dropped, the segment would keep a quantizer that no
+            // longer has codes for anything and would silently fall back to full precision
+            // forever. The codes re-keyed to the compacted numbering are installed instead.
+            this.pqCodes = new java.util.concurrent.ConcurrentHashMap<>(rekeyedPqCodes);
 
             reopenAfterCompaction(originalPath);
         } catch (IOException | RuntimeException e) {
@@ -2150,7 +2421,10 @@ public class HnswGraph implements AutoCloseable {
      * Restores the graph after a failed compaction swap.
      *
      * <p>The rename did not happen, so the original file still holds the live data:
-     * re-map it and drop the compacted temp file.</p>
+     * re-map it and drop both staged files.</p>
+     *
+     * @param compactPath  The staging path the compacted graph was built at
+     * @param originalPath The canonical path the graph is served from
      */
     private void rollbackFailedSwap(Path compactPath, Path originalPath) {
         try {
@@ -2159,12 +2433,11 @@ public class HnswGraph implements AutoCloseable {
             LOGGER.error("Failed to restore HNSW graph {} after an aborted compaction swap: {}",
                 originalPath, reopenFailure.getMessage());
         }
-        try {
-            Files.deleteIfExists(compactPath);
-        } catch (IOException deleteFailure) {
-            LOGGER.warn("Could not remove compaction temp file {}: {}",
-                compactPath, deleteFailure.getMessage());
-        }
+        // The staged mapping goes with the staged graph. Left alone it would tell the next
+        // open that a graph swap had completed, and it would install a compacted numbering
+        // over the graph that was never replaced.
+        deleteQuietly(compactPath);
+        deleteQuietly(documentMappingPath(compactPath));
     }
 
     /**
@@ -2200,7 +2473,7 @@ public class HnswGraph implements AutoCloseable {
             // mapping left over from an earlier copy would attribute this one's nodes to
             // whichever documents held those IDs before.
             Files.deleteIfExists(destPath);
-            Files.deleteIfExists(Path.of(destPath.toString() + DOCUMENT_MAPPING_SUFFIX));
+            Files.deleteIfExists(documentMappingPath(destPath));
 
             try (HnswGraph compacted = new HnswGraph(destPath, config, distanceFunction, maxNodes)) {
                 // Copy all active nodes
@@ -2260,9 +2533,13 @@ public class HnswGraph implements AutoCloseable {
         }
 
         int version = mappedFile.readInt(OFFSET_VERSION);
-        if (version != VERSION) {
+        if (!isSupportedVersion(version)) {
             throw new IOException("Unsupported HNSW graph version after compaction: " + version);
         }
+
+        requireMatchingMetric(
+            persistedMetric(version, mappedFile.readInt(OFFSET_METRIC), graphPath),
+            distanceFunction, graphPath);
 
         int dimension = mappedFile.readInt(OFFSET_DIMENSION);
         this.nodeCount = mappedFile.readLong(OFFSET_NODE_COUNT);
@@ -3201,11 +3478,27 @@ public class HnswGraph implements AutoCloseable {
             throw new IllegalStateException("ProductQuantizer must be set and trained");
         }
 
-        // The read lock, not the write lock. The loop reads one node per iteration off the
-        // mapped file - a page-in per node, and the whole vector region for a large segment -
-        // and its only mutation is into a concurrent map. Holding the exclusive lock across
-        // that excluded every query and every insert on the segment for the length of a full
-        // scan, and this runs on a WARMING segment, which is queryable.
+        int encoded = encodeEveryVector();
+        LOGGER.info("Encoded {} vectors with ProductQuantizer", encoded);
+
+        // The codebook is written once the codes exist, because that is the point at which the
+        // quantiser is actually in use. A codebook on disk is what lets the next process skip
+        // the training this one just paid for.
+        persistProductQuantizer();
+    }
+
+    /**
+     * Encodes every live node against the current quantizer.
+     *
+     * <p>The read lock, not the write lock. The loop reads one node per iteration off the
+     * mapped file - a page-in per node, and the whole vector region for a large segment - and
+     * its only mutation is into a concurrent map. Holding the exclusive lock across that
+     * excluded every query and every insert on the segment for the length of a full scan, and
+     * this runs on a WARMING segment, which is queryable.</p>
+     *
+     * @return The number of vectors encoded
+     */
+    private int encodeEveryVector() {
         lock.readLock().lock();
         try {
             int encoded = 0;
@@ -3217,10 +3510,85 @@ public class HnswGraph implements AutoCloseable {
                     encoded++;
                 }
             }
-            LOGGER.info("Encoded {} vectors with ProductQuantizer", encoded);
+            return encoded;
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /**
+     * Writes the trained codebook beside the graph file.
+     *
+     * <p>Failure is logged rather than thrown. The codes this process holds are unaffected, so
+     * the cost of a failed write is that the next process has to warm the segment again -
+     * against a graph that is already durable. Raising here would instead fail the encoding
+     * that did succeed.</p>
+     */
+    private void persistProductQuantizer() {
+        ProductQuantizer quantizer = this.pq;
+        if (quantizer == null || !quantizer.isTrained()) {
+            return;
+        }
+        Path codebookPath = productQuantizerPath(path);
+        try {
+            PQCodebookFile.write(codebookPath, quantizer);
+            LOGGER.debug("Wrote the product quantizer codebook for {} to {}", path, codebookPath);
+        } catch (IOException e) {
+            LOGGER.warn("Could not write the product quantizer codebook for {} to {}: {}. "
+                + "This segment will have to be re-trained after a restart.",
+                path, codebookPath, e.toString());
+        }
+    }
+
+    /**
+     * Adopts the codebook sitting beside an existing graph file, if there is one.
+     *
+     * <p>Called when re-attaching to a graph that already holds data. Training only happens
+     * while a segment is warming, and a segment that is reopened is past that, so a codebook
+     * that is not picked up here is one the segment will never have again.</p>
+     *
+     * <p>Only the codebook is read; the codes are not scanned back in. Opening a graph is on
+     * the startup path and quantised search is off unless a deployment asked for it, so a full
+     * encoding pass here would be a per-segment scan at every boot that most nodes would never
+     * consult. The codes rebuild themselves instead: a node the quantised beam reaches without
+     * a stored code is encoded on the spot and cached, which costs the same in total and only
+     * for the nodes a query actually visits. A caller that would rather pay it up front - one
+     * that knows quantised search is enabled - calls {@link #encodeAllVectors()} after
+     * opening.</p>
+     *
+     * <p>Persisting the codes themselves would not help: they are keyed by node id, which a
+     * compaction renumbers, so a file of them would have to be rewritten by every compaction or
+     * be read back describing the wrong vectors.</p>
+     *
+     * <p>A codebook that does not match this graph is refused and reported, and the graph opens
+     * without one. The vectors are the data; a sidecar that cannot be trusted costs
+     * quantisation, and refusing to open the graph over it would cost the corpus.</p>
+     */
+    private void restorePersistedQuantizer() {
+        Path codebookPath = productQuantizerPath(path);
+        if (!Files.exists(codebookPath)) {
+            return;
+        }
+
+        ProductQuantizer restored;
+        try {
+            restored = PQCodebookFile.read(codebookPath, config.dimension());
+        } catch (IOException e) {
+            LOGGER.warn("Refusing the product quantizer codebook at {}: {}. The graph is open "
+                + "without quantisation and searches it at full precision.",
+                codebookPath, e.toString());
+            return;
+        }
+
+        setProductQuantizer(restored);
+        LOGGER.info("Restored the product quantizer for {} from {}", path, codebookPath);
+    }
+
+    /**
+     * Returns the path of the codebook belonging to a graph file.
+     */
+    private static Path productQuantizerPath(Path graphPath) {
+        return graphPath.resolveSibling(graphPath.getFileName() + PRODUCT_QUANTIZER_SUFFIX);
     }
 
     /**
@@ -3347,6 +3715,103 @@ public class HnswGraph implements AutoCloseable {
             }
 
             return topResults;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Searches with the quantised beam and returns the top k scored on full-precision vectors.
+     *
+     * <p>The quantised pass is a cheap way to decide which nodes are worth measuring, and
+     * nothing more. Its lookups are sums of query-to-centroid terms - near the true distance,
+     * but off by an amount that varies per node - so a caller handed them would be ranking on a
+     * scale that is not the metric's. A segment's answer is this list merged with the write-log
+     * tail scan's, and the tail scan measures exactly; mixing the two scales would let the
+     * ranking turn on which half a result came from. Every candidate is therefore re-measured
+     * against its stored vector before it is returned, which makes these results
+     * indistinguishable in kind from {@link #search(float[], int)}'s.</p>
+     *
+     * <p>Recall is bought with {@code oversample}: the beam collects {@code oversample * k}
+     * candidates and the exact pass picks the k best of them, so a node the quantisation
+     * mis-ranks is still recovered as long as it lands inside the wider set.</p>
+     *
+     * @param query Query vector
+     * @param k Number of neighbours to return
+     * @param oversample How many candidates to measure per result, at least 1
+     * @return The k nearest, closest first, scored exactly
+     * @throws IllegalStateException if the graph is closed
+     * @throws IllegalArgumentException if the query is null or wrong dimension, k is not
+     *         positive, or oversample is below 1
+     */
+    public List<HnswSearchResult> searchWithPQThenRerank(float[] query, int k, int oversample) {
+        validateNotClosed();
+        validateQuery(query);
+        if (k <= 0) {
+            throw new IllegalArgumentException("k must be positive: " + k);
+        }
+        if (oversample < 1) {
+            throw new IllegalArgumentException("oversample must be at least 1: " + oversample);
+        }
+
+        if (pq == null || !pq.isTrained()) {
+            return search(query, k);
+        }
+
+        // One read lock over both passes, which the nested acquisitions below re-enter. The
+        // candidates are node ids, and a compaction between the two passes renumbers them -
+        // the rescore would then measure the query against whichever vectors had inherited
+        // those ids, and return them as this segment's nearest.
+        lock.readLock().lock();
+        try {
+            List<HnswSearchResult> candidates =
+                searchWithPQ(query, candidateWidth(k, oversample));
+            return rescoreExactly(query, candidates, k);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * The number of candidates a rescored search collects, saturating instead of overflowing.
+     *
+     * <p>{@code k} reaches here from the caller and the oversample from configuration, so the
+     * product can leave the int range; wrapping would turn the beam width negative.</p>
+     */
+    private static int candidateWidth(int k, int oversample) {
+        long widened = (long) k * oversample;
+        return widened > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) widened;
+    }
+
+    /**
+     * Re-measures candidates against their stored vectors and keeps the k nearest.
+     *
+     * <p>A candidate tombstoned since the beam admitted it is dropped rather than carried
+     * through with a distance nothing backs, which is the same re-check
+     * {@link #search(float[], int)} makes on its way out.</p>
+     *
+     * @param query The query vector
+     * @param candidates What the quantised beam proposed
+     * @param k How many to keep
+     * @return The k nearest candidates, closest first
+     */
+    private List<HnswSearchResult> rescoreExactly(
+            float[] query, List<HnswSearchResult> candidates, int k) {
+
+        lock.readLock().lock();
+        try {
+            List<HnswSearchResult> measured = new ArrayList<>(candidates.size());
+            for (HnswSearchResult candidate : candidates) {
+                NodeView node = readNode(candidate.nodeId());
+                if (node == null || node.isTombstoned()) {
+                    continue;
+                }
+                measured.add(createSearchResult(
+                    candidate.nodeId(), computeDistance(query, node.vector())));
+            }
+
+            measured.sort(Comparator.comparingDouble(HnswSearchResult::distance));
+            return new ArrayList<>(measured.subList(0, Math.min(k, measured.size())));
         } finally {
             lock.readLock().unlock();
         }
@@ -3717,6 +4182,7 @@ public class HnswGraph implements AutoCloseable {
             segment.setInt(OFFSET_CONFIG_EF_SEARCH, config.efSearch());
             segment.setLong(OFFSET_CONFIG_ML, Double.doubleToLongBits(config.mL()));
             segment.setLong(OFFSET_MAX_NODES, maxNodes);
+            segment.setInt(OFFSET_METRIC, PersistedMetric.codeFor(distanceFunction.name()));
 
             return HEADER_SIZE;
         } finally {

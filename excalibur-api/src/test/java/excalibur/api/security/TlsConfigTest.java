@@ -92,10 +92,12 @@ class TlsConfigTest {
         @DisplayName("an unreadable value for the enable flag is not read as off")
         void unparseableFlagDoesNotSilentlyDisable() {
             // "on" is not a boolean. Reading it as false would serve plaintext to an operator who
-            // asked for TLS, so it fails instead.
+            // asked for TLS, so it fails instead - naming the value that could not be read,
+            // rather than the keystore that a guessed-at "enabled" would then be missing.
             assertThatThrownBy(() -> TlsConfig.fromProperties(Map.of(TlsConfig.KEY_ENABLED, "on")))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining(TlsConfig.KEY_KEYSTORE);
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(TlsConfig.KEY_ENABLED)
+                .hasMessageContaining("on");
         }
     }
 

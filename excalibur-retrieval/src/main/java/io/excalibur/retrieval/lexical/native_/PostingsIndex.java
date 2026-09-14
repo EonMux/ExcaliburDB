@@ -3,6 +3,7 @@ package io.excalibur.retrieval.lexical.native_;
 import excalibur.filter.CuckooFilter;
 import io.excalibur.core.hash.XxHash64;
 import io.excalibur.core.mapped.MappedFile;
+import io.excalibur.retrieval.lexical.Bm25Parameters;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,13 +27,16 @@ import java.util.Objects;
  * copy of text this engine already holds in its segments.</p>
  *
  * <h2>Layout</h2>
- * <p>Five mapped files, all big-endian (the order MappedFile uses), all read through the page cache rather than the heap:</p>
+ * <p>All big-endian (the order MappedFile uses), all read through the page cache rather than the
+ * heap:</p>
  * <pre>
+ * index.meta  counts, and the BM25 pair the index was built with; see IndexMeta
  * terms.dict  [len:int32][utf8 bytes]...          terms in id order
  * terms.hash  [hash:int64][termId:int32][pad:int32]  open-addressed, power-of-two slots
- * post.off    [start:int64] x (termCount + 1)     CSR row offsets
- * post.doc    [docId:int32] x postingCount        doc ids, ascending within a term
- * post.tf     [tf:uint8] x postingCount           term frequency, saturating
+ * post.off    [start:int32] x (termCount + 1),    CSR row offsets, as block indices
+ *             then [offset:int64] x termCount     where each term starts in terms.dict
+ * post.blk    [record:24 bytes] x blockCount      one header per block; see BlockLayout
+ * post.dat    packed doc gaps and frequencies     addressed by the block headers
  * docs.len    [tokens:int32] x docCount           document length, for BM25 normalisation
  * </pre>
  *
@@ -46,11 +50,19 @@ public final class PostingsIndex implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(PostingsIndex.class);
 
-    /** BM25 term-frequency saturation. */
-    public static final double K1 = 1.2;
+    /**
+     * BM25 term-frequency saturation, when a deployment has not chosen its own.
+     *
+     * @see Bm25Parameters
+     */
+    public static final double K1 = Bm25Parameters.DEFAULT_K1;
 
-    /** BM25 length normalisation. */
-    public static final double B = 0.75;
+    /**
+     * BM25 length normalisation, when a deployment has not chosen its own.
+     *
+     * @see Bm25Parameters
+     */
+    public static final double B = Bm25Parameters.DEFAULT_B;
 
     /** Load factor of the term hash table; below 0.7 probing stays short. */
     private static final double HASH_LOAD = 0.6;
@@ -67,6 +79,7 @@ public final class PostingsIndex implements AutoCloseable {
     private final int docCount;
     private final int hashSlots;
     private final double averageDocLength;
+    private final Bm25Parameters bm25;
     private final CuckooFilter presence;
 
     /**
@@ -80,20 +93,37 @@ public final class PostingsIndex implements AutoCloseable {
     private final int[] docLengths;
 
     /**
-     * The largest query-independent BM25 factor in each term's postings, computed once at open.
+     * Whether this index's block headers hold a bound baked in against its own statistics.
      *
-     * <p>This is the bound WAND prunes with, so it has to be tight or the pivot never moves. It
-     * also has to be free at query time: deriving it per query meant scanning the block headers
-     * of every query term, which for a word appearing in most of the corpus is thousands of
-     * mapped reads and measured slower than not pruning at all. One sequential pass at open over
-     * headers that are 24 bytes each, and four bytes a term to keep, buys both.</p>
+     * <p>Such a bound is only valid for the mean document length the segment happened to have
+     * when it was written, which is not the mean a query across segments scores with, so it is
+     * ignored entirely and every term falls back to the saturation ceiling. See
+     * {@link #boundsFor}.</p>
      */
-    private final float[] termMaxSaturation;
+    private final boolean bakedInBlockBounds;
+
+    /**
+     * The largest query-independent BM25 factor each term can contribute, for one mean length.
+     *
+     * <p>This is the bound MaxScore prunes with, so it has to be tight or no term ever becomes
+     * non-essential. It also has to be free at query time: deriving it per query meant scanning
+     * the block headers of every query term, which for a word appearing in most of the corpus is
+     * thousands of mapped reads and measured slower than not pruning at all.</p>
+     *
+     * <p>It cannot simply be computed once at open, because the mean document length a query
+     * scores against belongs to the whole collection and changes as segments are published. So it
+     * is computed for one mean and kept until a query arrives with a different one - which, for a
+     * store whose segment set is not changing, is never. Publication of the replacement is a
+     * plain volatile write and two readers that race merely compute the same array twice, because
+     * the array is a pure function of the mean and of bytes that never change.</p>
+     */
+    private volatile TermBounds bounds;
 
     private PostingsIndex(MappedFile termsDict, MappedFile termsHash, MappedFile postOff,
                           MappedFile postBlk, MappedFile postDat, MappedFile docsLen,
                           int termCount, int docCount, int hashSlots, double averageDocLength,
-                          CuckooFilter presence, int[] docLengths, float[] termMaxSaturation) {
+                          Bm25Parameters bm25, CuckooFilter presence, int[] docLengths,
+                          boolean bakedInBlockBounds) {
         this.termsDict = termsDict;
         this.termsHash = termsHash;
         this.postOff = postOff;
@@ -104,27 +134,39 @@ public final class PostingsIndex implements AutoCloseable {
         this.docCount = docCount;
         this.hashSlots = hashSlots;
         this.averageDocLength = averageDocLength;
+        this.bm25 = bm25;
         this.presence = presence;
         this.docLengths = docLengths;
-        this.termMaxSaturation = termMaxSaturation;
+        this.bakedInBlockBounds = bakedInBlockBounds;
     }
 
-    /** Opens an index previously written by {@link PostingsWriter}. */
+    /** Every term's impact bound, for the one mean document length it was computed against. */
+    private record TermBounds(double average, float[] byTerm) { }
+
+    /** Opens an index previously written by {@link PostingsWriter}, scored with the defaults. */
     public static PostingsIndex open(Path directory) throws IOException {
+        return open(directory, Bm25Parameters.DEFAULT);
+    }
+
+    /**
+     * Opens an index to be scored with a chosen BM25 pair.
+     *
+     * @param bm25 What this node is configured to score with
+     * @throws Bm25MismatchException if the index was built with a different pair, since every
+     *                               score and therefore every ranking it can produce would differ
+     *                               from the one the corpus was ingested for
+     */
+    public static PostingsIndex open(Path directory, Bm25Parameters bm25) throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
-        MappedFile meta = MappedFile.open(directory.resolve("index.meta"));
-        int termCount;
-        int docCount;
-        int hashSlots;
-        double averageDocLength;
-        try {
-            termCount = meta.readInt(0);
-            docCount = meta.readInt(4);
-            hashSlots = meta.readInt(8);
-            averageDocLength = meta.readDouble(16);
-        } finally {
-            meta.close();
+        Objects.requireNonNull(bm25, "bm25 must not be null");
+        IndexMeta meta = IndexMeta.read(directory);
+        if (!meta.bm25().equals(bm25)) {
+            throw new Bm25MismatchException(directory, meta.bm25(), bm25);
         }
+        int termCount = meta.termCount();
+        int docCount = meta.docCount();
+        int hashSlots = meta.hashSlots();
+        double averageDocLength = meta.averageDocLength();
 
         MappedFile dict = MappedFile.open(directory.resolve("terms.dict"));
         MappedFile hash = MappedFile.open(directory.resolve("terms.hash"));
@@ -155,10 +197,18 @@ public final class PostingsIndex implements AutoCloseable {
                            | ((raw[b + 2] & 0xFF) << 8) | (raw[b + 3] & 0xFF);
             }
         }
+        if (meta.hasBakedInBlockBounds()) {
+            LOGGER.warn("Lexical index {} predates statistic-free block bounds, so its impact "
+                + "bounds are ignored and pruning falls back to the saturation ceiling; results "
+                + "are exact but slower until the segment is rewritten by a compaction",
+                directory);
+        }
         PostingsIndex index = new PostingsIndex(dict, hash, off, blk, dat, len,
-            termCount, docCount, hashSlots, averageDocLength, presence, lengths,
-            new float[termCount]);
-        index.computeTermBounds();
+            termCount, docCount, hashSlots, averageDocLength, bm25, presence, lengths,
+            meta.hasBakedInBlockBounds());
+        // Warmed for this index's own mean length, which is what a search that supplies no
+        // collection statistics scores against.
+        index.boundsFor(averageDocLength);
         return index;
     }
 
@@ -244,12 +294,12 @@ public final class PostingsIndex implements AutoCloseable {
      * Scores documents for a set of weighted terms and returns the best {@code limit}.
      *
      * <h2>Blocks that are never read</h2>
-     * <p>Each postings block records the last doc id it holds and the largest query-independent
-     * BM25 factor any of its postings has. That is enough to decide two things without touching
-     * the block: whether every document in it is already behind the cursor, and whether the most
-     * it could contribute still leaves a document below the current tenth-best score. A postings
-     * row for a common word is mostly blocks of the second kind, which is why a query full of
-     * ordinary English words stopped costing what it did.</p>
+     * <p>Each postings block records the last doc id it holds, the largest frequency any of its
+     * postings has and the length of its shortest document. That is enough to decide two things
+     * without touching the block: whether every document in it is already behind the cursor, and
+     * whether the most it could contribute still leaves a document below the current tenth-best
+     * score. A postings row for a common word is mostly blocks of the second kind, which is why a
+     * query full of ordinary English words stopped costing what it did.</p>
      *
      * <p>Blocks are decoded lazily, one per term at a time, so a row of ten thousand postings
      * costs a 128-posting decode when it is needed and nothing when it is not.</p>
@@ -266,6 +316,12 @@ public final class PostingsIndex implements AutoCloseable {
     /**
      * Scores against statistics supplied by the caller, for an index that is one of several.
      *
+     * <p>The statistics reach the pruning bounds as well as the scores, and they have to: BM25
+     * divides a document's length by the mean length of the collection, so a bound measured
+     * against this segment's own mean is an underestimate for any collection whose documents are
+     * longer on average - and MaxScore treats a bound as certain. A segment of short chunks
+     * inside a corpus of long ones would have its best documents pruned, silently.</p>
+     *
      * @param stats Collection-wide statistics, or null to use this index's own
      */
     public Hit[] search(String[] terms, double[] weights, int limit, Stats stats) {
@@ -275,7 +331,25 @@ public final class PostingsIndex implements AutoCloseable {
         if (limit <= 0 || docCount == 0) {
             return new Hit[0];
         }
+        double average = stats == null ? averageDocLength : stats.averageDocLength();
+        Cursor[] cursors = openCursors(terms, weights, stats, average);
+        if (cursors.length == 0) {
+            return new Hit[0];
+        }
+        return maxScore(cursors, Math.min(limit, docCount), average);
+    }
 
+    /**
+     * A cursor for every query term the dictionary knows, carrying its bound under {@code
+     * average}.
+     *
+     * <p>Terms the index does not hold are dropped rather than carried as empty cursors: an
+     * expanded query is mostly words this corpus never used, and a cursor for one of them would
+     * be scanned, sorted and suffix-summed to contribute nothing.</p>
+     */
+    private Cursor[] openCursors(String[] terms, double[] weights, Stats stats, double average) {
+        float[] bound = boundsFor(average).byTerm();
+        int collectionSize = stats == null ? docCount : stats.docCount();
         int distinct = 0;
         Cursor[] cursors = new Cursor[terms.length];
         for (int t = 0; t < terms.length; t++) {
@@ -288,106 +362,93 @@ public final class PostingsIndex implements AutoCloseable {
             if (firstBlock >= endBlock) {
                 continue;
             }
-            int localDf = documentFrequency(termId);
-            int df = stats == null ? localDf : Math.max(1, stats.documentFrequency().applyAsInt(terms[t]));
-            int n = stats == null ? docCount : stats.docCount();
-            double idf = Math.log(1.0 + (n - df + 0.5) / (df + 0.5));
+            int df = stats == null ? documentFrequency(termId)
+                : Math.max(1, stats.documentFrequency().applyAsInt(terms[t]));
+            double idf = Math.log(1.0 + (collectionSize - df + 0.5) / (df + 0.5));
             cursors[distinct++] =
-                new Cursor(firstBlock, endBlock, idf, weights[t], termMaxSaturation[termId]);
+                new Cursor(firstBlock, endBlock, idf, weights[t], bound[termId]);
         }
-        if (distinct == 0) {
-            return new Hit[0];
-        }
-        cursors = java.util.Arrays.copyOf(cursors, distinct);
-        // Strongest bound first, so the suffix sums below shrink as fast as possible.
-        java.util.Arrays.sort(cursors, (a, b) -> Double.compare(b.bound, a.bound));
-        double average = stats == null ? averageDocLength : stats.averageDocLength();
-        int wanted = Math.min(limit, docCount);
-        double[] heapScore = new double[wanted];
-        int[] heapDoc = new int[wanted];
-        int held = 0;
-        double threshold = 0;
+        return java.util.Arrays.copyOf(cursors, distinct);
+    }
 
-        for (Cursor cursor : cursors) {
-            cursor.load(this);
-        }
-
-        // MaxScore, with bounds taken from what the postings actually contain.
-        //
-        // Terms are ordered by the most they can contribute and a suffix sum is kept. Once the
-        // heap is full, any term whose suffix sum has fallen below the tenth-best score can no
-        // longer *surface* a candidate: a document appearing only in those terms cannot reach
-        // the heap however it scores. Such terms stop being scanned and are only sought into,
-        // which is where the saving is - but they still contribute to every document another
-        // term surfaced, which is what keeps the result exact.
-        //
-        // WAND was measured here too, with the same tight bounds, and was slower: on a query of
-        // six ordinary English words its pivot sits at the first cursor almost every iteration,
-        // so every document is scored anyway and the pivot arithmetic is pure overhead - 39 ms
-        // against 24 ms. Its advantage needs queries that mix very rare terms with very common
-        // ones, which expansion produces less often than it looks.
+    /**
+     * MaxScore, with bounds taken from what the postings actually contain.
+     *
+     * <p>Terms are ordered by the most they can contribute and a suffix sum is kept. Once the
+     * heap is full, any term whose suffix sum has fallen below the tenth-best score can no longer
+     * <em>surface</em> a candidate: a document appearing only in those terms cannot reach the heap
+     * however it scores. Such terms stop being scanned and are only sought into, which is where
+     * the saving is - but they still contribute to every document another term surfaced, which is
+     * what keeps the result exact.</p>
+     *
+     * <p>WAND was measured here too, with the same tight bounds, and was slower: on a query of six
+     * ordinary English words its pivot sits at the first cursor almost every iteration, so every
+     * document is scored anyway and the pivot arithmetic is pure overhead - 39 ms against 24 ms.
+     * Its advantage needs queries that mix very rare terms with very common ones, which expansion
+     * produces less often than it looks.</p>
+     */
+    private Hit[] maxScore(Cursor[] cursors, int wanted, double average) {
+        // Strongest bound first, so the suffix sums shrink as fast as possible.
         java.util.Arrays.sort(cursors, (a, b) -> Double.compare(b.bound, a.bound));
-        double[] suffix = new double[distinct + 1];
-        for (int i = distinct - 1; i >= 0; i--) {
+        double[] suffix = new double[cursors.length + 1];
+        for (int i = cursors.length - 1; i >= 0; i--) {
             suffix[i] = suffix[i + 1] + cursors[i].bound;
         }
-        int essential = distinct;
-
         for (Cursor cursor : cursors) {
             cursor.load(this);
         }
 
+        TopHits top = new TopHits(wanted);
+        int essential = cursors.length;
         while (true) {
-            int current = Integer.MAX_VALUE;
-            for (int c = 0; c < essential; c++) {
-                int doc = cursors[c].currentDoc();
-                if (doc >= 0 && doc < current) {
-                    current = doc;
-                }
-            }
-            if (current == Integer.MAX_VALUE) {
+            int current = nextCandidate(cursors, essential);
+            if (current < 0) {
                 break;
             }
-
-            double normBase = K1 * (1 - B + B * docLengths[current] / average);
-            double score = 0;
-            for (Cursor cursor : cursors) {
-                cursor.advanceTo(this, current);
-                if (cursor.currentDoc() == current) {
-                    int tf = cursor.currentFreq();
-                    score += cursor.weight * cursor.idf * (tf * (K1 + 1)) / (tf + normBase);
-                    cursor.step(this);
-                }
+            double score = scoreDocument(cursors, current, average);
+            if (score <= 0) {
+                continue;
             }
-
-            if (score > 0) {
-                if (held < wanted) {
-                    heapScore[held] = score;
-                    heapDoc[held] = current;
-                    held++;
-                    if (held == wanted) {
-                        siftAll(heapScore, heapDoc, held);
-                    }
-                } else if (score > heapScore[0]) {
-                    heapScore[0] = score;
-                    heapDoc[0] = current;
-                    siftDown(heapScore, heapDoc, 0, held);
-                }
-                if (held == wanted) {
-                    threshold = heapScore[0];
-                    while (essential > 1 && suffix[essential - 1] <= threshold) {
-                        essential--;
-                    }
-                }
+            top.offer(current, score);
+            while (essential > 1 && top.isFull() && suffix[essential - 1] <= top.threshold()) {
+                essential--;
             }
         }
+        return top.ranked();
+    }
 
-        Hit[] hits = new Hit[held];
-        for (int i = 0; i < held; i++) {
-            hits[i] = new Hit(heapDoc[i], heapScore[i]);
+    /** The lowest doc id any term still able to surface a candidate is sitting on, or -1. */
+    private static int nextCandidate(Cursor[] cursors, int essential) {
+        int lowest = Integer.MAX_VALUE;
+        for (int c = 0; c < essential; c++) {
+            int doc = cursors[c].currentDoc();
+            if (doc >= 0 && doc < lowest) {
+                lowest = doc;
+            }
         }
-        java.util.Arrays.sort(hits, (a, b) -> Double.compare(b.score(), a.score()));
-        return hits;
+        return lowest == Integer.MAX_VALUE ? -1 : lowest;
+    }
+
+    /**
+     * One document's whole score, from every term including the ones that cannot surface it.
+     *
+     * <p>Every cursor is advanced, not only the essential ones. A term too weak to bring a
+     * document into the top-k on its own still adds its score to one another term brought in, and
+     * dropping that contribution is how a pruning scorer ends up returning the right documents in
+     * the wrong order.</p>
+     */
+    private double scoreDocument(Cursor[] cursors, int doc, double average) {
+        double normBase = bm25.lengthNorm(docLengths[doc], average);
+        double score = 0;
+        for (Cursor cursor : cursors) {
+            cursor.advanceTo(this, doc);
+            if (cursor.currentDoc() == doc) {
+                score += cursor.weight * cursor.idf
+                    * bm25.saturation(cursor.currentFreq(), normBase);
+                cursor.step(this);
+            }
+        }
+        return score;
     }
 
     /** A position in one term's postings, decoding a block only when it must. */
@@ -399,7 +460,6 @@ public final class PostingsIndex implements AutoCloseable {
         long block;
         int within = -1;
         int count;
-        float maxSaturation;
         final int[] docs = new int[BlockLayout.BLOCK_SIZE];
         final int[] freqs = new int[BlockLayout.BLOCK_SIZE];
         // Reused across blocks: a decode per block otherwise allocates and discards a buffer per
@@ -407,7 +467,7 @@ public final class PostingsIndex implements AutoCloseable {
         byte[] scratch = new byte[BlockLayout.BLOCK_SIZE * 8 + 16];
         boolean decoded;
 
-        Cursor(long firstBlock, long endBlock, double idf, double weight, double maxSaturation) {
+        Cursor(long firstBlock, long endBlock, double idf, double weight, double maxImpact) {
             this.block = firstBlock;
             this.endBlock = endBlock;
             this.idf = idf;
@@ -415,8 +475,9 @@ public final class PostingsIndex implements AutoCloseable {
             // The largest score this term can add to any document, taken from what its blocks
             // actually contain rather than from the theoretical ceiling of the BM25 saturation
             // curve. (K1 + 1) is a true bound and a useless one: real postings sit far below it,
-            // so a pivot computed from it almost never advances and the skipping never happens.
-            this.bound = Math.abs(weight) * idf * maxSaturation;
+            // so a term computed from it almost never becomes non-essential and the skipping
+            // never happens.
+            this.bound = Math.abs(weight) * idf * maxImpact;
         }
 
         void load(PostingsIndex index) {
@@ -484,20 +545,85 @@ public final class PostingsIndex implements AutoCloseable {
         }
     }
 
-    /** One pass over the block headers, filling in every term's bound. */
-    private void computeTermBounds() {
-        for (int termId = 0; termId < termCount; termId++) {
-            float max = 0f;
-            long end = rowEnd(termId);
-            for (long b = rowStart(termId); b < end; b++) {
-                float value = postBlk.readFloat(
-                    b * BlockLayout.RECORD_BYTES + BlockLayout.OFFSET_MAX_SATURATION);
-                if (value > max) {
-                    max = value;
-                }
-            }
-            termMaxSaturation[termId] = max;
+    /**
+     * Every term's impact bound under a given mean document length, computed or reused.
+     *
+     * <p>The mean is compared by value rather than by how it was obtained: a store recomputes it
+     * from the same segments on every query and gets the same double back, so the cached array
+     * survives for as long as the segment set does. When it does change, the whole array is
+     * rebuilt in one sequential pass over the block headers - which is exactly the pass open
+     * already makes, so the worst a change of statistics costs is one more open.</p>
+     */
+    private TermBounds boundsFor(double average) {
+        TermBounds cached = bounds;
+        if (cached != null && cached.average() == average) {
+            return cached;
         }
+        TermBounds fresh = new TermBounds(average, computeTermBounds(average));
+        bounds = fresh;
+        return fresh;
+    }
+
+    /** One pass over the block headers, filling in every term's bound. */
+    private float[] computeTermBounds(double average) {
+        float[] byTerm = new float[termCount];
+        if (bakedInBlockBounds) {
+            java.util.Arrays.fill(byTerm, (float) bm25.maximumSaturation());
+            return byTerm;
+        }
+        for (int termId = 0; termId < termCount; termId++) {
+            double max = 0;
+            long end = rowEnd(termId);
+            for (long block = rowStart(termId); block < end; block++) {
+                max = Math.max(max, blockBound(block, average));
+            }
+            // Rounded up rather than to nearest. A float is four bytes a term instead of eight,
+            // which matters on a dictionary of millions, but rounding to nearest can land one
+            // ulp below the double the scorer computes - and a bound one ulp too low is not a
+            // bound. Rounding away from zero costs nothing and cannot be crossed.
+            byTerm[termId] = Math.nextUp((float) max);
+        }
+        return byTerm;
+    }
+
+    /**
+     * The most any posting in one block can contribute, before the query's weight and idf.
+     *
+     * <p>Taken from the block's largest frequency and its shortest document rather than from any
+     * single posting: saturation rises with frequency and falls with length, so that corner
+     * bounds every posting the block holds whether or not one of them sits at it. A block whose
+     * frequency field has hit its ceiling says only "this many or more", so it is bounded by the
+     * saturation ceiling instead.</p>
+     */
+    private double blockBound(long block, double average) {
+        long record = block * BlockLayout.RECORD_BYTES;
+        int maxFrequency = postBlk.readByte(record + BlockLayout.OFFSET_MAX_FREQUENCY) & 0xFF;
+        if (maxFrequency >= BlockLayout.FREQUENCY_LIMIT) {
+            return bm25.maximumSaturation();
+        }
+        return bm25.saturation(maxFrequency, bm25.lengthNorm(minLength(record), average));
+    }
+
+    /** MappedFile exposes no 24-bit accessor, so the length is read as three big-endian bytes. */
+    private int minLength(long record) {
+        long at = record + BlockLayout.OFFSET_MIN_LENGTH;
+        return ((postBlk.readByte(at) & 0xFF) << 16)
+             | ((postBlk.readByte(at + 1) & 0xFF) << 8)
+             | (postBlk.readByte(at + 2) & 0xFF);
+    }
+
+    /**
+     * The largest impact any of a term's postings can have, as the pruning bound reads it.
+     *
+     * <p>Exposed so that the soundness of skipping can be asserted against the scorer's own
+     * arithmetic rather than inferred from whether a sample of queries happens to expose a
+     * bound that is too low.
+     *
+     * @param averageDocumentLength The mean the query scores against, which is the only mean the
+     *                              bound is claimed to hold for
+     */
+    float termBound(int termId, double averageDocumentLength) {
+        return boundsFor(averageDocumentLength).byTerm()[termId];
     }
 
     /** MappedFile exposes no 16-bit accessor, so the count is read as two big-endian bytes. */
@@ -509,7 +635,6 @@ public final class PostingsIndex implements AutoCloseable {
     private void decode(Cursor cursor) {
         long record = cursor.block * BlockLayout.RECORD_BYTES;
         int firstDoc = postBlk.readInt(record + BlockLayout.OFFSET_FIRST_DOC);
-        cursor.maxSaturation = postBlk.readFloat(record + BlockLayout.OFFSET_MAX_SATURATION);
         long dataOffset = postBlk.readLong(record + BlockLayout.OFFSET_DATA);
         int count = readCount(record + BlockLayout.OFFSET_COUNT);
         int docBits = postBlk.readByte(record + BlockLayout.OFFSET_DOC_BITS) & 0xFF;
@@ -536,36 +661,6 @@ public final class PostingsIndex implements AutoCloseable {
         cursor.decoded = true;
     }
 
-    private static void siftAll(double[] score, int[] doc, int size) {
-        for (int i = size / 2 - 1; i >= 0; i--) {
-            siftDown(score, doc, i, size);
-        }
-    }
-
-    /** Min-heap on score, so position 0 is the weakest hit currently held. */
-    private static void siftDown(double[] score, int[] doc, int start, int size) {
-        int root = start;
-        while (true) {
-            int child = 2 * root + 1;
-            if (child >= size) {
-                return;
-            }
-            if (child + 1 < size && score[child + 1] < score[child]) {
-                child++;
-            }
-            if (score[root] <= score[child]) {
-                return;
-            }
-            double s = score[root];
-            score[root] = score[child];
-            score[child] = s;
-            int d = doc[root];
-            doc[root] = doc[child];
-            doc[child] = d;
-            root = child;
-        }
-    }
-
     /**
      * Collection-wide statistics BM25 must be scored against.
      *
@@ -587,6 +682,15 @@ public final class PostingsIndex implements AutoCloseable {
     /** Mean document length in this index alone. */
     public double averageDocumentLength() {
         return averageDocLength;
+    }
+
+    /**
+     * The BM25 pair this index is scored with, which is also the pair it was built with.
+     *
+     * <p>The two cannot differ: opening an index under a pair it was not built with is refused.
+     */
+    public Bm25Parameters bm25() {
+        return bm25;
     }
 
     /** A term and its postings, for merging or inspection. */

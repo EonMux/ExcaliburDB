@@ -95,6 +95,12 @@ public class IngestEndpoint implements HttpHandler {
     private final SourceFactory sourceFactory;
 
     /**
+     * The ids documents have been supplied directly under, or null on a node that takes no
+     * supplied documents. A crawl registered over one of them deletes what was supplied.
+     */
+    private final InlineSourceIds inlineSourceIds;
+
+    /**
      * Creates a new IngestEndpoint with a source registry.
      *
      * <p>Ingest targets are validated against the default security policy, which has
@@ -179,7 +185,28 @@ public class IngestEndpoint implements HttpHandler {
                           IngestStatusEndpoint.IngestionStatusRegistry statusRegistry,
                           IngestionOrchestrator orchestrator,
                           IngestTargetValidator targetValidator) {
+        this(sourceRegistry, statusRegistry, orchestrator, targetValidator, null);
+    }
+
+    /**
+     * Creates a new IngestEndpoint that also refuses crawls over supplied documents.
+     *
+     * @param sourceRegistry  The registry for managing sources
+     * @param statusRegistry  The registry for tracking ingestion status (may be null)
+     * @param orchestrator    The ingestion orchestrator for background processing (may be null)
+     * @param targetValidator The allow-list policy for ingest targets
+     * @param inlineSourceIds The ids documents have been supplied directly under, whose crawl
+     *                        registration this endpoint refuses, or null on a node that takes
+     *                        no supplied documents
+     * @throws NullPointerException if sourceRegistry or targetValidator is null
+     */
+    public IngestEndpoint(SourceRegistry sourceRegistry,
+                          IngestStatusEndpoint.IngestionStatusRegistry statusRegistry,
+                          IngestionOrchestrator orchestrator,
+                          IngestTargetValidator targetValidator,
+                          InlineSourceIds inlineSourceIds) {
         Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
+        this.inlineSourceIds = inlineSourceIds;
         this.sourceFactory = new SourceFactory(
             Objects.requireNonNull(targetValidator, "IngestTargetValidator cannot be null"));
 
@@ -246,6 +273,22 @@ public class IngestEndpoint implements HttpHandler {
                     return;
                 }
 
+                // After the allow-list, not before it: which targets a caller may point the
+                // crawler at is the boundary, and a request that fails it is refused without
+                // being told anything about what this node holds.
+                //
+                // A crawl decides for itself what its id holds, and its first pass tombstones
+                // every document under that id it did not find - which is every document
+                // supplied by hand. The caller cannot see that loss coming, so it is refused
+                // here rather than discovered later.
+                if (inlineSourceIds != null && inlineSourceIds.isSupplied(request.sourceId())) {
+                    closeQuietly(source);
+                    sendError(exchange, 409, "Source '" + request.sourceId() + "' holds documents "
+                        + "supplied directly; a crawl registered under its id would remove them "
+                        + "on its first pass. Use a different source_id.");
+                    return;
+                }
+
                 // Registration is a single atomic claim on the source ID: checking
                 // first and registering afterwards lets two concurrent requests both
                 // start ingestion and orphan one unclosed Source.
@@ -268,6 +311,21 @@ public class IngestEndpoint implements HttpHandler {
                 } catch (RuntimeException e) {
                     closeQuietly(source);
                     throw e;
+                }
+
+                // Read again after the claim, not only before it. Both routes publish their
+                // claim before their last read - this one registers, the supplied route records
+                // - so whichever publishes second sees the first, and the pair can never both
+                // proceed. Checking only before registering leaves a window the whole length of
+                // a catalog write, and a crawl that wins it deletes the supplied documents on
+                // its first pass.
+                if (inlineSourceIds != null && inlineSourceIds.isSupplied(request.sourceId())) {
+                    sourceRegistry.remove(request.sourceId());
+                    closeQuietly(source);
+                    sendError(exchange, 409, "Source '" + request.sourceId() + "' holds documents "
+                        + "supplied directly; a crawl registered under its id would remove them "
+                        + "on its first pass. Use a different source_id.");
+                    return;
                 }
 
                 // Send success response
@@ -342,6 +400,10 @@ public class IngestEndpoint implements HttpHandler {
                     throw new IllegalArgumentException("Field 'config.root_path' is required for filesystem source");
                 }
                 config.put(SourceFactory.ROOT_PATH, rootPath);
+                rejectFields(configJson, HTTP_ONLY_FIELDS, "an HTTP crawl only: a directory "
+                    + "walk fetches nothing over a wire, so it has no request to time, no "
+                    + "response body to bound and no agent to identify itself as");
+                putFilesystemTunables(configJson, config);
                 break;
 
             case SourceFactory.TYPE_HTTP:
@@ -350,24 +412,173 @@ public class IngestEndpoint implements HttpHandler {
                     throw new IllegalArgumentException("Field 'config.base_url' is required for HTTP source");
                 }
                 config.put(SourceFactory.BASE_URL, baseUrl);
+                rejectFields(configJson, FILESYSTEM_ONLY_FIELDS, "a filesystem walk only: an "
+                    + "HTTP crawl matches URLs, which have neither a file extension nor a "
+                    + "directory, no symbolic links, and no local file to size");
+                putHttpTunables(configJson, config);
                 break;
 
             default:
                 throw new IllegalArgumentException("Unknown source type: " + sourceType);
         }
 
-        // Optional fields
-        String[] includedExtensions = JsonText.stringArray(configJson, SourceFactory.INCLUDED_EXTENSIONS);
-        if (includedExtensions != null) {
-            config.put(SourceFactory.INCLUDED_EXTENSIONS, String.join(",", includedExtensions));
-        }
-
-        String[] excludedDirectories = JsonText.stringArray(configJson, SourceFactory.EXCLUDED_DIRECTORIES);
-        if (excludedDirectories != null) {
-            config.put(SourceFactory.EXCLUDED_DIRECTORIES, String.join(",", excludedDirectories));
-        }
-
         return new SourceDescriptor(sourceType, sourceId, config);
+    }
+
+    /**
+     * Settings only a filesystem walk can apply.
+     *
+     * <p>A crawl has a URL and a host policy: no file extension, no directory name, no
+     * symbolic link and no local file to size.</p>
+     */
+    private static final List<String> FILESYSTEM_ONLY_FIELDS = List.of(
+        SourceFactory.INCLUDED_EXTENSIONS, SourceFactory.EXCLUDED_DIRECTORIES,
+        SourceFactory.FOLLOW_SYMLINKS, SourceFactory.INCLUDE_HIDDEN,
+        SourceFactory.MAX_FILE_BYTES);
+
+    /** Settings only an HTTP crawl can apply. A directory walk fetches nothing over a wire. */
+    private static final List<String> HTTP_ONLY_FIELDS = List.of(
+        SourceFactory.MAX_DOCUMENTS, SourceFactory.MAX_RESPONSE_BYTES,
+        SourceFactory.TIMEOUT_SECONDS, SourceFactory.INCLUDED_PATH_PATTERNS,
+        SourceFactory.EXCLUDED_PATH_PATTERNS, SourceFactory.USER_AGENT);
+
+    /**
+     * Reads the settings that shape a filesystem walk.
+     *
+     * @param configJson The request's config object
+     * @param config     The descriptor being built
+     */
+    private static void putFilesystemTunables(String configJson, Map<String, String> config) {
+        putList(configJson, config, SourceFactory.INCLUDED_EXTENSIONS);
+        putList(configJson, config, SourceFactory.EXCLUDED_DIRECTORIES);
+        putBounded(configJson, config, SourceFactory.MAX_DEPTH, 1, SourceFactory.MAX_CRAWL_DEPTH);
+        putFlag(configJson, config, SourceFactory.FOLLOW_SYMLINKS);
+        putFlag(configJson, config, SourceFactory.INCLUDE_HIDDEN);
+        putBounded(configJson, config, SourceFactory.MAX_FILE_BYTES, 1,
+            SourceFactory.FILE_BYTES_LIMIT);
+    }
+
+    /**
+     * Reads the settings that shape an HTTP crawl.
+     *
+     * @param configJson The request's config object
+     * @param config     The descriptor being built
+     */
+    private static void putHttpTunables(String configJson, Map<String, String> config) {
+        putBounded(configJson, config, SourceFactory.MAX_DEPTH, 0, SourceFactory.MAX_CRAWL_DEPTH);
+        putBounded(configJson, config, SourceFactory.MAX_DOCUMENTS, 1,
+            SourceFactory.DOCUMENTS_LIMIT);
+        putBounded(configJson, config, SourceFactory.MAX_RESPONSE_BYTES, 1,
+            SourceFactory.RESPONSE_BYTES_LIMIT);
+        putBounded(configJson, config, SourceFactory.TIMEOUT_SECONDS, 1,
+            SourceFactory.TIMEOUT_SECONDS_LIMIT);
+        putList(configJson, config, SourceFactory.INCLUDED_PATH_PATTERNS);
+        putList(configJson, config, SourceFactory.EXCLUDED_PATH_PATTERNS);
+        putUserAgent(configJson, config);
+    }
+
+    /**
+     * Copies a string array across as a comma-joined value, absent staying absent.
+     *
+     * <p>A comma inside an element is refused rather than carried. The registration is
+     * recorded and restored as a comma-joined string, so an element containing one comes back
+     * as two: {@code ["/a,b/"]} would exclude {@code /a} and {@code b/}, far more of the crawl
+     * than was asked for, and the caller would be told the source registered fine.</p>
+     */
+    private static void putList(String configJson, Map<String, String> config, String field) {
+        String[] values = JsonText.stringArray(configJson, field);
+        if (values == null) {
+            return;
+        }
+        for (String value : values) {
+            if (value.indexOf(',') >= 0) {
+                throw new IllegalArgumentException("Field 'config." + field + "' must not "
+                    + "contain a comma in any element: the list is stored comma-separated, so "
+                    + "one element would be restored as two. Send them as separate elements.");
+            }
+        }
+        config.put(field, String.join(",", values));
+    }
+
+    /** Copies a true/false setting across, absent staying absent. */
+    private static void putFlag(String configJson, Map<String, String> config, String field) {
+        if (JsonText.has(configJson, field)) {
+            config.put(field, Boolean.toString(JsonText.booleanValue(configJson, field, false)));
+        }
+    }
+
+    /**
+     * Copies a whole-number setting across, refusing one outside the bound this node allows.
+     *
+     * <p>The bound is what stops a registration from sizing this node's work: a crawl depth,
+     * a document count and a response size each decide how much memory and how many requests
+     * one registration turns into.</p>
+     */
+    private static void putBounded(String configJson, Map<String, String> config, String field,
+                                   long min, long max) {
+        if (!JsonText.has(configJson, field)) {
+            return;
+        }
+        long value = JsonText.longValue(configJson, field, min);
+        if (value < min || value > max) {
+            throw new IllegalArgumentException("Field 'config." + field + "' must be between "
+                + min + " and " + max + ", got: " + value);
+        }
+        config.put(field, Long.toString(value));
+    }
+
+    /**
+     * Copies the crawl's User-Agent across, refusing one that could forge a header.
+     *
+     * <p>The value is sent as a request header. A carriage return or a newline in it would end
+     * that header and start one the caller wrote, so the crawl would carry headers this node
+     * never agreed to send.</p>
+     */
+    private static void putUserAgent(String configJson, Map<String, String> config) {
+        String userAgent = JsonText.string(configJson, SourceFactory.USER_AGENT);
+        if (userAgent == null) {
+            return;
+        }
+        if (userAgent.isBlank()) {
+            throw new IllegalArgumentException(
+                "Field 'config." + SourceFactory.USER_AGENT + "' must not be blank");
+        }
+        if (userAgent.length() > SourceFactory.USER_AGENT_LIMIT) {
+            throw new IllegalArgumentException("Field 'config." + SourceFactory.USER_AGENT
+                + "' must be at most " + SourceFactory.USER_AGENT_LIMIT + " characters, got: "
+                + userAgent.length());
+        }
+        for (int i = 0; i < userAgent.length(); i++) {
+            char c = userAgent.charAt(i);
+            if (c < 0x20 || c == 0x7F) {
+                throw new IllegalArgumentException("Field 'config." + SourceFactory.USER_AGENT
+                    + "' must not contain control characters: one of them would end the header "
+                    + "and let the rest of the value become headers this node did not send.");
+            }
+        }
+        config.put(SourceFactory.USER_AGENT, userAgent);
+    }
+
+    /**
+     * Refuses a setting on a source that cannot apply it.
+     *
+     * <p>Refused rather than dropped. A request carrying one would otherwise be answered
+     * {@code 200 registered} and then crawled with the setting discarded, with nothing in the
+     * response or in the status to say so.</p>
+     *
+     * @param configJson The request's config object
+     * @param fields     The settings this source type cannot honour
+     * @param reason     What those settings belong to and why this source cannot apply them
+     * @throws IllegalArgumentException if any of them is present
+     */
+    private static void rejectFields(String configJson, List<String> fields, String reason) {
+        for (String field : fields) {
+            if (JsonText.has(configJson, field)) {
+                throw new IllegalArgumentException("Field 'config." + field + "' applies to "
+                    + reason + ". Remove it, or register this source with the source_type it "
+                    + "belongs to.");
+            }
+        }
     }
 
     /**

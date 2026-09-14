@@ -5,7 +5,11 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
@@ -13,11 +17,18 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
- * Discovers existing segment files in the data directory.
+ * Discovers existing segment files across every directory a store may span.
  *
- * <p>This class is responsible for scanning the data directory on startup
- * to find existing segment files that were persisted from previous runs.
- * This enables recovery of data after restart.</p>
+ * <p>This class is responsible for scanning on startup to find existing segment files that
+ * were persisted from previous runs. This enables recovery of data after restart.</p>
+ *
+ * <h2>Volumes</h2>
+ * <p>A store spanning several volumes has segment files in several directories, and all of
+ * them have to be scanned: a directory left out is a set of segments the engine concludes never
+ * existed, and it will then create empty files over their indices. Discovery therefore takes
+ * the whole directory set, not just the data directory, and refuses to choose when two
+ * directories both hold a file for the same index - one of the two would have to be discarded,
+ * and nothing here knows which.</p>
  *
  * <h2>Segment File Naming Convention</h2>
  * <p>Segment files follow the pattern: {@code segment_<index>.dat}</p>
@@ -63,9 +74,9 @@ public class SegmentDiscovery {
     );
 
     /**
-     * The data directory to scan for segment files.
+     * Every directory to scan, data directory first, without duplicates.
      */
-    private final Path dataDir;
+    private final List<Path> directories;
 
     /**
      * Creates a new SegmentDiscovery for the specified data directory.
@@ -77,7 +88,38 @@ public class SegmentDiscovery {
         if (dataDir == null) {
             throw new IllegalArgumentException("Data directory cannot be null");
         }
-        this.dataDir = dataDir;
+        this.directories = List.of(dataDir);
+    }
+
+    /**
+     * Creates a new SegmentDiscovery covering every directory a store spans.
+     *
+     * <p>A static factory rather than a constructor overload: {@code new SegmentDiscovery(null)}
+     * would otherwise not say which kind of nothing it meant.</p>
+     *
+     * @param directories The directories to scan, data directory first (must not be null or
+     *                    empty, and must not contain null)
+     * @return A discovery over all of them
+     * @throws IllegalArgumentException if the list is null or empty
+     */
+    public static SegmentDiscovery across(List<Path> directories) {
+        if (directories == null || directories.isEmpty()) {
+            throw new IllegalArgumentException("At least one directory is required");
+        }
+        for (Path directory : directories) {
+            Objects.requireNonNull(directory, "directories cannot contain null");
+        }
+        return new SegmentDiscovery(List.copyOf(new LinkedHashSet<>(directories)), true);
+    }
+
+    /**
+     * Creates a discovery over an already validated, de-duplicated directory list.
+     *
+     * @param directories The directories, data directory first
+     * @param validated   Distinguishes this from the public single-directory constructor
+     */
+    private SegmentDiscovery(List<Path> directories, boolean validated) {
+        this.directories = directories;
     }
 
     /**
@@ -97,14 +139,45 @@ public class SegmentDiscovery {
      * @return List of discovered segments (never null, may be empty)
      */
     public List<DiscoveredSegment> scanDirectory() {
+        Map<Long, DiscoveredSegment> byIndex = new LinkedHashMap<>();
+
+        for (Path directory : directories) {
+            for (DiscoveredSegment segment : scanOne(directory)) {
+                DiscoveredSegment clash = byIndex.putIfAbsent(segment.segmentIndex(), segment);
+                if (clash != null) {
+                    // Keeping one and dropping the other silently discards whichever held the
+                    // newer data, and there is nothing here that can tell them apart.
+                    throw new IllegalStateException(
+                        "Segment " + segment.segmentIndex() + " exists on two volumes at once: "
+                            + clash.path() + " and " + segment.path()
+                            + ". Remove the stale copy before starting.");
+                }
+            }
+        }
+
+        List<DiscoveredSegment> discovered = new ArrayList<>(byIndex.values());
+        LOGGER.log(Level.INFO, "Discovered {0} segment(s) across {1}",
+            new Object[] { discovered.size(), directories });
+
+        return discovered;
+    }
+
+    /**
+     * Scans one directory for segment files.
+     *
+     * @param directory The directory to scan
+     * @return The segments found there, empty when the directory is absent
+     */
+    private List<DiscoveredSegment> scanOne(Path directory) {
         List<DiscoveredSegment> discovered = new ArrayList<>();
 
-        if (!Files.isDirectory(dataDir)) {
-            LOGGER.log(Level.WARNING, "Data directory does not exist or is not a directory: {0}", dataDir);
+        if (!Files.isDirectory(directory)) {
+            LOGGER.log(Level.WARNING, "Data directory does not exist or is not a directory: {0}",
+                directory);
             return discovered;
         }
 
-        try (Stream<Path> files = Files.list(dataDir)) {
+        try (Stream<Path> files = Files.list(directory)) {
             files.filter(Files::isRegularFile)
                  .filter(this::isSegmentFile)
                  .forEach(path -> {
@@ -118,12 +191,9 @@ public class SegmentDiscovery {
                      }
                  });
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to scan data directory: " + dataDir, e);
-            throw new UncheckedIOException("Failed to scan data directory: " + dataDir, e);
+            LOGGER.log(Level.WARNING, "Failed to scan data directory: " + directory, e);
+            throw new UncheckedIOException("Failed to scan data directory: " + directory, e);
         }
-
-        LOGGER.log(Level.INFO, "Discovered {0} segment(s) in {1}",
-            new Object[] { discovered.size(), dataDir });
 
         return discovered;
     }
@@ -137,11 +207,25 @@ public class SegmentDiscovery {
      * @return Path to the WAL file, or null if it doesn't exist
      */
     public Path findWriteLogForSegment(long segmentIndex) {
-        Path walPath = dataDir.resolve("segment_" + segmentIndex + ".wal");
-        if (Files.exists(walPath) && Files.isRegularFile(walPath)) {
-            return walPath;
+        for (Path directory : directories) {
+            Path walPath = writeLogIn(directory, segmentIndex);
+            if (walPath != null) {
+                return walPath;
+            }
         }
         return null;
+    }
+
+    /**
+     * Returns the write log for a segment in one directory, if it is there.
+     *
+     * @param directory    The directory to look in
+     * @param segmentIndex The segment index
+     * @return The WAL path, or null if that directory has none
+     */
+    private static Path writeLogIn(Path directory, long segmentIndex) {
+        Path walPath = directory.resolve("segment_" + segmentIndex + ".wal");
+        return Files.isRegularFile(walPath) ? walPath : null;
     }
 
     /**
@@ -173,8 +257,9 @@ public class SegmentDiscovery {
             long segmentIndex = Long.parseLong(matcher.group(1));
             long fileSize = Files.size(path);
 
-            // Check for associated write log
-            Path walPath = findWriteLogForSegment(segmentIndex);
+            // The write log lives beside its segment. Looking for it anywhere else would
+            // pair a segment on one volume with a log left behind on another.
+            Path walPath = writeLogIn(path.getParent(), segmentIndex);
             long walSize = walPath != null ? Files.size(walPath) : 0;
 
             return new DiscoveredSegment(segmentIndex, path, fileSize, walPath, walSize);
@@ -190,10 +275,19 @@ public class SegmentDiscovery {
     /**
      * Returns the data directory being scanned.
      *
-     * @return The data directory path
+     * @return The data directory path, the first of {@link #getDirectories()}
      */
     public Path getDataDir() {
-        return dataDir;
+        return directories.get(0);
+    }
+
+    /**
+     * Returns every directory this discovery scans, data directory first.
+     *
+     * @return The directories, in scan order
+     */
+    public List<Path> getDirectories() {
+        return directories;
     }
 
     /**

@@ -2,6 +2,7 @@ package io.excalibur.retrieval.lexical;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -38,7 +39,7 @@ import org.slf4j.LoggerFactory;
  *
  * <h2>Memory</h2>
  * Lucene works on the heap while the vector index deliberately does not, so the two compete for
- * different budgets and both have to be sized. {@link #ramBufferSizeMB} caps what indexing holds
+ * different budgets and both have to be sized. {@code ramBufferSizeMB} caps what indexing holds
  * before flushing; searching is served through the page cache like the mapped columns are. Leaving
  * the default and also sizing the heap for vectors is how a process ends up swapping.
  *
@@ -104,36 +105,64 @@ public final class LexicalIndex implements AutoCloseable {
     private final Directory directory;
     private final Analyzer analyzer;
     private final IndexWriter writer;
+    private final Bm25Parameters bm25;
     private final AtomicReference<DirectoryReader> reader = new AtomicReference<>();
     private final AtomicReference<IndexSearcher> searcher = new AtomicReference<>();
 
-    private LexicalIndex(Directory directory, Analyzer analyzer, IndexWriter writer) {
+    private LexicalIndex(Directory directory, Analyzer analyzer, IndexWriter writer,
+                         Bm25Parameters bm25) {
         this.directory = directory;
         this.analyzer = analyzer;
         this.writer = writer;
+        this.bm25 = bm25;
+    }
+
+    /**
+     * Lucene's BM25 at this pair.
+     *
+     * <p>Built fresh for the writer and for each searcher rather than shared, because a
+     * similarity is attached to the object that uses it and Lucene makes no promise about
+     * reusing one across both.
+     */
+    private static BM25Similarity similarityOf(Bm25Parameters bm25) {
+        return new BM25Similarity((float) bm25.k1(), (float) bm25.b());
+    }
+
+    /** Opens, or creates, an index under {@code path}, scored with the default BM25 pair. */
+    public static LexicalIndex open(Path path, double ramBufferSizeMB) throws IOException {
+        return open(path, ramBufferSizeMB, Bm25Parameters.DEFAULT);
     }
 
     /**
      * Opens, or creates, an index under {@code path}.
      *
+     * <p>Unlike the engine's own postings index, the pair is purely a scoring choice here: what
+     * Lucene writes at index time is the field length, which {@code k1} and {@code b} do not
+     * enter into. Changing them therefore takes effect on the next query rather than on the next
+     * reingest.
+     *
      * @param ramBufferSizeMB how much heap indexing may hold before flushing to disk. Sized
      *                        deliberately, because this heap is not available to anything else in
      *                        the process.
+     * @param bm25            what BM25 scores with, from {@code excalibur.ingest.bm25-k1} and
+     *                        {@code excalibur.ingest.bm25-b}
      */
-    public static LexicalIndex open(Path path, double ramBufferSizeMB) throws IOException {
+    public static LexicalIndex open(Path path, double ramBufferSizeMB, Bm25Parameters bm25)
+            throws IOException {
         if (ramBufferSizeMB <= 0) {
             throw new IllegalArgumentException(
                 "ramBufferSizeMB must be positive, got " + ramBufferSizeMB);
         }
+        Objects.requireNonNull(bm25, "bm25 must not be null");
         Directory directory = FSDirectory.open(path);
         Analyzer analyzer = new StandardAnalyzer();
         IndexWriterConfig config = new IndexWriterConfig(analyzer);
         config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
         config.setRAMBufferSizeMB(ramBufferSizeMB);
-        config.setSimilarity(new BM25Similarity());
+        config.setSimilarity(similarityOf(bm25));
 
         IndexWriter writer = new IndexWriter(directory, config);
-        LexicalIndex index = new LexicalIndex(directory, analyzer, writer);
+        LexicalIndex index = new LexicalIndex(directory, analyzer, writer, bm25);
         try {
             index.refresh();
         } catch (IOException e) {
@@ -246,7 +275,7 @@ public final class LexicalIndex implements AutoCloseable {
             return;
         }
         IndexSearcher newSearcher = new IndexSearcher(refreshed);
-        newSearcher.setSimilarity(new BM25Similarity());
+        newSearcher.setSimilarity(similarityOf(bm25));
         reader.set(refreshed);
         searcher.set(newSearcher);
         if (current != null) {

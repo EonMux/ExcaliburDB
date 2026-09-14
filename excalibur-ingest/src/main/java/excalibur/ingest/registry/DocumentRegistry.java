@@ -7,9 +7,12 @@ import org.slf4j.LoggerFactory;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -75,8 +78,31 @@ public final class DocumentRegistry {
     private static final char ESCAPE_CHAR = '\\';
 
     private final ConcurrentHashMap<String, DocumentMetadata> documents;
+    /** Extension of the file a save is written to before it is renamed over the registry. */
+    private static final String REPLACEMENT_SUFFIX = ".new";
+
+    /** Distinguishes one save's replacement file from another's. */
+    private static final java.util.concurrent.atomic.AtomicLong saveCounter =
+        new java.util.concurrent.atomic.AtomicLong();
+
     private final Path persistencePath;
-    private volatile boolean modified = false;
+    /**
+     * Counts mutations, so a save can tell what it wrote from what arrived while it was writing.
+     *
+     * <p>A boolean cleared after the write loses a registration that landed mid-iteration: the
+     * record is not in the file, and the flag says there is nothing to save, so that document's
+     * own save returns without writing. It stays searchable and absent from the registry, which
+     * after a restart makes it neither erasable nor reindexable. A counter cannot lose it - the
+     * save records the version it actually wrote, and a later mutation leaves the two unequal.</p>
+     */
+    private final java.util.concurrent.atomic.AtomicLong version =
+        new java.util.concurrent.atomic.AtomicLong();
+
+    /** The value of {@link #version} as of the last published save. */
+    private volatile long persistedVersion;
+
+    /** Serialises publishing, so two saves cannot interleave onto one registry file. */
+    private final Object persistLock = new Object();
 
     /**
      * Creates an in-memory DocumentRegistry (no persistence).
@@ -125,7 +151,7 @@ public final class DocumentRegistry {
         Objects.requireNonNull(metadata, "metadata must not be null");
         String key = makeKey(metadata.getSourceId(), metadata.getDocumentId());
         documents.put(key, metadata);
-        modified = true;
+        version.incrementAndGet();
     }
 
     /**
@@ -172,7 +198,7 @@ public final class DocumentRegistry {
         String key = makeKey(sourceId, documentId);
         DocumentMetadata removed = documents.remove(key);
         if (removed != null) {
-            modified = true;
+            version.incrementAndGet();
         }
         return removed;
     }
@@ -197,7 +223,7 @@ public final class DocumentRegistry {
         }
         
         if (removed > 0) {
-            modified = true;
+            version.incrementAndGet();
         }
         
         return removed;
@@ -263,7 +289,7 @@ public final class DocumentRegistry {
      */
     public void clear() {
         documents.clear();
-        modified = true;
+        version.incrementAndGet();
     }
 
     /**
@@ -303,6 +329,19 @@ public final class DocumentRegistry {
     /**
      * Persists the registry to disk if a persistence path was configured.
      *
+     * <h3>Why it is written to one file and renamed onto another</h3>
+     * <p>This file is the node's only record of which chunks belong to which document, and every
+     * later erasure and reindex is driven from it. Rewriting it in place means that from the
+     * truncate until the last line is flushed there is no complete registry anywhere: a crash in
+     * that window leaves a file that parses cleanly and silently omits documents the node is
+     * still serving, so those documents can no longer be erased or refreshed and nothing reports
+     * it. Writing the replacement beside it and renaming closes the window - a reader sees the
+     * old registry or the new one, and the rename is what publishes the change.</p>
+     *
+     * <p>The replacement is forced to disk before the rename, because the rename being durable
+     * while the content is not would publish an empty or partial file after a power loss - the
+     * same failure the rename exists to prevent, arrived at from the other side.</p>
+     *
      * @throws IOException if persistence fails
      */
     public void persist() throws IOException {
@@ -310,7 +349,11 @@ public final class DocumentRegistry {
             return;
         }
         
-        if (!modified) {
+        // Read before anything is written, and recorded only after. A mutation that lands while
+        // this save is iterating leaves version above it, so the next save still has work to do
+        // rather than being told the registry is clean.
+        long writing = version.get();
+        if (writing == persistedVersion) {
             return;
         }
         
@@ -318,15 +361,85 @@ public final class DocumentRegistry {
         if (parent != null && !Files.exists(parent)) {
             Files.createDirectories(parent);
         }
-        
-        try (BufferedWriter writer = Files.newBufferedWriter(persistencePath)) {
-            for (DocumentMetadata metadata : documents.values()) {
-                writer.write(formatMetadata(metadata));
-                writer.newLine();
+
+        // Serialised, because four callers reach this - an ingest run, an erasure, a reindex and
+        // shutdown - and the inline-document route reaches it from request threads, so two saves
+        // genuinely overlap. Two writers sharing a replacement path is worse than no replacement
+        // path at all: the second writer's open handle follows the file the first has just
+        // published, and its remaining writes land in the live registry.
+        synchronized (persistLock) {
+            // Beside the registry rather than in the system temp directory: a rename is only
+            // atomic within a filesystem, and a temp directory is routinely on a different one,
+            // where the move silently degrades to the copy this is here to avoid. Named per save
+            // so that a second registry instance over the same path - which this lock does not
+            // cover - still cannot write into a replacement this one is publishing.
+            Path replacement = persistencePath.resolveSibling(persistencePath.getFileName()
+                + "." + saveCounter.incrementAndGet() + REPLACEMENT_SUFFIX);
+            try {
+                try (BufferedWriter writer = Files.newBufferedWriter(replacement,
+                        StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                    for (DocumentMetadata metadata : documents.values()) {
+                        writer.write(formatMetadata(metadata));
+                        writer.newLine();
+                    }
+                    writer.flush();
+                    force(replacement);
+                }
+                move(replacement, persistencePath);
+            } catch (IOException e) {
+                // The old registry is still the published one, so the only thing to undo is the
+                // half-written replacement. Left behind it would never be read, but a failed
+                // save that also leaves litter reads as a worse failure. Suppressed rather than
+                // thrown: losing the real cause to a tidy-up failure is a worse trade.
+                try {
+                    Files.deleteIfExists(replacement);
+                } catch (IOException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
+                throw e;
             }
+
+            persistedVersion = writing;
         }
-        
-        modified = false;
+    }
+
+    /**
+     * Forces a written file to disk.
+     *
+     * <p>Best effort: a filesystem that does not support syncing a file channel is not a reason
+     * to fail a save that has otherwise succeeded, and the rename below still gives a reader
+     * either the whole old registry or the whole new one.</p>
+     *
+     * @param path The file to force
+     */
+    private static void force(Path path) {
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+            channel.force(true);
+        } catch (IOException e) {
+            LOGGER.warn("Could not force the document registry to disk before publishing it: {}",
+                e.getMessage());
+        }
+    }
+
+    /**
+     * Publishes the replacement over the live registry.
+     *
+     * @param replacement The file just written
+     * @param target      The registry path
+     * @throws IOException if the file cannot be published
+     */
+    private static void move(Path replacement, Path target) throws IOException {
+        try {
+            Files.move(replacement, target,
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            // A filesystem that cannot rename atomically leaves no better option than the
+            // replacing move. Said out loud rather than silently accepted: on such a deployment
+            // the window this method exists to close is open again.
+            LOGGER.warn("This filesystem cannot rename atomically; the document registry is "
+                + "published with a plain replace and a crash during it can truncate the file");
+            Files.move(replacement, target, StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     /**
@@ -526,7 +639,7 @@ public final class DocumentRegistry {
      * @return true if modified
      */
     public boolean isModified() {
-        return modified;
+        return version.get() != persistedVersion;
     }
 
     @Override

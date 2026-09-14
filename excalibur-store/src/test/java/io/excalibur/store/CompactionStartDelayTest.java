@@ -22,7 +22,7 @@ class CompactionStartDelayTest {
     @DisplayName("the worker keeps the delay it was given")
     void theWorkerKeepsItsDelay() {
         try (Arena arena = Arena.ofShared()) {
-            CompactionWorker worker = new CompactionWorker(arena, (oldSegment, newSegment) -> { });
+            CompactionWorker worker = new CompactionWorker(arena, (oldSegment, newSegment) -> CompactionOutcome.INSTALLED);
 
             assertThat(worker.getStartDelayMs()).isZero();
 
@@ -36,7 +36,7 @@ class CompactionStartDelayTest {
     @DisplayName("a negative delay is treated as none")
     void aNegativeDelayIsNone() {
         try (Arena arena = Arena.ofShared()) {
-            CompactionWorker worker = new CompactionWorker(arena, (oldSegment, newSegment) -> { });
+            CompactionWorker worker = new CompactionWorker(arena, (oldSegment, newSegment) -> CompactionOutcome.INSTALLED);
 
             worker.withStartDelayMs(-1L);
 

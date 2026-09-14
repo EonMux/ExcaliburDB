@@ -126,6 +126,9 @@ public class CuckooFilter {
     // Total: 32 bytes
     private static final int HEADER_SIZE = 32;
 
+    /** Fewest buckets any filter has, however small its capacity. */
+    private static final int MIN_BUCKETS = 4;
+
     // Header field offsets
     private static final int OFFSET_MAGIC = 0;
     private static final int OFFSET_VERSION = 4;
@@ -222,19 +225,39 @@ public class CuckooFilter {
      * @return A new CuckooFilter instance
      * @throws IllegalArgumentException if fingerprintBits is not in range [8, 16]
      */
+    /**
+     * Rounds up to a power of two, which is what the bucket index depends on.
+     *
+     * <p>Rounding down was the original behaviour and silently cancelled the doubling above:
+     * twice the minimum for a capacity of 1000 is 500 buckets, and the largest power of two
+     * at or below 500 is 256 - fewer slots than the doubling was there to provide.</p>
+     *
+     * @param value The least acceptable number of buckets
+     * @return The smallest power of two at or above it, and never below {@link #MIN_BUCKETS}
+     */
+    private static long nextPowerOfTwo(long value) {
+        if (value <= MIN_BUCKETS) {
+            return MIN_BUCKETS;
+        }
+        long highest = Long.highestOneBit(value);
+        return highest == value ? value : highest << 1;
+    }
+
     public static CuckooFilter create(long capacity, int fingerprintBits, long seed) {
         if (fingerprintBits < 8 || fingerprintBits > 16) {
             throw new IllegalArgumentException(
                 "fingerprintBits must be in range [8, 16], got: " + fingerprintBits);
         }
 
-        // Calculate number of buckets (power of 2)
-        // Each bucket holds 4 fingerprints
+        // Buckets are a power of two, and there are twice as many as the capacity strictly
+        // needs. The headroom is not slack: a cuckoo filter refuses inserts well before its
+        // slots are full, because an insert that cannot find a free slot displaces an occupant
+        // and gives up after a bounded chain of displacements. Sized to exactly the capacity,
+        // a filter asked to hold its documented capacity sits near 98% full and starts refusing
+        // terms - and a filter that has refused a term is no longer trusted to rule a segment
+        // out, so pruning switches off and every query scans everything.
         long minBuckets = (capacity + FINGERPRINTS_PER_BUCKET - 1) / FINGERPRINTS_PER_BUCKET;
-        long numBuckets = Long.highestOneBit(Math.max(minBuckets * 2, 4));
-        if (numBuckets < 4) {
-            numBuckets = 4;
-        }
+        long numBuckets = nextPowerOfTwo(Math.max(minBuckets * 2, MIN_BUCKETS));
 
         // Cache-line aligned bucket storage: 8 bytes per bucket
         // This ensures buckets never cross 64-byte cache line boundaries

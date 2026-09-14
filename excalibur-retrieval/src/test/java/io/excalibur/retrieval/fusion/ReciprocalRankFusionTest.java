@@ -88,6 +88,36 @@ class ReciprocalRankFusionTest {
     }
 
     @Test
+    @DisplayName("two values of k fuse the same lists into different orders")
+    void kChangesTheFusedOrder() {
+        // Document 1 is one signal's top pick and barely on the other's list; document 2 is
+        // fourth on both. A small k rewards the single strong placement, a large k flattens it
+        // until steady agreement wins instead. Same lists, opposite answers - which is what
+        // makes k worth exposing to an operator at all.
+        long[] shallow = {1, 101, 102, 2};
+        long[] deep = new long[20];
+        deep[0] = 103;
+        deep[1] = 104;
+        deep[2] = 105;
+        deep[3] = 2;
+        for (int position = 4; position < 19; position++) {
+            deep[position] = 200 + position;
+        }
+        deep[19] = 1;
+        List<RankedList> lists = List.of(list("dense", shallow), list("bm25", deep));
+
+        List<FusedDocument> sharp = new ReciprocalRankFusion(1).fuse(lists, 2);
+        List<FusedDocument> flat = new ReciprocalRankFusion(60).fuse(lists, 2);
+
+        assertThat(sharp.get(0).documentId())
+            .as("at k=1 one signal's first choice carries the document")
+            .isEqualTo(1);
+        assertThat(flat.get(0).documentId())
+            .as("at k=60 agreement between the signals carries it instead")
+            .isEqualTo(2);
+    }
+
+    @Test
     @DisplayName("the contribution breakdown records each signal's rank")
     void breakdownIsRecorded() {
         List<FusedDocument> fused = fusion.fuse(

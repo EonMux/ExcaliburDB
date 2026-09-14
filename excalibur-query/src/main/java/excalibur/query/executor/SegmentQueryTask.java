@@ -52,6 +52,7 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     private final DistanceFunction distanceFunction;
     private final TailScanner tailScanner;
     private final Set<Long> lshCandidates;
+    private final PqSearchSettings pqSearch;
 
     /**
      * Creates a new SegmentQueryTask.
@@ -107,6 +108,42 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
             DistanceFunction distanceFunction,
             Set<Long> lshCandidates) {
 
+        this(segmentId, segment, graph, queryVector, k, oversamplingFactor, distanceFunction,
+            lshCandidates, PqSearchSettings.DISABLED);
+    }
+
+    /**
+     * Creates a new SegmentQueryTask that may search the segment through its quantizer.
+     *
+     * <p>The quantised search is taken only when this deployment asked for it, the segment has
+     * a trained quantizer, and no pre-filter narrowed the search - {@link HnswGraph} has no
+     * candidate-restricted quantised search, and honouring the candidate set matters more,
+     * since ignoring it would search nodes the pre-filter ruled out.</p>
+     *
+     * @param segmentId The segment identifier
+     * @param segment The segment to search
+     * @param graph The HNSW graph for the segment
+     * @param queryVector The query vector
+     * @param k The number of results to retrieve
+     * @param oversamplingFactor The oversampling factor for HNSW search
+     * @param distanceFunction The distance function
+     * @param lshCandidates The set of LSH pre-filtered candidate node IDs (may be null or empty)
+     * @param pqSearch Whether this search may use the segment's quantizer, and how widely
+     * @throws NullPointerException if any required parameter is null
+     * @throws IllegalArgumentException if k is not positive
+     */
+    public SegmentQueryTask(
+            long segmentId,
+            Segment segment,
+            HnswGraph graph,
+            float[] queryVector,
+            int k,
+            int oversamplingFactor,
+            DistanceFunction distanceFunction,
+            Set<Long> lshCandidates,
+            PqSearchSettings pqSearch) {
+
+        this.pqSearch = Objects.requireNonNull(pqSearch, "PqSearchSettings cannot be null");
         this.segmentId = segmentId;
         this.segment = Objects.requireNonNull(segment, "Segment cannot be null");
         this.graph = Objects.requireNonNull(graph, "Graph cannot be null");
@@ -129,75 +166,12 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
     @Override
     public SegmentQueryResult call() {
         long startTime = System.nanoTime();
-        List<HnswSearchResult> results = new ArrayList<>();
-        Map<Long, byte[]> payloads = Map.of();
-        long tailScanEntries = 0;
+        SegmentReading reading = SegmentReading.nothing();
         boolean success = false;
         String errorMessage = null;
 
         try {
-            // Cooperative cancellation: a dispatcher timeout cancels this task with an
-            // interrupt, so bail out before doing any work rather than searching a
-            // segment nobody is waiting for.
-            if (Thread.currentThread().isInterrupted()) {
-                throw new InterruptedException("Segment search cancelled before starting");
-            }
-
-            // Step 1: Capture the tail-scan range BEFORE searching.
-            //
-            // The graph search and the tail scan must together cover every entry. Reading
-            // the watermark after the search would miss any entry integrated while the
-            // search ran: too late for the search to see it, and already below the
-            // watermark by the time the tail scan starts. Capturing it first can only
-            // re-scan entries the search already returned, and those duplicates are
-            // collapsed by mergeResults.
-            long lastIntegratedOffset = graph.getLastIntegratedOffset();
-            long writeLogHead = segment.getWriteLogHead();
-            WriteLog writeLog = segment.writeLog();
-
-            // Step 2: Perform HNSW graph search with oversampling
-            int searchK = searchK();
-            List<HnswSearchResult> hnswResults;
-
-            // Use LSH pre-filtered candidates if available, otherwise do full search
-            // CRITICAL: HnswGraph.search(query, k, emptySet) returns empty results,
-            // so we must use search(query, k) when there are no candidates
-            if (lshCandidates != null && !lshCandidates.isEmpty()) {
-                hnswResults = graph.search(queryVector, searchK, lshCandidates);
-                LOGGER.trace("Segment {}: HNSW search with {} LSH candidates returned {} results",
-                    segmentId, lshCandidates.size(), hnswResults.size());
-            } else {
-                hnswResults = graph.search(queryVector, searchK);
-                LOGGER.trace("Segment {}: HNSW search (full) returned {} results", segmentId, hnswResults.size());
-            }
-
-            // Step 3: Scan the captured tail range, if there is one
-            if (writeLog != null && tailScanner.hasTailEntries(lastIntegratedOffset, writeLogHead)) {
-                TailScanner.TailScanOutcome tailScan = tailScanner.scan(
-                    queryVector,
-                    writeLog,
-                    lastIntegratedOffset,
-                    writeLogHead,
-                    k,
-                    distanceFunction
-                );
-
-                // Report the work performed, not the number of results kept
-                tailScanEntries = tailScan.entriesScanned();
-
-                // The scan had each entry's value in hand, so its chunk text travels with
-                // the results rather than being read back out of storage later.
-                payloads = tailScan.payloads();
-                LOGGER.trace("Segment {}: Tail scan read {} entries and returned {} results",
-                    segmentId, tailScanEntries, tailScan.results().size());
-
-                // Step 4: Merge HNSW and tail scan results
-                results = mergeResults(hnswResults, tailScan.results(), k);
-            } else {
-                // No tail scan needed - just use HNSW results
-                results = limitResults(hnswResults, k);
-            }
-
+            reading = readSegment();
             success = true;
 
         } catch (InterruptedException e) {
@@ -214,13 +188,210 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
 
         return new SegmentQueryResult(
             segmentId,
-            results,
-            tailScanEntries,
+            reading.results(),
+            reading.tailScanEntries(),
             durationMs,
             success,
             errorMessage,
-            payloads
+            reading.payloads(),
+            reading.complete()
         );
+    }
+
+    /**
+     * Searches this segment's graph, and the part of its write log the graph has not caught
+     * up with.
+     *
+     * @return What this segment has to say about the query
+     * @throws InterruptedException if the task was cancelled before it began
+     */
+    private SegmentReading readSegment() throws InterruptedException {
+        // Cooperative cancellation: a dispatcher timeout cancels this task with an
+        // interrupt, so bail out before doing any work rather than searching a
+        // segment nobody is waiting for.
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException("Segment search cancelled before starting");
+        }
+
+        // Step 1: Capture the tail-scan range BEFORE searching.
+        TailRange tail = captureTailRange();
+
+        // Step 2: Perform HNSW graph search with oversampling
+        List<HnswSearchResult> hnswResults = searchGraph(searchK());
+
+        // Step 3: Scan the captured tail range, if there is one
+        if (tail.writeLog() != null
+                && tailScanner.hasTailEntries(tail.lastIntegratedOffset(), tail.writeLogHead())) {
+            return scanTailAndMerge(hnswResults, tail);
+        }
+
+        // No tail scan needed - just use HNSW results
+        return SegmentReading.fromGraph(limitResults(hnswResults, k));
+    }
+
+    /**
+     * Reads the stretch of write log the graph has not absorbed, before the search runs.
+     *
+     * <p>The graph search and the tail scan must together cover every entry. Reading
+     * the watermark after the search would miss any entry integrated while the
+     * search ran: too late for the search to see it, and already below the
+     * watermark by the time the tail scan starts. Capturing it first can only
+     * re-scan entries the search already returned, and those duplicates are
+     * collapsed by mergeResults.</p>
+     *
+     * @return The offsets a tail scan would have to cover, and the log holding them
+     */
+    private TailRange captureTailRange() {
+        return new TailRange(
+            graph.getLastIntegratedOffset(),
+            segment.getWriteLogHead(),
+            segment.writeLog());
+    }
+
+    /**
+     * Scans the captured tail range and ranks its hits against the graph's.
+     *
+     * @param hnswResults What the graph search returned
+     * @param tail The tail range captured before the graph was searched
+     * @return This segment's answer, drawn from both the graph and the write log
+     */
+    private SegmentReading scanTailAndMerge(List<HnswSearchResult> hnswResults, TailRange tail) {
+        TailScanner.TailScanOutcome tailScan = tailScanner.scan(
+            queryVector,
+            tail.writeLog(),
+            tail.lastIntegratedOffset(),
+            tail.writeLogHead(),
+            k,
+            distanceFunction
+        );
+
+        // Report the work performed, not the number of results kept
+        long tailScanEntries = tailScan.entriesScanned();
+        boolean complete = sawWholeTail(tailScan);
+
+        // The scan had each entry's value in hand, so its chunk text travels with
+        // the results rather than being read back out of storage later.
+        Map<Long, byte[]> payloads = tailScan.payloads();
+        LOGGER.trace("Segment {}: Tail scan read {} entries and returned {} results",
+            segmentId, tailScanEntries, tailScan.results().size());
+
+        // Step 4: Merge HNSW and tail scan results
+        List<HnswSearchResult> results = mergeResults(hnswResults, tailScan.results(), k);
+
+        return new SegmentReading(results, payloads, tailScanEntries, complete);
+    }
+
+    /**
+     * Whether the tail scan reached the end of the range it was handed.
+     *
+     * <p>A scan cut short did not see the whole tail, so this segment's answer is
+     * partial. It still carries everything the graph search found, which is why it
+     * is not reported as a failure - a failed segment's results are discarded
+     * wholesale - but a caller told the segment answered in full would be reading a
+     * short answer as an exhaustive one.</p>
+     *
+     * @param tailScan What the scan returned, including why it stopped
+     * @return true when this segment's answer covers everything it was asked about
+     */
+    private boolean sawWholeTail(TailScanner.TailScanOutcome tailScan) {
+        if (tailScan.backpressureTriggered() || tailScan.cancelled()) {
+            LOGGER.debug("Segment {}: tail scan stopped early (backpressure={}, "
+                + "cancelled={})", segmentId, tailScan.backpressureTriggered(),
+                tailScan.cancelled());
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * The stretch of a segment's write log that its graph has not absorbed yet.
+     *
+     * @param lastIntegratedOffset How far the graph has absorbed the log
+     * @param writeLogHead How far the log has been written
+     * @param writeLog The log to read the entries between them from, or null when the segment
+     *                 keeps none
+     */
+    private record TailRange(long lastIntegratedOffset, long writeLogHead, WriteLog writeLog) {
+    }
+
+    /**
+     * What one segment has to say about a query.
+     *
+     * @param results The ranked hits, closest first
+     * @param payloads The chunk text of the write-log hits, keyed by node ID, which the tail
+     *                 scan had in hand and which would otherwise be read back from storage
+     * @param tailScanEntries How many write-log entries the tail scan read, which is work
+     *                        performed rather than results kept
+     * @param complete Whether the segment was searched in full, or answered from part of its
+     *                 write log because the scan stopped early
+     */
+    private record SegmentReading(List<HnswSearchResult> results,
+                                  Map<Long, byte[]> payloads,
+                                  long tailScanEntries,
+                                  boolean complete) {
+
+        /**
+         * A reading from a segment that was never searched, for a task that failed or was
+         * cancelled before it could read anything.
+         *
+         * @return An empty reading
+         */
+        static SegmentReading nothing() {
+            return new SegmentReading(new ArrayList<>(), Map.of(), 0, true);
+        }
+
+        /**
+         * A reading answered entirely from the graph, the write log having no tail to scan.
+         *
+         * @param results The ranked hits from the graph
+         * @return The reading
+         */
+        static SegmentReading fromGraph(List<HnswSearchResult> results) {
+            return new SegmentReading(results, Map.of(), 0, true);
+        }
+    }
+
+    /**
+     * Searches the segment's graph the way this task is configured to.
+     *
+     * <p>A pre-filter's candidate set comes first: it names the only nodes this query may be
+     * answered from, and there is no candidate-restricted quantised search to honour it with.
+     * The set is consulted only when it holds something -
+     * {@code HnswGraph.search(query, k, emptySet)} means "nothing is admissible" and returns
+     * nothing, which is not what "no pre-filter ran" means.</p>
+     *
+     * @param searchK The oversampled number of results to ask the graph for
+     * @return What the graph returned, closest first
+     */
+    private List<HnswSearchResult> searchGraph(int searchK) {
+        if (!lshCandidates.isEmpty()) {
+            List<HnswSearchResult> results = graph.search(queryVector, searchK, lshCandidates);
+            LOGGER.trace("Segment {}: HNSW search with {} LSH candidates returned {} results",
+                segmentId, lshCandidates.size(), results.size());
+            return results;
+        }
+        if (quantisedSearchApplies()) {
+            List<HnswSearchResult> results =
+                graph.searchWithPQThenRerank(queryVector, searchK, pqSearch.oversample());
+            LOGGER.trace("Segment {}: quantised HNSW search (oversample {}) returned {} results",
+                segmentId, pqSearch.oversample(), results.size());
+            return results;
+        }
+        List<HnswSearchResult> results = graph.search(queryVector, searchK);
+        LOGGER.trace("Segment {}: HNSW search (full) returned {} results",
+            segmentId, results.size());
+        return results;
+    }
+
+    /**
+     * Whether this segment's quantizer may answer this search.
+     *
+     * <p>A segment with no trained quantizer has no codes to rank by, so it falls back to the
+     * exact search rather than failing: quantisation is trained per segment and a query fans
+     * out across segments that are not all at the same point in their lifecycle.</p>
+     */
+    private boolean quantisedSearchApplies() {
+        return pqSearch.enabled() && graph.isPQEnabled();
     }
 
     /**
@@ -294,6 +465,7 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
         private final boolean success;
         private final String errorMessage;
         private final Map<Long, byte[]> payloads;
+        private final boolean complete;
 
         public SegmentQueryResult(
                 long segmentId,
@@ -303,7 +475,8 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
                 boolean success,
                 String errorMessage) {
 
-            this(segmentId, results, tailScanEntries, durationMs, success, errorMessage, Map.of());
+            this(segmentId, results, tailScanEntries, durationMs, success, errorMessage,
+                Map.of(), true);
         }
 
         /**
@@ -326,6 +499,33 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
                 String errorMessage,
                 Map<Long, byte[]> payloads) {
 
+            this(segmentId, results, tailScanEntries, durationMs, success, errorMessage,
+                payloads, true);
+        }
+
+        /**
+         * Creates a segment result that can report having answered only in part.
+         *
+         * @param segmentId The segment identifier
+         * @param results The search results
+         * @param tailScanEntries The number of write-log entries the tail scan read
+         * @param durationMs The search duration
+         * @param success Whether the search succeeded
+         * @param errorMessage The failure message, or null
+         * @param payloads The chunk text of tail-scan results, keyed by node ID
+         * @param complete Whether everything this segment holds was actually searched
+         */
+        public SegmentQueryResult(
+                long segmentId,
+                List<HnswSearchResult> results,
+                long tailScanEntries,
+                long durationMs,
+                boolean success,
+                String errorMessage,
+                Map<Long, byte[]> payloads,
+                boolean complete) {
+
+            this.complete = complete;
             this.segmentId = segmentId;
             this.results = results != null ? Collections.unmodifiableList(new ArrayList<>(results)) : Collections.emptyList();
             this.tailScanEntries = tailScanEntries;
@@ -340,6 +540,19 @@ public class SegmentQueryTask implements Callable<SegmentQueryTask.SegmentQueryR
          */
         public long segmentId() {
             return segmentId;
+        }
+
+        /**
+         * Whether everything this segment holds was searched.
+         *
+         * <p>False when the write-log tail scan stopped early, at the backpressure limit or on
+         * cancellation. The results are still real and still returned - this is not a failure,
+         * whose results are discarded - but they were drawn from part of the segment.</p>
+         *
+         * @return true when the segment was searched in full
+         */
+        public boolean complete() {
+            return complete;
         }
 
         /**

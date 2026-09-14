@@ -1,5 +1,6 @@
 package io.excalibur.graph.staging;
 
+import io.excalibur.graph.file.Durability;
 import io.excalibur.graph.provenance.Provenance;
 import io.excalibur.graph.provenance.SourceType;
 import io.excalibur.graph.store.RelationSelector;
@@ -17,6 +18,8 @@ import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.zip.CRC32;
 
@@ -95,38 +98,32 @@ public final class GraphStagingStore implements AutoCloseable {
     /** File holding the text each entity was mentioned in. */
     public static final String ENTITY_TEXT_LOG = "entity_text.log";
 
-    /**
-     * Longest snippet recorded for one mention.
-     *
-     * <p>An entity's document is what BM25 ranks it by, and a few sentences of the text it
-     * appeared in is what makes it rankable. Recording whole documents per mention would store
-     * the corpus once per entity in it.
-     */
-    public static final int MAX_SNIPPET_BYTES = 2048;
+    /** Longest snippet recorded for one mention; see {@link EntityTextLog#MAX_SNIPPET_BYTES}. */
+    public static final int MAX_SNIPPET_BYTES = EntityTextLog.MAX_SNIPPET_BYTES;
+
+    /** Suffix of the partially rewritten log an erasure builds before swapping it in. */
+    private static final String ERASING_SUFFIX = ".erasing";
 
     private final Path directory;
     private final Path logPath;
-    private final Path textPath;
     private final LabelInterner entities;
     private final LabelInterner relations;
+    private final EntityTextLog text;
     private final Object appendLock = new Object();
-    private final Object textLock = new Object();
 
     private DataOutputStream out;
-    private DataOutputStream textOut;
     private long staged;
     private volatile boolean closed;
 
-    private GraphStagingStore(Path directory, Path logPath, Path textPath, LabelInterner entities,
-                              LabelInterner relations, DataOutputStream out,
-                              DataOutputStream textOut, long staged) {
+    private GraphStagingStore(Path directory, Path logPath, LabelInterner entities,
+                              LabelInterner relations, EntityTextLog text, DataOutputStream out,
+                              long staged) {
         this.directory = directory;
         this.logPath = logPath;
-        this.textPath = textPath;
         this.entities = entities;
         this.relations = relations;
+        this.text = text;
         this.out = out;
-        this.textOut = textOut;
         this.staged = staged;
     }
 
@@ -144,7 +141,7 @@ public final class GraphStagingStore implements AutoCloseable {
         LabelInterner entities = LabelInterner.open(directory.resolve(ENTITY_LABELS));
         LabelInterner relations = null;
         DataOutputStream out = null;
-        DataOutputStream textOut = null;
+        EntityTextLog text = null;
         try {
             relations = LabelInterner.open(directory.resolve(RELATION_LABELS));
 
@@ -156,18 +153,17 @@ public final class GraphStagingStore implements AutoCloseable {
             long existing = truncateToWholeRecords(logPath);
             out = openLog(logPath);
 
-            Path textPath = directory.resolve(ENTITY_TEXT_LOG);
-            textOut = openLog(textPath);
+            text = EntityTextLog.open(directory.resolve(ENTITY_TEXT_LOG));
 
             LOGGER.info("graph staging at {}: {} facts, {} entities, {} relations",
                 directory, existing, entities.size(), relations.size());
-            return new GraphStagingStore(directory, logPath, textPath, entities, relations,
-                out, textOut, existing);
+            return new GraphStagingStore(directory, logPath, entities, relations, text,
+                out, existing);
         } catch (IOException | RuntimeException e) {
             closeQuietly(entities);
             closeQuietly(relations);
             closeQuietly(out);
-            closeQuietly(textOut);
+            closeQuietly(text);
             throw e;
         }
     }
@@ -275,6 +271,163 @@ public final class GraphStagingStore implements AutoCloseable {
     }
 
     /**
+     * Removes every staged fact, snippet and label that an erasure covers.
+     *
+     * <h3>Why staging has to be erased too</h3>
+     * <p>Rewriting the edge store removes the erased edges from the graph being served. It does
+     * not touch the log those edges were built from, so the next {@code POST /v1/graph/build}
+     * replays the staged facts and puts back exactly what the erasure removed. The facts also
+     * simply remain on disk in the meantime, which for an erasure obligation is the whole
+     * problem: a tombstone is a filter, and what was promised was that the data stops
+     * existing.</p>
+     *
+     * <h3>Labels are part of it</h3>
+     * <p>An entity's label is a person's name, kept apart from the facts in {@code entities
+     * .labels}. Erasing the facts and the snippets and leaving the label behind left the name to
+     * be republished by the next build into the searchable label index, where the person who
+     * asked to be forgotten was findable by searching for themselves. The label is therefore
+     * tombstoned in place, keeping its ordinal, because no id may move.</p>
+     *
+     * <p>A corrupt record aborts the rewrite with the logs untouched, rather than truncating at
+     * it. Erasing everything after a bad record would destroy facts nobody asked to remove, and
+     * silently keeping them would discharge a promise that had not been kept; leaving the
+     * request outstanding and failing loudly is the only option that does neither.</p>
+     *
+     * @param erasure What the requests cover
+     * @return What was removed, and what could not be judged
+     * @throws IOException if a log cannot be read or rewritten
+     * @throws NullPointerException if {@code erasure} is null
+     */
+    public EraseResult erase(StagedErasure erasure) throws IOException {
+        Objects.requireNonNull(erasure, "erasure must not be null");
+
+        synchronized (appendLock) {
+            requireOpen();
+            flush();
+            long facts = rewriteTriples(erasure);
+            EntityTextLog.Erased snippets = text.erase(erasure::erasesSnippet);
+            int labels = entities.tombstone(erasure::erasesLabel);
+            return new EraseResult(facts, snippets.removed(), labels,
+                snippets.ofUnknownOrigin());
+        }
+    }
+
+    /**
+     * What one erasure pass removed from staging, and what it could not reach.
+     *
+     * @param factsRemoved            Staged facts removed from the triple log
+     * @param snippetsRemoved         Recorded snippets removed from the entity text log
+     * @param labelsTombstoned        Entity labels replaced by a placeholder
+     * @param snippetsOfUnknownOrigin Surviving snippets with no recorded origin. A source-scoped
+     *                                or extractor-scoped request cannot be matched against these,
+     *                                so a non-zero count means such a request has not been
+     *                                satisfied however many facts were removed, and must not be
+     *                                reported as discharged.
+     */
+    public record EraseResult(long factsRemoved, long snippetsRemoved, long labelsTombstoned,
+                              long snippetsOfUnknownOrigin) {
+
+        /** @throws IllegalArgumentException if any count is negative */
+        public EraseResult {
+            if (factsRemoved < 0 || snippetsRemoved < 0 || labelsTombstoned < 0
+                || snippetsOfUnknownOrigin < 0) {
+                throw new IllegalArgumentException("counts must not be negative");
+            }
+        }
+
+        /** Everything removed, across all three logs. */
+        public long removed() {
+            return factsRemoved + snippetsRemoved + labelsTombstoned;
+        }
+    }
+
+    private long rewriteTriples(StagedErasure erasure) throws IOException {
+        if (!Files.exists(logPath) || Files.size(logPath) < HEADER_BYTES) {
+            return 0;
+        }
+        byte[] all = Files.readAllBytes(logPath);
+        ByteBuffer buffer = readHeader(all, logPath, "triple log");
+        buffer.order(ByteOrder.LITTLE_ENDIAN);
+
+        // Scanned before anything is written, so a log that loses nothing is not churned. A
+        // request that can never be satisfied stays outstanding, and rewriting both logs on every
+        // compaction from then on would be a steady cost for no change.
+        List<Integer> kept = new ArrayList<>();
+        long removed = 0;
+        while (buffer.remaining() >= RECORD_BYTES) {
+            int start = buffer.position();
+            int subject = buffer.getInt();
+            int relation = buffer.getInt();
+            int object = buffer.getInt();
+            int validFrom = buffer.getInt();
+            int validTo = buffer.getInt();
+            byte sourceType = buffer.get();
+            byte confidence = buffer.get();
+            short extractorVersion = buffer.getShort();
+            long sourceId = buffer.getLong();
+            int stored = buffer.getInt();
+
+            CRC32 crc = new CRC32();
+            crc.update(all, start, RECORD_PAYLOAD_BYTES);
+            if (stored != (int) crc.getValue()) {
+                throw new IOException("triple log " + logPath + " has a corrupt record at "
+                    + "fact " + (kept.size() + removed) + "; refusing to rewrite it for an "
+                    + "erasure, because truncating here would remove facts nobody asked to erase");
+            }
+
+            Provenance provenance = new Provenance(SourceType.fromByte(sourceType), sourceId,
+                Byte.toUnsignedInt(confidence), extractorVersion);
+            if (erasure.erasesFact(subject, relation, object, validFrom, validTo, provenance)) {
+                removed++;
+            } else {
+                kept.add(start);
+            }
+        }
+        if (removed == 0) {
+            return 0;
+        }
+
+        Path temp = logPath.resolveSibling(logPath.getFileName() + ERASING_SUFFIX);
+        Files.deleteIfExists(temp);
+        out.close();
+        // Reopened on every path below, successful or not: the swap replaces the file this
+        // appends to, and a store left holding a closed stream would accept nothing and say
+        // nothing about it.
+        try {
+            try (DataOutputStream rewritten = openLog(temp)) {
+                for (int start : kept) {
+                    rewritten.write(all, start, RECORD_BYTES);
+                }
+            }
+            // Forced before the swap, because the point of the rewrite is that the erased facts
+            // are gone: a rename that outran its own contents would leave them on the platter
+            // after the erasure was reported discharged.
+            Durability.DEVICE.replaceDurably(temp, logPath);
+            staged = kept.size();
+        } finally {
+            Files.deleteIfExists(temp);
+            out = openLog(logPath);
+        }
+        LOGGER.info("erased {} staged fact(s) from {}; {} remain", removed, logPath, kept.size());
+        return removed;
+    }
+
+    private static ByteBuffer readHeader(byte[] all, Path path, String what) throws IOException {
+        ByteBuffer buffer = ByteBuffer.wrap(all);
+        long magic = buffer.getLong();
+        if (magic != MAGIC) {
+            throw new IOException("not a " + what + " (magic 0x" + Long.toHexString(magic)
+                + "): " + path);
+        }
+        int version = buffer.getInt();
+        if (version != VERSION) {
+            throw new IOException("unsupported " + what + " version " + version + ": " + path);
+        }
+        buffer.getInt();
+        return buffer;
+    }
+
+    /**
      * The id an entity label was given, assigning one if it is new.
      *
      * @param label The entity label
@@ -297,40 +450,39 @@ public final class GraphStagingStore implements AutoCloseable {
     }
 
     /**
-     * Records a piece of text an entity was mentioned in.
+     * Records a piece of text an entity was mentioned in, with no origin.
      *
-     * <p>What BM25 ranks the entity by. An entity with no recorded text is still traversable - it
-     * is in the edge store - but contributes nothing to the hybrid signal, so a graph built
-     * without this ranks every entity identically and the serialization budget is spent in
-     * arbitrary order.
+     * <p>A snippet recorded this way cannot be reached by a source-scoped or extractor-scoped
+     * erasure, because there is nothing in it to match: withdrawing the document it was copied
+     * out of will report the snippet as an obligation it could not meet. Prefer
+     * {@link #appendEntityText(int, String, Provenance)} wherever the origin is known, which at
+     * an ingestion site it always is.
      *
      * @param entityId The entity
      * @param snippet  Text it appeared in; truncated to {@link #MAX_SNIPPET_BYTES}
      * @throws IOException if the record cannot be written
      */
     public void appendEntityText(int entityId, String snippet) throws IOException {
-        if (entityId < 0) {
-            throw new IllegalArgumentException("entityId must not be negative: " + entityId);
-        }
-        if (snippet == null || snippet.isBlank()) {
-            return;
-        }
+        appendEntityText(entityId, snippet, Provenance.UNKNOWN);
+    }
 
-        byte[] bytes = snippet.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        if (bytes.length > MAX_SNIPPET_BYTES) {
-            bytes = truncateUtf8(bytes, MAX_SNIPPET_BYTES);
-        }
-
-        CRC32 crc = new CRC32();
-        crc.update(bytes);
-
-        synchronized (textLock) {
-            requireOpen();
-            textOut.writeInt(entityId);
-            textOut.writeInt(bytes.length);
-            textOut.write(bytes);
-            textOut.writeInt((int) crc.getValue());
-        }
+    /**
+     * Records a piece of text an entity was mentioned in, and where it came from.
+     *
+     * <p>What BM25 ranks the entity by. An entity with no recorded text is still traversable - it
+     * is in the edge store - but contributes nothing to the hybrid signal, so a graph built
+     * without this ranks every entity identically and the serialization budget is spent in
+     * arbitrary order.
+     *
+     * @param entityId   The entity
+     * @param snippet    Text it appeared in; truncated to {@link #MAX_SNIPPET_BYTES}
+     * @param provenance The document, conversation or statement the text was copied out of
+     * @throws IOException if the record cannot be written
+     */
+    public void appendEntityText(int entityId, String snippet, Provenance provenance)
+            throws IOException {
+        requireOpen();
+        text.append(entityId, snippet, provenance);
     }
 
     /**
@@ -343,65 +495,21 @@ public final class GraphStagingStore implements AutoCloseable {
     public long forEachEntityText(EntityTextVisitor visitor) throws IOException {
         Objects.requireNonNull(visitor, "visitor must not be null");
         flush();
-
-        if (!Files.exists(textPath) || Files.size(textPath) < HEADER_BYTES) {
-            return 0;
-        }
-
-        byte[] all = Files.readAllBytes(textPath);
-        ByteBuffer buffer = ByteBuffer.wrap(all);
-        long magic = buffer.getLong();
-        if (magic != MAGIC) {
-            throw new IOException("not an entity text log (magic 0x" + Long.toHexString(magic)
-                + "): " + textPath);
-        }
-        int version = buffer.getInt();
-        if (version != VERSION) {
-            throw new IOException("unsupported entity text log version " + version
-                + ": " + textPath);
-        }
-        buffer.getInt();
-
-        long replayed = 0;
-        while (buffer.remaining() >= Integer.BYTES * 2) {
-            int entityId = buffer.getInt();
-            int length = buffer.getInt();
-            if (entityId < 0 || length <= 0 || length > MAX_SNIPPET_BYTES
-                || buffer.remaining() < length + Integer.BYTES) {
-                break;
-            }
-            int start = buffer.position();
-            byte[] bytes = new byte[length];
-            buffer.get(bytes);
-            int stored = buffer.getInt();
-            CRC32 crc = new CRC32();
-            crc.update(all, start, length);
-            if (stored != (int) crc.getValue()) {
-                LOGGER.warn("entity text log {} has a corrupt record after {} snippets; "
-                    + "building from what came before it", textPath, replayed);
-                break;
-            }
-            visitor.visit(entityId, new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
-            replayed++;
-        }
-        return replayed;
+        return text.forEach((entityId, snippet, provenance) ->
+            visitor.visit(entityId, snippet));
     }
 
     /**
-     * Truncates UTF-8 bytes without splitting a character.
+     * Replays every snippet recorded so far, with the source each came out of.
      *
-     * @param bytes    The encoded text
-     * @param maxBytes The limit
-     * @return A prefix that is still valid UTF-8
+     * @param visitor Receives each snippet
+     * @return How many snippets were replayed
+     * @throws IOException if the log cannot be read
      */
-    private static byte[] truncateUtf8(byte[] bytes, int maxBytes) {
-        int end = maxBytes;
-        while (end > 0 && (bytes[end] & 0xC0) == 0x80) {
-            end--;
-        }
-        byte[] truncated = new byte[end];
-        System.arraycopy(bytes, 0, truncated, 0, end);
-        return truncated;
+    public long forEachEntityText(EntityTextLog.Visitor visitor) throws IOException {
+        Objects.requireNonNull(visitor, "visitor must not be null");
+        flush();
+        return text.forEach(visitor);
     }
 
     /** Receives each snippet of a {@link #forEachEntityText} replay. */
@@ -452,7 +560,7 @@ public final class GraphStagingStore implements AutoCloseable {
      *
      * @return A snapshot
      */
-    public java.util.List<String> entityLabels() {
+    public List<String> entityLabels() {
         return entities.labels();
     }
 
@@ -461,7 +569,7 @@ public final class GraphStagingStore implements AutoCloseable {
      *
      * @return A snapshot
      */
-    public java.util.List<String> relationLabels() {
+    public List<String> relationLabels() {
         return relations.labels();
     }
 
@@ -488,11 +596,7 @@ public final class GraphStagingStore implements AutoCloseable {
             relations.flush();
             out.flush();
         }
-        synchronized (textLock) {
-            if (!closed) {
-                textOut.flush();
-            }
-        }
+        text.flush();
     }
 
     @Override
@@ -505,10 +609,7 @@ public final class GraphStagingStore implements AutoCloseable {
             out.flush();
             out.close();
         }
-        synchronized (textLock) {
-            textOut.flush();
-            textOut.close();
-        }
+        text.close();
         entities.close();
         relations.close();
     }

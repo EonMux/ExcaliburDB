@@ -1,5 +1,6 @@
 package io.excalibur.graph.dictionary;
 
+import io.excalibur.graph.file.Durability;
 import io.excalibur.graph.format.EdgeStoreDescriptor;
 
 import java.io.BufferedOutputStream;
@@ -21,9 +22,13 @@ import java.util.Map;
  *
  * <p>Accumulates names in memory and writes them sorted by id, because the reader binary-searches
  * and a dictionary written in insertion order would silently return misses for ids that are
- * present. Both files are written beside their destination and moved into place, so a build that
- * fails partway leaves the previous dictionary intact rather than a half-written one that opens
- * and returns wrong names.
+ * present. Both files are written beside their destination, forced to the device and then moved
+ * into place, so a build that fails partway leaves the previous dictionary intact rather than a
+ * half-written one that opens and returns wrong names.
+ *
+ * <p>A dictionary is two files and therefore two renames, which cannot be made one atomic act. A
+ * crash between them is detected on the other side, by {@link LabelDictionary#open} comparing the
+ * text length the index describes against the text that is actually there.
  *
  * <p>Not thread-safe: build one, write it, discard it.
  */
@@ -105,13 +110,25 @@ public final class LabelDictionaryWriter {
                 data.write(index.array());
             }
 
+            // Both files are on the device before either name changes, so the pair that becomes
+            // visible is a pair that exists. Renaming over contents still in the page cache would
+            // publish an index describing text that a power loss can take away.
+            Durability.DEVICE.fsyncFile(dataTemp);
+            Durability.DEVICE.fsyncFile(indexTemp);
+
             // Data first: a reader that finds an index entry pointing into a data file that is
             // not there yet would read a name out of nothing. The index is what makes an entry
             // visible, so it goes last.
+            //
+            // The two renames are still two acts, and nothing can make them one. A crash between
+            // them leaves the previous index beside the new text, and it is LabelDictionary.open
+            // that catches the mismatch: the alternative to detecting it is serving one entity's
+            // name for another's, which nobody would notice.
             Files.move(dataTemp, directory.resolve(name + ".dat"),
                 StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             Files.move(indexTemp, directory.resolve(name + ".idx"),
                 StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            Durability.DEVICE.fsyncDirectory(directory);
         } finally {
             Files.deleteIfExists(indexTemp);
             Files.deleteIfExists(dataTemp);

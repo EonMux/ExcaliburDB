@@ -9,61 +9,18 @@ import java.util.Locale;
  * <p>This class is NOT thread-safe. It is a stateless validator that
  * can be instantiated and reused safely.</p>
  *
- * <h2>Validation Rules</h2>
- * <p>The validator enforces the following constraints:
- * <ul>
- *   <li><strong>Visibility:</strong>
- *     <ul>
- *       <li>epoch-tick-ms: 10-10000 (default: 100)</li>
- *       <li>query-timeout-ms: 1000-300000 (default: 30000)</li>
- *     </ul>
- *   </li>
- *   <li><strong>Ingest:</strong>
- *     <ul>
- *       <li>document-atomicity-timeout-ms: 1000-30000 (default: 2000)</li>
- *       <li>reindex-interval-ms: 60000-86400000 (default: 3600000)</li>
- *     </ul>
- *   </li>
- *   <li><strong>Health:</strong>
- *     <ul>
- *       <li>readiness-threshold: 0.0-1.0 (default: 0.5)</li>
- *       <li>healthy-threshold: 0.0-1.0 (default: 0.9)</li>
- *       <li>readiness-threshold must not exceed healthy-threshold</li>
- *       <li>max-latency-ms: 100-60000 (default: 5000)</li>
- *     </ul>
- *   </li>
- *   <li><strong>Query:</strong>
- *     <ul>
- *       <li>top-k-default: 1-10000 (default: 100)</li>
- *       <li>threshold: 0.0-1.0 (default: 0.3)</li>
- *       <li>vector-dimensions: 128-4096 (default: 1536)</li>
- *       <li>llm-timeout-ms: 5000-300000 (default: 60000)</li>
- *     </ul>
- *   </li>
- *   <li><strong>LLM:</strong>
- *     <ul>
- *       <li>base-url: must be a valid URL (http:// or https://)</li>
- *       <li>api-key: must not be sent over cleartext http:// to a non-loopback host</li>
- *       <li>embeddings-dimensions: 128-4096 (default: 1536)</li>
- *       <li>timeout-ms: 1000-300000 (default: 60000)</li>
- *       <li>max-retries: 0-10 (default: 3)</li>
- *       <li>failure-threshold: 1-100 (default: 5)</li>
- *       <li>cooldown-period-ms: 1000-600000 (default: 60000)</li>
- *       <li>max-prompts-per-query: 1-100 (default: 10)</li>
- *       <li>relevancy-threshold: 0.0-1.0 (default: 0.3)</li>
- *       <li>max-batch-tokens: 100-100000 (default: 4000)</li>
- *       <li>retry-base-delay-ms: 10-30000 (default: 500)</li>
- *     </ul>
- *   </li>
- *   <li><strong>Shard:</strong>
- *     <ul>
- *       <li>segment-load-factor: 0.5-0.9 (default: 0.7)</li>
- *       <li>default-ef-construction: 16-1024 (default: 128)</li>
- *       <li>default-ef-search: 8-1024 (default: 64)</li>
- *       <li>hnsw-integration-queue-depth-limit: 10000-1000000 (default: 100000)</li>
- *     </ul>
- *   </li>
- * </ul>
+ * <h2>What this adds to {@link Config}'s own checking</h2>
+ * <p>{@link Config} refuses an out-of-range value as it reads the property, so a node loaded from
+ * a file is already bounded by the time it gets here. This pass exists for the two things that
+ * cannot do: a configuration built in code rather than parsed, which never went through a
+ * setter's range check, and the invariants that span more than one key - that the readiness
+ * threshold does not exceed the healthy one, that the query's vector dimensions agree with the
+ * embedding model's, that an API key is not about to be sent in clear to a host that is not
+ * loopback.</p>
+ *
+ * <p>Every bound below is read from the {@code MIN_*}/{@code MAX_*} constants on {@link Config},
+ * never restated. The numbers are deliberately not repeated in prose anywhere: a second copy is
+ * a copy that drifts, and a stale one misleads an operator more than no copy at all.</p>
  *
  * @author ExcaliburDB
  */

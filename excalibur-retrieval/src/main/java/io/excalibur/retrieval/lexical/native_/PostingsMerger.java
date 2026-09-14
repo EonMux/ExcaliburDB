@@ -1,5 +1,7 @@
 package io.excalibur.retrieval.lexical.native_;
 
+import io.excalibur.retrieval.lexical.Bm25Parameters;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,16 +44,28 @@ public final class PostingsMerger {
         throw new AssertionError("Utility class");
     }
 
+    /** Merges indexes built with the default BM25 pair. */
+    public static void merge(List<Path> sources, Path destination) throws IOException {
+        merge(sources, destination, Bm25Parameters.DEFAULT);
+    }
+
     /**
      * Merges indexes into a new one.
      *
+     * <p>Every source must have been built with {@code bm25}, and the merged index is written
+     * with it. A merge that took the pair from whichever source it read first would produce an
+     * index whose block bounds silently disagreed with the deployment that asked for the merge.
+     *
      * @param sources     Index directories, in the order their documents were added
      * @param destination Where to write the merged index
+     * @param bm25        The pair the sources were built with and the result is built with
      * @throws IOException if any index cannot be read or the result cannot be written
      */
-    public static void merge(List<Path> sources, Path destination) throws IOException {
+    public static void merge(List<Path> sources, Path destination, Bm25Parameters bm25)
+            throws IOException {
         Objects.requireNonNull(sources, "sources must not be null");
         Objects.requireNonNull(destination, "destination must not be null");
+        Objects.requireNonNull(bm25, "bm25 must not be null");
         if (sources.isEmpty()) {
             throw new IllegalArgumentException("nothing to merge");
         }
@@ -59,7 +73,7 @@ public final class PostingsMerger {
         List<PostingsIndex> open = new ArrayList<>(sources.size());
         try {
             for (Path source : sources) {
-                open.add(PostingsIndex.open(source));
+                open.add(PostingsIndex.open(source, bm25));
             }
 
             int[] docOffset = new int[open.size()];
@@ -89,7 +103,8 @@ public final class PostingsMerger {
             long mergedTerms = 0;
             int[] docs = new int[1024];
             int[] freqs = new int[1024];
-            try (StreamingIndexWriter writer = new StreamingIndexWriter(destination, lengths)) {
+            try (StreamingIndexWriter writer =
+                     new StreamingIndexWriter(destination, lengths, bm25)) {
                 while (true) {
                     String smallest = null;
                     for (String candidate : head) {

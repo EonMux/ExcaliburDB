@@ -52,14 +52,30 @@ public final class HybridRetriever {
      * and another at 25 may well be the best answer once both are counted, but only if both lists
      * ran deep enough to contain it. Asking each signal for exactly the final limit would discard
      * that agreement before it could be observed.
+     *
+     * <p>Deeper costs every signal proportionally more work, so a deployment sizes it with
+     * {@code excalibur.query.per-signal-over-fetch} and hands the value to the three-argument
+     * constructor.
      */
     public static final int DEFAULT_PER_SIGNAL_OVER_FETCH = 3;
 
-    /** A retriever over {@code rankers}, fusing with reciprocal rank fusion at its default k. */
+    /**
+     * A retriever over {@code rankers} at the defaults.
+     *
+     * <p>Fuses with reciprocal rank fusion at its own default k. A deployment that has configured
+     * either k or the over-fetch wants the three-argument constructor: this one cannot see those
+     * values and would silently ignore them.
+     */
     public HybridRetriever(List<Ranker> rankers) {
         this(rankers, new ReciprocalRankFusion(), DEFAULT_PER_SIGNAL_OVER_FETCH);
     }
 
+    /**
+     * @param rankers            The signals to run, each with a distinct name
+     * @param fusion             How their answers are combined, carrying its own configuration
+     * @param perSignalOverFetch Multiplies the final limit to give each signal's depth, from
+     *                           {@code excalibur.query.per-signal-over-fetch}
+     */
     public HybridRetriever(List<Ranker> rankers, FusionStrategy fusion, int perSignalOverFetch) {
         if (rankers == null || rankers.isEmpty()) {
             throw new IllegalArgumentException("at least one ranker is required");

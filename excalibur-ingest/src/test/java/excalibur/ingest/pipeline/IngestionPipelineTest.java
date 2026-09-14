@@ -513,7 +513,7 @@ class IngestionPipelineTest {
             assertThat(captor.getAllValues().get(0).size())
                 .as("a batch carries several chunks and never exceeds the bound")
                 .isGreaterThan(1)
-                .isLessThanOrEqualTo(IngestionOrchestrator.EMBED_BATCH_SIZE);
+                .isLessThanOrEqualTo(DocumentIngestor.EMBED_BATCH_SIZE);
         }
 
         @Test
@@ -715,8 +715,203 @@ class IngestionPipelineTest {
 
             RecordingStatus status = ingest(orchestrator(), source);
 
-            assertThat(status.error).isNull();
+            assertThat(status.error)
+                .as("a document with nothing in it was not dropped: it was listed and had "
+                    + "nothing to give, which is not a failure to report to the caller")
+                .isNull();
             assertThat(storedChunkExists("docs", "real.txt", 0)).isTrue();
+        }
+
+        @Test
+        @DisplayName("a document that could not be embedded is reported as dropped, not ingested")
+        void unembeddableDocumentsAreReported() throws Exception {
+            // Every way a document fails to be ingested other than by throwing used to go
+            // uncounted - too large, too many chunks, unembeddable, rolled back - so the run
+            // reported the document as ingested and the caller was told it had been stored when
+            // nothing of it had. Refusing to embed is the cheapest of those to reach.
+            when(embeddings.embedBatch(org.mockito.ArgumentMatchers.anyList()))
+                .thenAnswer(invocation -> {
+                    java.util.List<String> texts = invocation.getArgument(0);
+                    if (texts.stream().anyMatch(t -> t.contains("unembeddable"))) {
+                        throw new io.excalibur.llm.LLMException("endpoint refused",
+                            io.excalibur.llm.LLMException.ErrorType.HTTP_ERROR);
+                    }
+                    java.util.List<float[]> out = new java.util.ArrayList<>(texts.size());
+                    for (String t : texts) {
+                        out.add(vectorFor(t));
+                    }
+                    return out;
+                });
+            FakeSource source = new FakeSource("docs", Map.of(
+                "bad.txt", "this one is unembeddable",
+                "real.txt", "actual content here"));
+
+            RecordingStatus status = ingest(orchestrator(), source);
+
+            assertThat(status.error)
+                .as("the status endpoint is the only place an operator would see this; the "
+                    + "document was listed, had content, and none of it was stored")
+                .contains("1 of 2");
+            assertThat(storedChunkExists("docs", "real.txt", 0))
+                .as("and the rest of the crawl still ran")
+                .isTrue();
+        }
+    }
+
+
+    @Nested
+    @DisplayName("shutting down while a request is ingesting")
+    class SynchronousShutdown {
+
+        /**
+         * Lets a test act at the one point inside {@code ingestNow} between its shutdown check
+         * and the work itself: {@code shutdown()} waits on nothing but the map of synchronous
+         * runs, so a run that is past its check and not yet in that map is a run shutdown
+         * reports a clean stop over - and the caller then closes the Arena underneath it.
+         */
+        private final class HookedRegistry implements IngestionOrchestrator.StatusRegistry {
+            private final Runnable hook;
+
+            HookedRegistry(Runnable hook) {
+                this.hook = hook;
+            }
+
+            @Override
+            public IngestionOrchestrator.IngestionStatus getOrCreate(String sourceId) {
+                hook.run();
+                return new RecordingStatus();
+            }
+        }
+
+        @Test
+        @DisplayName("a synchronous run is reachable by shutdown before it does any work")
+        void publishesItselfBeforeWorking() {
+            java.util.concurrent.atomic.AtomicReference<IngestionOrchestrator> holder =
+                new java.util.concurrent.atomic.AtomicReference<>();
+            AtomicInteger reachable = new AtomicInteger(-1);
+            IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
+                embeddings, storage, index,
+                new HookedRegistry(() ->
+                    reachable.set(holder.get().stopIngestion("docs") ? 1 : 0)));
+            holder.set(orchestrator);
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "some text")));
+
+            assertThat(reachable.get())
+                .as("a run shutdown cannot see is a run it will report a clean stop over")
+                .isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("a run that was interrupted hands its thread back with the flag cleared")
+        void clearsTheInterruptBeforeReturning() {
+            // ingestNow runs on the request thread, and a pooled thread goes on to serve other
+            // requests. An interrupt left set fails the next request at its first channel
+            // operation with ClosedByInterruptException, which closes that channel for good.
+            IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
+                embeddings, storage, index,
+                new HookedRegistry(() -> Thread.currentThread().interrupt()));
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "some text")));
+
+            assertThat(Thread.interrupted())
+                .as("the interrupt was addressed to the run, not to whatever the thread does next")
+                .isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("interlock with erasure")
+    class DocumentInterlock {
+
+        @Test
+        @DisplayName("a document is written and published under its own lock")
+        void ingestionHoldsTheDocumentLock() throws Exception {
+            // An erasure that runs between a document's chunks being written and its being
+            // registered deletes chunks the registry does not name yet, and the registration
+            // then puts back an entry for content that is gone. Holding the lock is what makes
+            // the two orders the only two outcomes.
+            IngestionOrchestrator orchestrator = orchestrator();
+            FakeSource source = new FakeSource("docs", Map.of("a.txt", "some text to ingest"));
+            java.util.concurrent.CountDownLatch held =
+                new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch release =
+                new java.util.concurrent.CountDownLatch(1);
+
+            Thread holder = new Thread(() -> excalibur.ingest.registry.DocumentLocks.shared()
+                .inDocument("docs:a.txt", () -> {
+                    held.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }));
+            holder.setDaemon(true);
+            holder.start();
+            assertThat(held.await(30, TimeUnit.SECONDS)).isTrue();
+
+            Thread ingesting = new Thread(() -> orchestrator.ingestNow(source));
+            ingesting.setDaemon(true);
+            ingesting.start();
+            try {
+                ingesting.join(500);
+                assertThat(storedChunkExists("docs", "a.txt", 0))
+                    .as("nothing of the document may land while another holder has it")
+                    .isFalse();
+            } finally {
+                release.countDown();
+            }
+
+            ingesting.join(TimeUnit.SECONDS.toMillis(30));
+            assertThat(storedChunkExists("docs", "a.txt", 0))
+                .as("and it goes through as soon as the lock is free")
+                .isTrue();
+        }
+    }
+
+    @Nested
+    @DisplayName("a rollback")
+    class Rollback {
+
+        /** Publishes nothing, so a document reaches the rollback path with its chunks written. */
+        private static final class RefusingTracker
+                extends excalibur.ingest.visibility.DocumentVisibilityTracker {
+
+            RefusingTracker() {
+                super(new excalibur.ingest.registry.DocumentRegistry());
+            }
+
+            @Override
+            public void registerFromMetadata(
+                    excalibur.ingest.registry.DocumentMetadata metadata, long commitEpoch) {
+                throw new IllegalStateException("publication refused");
+            }
+        }
+
+        @Test
+        @DisplayName("a rolled back document has its graph nodes retired as well as its chunks")
+        void rollbackRetiresVectors() {
+            // The integration worker inserts asynchronously from what storage holds, so a
+            // document rolled back after its chunks were written may already be in a graph -
+            // rankable by name and distance, with no text behind it and nothing else able to
+            // reach the node.
+            List<String> retired = new CopyOnWriteArrayList<>();
+            IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
+                embeddings, storage, index, registry, new RefusingTracker());
+            orchestrator.setVectorEraser(documentKey -> {
+                retired.add(documentKey);
+                return 1;
+            });
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "some text")));
+
+            assertThat(storedChunkExists("docs", "a.txt", 0))
+                .as("precondition: the rollback removed the chunks it had written")
+                .isFalse();
+            assertThat(retired)
+                .as("a node outlives the chunk it was built from unless it is retired too")
+                .containsExactly("docs:a.txt");
         }
     }
 
@@ -873,6 +1068,167 @@ class IngestionPipelineTest {
         void sourceIdIsRequired() {
             assertThatThrownBy(() -> orchestrator().stopIngestion(null))
                 .isInstanceOf(NullPointerException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("ingesting on the caller's thread")
+    class SynchronousIngestion {
+
+        /**
+         * Documents handed in directly are ingested inside the request that supplied them. The
+         * caller has to be told what happened to them: a 202 and a status to poll is the right
+         * answer for a crawl of unknown size, and the wrong one for a batch the caller is
+         * holding in its hand.
+         */
+        @Test
+        @DisplayName("returns only once the documents it was given are searchable")
+        void reportsWhatItIngested() {
+            FakeSource source = new FakeSource("notes",
+                Map.of("a.md", "storage engines and their write paths",
+                       "b.md", "query planning over segment catalogs"));
+
+            IngestionOrchestrator.IngestionOutcome outcome = orchestrator().ingestNow(source);
+
+            assertThat(outcome.documentsIngested()).isEqualTo(2);
+            assertThat(outcome.documentsFailed()).isZero();
+            assertThat(outcome.chunksIngested()).isPositive();
+            assertThat(storedChunk("notes", "a.md", 0))
+                .as("the run is finished when this returns, not scheduled")
+                .isNotNull();
+        }
+
+        /**
+         * A source already being crawled must not have a second run interleaved with it: the two
+         * would race on the same document ids. Refusing is what lets the caller retry, where
+         * silently returning would report documents as ingested that were dropped.
+         */
+        @Test
+        @DisplayName("refuses to run while the same source is already being ingested")
+        void refusesAConcurrentRunOfTheSameSource() throws Exception {
+            IngestionOrchestrator orchestrator = orchestrator();
+            java.util.concurrent.CountDownLatch inFlight =
+                new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch release =
+                new java.util.concurrent.CountDownLatch(1);
+            FakeSource blocking = new FakeSource("notes", Map.of("a.md", "text")) {
+                @Override
+                public FetchedDocument fetch(String documentId) throws SourceException {
+                    inFlight.countDown();
+                    try {
+                        release.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+            orchestrator.startIngestion(blocking);
+            assertThat(inFlight.await(30, TimeUnit.SECONDS)).isTrue();
+            try {
+                assertThatThrownBy(() -> orchestrator.ingestNow(
+                    new FakeSource("notes", Map.of("b.md", "other text"))))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("notes");
+            } finally {
+                release.countDown();
+                awaitIdle(orchestrator, "notes");
+            }
+        }
+
+        @Test
+        @DisplayName("rejects a null source")
+        void rejectsNullSource() {
+            assertThatThrownBy(() -> orchestrator().ingestNow(null))
+                .isInstanceOf(NullPointerException.class);
+        }
+
+        /**
+         * A synchronous run happens on the request thread, so it is not one of the background
+         * ingestion threads shutdown joins. Left untracked, shutdown returned while the run was
+         * still inside storageEngine.put - and the caller closes the Arena on the strength of
+         * that return, which is undefined behaviour rather than a caught exception.
+         */
+        @Test
+        @DisplayName("shutdown does not return while a synchronous run is still writing")
+        void shutdownWaitsForASynchronousRun() throws Exception {
+            IngestionOrchestrator orchestrator = orchestrator();
+            java.util.concurrent.CountDownLatch inFlight =
+                new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicBoolean runFinished =
+                new java.util.concurrent.atomic.AtomicBoolean();
+            // Deliberately does not stop on an interrupt: it stands in for a write that is
+            // partway through a memory-mapped region and has to be allowed to finish.
+            FakeSource slow = new FakeSource("notes", Map.of("a.md", "text")) {
+                @Override
+                public FetchedDocument fetch(String documentId) throws SourceException {
+                    inFlight.countDown();
+                    long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500);
+                    while (System.nanoTime() < until) {
+                        Thread.onSpinWait();
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+            Thread caller = new Thread(() -> {
+                try {
+                    orchestrator.ingestNow(slow);
+                } catch (RuntimeException ignored) {
+                    // What the interrupted run produced is not what this test is about.
+                } finally {
+                    runFinished.set(true);
+                }
+            });
+            caller.start();
+            assertThat(inFlight.await(30, TimeUnit.SECONDS)).isTrue();
+
+            orchestrator.shutdown();
+
+            assertThat(runFinished)
+                .as("shutdown returned while the run was still going, so its caller is about to "
+                    + "close the storage engine underneath it")
+                .isTrue();
+            caller.join(30_000);
+        }
+
+        /**
+         * Stopping one source has to reach a synchronous run of it too, or an operator cannot
+         * stop one at all.
+         */
+        @Test
+        @DisplayName("stopIngestion reaches a synchronous run of that source")
+        void stopIngestionReachesASynchronousRun() throws Exception {
+            IngestionOrchestrator orchestrator = orchestrator();
+            java.util.concurrent.CountDownLatch inFlight =
+                new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch release =
+                new java.util.concurrent.CountDownLatch(1);
+            FakeSource blocking = new FakeSource("notes", Map.of("a.md", "text")) {
+                @Override
+                public FetchedDocument fetch(String documentId) throws SourceException {
+                    inFlight.countDown();
+                    try {
+                        release.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+            Thread caller = new Thread(() -> {
+                try {
+                    orchestrator.ingestNow(blocking);
+                } catch (RuntimeException ignored) {
+                    // Interrupted by the stop; the assertion is that the stop found it.
+                }
+            });
+            caller.start();
+            assertThat(inFlight.await(30, TimeUnit.SECONDS)).isTrue();
+
+            assertThat(orchestrator.stopIngestion("notes")).isTrue();
+
+            release.countDown();
+            caller.join(30_000);
         }
     }
 

@@ -1,5 +1,6 @@
 package excalibur.ingest.graph;
 
+import io.excalibur.graph.provenance.Provenance;
 import io.excalibur.graph.staging.ExtractedTriple;
 import io.excalibur.graph.staging.GraphStagingStore;
 
@@ -7,9 +8,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -122,23 +123,48 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
      * it was found in. Without it the BM25 signal scores every entity identically, and the budget
      * that decides which facts a model is shown is spent in arbitrary order.
      *
+     * <p>Each snippet is recorded with the origin of the fact that mentioned the entity. Every
+     * triple here came out of one call over one document, so they agree on the three fields
+     * erasure matches against - source type, source id and extractor version - and what
+     * recording them buys is that a later source- or extractor-scoped erasure can reach this
+     * text. A snippet recorded without an origin can only be erased by naming its entity, and
+     * the coordinator has to withhold the request rather than report it satisfied.
+     *
+     * <p>The confidence is deliberately dropped. It is an extractor's confidence in one fact,
+     * and this is the whole document's text; carrying one triple's number on it would be a
+     * measurement of nothing that the next reader could reasonably try to filter on.
+     *
      * @param triples The facts extracted from this document
      * @param text    The document's text
      */
     private void recordEntityText(List<ExtractedTriple> triples, String text) {
-        Set<String> mentioned = new LinkedHashSet<>();
+        Map<String, Provenance> mentioned = new LinkedHashMap<>();
         for (ExtractedTriple triple : triples) {
-            mentioned.add(triple.subject());
-            mentioned.add(triple.object());
+            Provenance origin = originOf(triple.provenance());
+            mentioned.putIfAbsent(triple.subject(), origin);
+            mentioned.putIfAbsent(triple.object(), origin);
         }
-        for (String label : mentioned) {
+        for (Map.Entry<String, Provenance> entity : mentioned.entrySet()) {
             try {
-                staging.appendEntityText(staging.entityIdOf(label), text);
+                staging.appendEntityText(
+                    staging.entityIdOf(entity.getKey()), text, entity.getValue());
             } catch (IOException | RuntimeException e) {
                 indexFailures.incrementAndGet();
-                LOGGER.warn("could not record text for entity {}: {}", label, e.toString());
+                LOGGER.warn("could not record text for entity {}: {}",
+                    entity.getKey(), e.toString());
             }
         }
+    }
+
+    /**
+     * Where a fact came from, without the extractor's confidence in the fact itself.
+     *
+     * @param provenance The fact's provenance
+     * @return The same origin with no confidence attached
+     */
+    private static Provenance originOf(Provenance provenance) {
+        return new Provenance(provenance.sourceType(), provenance.sourceId(), 0,
+            provenance.extractorVersion());
     }
 
     /**

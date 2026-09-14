@@ -46,6 +46,7 @@ class DocumentErasureEndpointTest {
     private DocumentRegistry registry;
     private InMemorySourceRegistry sources;
     private DocumentErasureEndpoint endpoint;
+    private InlineSourceIds suppliedSources;
 
     @BeforeEach
     void setUp() {
@@ -55,13 +56,25 @@ class DocumentErasureEndpointTest {
         UpsertHandler.StorageAdapter adapter = storageAdapter();
         // No lexical index: this test is about the endpoint's contract, and the service's own
         // tests cover what an index adds to it.
+        suppliedSources = new InlineSourceIds(256);
         endpoint = new DocumentErasureEndpoint(
-            new DocumentErasureService(registry, adapter, null, null), sources);
+            new DocumentErasureService(registry, adapter, null, null), sources, suppliedSources);
     }
 
     /** Erasure's reach into storage: this test's map stands in for the chunks on disk. */
     private UpsertHandler.StorageAdapter storageAdapter() {
         return key -> storage.remove(new String(key, StandardCharsets.UTF_8)) != null;
+    }
+
+    /** A storage reach that will not release one named chunk, whatever it is asked. */
+    private UpsertHandler.StorageAdapter refusing(String unremovableChunkId) {
+        return key -> {
+            String chunkId = new String(key, StandardCharsets.UTF_8);
+            if (unremovableChunkId.equals(chunkId)) {
+                throw new IllegalStateException("segment is read-only");
+            }
+            return storage.remove(chunkId) != null;
+        };
     }
 
     /** Registers a crawlable source, so a source-scoped erasure has one to take out of the crawl. */
@@ -115,6 +128,42 @@ class DocumentErasureEndpointTest {
     }
 
     @Nested
+    @DisplayName("releasing a supplied source's id")
+    class ReleasingASuppliedId {
+
+        @Test
+        @DisplayName("forgets an id once everything supplied under it is erased")
+        void forgetsAnErasedSource() throws IOException {
+            // Otherwise the refusal outlives what it protects: POST /v1/ingest would go on
+            // refusing a crawl under this id on the grounds that it holds supplied documents
+            // the node no longer holds, with no way to clear it short of a restart.
+            suppliedSources.remember("notes");
+            ingest("notes", "a.md", 2);
+
+            Response response = post("{\"source_id\": \"notes\", \"scope\": \"source\"}");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(suppliedSources.isSupplied("notes")).isFalse();
+        }
+
+        @Test
+        @DisplayName("keeps the id when only some documents were erased")
+        void keepsTheIdForADocumentScopedErasure() throws IOException {
+            // The source still holds the rest of what was supplied, so a crawl registered under
+            // its id would still delete them.
+            suppliedSources.remember("notes");
+            ingest("notes", "a.md", 1);
+            ingest("notes", "b.md", 1);
+
+            Response response = post(
+                "{\"source_id\": \"notes\", \"document_ids\": [\"a.md\"]}");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(suppliedSources.isSupplied("notes")).isTrue();
+        }
+    }
+
+    @Nested
     @DisplayName("erasing")
     class Erasing {
 
@@ -162,6 +211,30 @@ class DocumentErasureEndpointTest {
                 .isEqualTo(200);
             assertThat(Json.at(response.json(), "documents_erased")).isEqualTo(0L);
             assertThat(Json.at(response.json(), "documents_not_found")).isEqualTo(1L);
+        }
+
+        @Test
+        @DisplayName("a document it could not fully erase is a failure, not a partial success")
+        void reportsWhatItCouldNotErase() throws IOException {
+            ingest("docs", "a.md", 2);
+            endpoint = new DocumentErasureEndpoint(
+                new DocumentErasureService(registry, refusing("docs:a.md:chunk:1"), null, null),
+                sources, suppliedSources);
+
+            Response response = post("{\"source_id\": \"docs\", \"document_id\": \"a.md\"}");
+
+            assertThat(response.status())
+                .as("the caller asked for content to be gone and some of it is not; a 200 here "
+                    + "would end a loop that has not finished its obligation")
+                .isEqualTo(500);
+            Object json = response.json();
+            assertThat(Json.at(json, "documents_incomplete")).isEqualTo(1L);
+            assertThat(Json.at(json, "chunks_not_removed")).isEqualTo(1L);
+            assertThat(Json.at(json, "documents_erased")).isEqualTo(0L);
+            assertThat(registry.contains("docs", "a.md"))
+                .as("the entry is what names the chunks, so a repeat of the request still has "
+                    + "something to erase")
+                .isTrue();
         }
 
         @Test

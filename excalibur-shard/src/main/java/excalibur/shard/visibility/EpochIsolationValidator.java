@@ -54,8 +54,8 @@ import java.util.concurrent.ConcurrentSkipListMap;
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Node visibility epochs are non-negative and monotonically increasing per segment</li>
- *   <li>A node is visible at epoch E if its visibility epoch <= E</li>
- *   <li>Filtered result counts are always <= original result counts</li>
+ *   <li>A node is visible at epoch E if its visibility epoch &lt;= E</li>
+ *   <li>Filtered result counts are always &lt;= original result counts</li>
  *   <li>No null results in filtered output</li>
  * </ul>
  *
@@ -310,7 +310,7 @@ public final class EpochIsolationValidator {
      *
      * <p><strong>Domain Correctness:</strong></p>
      * <ul>
-     *   <li>Returned list contains only nodes with visibility epoch <= queryEpoch</li>
+     *   <li>Returned list contains only nodes with visibility epoch &lt;= queryEpoch</li>
      *   <li>Original ordering (by distance) is preserved</li>
      *   <li>No null elements in returned list</li>
      * </ul>

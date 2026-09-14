@@ -2,6 +2,7 @@ package excalibur.ingest.registry;
 
 import excalibur.ingest.source.DocumentNotFoundException;
 import excalibur.ingest.source.FetchedDocument;
+import excalibur.ingest.source.IncompleteCrawlException;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
 import org.slf4j.Logger;
@@ -29,7 +30,10 @@ import java.util.stream.Stream;
  *
  * <h2>Deleted Document Detection</h2>
  * <p>After processing all crawled documents, any document in the registry that was not
- * seen during the crawl is considered deleted.</p>
+ * seen during the crawl is considered deleted. That inference is only sound over a complete
+ * listing, so a crawl that reports itself truncated - an
+ * {@link IncompleteCrawlException} - abandons the detection rather than deleting everything the
+ * crawl had not reached.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is NOT thread-safe. Each detection operation should be performed from
@@ -78,6 +82,8 @@ public class ChangeDetector {
                     seenDocumentIds.add(documentId);
                 }
             });
+        } catch (IncompleteCrawlException e) {
+            throw truncated(sourceId, e);
         }
         
         for (String registeredDocId : registry.getDocumentIds(sourceId)) {
@@ -138,8 +144,10 @@ public class ChangeDetector {
                 batchBuilder.totalCrawled(batchCount);
                 batchConsumer.accept(batchBuilder.build());
             }
+        } catch (IncompleteCrawlException e) {
+            throw truncated(sourceId, e);
         }
-        
+
         ChangeSet.Builder finalBuilder = ChangeSet.builder(sourceId);
         finalBuilder.totalCrawled(totalCrawled);
         finalBuilder.totalRegistered(totalRegistered);
@@ -154,6 +162,22 @@ public class ChangeDetector {
         }
         
         return finalBuilder.build();
+    }
+
+    /**
+     * Turns a crawl that stopped early into the failure its callers already handle.
+     *
+     * <p>Everything after the crawl infers deletions by subtraction: a registered document the
+     * crawl did not list is taken to be one the source no longer serves. That is only sound over
+     * a complete listing, and there is no partial answer worth returning from an incomplete one -
+     * the documents it never reached are exactly the ones it would tombstone. So the detection
+     * fails and the corpus is left as it is.</p>
+     */
+    private static SourceException truncated(String sourceId, IncompleteCrawlException cause) {
+        LOGGER.error("Change detection for source {} abandoned: {}", sourceId, cause.getMessage());
+        // Not retryable: the crawl did not fail on its own: something closed the source, and
+        // repeating it against a closed source gives the same answer.
+        return new SourceException(cause.getMessage(), sourceId, false, cause);
     }
 
     /**

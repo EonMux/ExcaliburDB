@@ -221,18 +221,7 @@ public class TailScanner {
             int k,
             DistanceFunction distanceFunction) {
 
-        Objects.requireNonNull(queryVector, "Query vector cannot be null");
-
-        if (startOffset < 0) {
-            throw new IllegalArgumentException("Start offset cannot be negative: " + startOffset);
-        }
-        if (endOffset < startOffset) {
-            throw new IllegalArgumentException(
-                "End offset " + endOffset + " cannot be less than start offset " + startOffset);
-        }
-        if (k < 0) {
-            throw new IllegalArgumentException("k cannot be negative: " + k);
-        }
+        requireScannableRange(queryVector, startOffset, endOffset, k);
 
         // Early return for empty range or k=0 (before null checks on writeLog/distanceFunction)
         if (startOffset >= endOffset || k == 0) {
@@ -252,11 +241,78 @@ public class TailScanner {
         );
 
         ScanState state = new ScanState();
-        long currentOffset = startOffset;
-        long writeLogEnd = writeLog.writeOffset();
 
         // Ensure we don't read beyond the actual write log data
-        long scanEnd = Math.min(endOffset, writeLogEnd);
+        long scanEnd = Math.min(endOffset, writeLog.writeOffset());
+
+        scanEntries(writeLog, startOffset, scanEnd, queryVector, distanceFunction, k,
+            topResults, state);
+
+        // Record tail scan metrics for JMX observability
+        // This tracks: total scans performed, total entries scanned, max entries per scan
+        Metrics.recordTailScanMetrics(state.entriesScanned, state.vectorEntriesFound);
+
+        // Convert max-heap to sorted list (closest first)
+        List<HnswSearchResult> results = new ArrayList<>(topResults);
+        results.sort(Comparator.comparingDouble(HnswSearchResult::distance));
+
+        logScanComplete(state, results.size());
+
+        return new TailScanOutcome(
+            results, state.entriesScanned, state.backpressureTriggered, state.cancelled,
+            state.payloads);
+    }
+
+    /**
+     * Rejects a scan whose range could not describe a stretch of write log.
+     *
+     * <p>Only the arguments a range needs, because an empty range is answered without a log or
+     * a distance function ever being touched: a caller with nothing to scan should not have to
+     * supply either.</p>
+     *
+     * @param queryVector The query vector to compare against
+     * @param startOffset The starting byte offset
+     * @param endOffset The ending byte offset
+     * @param k The maximum number of results to return
+     * @throws NullPointerException if queryVector is null
+     * @throws IllegalArgumentException if the offsets are invalid or k is negative
+     */
+    private static void requireScannableRange(float[] queryVector, long startOffset,
+                                              long endOffset, int k) {
+        Objects.requireNonNull(queryVector, "Query vector cannot be null");
+
+        if (startOffset < 0) {
+            throw new IllegalArgumentException("Start offset cannot be negative: " + startOffset);
+        }
+        if (endOffset < startOffset) {
+            throw new IllegalArgumentException(
+                "End offset " + endOffset + " cannot be less than start offset " + startOffset);
+        }
+        if (k < 0) {
+            throw new IllegalArgumentException("k cannot be negative: " + k);
+        }
+    }
+
+    /**
+     * Walks the range entry by entry until it ends, or until the scan must stop short.
+     *
+     * <p>Both ways of stopping short are recorded on the state rather than thrown, because the
+     * results found before stopping are still worth returning - what the caller must not do is
+     * read them as the whole tail.</p>
+     *
+     * @param writeLog The write log to scan
+     * @param startOffset The first offset to read
+     * @param scanEnd The offset to stop before
+     * @param queryVector The query vector to compare against
+     * @param distanceFunction The distance function to use for comparison
+     * @param k The maximum number of results to keep
+     * @param topResults The max-heap of results found so far
+     * @param state The counters and payloads for this scan
+     */
+    private void scanEntries(WriteLog writeLog, long startOffset, long scanEnd,
+                             float[] queryVector, DistanceFunction distanceFunction, int k,
+                             PriorityQueue<HnswSearchResult> topResults, ScanState state) {
+        long currentOffset = startOffset;
 
         while (currentOffset < scanEnd) {
             // CANCELLATION: a cancelled or timed-out query interrupts this thread.
@@ -286,27 +342,23 @@ public class TailScanner {
             }
             currentOffset = nextOffset;
         }
+    }
 
-        // Record tail scan metrics for JMX observability
-        // This tracks: total scans performed, total entries scanned, max entries per scan
-        Metrics.recordTailScanMetrics(state.entriesScanned, state.vectorEntriesFound);
-
-        // Convert max-heap to sorted list (closest first)
-        List<HnswSearchResult> results = new ArrayList<>(topResults);
-        results.sort(Comparator.comparingDouble(HnswSearchResult::distance));
-
+    /**
+     * Reports how the scan ended, loudly when it did not cover the whole tail.
+     *
+     * @param state The counters for the finished scan
+     * @param resultCount How many results it is returning
+     */
+    private void logScanComplete(ScanState state, int resultCount) {
         if (state.backpressureTriggered) {
             LOGGER.warn("Tail scan complete with backpressure: {} entries scanned (limit: {}), " +
                        "{} vectors found, {} results returned. Some tail entries were not scanned.",
-                       state.entriesScanned, backpressureEntryLimit, state.vectorEntriesFound, results.size());
+                       state.entriesScanned, backpressureEntryLimit, state.vectorEntriesFound, resultCount);
         } else {
             LOGGER.trace("Tail scan complete: {} entries scanned, {} vectors found, {} results returned",
-                state.entriesScanned, state.vectorEntriesFound, results.size());
+                state.entriesScanned, state.vectorEntriesFound, resultCount);
         }
-
-        return new TailScanOutcome(
-            results, state.entriesScanned, state.backpressureTriggered, state.cancelled,
-            state.payloads);
     }
 
     /**
@@ -340,43 +392,66 @@ public class TailScanner {
 
         // Only process PUT entries with vector data
         if (entry.isPut() && entry.valueLength() > ChunkPayloadCodec.HEADER_BYTES) {
-            float[] vector = extractVector(entry.value(), queryVector.length);
-
-            if (vector != null) {
-                // Exact dissimilarity: smaller is closer for every metric
-                float distance = distanceFunction.distance(queryVector, vector);
-
-                if (Float.isFinite(distance)) {
-                    // Clamp on the metric's natural scale, then convert back to the
-                    // ordered scale so the value stays comparable with HNSW results.
-                    DistanceFunction.Ordering ordering = distanceFunction.ordering();
-                    distance = ordering.toDistance(DistanceValidator.validateAndClamp(
-                        ordering.fromDistance(distance), distanceFunction));
-
-                    // Synthetic node ID (high bit tagged) plus the real document identity
-                    long nodeId = encodeNodeId(offset, entry.lsn());
-                    String documentId = extractDocumentId(entry.key());
-
-                    HnswSearchResult result = new HnswSearchResult(nodeId, distance, documentId);
-
-                    if (topResults.size() < k) {
-                        topResults.add(result);
-                        state.keepPayload(nodeId, chunkText(entry.value()));
-                    } else if (distance < topResults.peek().distance()) {
-                        state.dropPayload(topResults.poll().nodeId());
-                        topResults.add(result);
-                        state.keepPayload(nodeId, chunkText(entry.value()));
-                    }
-
-                    state.vectorEntriesFound++;
-                } else {
-                    LOGGER.debug("Skipping tail entry at offset {} with non-finite distance {}",
-                        offset, distance);
-                }
-            }
+            rankEntry(entry, offset, queryVector, distanceFunction, k, topResults, state);
         }
 
         return offset + entry.size();
+    }
+
+    /**
+     * Measures one write-log entry against the query and keeps it if it is close enough.
+     *
+     * <p>An entry whose value holds no readable vector, or that measures to a value which
+     * cannot be ordered, is passed over without being counted as a vector found: the tail was
+     * still read past it, and the vector tally is what says how much of it was searchable.</p>
+     *
+     * @param entry The PUT entry to measure
+     * @param offset The entry's offset, which its synthetic node ID is derived from
+     * @param queryVector The query vector to compare against
+     * @param distanceFunction The distance function to use for comparison
+     * @param k The maximum number of results to keep
+     * @param topResults The max-heap of results found so far, furthest at its head
+     * @param state The counters and payloads for this scan
+     */
+    private void rankEntry(LogEntry entry, long offset, float[] queryVector,
+                           DistanceFunction distanceFunction, int k,
+                           PriorityQueue<HnswSearchResult> topResults, ScanState state) {
+        float[] vector = extractVector(entry.value(), queryVector.length);
+        if (vector == null) {
+            return;
+        }
+
+        // Exact dissimilarity: smaller is closer for every metric
+        float distance = distanceFunction.distance(queryVector, vector);
+
+        if (!Float.isFinite(distance)) {
+            LOGGER.debug("Skipping tail entry at offset {} with non-finite distance {}",
+                offset, distance);
+            return;
+        }
+
+        // Clamp on the metric's natural scale, then convert back to the
+        // ordered scale so the value stays comparable with HNSW results.
+        DistanceFunction.Ordering ordering = distanceFunction.ordering();
+        distance = ordering.toDistance(DistanceValidator.validateAndClamp(
+            ordering.fromDistance(distance), distanceFunction));
+
+        // Synthetic node ID (high bit tagged) plus the real document identity
+        long nodeId = encodeNodeId(offset, entry.lsn());
+        String documentId = extractDocumentId(entry.key());
+
+        HnswSearchResult result = new HnswSearchResult(nodeId, distance, documentId);
+
+        if (topResults.size() < k) {
+            topResults.add(result);
+            state.keepPayload(nodeId, chunkText(entry.value()));
+        } else if (distance < topResults.peek().distance()) {
+            state.dropPayload(topResults.poll().nodeId());
+            topResults.add(result);
+            state.keepPayload(nodeId, chunkText(entry.value()));
+        }
+
+        state.vectorEntriesFound++;
     }
 
     /**

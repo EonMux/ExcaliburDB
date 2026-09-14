@@ -8,7 +8,6 @@ import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.ResponseBody;
 import excalibur.api.reindex.ReindexCoordinator;
 import excalibur.ingest.pipeline.DocumentReindexer;
-import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceResolver;
 import excalibur.shard.allocator.VolumeManager;
 import io.excalibur.core.logging.StructuredLoggingHelper;
@@ -18,7 +17,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -81,10 +79,6 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(ReindexEndpoint.class);
 
     /**
-     * Maximum request body size in bytes.
-     */
-
-    /**
      * How long {@link #close()} waits for in-flight reindex work to finish.
      */
     private static final int SHUTDOWN_TIMEOUT_SECONDS = 30;
@@ -100,6 +94,12 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     // Optional components for zero-downtime rolling replacement
     private final VolumeManager volumeManager;
     private final SegmentCatalog segmentCatalog;
+
+    /**
+     * What actually runs a reindex once this endpoint has claimed the source, or null on a node
+     * where reindexing is not configured and every request is answered 503.
+     */
+    private final ReindexRun reindexRun;
 
     /**
      * The authoritative mutual exclusion for reindex operations. Shared with the
@@ -193,6 +193,13 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         this.reindexExecutor = documentReindexer != null ? Executors.newVirtualThreadPerTaskExecutor() : null;
         this.volumeManager = volumeManager;
         this.segmentCatalog = segmentCatalog;
+        // Built only where it can run. A reindexer without a resolver has no way to reach the
+        // source's documents, which is the same "not configured on this server" that no
+        // reindexer at all is, and handle() answers both of them 503 before reaching this.
+        this.reindexRun = documentReindexer != null && sourceResolver != null
+            ? new ReindexRun(documentReindexer, sourceResolver, volumeManager, segmentCatalog,
+                reindexStatusRegistry)
+            : null;
 
         boolean hasRollingReplacement = volumeManager != null && segmentCatalog != null;
         LOGGER.info("ReindexEndpoint configured with document reindexer: {}, rolling replacement: {}",
@@ -211,14 +218,28 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
      * @param reindexStatusRegistry The registry for tracking reindex status
      */
     public ReindexEndpoint(SourceRegistry sourceRegistry, ReindexStatusRegistry reindexStatusRegistry) {
+        this(sourceRegistry, reindexStatusRegistry, new ReindexCoordinator());
+    }
+
+    /**
+     * Creates an endpoint without reindexing capability that shares a coordinator.
+     *
+     * @param sourceRegistry        The registry for looking up sources
+     * @param reindexStatusRegistry The registry for tracking reindex status
+     * @param coordinator           The shared reindex mutual-exclusion primitive
+     */
+    public ReindexEndpoint(SourceRegistry sourceRegistry,
+                           ReindexStatusRegistry reindexStatusRegistry,
+                           ReindexCoordinator coordinator) {
         this.sourceRegistry = Objects.requireNonNull(sourceRegistry, "SourceRegistry cannot be null");
         this.reindexStatusRegistry = Objects.requireNonNull(reindexStatusRegistry, "ReindexStatusRegistry cannot be null");
-        this.coordinator = new ReindexCoordinator();
+        this.coordinator = Objects.requireNonNull(coordinator, "ReindexCoordinator cannot be null");
         this.documentReindexer = null;
         this.sourceResolver = null;
         this.reindexExecutor = null;
         this.volumeManager = null;
         this.segmentCatalog = null;
+        this.reindexRun = null;
     }
 
     /**
@@ -235,8 +256,13 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     public void handle(HttpExchange exchange) throws IOException {
         String method = exchange.getRequestMethod();
 
+        if ("DELETE".equalsIgnoreCase(method)) {
+            cancelReindex(exchange);
+            return;
+        }
         if (!"POST".equalsIgnoreCase(method)) {
-            sendError(exchange, 405, "Method Not Allowed");
+            sendError(exchange, 405,
+                "Method Not Allowed - Use POST to start a reindex or DELETE to stop one");
             return;
         }
 
@@ -286,13 +312,13 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
                 boolean submitted = false;
                 try {
                     reindexStatusRegistry.startReindex(sourceId);
-                    reindexExecutor.submit(() -> {
-                        try {
-                            executeReindex(sourceId);
-                        } finally {
-                            lease.release();
-                        }
-                    });
+                    // execute, not submit. A cancelled Future on a virtual-thread-per-task
+                    // executor skips its task body outright, so a release living in that body's
+                    // finally is skipped with it - and a DELETE arriving before the run thread
+                    // is scheduled left the source claimed forever, which is the state this
+                    // endpoint's DELETE exists to clear. With execute there is no future to
+                    // cancel, the body always runs, and the release is reached on every outcome.
+                    reindexExecutor.execute(() -> runReindex(sourceId, lease));
                     submitted = true;
                     LOGGER.info("Async reindex task submitted for source");
                 } finally {
@@ -389,143 +415,83 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     // ==================== Async Reindex Execution ====================
 
     /**
-     * Executes the reindex operation in a background virtual thread.
+     * Runs one reindex, and releases its claim however it ends.
      *
-     * <p>This method is called asynchronously after the HTTP response has been
-     * sent. It performs the actual reindexing by:</p>
-     * <ol>
-     *   <li>Resolving the source using SourceResolver</li>
-     *   <li>Selecting a volume for new segments (if rolling replacement is enabled)</li>
-     *   <li>Invoking DocumentReindexer.reindexWithRollingReplacement() for zero-downtime reindexing</li>
-     *   <li>Falling back to reindexAll() if rolling replacement is not configured</li>
-     *   <li>Updating status registry as reindex progresses</li>
-     *   <li>Calling completeReindex() or failReindex() when done</li>
-     * </ol>
+     * <p>The claim is released here and nowhere else, so every outcome reaches it: a run that
+     * finished, one that threw, and one cancelled before it began. The last is the one that used
+     * to be missed, and missing it left the source permanently unreindexable.</p>
      *
-     * <h2>Zero-Downtime Rolling Replacement</h2>
-     * <p>When VolumeManager and SegmentCatalog are configured, this method uses
-     * rolling replacement which ensures:</p>
-     * <ul>
-     *   <li>New segments are created in BOOTSTRAPPING state</li>
-     *   <li>Old segments continue serving queries during reindexing</li>
-     *   <li>New segments progress through INDEXING → WARMING → ACTIVE</li>
-     *   <li>Old segments are tombstoned only after new segments are ACTIVE</li>
-     * </ul>
+     * <p>Cancellation is observed twice, because it can arrive on either side of this thread
+     * starting. Before: the lease already says so and the run is never begun. During: the
+     * canceller interrupts this thread, and a cancellation that lands between the check and the
+     * registration is replayed by the lease onto the canceller it is given.</p>
      *
-     * @param sourceId The source ID to reindex
+     * @param sourceId The source to reindex
+     * @param lease    This run's exclusive claim on it
      */
-    private void executeReindex(String sourceId) {
-        String threadName = Thread.currentThread().getName();
-        LOGGER.info("[reindex-{}] Starting reindex execution for source: {}", threadName, sourceId);
-
+    private void runReindex(String sourceId, ReindexCoordinator.Lease lease) {
         try {
-            // Resolve the source
-            Source source = sourceResolver.resolve(sourceId);
-            if (source == null) {
-                String error = "Source not found: " + sourceId;
-                LOGGER.error("[reindex-{}] {}", threadName, error);
-                reindexStatusRegistry.failReindex(sourceId, error);
+            if (lease.isCancelled()) {
+                LOGGER.info("Reindex of {} was cancelled before it started", sourceId);
+                reindexStatusRegistry.failReindex(sourceId,
+                    "Reindex was cancelled before it started");
                 return;
             }
-
-            // Update status to indicate crawling phase
-            reindexStatusRegistry.updateProgress(sourceId, "crawling", 0.1, 0, 0);
-
-            // Check if rolling replacement is configured
-            boolean useRollingReplacement = volumeManager != null && segmentCatalog != null && documentReindexer.hasRollingReplacement();
-
-            if (useRollingReplacement) {
-                // Zero-downtime rolling replacement
-                LOGGER.info("[reindex-{}] Using rolling replacement for zero-downtime reindex of source: {}", threadName, sourceId);
-
-                // Select a volume for the new segment
-                Path volumePath = volumeManager.getVolumeWithMostSpace();
-                if (volumePath == null) {
-                    String error = "No volume available for reindex";
-                    LOGGER.error("[reindex-{}] {} for source: {}", threadName, error, sourceId);
-                    reindexStatusRegistry.failReindex(sourceId, error);
-                    return;
-                }
-
-                LOGGER.info("[reindex-{}] Selected volume {} for new segment of source: {}", threadName, volumePath, sourceId);
-
-                // Update status to indicate embedding phase
-                reindexStatusRegistry.updateProgress(sourceId, "embedding", 0.3, 0, 0);
-
-                // Execute rolling replacement reindex
-                DocumentReindexer.RollingReindexResult result = documentReindexer.reindexWithRollingReplacement(source, volumePath);
-
-                // Update status to indicate indexing phase
-                reindexStatusRegistry.updateProgress(sourceId, "indexing", 0.7,
-                    result.getDocumentsIndexed(), result.getDocumentsIndexed() + result.getBasicResult().getChunksFailed());
-
-                if (result.hasErrors() && result.getDocumentsIndexed() == 0) {
-                    // Complete failure
-                    String error = String.format("Reindex failed completely with %d errors: %s",
-                        result.getErrorCount(),
-                        result.getBasicResult().getErrors().stream()
-                            .map(DocumentReindexer.ReindexResult.OperationError::getMessage)
-                            .reduce((a, b) -> a + "; " + b)
-                            .orElse("unknown"));
-                    LOGGER.error("[reindex-{}] {} for source: {}", threadName, error, sourceId);
-                    reindexStatusRegistry.failReindex(sourceId, error);
-                } else if (result.hasErrors()) {
-                    // Partial success - log warning but mark as complete
-                    LOGGER.warn("[reindex-{}] Rolling reindex completed with {} errors for source {}: {} docs indexed, {} old segments tombstoned, new segment {}",
-                        threadName, result.getErrorCount(), sourceId, result.getDocumentsIndexed(),
-                        result.getTombstonedSegmentIds().size(), result.getNewSegmentId());
-                    reindexStatusRegistry.completeReindex(sourceId);
-                } else {
-                    LOGGER.info("[reindex-{}] Rolling reindex completed successfully for source {}: {} docs indexed, {} old segments tombstoned, new segment {}",
-                        threadName, sourceId, result.getDocumentsIndexed(),
-                        result.getTombstonedSegmentIds().size(), result.getNewSegmentId());
-                    reindexStatusRegistry.completeReindex(sourceId);
-                }
-
-            } else {
-                // Fall back to non-rolling reindex
-                LOGGER.info("[reindex-{}] Using standard reindex (rolling replacement not configured) for source: {}", threadName, sourceId);
-                reindexStatusRegistry.updateProgress(sourceId, "embedding", 0.3, 0, 0);
-                DocumentReindexer.ReindexResult result = documentReindexer.reindexAll(source);
-
-                // Update status to indicate indexing phase
-                reindexStatusRegistry.updateProgress(sourceId, "indexing", 0.7,
-                    result.getDocumentsIndexed(), result.getDocumentsIndexed() + result.getChunksFailed());
-
-                // The same rule the rolling branch applies: a run is failed when it indexed
-                // nothing, and a partial success is a completed run with a warning. Failing on
-                // any error at all reported a run that reindexed four hundred documents and
-                // could not read one of them as a failed reindex, which is the opposite of
-                // what an operator would do about it.
-                if (result.hasErrors() && result.getDocumentsIndexed() == 0) {
-                    String error = String.format("Reindex failed completely with %d errors: %s",
-                        result.getErrorCount(),
-                        result.getErrors().stream()
-                            .map(DocumentReindexer.ReindexResult.OperationError::getMessage)
-                            .reduce((a, b) -> a + "; " + b)
-                            .orElse("unknown"));
-                    LOGGER.error("[reindex-{}] {} for source: {}", threadName, error, sourceId);
-                    reindexStatusRegistry.failReindex(sourceId, error);
-                } else if (result.hasErrors()) {
-                    LOGGER.warn("[reindex-{}] Reindex completed with {} errors for {}: {} docs "
-                            + "indexed, {} skipped, {} chunks created",
-                        threadName, result.getErrorCount(), sourceId, result.getDocumentsIndexed(),
-                        result.getDocumentsSkipped(), result.getChunksCreated());
-                    reindexStatusRegistry.completeReindex(sourceId);
-                } else {
-                    LOGGER.info("[reindex-{}] Reindex completed successfully for {}: {} docs "
-                            + "indexed, {} skipped, {} chunks created",
-                        threadName, sourceId, result.getDocumentsIndexed(),
-                        result.getDocumentsSkipped(), result.getChunksCreated());
-                    reindexStatusRegistry.completeReindex(sourceId);
-                }
-            }
-
-        } catch (Exception e) {
-            String error = "Reindex failed: " + e.getMessage();
-            LOGGER.error("[reindex-{}] {} for source: {}", threadName, error, sourceId, e);
-            reindexStatusRegistry.failReindex(sourceId, error);
+            Thread runner = Thread.currentThread();
+            lease.onCancel(runner::interrupt);
+            reindexRun.execute(sourceId);
+        } finally {
+            lease.release();
         }
+    }
+
+    /**
+     * {@code DELETE /v1/reindex} - asks a running reindex to stop.
+     *
+     * <h3>Why this exists</h3>
+     * <p>A rolling replacement holds its source's claim until it ends, and one that hangs - a
+     * source whose fetch never returns - holds it for the life of the process. Every later
+     * reindex of that source is then answered 409 forever, and the only recovery is restarting
+     * the node, which is not a thing an operator should have to do to a serving node.</p>
+     *
+     * <h3>What it does not do</h3>
+     * <p>It does not release the claim, and the reply does not say the reindex has stopped. The
+     * run stops at its next checkpoint and releases its own claim then; releasing it here would
+     * let a second rolling replacement start alongside the first, which is the data loss the
+     * claim exists to prevent. {@code GET /v1/reindex/status} is what says when it has ended.</p>
+     *
+     * @param exchange The request to answer
+     */
+    private void cancelReindex(HttpExchange exchange) throws IOException {
+        String sourceId;
+        try {
+            sourceId = parseRequest(readRequestBody(exchange)).sourceId;
+        } catch (RequestBody.TooLargeException e) {
+            sendError(exchange, 413, e.getMessage());
+            return;
+        } catch (IllegalArgumentException e) {
+            sendError(exchange, 400, "Bad Request: " + e.getMessage());
+            return;
+        }
+
+        if (!sourceRegistry.isRegistered(sourceId)) {
+            sendError(exchange, 404, "Source not found: " + sourceId);
+            return;
+        }
+
+        boolean cancelled = coordinator.cancel(sourceId);
+        if (cancelled) {
+            LOGGER.info("Reindex of {} was asked to stop", sourceId);
+        }
+        // 200 either way, with the fact in the body. A caller clearing a stuck reindex wants to
+        // know whether there was one, and "nothing was running" is an answer rather than an
+        // error - the state it was asking for is the state it now has.
+        ResponseBody.sendJson(exchange, 200,
+            "{\"source_id\": \"" + JsonText.escape(sourceId) + "\", "
+                + "\"cancelled\": " + cancelled + ", "
+                + "\"message\": \"" + (cancelled
+                    ? "Reindex was asked to stop; poll /v1/reindex/status for when it has"
+                    : "No reindex of this source is running") + "\"}");
     }
 
     /**
@@ -648,27 +614,6 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     }
 
     /**
-     * Registry interface for looking up sources.
-     */
-    public interface SourceRegistry {
-        /**
-         * Checks if a source ID is registered.
-         *
-         * @param sourceId The source ID to check
-         * @return true if the source is registered
-         */
-        boolean isRegistered(String sourceId);
-
-        /**
-         * Gets a source by ID.
-         *
-         * @param sourceId The source ID
-         * @return The source, or null if not found
-         */
-        Source get(String sourceId);
-    }
-
-    /**
      * Registry interface for tracking reindex status.
      */
     public interface ReindexStatusRegistry {
@@ -690,60 +635,6 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
          * @return true if a status was removed
          */
         boolean remove(String sourceId);
-    }
-
-    /**
-     * In-memory implementation of SourceRegistry.
-     *
-     * <p>This implementation stores both source IDs and Source instances,
-     * enabling full reindex functionality when used with a DocumentReindexer.</p>
-     */
-    public static class InMemorySourceRegistry implements SourceRegistry {
-        private final Set<String> registeredIds = ConcurrentHashMap.newKeySet();
-        private final ConcurrentHashMap<String, Source> sources = new ConcurrentHashMap<>();
-
-        /**
-         * Registers a source with its full instance.
-         *
-         * @param source The source to register
-         * @throws NullPointerException if source is null
-         */
-        public void register(Source source) {
-            Objects.requireNonNull(source, "Source cannot be null");
-            String sourceId = source.getSourceId();
-            registeredIds.add(sourceId);
-            sources.put(sourceId, source);
-        }
-
-        /**
-         * Registers a source by ID only (legacy method).
-         *
-         * <p>This method registers the source ID for tracking purposes but
-         * does not store the actual Source instance. The {@link #get(String)}
-         * method will return null for sources registered this way.</p>
-         *
-         * @param sourceId The source ID to register
-         * @deprecated Use {@link #register(Source)} for full functionality including reindex support
-         */
-        @Deprecated
-        public void register(String sourceId) {
-            registeredIds.add(sourceId);
-        }
-
-        @Override
-        public boolean isRegistered(String sourceId) {
-            return registeredIds.contains(sourceId);
-        }
-
-        @Override
-        public Source get(String sourceId) {
-            return sources.get(sourceId);
-        }
-
-        public void unregister(String sourceId) {
-            registeredIds.remove(sourceId);
-            sources.remove(sourceId);
-        }
     }
 
     /**

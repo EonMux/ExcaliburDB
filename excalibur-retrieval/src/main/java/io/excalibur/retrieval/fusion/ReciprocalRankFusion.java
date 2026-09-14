@@ -35,6 +35,8 @@ public final class ReciprocalRankFusion implements FusionStrategy {
      *
      * <p>Not a tuning knob to reach for first: it trades off how sharply top ranks are rewarded,
      * and moving it without measuring recall on a real query set usually makes things worse.
+     * A deployment that has measured sets it with {@code excalibur.query.rrf-k} and passes the
+     * configured strategy where the fusion is used, rather than relying on this.
      */
     public static final int DEFAULT_K = 60;
 

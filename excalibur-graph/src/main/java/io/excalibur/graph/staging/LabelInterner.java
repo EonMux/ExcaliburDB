@@ -1,5 +1,8 @@
 package io.excalibur.graph.staging;
 
+import io.excalibur.graph.file.Durability;
+import io.excalibur.graph.file.TailIntegrity;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntPredicate;
 import java.util.zip.CRC32;
 
 /**
@@ -42,6 +46,18 @@ import java.util.zip.CRC32;
  * tail, and the labels before it are still exactly the ids they were. Truncating there rather than
  * failing is what lets ingestion resume after a crash instead of requiring the graph to be rebuilt
  * from nothing.</p>
+ *
+ * <p>That tolerance holds only while nothing readable follows the damage. Labels lost from the
+ * middle of the file would have their ids handed out again to different labels, while every
+ * artifact built from an earlier state - the published dictionary above all - still maps those ids
+ * to the labels that were lost. An entity served under a stranger's name is the one outcome this
+ * class exists to prevent, so that case fails the open instead; see
+ * {@link io.excalibur.graph.file.TailIntegrity}.</p>
+ *
+ * <h2>Erasure</h2>
+ * <p>{@link #tombstone} is the only way a label leaves this file. It rewrites the file in place of
+ * appending, because an erased name that is still on disk has not been erased, and it keeps every
+ * ordinal where it was, because an erasure may not renumber a published graph.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use. Lookups are lock-free; assigning a new id takes a lock, because the
@@ -69,6 +85,9 @@ public final class LabelInterner implements AutoCloseable {
      * storing it would put a megabyte of prose where an id's label belongs.
      */
     public static final int MAX_LABEL_BYTES = 4096;
+
+    /** Suffix of the whole-file replacement a tombstoning rewrite builds before swapping it in. */
+    private static final String REWRITE_SUFFIX = ".rewriting";
 
     private final Path path;
     private final Map<String, Integer> ids = new ConcurrentHashMap<>();
@@ -105,7 +124,14 @@ public final class LabelInterner implements AutoCloseable {
         // record the next replay stops at - so those labels are read back as absent and their ids
         // are handed out again to different labels. Ids that move are the one thing this class
         // exists to prevent.
+        //
+        // Which is also why the truncation is refused unless the unreadable bytes really are a
+        // tail. Labels lost from the middle of the file would be reassigned to whatever is
+        // interned next, while the published entities.idx still maps those ids to the labels that
+        // were lost - one entity served under another's name, reported by nothing.
         if (Files.exists(path) && Files.size(path) > replay.validBytes()) {
+            TailIntegrity.requireTornTail(path, "label interner", replay.contents(),
+                replay.validBytes(), LabelInterner::recordStartsAt);
             LOGGER.warn("truncating {} from {} to {} bytes: the tail was not readable",
                 path, Files.size(path), replay.validBytes());
             try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(
@@ -114,18 +140,7 @@ public final class LabelInterner implements AutoCloseable {
             }
         }
 
-        boolean fresh = !Files.exists(path) || Files.size(path) < HEADER_BYTES;
-        OutputStream sink = Files.newOutputStream(path,
-            StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
-        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(sink));
-        if (fresh) {
-            out.writeLong(MAGIC);
-            out.writeInt(VERSION);
-            out.writeInt(0);
-            out.flush();
-        }
-
-        LabelInterner interner = new LabelInterner(path, out);
+        LabelInterner interner = new LabelInterner(path, openForAppend(path));
         for (String label : existing) {
             interner.labels.add(label);
             interner.ids.put(label, interner.labels.size() - 1);
@@ -177,6 +192,119 @@ public final class LabelInterner implements AutoCloseable {
             labels.add(label);
             ids.put(label, id);
             return id;
+        }
+    }
+
+    /**
+     * The placeholder an erased id's label is replaced by.
+     *
+     * <p>Carries the id so that two erased labels stay distinct strings. Were they identical, the
+     * label-to-id map would hold one entry for both and {@link #size()} would fall below the
+     * number of ids assigned - and that count is the entity count an edge store is built with, so
+     * shrinking it would size the store's offset array below ids that are still in use.</p>
+     *
+     * @param id The erased id
+     * @return A non-blank label that names nobody
+     */
+    public static String erasedLabel(int id) {
+        return "(erased " + id + ")";
+    }
+
+    /**
+     * Replaces the labels of erased ids with {@link #erasedLabel}, keeping every ordinal in place.
+     *
+     * <h3>Why a rewrite rather than an append</h3>
+     * <p>The file is the only record of what each id is called, and an id's label is its ordinal in
+     * the file. An erased name cannot be retracted by appending anything, because the bytes of the
+     * name would still be on disk - which is the whole distinction between a tombstone and an
+     * erasure. So the file is rewritten with the same records in the same order, and only the
+     * erased ones carrying different bytes.</p>
+     *
+     * <p>Ids therefore do not move, which they must not: the published edge store, the lexical
+     * index over labels and any serialized subgraph all address entities by these integers, and
+     * none of them is rebuilt by an erasure.</p>
+     *
+     * <p>The erased label is also dropped from the lookup map, so it survives neither on disk nor
+     * in this process, and re-ingesting the same name afterwards assigns a fresh id rather than
+     * reviving the one that was erased.</p>
+     *
+     * @param erased Answers true for each id whose label must go
+     * @return How many labels were replaced
+     * @throws IOException if the rewritten file cannot be written, forced or moved into place
+     * @throws NullPointerException if {@code erased} is null
+     * @throws IllegalStateException if the interner is closed
+     */
+    public int tombstone(IntPredicate erased) throws IOException {
+        Objects.requireNonNull(erased, "erased must not be null");
+
+        synchronized (appendLock) {
+            requireOpen();
+            List<Integer> victims = new ArrayList<>();
+            for (int id = 0; id < labels.size(); id++) {
+                if (erased.test(id)) {
+                    victims.add(id);
+                }
+            }
+            if (victims.isEmpty()) {
+                return 0;
+            }
+
+            out.flush();
+            List<String> rewritten = new ArrayList<>(labels);
+            for (int id : victims) {
+                rewritten.set(id, erasedLabel(id));
+            }
+            rewriteFile(rewritten);
+
+            for (int id : victims) {
+                ids.remove(labels.get(id));
+                labels.set(id, rewritten.get(id));
+                ids.put(rewritten.get(id), id);
+            }
+            LOGGER.info("tombstoned {} label(s) in {}; {} ids unchanged",
+                victims.size(), path, labels.size());
+            return victims.size();
+        }
+    }
+
+    /**
+     * Writes {@code replacement} over the file as a whole, durably.
+     *
+     * <p>Built beside the real file and moved onto it, so a failure part way leaves the previous
+     * labels rather than a file holding half of each. Forced before the move because the point of
+     * the rewrite is that the erased bytes are gone: a rename that outran its own contents would
+     * leave the erased name readable on the platter after the erasure was reported discharged.</p>
+     *
+     * <p>The append stream is reopened whatever happens, since the move replaces the file it was
+     * writing to and an interner left holding the old one would accept labels nothing reads.</p>
+     *
+     * @param replacement Every label, in id order
+     * @throws IOException if the replacement cannot be written or swapped in
+     */
+    private void rewriteFile(List<String> replacement) throws IOException {
+        Path temp = path.resolveSibling(path.getFileName() + REWRITE_SUFFIX);
+        Files.deleteIfExists(temp);
+        out.close();
+        try {
+            try (DataOutputStream rewritten = new DataOutputStream(new BufferedOutputStream(
+                    Files.newOutputStream(temp, StandardOpenOption.CREATE_NEW,
+                        StandardOpenOption.WRITE)))) {
+                rewritten.writeLong(MAGIC);
+                rewritten.writeInt(VERSION);
+                rewritten.writeInt(0);
+                for (String label : replacement) {
+                    byte[] bytes = label.getBytes(StandardCharsets.UTF_8);
+                    CRC32 crc = new CRC32();
+                    crc.update(bytes);
+                    rewritten.writeInt(bytes.length);
+                    rewritten.write(bytes);
+                    rewritten.writeInt((int) crc.getValue());
+                }
+            }
+            Durability.DEVICE.replaceDurably(temp, path);
+        } finally {
+            Files.deleteIfExists(temp);
+            out = openForAppend(path);
         }
     }
 
@@ -244,6 +372,27 @@ public final class LabelInterner implements AutoCloseable {
     }
 
     /**
+     * Opens the file for appending, writing the header when there is not one yet.
+     *
+     * @param path The file
+     * @return A buffered stream positioned at the end
+     * @throws IOException if the file cannot be opened
+     */
+    private static DataOutputStream openForAppend(Path path) throws IOException {
+        boolean fresh = !Files.exists(path) || Files.size(path) < HEADER_BYTES;
+        OutputStream sink = Files.newOutputStream(path,
+            StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(sink));
+        if (fresh) {
+            out.writeLong(MAGIC);
+            out.writeInt(VERSION);
+            out.writeInt(0);
+            out.flush();
+        }
+        return out;
+    }
+
+    /**
      * Reads back the assignments a previous run recorded.
      *
      * <p>Stops at the first record that does not read cleanly rather than failing. The file is
@@ -257,7 +406,7 @@ public final class LabelInterner implements AutoCloseable {
     private static Replay readExisting(Path path) throws IOException {
         List<String> labels = new ArrayList<>();
         if (!Files.exists(path) || Files.size(path) < HEADER_BYTES) {
-            return new Replay(labels, HEADER_BYTES);
+            return new Replay(labels, HEADER_BYTES, new byte[0]);
         }
 
         byte[] all = Files.readAllBytes(path);
@@ -300,7 +449,7 @@ public final class LabelInterner implements AutoCloseable {
                 break;
             }
         }
-        return new Replay(labels, validBytes);
+        return new Replay(labels, validBytes, all);
     }
 
     /**
@@ -308,8 +457,32 @@ public final class LabelInterner implements AutoCloseable {
      *
      * @param labels     the labels read, in id order
      * @param validBytes byte offset just past the last record that read cleanly
+     * @param contents   the whole file as read, so the tail can be examined without re-reading it
      */
-    private record Replay(List<String> labels, long validBytes) {
+    private record Replay(List<String> labels, long validBytes, byte[] contents) {
+    }
+
+    /**
+     * Whether a complete, checksum-clean label record begins at {@code offset}.
+     *
+     * @param contents The whole file
+     * @param offset   Where to look
+     * @return true when a record starts exactly there
+     */
+    private static boolean recordStartsAt(byte[] contents, int offset) {
+        if (offset + Integer.BYTES > contents.length) {
+            return false;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(contents, offset, contents.length - offset);
+        int length = buffer.getInt();
+        if (length <= 0 || length > MAX_LABEL_BYTES
+            || buffer.remaining() < length + Integer.BYTES) {
+            return false;
+        }
+        CRC32 crc = new CRC32();
+        crc.update(contents, offset + Integer.BYTES, length);
+        buffer.position(buffer.position() + length);
+        return buffer.getInt() == (int) crc.getValue();
     }
 
     @Override

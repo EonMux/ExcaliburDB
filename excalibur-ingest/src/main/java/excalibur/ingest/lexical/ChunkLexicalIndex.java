@@ -1,6 +1,7 @@
 package excalibur.ingest.lexical;
 
 import io.excalibur.core.hash.XxHash64;
+import io.excalibur.retrieval.lexical.Bm25Parameters;
 import io.excalibur.retrieval.lexical.LexicalIndex;
 
 import org.slf4j.Logger;
@@ -68,8 +69,23 @@ public final class ChunkLexicalIndex implements ChunkIndex {
      * @throws IOException if the directory cannot be opened
      */
     public static ChunkLexicalIndex open(Path directory, double ramBufferSizeMB) throws IOException {
+        return open(directory, ramBufferSizeMB, Bm25Parameters.DEFAULT);
+    }
+
+    /**
+     * Opens (or creates) the chunk index under a directory, scoring it with a given BM25 pair.
+     *
+     * @param directory       Where the Lucene index lives
+     * @param ramBufferSizeMB Indexing buffer before a flush
+     * @param bm25            The scoring parameters this node is configured for
+     * @return The opened index
+     * @throws IOException if the directory cannot be opened
+     */
+    public static ChunkLexicalIndex open(Path directory, double ramBufferSizeMB,
+                                         Bm25Parameters bm25) throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
-        LexicalIndex index = LexicalIndex.open(directory, ramBufferSizeMB);
+        Objects.requireNonNull(bm25, "bm25 must not be null");
+        LexicalIndex index = LexicalIndex.open(directory, ramBufferSizeMB, bm25);
         return new ChunkLexicalIndex(index, index.documentCount());
     }
 

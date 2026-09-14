@@ -101,6 +101,9 @@ public final class ApiSecurityConfig {
     public static final String KEY_MAX_QUERY_CHARS = "excalibur.api.max-query-chars";
     /** Configuration key bounding {@code oversampling_factor} on the query endpoint. */
     public static final String KEY_MAX_OVERSAMPLING_FACTOR = "excalibur.api.max-oversampling-factor";
+
+    /** Configuration key bounding the text returned for one result or fetched chunk. */
+    public static final String KEY_MAX_RESULT_TEXT_CHARS = "excalibur.api.max-result-text-chars";
     /** Configuration key listing the directories filesystem ingest may read. */
     public static final String KEY_ALLOWED_ROOTS = "excalibur.ingest.allowed-roots";
     /** Configuration key listing the hosts URL ingest may crawl. */
@@ -148,6 +151,17 @@ public final class ApiSecurityConfig {
      * already {@code top_k} times this - and far below where the walk stops being a walk.</p>
      */
     public static final int DEFAULT_MAX_OVERSAMPLING_FACTOR = 16;
+
+    /**
+     * Default upper bound on the characters of text returned for one chunk.
+     *
+     * <p>A search asked for text returns {@code top_k} chunks in one body, and chunk size is an
+     * ingestion setting rather than a request one, so without this the response size is chosen by
+     * whoever ingested the corpus. Four thousand characters is past any chunk size worth
+     * retrieving against - a chunk that large has stopped being a passage - and {@code top_k}
+     * times this is still a body that fits in memory.</p>
+     */
+    public static final int DEFAULT_MAX_RESULT_TEXT_CHARS = 4_096;
     /** Default bound on registered ingestion sources. */
     public static final int DEFAULT_MAX_SOURCES = 256;
 
@@ -165,6 +179,7 @@ public final class ApiSecurityConfig {
     private final List<Path> allowedIngestRoots;
     private final Set<String> allowedIngestHosts;
     private final int maxOversamplingFactor;
+    private final int maxResultTextChars;
     private final int maxRegisteredSources;
     private final TlsConfig tls;
     private final boolean allowPlaintext;
@@ -185,6 +200,7 @@ public final class ApiSecurityConfig {
         this.allowedIngestRoots = List.copyOf(builder.allowedIngestRoots);
         this.allowedIngestHosts = Set.copyOf(builder.allowedIngestHosts);
         this.maxOversamplingFactor = builder.maxOversamplingFactor;
+        this.maxResultTextChars = builder.maxResultTextChars;
         this.maxRegisteredSources = builder.maxRegisteredSources;
         this.tls = builder.tls;
         this.allowPlaintext = builder.allowPlaintext;
@@ -234,6 +250,8 @@ public final class ApiSecurityConfig {
         builder.maxQueryChars((int) ConfigText.positiveLong(props, KEY_MAX_QUERY_CHARS, DEFAULT_MAX_QUERY_CHARS));
         builder.maxOversamplingFactor((int) ConfigText.positiveLong(
             props, KEY_MAX_OVERSAMPLING_FACTOR, DEFAULT_MAX_OVERSAMPLING_FACTOR));
+        builder.maxResultTextChars((int) ConfigText.positiveLong(
+            props, KEY_MAX_RESULT_TEXT_CHARS, DEFAULT_MAX_RESULT_TEXT_CHARS));
         builder.maxRegisteredSources((int) ConfigText.positiveLong(props, KEY_MAX_SOURCES, DEFAULT_MAX_SOURCES));
 
         for (String root : ConfigText.splitList(props.get(KEY_ALLOWED_ROOTS))) {
@@ -387,6 +405,11 @@ public final class ApiSecurityConfig {
         return maxOversamplingFactor;
     }
 
+    /** @return longest text returned for one result or fetched chunk, past which it is clipped */
+    public int maxResultTextChars() {
+        return maxResultTextChars;
+    }
+
     /** @return upper bound accepted for {@code timeout_ms} */
     public long maxQueryTimeoutMs() {
         return maxQueryTimeoutMs;
@@ -466,6 +489,7 @@ public final class ApiSecurityConfig {
         private final List<Path> allowedIngestRoots = new ArrayList<>();
         private final Set<String> allowedIngestHosts = new LinkedHashSet<>();
         private int maxOversamplingFactor = DEFAULT_MAX_OVERSAMPLING_FACTOR;
+        private int maxResultTextChars = DEFAULT_MAX_RESULT_TEXT_CHARS;
         private int maxRegisteredSources = DEFAULT_MAX_SOURCES;
         private TlsConfig tls = TlsConfig.disabled();
         private boolean allowPlaintext;
@@ -550,7 +574,18 @@ public final class ApiSecurityConfig {
         }
 
         /**
-         * Bounds {@code oversampling_factor}.
+         * Bounds the text returned for one result or fetched chunk.
+         *
+         * @param maxResultTextChars Maximum characters of text per chunk
+         * @return This builder
+         */
+        public Builder maxResultTextChars(int maxResultTextChars) {
+            this.maxResultTextChars = maxResultTextChars;
+            return this;
+        }
+
+        /**
+         * Sets the largest oversampling factor a request may ask for.
          *
          * @param maxOversamplingFactor Maximum accepted factor
          * @return This builder

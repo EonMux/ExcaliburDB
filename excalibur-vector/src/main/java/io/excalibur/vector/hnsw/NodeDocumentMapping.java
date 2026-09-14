@@ -1,5 +1,6 @@
 package io.excalibur.vector.hnsw;
 
+import io.excalibur.vector.durability.DurableFiles;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,7 +73,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *
  * @author ExcaliburDB
  * @since 1.0
- * @see DocumentAtomicityFilter
  * @see HnswGraph
  */
 public class NodeDocumentMapping {
@@ -306,9 +306,11 @@ public class NodeDocumentMapping {
     /**
      * Persists the current mappings to disk.
      *
-     * <p>This method atomically writes all mappings to the mapping file.
-     * The file is written to a temporary location first, then renamed
-     * to ensure atomicity.</p>
+     * <p>The mappings are written to a temporary file in the same directory, forced to
+     * storage, and renamed over the mapping file, so a reader sees either the previous
+     * mapping or this one and never a partial one. The directory is forced after the rename
+     * as well: a caller that swaps this file together with the graph it describes has to be
+     * able to tell, after a crash, which of the two renames had happened.</p>
      *
      * @throws IOException if persistence fails
      * @throws IllegalStateException if persistence is not enabled
@@ -364,6 +366,7 @@ public class NodeDocumentMapping {
             java.nio.file.Files.move(tempPath, mappingPath,
                 java.nio.file.StandardCopyOption.ATOMIC_MOVE,
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            DurableFiles.syncContainingDirectory(mappingPath);
 
             LOGGER.debug("Persisted {} mappings to {}", entryCount, mappingPath);
 

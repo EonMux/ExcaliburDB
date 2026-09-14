@@ -95,8 +95,12 @@ public final class UnconfiguredSourceProbe implements Runnable {
                 LOGGER.error("failed to crawl source: {}", e.getMessage(), e);
 
             } catch (RuntimeException e) {
-                status.setError("Source probe failed: " + e.getMessage());
-                LOGGER.error("failed to probe source: {}", e.getMessage(), e);
+                // Unlike the SourceException above, this is not a fact about the caller's own
+                // source: it is whatever went wrong inside the node, and its message names
+                // internals a readback of /v1/ingest/status has no business carrying.
+                status.setError("Source probe failed (" + e.getClass().getSimpleName()
+                    + "); see the node's log for the reason");
+                LOGGER.error("failed to probe source", e);
             }
             // The Source is owned by the registry that published it and is reused by every later
             // reindex of the same source. Closing it here is what leaves the registry handing out

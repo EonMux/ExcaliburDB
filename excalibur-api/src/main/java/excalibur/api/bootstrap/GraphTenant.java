@@ -117,7 +117,11 @@ public final class GraphTenant implements AutoCloseable {
                         config.graph().getErasureTombstoneRatio(),
                         Duration.ofSeconds(config.graph().getErasureMaxLatencySeconds()),
                         Integer.MAX_VALUE),
-                    Clock.systemUTC()),
+                    Clock.systemUTC(),
+                    // Erased alongside the served store. Removing an edge from the graph and
+                    // leaving the fact it was built from staged means the next build restores
+                    // exactly what the erasure removed.
+                    staging),
                 holder, config);
 
             LOGGER.info("graph tenant {} opened at {} ({} facts staged, graph {})",

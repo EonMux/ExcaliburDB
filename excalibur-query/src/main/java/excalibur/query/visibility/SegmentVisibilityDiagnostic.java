@@ -202,8 +202,53 @@ public final class SegmentVisibilityDiagnostic {
         int registeredSegments = visibilityTracker.getRegisteredSegmentCount();
         int visibleSegments = visibleAtCurrentEpoch.size();
 
+        reportCorpusWideVisibility(totalCatalogSegments, registeredSegments, visibleSegments,
+            currentEpoch, issues);
+
         // Count queryable segments
-        int queryableSegments = 0;
+        int queryableSegments = auditCatalogSegments(visibilityTracker, allMetadata,
+            currentEpoch, issues);
+
+        reportOrphanedVisibility(visibleAtCurrentEpoch, allMetadata, issues);
+
+        // Log results
+        LOGGER.info("Visibility diagnostic complete: {} catalog segments, {} registered, {} visible, {} queryable, {} issues",
+            totalCatalogSegments, registeredSegments, visibleSegments, queryableSegments, issues.size());
+
+        for (DiagnosticIssue issue : issues) {
+            LOGGER.debug("Diagnostic issue: {}", issue);
+        }
+
+        return new DiagnosticResult(
+            currentEpoch,
+            totalCatalogSegments,
+            registeredSegments,
+            visibleSegments,
+            queryableSegments,
+            Collections.unmodifiableList(issues)
+        );
+    }
+
+    /**
+     * Reports the faults that are properties of the corpus as a whole rather than of any one
+     * segment.
+     *
+     * <p>Each is conditioned on the stage before it having something to show, so a corpus that
+     * has simply not been ingested into reports one warning rather than a cascade of criticals
+     * about segments that were never meant to exist yet.</p>
+     *
+     * @param totalCatalogSegments How many segments the catalog holds
+     * @param registeredSegments   How many the visibility tracker knows about
+     * @param visibleSegments      How many are visible at the current epoch
+     * @param currentEpoch         The epoch visibility was read at
+     * @param issues               The list collecting this diagnostic's findings
+     */
+    private static void reportCorpusWideVisibility(
+            int totalCatalogSegments,
+            int registeredSegments,
+            int visibleSegments,
+            long currentEpoch,
+            List<DiagnosticIssue> issues) {
 
         // Issue: No segments in catalog
         if (totalCatalogSegments == 0) {
@@ -231,6 +276,25 @@ public final class SegmentVisibilityDiagnostic {
                 "Check segment lifecycle states and epoch values (creation epoch should be <= current epoch)"
             ));
         }
+    }
+
+    /**
+     * Walks the catalog, reporting what is wrong with each segment's visibility and counting
+     * the ones a query could read.
+     *
+     * @param visibilityTracker The visibility tracker
+     * @param allMetadata       Every segment the catalog holds, by id
+     * @param currentEpoch      The epoch visibility was read at
+     * @param issues            The list collecting this diagnostic's findings
+     * @return How many catalog segments are in a queryable lifecycle state
+     */
+    private static int auditCatalogSegments(
+            VisibilityTracker visibilityTracker,
+            Map<Long, SegmentCatalog.SegmentMetadata> allMetadata,
+            long currentEpoch,
+            List<DiagnosticIssue> issues) {
+
+        int queryableSegments = 0;
 
         // Check each segment in the catalog
         for (Map.Entry<Long, SegmentCatalog.SegmentMetadata> entry : allMetadata.entrySet()) {
@@ -263,27 +327,69 @@ public final class SegmentVisibilityDiagnostic {
                 ));
             }
 
-            // Check epoch correctness
-            long tombstoneEpoch = visibilityTracker.getTombstoneEpoch(segmentId);
-
-            // Check if creation epoch is in the future
-            if (creationEpoch > currentEpoch) {
-                issues.add(DiagnosticIssue.critical(
-                    segmentId, "FUTURE_CREATION_EPOCH",
-                    "Segment creation epoch (" + creationEpoch + ") is greater than current epoch (" + currentEpoch + ")",
-                    "Epoch may have been corrupted, or segment was registered incorrectly"
-                ));
-            }
-
-            // Check if tombstoned
-            if (tombstoneEpoch != Long.MAX_VALUE && tombstoneEpoch <= currentEpoch) {
-                issues.add(DiagnosticIssue.info(
-                    segmentId, "TOMBSTONED",
-                    "Segment was tombstoned at epoch " + tombstoneEpoch,
-                    "Segment is no longer visible to new queries"
-                ));
-            }
+            reportSegmentEpochs(visibilityTracker, segmentId, creationEpoch, currentEpoch, issues);
         }
+
+        return queryableSegments;
+    }
+
+    /**
+     * Reports a registered segment's epochs against the epoch the query would read at.
+     *
+     * <p>Only reached for a segment the tracker knows, because both readings are meaningless
+     * for one it does not: an unregistered segment has no creation epoch to be ahead of the
+     * clock and no tombstone epoch to have passed.</p>
+     *
+     * @param visibilityTracker The visibility tracker
+     * @param segmentId         The segment being checked
+     * @param creationEpoch     The epoch the segment was registered at
+     * @param currentEpoch      The epoch visibility was read at
+     * @param issues            The list collecting this diagnostic's findings
+     */
+    private static void reportSegmentEpochs(
+            VisibilityTracker visibilityTracker,
+            long segmentId,
+            long creationEpoch,
+            long currentEpoch,
+            List<DiagnosticIssue> issues) {
+
+        // Check epoch correctness
+        long tombstoneEpoch = visibilityTracker.getTombstoneEpoch(segmentId);
+
+        // Check if creation epoch is in the future
+        if (creationEpoch > currentEpoch) {
+            issues.add(DiagnosticIssue.critical(
+                segmentId, "FUTURE_CREATION_EPOCH",
+                "Segment creation epoch (" + creationEpoch + ") is greater than current epoch (" + currentEpoch + ")",
+                "Epoch may have been corrupted, or segment was registered incorrectly"
+            ));
+        }
+
+        // Check if tombstoned
+        if (tombstoneEpoch != Long.MAX_VALUE && tombstoneEpoch <= currentEpoch) {
+            issues.add(DiagnosticIssue.info(
+                segmentId, "TOMBSTONED",
+                "Segment was tombstoned at epoch " + tombstoneEpoch,
+                "Segment is no longer visible to new queries"
+            ));
+        }
+    }
+
+    /**
+     * Reports segments the visibility tracker still shows to queries after the catalog has
+     * forgotten them.
+     *
+     * <p>A query routed to one of these finds nothing to read, so the gap shows up as missing
+     * results rather than as an error. Naming it here is what connects the two.</p>
+     *
+     * @param visibleAtCurrentEpoch The segment ids visible at the current epoch
+     * @param allMetadata           Every segment the catalog holds, by id
+     * @param issues                The list collecting this diagnostic's findings
+     */
+    private static void reportOrphanedVisibility(
+            Set<Long> visibleAtCurrentEpoch,
+            Map<Long, SegmentCatalog.SegmentMetadata> allMetadata,
+            List<DiagnosticIssue> issues) {
 
         // Check for segments in visibility tracker but not in catalog
         for (Long segmentId : visibleAtCurrentEpoch) {
@@ -295,23 +401,6 @@ public final class SegmentVisibilityDiagnostic {
                 ));
             }
         }
-
-        // Log results
-        LOGGER.info("Visibility diagnostic complete: {} catalog segments, {} registered, {} visible, {} queryable, {} issues",
-            totalCatalogSegments, registeredSegments, visibleSegments, queryableSegments, issues.size());
-
-        for (DiagnosticIssue issue : issues) {
-            LOGGER.debug("Diagnostic issue: {}", issue);
-        }
-
-        return new DiagnosticResult(
-            currentEpoch,
-            totalCatalogSegments,
-            registeredSegments,
-            visibleSegments,
-            queryableSegments,
-            Collections.unmodifiableList(issues)
-        );
     }
 
     /**

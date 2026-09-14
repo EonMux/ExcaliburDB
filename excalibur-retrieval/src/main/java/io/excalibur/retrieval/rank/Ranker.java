@@ -10,10 +10,10 @@ package io.excalibur.retrieval.rank;
  * signal also passes through.
  *
  * <p>The scores a ranker reports are its own. They are not required to be normalised, comparable
- * with another ranker's, or even positive, because {@link io.excalibur.retrieval.fusion.
- * ReciprocalRankFusion} reads position rather than magnitude. A ranker that tried to make its
- * scores comparable with the others would be doing the fusion layer's job, and doing it with less
- * information.
+ * with another ranker's, or even positive, because
+ * {@link io.excalibur.retrieval.fusion.ReciprocalRankFusion} reads position rather than
+ * magnitude. A ranker that tried to make its scores comparable with the others would be doing
+ * the fusion layer's job, and doing it with less information.
  *
  * <p>Implementations must be safe for concurrent use: one instance serves many queries.
  */

@@ -3,6 +3,7 @@ package excalibur.shard;
 import excalibur.filter.CuckooFilter;
 import excalibur.filter.HierarchicalCuckooFilter;
 import excalibur.shard.allocator.VolumeManager;
+import excalibur.shard.allocator.VolumePlacements;
 import excalibur.shard.visibility.EpochIsolationValidator;
 import excalibur.shard.worker.CuckooMaintenanceWorker;
 import excalibur.shard.worker.CuckooMetricsWorker;
@@ -13,6 +14,7 @@ import excalibur.shard.worker.SegmentReindexScheduler;
 import excalibur.shard.worker.WarmingPhaseWorker;
 import io.excalibur.vector.quantization.PQConfig;
 import io.excalibur.config.Config;
+import io.excalibur.store.CompactionOutcome;
 import io.excalibur.store.CompactionWorker;
 import io.excalibur.store.LifecycleState;
 import java.lang.foreign.Arena;
@@ -25,9 +27,14 @@ import io.excalibur.vector.hnsw.TailOffsetTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -343,6 +350,36 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
                               int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
                               long reindexCheckIntervalMs, long epochTickIntervalMs,
                               long initialEpoch) {
+        this(catalog, storageEngine, volumeManager, hnswQueueDepthLimit,
+             cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs,
+             initialEpoch, CompactionSettings.DEFAULTS);
+    }
+
+    /**
+     * Creates a new IndexOrchestrator with an explicit compaction policy.
+     *
+     * <p>Both compaction workers are built here and never rebuilt, so the policy has to arrive
+     * with the rest of the construction arguments. {@link CompactionSettings#DEFAULTS} is what
+     * every other constructor passes.</p>
+     *
+     * @param catalog                       The segment catalog
+     * @param storageEngine                 The storage engine
+     * @param volumeManager                 The volume manager for segment placement (optional)
+     * @param hnswQueueDepthLimit           HNSW integration queue depth limit
+     * @param cuckooMaintenanceIntervalMs   Cuckoo maintenance interval (ms)
+     * @param reindexCheckIntervalMs        Re-index check interval (ms)
+     * @param epochTickIntervalMs           Epoch tick interval (ms)
+     * @param initialEpoch                  Epoch the visibility counter starts at
+     * @param compaction                    When compaction runs and what it rewrites
+     * @throws NullPointerException         if catalog, storageEngine or compaction is null
+     * @throws IllegalArgumentException     if configuration values are invalid
+     */
+    public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
+                              VolumeManager volumeManager,
+                              int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
+                              long reindexCheckIntervalMs, long epochTickIntervalMs,
+                              long initialEpoch, CompactionSettings compaction) {
+        Objects.requireNonNull(compaction, "compaction settings cannot be null");
         if (catalog == null) {
             throw new NullPointerException("Catalog cannot be null");
         }
@@ -394,9 +431,12 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         // engine's Arena. See the compactionWorker field for why no other Arena will do.
         Arena arena = storageEngine.arena();
         if (arena != null) {
-            this.compactionWorker = new CompactionWorker(arena, (oldSegment, newSegment) -> {
-                onCompactionComplete(oldSegment, newSegment);
-            });
+            this.compactionWorker = new CompactionWorker(arena,
+                this::onCompactionComplete,
+                compaction.segmentIntervalMs(),
+                compaction.segmentTombstoneRatio(),
+                compaction.segmentWriteLogBytes(),
+                compaction.maxConcurrentSegmentCompactions());
             LOGGER.info("CompactionWorker initialized over the storage engine's Arena");
         } else {
             this.compactionWorker = null;
@@ -411,9 +451,9 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             100, 100, null);
         LOGGER.info("WarmingPhaseWorker initialized for PQ training");
 
-        // Create HNSW compaction worker for removing tombstoned nodes
-        // Uses default 1-minute interval and 20% tombstone threshold
-        this.hnswCompactionWorker = new HnswCompactionWorker();
+        // Create HNSW compaction worker for removing tombstoned nodes, on the configured
+        // schedule and threshold.
+        this.hnswCompactionWorker = compaction.newGraphWorker();
         this.hnswCompactionWorker.setCompactionListener(new HnswCompactionWorker.CompactionListener() {
             @Override
             public void onGraphCompacted(HnswGraph graph, long nodesRemoved) {
@@ -445,7 +485,11 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * orchestrator parameters:</p>
      * <ul>
      *   <li>{@code hnswQueueLimit} → HNSW integration queue depth limit</li>
-     *   <li>{@code compactDelayMs} → Used as additional context for compaction timing</li>
+     *   <li>{@code compactDelayMs} → how long the compaction loop waits before its first check</li>
+     *   <li>{@code compaction-*} and {@code hnsw-compaction-*} → the policy both compaction
+     *       workers are built with, via {@link CompactionSettings#fromConfig(Config.Shard)}</li>
+     *   <li>{@code volumes} → the directories segments are spread across, via
+     *       {@link #withVolumePlacement(List)}</li>
      *   <li>{@code cuckooMaintenanceIntervalMs} → Uses default (5000ms)</li>
      *   <li>{@code reindexCheckIntervalMs} → Uses default (60000ms)</li>
      *   <li>{@code epochTickIntervalMs} → Uses default (100ms)</li>
@@ -456,6 +500,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *   <li>HNSW queue limit must be positive (enforced by Config.Shard validation)</li>
      *   <li>Compact delay is applied to the compaction worker's first check, so an operator
      *       can keep compaction off the back of a bulk load</li>
+     *   <li>Volume placement has to be installed before {@link StorageEngine#start()}, because
+     *       that is where the engine discovers what is on disk and creates what is missing</li>
      * </ul>
      *
      * @param catalog The segment catalog
@@ -493,8 +539,11 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
         Objects.requireNonNull(shard, "shard config cannot be null");
 
-        LOGGER.info("Creating IndexOrchestrator from Config.Shard: hnswQueueLimit={}, compactDelayMs={}",
-            shard.getHnswQueueLimit(), shard.getCompactDelayMs());
+        CompactionSettings compaction = CompactionSettings.fromConfig(shard);
+
+        LOGGER.info("Creating IndexOrchestrator from Config.Shard: hnswQueueLimit={}, "
+                + "compactDelayMs={}, compaction={}",
+            shard.getHnswQueueLimit(), shard.getCompactDelayMs(), compaction);
 
         IndexOrchestrator orchestrator = new IndexOrchestrator(
             catalog,
@@ -504,14 +553,47 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,  // Keep default: 5000ms
             DEFAULT_REINDEX_CHECK_INTERVAL_MS,       // Keep default: 60000ms
             DEFAULT_EPOCH_TICK_INTERVAL_MS,          // Keep default: 100ms
-            initialEpoch
+            initialEpoch,
+            compaction
         );
 
         // The key was parsed, range-checked, shipped and logged at startup while reaching no
         // compaction code: an operator who set it to keep compaction away from a bulk load saw
         // it echoed back and got the same schedule as before.
         orchestrator.withCompactionStartDelayMs(shard.getCompactDelayMs());
+        orchestrator.withVolumePlacement(shard.getVolumes());
         return orchestrator;
+    }
+
+    /**
+     * Spreads the storage engine's segments over the configured volumes.
+     *
+     * <p>The data directory is registered first and then each configured volume, so a
+     * single-volume deployment - the default, and an empty list - changes nothing at all: the
+     * engine keeps the placement it was born with and every file lands exactly where it always
+     * did. Naming volumes registers them on the {@link VolumeManager} and hands the engine a
+     * placement backed by its consistent hash ring, so a volume added later moves as few
+     * existing segments as possible.</p>
+     *
+     * <p>Must run before {@link StorageEngine#start()}. Start is where the engine scans for
+     * what is on disk and creates whatever the base keyspace is missing, and both depend on
+     * knowing the volume set; the engine refuses a placement installed after it.</p>
+     *
+     * <p>A configured volume that is not a directory is refused here, before the volume
+     * manager gets a chance to create it. An unmounted volume silently replaced by an empty
+     * directory on the root filesystem is how a node loses a quarter of its corpus and reports
+     * nothing.</p>
+     *
+     * @param volumePaths The configured volume directories, possibly empty
+     * @return this orchestrator, for chaining
+     * @throws NullPointerException     if volumePaths is null
+     * @throws IllegalArgumentException if a configured volume is not an existing directory
+     * @throws IllegalStateException    if volumes are configured but this orchestrator has no
+     *                                  volume manager, or the engine has already started
+     */
+    public IndexOrchestrator withVolumePlacement(List<String> volumePaths) {
+        VolumePlacements.install(storageEngine, volumeManager, volumePaths);
+        return this;
     }
 
     /**
@@ -943,7 +1025,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * It records the tombstone epoch in the visibility tracker, ensuring that:</p>
      * <ul>
      *   <li>New queries (capturing epoch >= tombstone epoch) will not see this segment</li>
-     *   <li>In-flight queries (capturing epoch < tombstone epoch) will still see the segment</li>
+     *   <li>In-flight queries (capturing epoch &lt; tombstone epoch) will still see the segment</li>
      * </ul>
      *
      * <p><strong>Note:</strong> This method only updates the visibility tracker.
@@ -1287,17 +1369,21 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *
      * @param oldSegment The segment that was compacted (still open, write lock held)
      * @param newSegment The compacted replacement, already installed at the canonical path
+     * @return Which of the two segments the worker may retire
      */
-    private void onCompactionComplete(Segment oldSegment, Segment newSegment) {
+    private CompactionOutcome onCompactionComplete(Segment oldSegment, Segment newSegment) {
         try {
-            applyCompactionSwap(oldSegment, newSegment);
+            return applyCompactionSwap(oldSegment, newSegment);
         } catch (RuntimeException e) {
-            // Throwing here would make the compaction worker discard and close a segment it
-            // has already installed at the canonical path. The reconciliation sweep repairs
-            // whatever part of the bookkeeping did not complete.
-            LOGGER.error("Compaction bookkeeping failed for {}: {}. The compacted file is "
-                + "installed; the segment registry will be reconciled by the next sweep.",
+            // The swap did not happen: everything quiesced on the way to it has been put back,
+            // and the directory still routes to the old segment. Refusing is what keeps that
+            // segment open - reporting the swap as installed would retire a segment the
+            // directory is still handing reads and writes to.
+            LOGGER.error("Compaction bookkeeping failed for {}: {}. The old segment stays in "
+                + "service and the replacement is discarded; the compacted file is installed at "
+                + "the canonical name and the next sweep reconciles the registry.",
                 newSegment.path(), e.getMessage(), e);
+            return CompactionOutcome.REFUSED;
         }
     }
 
@@ -1306,41 +1392,90 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *
      * @param oldSegment The segment that was compacted
      * @param newSegment The compacted replacement
+     * @return Which of the two segments the worker may retire
      */
-    private void applyCompactionSwap(Segment oldSegment, Segment newSegment) {
+    private CompactionOutcome applyCompactionSwap(Segment oldSegment, Segment newSegment) {
         // The directory decides, because the directory is what the swap is validated against:
         // replaceSegment compares the segment it holds at this index with the one being replaced.
         // Asking it to swap at an index this orchestrator's own map happens to remember - a map
         // that drifts when a segment moves between indices - names an index holding somebody
-        // else, and the swap is refused. The compaction worker closes the old segment as soon as
-        // this returns, so a refusal there retires a segment the directory is still routing to,
-        // and every read and write to it fails for the life of the process.
+        // else, and the swap is refused. The compaction worker retires the old segment on the
+        // strength of the outcome returned here, so a refusal reported as an installation
+        // retires a segment the directory is still routing to, and every read and write to it
+        // fails for the life of the process.
         long directoryId = directoryIndexOf(oldSegment);
-        long registeredId = registeredSegmentId(oldSegment);
         if (directoryId < 0) {
-            // Already replaced or retired by whoever won the race for it. Nothing routes to it,
-            // so there is nothing to swap and closing it costs nothing.
-            LOGGER.warn("Compacted segment {} is no longer in the storage directory; leaving the "
-                + "registry alone", oldSegment.path());
-            return;
+            return abandonSwap(oldSegment);
         }
-        long segmentId = directoryId;
+
+        CompactionSwapContext context = swapContext(oldSegment, directoryId);
+        LOGGER.info("Compaction complete for segment {}: {} -> {}",
+            context.segmentId(), oldSegment.path(), newSegment.path());
+
+        if (!installReplacement(oldSegment, newSegment, context)) {
+            LOGGER.error("Compacted segment {} could not be installed in the storage registry; "
+                + "leaving the existing registration in place", context.segmentId());
+            return CompactionOutcome.REFUSED;
+        }
+
+        completeSwapBookkeeping(oldSegment, newSegment, context);
+        return CompactionOutcome.INSTALLED;
+    }
+
+    /**
+     * Retires a compacted segment the storage directory no longer holds.
+     *
+     * <p>Whoever won the race for it - a split publishing its children, or a reconciliation
+     * sweep - has already routed its keys elsewhere, so there is no index to swap at and
+     * nothing reads either segment. Both are retired: the registrations that outlived the
+     * directory entry are dropped here, and the worker closes the two segments rather than
+     * leaving their mappings and write log descriptors open with nothing pointing at them.</p>
+     *
+     * @param oldSegment The compacted segment, no longer in the directory
+     * @return Always {@link CompactionOutcome#ABANDONED}
+     */
+    private CompactionOutcome abandonSwap(Segment oldSegment) {
+        LOGGER.warn("Compacted segment {} is no longer in the storage directory; retiring it "
+            + "along with its replacement", oldSegment.path());
+        hnswWorker.unregisterSegment(oldSegment);
+        unregisterFromCompaction(oldSegment);
+        return CompactionOutcome.ABANDONED;
+    }
+
+    /**
+     * Gathers what a compacted segment's registrations hold, before any of it is moved.
+     *
+     * @param oldSegment  The segment that was compacted
+     * @param directoryId The directory index the storage engine holds it at
+     * @return The index structures and identifiers the swap has to carry over
+     */
+    private CompactionSwapContext swapContext(Segment oldSegment, long directoryId) {
+        long registeredId = registeredSegmentId(oldSegment);
         if (registeredId >= 0 && registeredId != directoryId) {
             LOGGER.warn("Compacted segment {} is registered here as {} but held by the directory "
                 + "as {}; swapping at the directory's index", oldSegment.path(), registeredId,
                 directoryId);
         }
 
-        LOGGER.info("Compaction complete for segment {}: {} -> {}",
-            segmentId, oldSegment.path(), newSegment.path());
-
-        SegmentIndexInfo oldInfo = segmentIndexInfo.get(registeredId >= 0 ? registeredId : segmentId);
+        SegmentIndexInfo oldInfo = segmentIndexInfo.get(registeredId >= 0 ? registeredId : directoryId);
         HnswGraph graph = oldInfo != null && oldInfo.graph != null
             ? oldInfo.graph : oldSegment.getHnswGraph();
         TailOffsetTracker tracker = oldInfo != null && oldInfo.tracker != null
             ? oldInfo.tracker : oldSegment.getTailOffsetTracker();
         CuckooFilter filter = oldInfo != null ? oldInfo.filter : null;
+        return new CompactionSwapContext(directoryId, registeredId, oldInfo, graph, tracker, filter);
+    }
 
+    /**
+     * Moves the storage directory from the compacted segment to its replacement.
+     *
+     * @param oldSegment The segment that was compacted
+     * @param newSegment The compacted replacement
+     * @param context    What the old segment's registrations hold
+     * @return true if the directory now routes to the replacement
+     */
+    private boolean installReplacement(Segment oldSegment, Segment newSegment,
+                                       CompactionSwapContext context) {
         // Quiesce the old registration before touching anything it shares. The integration
         // worker holds this very tracker and the old segment's still-populated write log, and it
         // takes no lock: a cycle that starts after the rebase re-reads the old log from zero and
@@ -1351,8 +1486,9 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
 
         boolean installed = false;
         try {
-            carryIndexAttachments(oldSegment, newSegment, graph, tracker);
-            installed = storageEngine.replaceSegment(segmentId, oldSegment, newSegment);
+            carryIndexAttachments(oldSegment, newSegment, context.graph(), context.tracker());
+            installed = storageEngine.replaceSegment(context.segmentId(), oldSegment, newSegment);
+            return installed;
         } finally {
             if (!installed) {
                 // Put back what was quiesced, so a failed swap leaves the old segment served
@@ -1360,34 +1496,76 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
                 // over moved ownership to a replacement that is about to be discarded and closed,
                 // and closing it releases the mappings of whatever is still attached to it.
                 returnIndexAttachments(oldSegment, newSegment);
-                if (graph != null && tracker != null) {
-                    hnswWorker.registerSegment(oldSegment, graph, tracker);
+                if (context.graph() != null && context.tracker() != null) {
+                    hnswWorker.registerSegment(oldSegment, context.graph(), context.tracker());
                 }
                 registerForCompaction(oldSegment);
             }
         }
+    }
 
-        if (!installed) {
-            LOGGER.error("Compacted segment {} could not be installed in the storage registry; "
-                + "leaving the existing registration in place", segmentId);
-            return;
+    /**
+     * Finishes the bookkeeping behind a swap the storage directory has already taken.
+     *
+     * <p>A failure here is logged rather than raised. The directory routes to the replacement
+     * by the time this runs, which makes the compacted segment unreachable whatever else goes
+     * wrong; reporting a refusal now would keep that segment open for the life of the process
+     * with nothing to serve, and the reconciliation sweep repairs the registrations that did
+     * not complete.</p>
+     *
+     * @param oldSegment The segment that was compacted
+     * @param newSegment The compacted replacement, now serving
+     * @param context    What the old segment's registrations held
+     */
+    private void completeSwapBookkeeping(Segment oldSegment, Segment newSegment,
+                                         CompactionSwapContext context) {
+        long segmentId = context.segmentId();
+        try {
+            repointWorkers(segmentId, oldSegment, newSegment,
+                context.graph(), context.filter(), context.tracker());
+
+            if (context.hasDriftedRegistration()) {
+                // The drifted entry names the segment the worker is about to close. Left in
+                // place it would answer every later lookup of that index with a closed segment,
+                // and the reconciliation sweep would keep finding an index it believes is
+                // already registered.
+                segmentIndexInfo.remove(context.registeredId(), context.oldInfo());
+                warmingWorker.unregisterSegment(context.registeredId());
+            }
+
+            catalog.completeCompaction(segmentId);
+
+            LOGGER.info("Compaction swap complete for segment {}: {} entries, registry updated",
+                segmentId, newSegment.entryCount());
+        } catch (RuntimeException e) {
+            LOGGER.error("Compaction of segment {} is installed but its bookkeeping did not "
+                + "complete: {}. The replacement is serving; the next reconciliation sweep "
+                + "repairs the registrations.", segmentId, e.getMessage(), e);
         }
+    }
 
-        repointWorkers(segmentId, oldSegment, newSegment, graph, filter, tracker);
+    /**
+     * What a compacted segment's registrations held, gathered before the swap disturbs them.
+     *
+     * @param segmentId    The directory index the swap is applied at
+     * @param registeredId The index this orchestrator has the segment under, or -1
+     * @param oldInfo      The old registration, or null if there is none
+     * @param graph        The HNSW graph to carry, or null
+     * @param tracker      The tail offset tracker to carry, or null
+     * @param filter       The Cuckoo filter to carry, or null
+     */
+    private record CompactionSwapContext(long segmentId, long registeredId,
+                                         SegmentIndexInfo oldInfo, HnswGraph graph,
+                                         TailOffsetTracker tracker, CuckooFilter filter) {
 
-        if (registeredId >= 0 && registeredId != segmentId && oldInfo != null) {
-            // The drifted entry names the segment the worker is about to close. Left in place it
-            // would answer every later lookup of that index with a closed segment, and the
-            // reconciliation sweep would keep finding an index it believes is already registered.
-            segmentIndexInfo.remove(registeredId, oldInfo);
-            warmingWorker.unregisterSegment(registeredId);
+        /**
+         * Whether this orchestrator holds the segment at an index the directory disagrees with.
+         *
+         * @return true if a registration under a different index has to be dropped
+         */
+        boolean hasDriftedRegistration() {
+            return registeredId >= 0 && registeredId != segmentId && oldInfo != null;
         }
-
-        // Update catalog to complete compaction transition
-        catalog.completeCompaction(segmentId);
-
-        LOGGER.info("Compaction swap complete for segment {}: {} entries, registry updated",
-            segmentId, newSegment.entryCount());
     }
 
     /**
@@ -1876,6 +2054,162 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      */
     public CompactionWorker getCompactionWorker() {
         return compactionWorker;
+    }
+
+    // ==================== Compaction On Demand ====================
+
+    /**
+     * Compacts everything the policy says is worth compacting, now, on the calling thread.
+     *
+     * @return What the run examined, reclaimed and failed on
+     */
+    public CompactionReport compactNow() {
+        return compactNow(false);
+    }
+
+    /**
+     * Compacts segments and HNSW graphs on the calling thread and reports what happened.
+     *
+     * <p>Unforced, this applies exactly the thresholds the background workers apply, so it
+     * brings forward work that would have happened anyway. Forced, it rewrites every live
+     * segment and rebuilds every registered graph whether or not there is dead weight to
+     * reclaim, which is what an operator wants after a bulk erasure and is otherwise wasted
+     * I/O.</p>
+     *
+     * <h3>Running alongside the background workers</h3>
+     * <p>Safe, and it takes no new lock to be so. A segment compaction holds that segment's own
+     * write lock for its whole duration and re-checks under it that the segment is still open
+     * and not splitting; so if the background loop is already rewriting a segment, this call
+     * blocks on that lock and then finds the segment closed and skips it - and the reverse
+     * holds too. A graph rebuild is serialised the same way by the graph's own write lock. No
+     * segment and no graph is ever compacted twice concurrently, and neither caller has to know
+     * the other exists.</p>
+     *
+     * <p>One segment failing never ends the run: the failure is logged with its cause and
+     * counted in the report. The report is the honest answer - partial success is reported as
+     * partial success rather than as either extreme.</p>
+     *
+     * <h3>Interruption</h3>
+     * <p>The run stops at the next segment boundary when its thread is interrupted, returns a
+     * report of what it had done by then, and leaves the interrupt flag set for the caller that
+     * set it. This is how a shutdown reclaims the thread: the drain interrupts a run that has
+     * outstayed its grace period and then closes the arena the segments are mapped out of, and
+     * a run that ignored the interrupt would go on copying entries out of memory being unmapped
+     * underneath it.</p>
+     *
+     * @param force true to compact every live segment and graph regardless of the thresholds
+     * @return What the run examined, reclaimed and failed on
+     */
+    public CompactionReport compactNow(boolean force) {
+        long startNanos = System.nanoTime();
+
+        SegmentCompactionTally segments = compactLiveSegments(force);
+        HnswCompactionWorker.GraphCompactionSummary graphs = compactLiveGraphs(force);
+
+        CompactionReport report = new CompactionReport(
+            segments.considered(), segments.compacted(), segments.failed(),
+            graphs.graphsConsidered(), graphs.graphsCompacted(), graphs.graphsFailed(),
+            Duration.ofNanos(System.nanoTime() - startNanos));
+
+        LOGGER.info("On-demand compaction (force={}): {}", force, report);
+        return report;
+    }
+
+    /**
+     * Compacts every distinct live segment the storage engine holds.
+     *
+     * <p>The engine's directory maps several indices onto one segment after a split, so the
+     * segments are de-duplicated by identity first: compacting the same segment twice would
+     * count a rewrite that did not happen, and the second attempt would find the segment
+     * already closed.</p>
+     *
+     * @param force true to rewrite regardless of the thresholds
+     * @return The counts for the segment half of the run
+     */
+    private SegmentCompactionTally compactLiveSegments(boolean force) {
+        CompactionWorker worker = compactionWorker;
+        Set<Segment> live = Collections.newSetFromMap(new IdentityHashMap<>());
+        live.addAll(storageEngine.getSegments().values());
+
+        if (worker == null) {
+            return noCompactionAvailable(live.size());
+        }
+
+        int compacted = 0;
+        int failed = 0;
+        for (Segment segment : live) {
+            if (Thread.currentThread().isInterrupted()) {
+                // The thread a forced run is on is interrupted by the shutdown path, which then
+                // closes the arena every segment is mapped out of. Carrying on past that point
+                // copies entries out of memory that is being unmapped, which ends the process
+                // rather than raising anything a caller could be told about.
+                LOGGER.warn("On-demand compaction was interrupted after {} of {} segment(s); the "
+                    + "rest are left to the background worker", compacted + failed, live.size());
+                break;
+            }
+            try {
+                if (worker.compactNow(segment, force)) {
+                    compacted++;
+                }
+            } catch (IOException | RuntimeException e) {
+                failed++;
+                LOGGER.error("On-demand compaction failed for segment {}: {}",
+                    segment.path(), e.getMessage(), e);
+            }
+        }
+        return new SegmentCompactionTally(live.size(), compacted, failed);
+    }
+
+    /**
+     * Reports a run against an engine that has no compaction worker at all.
+     *
+     * <p>The segments are counted as failed rather than skipped. A skip is a segment the policy
+     * looked at and declined, and no policy was applied here: the engine exposes no arena, so
+     * there is nothing that could rewrite them however much dead weight they hold. Reported as
+     * skips, a run that reclaimed nothing and could never have reclaimed anything is
+     * indistinguishable from a healthy run with nothing to do, and the operator who asked for
+     * the space back is told the request succeeded.</p>
+     *
+     * @param live How many live segments the engine holds
+     * @return The counts for a run that could not examine any of them
+     */
+    private static SegmentCompactionTally noCompactionAvailable(int live) {
+        if (live > 0) {
+            LOGGER.error("Compaction was requested but the storage engine exposes no Arena, so "
+                + "none of the {} live segment(s) could be rewritten; dead space is reclaimed "
+                + "by reindex only", live);
+        }
+        return new SegmentCompactionTally(live, 0, live);
+    }
+
+    /**
+     * Rebuilds the registered HNSW graphs, unless the run has already been interrupted.
+     *
+     * <p>A graph rebuild is as long-running as a segment rewrite and maps out of the same
+     * arena, so an interrupt has to be observed before the second half of a run starts and not
+     * only between the segments of the first. Nothing is examined after an interrupt, which is
+     * why this reports none considered rather than a count of graphs it skipped.</p>
+     *
+     * @param force true to rebuild every registered graph regardless of its tombstone ratio
+     * @return The counts for the graph half of the run
+     */
+    private HnswCompactionWorker.GraphCompactionSummary compactLiveGraphs(boolean force) {
+        if (Thread.currentThread().isInterrupted()) {
+            LOGGER.warn("On-demand compaction was interrupted before the HNSW graphs were "
+                + "examined; none were rebuilt");
+            return new HnswCompactionWorker.GraphCompactionSummary(0, 0, 0);
+        }
+        return hnswCompactionWorker.compactNow(force);
+    }
+
+    /**
+     * The segment half of an on-demand compaction run.
+     *
+     * @param considered distinct live segments examined
+     * @param compacted  segments rewritten
+     * @param failed     segments whose rewrite raised an error
+     */
+    private record SegmentCompactionTally(int considered, int compacted, int failed) {
     }
 
     /**

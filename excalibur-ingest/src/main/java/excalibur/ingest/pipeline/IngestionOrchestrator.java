@@ -1,13 +1,9 @@
 package excalibur.ingest.pipeline;
 
-import io.excalibur.core.codec.ChunkPayloadCodec;
-import io.excalibur.core.text.ChunkIdentifiers;
-import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.processor.TermFrequencyTracker;
-import excalibur.ingest.registry.DocumentMetadata;
+import excalibur.ingest.erasure.DocumentErasureService;
 import excalibur.ingest.registry.DocumentRegistry;
-import excalibur.ingest.source.FetchedDocument;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
 import excalibur.ingest.source.DocumentNotFoundException;
@@ -15,17 +11,11 @@ import excalibur.ingest.visibility.DocumentVisibilityTracker;
 import excalibur.llm.embedding.EmbeddingClient;
 import excalibur.shard.IndexOrchestrator;
 import io.excalibur.core.logging.StructuredLoggingHelper;
-import io.excalibur.llm.LLMException;
-import io.excalibur.store.Segment;
 import io.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -84,15 +74,6 @@ public class IngestionOrchestrator {
     private static final Logger LOGGER = LoggerFactory.getLogger(IngestionOrchestrator.class);
 
     /**
-     * Chunks sent to the embedding endpoint in one request.
-     *
-     * <p>Sixteen 512-token chunks is roughly 8k tokens, which sits inside a typical server's
-     * physical batch, keeps a failed request cheap to retry, and keeps the request body small
-     * enough to be unremarkable.</p>
-     */
-    static final int EMBED_BATCH_SIZE = 16;
-
-    /**
      * Interface for status registry callbacks.
      * Decouples the orchestrator from the API layer's status registry.
      */
@@ -129,12 +110,20 @@ public class IngestionOrchestrator {
         void setError(String error);
     }
 
-    private final TextChunker textChunker;
-    private final EmbeddingClient embeddingClient;
-    private final StorageEngine storageEngine;
+    /** The BM25 index kept beside the chunks written here, if the node keeps one. */
+    private final LexicalSideIndex lexicalSideIndex;
+
+    /** Files written terms under their segment, so queries can prune segments that cannot match. */
+    private final SegmentTermRecorder termRecorder = new SegmentTermRecorder();
+
+    /** Reports published documents onwards, so a graph can be built from them. */
+    private final GraphReporter graphReporter = new GraphReporter();
+
+    /** Writes and publishes one document at a time, atomically. */
+    private final DocumentIngestor documentIngestor;
+
     private final IndexOrchestrator indexOrchestrator;
     private final StatusRegistry statusRegistry;
-    private final DocumentVisibilityTracker visibilityTracker; // optional, nullable - visibility epoch
 
     /**
      * Registry that records what was ingested so a later reindex can detect changes and
@@ -144,58 +133,24 @@ public class IngestionOrchestrator {
     private final DocumentRegistry documentRegistry;
 
     /**
-     * Term frequency tracker for selectivity estimation during queries.
-     * Tracks term frequencies in segment Count-Min Sketches for query optimization.
-     * May be null if selectivity-based optimization is not needed.
-     */
-    private final TermFrequencyTracker termFrequencyTracker;
-
-    /**
      * Timeout for awaiting backpressure release from the HNSW integration queue.
      * Configured via excalibur.ingest.document-atomicity-timeout-ms (default 2000ms).
      */
     private final int documentTimeoutMs;
 
-    /**
-     * Where published documents are reported so the graph can be built from them.
-     *
-     * <p>Optional and settable after construction: the graph stack is opened by the API layer,
-     * which is built after this orchestrator, and a deployment that indexes text without
-     * extracting facts never sets one.</p>
-     */
-    private volatile excalibur.ingest.graph.GraphIngestSink graphSink;
-
-    /**
-     * BM25 index over the chunks this orchestrator writes, or null when the node keeps none.
-     *
-     * <p>Written inside the same try that writes the chunks, so a document that fails and rolls
-     * back does not leave its text searchable under a key nothing resolves.</p>
-     */
-    private volatile excalibur.ingest.lexical.ChunkIndex lexicalIndex;
-
-    /**
-     * Membership filter the query pipeline prunes segments with, or null when the node keeps
-     * none.
-     *
-     * <p>Written from the same loop that writes the chunks, under the segment the engine
-     * reports the chunk landed in. Populating it is an optimisation and never a condition of
-     * the write: a term the filter cannot take costs the pruning of one segment, and a filter
-     * that is never given a term costs all of it, but neither loses a chunk.</p>
-     */
-    private volatile excalibur.filter.HierarchicalCuckooFilter membershipFilter;
-
-    /**
-     * Cluster every segment is filed under in the membership filter.
-     *
-     * <p>The filter's middle level partitions segments by topic; nothing in this server assigns
-     * topics, so there is one cluster and it matches what excalibur-shard registers segments
-     * under. A second name here would put ingested terms in a cluster the query side never
-     * looks in.</p>
-     */
-    private static final String MEMBERSHIP_CLUSTER = "default";
-
     private final Set<String> activeIngestions;
     private final Map<String, Thread> ingestionThreads;
+
+    /**
+     * The threads running {@link #ingestNow}, by source.
+     *
+     * <p>Kept apart from {@link #ingestionThreads} because these are not threads this class
+     * owns - they are request threads that go back to serving requests afterwards. Shutdown may
+     * interrupt one, to break it out of a blocking write, but must never join one: a pooled
+     * thread does not die when the run it is executing ends, so a join would wait forever. So
+     * shutdown waits for the entry to be removed instead of for the thread to stop.</p>
+     */
+    private final Map<String, Thread> synchronousIngestions = new ConcurrentHashMap<>();
     private final AtomicBoolean shutdown;
 
     /**
@@ -204,24 +159,8 @@ public class IngestionOrchestrator {
      */
     public static final int DEFAULT_DOCUMENT_TIMEOUT_MS = 2000;
 
-    /**
-     * Upper bound on the byte size of a single fetched document.
-     *
-     * <p>A source can report an arbitrary file size (FilesystemSource allows up to 2GB), and a
-     * document is held several times over while it is processed: the fetched byte array, its
-     * defensive copy, the decoded String, and one substring per chunk. Every chunk also costs
-     * one embedding call. Documents above this bound are skipped with a recorded error rather
-     * than being allowed to exhaust the heap. Matches DocumentReindexer's limit.</p>
-     */
-    public static final int MAX_DOCUMENT_CONTENT_BYTES = 100 * 1024 * 1024;
-
-    /**
-     * Upper bound on the number of chunks accepted from a single document.
-     *
-     * <p>Each chunk is one embedding request and one storage write; a document is only published
-     * once all of them succeed. This bounds the work a single document can schedule.</p>
-     */
-    public static final int MAX_CHUNKS_PER_DOCUMENT = 10_000;
+    /** How often shutdown re-checks whether a synchronous run has finished. */
+    private static final long SHUTDOWN_POLL_MILLIS = 5;
 
     /**
      * How long {@link #shutdown()} waits for in-flight ingestion threads to unwind.
@@ -294,18 +233,19 @@ public class IngestionOrchestrator {
                                   DocumentVisibilityTracker visibilityTracker,
                                   TermFrequencyTracker termFrequencyTracker,
                                   int documentTimeoutMs) {
-        this.textChunker = Objects.requireNonNull(textChunker, "TextChunker cannot be null");
-        // Nullable, deliberately. A null client is lexical-only ingestion: chunks are written,
-        // term-indexed and published with no vector, which is what lets Lucene and the graph
-        // serve retrieval without a corpus-wide embedding pass first. Vector search is then
-        // simply a signal this deployment does not have.
-        this.embeddingClient = embeddingClient;
-        this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
+        // The collaborators below re-check what they are handed, but they are built in
+        // dependency order rather than parameter order. Checking here first means a caller that
+        // omitted two dependencies is told about the earlier one in this signature, which is the
+        // one it is most likely to have got wrong.
+        Objects.requireNonNull(textChunker, "TextChunker cannot be null");
+        Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.indexOrchestrator = Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
         this.statusRegistry = Objects.requireNonNull(statusRegistry, "StatusRegistry cannot be null");
-        this.visibilityTracker = visibilityTracker; // may be null
         this.documentRegistry = visibilityTracker != null ? visibilityTracker.getRegistry() : null;
-        this.termFrequencyTracker = termFrequencyTracker; // may be null
+        this.lexicalSideIndex = new LexicalSideIndex(storageEngine);
+        this.documentIngestor = new DocumentIngestor(textChunker, embeddingClient, storageEngine,
+            visibilityTracker, this.documentRegistry, termFrequencyTracker,
+            this.lexicalSideIndex, this.termRecorder, this.graphReporter);
         this.documentTimeoutMs = documentTimeoutMs > 0 ? documentTimeoutMs : DEFAULT_DOCUMENT_TIMEOUT_MS;
         this.activeIngestions = ConcurrentHashMap.newKeySet();
         this.ingestionThreads = new ConcurrentHashMap<>();
@@ -323,9 +263,7 @@ public class IngestionOrchestrator {
      * @param lexicalIndex The index, or null to keep none
      */
     public void setLexicalIndex(excalibur.ingest.lexical.ChunkIndex lexicalIndex) {
-        this.lexicalIndex = lexicalIndex;
-        LOGGER.info("Lexical index {}", lexicalIndex == null
-            ? "disabled" : "enabled (" + lexicalIndex.engine() + " engine)");
+        this.lexicalSideIndex.setIndex(lexicalIndex);
     }
 
     /**
@@ -339,8 +277,7 @@ public class IngestionOrchestrator {
      * @param membershipFilter The filter, or null to keep none
      */
     public void setMembershipFilter(excalibur.filter.HierarchicalCuckooFilter membershipFilter) {
-        this.membershipFilter = membershipFilter;
-        LOGGER.info("Membership filter {}", membershipFilter == null ? "disabled" : "enabled");
+        this.termRecorder.setFilter(membershipFilter);
     }
 
     /**
@@ -353,30 +290,127 @@ public class IngestionOrchestrator {
      * @param graphSink The sink, or null for none
      */
     public void setGraphSink(excalibur.ingest.graph.GraphIngestSink graphSink) {
-        this.graphSink = graphSink;
-        LOGGER.info("Graph ingest sink {}", graphSink == null ? "disabled" : "enabled");
+        this.graphReporter.setSink(graphSink);
     }
 
     /**
-     * Tells the graph about a document that is now published.
+     * Wires the eraser that retires a rolled back document's graph nodes.
      *
-     * <p>After publication, deliberately. A fact staged for a document whose write then failed
-     * would be a fact about something the corpus does not contain, and nothing later would
-     * retract it. Never throws: the document is already published and counted by the time this
-     * runs, so failing here would report a loss that did not happen.</p>
+     * <p>Set after construction, like the lexical index and the membership filter: the vector
+     * stack belongs to the API layer, which is assembled after this orchestrator.</p>
      *
-     * @param documentKey The source-qualified document key
-     * @param doc         The fetched document, decoded with the encoding its source declared
+     * @param vectorEraser The eraser, or null on a node that keeps no vector index
      */
-    private void reportToGraph(String documentKey, FetchedDocument doc) {
-        excalibur.ingest.graph.GraphIngestSink sink = this.graphSink;
-        if (sink == null) {
-            return;
+    public void setVectorEraser(DocumentErasureService.VectorEraser vectorEraser) {
+        this.documentIngestor.setVectorEraser(vectorEraser);
+    }
+
+    /**
+     * Ingests a source on the calling thread, returning when its documents are searchable.
+     *
+     * <p>The counterpart to {@link #startIngestion(Source)}, and the right one for documents a
+     * client handed in directly. A crawl is of unknown size and unknown duration, so it is
+     * answered with an accepted-and-in-progress and a status to poll. A batch the caller is
+     * holding in its hand is neither: it can be ingested inside the request that carried it, and
+     * a caller that has to poll to find out whether the documents it just sent were accepted has
+     * been given a worse answer than the one that was available.</p>
+     *
+     * @param source The source to ingest
+     * @return What the run did
+     * @throws NullPointerException  if source is null
+     * @throws IllegalStateException if the node is shutting down, or this source is already
+     *                               being ingested
+     * @throws IngestionFailedException if the run could not complete
+     */
+    public IngestionOutcome ingestNow(Source source) {
+        Objects.requireNonNull(source, "Source cannot be null");
+
+        String sourceId = source.getSourceId();
+        if (shutdown.get()) {
+            throw new IllegalStateException("The node is shutting down and is not ingesting");
         }
-        try {
-            sink.onDocumentPublished(documentKey, doc.getText());
+        // The same claim a background run takes, for the same reason: two runs over one source
+        // id would race on the same document identifiers. Refusing lets the caller retry, where
+        // returning quietly - which is right for a scheduled crawl that will come round again -
+        // would report documents as ingested that were never looked at.
+        if (!activeIngestions.add(sourceId)) {
+            throw new IllegalStateException("Ingestion is already running for source: " + sourceId);
+        }
+        // Published before the flag is read again, not after. shutdown() waits on this map and
+        // on nothing else, so a run that has passed its last check and is not yet in the map is
+        // a run shutdown reports a clean stop over - and the caller then closes the storage
+        // engine's Arena under a thread that is about to write into a memory mapping, which
+        // takes the JVM down rather than throwing. Publishing first makes the two orders the
+        // only two outcomes: either shutdown sees this run and waits for it, or this run sees
+        // the flag and backs out.
+        synchronousIngestions.put(sourceId, Thread.currentThread());
+        if (shutdown.get()) {
+            synchronousIngestions.remove(sourceId, Thread.currentThread());
+            activeIngestions.remove(sourceId);
+            throw new IllegalStateException("The node is shutting down and is not ingesting");
+        }
+
+        IngestionStatus status = statusRegistry.getOrCreate(sourceId);
+        try (StructuredLoggingHelper.ScopedContext ctx = StructuredLoggingHelper.scopedContext()
+                .withSourceId(sourceId)
+                .build()) {
+            return ingestSource(source, sourceId, status);
+        } catch (SourceException e) {
+            String error = "Ingestion failed: " + e.getMessage();
+            LOGGER.error("{}", error, e);
+            status.setError(error);
+            // Wrapped rather than swallowed: this caller is a request that has to answer for
+            // what it was handed, and a run that failed outright is not a run that ingested
+            // nothing - the difference is the whole content of the reply.
+            throw new IngestionFailedException(error, e);
         } catch (RuntimeException e) {
-            LOGGER.warn("Graph sink failed for {}: {}", documentKey, e.toString());
+            // Everything below this call is internal - storage writes, the lexical index, the
+            // embedding client - and those failures are not this caller's two expected states.
+            // Left to propagate, an internal IllegalStateException reaches a request handler
+            // that reads it as "already running" and answers 409 with the message, which
+            // carries filesystem paths and endpoint URLs the caller has no business seeing.
+            String error = "Ingestion failed: " + e.getMessage();
+            LOGGER.error("{}", error, e);
+            status.setError(error);
+            throw new IngestionFailedException(error, e);
+        } finally {
+            synchronousIngestions.remove(sourceId, Thread.currentThread());
+            activeIngestions.remove(sourceId);
+            // Cleared before the thread goes back to whatever it was doing. The interrupt was
+            // addressed to this run - by shutdown(), or by a stop of this source - and this is a
+            // request thread from a pool: carried away, the flag fails the next request served
+            // on it at its first interruptible channel operation with ClosedByInterruptException,
+            // which closes that channel for good.
+            Thread.interrupted();
+        }
+    }
+
+    /**
+     * What one ingestion run did.
+     *
+     * @param documentsIngested Documents written and published
+     * @param chunksIngested    Chunks those documents produced
+     * @param documentsFailed   Documents that were listed and could not be ingested
+     * @param stopped           Whether the run was cut short by shutdown or interruption
+     */
+    public record IngestionOutcome(int documentsIngested, long chunksIngested,
+                                   int documentsFailed, boolean stopped) {
+
+        /** A run over a source that listed no documents. */
+        static final IngestionOutcome NOTHING = new IngestionOutcome(0, 0, 0, false);
+    }
+
+    /** A synchronous ingestion run that could not complete. */
+    public static final class IngestionFailedException extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        /**
+         * @param message What went wrong
+         * @param cause   The failure underneath
+         */
+        public IngestionFailedException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -409,13 +443,6 @@ public class IngestionOrchestrator {
             return;
         }
 
-        // Re-check: shutdown() may have flipped the flag between the test above and the claim.
-        if (shutdown.get()) {
-            LOGGER.warn("Cannot start ingestion: orchestrator is shutting down");
-            activeIngestions.remove(sourceId);
-            return;
-        }
-
         LOGGER.info("Starting background ingestion for source: {}", sourceId);
 
         Thread worker = Thread.ofVirtual().name("ingestion-" + sourceId).unstarted(() -> {
@@ -426,7 +453,16 @@ public class IngestionOrchestrator {
                 activeIngestions.remove(sourceId);
             }
         });
+        // Published before the flag is read, for the reason ingestNow gives: shutdown()
+        // interrupts and joins what is in this map, so a worker that enters it afterwards is one
+        // nothing waits for. Registered unstarted, so backing out here costs no thread.
         ingestionThreads.put(sourceId, worker);
+        if (shutdown.get()) {
+            LOGGER.warn("Cannot start ingestion: orchestrator is shutting down");
+            ingestionThreads.remove(sourceId, worker);
+            activeIngestions.remove(sourceId);
+            return;
+        }
         worker.start();
     }
 
@@ -461,7 +497,8 @@ public class IngestionOrchestrator {
     /**
      * Crawls a source and ingests every document it yields.
      */
-    private void ingestSource(Source source, String sourceId, IngestionStatus status) throws SourceException {
+    private IngestionOutcome ingestSource(Source source, String sourceId, IngestionStatus status)
+            throws SourceException {
         status.update("crawling", 0.0, 0, 0);
         StructuredLoggingHelper.setStage("crawling");
         LOGGER.info("Phase 1: Starting crawl");
@@ -477,7 +514,7 @@ public class IngestionOrchestrator {
         if (totalPending == 0) {
             status.update("idle", 1.0, 0, 0);
             LOGGER.info("No documents to ingest");
-            return;
+            return IngestionOutcome.NOTHING;
         }
 
         StructuredLoggingHelper.setStage("embedding");
@@ -495,14 +532,24 @@ public class IngestionOrchestrator {
                 LOGGER.info("Ingestion of {} stopped after {} of {} documents",
                     sourceId, processedDocs, totalPending);
                 status.setError("Ingestion stopped");
-                return;
+                return new IngestionOutcome(processedDocs - failedDocs, totalIngested,
+                    failedDocs, true);
             }
 
             awaitBackpressureRelease();
 
             try {
                 StructuredLoggingHelper.setDocumentId(documentId);
-                totalIngested += ingestDocument(source, sourceId, documentId);
+                DocumentIngestor.DocumentOutcome outcome =
+                    documentIngestor.ingest(source, sourceId, documentId);
+                totalIngested += outcome.chunks();
+                // Counted here and not only in the catch arms below. Most of the ways a document
+                // fails to be ingested do not throw: too large, too many chunks, unembeddable,
+                // rolled back. Left uncounted, the run reported them to the caller as ingested,
+                // which told someone their document was stored when nothing of it was.
+                if (outcome.dropped()) {
+                    failedDocs++;
+                }
             } catch (DocumentNotFoundException e) {
                 failedDocs++;
                 LOGGER.warn("Document not found: {}", documentId);
@@ -529,14 +576,15 @@ public class IngestionOrchestrator {
         // Lucene writes are invisible to search until a reader is reopened. Doing it once per
         // run rather than per document keeps the cost off the write path, at the price of a
         // source's chunks becoming searchable together at the end of its run.
-        refreshLexicalIndex();
-        compactLexicalIndex();
+        lexicalSideIndex.refresh();
+        lexicalSideIndex.compactIfDue();
         persistRegistry();
 
         status.update("idle", 1.0, totalIngested, 0);
         reportDroppedDocuments(sourceId, status, failedDocs, totalPending);
         LOGGER.info("Ingestion complete: {} chunks from {} of {} documents",
             totalIngested, processedDocs - failedDocs, totalPending);
+        return new IngestionOutcome(processedDocs - failedDocs, totalIngested, failedDocs, false);
     }
 
     /**
@@ -564,308 +612,6 @@ public class IngestionOrchestrator {
     }
 
     /**
-     * Ingests one document as an atomic unit.
-     *
-     * <p>Every chunk is embedded and written before the document is published. A failure at any
-     * step rolls back the chunks already written and leaves the document unregistered, so no
-     * query can observe a fragment of it.</p>
-     *
-     * @return The number of chunks published (0 if the document was skipped)
-     */
-    private int ingestDocument(Source source, String sourceId, String documentId)
-            throws SourceException {
-        FetchedDocument doc = source.fetch(documentId);
-
-        if (doc.getContentLength() > MAX_DOCUMENT_CONTENT_BYTES) {
-            LOGGER.warn("Skipping document {}: {} bytes exceeds the {} byte ingest limit",
-                documentId, doc.getContentLength(), MAX_DOCUMENT_CONTENT_BYTES);
-            return 0;
-        }
-
-        String documentKey = ChunkIdentifiers.documentKey(sourceId, documentId);
-        // Decoded with the encoding the source declared, not with an assumed UTF-8: decoding a
-        // windows-1252 or UTF-16 document as UTF-8 substitutes U+FFFD silently, and the terms
-        // indexed from it are then not the terms it contains.
-        List<TextChunk> chunks = textChunker.chunk(documentKey, doc.getText());
-
-        if (chunks.isEmpty()) {
-            LOGGER.debug("Document {} produced no chunks", documentId);
-            return 0;
-        }
-        if (chunks.size() > MAX_CHUNKS_PER_DOCUMENT) {
-            LOGGER.warn("Skipping document {}: {} chunks exceeds the per-document limit of {}",
-                documentId, chunks.size(), MAX_CHUNKS_PER_DOCUMENT);
-            return 0;
-        }
-
-        // Null means this node embeds nothing at all; a null return from embedAll means this
-        // document could not be embedded and must not be published in part.
-        Map<Integer, float[]> embeddings = null;
-        if (embeddingClient != null) {
-            embeddings = embedAll(chunks, documentId);
-            if (embeddings == null) {
-                return 0;
-            }
-        }
-
-        List<String> writtenKeys = new ArrayList<>(chunks.size());
-        try {
-            // Marked in flight before the first chunk reaches storage. This is what the
-            // atomicity filter excludes on: a chunk written but not yet published is reachable
-            // by a tail scan, and without the marker the filter has no way to tell that from a
-            // document it simply has not heard of, so it either shows half a document or drops
-            // whole ones. Publishing clears it; so does rollback.
-            beginIngestion(documentKey, chunks);
-            writeChunks(documentKey, chunks, embeddings, writtenKeys);
-            publishDocument(sourceId, documentId, documentKey, doc, chunks);
-        } catch (Exception e) {
-            rollbackChunks(documentKey, writtenKeys, e);
-            return 0;
-        }
-
-        trackTermFrequencies(documentKey, chunks);
-        reportToGraph(documentKey, doc);
-        return chunks.size();
-    }
-
-    /**
-     * Generates embeddings for every chunk, a batch of {@link #EMBED_BATCH_SIZE} at a time.
-     *
-     * <p>One request per chunk was one HTTP round trip, one queue wait and one scheduler pass
-     * per 512 tokens of work. Measured against a local GPU server, request overhead rather than
-     * the model was the ceiling: three different sub-1B models landed within 6% of each other,
-     * which is the signature of a bottleneck outside the weights. Batching amortises that
-     * overhead over a whole document, and it is also what makes a document's chunks visible to
-     * the embedding endpoint as a unit, which is the precondition for any context-aware
-     * embedding model to be able to see across chunk boundaries at all.</p>
-     *
-     * <p>Bounded rather than one request per document: a document may hold up to
-     * {@code MAX_CHUNKS_PER_DOCUMENT} chunks, and a single request carrying all of them would be
-     * a multi-megabyte body whose failure costs the whole document.</p>
-     *
-     * @return The embeddings keyed by chunk index, or null if any chunk failed
-     */
-    private Map<Integer, float[]> embedAll(List<TextChunk> chunks, String documentId) {
-        Map<Integer, float[]> embeddings = new HashMap<>(chunks.size());
-        for (int start = 0; start < chunks.size(); start += EMBED_BATCH_SIZE) {
-            List<TextChunk> batch =
-                chunks.subList(start, Math.min(start + EMBED_BATCH_SIZE, chunks.size()));
-            List<String> texts = new ArrayList<>(batch.size());
-            for (TextChunk chunk : batch) {
-                texts.add(chunk.getText());
-            }
-            try {
-                List<float[]> vectors = embeddingClient.embedBatch(texts);
-                if (vectors.size() != batch.size()) {
-                    // The client already checks this, so reaching here means the contract moved.
-                    // Pairing vectors with the wrong chunks is undetectable downstream, so the
-                    // document is abandoned rather than written from a guess.
-                    LOGGER.warn("Skipping document {}: embedding endpoint returned {} vectors "
-                        + "for {} chunks", documentId, vectors.size(), batch.size());
-                    return null;
-                }
-                for (int i = 0; i < batch.size(); i++) {
-                    embeddings.put(batch.get(i).getChunkIndex(), vectors.get(i));
-                }
-            } catch (LLMException e) {
-                LOGGER.warn("Skipping document {}: failed to embed chunks {}-{}: {}",
-                    documentId, batch.get(0).getChunkIndex(),
-                    batch.get(batch.size() - 1).getChunkIndex(), e.getMessage());
-                return null;
-            }
-        }
-        return embeddings;
-    }
-
-    /**
-     * Marks a document in flight, with the chunk ids it is about to write.
-     *
-     * <p>No-op without a visibility tracker: the atomicity guarantee is the tracker's, and a
-     * deployment without one has already opted out of it.
-     */
-    private void beginIngestion(String documentKey, List<TextChunk> chunks) {
-        if (visibilityTracker == null) {
-            return;
-        }
-        visibilityTracker.beginIngestion(documentKey, chunks.size());
-        for (TextChunk chunk : chunks) {
-            visibilityTracker.addPendingChunk(documentKey,
-                ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex()));
-        }
-    }
-
-    /**
-     * Writes every chunk to the storage engine, recording the keys written so a later failure
-     * can undo them.
-     */
-    private void writeChunks(String documentKey, List<TextChunk> chunks,
-                             Map<Integer, float[]> embeddings, List<String> writtenKeys) {
-        for (TextChunk chunk : chunks) {
-            String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
-            float[] vector = embeddings == null ? null : embeddings.get(chunk.getChunkIndex());
-            byte[] value = vector == null
-                ? ChunkPayloadCodec.encodeTextOnly(chunk.getText())
-                : ChunkPayloadCodec.encode(chunk.getText(), vector);
-            long segmentId = storageEngine.putReportingSegment(
-                chunkId.getBytes(StandardCharsets.UTF_8), value);
-            indexLexically(chunkId, chunk.getText());
-            recordTermsForPruning(segmentId, chunkId, chunk.getText());
-            writtenKeys.add(chunkId);
-        }
-    }
-
-    /**
-     * Advances the visibility epoch and registers the document so queries can see it.
-     *
-     * <p>Registration uses the {@code sourceId:documentId} key, which is what excalibur-shard
-     * derives from the storage key and what excalibur-query's atomicity filter looks up. It also
-     * records the document in the {@link DocumentRegistry} so a later reindex can detect the
-     * change and tombstone exactly these chunk ids.</p>
-     */
-    private void publishDocument(String sourceId, String documentId, String documentKey,
-                                 FetchedDocument doc, List<TextChunk> chunks) {
-        byte[] content = doc.getContent();
-        List<String> chunkIds = new ArrayList<>(chunks.size());
-        for (TextChunk chunk : chunks) {
-            chunkIds.add(ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex()));
-        }
-
-        DocumentMetadata metadata = DocumentMetadata.builder()
-            .sourceId(sourceId)
-            .documentId(documentId)
-            .lastModifiedMillis(doc.getLastModifiedMillis())
-            .contentHash(DocumentRegistry.computeContentHash(content))
-            .contentLength(content.length)
-            .chunkIds(chunkIds)
-            .indexTimeMillis(System.currentTimeMillis())
-            .build();
-
-        if (visibilityTracker != null) {
-            long epoch = visibilityTracker.advanceEpoch();
-            visibilityTracker.registerFromMetadata(metadata, epoch);
-            LOGGER.debug("Document {} published at epoch {} with {} chunks",
-                documentKey, epoch, chunkIds.size());
-        }
-
-        if (documentRegistry != null) {
-            documentRegistry.register(metadata);
-        }
-    }
-
-    /**
-     * Removes chunks written for a document that failed to publish.
-     */
-    private void rollbackChunks(String documentKey, List<String> writtenKeys, Exception cause) {
-        LOGGER.error("Rolling back document {} after publication failure: {}",
-            documentKey, cause.getMessage(), cause);
-
-        // Clear the in-flight marker. A document left pending is invisible to every query
-        // for the life of the process, and never released.
-        if (visibilityTracker != null) {
-            visibilityTracker.abortIngestion(documentKey);
-        }
-
-        for (String chunkId : writtenKeys) {
-            try {
-                storageEngine.delete(chunkId.getBytes(StandardCharsets.UTF_8));
-            } catch (Exception e) {
-                LOGGER.warn("Failed to roll back chunk {}: {}", chunkId, e.getMessage());
-            }
-        }
-        unindexLexically(writtenKeys);
-    }
-
-    /**
-     * Takes rolled-back chunks back out of the lexical index.
-     *
-     * <p>Storage no longer has them, so a search that still returned them would report hits whose
-     * text nothing can resolve - a chunk id pointing at a document that was never published. The
-     * chunks were indexed as they were written, so undoing the write has to undo that too.</p>
-     */
-    private void unindexLexically(List<String> chunkIds) {
-        excalibur.ingest.lexical.ChunkIndex target = this.lexicalIndex;
-        if (target == null || chunkIds.isEmpty()) {
-            return;
-        }
-        try {
-            target.erase(new java.util.LinkedHashSet<>(chunkIds));
-        } catch (IOException e) {
-            LOGGER.warn("Rolled-back chunks of a failed document remain lexically searchable: {}",
-                e.getMessage());
-        }
-    }
-
-    /**
-     * Reclaims erased chunks if the index's policy says it is due.
-     *
-     * <p>Run at the end of an ingestion run rather than on a timer of its own: this is the moment
-     * the index has just changed, and a node that is not ingesting is not accumulating anything to
-     * reclaim. The usual outcome is that nothing is due, which costs a comparison of four
-     * numbers.</p>
-     */
-    private void compactLexicalIndex() {
-        excalibur.ingest.lexical.ChunkIndex target = this.lexicalIndex;
-        if (target == null) {
-            return;
-        }
-        try {
-            long started = System.currentTimeMillis();
-            io.excalibur.retrieval.lexical.native_.CompactionResult result =
-                target.compactIfDue(excalibur.ingest.lexical.StoredChunkText.of(storageEngine));
-            if (result.performed()) {
-                // The elapsed time is reported because queries wait on it: a compaction holds the
-                // index exclusively while it rewrites. Merges pick the smallest segments and stay
-                // brief; a compaction driven by an overdue erasure takes every segment holding a
-                // tombstone and can take much longer, which is the deadline being met rather than
-                // a fault, but is not something an operator should have to infer.
-                LOGGER.info("Lexical compaction: {} segment(s) rewritten to {}, {} chunk(s) "
-                    + "physically removed in {}ms ({})", result.segmentsRewritten(),
-                    result.segmentsProduced(), result.documentsRemoved(),
-                    System.currentTimeMillis() - started, result.reason());
-            }
-        } catch (IOException e) {
-            LOGGER.warn("Lexical compaction did not run; erased chunks stay on disk "
-                + "until the next attempt: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * Records the document's terms in the Count-Min Sketch of each chunk's segment, so the query
-     * planner can estimate selectivity.
-     */
-    private void trackTermFrequencies(String documentKey, List<TextChunk> chunks) {
-        if (termFrequencyTracker == null) {
-            return;
-        }
-
-        for (TextChunk chunk : chunks) {
-            String chunkId = ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex());
-            try {
-                Segment segment = segmentFor(chunkId);
-                if (segment != null) {
-                    termFrequencyTracker.trackText(segment, chunk.getText());
-                }
-            } catch (Exception e) {
-                LOGGER.warn("Failed to track term frequencies for chunk {}: {}", chunkId, e.getMessage());
-            }
-        }
-    }
-
-    /**
-     * Resolves the segment a key routes to, using the same arithmetic as
-     * {@code StorageEngine.put} so the LSH index and the sketch land on the segment that
-     * actually holds the entry.
-     */
-    private Segment segmentFor(String chunkId) {
-        int segmentCount = storageEngine.getSegmentCount();
-        if (segmentCount <= 0) {
-            return null;
-        }
-        long keyHash = io.excalibur.store.hash.XxHash64.hash(chunkId.getBytes(StandardCharsets.UTF_8));
-        return storageEngine.getSegment(keyHash & (segmentCount - 1));
-    }
-
-    /**
      * Writes the registry, so this run's documents survive a restart.
      *
      * <p>The registry is what change detection compares against. Lost, every document this run
@@ -884,68 +630,6 @@ public class IngestionOrchestrator {
         } catch (IOException e) {
             LOGGER.warn("Document registry not persisted; a restart would make this run's "
                 + "documents look new to the next re-crawl: {}", e.getMessage());
-        }
-    }
-
-    /** Makes this run's lexical writes searchable. */
-    private void refreshLexicalIndex() {
-        excalibur.ingest.lexical.ChunkIndex target = this.lexicalIndex;
-        if (target == null) {
-            return;
-        }
-        try {
-            target.refresh();
-        } catch (IOException e) {
-            LOGGER.warn("Lexical index not refreshed; this run's chunks stay unsearchable "
-                + "until the next refresh: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * Adds one chunk to the lexical index, if this node keeps one.
-     *
-     * <p>A failure here is logged and not rethrown. The chunk is already in storage and the
-     * document is still worth publishing: losing one chunk from BM25 costs recall on that chunk,
-     * while failing the document costs the document. The two are not the same size of loss.</p>
-     */
-    private void indexLexically(String chunkId, String text) {
-        excalibur.ingest.lexical.ChunkIndex target = this.lexicalIndex;
-        if (target == null) {
-            return;
-        }
-        try {
-            target.add(chunkId, text);
-        } catch (IOException e) {
-            LOGGER.warn("Chunk {} stored but not lexically indexed: {}", chunkId, e.getMessage());
-        }
-    }
-
-    /**
-     * Files one chunk's distinct terms under the segment it was written to.
-     *
-     * <p>Distinct terms, because the filter answers whether a segment holds a term: a word
-     * occurring forty times in a chunk is one fact. The segment is registered first because the
-     * engine creates segments as writes route to them, and a segment the filter has never been
-     * told about would be refused rather than recorded; registration is idempotent.</p>
-     *
-     * <p>Nothing here can fail the write. A term the filter has no room for takes that segment
-     * out of pruning - {@link excalibur.filter.HierarchicalCuckooFilter#coversSegment} then
-     * reports it - and the query reads the segment in full, which is slower and not wrong.</p>
-     */
-    private void recordTermsForPruning(long segmentId, String chunkId, String text) {
-        excalibur.filter.HierarchicalCuckooFilter target = this.membershipFilter;
-        if (target == null || text == null || text.isEmpty()) {
-            return;
-        }
-        String segment = String.valueOf(segmentId);
-        try {
-            target.registerSegment(segment, MEMBERSHIP_CLUSTER);
-            for (String term : io.excalibur.core.text.TermExtractor.extractUniqueTerms(text)) {
-                target.insert(term.getBytes(StandardCharsets.UTF_8), segment);
-            }
-        } catch (RuntimeException e) {
-            LOGGER.warn("Chunk {} stored but its terms were not filed for pruning; segment {} "
-                + "will be read in full: {}", chunkId, segment, e.toString());
         }
     }
 
@@ -998,7 +682,14 @@ public class IngestionOrchestrator {
      */
     public boolean stopIngestion(String sourceId) {
         Objects.requireNonNull(sourceId, "sourceId cannot be null");
+        // Either kind of run. A source can be in flight on a background thread or on the request
+        // thread that supplied its documents, and an operator asking for one to stop does not
+        // know or care which - looking only at the background threads meant a synchronous run
+        // could not be stopped at all.
         Thread worker = ingestionThreads.get(sourceId);
+        if (worker == null) {
+            worker = synchronousIngestions.get(sourceId);
+        }
         if (worker == null) {
             return false;
         }
@@ -1025,6 +716,11 @@ public class IngestionOrchestrator {
         for (Thread worker : ingestionThreads.values()) {
             worker.interrupt();
         }
+        // Interrupted for the same reason - to break a blocking write - but never joined: these
+        // are request threads, and a pooled thread does not die when its run ends.
+        for (Thread caller : synchronousIngestions.values()) {
+            caller.interrupt();
+        }
 
         long deadline = System.nanoTime() + SHUTDOWN_AWAIT_MILLIS * 1_000_000L;
         boolean clean = true;
@@ -1037,6 +733,22 @@ public class IngestionOrchestrator {
             try {
                 worker.join(remainingMillis);
                 clean &= !worker.isAlive();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        // A synchronous run ends by removing its own entry, so an empty map is what says the
+        // run has left the storage engine alone - the question the caller is actually asking
+        // before it closes the Arena.
+        while (!synchronousIngestions.isEmpty()) {
+            if (System.nanoTime() >= deadline) {
+                clean = false;
+                break;
+            }
+            try {
+                Thread.sleep(SHUTDOWN_POLL_MILLIS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return false;

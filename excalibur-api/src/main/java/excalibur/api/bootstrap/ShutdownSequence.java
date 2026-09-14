@@ -50,6 +50,29 @@ public final class ShutdownSequence {
         void run() throws Exception;
     }
 
+    /**
+     * A shutdown action on a target that may or may not be there.
+     *
+     * <p>Takes the target rather than closing over it, so that a caller writes
+     * {@code Arena::close} - an unbound reference, evaluated per call - where the no-argument
+     * form would invite {@code arena::close}, which binds its receiver while the argument list
+     * is being evaluated and therefore throws on a null target before this class ever gets to
+     * test it. That failure takes the whole sequence with it, on the one path where nothing
+     * else will ever close the engine.</p>
+     *
+     * @param <T> What the step acts on
+     */
+    @FunctionalInterface
+    public interface TargetedShutdownAction<T> {
+        /**
+         * Performs the action.
+         *
+         * @param target The object the step acts on, never null
+         * @throws Exception if the step fails; later steps still run
+         */
+        void run(T target) throws Exception;
+    }
+
     private record Step(String name, ShutdownAction action) {
     }
 
@@ -70,15 +93,21 @@ public final class ShutdownSequence {
     /**
      * Appends a step only when the target is present.
      *
+     * <p>The action receives the target, which is what makes the null-safety structural: there
+     * is no receiver to bind before the check, so a caller cannot write the reference that
+     * would fail. See {@link TargetedShutdownAction}.</p>
+     *
      * @param name   Step name
      * @param target The object the step acts on; when null the step is skipped
-     * @param action The action to run
+     * @param action The action to run on it
      * @param <T>    Target type
      * @return this sequence
      */
-    public <T> ShutdownSequence addIfPresent(String name, T target, ShutdownAction action) {
+    public <T> ShutdownSequence addIfPresent(String name, T target,
+                                             TargetedShutdownAction<T> action) {
+        Objects.requireNonNull(action, "action cannot be null");
         if (target != null) {
-            add(name, action);
+            add(name, () -> action.run(target));
         }
         return this;
     }

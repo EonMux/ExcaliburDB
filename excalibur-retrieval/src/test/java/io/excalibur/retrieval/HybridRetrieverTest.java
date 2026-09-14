@@ -5,6 +5,7 @@ import java.util.List;
 import io.excalibur.core.trace.QueryTrace;
 import io.excalibur.core.trace.Stage;
 import io.excalibur.retrieval.fusion.FusedDocument;
+import io.excalibur.retrieval.fusion.ReciprocalRankFusion;
 import io.excalibur.retrieval.rank.RankedList;
 import io.excalibur.retrieval.rank.Ranker;
 import io.excalibur.retrieval.rank.RetrievalQuery;
@@ -110,6 +111,53 @@ class HybridRetrieverTest {
 
         assertThat(askedFor[0])
             .isEqualTo(5 * HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH);
+    }
+
+    @Test
+    @DisplayName("a configured over-fetch is what each signal is asked for")
+    void configuredOverFetchIsUsed() {
+        // How deep each signal runs is a cost-against-recall decision that belongs to whoever
+        // sized the deployment, not to a constant in this file.
+        int[] askedFor = new int[1];
+        Ranker recording = new Ranker() {
+            @Override
+            public String name() {
+                return "recording";
+            }
+
+            @Override
+            public RankedList rank(RetrievalQuery query, int limit) {
+                askedFor[0] = limit;
+                return RankedList.empty(name());
+            }
+        };
+
+        new HybridRetriever(List.of(recording, new FixedRanker("other", 1)),
+            new ReciprocalRankFusion(), 7).retrieve(QUERY, 5);
+
+        assertThat(askedFor[0]).isEqualTo(35);
+    }
+
+    @Test
+    @DisplayName("an over-fetch below one is refused")
+    void overFetchMustBeAtLeastOne() {
+        assertThatThrownBy(() -> new HybridRetriever(
+                List.of(new FixedRanker("dense", 1)), new ReciprocalRankFusion(), 0))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("at least 1");
+    }
+
+    @Test
+    @DisplayName("a configured fusion is the one that runs, k and all")
+    void configuredFusionIsUsed() {
+        // The convenience constructor builds fusion at its default k. A deployment that set k
+        // has to be able to hand one in instead, or the setting would stop at this boundary.
+        HybridRetriever retriever = new HybridRetriever(List.of(new FixedRanker("dense", 1)),
+            new ReciprocalRankFusion(17), HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH);
+
+        assertThat(retriever.fusion().name()).isEqualTo("rrf(k=17)");
+        assertThat(retriever.retrieve(QUERY, 1).get(0).score())
+            .isCloseTo(1.0 / 18, org.assertj.core.data.Offset.offset(1e-12));
     }
 
     @Test

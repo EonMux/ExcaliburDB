@@ -57,7 +57,8 @@ public final class QueryRequestParser {
      *   <li>{@code top_k} is positive and within the configured maximum</li>
      *   <li>{@code threshold} and {@code llm_threshold} are in [0.0, 1.0]</li>
      *   <li>{@code timeout_ms} is positive and within the configured maximum</li>
-     *   <li>{@code oversampling_factor} is at least 1</li>
+     *   <li>{@code oversampling_factor} is at least 1 and within the configured maximum</li>
+     *   <li>{@code include_text} is a boolean, defaulting to false</li>
      * </ul>
      *
      * @param json The request body
@@ -92,6 +93,11 @@ public final class QueryRequestParser {
             ? (float) config.llm().getRelevancyThreshold()
             : 0.3f;
         float llmThreshold = JsonText.floatValue(json, "llm_threshold", defaultLlmThreshold);
+
+        // Off unless asked for. The identifier-only answer is what existing clients parse, and
+        // text is the larger half of a response - opting in is what keeps a caller that does not
+        // read the field from paying for it on every query.
+        boolean includeText = JsonText.booleanValue(json, "include_text", false);
 
         // Parse oversampling_factor with default from QueryOptions
         int oversamplingFactor = JsonText.integer(json, "oversampling_factor",
@@ -162,7 +168,7 @@ public final class QueryRequestParser {
         }
 
         return new ParsedQuery(query, topK, threshold, timeoutMs,
-            includePartial, enableLlmScoring, llmThreshold, oversamplingFactor);
+            includePartial, enableLlmScoring, llmThreshold, oversamplingFactor, includeText);
     }
 
     /**
@@ -179,10 +185,11 @@ public final class QueryRequestParser {
      * @param enableLlmScoring    Whether Stage 5 LLM scoring runs
      * @param llmThreshold        Minimum LLM relevancy score
      * @param oversamplingFactor  Candidate oversampling factor
+     * @param includeText         Whether each result carries the text behind its identifier
      */
     public record ParsedQuery(String query, int topK, float threshold,
                                long timeoutMs, boolean includePartial, boolean enableLlmScoring,
-                               float llmThreshold, int oversamplingFactor) {
+                               float llmThreshold, int oversamplingFactor, boolean includeText) {
 
         /**
          * Builds the pipeline request once the embedding is available.

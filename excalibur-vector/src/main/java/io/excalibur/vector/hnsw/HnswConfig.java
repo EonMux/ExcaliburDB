@@ -74,7 +74,26 @@ public final class HnswConfig {
      * Value: 1 / ln(M) where M is maxConnections
      * This ensures expected number of connections per node is M.
      */
-    public static final double DEFAULT_ML = 1.0 / Math.log(DEFAULT_MAX_CONNECTIONS);
+    public static final double DEFAULT_ML = mLFor(DEFAULT_MAX_CONNECTIONS);
+
+    /**
+     * Returns the level-generation factor that belongs with a given connection bound.
+     *
+     * <p>{@code mL} is {@code 1 / ln(M)}: it is what makes the expected number of
+     * layers match a graph whose nodes hold {@code M} neighbours, so it follows
+     * {@code maxConnections} rather than being tuned on its own. At the smallest
+     * permitted {@code M} the reciprocal logarithm rises above 1, outside the range
+     * {@code mL} is defined over, so it is capped there; the level distribution that
+     * results is the flattest the generator can produce, which is what a graph that
+     * narrow wants anyway.</p>
+     *
+     * @param maxConnections The connection bound above layer 0, the graph's {@code M}
+     * @return The matching normalization factor, in range (0, 1]
+     */
+    public static double mLFor(int maxConnections) {
+        validateMaxConnections(maxConnections);
+        return Math.min(1.0, 1.0 / Math.log(maxConnections));
+    }
 
     /**
      * Maximum supported vector dimension.
@@ -203,16 +222,17 @@ public final class HnswConfig {
      * <ul>
      *   <li>{@code efConstruction} → Size of candidate list during graph construction</li>
      *   <li>{@code efSearch} → Size of candidate list during search</li>
-     *   <li>{@code maxConnections} → Uses default (16)</li>
-     *   <li>{@code maxConnectionsLayer0} → Uses default (32)</li>
-     *   <li>{@code mL} → Uses default (1 / ln(M))</li>
+     *   <li>{@code maxConnections} → Neighbours per node above layer 0</li>
+     *   <li>{@code maxConnectionsLayer0} → Neighbours per node at layer 0</li>
+     *   <li>{@code mL} → Derived from {@code maxConnections} as {@code 1 / ln(M)}</li>
      * </ul>
      *
      * <h3>Domain Correctness</h3>
      * <ul>
      *   <li>efConstruction and efSearch must be at least 1 (enforced by Config.Shard validation)</li>
      *   <li>Values from config override HnswConfig defaults for user-configurability</li>
-     *   <li>Graph connectivity (maxConnections) uses proven defaults from HNSW paper</li>
+     *   <li>The connection bounds fix a graph's on-disk adjacency layout, so they take effect
+     *       when a graph is created; one already on disk keeps the bounds it was built with</li>
      * </ul>
      *
      * @param dimension Vector dimension (must be in range [1, 4096])
@@ -226,12 +246,13 @@ public final class HnswConfig {
             throw new NullPointerException("shard config cannot be null");
         }
 
+        int maxConnections = shard.getMaxConnections();
         return new HnswConfig(
-            DEFAULT_MAX_CONNECTIONS,           // Keep default: 16 (HNSW paper recommendation)
-            DEFAULT_MAX_CONNECTIONS_LAYER0,    // Keep default: 32 (2x maxConnections)
-            shard.getEfConstruction(),         // Use config value
-            shard.getEfSearch(),               // Use config value
-            DEFAULT_ML,                        // Keep default: 1/ln(M)
+            maxConnections,
+            shard.getMaxConnectionsLayer0(),
+            shard.getEfConstruction(),
+            shard.getEfSearch(),
+            mLFor(maxConnections),   // mL follows M rather than being configured on its own
             dimension
         );
     }

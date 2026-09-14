@@ -1,10 +1,11 @@
 package excalibur.llm.embedding;
 
+import excalibur.llm.client.CorrelationId;
+import excalibur.llm.client.SafeUrl;
 import excalibur.llm.client.LLMClientConfig;
 import io.excalibur.llm.LLMException;
 import io.excalibur.llm.LLMException.ErrorType;
 import io.excalibur.llm.client.CircuitBreaker;
-import io.excalibur.llm.client.CircuitBreakerState;
 import io.excalibur.llm.json.JsonWriter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,9 +18,9 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Supplier;
 import java.util.random.RandomGenerator;
 import java.util.random.RandomGeneratorFactory;
 
@@ -71,10 +72,6 @@ public final class EmbeddingClient {
     // Endpoint path
     private static final String EMBEDDINGS_PATH = "/v1/embeddings";
 
-    // Dimension constraints
-    private static final int MIN_EMBEDDING_DIMENSION = 1;
-    private static final int MAX_EMBEDDING_DIMENSION = 4096;
-
     // Retry configuration (base delay is configurable via LLMClientConfig.getRetryBaseDelay())
     private static final long RETRY_MAX_DELAY_MS = 30_000L;
     private static final double RETRY_BACKOFF_MULTIPLIER = 2.0;
@@ -85,6 +82,7 @@ public final class EmbeddingClient {
     private final HttpClient httpClient;
     private final LLMClientConfig config;
     private final CircuitBreaker circuitBreaker;
+    private final EmbeddingResponseParser parser;
 
     /**
      * Creates a new EmbeddingClient with the given configuration.
@@ -99,6 +97,7 @@ public final class EmbeddingClient {
     public EmbeddingClient(LLMClientConfig config) {
         this.config = Objects.requireNonNull(config, "Configuration cannot be null");
         this.httpClient = createHttpClient(config.getTimeout());
+        this.parser = new EmbeddingResponseParser(this.config);
         this.circuitBreaker = new CircuitBreaker(
             config.getFailureThreshold(),
             config.getCooldownPeriod(),
@@ -106,7 +105,8 @@ public final class EmbeddingClient {
         );
 
         LOG.debug("EmbeddingClient initialized with baseUrl={}, model={}, dimension={}",
-                config.getBaseUrl(), config.getEmbeddingModel(), config.getEmbeddingDimension());
+                SafeUrl.redact(config.getBaseUrl()), config.getEmbeddingModel(),
+                config.getEmbeddingDimension());
     }
 
     /**
@@ -123,9 +123,10 @@ public final class EmbeddingClient {
         this.config = Objects.requireNonNull(config, "Configuration cannot be null");
         this.circuitBreaker = Objects.requireNonNull(circuitBreaker, "CircuitBreaker cannot be null");
         this.httpClient = createHttpClient(config.getTimeout());
+        this.parser = new EmbeddingResponseParser(this.config);
 
         LOG.debug("EmbeddingClient initialized with custom circuit breaker, baseUrl={}, model={}",
-                config.getBaseUrl(), config.getEmbeddingModel());
+                SafeUrl.redact(config.getBaseUrl()), config.getEmbeddingModel());
     }
 
     // ==================== Public API ====================
@@ -133,8 +134,9 @@ public final class EmbeddingClient {
     /**
      * Generates an embedding vector for the given text.
      *
-     * <p>This method does NOT use circuit breaker protection. For circuit breaker
-     * protection, use {@link #embedWithCircuitBreaker(String)}.</p>
+     * <p>Protected by the circuit breaker, like every call on this client: once the endpoint
+     * has failed often enough, this fails fast with {@link ErrorType#CIRCUIT_OPEN} rather than
+     * spending a timeout rediscovering it.</p>
      *
      * <h3>Domain Correctness</h3>
      * <ul>
@@ -169,29 +171,29 @@ public final class EmbeddingClient {
             throw new IllegalArgumentException("Text cannot be empty");
         }
 
-        LOG.debug("Generating embedding for text of length {} characters, correlationId={}",
-                text.length(), correlationId);
+        return guarded(correlationId, () -> {
+            LOG.debug("Generating embedding for text of length {} characters, correlationId={}",
+                    text.length(), correlationId);
 
-        // Build request
-        String requestBody = buildEmbeddingRequestBody(text);
-        String url = config.getBaseUrl() + EMBEDDINGS_PATH;
+            String requestBody = buildEmbeddingRequestBody(text);
+            String url = config.getBaseUrl() + EMBEDDINGS_PATH;
 
-        // Execute request with retry
-        HttpResponse<String> response = executeRequest(url, requestBody, correlationId);
+            HttpResponse<String> response = executeRequest(url, requestBody, correlationId);
 
-        // Parse and validate response
-        float[] embedding = parseEmbeddingResponse(response.body());
-        validateEmbedding(embedding);
+            float[] embedding = parser.parseEmbeddingResponse(response.body());
+            parser.validateEmbedding(embedding);
 
-        LOG.debug("Generated embedding of dimension {}, correlationId={}", embedding.length, correlationId);
-        return embedding;
+            LOG.debug("Generated embedding of dimension {}, correlationId={}",
+                    embedding.length, correlationId);
+            return embedding;
+        });
     }
 
     /**
-     * Generates an embedding with circuit breaker protection.
+     * Generates an embedding, identically to {@link #embed(String)}.
      *
-     * <p>If the circuit breaker is open, this method fails fast with an
-     * {@link LLMException} of type {@link ErrorType#CIRCUIT_OPEN}.</p>
+     * <p>Retained because callers name it to say that they want the breaker. They always get
+     * it now, so this is a synonym; it counts one failure per failed call, not two.</p>
      *
      * @param text The text to embed (must not be null or empty)
      * @return Embedding vector as float array
@@ -204,7 +206,7 @@ public final class EmbeddingClient {
     }
 
     /**
-     * Generates an embedding with circuit breaker protection and correlation ID.
+     * Generates an embedding, identically to {@link #embed(String, String)}.
      *
      * @param text The text to embed (must not be null or empty)
      * @param correlationId Optional correlation ID for request tracing
@@ -214,27 +216,7 @@ public final class EmbeddingClient {
      * @throws LLMException if circuit is open or API call fails
      */
     public float[] embedWithCircuitBreaker(String text, String correlationId) {
-        // Check circuit breaker
-        if (!circuitBreaker.allowRequest()) {
-            LOG.warn("Circuit breaker is OPEN, failing fast (correlationId={})", correlationId);
-            throw new LLMException(
-                "Circuit breaker is open - embedding endpoint appears unavailable",
-                ErrorType.CIRCUIT_OPEN
-            );
-        }
-
-        try {
-            float[] embedding = embed(text, correlationId);
-            circuitBreaker.recordSuccess();
-            return embedding;
-        } catch (LLMException e) {
-            if (shouldCountAsFailure(e)) {
-                circuitBreaker.recordFailure();
-                LOG.debug("Recorded circuit breaker failure: {} (correlationId={})",
-                        e.getErrorType(), correlationId);
-            }
-            throw e;
-        }
+        return embed(text, correlationId);
     }
 
     /**
@@ -288,26 +270,24 @@ public final class EmbeddingClient {
             }
         }
 
-        LOG.debug("Generating batch embeddings for {} texts, correlationId={}",
-                texts.size(), correlationId);
+        return guarded(correlationId, () -> {
+            LOG.debug("Generating batch embeddings for {} texts, correlationId={}",
+                    texts.size(), correlationId);
 
-        // Build batch request
-        String requestBody = buildBatchEmbeddingRequestBody(texts);
-        String url = config.getBaseUrl() + EMBEDDINGS_PATH;
+            String requestBody = buildBatchEmbeddingRequestBody(texts);
+            String url = config.getBaseUrl() + EMBEDDINGS_PATH;
 
-        // Execute request
-        HttpResponse<String> response = executeRequest(url, requestBody, correlationId);
+            HttpResponse<String> response = executeRequest(url, requestBody, correlationId);
 
-        // Parse and validate response
-        List<float[]> embeddings = parseBatchEmbeddingResponse(response.body(), texts.size());
+            List<float[]> embeddings = parser.parseBatchEmbeddingResponse(response.body(), texts.size());
+            for (float[] embedding : embeddings) {
+                parser.validateEmbedding(embedding);
+            }
 
-        // Validate each embedding
-        for (int i = 0; i < embeddings.size(); i++) {
-            validateEmbedding(embeddings.get(i));
-        }
-
-        LOG.debug("Generated {} batch embeddings, correlationId={}", embeddings.size(), correlationId);
-        return embeddings;
+            LOG.debug("Generated {} batch embeddings, correlationId={}",
+                    embeddings.size(), correlationId);
+            return embeddings;
+        });
     }
 
     /**
@@ -342,15 +322,63 @@ public final class EmbeddingClient {
             throw new IllegalArgumentException("Text cannot be empty");
         }
 
-        LOG.debug("Generating embedding with metadata for text of length {}, correlationId={}",
-                text.length(), correlationId);
+        return guarded(correlationId, () -> {
+            LOG.debug("Generating embedding with metadata for text of length {}, correlationId={}",
+                    text.length(), correlationId);
 
-        String requestBody = buildEmbeddingRequestBody(text);
-        String url = config.getBaseUrl() + EMBEDDINGS_PATH;
+            String requestBody = buildEmbeddingRequestBody(text);
+            String url = config.getBaseUrl() + EMBEDDINGS_PATH;
 
-        HttpResponse<String> response = executeRequest(url, requestBody, correlationId);
+            HttpResponse<String> response = executeRequest(url, requestBody, correlationId);
 
-        return parseEmbeddingResponseWithMetadata(response.body());
+            return parser.parseEmbeddingResponseWithMetadata(response.body());
+        });
+    }
+
+    // ==================== Circuit Breaker ====================
+
+    /**
+     * Runs an embedding call behind the circuit breaker.
+     *
+     * <p>Every public call goes through here rather than through an opt-in variant. Embedding
+     * sits on the hot path of both ingestion and query, so the callers that most need the
+     * breaker are exactly the ones least likely to remember to ask for it - and when the
+     * protection was opt-in, none of them did: a provider that was down was rediscovered by
+     * every chunk of every document and every query in flight, each paying the full retry
+     * schedule to learn what the previous one already knew.</p>
+     *
+     * <p>Parse failures count as failures. A provider answering 200 with a body this client
+     * cannot read is as unusable as one answering 500, and retrying it per chunk is the same
+     * waste.</p>
+     *
+     * @param correlationId Correlation id for tracing, may be null
+     * @param call          The call to make if the breaker permits it
+     * @param <T>           What the call returns
+     * @return Whatever the call returned
+     * @throws LLMException with {@link ErrorType#CIRCUIT_OPEN} if the breaker is refusing traffic
+     */
+    private <T> T guarded(String correlationId, Supplier<T> call) {
+        if (!circuitBreaker.allowRequest()) {
+            LOG.warn("Circuit breaker '{}' is {}, failing fast (correlationId={})",
+                    circuitBreaker.getName(), circuitBreaker.getState(), correlationId);
+            throw new LLMException(
+                "Circuit breaker is open - the embedding endpoint appears unavailable",
+                ErrorType.CIRCUIT_OPEN
+            );
+        }
+
+        try {
+            T result = call.get();
+            circuitBreaker.recordSuccess();
+            return result;
+        } catch (LLMException e) {
+            if (shouldCountAsFailure(e)) {
+                circuitBreaker.recordFailure();
+                LOG.debug("Recorded circuit breaker failure: {} (correlationId={})",
+                        e.getErrorType(), correlationId);
+            }
+            throw e;
+        }
     }
 
     // ==================== Configuration Accessors ====================
@@ -444,9 +472,11 @@ public final class EmbeddingClient {
                     requestBuilder.header(AUTHORIZATION_HEADER, "Bearer " + apiKey);
                 }
 
-                // Add correlation ID header if provided
-                if (correlationId != null && !correlationId.isBlank()) {
-                    requestBuilder.header(CORRELATION_ID_HEADER, correlationId);
+                // Validated at the point of use, for the same reason as in the chat client:
+                // this value arrived from the API boundary and nothing has checked it.
+                String safeCorrelationId = CorrelationId.sanitize(correlationId);
+                if (safeCorrelationId != null) {
+                    requestBuilder.header(CORRELATION_ID_HEADER, safeCorrelationId);
                 }
 
                 HttpRequest request = requestBuilder.build();
@@ -526,309 +556,6 @@ public final class EmbeddingClient {
         throw lastException;
     }
 
-    private float[] parseEmbeddingResponse(String responseBody) {
-        if (responseBody == null || responseBody.isEmpty()) {
-            throw new LLMException("Empty response body from embedding API", ErrorType.PARSE_ERROR);
-        }
-
-        // Find "embedding" array in response
-        String embeddingKey = "\"embedding\"";
-        int embeddingIndex = responseBody.indexOf(embeddingKey);
-
-        if (embeddingIndex == -1) {
-            LOG.error("Response does not contain 'embedding' field: {}", truncate(responseBody, 500));
-            throw new LLMException("Response does not contain 'embedding' field", ErrorType.PARSE_ERROR);
-        }
-
-        int arrayStart = responseBody.indexOf('[', embeddingIndex);
-        if (arrayStart == -1) {
-            throw new LLMException("Could not find embedding array start", ErrorType.PARSE_ERROR);
-        }
-
-        int arrayEnd = findMatchingBracket(responseBody, arrayStart);
-        if (arrayEnd == -1) {
-            throw new LLMException("Could not find embedding array end", ErrorType.PARSE_ERROR);
-        }
-
-        String arrayContent = responseBody.substring(arrayStart + 1, arrayEnd);
-        return parseFloatArray(arrayContent);
-    }
-
-    private List<float[]> parseBatchEmbeddingResponse(String responseBody, int expectedCount) {
-        if (responseBody == null || responseBody.isEmpty()) {
-            throw new LLMException("Empty response body from embedding API", ErrorType.PARSE_ERROR);
-        }
-
-        // Find "data" array
-        String dataKey = "\"data\"";
-        int dataIndex = responseBody.indexOf(dataKey);
-        if (dataIndex == -1) {
-            throw new LLMException("Response does not contain 'data' field", ErrorType.PARSE_ERROR);
-        }
-
-        // Parse all embedding objects from the data array
-        List<float[]> embeddings = new ArrayList<>(expectedCount);
-
-        int pos = responseBody.indexOf('[', dataIndex);
-        if (pos == -1) {
-            throw new LLMException("Could not find data array start", ErrorType.PARSE_ERROR);
-        }
-
-        int dataEnd = findMatchingBracket(responseBody, pos);
-        if (dataEnd == -1) {
-            throw new LLMException("Could not find data array end", ErrorType.PARSE_ERROR);
-        }
-
-        String dataArray = responseBody.substring(pos + 1, dataEnd);
-
-        // Parse each embedding object, placing it at the index the response gives it rather
-        // than at the position it happened to be written in.
-        //
-        // The OpenAI batch schema carries an "index" per element precisely because the order
-        // of the data array is not promised, and vLLM and other servers do reorder when a
-        // batch is split across workers. Trusting arrival order costs nothing when the server
-        // is well behaved and silently attaches every vector to the wrong input when it is
-        // not -- a corruption with no symptom, since every vector is individually valid and
-        // only the pairing is wrong.
-        List<float[]> byIndex = new ArrayList<>(java.util.Collections.nCopies(expectedCount, null));
-        boolean sawIndex = false;
-        int parsed = 0;
-        int currentPos = 0;
-        while (currentPos < dataArray.length()) {
-            int embIdx = dataArray.indexOf("\"embedding\"", currentPos);
-            if (embIdx == -1) break;
-
-            int arrStart = dataArray.indexOf('[', embIdx);
-            if (arrStart == -1) break;
-
-            int arrEnd = findMatchingBracket(dataArray, arrStart);
-            if (arrEnd == -1) break;
-
-            String arrContent = dataArray.substring(arrStart + 1, arrEnd);
-            float[] vector = parseFloatArray(arrContent);
-
-            int slot = parsed;
-            Integer declared = indexNear(dataArray, embIdx, arrEnd);
-            if (declared != null) {
-                sawIndex = true;
-                if (declared < 0 || declared >= expectedCount) {
-                    throw new LLMException(
-                            "Embedding index " + declared + " is outside the batch of "
-                            + expectedCount, ErrorType.PARSE_ERROR);
-                }
-                slot = declared;
-            }
-            if (byIndex.get(slot) != null) {
-                throw new LLMException(
-                        "Embedding index " + slot + " returned twice in one batch",
-                        ErrorType.PARSE_ERROR);
-            }
-            byIndex.set(slot, vector);
-            parsed++;
-            currentPos = arrEnd + 1;
-        }
-
-        if (parsed == expectedCount) {
-            for (int i = 0; i < expectedCount; i++) {
-                if (byIndex.get(i) == null) {
-                    throw new LLMException(
-                            "Batch response left index " + i + " unfilled", ErrorType.PARSE_ERROR);
-                }
-            }
-            embeddings.addAll(byIndex);
-        } else {
-            // Fall through to the count check below, which reports the mismatch.
-            for (float[] v : byIndex) {
-                if (v != null) {
-                    embeddings.add(v);
-                }
-            }
-        }
-        if (!sawIndex) {
-            LOG.debug("Batch response carried no per-element index; relied on response order");
-        }
-
-        if (embeddings.size() != expectedCount) {
-            throw new LLMException(
-                    "Embedding count mismatch: expected " + expectedCount +
-                    ", got " + embeddings.size(), ErrorType.PARSE_ERROR);
-        }
-
-        return embeddings;
-    }
-
-    /**
-     * Reads the {@code "index"} of the batch element whose embedding array ends at
-     * {@code arrayEnd}, or null when the element does not declare one.
-     *
-     * <p>Scoped to the element rather than searched globally: an embedding array is a list of
-     * numbers, so a naive search for the next {@code "index"} would happily find the one
-     * belonging to the following element.</p>
-     */
-    private static Integer indexNear(String dataArray, int embeddingKeyPos, int arrayEnd) {
-        int objectStart = dataArray.lastIndexOf('{', embeddingKeyPos);
-        int searchFrom = objectStart == -1 ? 0 : objectStart;
-        int objectEnd = dataArray.indexOf('}', arrayEnd);
-        int searchTo = objectEnd == -1 ? dataArray.length() : objectEnd;
-
-        int key = dataArray.indexOf("\"index\"", searchFrom);
-        if (key == -1 || key > searchTo) {
-            return null;
-        }
-        int colon = dataArray.indexOf(':', key);
-        if (colon == -1 || colon > searchTo) {
-            return null;
-        }
-        int i = colon + 1;
-        while (i < searchTo && Character.isWhitespace(dataArray.charAt(i))) {
-            i++;
-        }
-        int start = i;
-        while (i < searchTo && Character.isDigit(dataArray.charAt(i))) {
-            i++;
-        }
-        if (start == i) {
-            return null;
-        }
-        try {
-            return Integer.valueOf(dataArray.substring(start, i));
-        } catch (NumberFormatException e) {
-            return null;
-        }
-    }
-
-    private EmbeddingResponse parseEmbeddingResponseWithMetadata(String responseBody) {
-        float[] embedding = parseEmbeddingResponse(responseBody);
-        validateEmbedding(embedding);
-
-        // Parse usage if available
-        int totalTokens = 0;
-        String usageKey = "\"usage\"";
-        int usageIdx = responseBody.indexOf(usageKey);
-        if (usageIdx != -1) {
-            String totalTokensKey = "\"total_tokens\"";
-            int tokensIdx = responseBody.indexOf(totalTokensKey, usageIdx);
-            if (tokensIdx != -1) {
-                int colonIdx = responseBody.indexOf(':', tokensIdx);
-                if (colonIdx != -1) {
-                    int start = colonIdx + 1;
-                    while (start < responseBody.length() && !Character.isDigit(responseBody.charAt(start))) {
-                        start++;
-                    }
-                    int end = start;
-                    while (end < responseBody.length() && Character.isDigit(responseBody.charAt(end))) {
-                        end++;
-                    }
-                    if (start < end) {
-                        try {
-                            totalTokens = Integer.parseInt(responseBody.substring(start, end));
-                        } catch (NumberFormatException e) {
-                            // Keep default of 0
-                        }
-                    }
-                }
-            }
-        }
-
-        return new EmbeddingResponse(embedding, config.getEmbeddingModel(), totalTokens);
-    }
-
-    private int findMatchingBracket(String json, int startPos) {
-        int depth = 1;
-        boolean inString = false;
-        boolean escape = false;
-
-        for (int i = startPos + 1; i < json.length(); i++) {
-            char c = json.charAt(i);
-
-            if (escape) {
-                escape = false;
-                continue;
-            }
-
-            if (c == '\\' && inString) {
-                escape = true;
-                continue;
-            }
-
-            if (c == '"') {
-                inString = !inString;
-                continue;
-            }
-
-            if (!inString) {
-                if (c == '[') {
-                    depth++;
-                } else if (c == ']') {
-                    depth--;
-                    if (depth == 0) {
-                        return i;
-                    }
-                }
-            }
-        }
-
-        return -1;
-    }
-
-    private float[] parseFloatArray(String arrayContent) {
-        String[] parts = arrayContent.split(",");
-        if (parts.length == 0 || (parts.length == 1 && parts[0].trim().isEmpty())) {
-            throw new LLMException("Empty embedding array", ErrorType.PARSE_ERROR);
-        }
-
-        float[] result = new float[parts.length];
-        for (int i = 0; i < parts.length; i++) {
-            String part = parts[i].trim();
-            if (part.isEmpty()) {
-                throw new LLMException("Empty element in embedding array at index " + i, ErrorType.PARSE_ERROR);
-            }
-            try {
-                result[i] = Float.parseFloat(part);
-            } catch (NumberFormatException e) {
-                throw new LLMException(
-                        "Invalid float value in embedding array at index " + i + ": " + part,
-                        ErrorType.PARSE_ERROR, e);
-            }
-        }
-
-        return result;
-    }
-
-    private void validateEmbedding(float[] embedding) {
-        if (embedding == null) {
-            throw new LLMException("Embedding is null", ErrorType.PARSE_ERROR);
-        }
-
-        int length = embedding.length;
-        if (length < MIN_EMBEDDING_DIMENSION || length > MAX_EMBEDDING_DIMENSION) {
-            throw new LLMException(
-                    "Embedding dimension out of range [" + MIN_EMBEDDING_DIMENSION + ", " +
-                    MAX_EMBEDDING_DIMENSION + "]: " + length, ErrorType.PARSE_ERROR);
-        }
-
-        for (int i = 0; i < length; i++) {
-            float value = embedding[i];
-            if (Float.isNaN(value)) {
-                throw new LLMException("Embedding contains NaN at index " + i, ErrorType.PARSE_ERROR);
-            }
-            if (Float.isInfinite(value)) {
-                throw new LLMException("Embedding contains Infinite at index " + i, ErrorType.PARSE_ERROR);
-            }
-        }
-
-        // Enforce that embedding dimension matches configured dimensionality
-        // Domain correctness: embeddings must be float arrays of configured dimensionality
-        int configuredDim = config.getEmbeddingDimension();
-        if (length != configuredDim) {
-            throw new LLMException(
-                    "Embedding dimension (" + length + ") does not match configured dimensionality (" +
-                    configuredDim + "). " +
-                    "Ensure the embedding model '" + config.getEmbeddingModel() + "' produces " +
-                    configuredDim + "-dimensional vectors, or update excalibur.llm.embeddings-dimensions.",
-                    ErrorType.PARSE_ERROR);
-        }
-    }
 
     private boolean isErrorStatus(int statusCode) {
         return statusCode >= 400;
@@ -864,18 +591,13 @@ public final class EmbeddingClient {
         return Math.max(delayWithJitter, baseDelayMs);
     }
 
-    private String truncate(String s, int maxLength) {
-        if (s == null) return "null";
-        if (s.length() <= maxLength) return s;
-        return s.substring(0, maxLength) + "...";
-    }
 
     @Override
     public String toString() {
         return "EmbeddingClient{" +
                 "model='" + config.getEmbeddingModel() + '\'' +
                 ", dimension=" + config.getEmbeddingDimension() +
-                ", baseUrl='" + config.getBaseUrl() + '\'' +
+                ", baseUrl='" + SafeUrl.redact(config.getBaseUrl()) + '\'' +
                 ", circuitBreakerState=" + circuitBreaker.getState() +
                 '}';
     }
