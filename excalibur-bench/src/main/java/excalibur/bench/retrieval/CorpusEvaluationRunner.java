@@ -57,6 +57,15 @@ import java.util.stream.Stream;
  */
 public final class CorpusEvaluationRunner {
 
+    /**
+     * What one expansion call is allowed while benchmarking.
+     *
+     * <p>Generous on purpose: a served query bounds expansion at five seconds because a client
+     * is waiting, and a benchmark that inherited that bound would record a slow endpoint as a
+     * weak retrieval strategy.</p>
+     */
+    private static final long EXPANSION_DEADLINE_MS = 120_000L;
+
     /** Chunk size, matching the ingestion pipeline's own target. */
     private static final int CHUNK_CHARS = 2048;
 
@@ -121,9 +130,14 @@ public final class CorpusEvaluationRunner {
 
         QueryExpander expander = null;
         if (chatBaseUrl != null && chatModel != null) {
+            // A longer deadline than a served query gets, deliberately. The node's 5s bound
+            // exists because a caller is holding a socket open; nobody is holding one here, and
+            // an expansion that timed out would be scored as a strategy that produced nothing
+            // rather than as a call that was cut short - which would read as a result.
             expander = new LlmQueryExpander(new LLMHttpClient(
                 excalibur.llm.client.LLMClientConfig.builder()
-                    .baseUrl(chatBaseUrl).chatModel(chatModel).apiKey("none").build()));
+                    .baseUrl(chatBaseUrl).chatModel(chatModel).apiKey("none").build()),
+                EXPANSION_DEADLINE_MS);
         }
 
         for (Engine engine : engines) {

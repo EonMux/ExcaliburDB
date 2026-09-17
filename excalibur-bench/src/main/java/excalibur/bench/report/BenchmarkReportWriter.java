@@ -247,7 +247,8 @@ public final class BenchmarkReportWriter {
             if (throughput != null) {
                 sb.append(String.format("  %-40s %12.2f ops/sec", result.methodName(), throughput.value()));
                 if (result.hasTarget()) {
-                    sb.append(" (target: ≥").append(String.format("%.0f", result.targetValue())).append(")");
+                    sb.append(" (target: ").append(targetBound(result))
+                        .append(String.format("%.0f", result.targetValue())).append(")");
                     sb.append(result.hasUnevaluatedTarget() ? " ?"
                         : result.meetsTarget() ? " ✓" : " ✗");
                 }
@@ -314,6 +315,18 @@ public final class BenchmarkReportWriter {
 
     private BenchmarkReportWriter() {
         // Utility class
+    }
+
+    /**
+     * The comparison a target expresses, taken from the target rather than from the
+     * score it is compared against.
+     *
+     * <p>Printing every threshold as a lower bound states the opposite of what a
+     * latency gate enforces: a 10 ms p50 target rendered as "target: >= 10" reads as
+     * a demand for slower queries.</p>
+     */
+    private static String targetBound(BenchmarkResult result) {
+        return result.targetEvaluations().get(0).target().higherIsBetter() ? "\u2265" : "\u2264";
     }
 
     /**

@@ -12,12 +12,12 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.excalibur.vector.hnsw.HnswGraphTestVectors.randomVector;
 import static org.assertj.core.api.Assertions.*;
 
 /**
@@ -541,16 +541,5 @@ class TailOffsetTrackerTest {
             assertThat(reopenedGraph.getLastIntegratedOffset())
                 .isLessThanOrEqualTo(tracker.getLastIntegratedOffset());
         }
-    }
-
-    // ==================== Helper Methods ====================
-
-    private float[] randomVector(int dim) {
-        Random random = new Random();
-        float[] vec = new float[dim];
-        for (int i = 0; i < dim; i++) {
-            vec[i] = random.nextFloat() * 2 - 1;
-        }
-        return vec;
     }
 }

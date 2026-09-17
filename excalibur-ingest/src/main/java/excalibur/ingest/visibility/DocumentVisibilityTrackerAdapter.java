@@ -16,7 +16,9 @@ import java.util.Set;
  * <ul>
  *   <li>A document is only visible if ALL its chunks are registered</li>
  *   <li>Visibility is epoch-based: a document visible at epoch E is visible at all epochs >= E</li>
- *   <li>Queries never see partial documents (some chunks visible, others not)</li>
+ *   <li>Queries never see partial documents (some chunks visible, others not), including
+ *       after a restart that interrupted one - the tracker records its in-flight documents
+ *       beside the document registry</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>

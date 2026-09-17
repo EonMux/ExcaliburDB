@@ -2,21 +2,14 @@ package io.excalibur.store;
 
 import io.excalibur.core.memory.MemorySegmentFactory;
 
-import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
-import java.util.SortedMap;
-import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
@@ -40,15 +33,29 @@ import java.util.logging.Logger;
  *
  * <h2>Extensible Hashing Directory</h2>
  * <p>{@code segments} is a <em>directory</em>, not a set: several directory indices may
- * point at the same {@link Segment}. When one segment splits, the directory doubles and
- * every index {@code i} that did not split gets a buddy pointer at {@code i + oldCount}
- * aimed at the same segment, so widening the routing mask never orphans another
- * segment's keys. Only the segment that split gets two distinct children.</p>
- *
- * <p>The <em>canonical index</em> of a segment is the smallest directory index that
- * points at it. It is the index used for its file name and its catalog entry.
+ * point at the same {@link Segment}, and the <em>canonical index</em> of a segment - the
+ * smallest index pointing at it - is the one that names its file and its catalog entry.
  * Enumerations ({@link #getSegments()}, {@link #getQueryableSegments()},
- * {@link #getTotalEntryCount()}) are de-duplicated by segment identity.</p>
+ * {@link #getTotalEntryCount()}) are therefore de-duplicated by segment identity.
+ * {@link EngineRouting} owns that directory and carries the rules it has to obey.</p>
+ *
+ * <h2>How this class is put together</h2>
+ * <p>This is the published surface; the work behind it is divided by seam, and each
+ * collaborator's own documentation carries the reasoning for its part:</p>
+ * <ul>
+ *   <li>{@link EngineRouting} - the directory: rebuilding, publishing, persisting it</li>
+ *   <li>{@link RoutingSnapshot} - the width and the slots, published as one value</li>
+ *   <li>{@link EngineLifecycle} - {@link #start()}, {@link #close()}, and the volume set</li>
+ *   <li>{@link SegmentRegistry} - the one path a segment is created and reclaimed through</li>
+ *   <li>{@link SegmentIndexAttachment} - attaching and discarding vector index structures</li>
+ *   <li>{@link EngineWrites} - the routed read, write and delete paths</li>
+ *   <li>{@link SplitPublication} - turning two built children into two routed segments</li>
+ * </ul>
+ *
+ * <p>Shared mutable state stays here, package-private, and is written through directly by
+ * those collaborators. That is deliberate: {@code this.x = v} becoming {@code engine.x = v}
+ * is the same memory operation, whereas routing it through an accessor is a second chance
+ * to lose a volatile read or take the wrong lock.</p>
  *
  * <h2>Segment Lifecycle States</h2>
  * <p>Each segment progresses through lifecycle states:
@@ -76,7 +83,7 @@ import java.util.logging.Logger;
  */
 public class StorageEngine implements AutoCloseable {
 
-    private static final Logger LOGGER = Logger.getLogger(StorageEngine.class.getName());
+    static final Logger LOGGER = Logger.getLogger(StorageEngine.class.getName());
 
     // ==================== Constants ====================
 
@@ -115,11 +122,6 @@ public class StorageEngine implements AutoCloseable {
      */
     public static final int SEGMENT_BUFFER_FACTOR = 15; // 1.5x buffer
 
-    /**
-     * How long a write blocked on capacity waits for a split to publish, in ms.
-     */
-    private static final long SPLIT_WAIT_TIMEOUT_MS = 5000;
-
     // ==================== Instance Fields ====================
 
     /**
@@ -130,7 +132,7 @@ public class StorageEngine implements AutoCloseable {
      * {@link #placement}'s answer, and its answer is this directory for every segment until a
      * deployment names volumes to spread them over.</p>
      */
-    private final Path dataDir;
+    final Path dataDir;
 
     /**
      * Which directory each segment's files live in, and everywhere a restart has to look.
@@ -139,13 +141,13 @@ public class StorageEngine implements AutoCloseable {
      * and what every path in this engine resolved to before placement existed. Replaced only
      * by {@link #withSegmentPlacement(SegmentPlacement)}, and only before {@link #start()}.</p>
      */
-    private volatile SegmentPlacement placement;
+    volatile SegmentPlacement placement;
 
     /**
      * Where each segment index's files actually are, which is not always where the placement
      * would put them: the volume set is configuration, and it can change between runs.
      */
-    private final SegmentLocations locations = new SegmentLocations();
+    final SegmentLocations locations = new SegmentLocations();
 
     /**
      * Arena for memory allocation.
@@ -155,7 +157,7 @@ public class StorageEngine implements AutoCloseable {
      *
      * <p>May be null when using the fallback ByteBuffer-based implementation.</p>
      */
-    private final Arena arena;
+    final Arena arena;
 
     /**
      * Flag indicating whether Panama FFM is being used.
@@ -163,7 +165,7 @@ public class StorageEngine implements AutoCloseable {
      * <p>When true, the engine uses native Panama FFM MemorySegments.
      * When false, the engine uses the ByteBuffer-based fallback implementation.</p>
      */
-    private final boolean usingPanama;
+    final boolean usingPanama;
 
     /**
      * Registry of active segments.
@@ -177,7 +179,7 @@ public class StorageEngine implements AutoCloseable {
      * <p>Segment indices are in the range [0, segmentCount-1] and are computed as:
      * {@code segmentIndex = keyHash & (segmentCount - 1)}</p>
      */
-    private final Map<Long, Segment> segments;
+    final Map<Long, Segment> segments;
 
     /**
      * Effective segment count for hash-based routing.
@@ -185,15 +187,7 @@ public class StorageEngine implements AutoCloseable {
      * splits can temporarily make the map size non-power-of-2. Routing always
      * uses this value: segmentIndex = keyHash & (routingSegmentCount - 1).
      */
-    private volatile int routingSegmentCount;
-
-    /**
-     * How many times a routed operation may re-resolve before giving up.
-     *
-     * <p>Each retry follows a split that has already published, so one is normally enough;
-     * the bound is there so a routing bug surfaces as an error rather than a hang.</p>
-     */
-    private static final int MAX_ROUTING_RETRIES = 8;
+    volatile int routingSegmentCount;
 
     /**
      * The routing directory and the mask that indexes it, as one value.
@@ -204,10 +198,10 @@ public class StorageEngine implements AutoCloseable {
      * key whose split bit is 1 to the left child - a lookup that answers "absent" for a key that
      * exists, and a write that lands in the wrong half.</p>
      *
-     * <p>Rebuilt by {@link #publishRouting()} after every change to the directory, under the
+     * <p>Rebuilt by {@link EngineRouting#publishRouting()} after every change to the directory, under the
      * same lock that made the change.</p>
      */
-    private volatile Routing routing = new Routing(0, new Segment[0]);
+    volatile RoutingSnapshot routing = new RoutingSnapshot(0, new Segment[0]);
 
     /**
      * Whether this engine created {@link #arena} and must therefore close it.
@@ -215,7 +209,7 @@ public class StorageEngine implements AutoCloseable {
      * <p>The single-argument constructor creates its own shared Arena; the Arena-taking
      * constructors borrow one owned by the caller and must not close it.</p>
      */
-    private final boolean ownsArena;
+    final boolean ownsArena;
 
     /**
      * Canonical directory index of each live segment.
@@ -225,12 +219,12 @@ public class StorageEngine implements AutoCloseable {
      * the one that names its file and its catalog entry, so catalog updates never
      * create a second entry for a segment that already has one.</p>
      */
-    private final Map<Segment, Long> canonicalIndex = new ConcurrentHashMap<>();
+    final Map<Segment, Long> canonicalIndex = new ConcurrentHashMap<>();
 
     /**
      * Lock object for synchronizing segment creation and directory updates.
      */
-    private final Object segmentLock = new Object();
+    final Object segmentLock = new Object();
 
     /**
      * Segment catalog for metadata management.
@@ -246,7 +240,7 @@ public class StorageEngine implements AutoCloseable {
      * This catalog is used by the Index Orchestration module (Phase 5) for
      * segment discovery, lifecycle management, and visibility tracking.</p>
      */
-    private final SegmentCatalog catalog;
+    final SegmentCatalog catalog;
 
     /**
      * Visibility tracker for coordinating epochs across segments.
@@ -259,29 +253,55 @@ public class StorageEngine implements AutoCloseable {
      * segment registration and tombstone tracking, inject a tracker from
      * the IndexOrchestrator in the excalibur-shard module.</p>
      */
-    private volatile VisibilityTracker visibilityTracker = new VisibilityTracker.Default();
+    volatile VisibilityTracker visibilityTracker = new VisibilityTracker.Default();
 
     /**
      * Statistics for monitoring and diagnostics.
      */
-    private final Statistics statistics = new Statistics();
+    final Statistics statistics = new Statistics();
 
     /**
      * Flag indicating whether the engine has been started.
      */
-    private volatile boolean started = false;
+    volatile boolean started = false;
 
     /**
      * HNSW initializer for creating HNSW graphs for segments.
      * May be null if HNSW initialization is disabled.
      */
-    private volatile HnswInitializer hnswInitializer;
+    volatile HnswInitializer hnswInitializer;
 
     /**
      * Vector pre-filter attached to every queryable segment alongside its HNSW graph.
      * May be null if no pre-filter is configured.
      */
-    private volatile VectorPrefilter vectorPrefilter;
+    volatile VectorPrefilter vectorPrefilter;
+
+    /**
+     * Threshold new segments are created with, from {@code excalibur.shard.segment-load-factor}.
+     * Defaults to {@link Segment#LOAD_FACTOR_THRESHOLD}.
+     */
+    volatile double loadFactorThreshold = Segment.LOAD_FACTOR_THRESHOLD;
+
+    /**
+     * The extensible-hashing directory: how it is rebuilt, published, persisted and read back.
+     */
+    final EngineRouting routingTable = new EngineRouting(this);
+
+    /** The single path a segment is created, registered and reclaimed through. */
+    final SegmentRegistry registry = new SegmentRegistry(this);
+
+    /** Where a segment's HNSW graph and vector pre-filter are attached and discarded. */
+    final SegmentIndexAttachment indexes = new SegmentIndexAttachment(this);
+
+    /** The routed read, write and delete paths. */
+    final EngineWrites writes = new EngineWrites(this);
+
+    /** Publication of a completed split into the routing directory. */
+    final SplitPublication splits = new SplitPublication(this);
+
+    /** Bringing the engine up, and taking it down. */
+    final EngineLifecycle lifecycle = new EngineLifecycle(this);
 
     /**
      * Background split worker for automatic capacity management.
@@ -298,7 +318,7 @@ public class StorageEngine implements AutoCloseable {
      *   <li>New writes are routed to the appropriate child</li>
      * </ol>
      */
-    private volatile SplitWorker splitWorker;
+    volatile SplitWorker splitWorker;
 
     // ==================== Constructors ====================
 
@@ -343,7 +363,7 @@ public class StorageEngine implements AutoCloseable {
         this.catalog = new SegmentCatalog(dataDir.resolve("catalog.dat"));
         this.segments = new ConcurrentHashMap<>(DEFAULT_INITIAL_SEGMENTS);
         this.routingSegmentCount = DEFAULT_INITIAL_SEGMENTS;
-        publishRouting();
+        routingTable.publishRouting();
 
         // Initialize split worker with listener that publishes the split into the
         // routing directory. This enables automatic capacity management when segments
@@ -388,7 +408,7 @@ public class StorageEngine implements AutoCloseable {
         this.catalog = new SegmentCatalog(dataDir.resolve("catalog.dat"), arena);
         this.segments = new ConcurrentHashMap<>(DEFAULT_INITIAL_SEGMENTS);
         this.routingSegmentCount = DEFAULT_INITIAL_SEGMENTS;
-        publishRouting();
+        routingTable.publishRouting();
 
         // Initialize split worker with listener that publishes the split into the
         // routing directory. This enables automatic capacity management when segments
@@ -409,7 +429,7 @@ public class StorageEngine implements AutoCloseable {
     private SplitWorker newSplitWorker() {
         return new SplitWorker(
             arena,
-            this::handleSplitComplete,
+            splits::handleSplitComplete,
             () -> Integer.numberOfTrailingZeros(routingSegmentCount));
     }
 
@@ -502,399 +522,7 @@ public class StorageEngine implements AutoCloseable {
      * the split completes.</p>
      */
     public void start() {
-        if (started) {
-            return; // Already started
-        }
-
-        // Validate data directory is accessible
-        if (!java.nio.file.Files.exists(dataDir)) {
-            throw new IllegalStateException(
-                "Data directory does not exist: " + dataDir);
-        }
-
-        // Recover persisted catalog metadata from previous runs
-        catalog.recover();
-
-        // DISCOVER EXISTING SEGMENTS - This is the critical fix for data persistence
-        // Without this, existing segment files would be ignored and data would be lost
-        SegmentDiscovery discovery = SegmentDiscovery.across(placement.directories());
-        java.util.List<SegmentDiscovery.DiscoveredSegment> discoveredSegments = discovery.scanDirectory();
-
-        // Before anything is opened, and well before the routing rebuild starts creating empty
-        // segments over indices it did not find.
-        refuseIfAnyVolumeIsMissing(discoveredSegments);
-
-        // Track the highest segment index found for proper routing
-        int maxSegmentIndex = -1;
-
-        // Open and register each discovered segment
-        for (SegmentDiscovery.DiscoveredSegment discovered : discoveredSegments) {
-            try {
-                // Open existing segment WITHOUT truncating - preserves data.
-                // With the configured threshold, not the compile-time default: a segment
-                // filled under a larger configured factor and reopened at the default rejects
-                // replay of entries it had already acknowledged, and the startup fails every
-                // time from then on.
-                Segment segment =
-                    Segment.openExisting(discovered.path(), arena, loadFactorThreshold);
-
-                long segmentIndex = discovered.segmentIndex();
-                // Where this segment is, not where the volume set would now put it: every
-                // name derived from the index from here on has to follow the file.
-                locations.adopt(segmentIndex, discovered.path());
-                segments.put(segmentIndex, segment);
-                canonicalIndex.put(segment, segmentIndex);
-
-                // Recovered segments are queryable, so they need a graph too.
-                initializeHnswGraph(segment, segmentIndex);
-                initializeVectorPrefilter(segment, segmentIndex);
-
-                // Track max index for routing table sizing
-                if (segmentIndex > maxSegmentIndex) {
-                    maxSegmentIndex = (int) segmentIndex;
-                }
-
-                // Every segment gets a write log. A missing or empty WAL used to mean "attach
-                // nothing", and Segment.appendPutToLog quietly returns when there is no log -
-                // so the segment served reads and writes normally while nothing it accepted was
-                // logged, durable only if the OS happened to write the mapping back. The window
-                // is real: compaction unlinks a WAL and then creates its replacement, and a
-                // crash in between leaves an absent or zero-length file.
-                Path walPath = discovered.walPath() != null
-                    ? discovered.walPath()
-                    : walPathFor(discovered.path());
-                WriteLog writeLog = new WriteLog(walPath);
-                segment.attachWriteLog(writeLog);
-
-                if (discovered.hasWriteLog()) {
-                    try {
-                        // Replay write log to recover any uncommitted entries
-                        segment.recoverFromLog();
-                    } catch (IOException | RuntimeException e) {
-                        // A replay that cannot be completed means the segment's committed
-                        // state is unknown. Refuse to start rather than serving a segment
-                        // that silently lost the tail of its log.
-                        throw new IllegalStateException(
-                            "Write-ahead log replay failed for segment " + segmentIndex
-                            + " (" + walPath + "). Refusing to start with "
-                            + "partially recovered state.", e);
-                    }
-                } else {
-                    LOGGER.log(Level.WARNING,
-                        "Segment {0} had no usable write-ahead log at {1}; a fresh one was "
-                        + "created. Anything it accepted since the log was lost is not "
-                        + "recoverable.",
-                        new Object[] { segmentIndex, walPath });
-                }
-
-                // Update last integrated offset from catalog if available
-                SegmentCatalog.SegmentMetadata walMetadata = catalog.get(segmentIndex);
-                if (walMetadata != null) {
-                    writeLog.setLastIntegratedOffset(walMetadata.getLastIntegratedOffset());
-                }
-
-                // Register in catalog and set appropriate lifecycle state
-                SegmentCatalog.SegmentMetadata metadata = catalog.get(segmentIndex);
-                if (metadata == null) {
-                    // New to catalog - add with appropriate state
-                    metadata = catalog.add(segmentIndex, discovered.path());
-                }
-
-                // Set lifecycle state based on whether segment has entries
-                // Segments with entries should be ACTIVE (queryable)
-                // Empty segments should be BOOTSTRAPPING (invisible to queries)
-                if (segment.entryCount() > 0) {
-                    // Transition to ACTIVE state for queryable segments
-                    if (metadata.getLifecycleState() == LifecycleState.BOOTSTRAPPING) {
-                        try {
-                            metadata.transitionToIndexing();
-                            metadata.transitionToWarming();
-                            metadata.transitionToActive();
-                            metadata.setEntryCount(segment.entryCount());
-                        } catch (IllegalStateException e) {
-                            // State transition failed - log and continue
-                            java.util.logging.Logger.getLogger(StorageEngine.class.getName())
-                                .warning("Failed to transition segment " + segmentIndex + " to ACTIVE: " + e.getMessage());
-                        }
-                    }
-                }
-
-                statistics.incrementSegmentOperations();
-
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to open discovered segment: " + discovered.path(), e);
-            }
-        }
-
-        rebuildRoutingDirectory(maxSegmentIndex);
-
-        // Start the background split worker for automatic capacity management
-        if (splitWorker != null) {
-            splitWorker.start();
-
-            // Register each distinct segment once for load factor monitoring
-            for (Segment segment : distinctSegments().values()) {
-                splitWorker.registerSegment(segment);
-            }
-        }
-
-        started = true;
-        statistics.incrementStartOperations();
-
-        // Log startup summary
-        java.util.logging.Logger.getLogger(StorageEngine.class.getName()).info(
-            String.format("StorageEngine started: discovered=%d, total=%d segments, ready for operations",
-                discoveredSegments.size(), segments.size()));
-    }
-
-    /**
-     * Refuses to start when the catalog names segments that no scanned directory produced.
-     *
-     * <p>A volume that failed to mount, or that was dropped from the configuration, takes its
-     * segments with it. Nothing further on in startup would notice: discovery would simply
-     * return fewer segments, the routing rebuild would create empty files over the indices it
-     * did not find, and the node would come up serving a corpus with a hole in it and no error
-     * anywhere. So the catalog - which records where every segment was last written - is the
-     * check, and a gap is fatal rather than a warning.</p>
-     *
-     * <p>The check runs only for a store that has actually used a volume other than the data
-     * directory, whether it still has it registered or not. A single-directory store has no
-     * volume that can go missing, and a segment file absent from it is a deleted file, which
-     * this engine has always tolerated.</p>
-     *
-     * @param discovered Everything the scan found
-     * @throws IllegalStateException if the catalog knows a live segment nothing produced
-     */
-    private void refuseIfAnyVolumeIsMissing(List<SegmentDiscovery.DiscoveredSegment> discovered) {
-        Map<Long, SegmentCatalog.SegmentMetadata> known = catalog.getAll();
-        if (known.isEmpty()) {
-            return;
-        }
-
-        List<Path> scanned = placement.directories();
-        if (scanned.size() <= 1 && !usesDirectoryOutside(known, scanned)) {
-            return;
-        }
-
-        Set<Long> found = new HashSet<>();
-        for (SegmentDiscovery.DiscoveredSegment segment : discovered) {
-            found.add(segment.segmentIndex());
-        }
-
-        SortedMap<Path, List<Long>> gaps = new TreeMap<>();
-        for (Map.Entry<Long, SegmentCatalog.SegmentMetadata> entry : known.entrySet()) {
-            SegmentCatalog.SegmentMetadata metadata = entry.getValue();
-            Path recorded = metadata.getVolumePath();
-            if (recorded == null || found.contains(entry.getKey())) {
-                continue;
-            }
-            if (isRetired(metadata.getLifecycleState())) {
-                continue;
-            }
-            Path directory = recorded.getParent() != null ? recorded.getParent() : recorded;
-            gaps.computeIfAbsent(directory, key -> new ArrayList<>()).add(entry.getKey());
-        }
-
-        if (gaps.isEmpty()) {
-            return;
-        }
-        throw new IllegalStateException(
-            "Refusing to start: the catalog records segments that no scanned directory holds. "
-                + "Missing by directory: " + gaps + ". Directories scanned: " + scanned
-                + ". Restore or remount the volume, or remove those segments from the catalog "
-                + "deliberately; starting without them would silently create empty segments "
-                + "over their indices.");
-    }
-
-    /**
-     * Whether the catalog remembers a segment written outside the directories now scanned.
-     *
-     * @param known   The recovered catalog entries
-     * @param scanned The directories this start scans
-     * @return true if any recorded segment sits outside the scanned set
-     */
-    private static boolean usesDirectoryOutside(Map<Long, SegmentCatalog.SegmentMetadata> known,
-                                                List<Path> scanned) {
-        for (SegmentCatalog.SegmentMetadata metadata : known.values()) {
-            Path recorded = metadata.getVolumePath();
-            if (recorded == null) {
-                continue;
-            }
-            Path directory = recorded.getParent() != null ? recorded.getParent() : recorded;
-            if (!scanned.contains(directory)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Whether a segment in this state is allowed to have no file.
-     *
-     * @param state The recorded lifecycle state, possibly null
-     * @return true if reclamation has removed, or is entitled to remove, the file
-     */
-    private static boolean isRetired(LifecycleState state) {
-        return state == LifecycleState.TOMBSTONED || state == LifecycleState.PURGED;
-    }
-
-    /**
-     * Rebuilds the routing directory so it covers exactly {@code [0, routingSegmentCount)}.
-     *
-     * <p>The directory width is the smallest power of two that both covers every
-     * discovered segment index and is at least {@link #DEFAULT_INITIAL_SEGMENTS}. The
-     * base indices below {@code DEFAULT_INITIAL_SEGMENTS} are created if missing;
-     * every higher index without a file of its own is a buddy pointer to the segment it
-     * was split from, exactly as it was before the restart.</p>
-     *
-     * <p>Creating a fresh empty segment for such an index instead would orphan half of
-     * the keys of the segment it buddies with, which is why only base indices are
-     * created here.</p>
-     *
-     * @param maxSegmentIndex Highest segment index found on disk, or -1 if none
-     */
-    private void rebuildRoutingDirectory(int maxSegmentIndex) {
-        int width = DEFAULT_INITIAL_SEGMENTS;
-        while (width <= maxSegmentIndex) {
-            width <<= 1;
-        }
-
-        // Base indices always have their own file.
-        for (int i = 0; i < DEFAULT_INITIAL_SEGMENTS; i++) {
-            if (!segments.containsKey((long) i)) {
-                createSegment(i);
-            }
-        }
-
-        // The directory as it actually was, when the previous run wrote it down.
-        if (applyPersistedRouting(width)) {
-            return;
-        }
-
-        // Otherwise the buddy heuristic, which is exact only while at most one segment has ever
-        // split. Beyond that it cannot be exact -- two segments that split from a common
-        // ancestor look the same by file name as two that did not -- so it is a best effort and
-        // says so. See RoutingDirectory for the worked example.
-        if (maxSegmentIndex < 0) {
-            // A store with no segments has no directory because it has never needed one. What is
-            // built below is the initial directory rather than a reconstruction of a lost one,
-            // and nothing has split for it to get wrong - so warning here would only teach an
-            // operator that the first line of every new deployment is noise.
-            LOGGER.log(Level.INFO, "New store: routing directory created with {0} slots", width);
-        } else {
-            LOGGER.log(Level.WARNING,
-                "No routing directory at {0}; reconstructing it from segment file names. This is "
-                    + "exact only if at most one segment has ever split.",
-                dataDir.resolve(RoutingDirectory.FILE_NAME));
-        }
-
-        for (int i = DEFAULT_INITIAL_SEGMENTS; i < width; i++) {
-            if (segments.containsKey((long) i)) {
-                continue;
-            }
-            Segment buddy = segments.get((long) (i - Integer.highestOneBit(i)));
-            if (buddy != null) {
-                segments.put((long) i, buddy);
-            } else {
-                LOGGER.log(Level.WARNING,
-                    "No buddy segment for routing index {0}; creating an empty segment", i);
-                createSegment(i);
-            }
-        }
-
-        routingSegmentCount = width;
-        publishRouting();
-        persistRoutingDirectory();
-    }
-
-    /**
-     * Restores the directory the previous run wrote, if it is there and still makes sense.
-     *
-     * <p>Rejected rather than partially applied when it does not: a directory naming a width
-     * that disagrees with the files on disk, or pointing at a segment that is no longer there,
-     * describes a store this file was not written for.
-     *
-     * @param width The width implied by the segment files found
-     * @return true when the persisted directory was applied
-     */
-    private boolean applyPersistedRouting(int width) {
-        int[] canonicalPerSlot = RoutingDirectory.read(dataDir);
-        if (canonicalPerSlot == null) {
-            return false;
-        }
-        if (canonicalPerSlot.length < width) {
-            LOGGER.log(Level.WARNING,
-                "Routing directory covers {0} slots but the segment files need {1}; "
-                    + "reconstructing instead",
-                new Object[] { canonicalPerSlot.length, width });
-            return false;
-        }
-
-        Map<Long, Segment> resolved = new HashMap<>(canonicalPerSlot.length);
-        for (int slot = 0; slot < canonicalPerSlot.length; slot++) {
-            Segment segment = segments.get((long) canonicalPerSlot[slot]);
-            if (segment == null) {
-                LOGGER.log(Level.WARNING,
-                    "Routing directory sends slot {0} to segment {1}, which is not on disk; "
-                        + "reconstructing instead",
-                    new Object[] { slot, canonicalPerSlot[slot] });
-                return false;
-            }
-            resolved.put((long) slot, segment);
-        }
-
-        segments.putAll(resolved);
-        routingSegmentCount = canonicalPerSlot.length;
-        publishRouting();
-        LOGGER.log(Level.INFO, "Routing directory restored: {0} slots",
-            canonicalPerSlot.length);
-        return true;
-    }
-
-    /**
-     * Writes the current directory so the next start does not have to guess it.
-     *
-     * <p>Failure is logged, not thrown. Losing the file costs accuracy on the next restart,
-     * which is recoverable; failing the split that just succeeded is not.
-     */
-    private void persistRoutingDirectory() {
-        try {
-            int width = routingSegmentCount;
-            Map<Segment, Long> canonical = new IdentityHashMap<>();
-            for (Map.Entry<Long, Segment> entry : segments.entrySet()) {
-                canonical.merge(entry.getValue(), entry.getKey(), Math::min);
-            }
-
-            int[] canonicalPerSlot = new int[width];
-            for (int slot = 0; slot < width; slot++) {
-                Segment segment = segments.get((long) slot);
-                Long index = segment == null ? null : canonical.get(segment);
-                canonicalPerSlot[slot] = index == null ? slot : index.intValue();
-            }
-            RoutingDirectory.write(dataDir, canonicalPerSlot);
-        } catch (IOException | RuntimeException e) {
-            LOGGER.log(Level.WARNING,
-                "Failed to persist the routing directory; the next start will reconstruct it", e);
-        }
-    }
-
-    /**
-     * Returns each distinct segment keyed by its canonical (smallest) directory index.
-     *
-     * <p>The directory can point several indices at the same segment, so any traversal
-     * that must visit a segment once - counting entries, flushing, closing, building a
-     * query snapshot - has to go through this de-duplication.</p>
-     *
-     * @return Canonical index to segment
-     */
-    private Map<Long, Segment> distinctSegments() {
-        IdentityHashMap<Segment, Long> canonical = new IdentityHashMap<>();
-        for (Map.Entry<Long, Segment> entry : segments.entrySet()) {
-            canonical.merge(entry.getValue(), entry.getKey(), Math::min);
-        }
-        Map<Long, Segment> result = new HashMap<>(canonical.size());
-        canonical.forEach((segment, index) -> result.put(index, segment));
-        return result;
+        lifecycle.start();
     }
 
     /**
@@ -953,227 +581,7 @@ public class StorageEngine implements AutoCloseable {
      * @throws SegmentAtCapacityException if segment is at capacity and split cannot complete
      */
     public long putReportingSegment(byte[] key, byte[] value) {
-        if (key == null || value == null) {
-            throw new NullPointerException("Key and value cannot be null");
-        }
-
-        if (!started) {
-            throw new IllegalStateException("StorageEngine must be started before operations");
-        }
-
-        long keyHash = io.excalibur.store.hash.XxHash64.hash(key);
-
-        // Bounded, because each retry follows a publication that has already happened: a
-        // segment that reports itself retired has been replaced in the directory this loop
-        // re-reads, so a second pass resolves the child. Looping without a bound would turn a
-        // routing bug into a hang.
-        for (int attempt = 0; attempt < MAX_ROUTING_RETRIES; attempt++) {
-            Routing snapshot = routing;
-            int segmentIndex = snapshot.slotFor(keyHash);
-            if (segmentIndex < 0) {
-                throw new IllegalStateException("No segments available - call start() first");
-            }
-
-            Segment segment = snapshot.segmentFor(keyHash);
-            if (segment == null) {
-                // Create segment at this index only if it doesn't exist
-                segment = createSegment(segmentIndex);
-            }
-
-            try {
-                segment.put(key, value);
-
-                // Update catalog entry count only - don't change lifecycle state
-                // Segments remain in INDEXING state during writes
-                catalog.updateEntryCount(catalogIndexOf(segment, segmentIndex), 1);
-
-                // Increment visibility epoch for consistent reads
-                visibilityTracker.advanceEpoch();
-
-                statistics.incrementWriteOperations();
-                return segment.segmentId();
-            } catch (SegmentCapacityExceededException e) {
-                // Every capacity signal - load factor, exhausted data region, or an
-                // unsatisfiable probe chain - is handled the same way: split and retry.
-                // Classifying these by exception message would silently miss the data
-                // region case, which is the one vector payloads hit first.
-                return putWithSplitHandling(key, value, keyHash, segment, segmentIndex);
-            } catch (SegmentRetiredException e) {
-                // The split published while this write was in flight. The key belongs to one of
-                // the children now; writing it here would land in a file nothing can reach.
-                LOGGER.log(Level.FINE,
-                    "Re-routing a write after the target segment was retired by a split");
-            }
-        }
-
-        throw new IllegalStateException(
-            "Could not route a write after " + MAX_ROUTING_RETRIES
-                + " attempts: the directory kept changing underneath it");
-    }
-
-    /**
-     * Returns the catalog index for a segment.
-     *
-     * <p>Buddy pointers make a segment reachable from several directory indices; its
-     * catalog entry lives under the canonical (smallest) one. Falls back to the routed
-     * index for a segment that is not in the directory.</p>
-     *
-     * @param segment     The segment
-     * @param routedIndex The directory index the key routed to
-     * @return The catalog index to update
-     */
-    private long catalogIndexOf(Segment segment, long routedIndex) {
-        Long canonical = canonicalIndex.get(segment);
-        return canonical != null ? canonical : routedIndex;
-    }
-
-    /**
-     * Handles a put operation when the target segment has reached capacity.
-     *
-     * <p>This method implements automatic capacity management by:</p>
-     * <ol>
-     *   <li>Requesting an immediate split of the full segment</li>
-     *   <li>Waiting for the split to complete (up to 5 seconds)</li>
-     *   <li>Routing the insert to the appropriate child segment</li>
-     * </ol>
-     *
-     * <p><strong>Domain Correctness:</strong> the child is selected with the very bit
-     * the split partitioned on, read back from the parent via {@link Segment#splitBit()}.
-     * Deriving a bit independently here is what makes a split lose half its keys.</p>
-     *
-     * @param key The key to insert
-     * @param value The value to insert
-     * @param keyHash The pre-computed key hash
-     * @param segment The segment that is at capacity
-     * @param segmentIndex The segment index
-     * @throws SegmentAtCapacityException if split cannot complete in time
-     */
-    private long putWithSplitHandling(byte[] key, byte[] value, long keyHash,
-                                       Segment segment, int segmentIndex) {
-        if (splitWorker == null || !splitWorker.isRunning()) {
-            // No split worker available - cannot handle capacity automatically
-            throw new SegmentAtCapacityException(
-                "Segment " + segmentIndex + " at capacity. No automatic splitting available. " +
-                "Ensure StorageEngine is started to enable automatic capacity management.");
-        }
-
-        // The bit a doubling of the routing table newly exposes. The worker uses the
-        // routing table's current value, so this is advisory only.
-        int expectedSplitBit = Integer.numberOfTrailingZeros(routingSegmentCount);
-        splitWorker.requestSplit(segment, expectedSplitBit);
-
-        awaitSplit(segment, segmentIndex);
-
-        // Route to the child using the bit the split actually partitioned on.
-        int splitBit = segment.splitBit();
-        boolean goesRight = Segment.shouldGoToRightChild(keyHash, splitBit);
-        Segment child = goesRight ? segment.rightChild() : segment.leftChild();
-
-        if (child == null) {
-            throw new IllegalStateException(
-                "Split completed but child segment is null. Segment: " + segmentIndex);
-        }
-
-        // Insert into child segment
-        child.put(key, value);
-
-        catalog.updateEntryCount(catalogIndexOf(child, segmentIndex), 1);
-
-        visibilityTracker.advanceEpoch();
-        statistics.incrementWriteOperations();
-        return child.segmentId();
-    }
-
-    /**
-     * Waits for an in-progress split of the given segment to publish its children.
-     *
-     * @param segment      The segment being split
-     * @param segmentIndex The segment's directory index, for error messages
-     * @throws SegmentAtCapacityException if the split does not complete in time
-     */
-    private void awaitSplit(Segment segment, int segmentIndex) {
-        long deadline = System.currentTimeMillis() + SPLIT_WAIT_TIMEOUT_MS;
-        while (!segment.isSplitComplete()) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new SegmentAtCapacityException(
-                    "Segment " + segmentIndex + " at capacity. Split in progress but not complete. " +
-                    "Please retry the operation.");
-            }
-            try {
-                Thread.sleep(10); // Brief sleep before checking again
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                throw new SegmentAtCapacityException(
-                    "Interrupted while waiting for segment split", ie);
-            }
-        }
-    }
-
-    /**
-     * Creates a segment at the specified index.
-     *
-     * <p>This method is synchronized to prevent concurrent creation of
-     * the same segment index.</p>
-     *
-     * <p>New segments are automatically registered with the split worker
-     * for load factor monitoring if the split worker is running.</p>
-     *
-     * @param segmentIndex The index for the new segment
-     * @return The created or existing segment
-     */
-    private Segment createSegmentAtIndex(int segmentIndex) {
-        return createSegment(segmentIndex);
-    }
-
-    /**
-     * Creates, registers and fully initializes the segment at the given directory index.
-     *
-     * <p>This is the single creation path. Both eager pre-allocation and lazy creation
-     * on first write go through it, so a segment can never be created without its write
-     * log, its catalog entry or its HNSW graph.</p>
-     *
-     * @param segmentIndex The directory index for the new segment
-     * @return The created or already-present segment
-     * @throws RuntimeException if the segment or its write log cannot be created
-     */
-    private Segment createSegment(int segmentIndex) {
-        synchronized (segmentLock) {
-            // Double-check after acquiring lock
-            Segment existing = segments.get((long) segmentIndex);
-            if (existing != null) {
-                return existing;
-            }
-
-            Path segmentPath = segmentPath(segmentIndex);
-            try {
-                Segment segment = new Segment(segmentPath, 1024 * 1024, arena, loadFactorThreshold);
-                locations.adopt(segmentIndex, segmentPath);
-
-                // Create and attach WriteLog for crash recovery. Every mutation is
-                // recorded in the log so a crash does not lose committed writes.
-                segment.attachWriteLog(new WriteLog(walPathFor(segmentPath)));
-
-                initializeHnswGraph(segment, segmentIndex);
-                initializeVectorPrefilter(segment, segmentIndex);
-
-                segments.put((long) segmentIndex, segment);
-                canonicalIndex.put(segment, (long) segmentIndex);
-                publishRouting();
-
-                // Add to catalog with initial INDEXING state
-                catalog.add((long) segmentIndex, segmentPath);
-
-                // Register with split worker for automatic capacity management
-                if (splitWorker != null && splitWorker.isRunning()) {
-                    splitWorker.registerSegment(segment);
-                }
-
-                statistics.incrementSegmentOperations();
-                return segment;
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to create segment at index " + segmentIndex, e);
-            }
-        }
+        return writes.putReportingSegment(key, value);
     }
 
     /**
@@ -1215,7 +623,7 @@ public class StorageEngine implements AutoCloseable {
      * @param segmentFile The segment file
      * @return The {@code segment_<index>.wal} path in the same directory
      */
-    private static Path walPathFor(Path segmentFile) {
+    static Path walPathFor(Path segmentFile) {
         String name = segmentFile.getFileName().toString();
         String base = name.endsWith(".dat") ? name.substring(0, name.length() - 4) : name;
         return segmentFile.resolveSibling(base + ".wal");
@@ -1250,117 +658,34 @@ public class StorageEngine implements AutoCloseable {
      *                                  directory that is not there
      */
     public StorageEngine withSegmentPlacement(SegmentPlacement placement) {
-        Objects.requireNonNull(placement, "placement cannot be null");
-        if (started) {
-            throw new IllegalStateException(
-                "Segment placement must be installed before start(): start() has already "
-                    + "discovered segments and created the base keyspace under "
-                    + this.placement.directories());
-        }
-
-        List<Path> directories = placement.directories();
-        if (directories == null || directories.isEmpty()) {
-            throw new IllegalArgumentException("Placement must name at least one directory");
-        }
-        if (!directories.contains(dataDir)) {
-            throw new IllegalArgumentException(
-                "Placement must include the data directory " + dataDir
-                    + ", which holds the catalog and the routing directory; got " + directories);
-        }
-        for (Path directory : directories) {
-            if (!java.nio.file.Files.isDirectory(directory)) {
-                throw new IllegalArgumentException(
-                    "Volume directory does not exist: " + directory
-                        + ". A volume that is not mounted holds segments this node cannot read.");
-            }
-        }
-
-        this.placement = placement;
-        // Anything the single-directory default was already asked about was answered for a
-        // directory set this engine is no longer using.
-        locations.forgetAll();
-        LOGGER.log(Level.INFO, "Segment placement installed over {0}", directories);
-        return this;
+        return lifecycle.installPlacement(placement);
     }
 
     /**
-     * Attaches an HNSW graph to a segment if an initializer is configured.
+     * Returns how many segments are serving without a vector index.
      *
-     * <p>Every segment that can be queried goes through this method - segments created
-     * lazily, segments pre-allocated at startup, segments recovered by discovery and
-     * split children alike - so vector search can never be silently disabled for part
-     * of the keyspace.</p>
+     * <p>Zero is the only healthy value. Anything above it means a vector search over this
+     * engine is answering from part of its keyspace: the result is not an error and not empty,
+     * it is short, which is why this is worth alerting on rather than only logging. See
+     * {@link SegmentIndexAttachment} for why such a segment is kept in service.</p>
      *
-     * @param segment      The segment to initialize
-     * @param segmentIndex The segment's directory index, for logging
+     * @return Number of segments whose HNSW graph could not be attached
      */
-    private void initializeHnswGraph(Segment segment, long segmentIndex) {
-        HnswInitializer initializer = this.hnswInitializer;
-        if (initializer == null || segment.getHnswGraph() != null) {
-            return;
-        }
-        try {
-            initializer.initializeForSegment(segment);
-            LOGGER.fine("HNSW graph initialized for segment " + segmentIndex);
-        } catch (IOException e) {
-            LOGGER.warning("Failed to initialize HNSW graph for segment "
-                + segmentIndex + ": " + e.getMessage());
-            // Continue without HNSW - segment is still functional for KV operations
-        }
+    public int segmentsWithoutVectorIndexCount() {
+        return indexes.failureCount();
     }
 
     /**
-     * Attaches a vector pre-filter to a segment if one is configured.
+     * Returns each segment serving without a vector index, and why.
      *
-     * <p>Paired with {@link #initializeHnswGraph(Segment, long)} and called from the same places,
-     * because the pre-filter is keyed by the node ids that graph hands out. A segment with a
-     * graph and no pre-filter is merely slower to search; a segment whose pre-filter belongs to
-     * different data answers with the wrong nodes, which is why the split path discards the
-     * inherited state before this runs.</p>
+     * <p>Keyed by directory index, valued by the failure that kept the graph from attaching -
+     * a dimension mismatch and an unreadable file need different answers from an operator, so
+     * the count alone is not enough to act on.</p>
      *
-     * @param segment      The segment to initialize
-     * @param segmentIndex The segment's directory index, for logging
+     * @return An immutable snapshot, empty when every segment has its graph
      */
-    private void initializeVectorPrefilter(Segment segment, long segmentIndex) {
-        VectorPrefilter prefilter = this.vectorPrefilter;
-        if (prefilter == null || segment.getLshIndex() != null) {
-            return;
-        }
-        try {
-            prefilter.initialize(segment);
-            LOGGER.fine("Vector pre-filter initialized for segment " + segmentIndex);
-        } catch (RuntimeException e) {
-            LOGGER.warning("Failed to initialize vector pre-filter for segment "
-                + segmentIndex + ": " + e.getMessage());
-            // Continue without a pre-filter - the query pipeline falls back to a full search
-        }
-    }
-
-    /**
-     * Removes the persisted pre-filter state a split child would otherwise inherit.
-     *
-     * <p>The counterpart of {@link #discardInheritedGraph(Segment, long)}, and needed for the
-     * same reason: the pre-filter's files are derived from the segment's canonical name, the left
-     * child takes its parent's name, and the graph the child starts is a new one whose node ids
-     * begin again at zero. The inherited index holds its parent's ids, so leaving it would have
-     * the query pipeline restrict the child's search to nodes that are either absent or hold
-     * entirely different vectors.</p>
-     *
-     * @param child        The child being prepared
-     * @param segmentIndex The child's canonical index
-     */
-    private void discardInheritedPrefilter(Segment child, long segmentIndex) {
-        VectorPrefilter prefilter = this.vectorPrefilter;
-        if (prefilter == null || child.getLshIndex() != null) {
-            return;
-        }
-        try {
-            prefilter.discardPersistedState(child);
-        } catch (RuntimeException e) {
-            LOGGER.log(Level.WARNING,
-                "Could not remove the vector pre-filter a split child would inherit (segment "
-                    + segmentIndex + ")", e);
-        }
+    public Map<Long, String> segmentsWithoutVectorIndex() {
+        return indexes.failures();
     }
 
     /**
@@ -1376,24 +701,7 @@ public class StorageEngine implements AutoCloseable {
      * @throws IllegalStateException if engine is not started
      */
     public MemorySegment get(byte[] key) {
-        if (key == null) {
-            throw new NullPointerException("Key cannot be null");
-        }
-
-        if (!started) {
-            throw new IllegalStateException("StorageEngine must be started before operations");
-        }
-
-        long keyHash = io.excalibur.store.hash.XxHash64.hash(key);
-
-        // One read of the directory, so the mask and the slot agree.
-        Segment segment = routing.segmentFor(keyHash);
-        if (segment == null) {
-            return null;
-        }
-
-        statistics.incrementReadOperations();
-        return segment.get(key);
+        return writes.get(key);
     }
 
     /**
@@ -1416,26 +724,7 @@ public class StorageEngine implements AutoCloseable {
      * @throws NullPointerException if key is null
      */
     public ZeroCopySlice getWithEpoch(byte[] key) {
-        if (key == null) {
-            throw new NullPointerException("Key cannot be null");
-        }
-
-        if (!started) {
-            throw new IllegalStateException("StorageEngine must be started before operations");
-        }
-
-        long keyHash = io.excalibur.store.hash.XxHash64.hash(key);
-
-        Segment segment = routing.segmentFor(keyHash);
-        if (segment == null) {
-            return ZeroCopySlice.notFound(0, 0, null);
-        }
-
-        // Delegate to segment's getWithEpoch which captures the per-segment epoch
-        // This ensures ZeroCopySlice.isValid() compares against the correct epoch
-        ZeroCopySlice slice = segment.getWithEpoch(key);
-        statistics.incrementReadOperations();
-        return slice;
+        return writes.getWithEpoch(key);
     }
 
     /**
@@ -1456,51 +745,7 @@ public class StorageEngine implements AutoCloseable {
      * @throws NullPointerException if key is null
      */
     public boolean delete(byte[] key) {
-        if (key == null) {
-            throw new NullPointerException("Key cannot be null");
-        }
-
-        if (!started) {
-            throw new IllegalStateException("StorageEngine must be started before operations");
-        }
-
-        long keyHash = io.excalibur.store.hash.XxHash64.hash(key);
-
-        for (int attempt = 0; attempt < MAX_ROUTING_RETRIES; attempt++) {
-            Routing snapshot = routing;
-            int segmentIndex = snapshot.slotFor(keyHash);
-            if (segmentIndex < 0) {
-                return false;
-            }
-
-            Segment segment = snapshot.segmentFor(keyHash);
-            if (segment == null) {
-                return false;
-            }
-
-            try {
-                if (segment.delete(key)) {
-                    // Only update entry count, don't change lifecycle state
-                    // Entry tombstones are handled separately from segment lifecycle
-                    long catalogIndex = catalogIndexOf(segment, segmentIndex);
-                    catalog.updateEntryCount(catalogIndex, -1);
-                    catalog.recordTombstone(catalogIndex);
-                    statistics.incrementDeleteOperations();
-                    visibilityTracker.advanceEpoch();
-                    return true;
-                }
-                return false;
-            } catch (SegmentRetiredException e) {
-                // Tombstoning the retired parent reported success for a key that stays live in
-                // whichever child now owns it.
-                LOGGER.log(Level.FINE,
-                    "Re-routing a delete after the target segment was retired by a split");
-            }
-        }
-
-        throw new IllegalStateException(
-            "Could not route a delete after " + MAX_ROUTING_RETRIES
-                + " attempts: the directory kept changing underneath it");
+        return writes.delete(key);
     }
 
     // ==================== Segment Lifecycle Management ====================
@@ -1512,16 +757,7 @@ public class StorageEngine implements AutoCloseable {
      * configurable criteria like tombstone thresholds for compaction and
      * epoch lag for reclamation.</p>
      */
-    private volatile SegmentLifecycleManager lifecycleManager;
-
-    /**
-     * Segment indices whose reclamation has already been refused and logged.
-     *
-     * <p>A refusal is a standing condition, not an event: the lifecycle sweep offers the same
-     * segment on every tick for as long as it stays tombstoned. Recording it keeps the warning
-     * to once per segment instead of once per tick.</p>
-     */
-    private final java.util.Set<Long> refusedReclamations = ConcurrentHashMap.newKeySet();
+    volatile SegmentLifecycleManager lifecycleManager;
 
     /**
      * Gets or creates the lifecycle manager for this engine.
@@ -1531,67 +767,7 @@ public class StorageEngine implements AutoCloseable {
      * @return The lifecycle manager
      */
     public SegmentLifecycleManager getLifecycleManager() {
-        if (lifecycleManager == null) {
-            synchronized (this) {
-                if (lifecycleManager == null) {
-                    SegmentLifecycleManager manager = new SegmentLifecycleManager(catalog);
-                    // Reclamation must be gated on the visibility epoch, not wall clock.
-                    manager.setCurrentEpochSupplier(() -> visibilityTracker.currentEpoch());
-                    // Nothing else moves a segment out of INDEXING: every later transition is
-                    // driven by a worker that selects on a later state.
-                    manager.setIndexingCompletionProbe(this::isIndexingComplete);
-                    // Only the engine knows which indices the directory still routes to, and
-                    // reclaiming one of those is undone by the next start.
-                    manager.setReclamationCallback(segmentId -> reclaim(manager, segmentId));
-                    lifecycleManager = manager;
-                }
-            }
-        }
-        return lifecycleManager;
-    }
-
-    /**
-     * Reclaims a tombstoned segment, or refuses one the directory still routes to.
-     *
-     * <p>A segment index is a slot in a hash directory: every key whose hash lands on it is
-     * written there, and a slot cannot be vacated - there is no operation that takes a segment
-     * out of the directory, only ones that re-point a slot at a different segment. Purging such
-     * a segment removes its catalog row and leaves the file and the writes behind. From that
-     * moment {@link #getQueryableSegments()} skips the slot, because it has no metadata to
-     * judge, so everything routed there stops being answerable; and the next {@link #start()}
-     * rediscovers the file, finds no row naming it and adds one back as a live segment, so the
-     * tombstone a rolling reindex placed is undone by a bounce and the superseded copy of every
-     * document it retired answers queries again.</p>
-     *
-     * <p>Refusing leaves the segment TOMBSTONED. That is durable, it is not queryable, and it
-     * means the same thing after a restart as before one - which is the whole point.</p>
-     *
-     * @param manager      The lifecycle manager that offered the segment
-     * @param segmentIndex The segment offered for reclamation
-     * @return true if the catalog row was removed
-     */
-    private boolean reclaim(SegmentLifecycleManager manager, long segmentIndex) {
-        if (segments.get(segmentIndex) != null) {
-            if (refusedReclamations.add(segmentIndex)) {
-                LOGGER.log(Level.WARNING,
-                    "Segment {0} is tombstoned but the routing directory still writes to it, so "
-                    + "it is kept tombstoned rather than purged: a purged row is recreated as a "
-                    + "live segment by the next start",
-                    segmentIndex);
-            }
-            return false;
-        }
-
-        try {
-            manager.purge(segmentIndex);
-        } catch (RuntimeException e) {
-            LOGGER.log(Level.WARNING,
-                "Failed to purge segment " + segmentIndex + "; it stays tombstoned", e);
-            return false;
-        }
-
-        refusedReclamations.remove(segmentIndex);
-        return true;
+        return registry.lifecycleManager();
     }
 
     /**
@@ -1717,28 +893,9 @@ public class StorageEngine implements AutoCloseable {
         metadata.setLifecycleState(newState);
 
         // Update entry state to match lifecycle state for catalog consistency
-        int entryState = lifecycleToEntryState(newState);
+        int entryState = EntryStateMapping.toEntryState(newState);
         if (entryState >= 0) {
             metadata.setEntryState(entryState);
-        }
-    }
-
-    /**
-     * Converts a LifecycleState to the corresponding entry state constant.
-     *
-     * @param state The lifecycle state
-     * @return The entry state constant, or -1 if no mapping exists
-     */
-    private int lifecycleToEntryState(LifecycleState state) {
-        switch (state) {
-            case BOOTSTRAPPING: return SegmentCatalog.ENTRY_STATE_NONE;
-            case INDEXING: return SegmentCatalog.ENTRY_STATE_INDEXING;
-            case WARMING: return SegmentCatalog.ENTRY_STATE_WARMING;
-            case ACTIVE: return SegmentCatalog.ENTRY_STATE_ACTIVE;
-            case COMPACTING: return SegmentCatalog.ENTRY_STATE_COMPACTING;
-            case TOMBSTONED: return SegmentCatalog.ENTRY_STATE_DELETED;
-            case PURGED: return SegmentCatalog.ENTRY_STATE_NONE;
-            default: return -1;
         }
     }
 
@@ -1769,7 +926,7 @@ public class StorageEngine implements AutoCloseable {
      * @param segmentIndex Index of the segment to pre-allocate
      */
     public void preAllocateSegment(int segmentIndex) {
-        createSegment(segmentIndex);
+        registry.createSegment(segmentIndex);
     }
 
     /**
@@ -1803,31 +960,7 @@ public class StorageEngine implements AutoCloseable {
      *         or old segment doesn't match
      */
     public boolean replaceSegment(long segmentIndex, Segment oldSegment, Segment newSegment) {
-        // Guarded by the same monitor as every other directory mutation, so the
-        // compare-and-set cannot interleave with a split publishing its children.
-        synchronized (segmentLock) {
-            Segment current = segments.get(segmentIndex);
-            if (current == null) {
-                LOGGER.log(Level.WARNING, "Cannot replace segment {0}: not found in registry", segmentIndex);
-                return false;
-            }
-            if (current != oldSegment) {
-                LOGGER.log(Level.WARNING, "Cannot replace segment {0}: old segment mismatch", segmentIndex);
-                return false;
-            }
-
-            for (long slot : directorySlotsOf(oldSegment)) {
-                segments.put(slot, newSegment);
-            }
-
-            Long canonical = canonicalIndex.remove(oldSegment);
-            canonicalIndex.put(newSegment, canonical != null ? canonical : segmentIndex);
-            publishRouting();
-
-            LOGGER.log(Level.INFO, "Replaced segment {0}: {1} entries in new segment",
-                new Object[] { segmentIndex, newSegment.entryCount() });
-            return true;
-        }
+        return routingTable.replaceSegment(segmentIndex, oldSegment, newSegment);
     }
 
     /**
@@ -1840,7 +973,7 @@ public class StorageEngine implements AutoCloseable {
      * @return Map of canonical segment index to segment instance
      */
     public Map<Long, Segment> getSegments() {
-        return Map.copyOf(distinctSegments());
+        return Map.copyOf(routingTable.distinctSegments());
     }
 
     /**
@@ -1858,7 +991,7 @@ public class StorageEngine implements AutoCloseable {
      * @return Total entry count
      */
     public long getTotalEntryCount() {
-        return distinctSegments().values().stream()
+        return routingTable.distinctSegments().values().stream()
             .mapToLong(Segment::entryCount)
             .sum();
     }
@@ -1870,7 +1003,7 @@ public class StorageEngine implements AutoCloseable {
      * durability of recent operations.</p>
      */
     public void flush() {
-        for (Segment segment : distinctSegments().values()) {
+        for (Segment segment : routingTable.distinctSegments().values()) {
             segment.flush();
         }
     }
@@ -1892,56 +1025,7 @@ public class StorageEngine implements AutoCloseable {
      */
     @Override
     public void close() {
-        // Stop the lifecycle manager if running
-        stopLifecycleManager();
-
-        // Stop the split worker if running
-        if (splitWorker != null) {
-            splitWorker.stop();
-        }
-
-        // The directory, before the segments go. Splits already persist it; this covers a
-        // directory that was reconstructed at start and never split afterwards.
-        persistRoutingDirectory();
-
-        // Flush and close each distinct segment once. Segment.close() also closes the
-        // write log it owns, so no descriptor survives this.
-        for (Segment segment : distinctSegments().values()) {
-            if (!segment.isClosed()) {
-                segment.flush();
-                segment.close();
-            }
-        }
-        segments.clear();
-        canonicalIndex.clear();
-        publishRouting();
-
-        // Flush and close catalog to persist metadata. A failed flush must not abort the rest of
-        // this method: the mappings released below are still held by this process, and an arena
-        // left open keeps them held for the life of the JVM. So record it and carry on - the
-        // catalog's own close reports whether its metadata reached the device.
-        try {
-            catalog.flush();
-        } catch (RuntimeException e) {
-            LOGGER.log(Level.SEVERE, "Failed to flush the catalog while closing", e);
-        }
-        catalog.close();
-        catalog.clear();
-
-        // Release the mappings. Only safe once every segment and write log is closed,
-        // and only for the Arena this engine created - a caller-supplied Arena stays
-        // the caller's to close.
-        if (ownsArena && arena != null) {
-            try {
-                arena.close();
-            } catch (RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to close storage arena", e);
-            }
-        }
-
-        // Reset state
-        started = false;
-        // Epoch reset not needed - visibilityTracker handles this;
+        lifecycle.close();
     }
 
     /**
@@ -2017,26 +1101,7 @@ public class StorageEngine implements AutoCloseable {
      * @param initializer The HNSW initializer, or null to disable
      */
     public void setHnswInitializer(HnswInitializer initializer) {
-        this.hnswInitializer = initializer;
-        LOGGER.info("HNSW initializer " + (initializer != null ? "configured" : "disabled"));
-
-        if (initializer == null) {
-            return;
-        }
-
-        int initialized = 0;
-        for (Map.Entry<Long, Segment> entry : distinctSegments().entrySet()) {
-            Segment segment = entry.getValue();
-            if (segment.getHnswGraph() == null && !segment.isClosed()) {
-                initializeHnswGraph(segment, entry.getKey());
-                if (segment.getHnswGraph() != null) {
-                    initialized++;
-                }
-            }
-        }
-        if (initialized > 0) {
-            LOGGER.info("Back-filled HNSW graphs for " + initialized + " existing segment(s)");
-        }
+        indexes.setHnswInitializer(initializer);
     }
 
     /**
@@ -2064,26 +1129,7 @@ public class StorageEngine implements AutoCloseable {
      * @param prefilter The vector pre-filter, or null to disable
      */
     public void setVectorPrefilter(VectorPrefilter prefilter) {
-        this.vectorPrefilter = prefilter;
-        LOGGER.info("Vector pre-filter " + (prefilter != null ? "configured" : "disabled"));
-
-        if (prefilter == null) {
-            return;
-        }
-
-        int initialized = 0;
-        for (Map.Entry<Long, Segment> entry : distinctSegments().entrySet()) {
-            Segment segment = entry.getValue();
-            if (segment.getLshIndex() == null && !segment.isClosed()) {
-                initializeVectorPrefilter(segment, entry.getKey());
-                if (segment.getLshIndex() != null) {
-                    initialized++;
-                }
-            }
-        }
-        if (initialized > 0) {
-            LOGGER.info("Back-filled vector pre-filters for " + initialized + " existing segment(s)");
-        }
+        indexes.setVectorPrefilter(prefilter);
     }
 
     /**
@@ -2207,7 +1253,7 @@ public class StorageEngine implements AutoCloseable {
     public List<Segment> getQueryableSegmentsAtEpoch(long queryEpoch) {
         List<Segment> result = new ArrayList<>();
 
-        for (Map.Entry<Long, Segment> entry : distinctSegments().entrySet()) {
+        for (Map.Entry<Long, Segment> entry : routingTable.distinctSegments().entrySet()) {
             long segmentIndex = entry.getKey();
             Segment segment = entry.getValue();
 
@@ -2250,7 +1296,7 @@ public class StorageEngine implements AutoCloseable {
     public List<Segment> getQueryableSegments() {
         List<Segment> result = new ArrayList<>();
 
-        for (Map.Entry<Long, Segment> entry : distinctSegments().entrySet()) {
+        for (Map.Entry<Long, Segment> entry : routingTable.distinctSegments().entrySet()) {
             long segmentIndex = entry.getKey();
             Segment segment = entry.getValue();
 
@@ -2305,187 +1351,6 @@ public class StorageEngine implements AutoCloseable {
     }
 
     /**
-     * Publishes a completed split into the routing directory.
-     *
-     * <p>Called by the {@link SplitWorker} once both children are built. This method
-     * owns everything the worker cannot do, because only the directory knows the
-     * children's indices:</p>
-     * <ol>
-     *   <li>Move each child from its temporary build name to the canonical
-     *       {@code segment_<index>.dat} name that {@link SegmentDiscovery} matches,
-     *       and give it a write log and an HNSW graph under that name</li>
-     *   <li>Double the directory, installing buddy pointers so that no unsplit
-     *       segment's keys are orphaned by the wider routing mask</li>
-     *   <li>Install the children and widen {@code routingSegmentCount}</li>
-     * </ol>
-     *
-     * <h3>Extensible Hashing</h3>
-     * <p>The parent may be reachable from several directory indices (it has a smaller
-     * local depth than the directory's global depth). Every one of those indices
-     * {@code j} must end up pointing at the left child, and {@code j + oldCount} at the
-     * right child, because {@code j + oldCount} is exactly the index whose split bit is
-     * 1. Every other index {@code i} gets a buddy pointer at {@code i + oldCount} to the
-     * same segment, so its keys keep resolving after the mask widens.</p>
-     *
-     * <h3>Publication Order</h3>
-     * <p>The new upper half of the directory is filled first, then
-     * {@code routingSegmentCount} is widened, and only then are the parent's own slots
-     * repointed at the left child. At every instant a reader - using either the old or
-     * the new mask - reaches a segment that holds its key.</p>
-     *
-     * <p>If publication fails the directory is left untouched and the exception
-     * propagates, which makes the worker discard the children and return the parent to
-     * service.</p>
-     *
-     * @param parent The parent segment that was split
-     * @param leftChild The left child segment (entries whose split bit is 0)
-     * @param rightChild The right child segment (entries whose split bit is 1)
-     */
-    /**
-     * Observers notified after a split is published. Copy-on-write: splits are rare and
-     * notification happens while readers may be registering, so a snapshot iterator is worth more
-     * than write throughput here.
-     */
-    /**
-     * Threshold new segments are created with, from {@code excalibur.shard.segment-load-factor}.
-     * Defaults to {@link Segment#LOAD_FACTOR_THRESHOLD}.
-     */
-    private volatile double loadFactorThreshold = Segment.LOAD_FACTOR_THRESHOLD;
-
-    private final java.util.List<SplitWorker.SplitListener> splitObservers =
-        new java.util.concurrent.CopyOnWriteArrayList<>();
-
-    private void handleSplitComplete(Segment parent, Segment leftChild, Segment rightChild) {
-        synchronized (segmentLock) {
-            int oldRouting = routingSegmentCount;
-
-            List<Long> parentSlots = directorySlotsOf(parent);
-            if (parentSlots.isEmpty()) {
-                throw new IllegalStateException(
-                    "Parent segment not found in routing directory during split publication: "
-                    + parent.path());
-            }
-
-            long leftIndex = parentSlots.get(0);
-            long rightIndex = leftIndex + oldRouting;
-
-            // Step 1: give the children discoverable identities before publishing them.
-            // The right child goes first: its target name is unused, so a failure there
-            // leaves everything untouched. The left child's target is the parent's own
-            // file, so that move is done last - and even if the process dies between the
-            // two, the parent file still holds every key both children were built from.
-            prepareSplitChild(rightChild, rightIndex);
-
-            // The left child is about to take over the parent's file names, the HNSW graph
-            // file among them. Two graphs mapping one file is not survivable: the parent's
-            // close() forces its own stale pages over whatever the child has written since.
-            // Releasing the parent's graph here, before the child opens one, is what keeps the
-            // retirement below from corrupting the child.
-            io.excalibur.vector.hnsw.HnswGraph parentGraph = parent.detachHnswGraph();
-            if (parentGraph != null) {
-                try {
-                    parentGraph.close();
-                } catch (Exception e) {
-                    LOGGER.log(java.util.logging.Level.WARNING,
-                        "Failed to close the parent's HNSW graph during split of "
-                            + parent.path(), e);
-                }
-            }
-
-            prepareSplitChild(leftChild, leftIndex);
-
-            // Step 2: fill the new upper half. These indices are unreachable under the
-            // old mask, so this is invisible to concurrent readers.
-            for (int i = 0; i < oldRouting; i++) {
-                Segment current = segments.get((long) i);
-                if (current == null) {
-                    continue;
-                }
-                segments.put(i + (long) oldRouting, current == parent ? rightChild : current);
-            }
-
-            // Step 3: widen the mask. The parent still serves its own slots and holds
-            // every key that maps to them, so this is safe to publish now.
-            routingSegmentCount = oldRouting * 2;
-
-            // Step 4: retire the parent from the lower half.
-            for (long slot : parentSlots) {
-                segments.put(slot, leftChild);
-            }
-
-            canonicalIndex.remove(parent);
-            canonicalIndex.put(leftChild, leftIndex);
-            canonicalIndex.put(rightChild, rightIndex);
-
-            if (splitWorker != null) {
-                splitWorker.unregisterSegment(parent);
-            }
-
-            // The left child inherits the parent's catalog entry (same index), which may
-            // be in any lifecycle state, so it is re-pointed rather than re-added.
-            catalog.registerFile(leftIndex, leftChild.path()).setEntryCount(leftChild.entryCount());
-            catalog.add(rightIndex, rightChild.path()).setEntryCount(rightChild.entryCount());
-
-            if (splitWorker != null && splitWorker.isRunning()) {
-                splitWorker.registerSegment(leftChild);
-                splitWorker.registerSegment(rightChild);
-            }
-
-            // Increment visibility epoch to signal state change
-            visibilityTracker.advanceEpoch();
-
-            publishRouting();
-
-            LOGGER.info(String.format(
-                "Split published: parent slots=%s -> left=%d, right=%d, routingCount=%d",
-                parentSlots, leftIndex, rightIndex, routingSegmentCount));
-        }
-
-        // The directory just changed shape, and the shape is not recoverable from the segment
-        // file names. Written before the observers run, so a crash during that work still leaves
-        // a directory describing the split that is already durable.
-        persistRoutingDirectory();
-
-        // Outside the lock, and only after publication. Observers re-register index structures
-        // against the children, which means opening graphs and filters -- work that must not run
-        // while every routing decision in the engine is blocked behind segmentLock.
-        notifySplitObservers(parent, leftChild, rightChild);
-
-        // The routing table no longer references the parent, so nothing can newly resolve it and
-        // it can be retired -- the same point compaction retires the segment it replaced. Until
-        // this was here the parent was simply dropped: its descriptor, its mapping and its write
-        // log stayed open for the life of the process, and because the left child's move
-        // unlinked the parent's file, so did the disk blocks behind it. One of each, per split,
-        // forever. Its graph was already released above.
-        try {
-            parent.close();
-        } catch (RuntimeException e) {
-            LOGGER.log(java.util.logging.Level.WARNING,
-                "Failed to retire the parent segment after splitting " + parent.path(), e);
-        }
-    }
-
-    /**
-     * Tells observers a split has been published.
-     *
-     * <p>An observer that throws is logged and skipped rather than allowed to propagate. By this
-     * point the split is already durable and the routing table already points at the children;
-     * unwinding is not possible, and letting one observer's failure abort the notification would
-     * leave the remaining observers permanently unaware of a split that did happen.
-     */
-    private void notifySplitObservers(Segment parent, Segment leftChild, Segment rightChild) {
-        for (SplitWorker.SplitListener observer : splitObservers) {
-            try {
-                observer.onSplitComplete(parent, leftChild, rightChild);
-            } catch (RuntimeException e) {
-                LOGGER.log(java.util.logging.Level.SEVERE,
-                    "Split observer failed for parent " + parent.path()
-                        + "; the split stands and other observers still run", e);
-            }
-        }
-    }
-
-    /**
      * Registers an observer notified after each split is published.
      *
      * <p>Separate from the single {@link SplitWorker.SplitListener} the worker holds, which is this
@@ -2499,243 +1364,12 @@ public class StorageEngine implements AutoCloseable {
         if (observer == null) {
             throw new IllegalArgumentException("observer must not be null");
         }
-        splitObservers.add(observer);
+        splits.addObserver(observer);
     }
 
     /** Removes a previously registered split observer. */
     public boolean removeSplitObserver(SplitWorker.SplitListener observer) {
-        return splitObservers.remove(observer);
-    }
-
-    /**
-     * Returns every directory index pointing at a segment, smallest first.
-     *
-     * @param segment The segment to locate
-     * @return Sorted directory indices, empty if the segment is not in the directory
-     */
-    private List<Long> directorySlotsOf(Segment segment) {
-        List<Long> slots = new ArrayList<>();
-        for (Map.Entry<Long, Segment> entry : segments.entrySet()) {
-            if (entry.getValue() == segment) {
-                slots.add(entry.getKey());
-            }
-        }
-        Collections.sort(slots);
-        return slots;
-    }
-
-    /**
-     * Moves a split child into its canonical name and completes its initialization.
-     *
-     * <p>A child left under its temporary build name would be invisible to
-     * {@link SegmentDiscovery} on the next start, so every write routed to it after the
-     * split would be lost. The rename happens while the child stays mapped: the mapping
-     * and descriptor follow the inode.</p>
-     *
-     * @param child        The child segment to publish
-     * @param segmentIndex The directory index the child will occupy
-     * @throws IllegalStateException if the child cannot be moved into place
-     */
-    private void prepareSplitChild(Segment child, long segmentIndex) {
-        Path source = child.path();
-        Path target = installSplitChild(child, segmentIndex);
-
-        if (child.writeLog() == null) {
-            try {
-                // The parent's log is fully integrated into the children's files, so the
-                // child starts from an empty log at its own canonical name, beside the file
-                // it actually ended up at.
-                Path logPath = walPathFor(target);
-                java.nio.file.Files.deleteIfExists(logPath);
-                child.attachWriteLog(new WriteLog(logPath));
-            } catch (IOException e) {
-                throw new IllegalStateException(
-                    "Failed to create write log for split child " + source
-                        + " at index " + segmentIndex, e);
-            }
-        }
-
-        discardInheritedGraph(child, segmentIndex);
-        discardInheritedPrefilter(child, segmentIndex);
-        initializeHnswGraph(child, segmentIndex);
-        initializeVectorPrefilter(child, segmentIndex);
-        alignCheckpointToLog(child, segmentIndex);
-    }
-
-    /**
-     * Renames a split child onto its canonical name and returns where it landed.
-     *
-     * <p>A child is built beside its parent, so a placement that puts the child's index on
-     * another volume asks for a rename across file stores. That rename cannot be atomic, and
-     * copy-then-delete is not an option either: the child is mapped, and the mapping follows
-     * the inode, so a copy would leave every subsequent write going to the file that was
-     * deleted. The child therefore stays on its parent's volume, which is always a directory
-     * a restart scans, and the placement's preference is logged as unmet rather than
-     * silently obeyed.</p>
-     *
-     * @param child        The child segment, still under its build name
-     * @param segmentIndex The directory index the child will occupy
-     * @return The path the child now lives at
-     * @throws IllegalStateException if the child cannot be renamed at all
-     */
-    private Path installSplitChild(Segment child, long segmentIndex) {
-        Path source = child.path();
-        Path target = segmentPath(segmentIndex);
-        if (source.equals(target)) {
-            locations.adopt(segmentIndex, target);
-            return target;
-        }
-
-        try {
-            moveIntoPlace(source, target);
-        } catch (java.nio.file.AtomicMoveNotSupportedException crossStore) {
-            Path beside = source.resolveSibling(SegmentLocations.fileName(segmentIndex));
-            LOGGER.log(Level.WARNING,
-                "Split child {0} cannot be moved to {1} atomically because they are on "
-                    + "different file stores; keeping it beside its parent at {2}",
-                new Object[] { source, target, beside });
-            try {
-                moveIntoPlace(source, beside);
-            } catch (IOException e) {
-                throw new IllegalStateException(
-                    "Failed to move split child " + source + " to " + beside, e);
-            }
-            child.renamedTo(beside);
-            locations.adopt(segmentIndex, beside);
-            return beside;
-        } catch (IOException e) {
-            throw new IllegalStateException(
-                "Failed to move split child " + source + " to " + target, e);
-        }
-
-        child.renamedTo(target);
-        locations.adopt(segmentIndex, target);
-        return target;
-    }
-
-    /**
-     * Renames a file onto a canonical name, replacing whatever is there.
-     *
-     * @param source The current path
-     * @param target The canonical path
-     * @throws IOException if the rename fails
-     */
-    private static void moveIntoPlace(Path source, Path target) throws IOException {
-        java.nio.file.Files.move(source, target,
-            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-            java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-    }
-
-    /**
-     * Removes the graph file the child would otherwise inherit.
-     *
-     * <p>The left child takes the parent's canonical name, and the graph file is derived from
-     * that name - so it opened the parent's graph. That graph describes the parent's contents:
-     * it holds nodes for every entry that moved to the right child, and its header carries a
-     * checkpoint into a write log that no longer exists. Half of the split's own point is that
-     * the children hold different entries, so there is nothing in that graph worth keeping.</p>
-     *
-     * <p>Its sidecars go with it. The document mapping names the parent's nodes, and the
-     * product-quantisation codebook was trained on the parent's vectors; a child left holding
-     * either would describe its own contents with the parent's answers.</p>
-     *
-     * @param child The child being prepared
-     * @param segmentIndex The child's canonical index
-     */
-    private void discardInheritedGraph(Segment child, long segmentIndex) {
-        HnswInitializer initializer = this.hnswInitializer;
-        if (initializer == null || child.getHnswGraph() != null) {
-            return;
-        }
-        Path graphPath = initializer.computeGraphPath(child.path());
-        try {
-            java.nio.file.Files.deleteIfExists(graphPath);
-            java.nio.file.Files.deleteIfExists(Path.of(graphPath.toString()
-                + io.excalibur.vector.hnsw.HnswGraph.DOCUMENT_MAPPING_SUFFIX));
-            java.nio.file.Files.deleteIfExists(Path.of(graphPath.toString()
-                + io.excalibur.vector.hnsw.HnswGraph.PRODUCT_QUANTIZER_SUFFIX));
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING,
-                "Could not remove the graph a split child would inherit at "
-                    + graphPath + " (segment " + segmentIndex + ")", e);
-        }
-    }
-
-    /**
-     * Brings a child's integration checkpoint back within its own write log.
-     *
-     * <p>The checkpoint says how far the integration worker has read; the child's log starts
-     * empty. A checkpoint left pointing into the parent's discarded log is ahead of the child's
-     * head, and the integration worker returns early whenever the head is at or behind it - so
-     * every vector written to the child afterwards is stored, found by key, and never enters the
-     * graph, which is to say never returned by a vector search. Compaction guards against
-     * exactly this; the split path did not.</p>
-     *
-     * @param child The child being prepared
-     * @param segmentIndex The child's canonical index
-     */
-    private void alignCheckpointToLog(Segment child, long segmentIndex) {
-        long head = child.getWriteLogHead();
-
-        io.excalibur.vector.hnsw.HnswGraph graph = child.getHnswGraph();
-        if (graph != null && graph.getLastIntegratedOffset() > head) {
-            LOGGER.log(Level.INFO,
-                "Rebasing the HNSW checkpoint of split child {0} from {1} to {2}",
-                new Object[] { segmentIndex, graph.getLastIntegratedOffset(), head });
-            graph.setLastIntegratedOffset(head);
-        }
-
-        io.excalibur.vector.hnsw.TailOffsetTracker tracker = child.getTailOffsetTracker();
-        if (tracker != null && tracker.getLastIntegratedOffset() > head) {
-            tracker.resetTo(head);
-        }
-    }
-
-    /**
-     * Rebuilds the immutable routing snapshot from the current directory.
-     *
-     * <p>Must be called with {@code segmentLock} held, or from a context where no other thread
-     * can be changing the directory - start-up and construction.</p>
-     */
-    private void publishRouting() {
-        int width = routingSegmentCount;
-        Segment[] slots = new Segment[width];
-        for (int slot = 0; slot < width; slot++) {
-            slots[slot] = segments.get((long) slot);
-        }
-        this.routing = new Routing(width, slots);
-    }
-
-    /**
-     * A directory and the mask that indexes it, published together.
-     *
-     * @param width The number of slots; always a power of two
-     * @param slots The segment serving each slot, indexed by slot
-     */
-    private record Routing(int width, Segment[] slots) {
-
-        /**
-         * The segment a hash routes to, or null when the slot is empty.
-         *
-         * @param keyHash The key's hash
-         * @return The segment, or null
-         */
-        Segment segmentFor(long keyHash) {
-            if (width == 0) {
-                return null;
-            }
-            return slots[(int) (keyHash & (width - 1))];
-        }
-
-        /**
-         * The slot a hash routes to.
-         *
-         * @param keyHash The key's hash
-         * @return The slot index, or -1 when the directory is empty
-         */
-        int slotFor(long keyHash) {
-            return width == 0 ? -1 : (int) (keyHash & (width - 1));
-        }
+        return splits.removeObserver(observer);
     }
 
     // ==================== Inner Classes ====================

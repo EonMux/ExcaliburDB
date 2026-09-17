@@ -1,12 +1,12 @@
 package excalibur.api.bootstrap;
 
+import excalibur.api.endpoint.SourceRegistry;
 import excalibur.api.retrieval.LexicalQueryService;
 import excalibur.api.server.ExcaliburDBServer;
 import excalibur.filter.HierarchicalCuckooFilter;
 import excalibur.ingest.erasure.SegmentVectorEraser;
 import excalibur.ingest.graph.LlmRelationExtractor;
 import excalibur.ingest.graph.RelationExtractor;
-import excalibur.ingest.graph.StagingGraphIngestSink;
 import excalibur.ingest.lexical.ChunkIndex;
 import excalibur.ingest.lexical.StoredChunkText;
 import excalibur.ingest.lsh.LshIngestionService;
@@ -19,8 +19,10 @@ import excalibur.shard.IndexOrchestrator;
 import io.excalibur.config.Config;
 import io.excalibur.llm.client.LLMHttpClient;
 import io.excalibur.retrieval.expand.LlmQueryExpander;
+import io.excalibur.retrieval.expand.CachingQueryExpander;
 import io.excalibur.retrieval.expand.QueryExpander;
 import io.excalibur.store.StorageEngine;
+import io.excalibur.tenancy.NamespaceId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,6 +30,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The ingestion half of a node, attached to a server that already has the query half.
@@ -132,7 +135,7 @@ public record IngestionWiring(Config config,
             // signal of several rather than the precondition for having an index at all --
             // requiring it meant a corpus-wide embedding pass before a single document could be
             // searched.
-            RetrievalCapabilities capabilities = RetrievalCapabilities.from(config.llm());
+            RetrievalCapabilities capabilities = RetrievalCapabilities.from(config);
 
             LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
             EmbeddingClient embeddingClient = createEmbeddingClient(capabilities, llmClientConfig);
@@ -330,10 +333,15 @@ public record IngestionWiring(Config config,
         if (orchestrator != null) {
             orchestrator.setLexicalIndex(chunkIndex);
         }
-        QueryExpander expander = createQueryExpander(capabilities, llmClientConfig);
+        // Remembered, and shared with the query route: the ranker expands to search and the
+        // response expands to report, and a second generation is a second bill and possibly
+        // different terms from the ones that actually ran.
+        QueryExpander expander = CachingQueryExpander.over(
+            createQueryExpander(capabilities, llmClientConfig));
         server.withLexicalQueryService(new LexicalQueryService(
             chunkIndex, expander, List.of(),
             config.query().getRrfK(), config.query().getPerSignalOverFetch()));
+        server.withQueryExpander(expander);
         server.withChunkIndex(chunkIndex);
 
         return new LexicalErasureSweep(
@@ -357,8 +365,13 @@ public record IngestionWiring(Config config,
     private QueryExpander createQueryExpander(RetrievalCapabilities capabilities,
                                               LLMClientConfig llmClientConfig) {
         if (capabilities.expandQueries()) {
-            LlmQueryExpander expander =
-                new LlmQueryExpander(new LLMHttpClient(llmClientConfig));
+            // On the expansion budget rather than the ingestion client's. Expansion runs inside
+            // a request a caller is holding open and the search cannot start until it returns,
+            // so the 60s the client is configured with - longer than any query budget a caller
+            // can ask for - made one slow call to the chat model an empty timed-out answer.
+            LlmQueryExpander expander = new LlmQueryExpander(
+                new LLMHttpClient(llmClientConfig),
+                config.query().getExpansionTimeoutMs());
             LOGGER.info("Query expansion enabled with chat model {}",
                 config.llm().getChatModel());
             return expander;
@@ -410,6 +423,11 @@ public record IngestionWiring(Config config,
      * it is a chat-model call per document, which is the most expensive thing ingestion can do,
      * and a node doing vector search should not start paying for a graph nobody asked for.</p>
      *
+     * <p>The sink routes rather than pointing at one tenant. A source belongs to the namespace
+     * that registered it, and the sink stages each published document into that namespace's
+     * graph for the length of one borrow; a source registered without a namespace stages into
+     * the shared one, which is the whole of what a single-tenant node ever does.</p>
+     *
      * @param server          The server holding the ingestion orchestrator
      * @param llmClientConfig The LLM configuration, for the extractor's client
      */
@@ -428,13 +446,28 @@ public record IngestionWiring(Config config,
                 config.graph().getExtractorVersion());
         }
 
-        // Ingestion is not namespace-aware: a source belongs to whichever namespace registered
-        // it, and today that is the shared one. Staging is therefore taken from the shared tenant,
-        // held for the life of the process rather than borrowed per document - it is two small
-        // append-only files, not the thirteen mappings the budget exists to bound.
-        orchestrator.setGraphSink(new StagingGraphIngestSink(
-            graphTenants.shared().staging(), extractor));
-        LOGGER.info("Graph ingest wired: extraction {} (extractor version {})",
-            extractionEnabled ? "enabled" : "disabled", config.graph().getExtractorVersion());
+        orchestrator.setGraphSink(new NamespaceRoutingGraphIngestSink(
+            graphTenants, sourceId -> namespaceOf(server, sourceId), extractor));
+        LOGGER.info("Graph ingest wired: extraction {} (extractor version {}), staged into the "
+            + "namespace each source was registered in", extractionEnabled ? "enabled"
+            : "disabled", config.graph().getExtractorVersion());
+    }
+
+    /**
+     * Asks the server's source registry which namespace a source belongs to.
+     *
+     * <p>Read through the server on every call rather than captured once, because the registry
+     * is replaced when the security policy is applied and a sink holding the one that existed at
+     * attachment time would answer from a registry nothing registers into. An absent registry
+     * answers empty, which the sink reads as "no namespace to stage into" rather than as the
+     * shared one.</p>
+     *
+     * @param server   The server holding the registry
+     * @param sourceId The source id
+     * @return Its namespace, or empty if nothing is registered under that id
+     */
+    private static Optional<NamespaceId> namespaceOf(ExcaliburDBServer server, String sourceId) {
+        SourceRegistry registry = server.getIngestSourceRegistry();
+        return registry == null ? Optional.empty() : registry.namespaceOf(sourceId);
     }
 }

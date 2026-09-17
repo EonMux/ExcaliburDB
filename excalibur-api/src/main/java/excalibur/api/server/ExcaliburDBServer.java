@@ -2,6 +2,7 @@ package excalibur.api.server;
 
 import com.sun.net.httpserver.HttpServer;
 import excalibur.api.bootstrap.GraphTenants;
+import excalibur.api.endpoint.BuildInfo;
 import excalibur.api.endpoint.InMemorySourceRegistry;
 import excalibur.api.endpoint.SourceRegistry;
 import excalibur.api.retrieval.LexicalQueryService;
@@ -39,8 +40,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <h2>Endpoints</h2>
  * <ul>
- *   <li>{@code GET /health} - Health check for load balancers and Kubernetes</li>
+ *   <li>{@code GET /health} - Liveness check for load balancers and Kubernetes</li>
+ *   <li>{@code GET /health/ready} - Readiness, answering 200 or 503 so a probe can act</li>
+ *   <li>{@code GET /metrics} - Prometheus text exposition for a scraper</li>
  *   <li>{@code GET /v1/stats} - System statistics and observability</li>
+ *   <li>{@code GET /v1/version} - Which build this process is running</li>
+ *   <li>{@code POST}/{@code DELETE /v1/drain} - Take this node out of rotation, and back</li>
+ *   <li>{@code GET /v1/query/status} - Queries in flight</li>
  *   <li>{@code POST /v1/query} - Query execution</li>
  *   <li>{@code POST /v1/ingest} - Register ingestion source</li>
  *   <li>{@code POST /v1/reindex} - Force reindex of a source</li>
@@ -266,6 +272,17 @@ public class ExcaliburDBServer {
     }
 
     /**
+     * Enables {@code GET /v1/documents/list} on this server.
+     *
+     * @param registry What this node has ingested
+     * @throws IllegalStateException if the server is already running
+     */
+    public void withDocumentRegistry(excalibur.ingest.registry.DocumentRegistry registry) {
+        requireNotStarted("the document registry");
+        wiring.withDocumentRegistry(registry);
+    }
+
+    /**
      * Makes source registrations survive a restart.
      *
      * <p>Must be called before {@link #start()}: the catalog is read once while the endpoints are
@@ -283,6 +300,11 @@ public class ExcaliburDBServer {
     /** Attaches lexical retrieval, before the server starts. */
     public void withLexicalQueryService(LexicalQueryService service) {
         wiring.withLexicalQueryService(service);
+    }
+
+    /** @param expander The expander the lexical half widens queries with, or null for none */
+    public void withQueryExpander(io.excalibur.retrieval.expand.QueryExpander expander) {
+        wiring.withQueryExpander(expander);
     }
 
     /**
@@ -598,8 +620,12 @@ public class ExcaliburDBServer {
     private void logStarted() {
         // getPort(), not the configured port: a node started on 0 binds an ephemeral port, and
         // telling the operator it came up "on port 0" withholds the one fact they need to reach it.
-        LOGGER.info("ExcaliburDB API server started successfully on port {} ({}, "
+        // The build, first. "Which version is on this host" is the first question of an
+        // incident and of a rollback, and a banner that lists every route without ever
+        // saying what it is a banner for leaves it to be answered off the filesystem.
+        LOGGER.info("ExcaliburDB {} on {} started successfully on port {} ({}, "
                 + "authentication {})",
+            BuildInfo.version(), BuildInfo.jvm(),
             getPort(), wiring.security().tls().isEnabled() ? "TLS" : "cleartext",
             wiring.security().isAuthenticationRequired() ? "required" : "disabled");
         LOGGER.info("Endpoints available:");

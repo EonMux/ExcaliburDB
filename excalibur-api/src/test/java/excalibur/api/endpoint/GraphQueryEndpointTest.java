@@ -197,6 +197,25 @@ class GraphQueryEndpointTest {
         }
 
         @Test
+        @DisplayName("naming an instant does not hide which plan ran")
+        void namingAnInstantDoesNotHideThePlan() throws IOException {
+            // "as of 2019" modifies a question without changing what is being asked, so the
+            // planner wraps the plan rather than replacing it. Reporting the wrapper's name
+            // meant every dated question came back as "temporal" whatever it actually did -
+            // and the response already echoes as_of, so the wrapper was the one part of the
+            // plan that carried nothing the caller did not already have.
+            var undated = parse(call("POST",
+                "{\"query\": \"Who did Ada Lovelace collaborate with?\"}"));
+            var dated = parse(call("POST", "{\"query\": \"Who did Ada Lovelace collaborate with?\","
+                + " \"as_of\": \"1843-01-01\"}"));
+
+            assertThat(dated.get("plan").asText())
+                .as("the same question asked at an instant is the same plan")
+                .isEqualTo(undated.get("plan").asText())
+                .isNotEqualTo("temporal");
+        }
+
+        @Test
         @DisplayName("a question with no as_of does not claim one")
         void noAsOfIsNotReported() throws IOException {
             var node = parse(call("POST",

@@ -24,6 +24,20 @@ public sealed interface QueryPlan
     List<String> mentions();
 
     /**
+     * How the answer is found, with any temporal wrapper removed.
+     *
+     * <p>{@link Temporal} says when to evaluate, not what to evaluate, so it is the wrong answer
+     * to "which plan ran": a caller told only "temporal" learns nothing it did not already know
+     * from having asked at an instant. Since a temporal plan cannot wrap another, one unwrapping
+     * always reaches the plan that decides the work.
+     *
+     * @return this plan, or the plan inside it if this is a {@link Temporal}
+     */
+    default QueryPlan shape() {
+        return this instanceof Temporal temporal ? temporal.inner() : this;
+    }
+
+    /**
      * Retrieve facts about named entities directly.
      *
      * <p>"What is Ada Lovelace's date of birth". No traversal: the answer is on the entity.

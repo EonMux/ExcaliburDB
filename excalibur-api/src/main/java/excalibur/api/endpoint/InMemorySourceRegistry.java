@@ -6,6 +6,7 @@ import excalibur.ingest.registry.SourceCatalog;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceDescriptor;
 import excalibur.shard.worker.SegmentReindexScheduler;
+import io.excalibur.tenancy.NamespaceId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -14,6 +15,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -43,6 +45,17 @@ public class InMemorySourceRegistry implements SourceRegistry {
     private static final Logger LOGGER = LoggerFactory.getLogger(InMemorySourceRegistry.class);
 
     private final ConcurrentHashMap<String, Source> sources = new ConcurrentHashMap<>();
+
+    /**
+     * Which namespace each registered source's documents belong to.
+     *
+     * <p>Beside the sources rather than inside them, because a {@link Source} is a crawler and
+     * knows nothing about tenancy - and because the answer is wanted once per published
+     * document, on the ingestion thread, which is no place to be reading a file. It is populated
+     * from the descriptor a registration or a restore carries, so a source brought back from the
+     * catalog stages where it staged before the restart.</p>
+     */
+    private final ConcurrentHashMap<String, NamespaceId> namespaces = new ConcurrentHashMap<>();
     private final int maxSources;
     private volatile IngestionOrchestrator ingestionOrchestrator;
     private volatile IngestStatusEndpoint.IngestionStatusRegistry statusRegistry;
@@ -174,21 +187,34 @@ public class InMemorySourceRegistry implements SourceRegistry {
 
     @Override
     public void register(Source source) {
-        admit(source, null, Crawl.YES);
+        admit(source, NamespaceId.SHARED, null, Crawl.YES);
     }
 
     @Override
     public void register(Source source, SourceDescriptor descriptor) {
+        requireMatching(source, descriptor);
+        admit(source, descriptor.namespace(), descriptor, Crawl.YES);
+    }
+
+    /**
+     * Checks that a descriptor describes the source it arrived with.
+     *
+     * <p>The catalog is addressed by the same id as the registry and the re-crawl schedule. A
+     * record filed under a different one names a source no removal can cancel and no restart can
+     * match to a crawler - and would bind a namespace to an id nothing ever crawls.</p>
+     *
+     * @param source     The crawler
+     * @param descriptor What it was registered as
+     * @throws NullPointerException     if either is null
+     * @throws IllegalArgumentException if they name different sources
+     */
+    private static void requireMatching(Source source, SourceDescriptor descriptor) {
         Objects.requireNonNull(source, "Source cannot be null");
         Objects.requireNonNull(descriptor, "descriptor must not be null");
         if (!descriptor.sourceId().equals(source.getSourceId())) {
-            // The catalog is addressed by the same id as the registry and the re-crawl schedule.
-            // A record filed under a different one names a source no removal can cancel and no
-            // restart can match to a crawler.
             throw new IllegalArgumentException("Descriptor names source "
                 + descriptor.sourceId() + " but the source is " + source.getSourceId());
         }
-        admit(source, descriptor, Crawl.YES);
     }
 
     /**
@@ -211,9 +237,34 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * @throws SourceRegistrationException if the ID is taken or the registry is full
      */
     public void restore(Source source) {
-        admit(source, null, Crawl.NO);
+        admit(source, NamespaceId.SHARED, null, Crawl.NO);
         LOGGER.info("Restored source {} from the catalog; next re-crawl in {}ms",
             source.getSourceId(), reindexIntervalMs);
+    }
+
+    /**
+     * Brings back a source a previous run registered, into the namespace it was registered in.
+     *
+     * <p>Everything {@link #restore(Source)} does, plus the binding that makes the restoration
+     * faithful. A source's namespace decides which tenant's graph its documents are staged into,
+     * and it is settled once, by the caller that registered it; a restore that dropped it would
+     * leave the same source staging into the shared namespace from the next restart on, moving
+     * one tenant's facts into the index every other tenant reads - a boundary crossed by a
+     * reboot, with nothing in the node reporting it.</p>
+     *
+     * <p>Nothing is written to the catalog: the registration being restored came out of it.</p>
+     *
+     * @param source     The source to bring back
+     * @param descriptor The record it was rebuilt from
+     * @throws NullPointerException        if either argument is null
+     * @throws IllegalArgumentException    if the descriptor names a different source
+     * @throws SourceRegistrationException if the ID is taken or the registry is full
+     */
+    public void restore(Source source, SourceDescriptor descriptor) {
+        requireMatching(source, descriptor);
+        admit(source, descriptor.namespace(), null, Crawl.NO);
+        LOGGER.info("Restored source {} in namespace {} from the catalog; next re-crawl in {}ms",
+            source.getSourceId(), descriptor.namespace(), reindexIntervalMs);
     }
 
     /** Whether admitting a source starts a crawl, or only takes its place in the schedule. */
@@ -223,14 +274,40 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * Takes a source into the registry and starts whatever that entails.
      *
      * <p>The catalog is written before anything else is started, so a registration that cannot be
-     * recorded leaves nothing behind to undo: no status entry, no schedule, no crawl.</p>
+     * recorded leaves nothing behind to undo: no status entry, no schedule, no crawl. The
+     * namespace is bound after that write for the same reason - a source that is not registered
+     * must not be left behind in the map the graph sink routes on.</p>
+     *
+     * @param source     The crawler
+     * @param namespace  The namespace its documents belong to
+     * @param toRecord   What to write to the catalog, or null for a registration already in it
+     * @param crawl      Whether to start crawling now
      */
-    private void admit(Source source, SourceDescriptor descriptor, Crawl crawl) {
+    private void admit(Source source, NamespaceId namespace, SourceDescriptor toRecord,
+                       Crawl crawl) {
         Objects.requireNonNull(source, "Source cannot be null");
-        String sourceId = source.getSourceId();
+        Objects.requireNonNull(namespace, "namespace cannot be null");
 
-        // Claim the ID atomically. A separate isRegistered() check would leave a
-        // window in which two requests both believe they are the first.
+        claim(source);
+        if (toRecord != null) {
+            record(source, toRecord);
+        }
+        namespaces.put(source.getSourceId(), namespace);
+        start(source, crawl);
+    }
+
+    /**
+     * Takes the source id, or refuses because someone else has it or the registry is full.
+     *
+     * <p>Atomically. A separate {@link #isRegistered(String)} check would leave a window in
+     * which two requests both believe they are the first, and the loser's crawler is started
+     * and then leaked - nothing else closes a source the registry does not hold.</p>
+     *
+     * @param source The crawler claiming its id
+     * @throws SourceRegistrationException if the id is taken or the registry is full
+     */
+    private void claim(Source source) {
+        String sourceId = source.getSourceId();
         if (sources.putIfAbsent(sourceId, source) != null) {
             throw new SourceRegistrationException(
                 SourceRegistrationException.Reason.DUPLICATE,
@@ -242,10 +319,17 @@ public class InMemorySourceRegistry implements SourceRegistry {
                 SourceRegistrationException.Reason.CAPACITY,
                 "Source registry is full (limit " + maxSources + ")");
         }
+    }
 
-        if (descriptor != null) {
-            record(source, descriptor);
-        }
+    /**
+     * Starts everything a registered source is entitled to: a status entry, a place in the
+     * re-crawl schedule, and - unless it is being restored - a crawl.
+     *
+     * @param source The crawler, already claimed and recorded
+     * @param crawl  Whether to crawl now, or only take a place in the schedule
+     */
+    private void start(Source source, Crawl crawl) {
+        String sourceId = source.getSourceId();
 
         // Create initial status entry if status registry is configured
         // This ensures /v1/ingest/status returns data even without orchestrator
@@ -362,6 +446,7 @@ public class InMemorySourceRegistry implements SourceRegistry {
         boolean recorded = forget(sourceId);
 
         Source removed = sources.remove(sourceId);
+        namespaces.remove(sourceId);
         if (removed == null) {
             // A record with no live source behind it is still a registration someone made: the
             // node could not rebuild the crawler at startup, and this is what cancels it.
@@ -385,6 +470,55 @@ public class InMemorySourceRegistry implements SourceRegistry {
         LOGGER.info("Removed source {}: ingestion stopped, status cleared, reindexing cancelled",
             sourceId);
         return true;
+    }
+
+    /**
+     * Asks the run over one source to stop, and leaves everything else about it alone.
+     *
+     * <p>Deliberately not symmetric with {@link #remove(String)}: the catalog record, the
+     * status entry and the place in the re-crawl schedule all stay, because the source is
+     * still registered and is still going to be crawled again at its next interval. What
+     * stops is the run that is in flight right now.</p>
+     *
+     * @param sourceId The source whose run should stop
+     * @return true if a run was in flight and has been asked to stop
+     */
+    @Override
+    public boolean stopIngestion(String sourceId) {
+        Objects.requireNonNull(sourceId, "sourceId cannot be null");
+        IngestionOrchestrator orchestrator = this.ingestionOrchestrator;
+        if (orchestrator == null || !sources.containsKey(sourceId)) {
+            return false;
+        }
+        boolean stopping = orchestrator.stopIngestion(sourceId);
+        if (stopping) {
+            LOGGER.info("Ingestion of source {} was asked to stop; the source stays registered "
+                + "and will be crawled again at its next scheduled interval", sourceId);
+        }
+        return stopping;
+    }
+
+    /**
+     * The namespace a registered source's documents belong to.
+     *
+     * <p>Keyed off the live registry rather than off the namespace map alone, so that a source
+     * that has been removed answers empty even if the two maps were momentarily out of step. The
+     * caller is the graph sink, and an answer of "shared" for a source it should not have is
+     * worse than no answer at all: facts would be staged into the index every tenant reads.</p>
+     *
+     * <p>A source admitted before this registry tracked namespaces - or by the plain
+     * {@link #register(Source)}, which names none - is in the shared namespace, which is what a
+     * registration that named none has always meant.</p>
+     *
+     * @param sourceId The source id
+     * @return Its namespace, or empty if nothing is registered under that id
+     */
+    @Override
+    public Optional<NamespaceId> namespaceOf(String sourceId) {
+        if (sourceId == null || !sources.containsKey(sourceId)) {
+            return Optional.empty();
+        }
+        return Optional.of(namespaces.getOrDefault(sourceId, NamespaceId.SHARED));
     }
 
     @Override
@@ -416,6 +550,7 @@ public class InMemorySourceRegistry implements SourceRegistry {
             closeSource(entry.getKey(), entry.getValue());
         }
         sources.clear();
+        namespaces.clear();
     }
 
     private static void closeSource(String sourceId, Source source) {

@@ -200,6 +200,23 @@ class QueryClassifierTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("one as-of instant");
         }
+
+        @Test
+        @DisplayName("the shape of a temporal plan is the plan inside it")
+        void shapeUnwraps() {
+            QueryPlan inner = new QueryPlan.Lookup(java.util.List.of("Ada"));
+
+            assertThat(new QueryPlan.Temporal(inner, TemporalFilter.ALL).shape())
+                .isSameAs(inner);
+        }
+
+        @Test
+        @DisplayName("the shape of an untimed plan is the plan itself")
+        void shapeOfAnUntimedPlanIsItself() {
+            QueryPlan plan = new QueryPlan.Lookup(java.util.List.of("Ada"));
+
+            assertThat(plan.shape()).isSameAs(plan);
+        }
     }
 
     @Nested

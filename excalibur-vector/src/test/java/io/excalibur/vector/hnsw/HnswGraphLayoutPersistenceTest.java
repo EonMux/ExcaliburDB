@@ -1,6 +1,7 @@
 package io.excalibur.vector.hnsw;
 
 import io.excalibur.config.Config;
+import io.excalibur.config.ShardConfig;
 import io.excalibur.vector.distance.CosineSimilarity;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -70,7 +71,7 @@ class HnswGraphLayoutPersistenceTest {
         }
     }
 
-    private static Config.Shard shardWithMaxConnections(int maxConnections, int layer0) {
+    private static ShardConfig shardWithMaxConnections(int maxConnections, int layer0) {
         Map<String, String> props = new HashMap<>();
         props.put("excalibur.shard.default-max-connections", Integer.toString(maxConnections));
         props.put("excalibur.shard.default-max-connections-layer0", Integer.toString(layer0));

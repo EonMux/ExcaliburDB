@@ -1,5 +1,9 @@
 package io.excalibur.graph.vector;
 
+import io.excalibur.graph.build.BuildCancellation;
+import io.excalibur.graph.build.BuildCancelledException;
+import io.excalibur.graph.file.Durability;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,6 +29,15 @@ import java.nio.file.StandardOpenOption;
  * caller must say up front how many entities there are. That is known: it is the entity count the
  * edge store was built with.</p>
  *
+ * <h2>Nothing half-written ever wears the real name</h2>
+ * <p>The vectors are streamed to a temporary body and the finished file is assembled beside it,
+ * because the header and the presence flags belong in front of bytes that are only complete at
+ * the end. Neither temporary is the file a reader opens: the assembled copy is forced and moved
+ * onto the real name in one atomic act. The alternative, streaming into the real name and giving
+ * it a header afterwards, means any failure in between leaves {@code entity_vectors.vec} as
+ * headerless raw floats - which {@link EntityVectors#open} refuses, so the whole graph beside it
+ * stops opening for want of a file whose <em>absence</em> is a supported configuration.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Not thread-safe. One writer per file, used by the build that owns it.</p>
  *
@@ -34,7 +47,16 @@ public final class EntityVectorWriter implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EntityVectorWriter.class);
 
+    /** Suffix of the streamed body, which holds the vectors and nothing else. */
+    private static final String BODY_SUFFIX = ".body";
+
+    /** Suffix of the complete file, assembled beside the real name before it is moved onto it. */
+    private static final String ASSEMBLED_SUFFIX = ".assembled";
+
     private final Path path;
+    private final Path body;
+    private final Path assembled;
+    private final Durability durability;
     private final int dimension;
     private final long count;
     private final byte[] present;
@@ -55,6 +77,24 @@ public final class EntityVectorWriter implements AutoCloseable {
      * @throws IllegalArgumentException if the dimension or count is not usable
      */
     public EntityVectorWriter(Path path, int dimension, long count) throws IOException {
+        this(path, dimension, count, Durability.DEVICE);
+    }
+
+    /**
+     * As above, with how the finished file is forced to the device under the caller's control.
+     *
+     * @param path       Where the file goes
+     * @param dimension  Length of every vector
+     * @param count      How many entities the file will address
+     * @param durability How the assembled file is forced before it takes the real name
+     * @throws IOException if the file cannot be created
+     * @throws IllegalArgumentException if the dimension, count or durability is not usable
+     */
+    public EntityVectorWriter(Path path, int dimension, long count, Durability durability)
+            throws IOException {
+        if (durability == null) {
+            throw new IllegalArgumentException("durability must not be null");
+        }
         if (path == null) {
             throw new IllegalArgumentException("path must not be null");
         }
@@ -71,6 +111,9 @@ public final class EntityVectorWriter implements AutoCloseable {
         }
 
         this.path = path;
+        this.body = path.resolveSibling(path.getFileName() + BODY_SUFFIX);
+        this.assembled = path.resolveSibling(path.getFileName() + ASSEMBLED_SUFFIX);
+        this.durability = durability;
         this.dimension = dimension;
         this.count = count;
         this.present = new byte[(int) count];
@@ -80,7 +123,7 @@ public final class EntityVectorWriter implements AutoCloseable {
         if (parent != null) {
             Files.createDirectories(parent);
         }
-        this.out = new BufferedOutputStream(Files.newOutputStream(path,
+        this.out = new BufferedOutputStream(Files.newOutputStream(body,
             StandardOpenOption.CREATE, StandardOpenOption.WRITE,
             StandardOpenOption.TRUNCATE_EXISTING));
     }
@@ -96,8 +139,15 @@ public final class EntityVectorWriter implements AutoCloseable {
      * @throws IOException if the write fails
      * @throws IllegalStateException if more vectors are written than the declared count
      * @throws IllegalArgumentException if the vector is not of the declared dimension
+     * @throws BuildCancelledException if the graph build on this thread was asked to stop
      */
     public void put(float[] vector) throws IOException {
+        // The embedding phase is the long half of a build, and this is its only seam: the
+        // caller embeds a batch and then offers the vectors one at a time, so a build asked
+        // to stop ends one batch after the request rather than at the end of the corpus.
+        // Checked on every entity rather than every thousandth, because the work between two
+        // calls here is an embedding round trip amortised over a batch, not a field decode.
+        BuildCancellation.checkpoint();
         if (finished) {
             throw new IllegalStateException("writer is finished: " + path);
         }
@@ -136,6 +186,11 @@ public final class EntityVectorWriter implements AutoCloseable {
      * the presence flags are only known once every entity has been offered. Assembling the final
      * file here is one sequential copy.</p>
      *
+     * <p>The assembled copy is forced and then moved onto the real name atomically, so that name
+     * only ever refers to a complete file. Both temporaries are removed whatever happens: a
+     * failure here leaves no vectors, which is a graph reranked lexically, rather than a vector
+     * file that will not open and takes the graph down with it.</p>
+     *
      * @throws IOException if the file cannot be completed
      * @throws IllegalStateException if fewer vectors were written than declared
      */
@@ -152,9 +207,24 @@ public final class EntityVectorWriter implements AutoCloseable {
         out.close();
         out = null;
 
-        Path body = path;
-        Path finalPath = path.resolveSibling(path.getFileName() + ".assembled");
+        try {
+            assemble();
+            durability.replaceDurably(assembled, path);
+        } finally {
+            Files.deleteIfExists(assembled);
+            Files.deleteIfExists(body);
+        }
 
+        LOGGER.info("wrote {}: {} of {} entities have a vector of dimension {}",
+            path, withVector, count, dimension);
+    }
+
+    /**
+     * Writes the header, the presence flags and the streamed body into the assembled copy.
+     *
+     * @throws IOException if the copy cannot be written
+     */
+    private void assemble() throws IOException {
         ByteBuffer header = ByteBuffer.allocate(EntityVectors.HEADER_BYTES)
             .order(ByteOrder.LITTLE_ENDIAN);
         header.putLong(EntityVectors.MAGIC);
@@ -162,17 +232,13 @@ public final class EntityVectorWriter implements AutoCloseable {
         header.putInt(dimension);
         header.putLong(count);
 
-        try (OutputStream assembled = new BufferedOutputStream(Files.newOutputStream(finalPath,
+        try (OutputStream complete = new BufferedOutputStream(Files.newOutputStream(assembled,
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE,
                 StandardOpenOption.TRUNCATE_EXISTING))) {
-            assembled.write(header.array());
-            assembled.write(present);
-            Files.copy(body, assembled);
+            complete.write(header.array());
+            complete.write(present);
+            Files.copy(body, complete);
         }
-        Files.move(finalPath, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-
-        LOGGER.info("wrote {}: {} of {} entities have a vector of dimension {}",
-            path, withVector, count, dimension);
     }
 
     /**
@@ -184,11 +250,24 @@ public final class EntityVectorWriter implements AutoCloseable {
         return withVector;
     }
 
+    /**
+     * Releases the stream and removes any temporary an unfinished write left behind.
+     *
+     * <p>Closing without finishing is an abandoned write. The real file is untouched by such a
+     * write - it was never the thing being written to - so all that is owed here is not leaving
+     * the scratch behind for the next build to trip over.
+     *
+     * @throws IOException if the stream or the temporaries cannot be released
+     */
     @Override
     public void close() throws IOException {
         if (out != null) {
             out.close();
             out = null;
+        }
+        if (!finished) {
+            Files.deleteIfExists(body);
+            Files.deleteIfExists(assembled);
         }
     }
 }

@@ -6,6 +6,7 @@ import excalibur.ingest.registry.DocumentRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -41,6 +42,41 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>Commit epoch - the epoch at which this document became visible</li>
  *   <li>Write log offset range - [startOffset, endOffset) for atomicity verification</li>
  * </ul>
+ *
+ * <h2>What survives a restart, and why it is the in-flight set rather than the published one</h2>
+ * <p>Two kinds of entry live here and only one of them has to outlast the process.</p>
+ *
+ * <p>A published document is a document whose chunks are all in storage. Forgetting it - to
+ * retention, or to a restart - leaves it unknown to this tracker, and the atomicity filter passes
+ * an unknown document through, which is the right answer for a document that is whole. Persisting
+ * those entries would buy nothing and would cost a write per published document.</p>
+ *
+ * <p>An in-flight document is the opposite. Its chunks are being written one at a time and are
+ * reachable by a scan the moment they land, so the mark is the only thing standing between a
+ * query and half a document. Forgetting it does not return the document to a safe default: the
+ * restarted node has never heard of it, passes it through, and serves exactly the partial
+ * document this class exists to prevent. So the in-flight set, and only it, is written to an
+ * {@link InFlightDocumentJournal} beside the document registry - the mark is durable before the
+ * first chunk is written, and it is released when the document is published or rolled back.</p>
+ *
+ * <p>The alternative was to reconcile at startup instead: find the chunks of documents that were
+ * never completed and delete them. That is the same fact arrived at more expensively and less
+ * reliably. Nothing on a chunk says which attempt wrote it, so finding them means scanning
+ * storage against the registry at every start, and the registry does not record an attempt until
+ * it succeeds - a document being ingested for the first time has no entry to compare against, so
+ * a scan cannot tell its chunks from those of a document written before the registry was last
+ * saved. Recording the intent before the write is what makes the question answerable at all, and
+ * once it is recorded there is nothing left for a scan to discover.</p>
+ *
+ * <p>What this buys is that an interrupted document stays hidden rather than being erased. The
+ * chunks it wrote remain in storage, invisible, until the next crawl re-ingests the document -
+ * which it will, because the registry holds no entry for it, so change detection reads it as new
+ * - or until it is erased. This tracker holds no handle on storage and removing chunks is not
+ * its to do; hiding them is, and hiding them is what the guarantee needs.</p>
+ *
+ * <p>A tracker built on a registry with no file has no data directory to write to and makes no
+ * promise across a restart. That is the standalone and test arrangement; production opens the
+ * registry under the node's data directory.</p>
  *
  * <h2>Retention</h2>
  * <p>Published documents are remembered for a bounded window
@@ -98,6 +134,16 @@ public class DocumentVisibilityTracker {
     private final Map<String, Set<String>> pendingChunks;
     private final int retainedDocuments;
     private final Object evictionLock = new Object();
+
+    /**
+     * Where in-flight documents are recorded, or null when the registry is in memory only.
+     *
+     * <p>Null is not a degraded mode to be papered over: a registry with no file names no data
+     * directory, so there is nowhere for a mark to survive to and nothing after a restart that
+     * would read it. Such a node has already opted out of everything that outlives the process.
+     * </p>
+     */
+    private final InFlightDocumentJournal journal;
 
     /**
      * Creates a new DocumentVisibilityTracker with an in-memory document registry.
@@ -177,8 +223,35 @@ public class DocumentVisibilityTracker {
         this.documentVisibility = new ConcurrentHashMap<>();
         this.pendingChunks = new ConcurrentHashMap<>();
 
+        Path registryFile = documentRegistry.persistencePath();
+        this.journal = registryFile == null ? null : new InFlightDocumentJournal(registryFile);
+        recoverInterruptedDocuments();
+
         LOGGER.info("DocumentVisibilityTracker initialized on {} clock, retaining {} documents",
             nodeClock ? "the node" : "a private", retainedDocuments);
+    }
+
+    /**
+     * Restores the marks a previous process left, so its half-written documents stay hidden.
+     *
+     * <p>Each key comes back as a pending document with no chunks recorded against it. The chunk
+     * ids are not needed and are not journalled: the filter derives a document key from the chunk
+     * id it is asked about, so hiding the document hides every chunk of it, including any this
+     * process never heard of.</p>
+     */
+    private void recoverInterruptedDocuments() {
+        if (journal == null) {
+            return;
+        }
+        Set<String> interrupted = journal.recover();
+        for (String documentKey : interrupted) {
+            pendingChunks.put(documentKey, new HashSet<>());
+        }
+        if (!interrupted.isEmpty()) {
+            LOGGER.warn("{} document(s) were being ingested when this node last stopped; they "
+                + "stay hidden from queries until they are ingested again or erased: {}",
+                interrupted.size(), interrupted);
+        }
     }
 
     /**
@@ -266,8 +339,12 @@ public class DocumentVisibilityTracker {
         documentVisibility.put(documentKey, visibility);
         // Clearing the in-flight marker is what completes the publish. Without it a document
         // begun with beginIngestion and finished here stays pending forever: invisible to every
-        // query, and never released.
+        // query, and never released. The on-disk mark goes with it, or the next restart would
+        // hide a document that is whole.
         pendingChunks.remove(documentKey);
+        if (journal != null) {
+            journal.end(documentKey);
+        }
         forgetOldestBeyondRetention();
 
         LOGGER.debug("Document {} registered at epoch {} with {} chunks",
@@ -297,11 +374,20 @@ public class DocumentVisibilityTracker {
      *
      * <p>Chunks are added incrementally until the document is committed atomically.</p>
      *
+     * <p>Returns only once the mark is on disk, when this tracker has a data directory to write
+     * it to. The caller writes chunks immediately afterwards, and a mark that is still in the
+     * page cache when the host dies covers none of them.</p>
+     *
      * @param documentId The document identifier
      * @param expectedChunkCount The expected number of chunks
+     * @throws InFlightJournalException if the mark cannot be made durable, which fails the
+     *                                  document rather than writing chunks nothing can hide
      */
     public void beginIngestion(String documentId, int expectedChunkCount) {
         Objects.requireNonNull(documentId, "documentId must not be null");
+        if (journal != null) {
+            journal.begin(documentId);
+        }
         pendingChunks.put(documentId, new HashSet<>());
         LOGGER.trace("Began tracking ingestion for document {}", documentId);
     }
@@ -331,6 +417,11 @@ public class DocumentVisibilityTracker {
     public void abortIngestion(String documentId) {
         Objects.requireNonNull(documentId, "documentId must not be null");
         Set<String> removed = pendingChunks.remove(documentId);
+        if (journal != null) {
+            // The caller has removed the chunks it managed to write, so there is nothing left
+            // for a restart to hide and the mark would only hide the next attempt.
+            journal.end(documentId);
+        }
         if (removed != null) {
             LOGGER.debug("Aborted ingestion for document {} with {} pending chunks",
                 documentId, removed.size());
@@ -513,6 +604,9 @@ public class DocumentVisibilityTracker {
         Objects.requireNonNull(documentId, "documentId must not be null");
         DocumentVisibility removed = documentVisibility.remove(documentId);
         pendingChunks.remove(documentId);
+        if (journal != null) {
+            journal.end(documentId);
+        }
         if (removed != null) {
             LOGGER.debug("Document {} removed from visibility tracking", documentId);
             return true;
@@ -526,6 +620,9 @@ public class DocumentVisibilityTracker {
     public void clear() {
         documentVisibility.clear();
         pendingChunks.clear();
+        if (journal != null) {
+            journal.clear();
+        }
         LOGGER.debug("DocumentVisibilityTracker cleared");
     }
 

@@ -397,7 +397,7 @@ public class GraphQueryEndpoint implements HttpHandler {
         }
 
         json.append(",\"plan\":").append(result.plan()
-            .map(plan -> quoted(plan.getClass().getSimpleName().toLowerCase(Locale.ROOT)))
+            .map(plan -> quoted(plan.shape().getClass().getSimpleName().toLowerCase(Locale.ROOT)))
             .orElse("null"));
         // Only when the caller named one. Echoing the instant a node happened to answer at
         // when nobody asked for one would read as a promise that the value was honoured.

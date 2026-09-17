@@ -10,8 +10,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Random;
 
+import static io.excalibur.vector.hnsw.HnswGraphTestVectors.randomVector;
 import static org.assertj.core.api.Assertions.*;
 
 /**
@@ -355,25 +355,5 @@ class HnswInvariantVerifierEdgeCaseTest {
                 assertThat(result.isValid()).isTrue();
             }
         }
-    }
-
-    // Helper method
-    private float[] randomVector(int dim) {
-        Random random = new Random();
-        float[] vec = new float[dim];
-        for (int i = 0; i < dim; i++) {
-            vec[i] = (float) random.nextGaussian();
-        }
-        float norm = 0.0f;
-        for (int i = 0; i < dim; i++) {
-            norm += vec[i] * vec[i];
-        }
-        norm = (float) Math.sqrt(norm);
-        if (norm > 0) {
-            for (int i = 0; i < dim; i++) {
-                vec[i] /= norm;
-            }
-        }
-        return vec;
     }
 }

@@ -12,6 +12,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -19,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.zip.CRC32;
 
 import io.excalibur.graph.file.TailIntegrity;
@@ -226,6 +228,112 @@ public final class ErasureLog implements AutoCloseable {
         LOGGER.debug("opened erasure log {} with {} outstanding requests",
             file, log.outstanding.size());
         return log;
+    }
+
+    /**
+     * What a log owes, as read from the file without taking it over.
+     *
+     * <p>Two numbers, because two questions decide whether a sweep should spend anything on a
+     * namespace: is anything owed at all, and has the longest-waiting obligation passed the
+     * deadline the deployment promised. Neither needs the store the compaction would rewrite.</p>
+     *
+     * @param count             How many requests are outstanding
+     * @param oldestRequestedAt When the longest-waiting of them arrived, empty when none is
+     */
+    public record Pending(int count, Optional<Instant> oldestRequestedAt) {
+
+        /** What a log that was never written, or that owes nothing, reports. */
+        public static final Pending NONE = new Pending(0, Optional.empty());
+
+        public Pending {
+            if (count < 0) {
+                throw new IllegalArgumentException("count must not be negative, got " + count);
+            }
+            Objects.requireNonNull(oldestRequestedAt, "oldestRequestedAt must not be null");
+            if (count == 0 && oldestRequestedAt.isPresent()) {
+                throw new IllegalArgumentException(
+                    "nothing is outstanding, so nothing can be the oldest outstanding request");
+            }
+            if (count > 0 && oldestRequestedAt.isEmpty()) {
+                throw new IllegalArgumentException(
+                    count + " request(s) are outstanding, so one of them is the oldest");
+            }
+        }
+
+        /**
+         * Whether the oldest outstanding request has waited out {@code maxLatency}.
+         *
+         * <p>The same test {@link CompactionPolicy#standard} applies to its
+         * {@code oldestOutstanding}, and deliberately only that one. The policy's other two
+         * conditions - the tombstone ratio and the segment count - are questions about a store,
+         * and a caller holding one of these has not opened one. This is the condition that is an
+         * obligation rather than an optimisation, and it is the one that can be answered from a
+         * small append-only file.</p>
+         *
+         * @param now        The clock the wait is measured against
+         * @param maxLatency How long an obligation may remain unapplied
+         * @return true when something is outstanding and its deadline has arrived
+         */
+        public boolean dueAt(Instant now, Duration maxLatency) {
+            Objects.requireNonNull(now, "now must not be null");
+            Objects.requireNonNull(maxLatency, "maxLatency must not be null");
+            return oldestRequestedAt
+                .map(requestedAt -> !Duration.between(requestedAt, now).minus(maxLatency)
+                    .isNegative())
+                .orElse(false);
+        }
+    }
+
+    /**
+     * Reads what a log owes without opening it.
+     *
+     * <h3>Why this is not {@link #open}</h3>
+     * <p>Opening is not a question. It truncates a torn tail, takes an append handle, and hands
+     * back a resource whose lifetime somebody now owns - and for a graph tenant it is reached
+     * only by opening the tenant, which is thirteen memory mappings for a store this caller has
+     * no intention of reading. The sweep that enforces the erasure deadline has to ask this of
+     * every namespace on disk, including the ones eviction closed precisely to reclaim those
+     * mappings. So it asks the file.</p>
+     *
+     * <h3>What it costs</h3>
+     * <p>One read of the whole log and one pass over its records: no mappings, no file handle
+     * left behind, and not a byte written. The log is a fixed-size record per accepted request
+     * and one per batch of completions, so it is small for any namespace whose obligations are
+     * actually being discharged - and a namespace whose log has grown is exactly one this should
+     * be reporting on.</p>
+     *
+     * <h3>What it refuses</h3>
+     * <p>Everything {@link #open} refuses, on the same terms. A log written by a newer build, or
+     * one damaged with intact records after the damage, throws here rather than reporting the
+     * requests it happened to reach. Reporting a subset would be worse than failing: the caller
+     * is deciding whether a namespace owes anything, and a short count reads as "swept clean"
+     * while the obligations behind the damage stay on disk with nothing left to notice them.</p>
+     *
+     * @param file The log file; need not exist
+     * @return What it owes, and when the longest-waiting request arrived
+     * @throws IOException if the file exists and is not an erasure log this build can read
+     * @throws NullPointerException if {@code file} is null
+     */
+    public static Pending inspect(Path file) throws IOException {
+        Objects.requireNonNull(file, "file must not be null");
+        if (!Files.exists(file) || Files.size(file) < HEADER_BYTES) {
+            return Pending.NONE;
+        }
+
+        Replay replay = replay(file);
+        // The same distinction open() draws, drawn read-only: a tail that is merely torn is the
+        // ordinary outcome of a process killed mid-append and the records before it stand, while
+        // records following damage were acknowledged to a caller and must not be silently
+        // dropped from the count.
+        if (Files.size(file) > replay.validBytes()) {
+            TailIntegrity.requireTornTail(file, "erasure log", replay.contents(),
+                replay.validBytes(), ErasureLog::recordStartsAt);
+        }
+
+        Optional<Instant> oldest = replay.outstanding().values().stream()
+            .map(ErasureRequest::requestedAt)
+            .min(Instant::compareTo);
+        return new Pending(replay.outstanding().size(), oldest);
     }
 
     /**

@@ -162,6 +162,103 @@ class QueryExpansionTest {
         }
 
         @Test
+        @DisplayName("terms the model sent without a confidence are still searched")
+        void unweightedTermsAreStillSearched() {
+            // A chat model that emits the terms and forgets the weights is an ordinary
+            // formatting failure. Defaulting them beneath the usefulness floor silently
+            // discards every one, which turns the deployment whose entire semantic capability
+            // is expansion into plain BM25 with nothing said about it.
+            List<SearchFormulation> out = expanderReturning(
+                "[{\"q\":\"OOM killer\"},{\"q\":\"ENOMEM\"}]").expand("out of memory");
+
+            assertThat(out.stream().map(SearchFormulation::text))
+                .containsExactly("out of memory", "OOM killer", "ENOMEM");
+            assertThat(out.subList(1, out.size()))
+                .as("an unstated confidence must not outrank a stated one")
+                .allSatisfy(f -> assertThat(f.weight())
+                    .isLessThan(SearchFormulation.ORIGINAL_WEIGHT));
+        }
+
+        @Test
+        @DisplayName("a query longer than a few sentences is expanded like any other")
+        void aLongQueryIsStillExpanded() {
+            // The API accepts a query up to excalibur.api.max-query-chars, and that bound
+            // exists precisely to bound the outbound expansion call. A second, lower, silent
+            // cap inside the expander means a 600-character query is answered by a different
+            // retrieval strategy than a 500-character one, with nothing saying so.
+            String longQuery = "why does my service die when the machine runs out of RAM? "
+                .repeat(11);
+            assertThat(longQuery.length()).isGreaterThan(512);
+
+            List<SearchFormulation> out = expanderReturning(
+                "[{\"q\":\"OOM killer\",\"w\":0.9}]").expand(longQuery);
+
+            assertThat(out.stream().map(SearchFormulation::text)).contains("OOM killer");
+        }
+
+        @Test
+        @DisplayName("a model that does not answer in time costs the expansion, not the query")
+        void aSlowModelIsAbandonedOnItsOwnDeadline() {
+            // The client's own timeout is sized for ingestion, where nobody holds a socket
+            // open. One expansion call on that budget outlasts every query budget the API
+            // allows, so the expansion carries a deadline of its own.
+            LLMHttpClient slow = mock(LLMHttpClient.class);
+            when(slow.completeWithCircuitBreaker(anyString(), anyString(), any()))
+                .thenAnswer(invocation -> {
+                    Thread.sleep(30_000);
+                    return "[{\"q\":\"OOM killer\",\"w\":0.9}]";
+                });
+
+            long start = System.nanoTime();
+            List<SearchFormulation> out =
+                new LlmQueryExpander(slow, 300L).expand("out of memory");
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+            assertThat(out).singleElement()
+                .satisfies(f -> assertThat(f.text()).isEqualTo("out of memory"));
+            assertThat(elapsedMs)
+                .as("the query's budget is what the caller is holding a socket open for")
+                .isLessThan(5_000L);
+        }
+
+        @Test
+        @DisplayName("a withdrawn request stops the expansion rather than searching on")
+        void anInterruptStopsTheSearchItBelongsTo() throws Exception {
+            // Swallowing the interrupt lets an abandoned search run its full BM25 pass behind
+            // a permit the node's concurrency bound says is free.
+            java.util.concurrent.CountDownLatch calling =
+                new java.util.concurrent.CountDownLatch(1);
+            LLMHttpClient blocking = mock(LLMHttpClient.class);
+            when(blocking.completeWithCircuitBreaker(anyString(), anyString(), any()))
+                .thenAnswer(invocation -> {
+                    calling.countDown();
+                    Thread.sleep(30_000);
+                    return "[]";
+                });
+            java.util.concurrent.atomic.AtomicReference<Throwable> thrown =
+                new java.util.concurrent.atomic.AtomicReference<>();
+            Thread search = new Thread(() -> {
+                try {
+                    new LlmQueryExpander(blocking, 30_000L).expand("out of memory");
+                } catch (Throwable t) {
+                    thrown.set(t);
+                }
+            });
+
+            search.start();
+            assertThat(calling.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            search.interrupt();
+            search.join(5_000);
+
+            assertThat(search.isAlive())
+                .as("the search has to unwind so its permit goes back")
+                .isFalse();
+            assertThat(thrown.get())
+                .as("a withdrawn request is not answered by searching what is left of it")
+                .isInstanceOf(java.util.concurrent.CancellationException.class);
+        }
+
+        @Test
         @DisplayName("duplicates and echoes of the query are dropped")
         void duplicatesAreDropped() {
             List<SearchFormulation> out = expanderReturning(
@@ -229,6 +326,32 @@ class QueryExpansionTest {
                     .rank(RetrievalQuery.ofText("process killed for using too much memory"), 5);
 
                 assertThat(out.documents().get(0).documentId()).isEqualTo(1L);
+            }
+        }
+
+        @Test
+        @DisplayName("expansions that agree on a term still cannot outrank the user's own word")
+        void agreementCannotOutrankTheUser(@TempDir Path dir) throws Exception {
+            // Two surviving formulations sharing one token sum past 1.0, and the shared token
+            // then scores above the word the user actually typed. Both documents carry the
+            // same length and the same document frequency, so the ranking between them is
+            // decided by the weights alone.
+            try (LexicalIndex index = LexicalIndex.open(dir, 8.0)) {
+                index.put(1L, "alpha filler one two three four", "corpus:alpha.txt:chunk:0");
+                index.put(2L, "bravo filler one two three four", "corpus:bravo.txt:chunk:0");
+                index.refresh();
+
+                QueryExpander agreeing = text -> List.of(
+                    SearchFormulation.original(text),
+                    new SearchFormulation("bravo charlie", 0.9),
+                    new SearchFormulation("bravo delta", 0.9));
+
+                RankedList out = new ExpandedLexicalRanker(index, agreeing)
+                    .rank(RetrievalQuery.ofText("alpha"), 5);
+
+                assertThat(out.documents().get(0).documentId())
+                    .as("the word the user typed must still lead a guess two expansions agreed on")
+                    .isEqualTo(1L);
             }
         }
 

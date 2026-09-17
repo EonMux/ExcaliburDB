@@ -26,7 +26,7 @@ import java.nio.file.Path;
  * @param tornTail  Why the record at {@code endOffset} could not be read, or null if the log
  *                  ended at unwritten bytes
  */
-record LogScan(long nextLsn, long endOffset, String tornTail) {
+public record LogScan(long nextLsn, long endOffset, String tornTail) {
 
     /**
      * Reads a mapped log from the beginning to find where it ends.
@@ -36,7 +36,7 @@ record LogScan(long nextLsn, long endOffset, String tornTail) {
      * @return What the scan found
      * @throws CorruptLogException if the log is damaged anywhere but its tail
      */
-    static LogScan of(Segment mapped, Path logFilePath) throws CorruptLogException {
+    public static LogScan of(Segment mapped, Path logFilePath) throws CorruptLogException {
         long fileSize = mapped.byteSize();
         long offset = 0;
         long maxLsn = -1;

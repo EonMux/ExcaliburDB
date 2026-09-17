@@ -1,7 +1,6 @@
 package excalibur.api.endpoint;
 
 import excalibur.api.protocol.JsonText;
-import excalibur.api.retrieval.ChunkTextResolver;
 import excalibur.api.retrieval.HybridFusion;
 import excalibur.api.retrieval.LexicalQueryService;
 import excalibur.query.IndexCoverage;
@@ -27,11 +26,24 @@ import java.util.List;
  * and means nothing in absolute terms. A threshold tuned against cosine scores does not transfer
  * to a fused one, which is why the field that says so is not optional.</p>
  *
+ * <h2>How much there is, and how to get the rest</h2>
+ * <p>{@code page} and {@code result_total} are on every answer, including the empty one a
+ * timed-out query returns. A caller that has to test for them cannot use them for arithmetic,
+ * and the pair is what separates "nothing matched" from "the first page happened to be empty".
+ * The total says which of the two it is rather than leaving a caller to guess - see
+ * {@link ResultTotal}.</p>
+ *
  * <h2>Text on a result</h2>
  * <p>Absent unless the request asked for it, and then present on every result of that answer -
  * {@code null} included, for a chunk storage no longer holds. A field that appears on some
  * results of one answer and not others cannot be read without checking for it each time, so the
- * request decides whether it is there and nothing else does.</p>
+ * request decides whether it is there and nothing else does. A request that also asked for a
+ * snippet gets {@code text_offset} and {@code highlights} beside it, on the same terms.</p>
+ *
+ * <h2>Why a result was returned</h2>
+ * <p>{@code explain} on a result, and {@code query_expansion} on the answer, both only when
+ * the request asked. They cost a storage read per result, which is the same reason
+ * {@code include_text} is opt-in.</p>
  */
 public final class QueryResponseJson {
 
@@ -50,21 +62,13 @@ public final class QueryResponseJson {
     /**
      * Renders an answer from vector search alone.
      *
-     * @param response What the query pipeline produced
+     * @param response What the query pipeline produced, for its coverage and timings
+     * @param page     The results this answer returns, already sliced to the page
+     * @param answer   What this response says beyond the ranking
      * @return The response body
      */
-    public static String vector(QueryResponse response) {
-        return vector(response, null);
-    }
-
-    /**
-     * Renders an answer from vector search alone, optionally carrying each result's text.
-     *
-     * @param response What the query pipeline produced
-     * @param text     Reads the text behind an identifier, or null when none was asked for
-     * @return The response body
-     */
-    public static String vector(QueryResponse response, ChunkTextResolver text) {
+    public static String vector(QueryResponse response, List<QueryResultItem> page,
+                                QueryAnswer answer) {
         StringBuilder sb = new StringBuilder(256);
         appendQueryId(sb, response.queryId());
 
@@ -72,39 +76,41 @@ public final class QueryResponseJson {
         // assigned - not the HNSW node ID, which is an internal handle that compaction renumbers
         // and that no client can look anything up by.
         sb.append("\"results\": [");
-        List<QueryResultItem> results = response.results();
-        for (int i = 0; i < results.size(); i++) {
+        for (int i = 0; i < page.size(); i++) {
             if (i > 0) {
                 sb.append(",");
             }
-            QueryResultItem item = results.get(i);
+            QueryResultItem item = page.get(i);
             sb.append("{\"document_id\": \"").append(JsonText.escape(item.externalId()))
                 .append("\", \"score\": ").append(JsonText.number(item.score(), 6))
                 .append(", \"segment_id\": ").append(item.segmentId());
-            appendText(sb, text, item.externalId());
+            appendText(sb, answer, item.externalId());
+            appendExplain(sb, answer, i);
             sb.append("}");
         }
         sb.append("], ");
         sb.append("\"retrieval\": \"").append(VECTOR).append("\", ");
         appendCoverage(sb, response.coverage());
-        appendTail(sb, response.timedOut(), response.cancelled(), response.queryTimeMs());
+        appendAnswer(sb, answer);
+        appendTail(sb, response.timedOut(), response.cancelled(), response.queryTimeMs(),
+            response.fromCache());
         return sb.toString();
     }
 
     /**
-     * Renders an answer both signals contributed to, optionally carrying each result's text.
+     * Renders an answer both signals contributed to.
      *
      * <p>Coverage is the vector pipeline's, unchanged: it measures how much of the segment
      * catalog the query reached, which is a question about the vector index and is not made
      * truer or falser by a second signal having also run.</p>
      *
      * @param response What the query pipeline produced, for its coverage and timings
-     * @param fused    The fused ranking, best first
-     * @param text     Reads the text behind an identifier, or null when none was asked for
+     * @param fused    The fused ranking, best first, sliced to the page being returned
+     * @param answer   What this response says beyond the ranking
      * @return The response body
      */
     public static String hybrid(QueryResponse response, List<HybridFusion.Result> fused,
-                                ChunkTextResolver text) {
+                                QueryAnswer answer) {
         StringBuilder sb = new StringBuilder(256);
         appendQueryId(sb, response.queryId());
 
@@ -113,50 +119,64 @@ public final class QueryResponseJson {
             if (i > 0) {
                 sb.append(",");
             }
-            HybridFusion.Result result = fused.get(i);
-            sb.append("{\"document_id\": \"").append(JsonText.escape(result.documentId()))
-                .append("\", \"score\": ").append(JsonText.number(result.score(), 6))
-                // null rather than a number for a hit only BM25 returned: it was never in a
-                // vector segment, and naming one would invent a provenance it does not have.
-                .append(", \"segment_id\": ")
-                .append(result.segmentId() == null ? "null" : result.segmentId().toString())
-                .append(", \"signals\": [");
-            List<String> signals = result.signals();
-            for (int s = 0; s < signals.size(); s++) {
-                if (s > 0) {
-                    sb.append(", ");
-                }
-                sb.append('"').append(JsonText.escape(signals.get(s))).append('"');
-            }
-            sb.append("]");
-            appendText(sb, text, result.documentId());
-            sb.append("}");
+            appendFused(sb, fused.get(i), answer, i);
         }
         sb.append("], ");
         sb.append("\"retrieval\": \"").append(HYBRID).append("\", ");
         appendCoverage(sb, response.coverage());
-        appendTail(sb, response.timedOut(), response.cancelled(), response.queryTimeMs());
+        appendAnswer(sb, answer);
+        appendTail(sb, response.timedOut(), response.cancelled(), response.queryTimeMs(),
+            response.fromCache());
         return sb.toString();
     }
 
     /**
-     * Renders an answer from the lexical index alone, optionally carrying each result's text.
+     * Renders one fused result.
+     *
+     * @param sb     The response under construction
+     * @param result The fused result
+     * @param answer What this response says beyond the ranking
+     * @param index  Where the result sits in the page, for its explanation
+     */
+    private static void appendFused(StringBuilder sb, HybridFusion.Result result,
+                                    QueryAnswer answer, int index) {
+        sb.append("{\"document_id\": \"").append(JsonText.escape(result.documentId()))
+            .append("\", \"score\": ").append(JsonText.number(result.score(), 6))
+            // null rather than a number for a hit only BM25 returned: it was never in a
+            // vector segment, and naming one would invent a provenance it does not have.
+            .append(", \"segment_id\": ")
+            .append(result.segmentId() == null ? "null" : result.segmentId().toString())
+            .append(", \"signals\": [");
+        List<String> signals = result.signals();
+        for (int s = 0; s < signals.size(); s++) {
+            if (s > 0) {
+                sb.append(", ");
+            }
+            sb.append('"').append(JsonText.escape(signals.get(s))).append('"');
+        }
+        sb.append("]");
+        appendText(sb, answer, result.documentId());
+        appendExplain(sb, answer, index);
+        sb.append("}");
+    }
+
+    /**
+     * Renders an answer from the lexical index alone.
      *
      * @param queryId     The identifier this query was registered under
-     * @param hits        What BM25 returned, best first
+     * @param hits        What BM25 returned, best first, sliced to the page being returned
      * @param coverage    What the index says it searched
-     * @param requestBody The raw request, read for which unhonoured fields the caller sent
-     * @param unhonoured  Fields this path parses and cannot act on
+     * @param ignored     What this answer did not act on, already decided by the caller
      * @param timedOut    Whether the request's budget ran out
      * @param cancelled   Whether the caller withdrew the request
      * @param durationMs  How long the request took
-     * @param text        Reads the text behind an identifier, or null when none was asked for
+     * @param answer      What this response says beyond the ranking
      * @return The response body
      */
     public static String lexical(String queryId, List<LexicalQueryService.Hit> hits,
-                                 IndexCoverage coverage, String requestBody,
-                                 List<String> unhonoured, boolean timedOut, boolean cancelled,
-                                 long durationMs, ChunkTextResolver text) {
+                                 IndexCoverage coverage,
+                                 List<String> ignored, boolean timedOut, boolean cancelled,
+                                 long durationMs, QueryAnswer answer) {
         StringBuilder sb = new StringBuilder(256);
         appendQueryId(sb, queryId);
 
@@ -168,14 +188,20 @@ public final class QueryResponseJson {
             sb.append("{\"document_id\": \"")
               .append(JsonText.escape(hits.get(i).chunkId()))
               .append("\", \"score\": ").append(JsonText.number(hits.get(i).score(), 6));
-            appendText(sb, text, hits.get(i).chunkId());
+            appendText(sb, answer, hits.get(i).chunkId());
+            appendExplain(sb, answer, i);
             sb.append("}");
         }
         sb.append("], ");
         sb.append("\"retrieval\": \"").append(LEXICAL).append("\", ");
         appendCoverage(sb, coverage);
-        appendIgnoredFields(sb, requestBody, unhonoured);
-        appendTail(sb, timedOut, cancelled, durationMs);
+        appendIgnoredFields(sb, ignored);
+        appendAnswer(sb, answer);
+        // Always false here. The lexical path answers from the BM25 index on every request:
+        // a lexical answer can change with no mutation to observe, purely because the query
+        // epoch later crosses a manifest entry, so there is nothing to fingerprint and
+        // nothing is cached.
+        appendTail(sb, timedOut, cancelled, durationMs, false);
         return sb.toString();
     }
 
@@ -188,22 +214,69 @@ public final class QueryResponseJson {
      * asked. {@code text_truncated} rides alongside because a clipped passage that does not say
      * so gets quoted as the whole one.</p>
      *
+     * <p>A request that asked for a query-centred window gets two more fields, on the same
+     * terms: where the window starts in the chunk, and where the matched terms are inside it.
+     * Without those a caller is shown a quotation it cannot locate and cannot highlight.</p>
+     *
      * @param sb      The response under construction
-     * @param text    The resolver, or null when the request did not ask for text
+     * @param answer  What this response says beyond the ranking
      * @param chunkId The identifier of the result being rendered
      */
-    private static void appendText(StringBuilder sb, ChunkTextResolver text, String chunkId) {
-        if (text == null) {
+    private static void appendText(StringBuilder sb, QueryAnswer answer, String chunkId) {
+        ResultPassages passages = answer.passages();
+        if (passages == null || !passages.rendersText()) {
             return;
         }
-        ChunkTextResolver.Resolved resolved = text.resolve(chunkId);
+        ResultPassages.Passage passage = passages.of(chunkId);
         sb.append(", \"text\": ");
-        if (resolved.text() == null) {
+        if (passage.text() == null) {
             sb.append("null");
         } else {
-            sb.append('"').append(JsonText.escape(resolved.text())).append('"');
+            sb.append('"').append(JsonText.escape(passage.text())).append('"');
         }
-        sb.append(", \"text_truncated\": ").append(resolved.truncated());
+        sb.append(", \"text_truncated\": ").append(passage.truncated());
+        if (!passages.windowed()) {
+            return;
+        }
+        sb.append(", \"text_offset\": ").append(passage.offset());
+        sb.append(", \"highlights\": [");
+        List<ResultPassages.Highlight> highlights = passage.highlights();
+        for (int i = 0; i < highlights.size(); i++) {
+            sb.append(i > 0 ? ", " : "")
+              .append("{\"start\": ").append(highlights.get(i).start())
+              .append(", \"length\": ").append(highlights.get(i).length()).append('}');
+        }
+        sb.append("]");
+    }
+
+    /**
+     * Appends why one result was returned, when the request asked to be told.
+     *
+     * @param sb     The response under construction
+     * @param answer What this response says beyond the ranking
+     * @param index  Where the result sits in the page
+     */
+    private static void appendExplain(StringBuilder sb, QueryAnswer answer, int index) {
+        QueryExplanation explanation = answer.explanation();
+        if (explanation == null) {
+            return;
+        }
+        ResultExplanation explained = explanation.at(index);
+        if (explained == null) {
+            return;
+        }
+        sb.append(", \"explain\": {\"signals\": [");
+        List<ResultExplanation.Signal> signals = explained.signals();
+        for (int i = 0; i < signals.size(); i++) {
+            ResultExplanation.Signal signal = signals.get(i);
+            sb.append(i > 0 ? ", " : "")
+              .append("{\"signal\": \"").append(JsonText.escape(signal.name()))
+              .append("\", \"rank\": ").append(signal.rank())
+              .append(", \"score\": ").append(JsonText.number(signal.score(), 6)).append('}');
+        }
+        sb.append("], \"matched_terms\": [");
+        appendStrings(sb, explained.matchedTerms());
+        sb.append("]}");
     }
 
     /**
@@ -249,42 +322,91 @@ public final class QueryResponseJson {
     }
 
     /**
-     * Names the request fields a path accepted and could not act on.
+     * Names what this answer accepted and could not act on.
      *
      * <p>Always emitted, empty list included: a caller cannot tell an unhonoured field from an
      * honoured one by its absence, and a field that only appears when something went wrong is
      * a field nobody looks for.</p>
      *
-     * @param sb          The response being built
-     * @param requestBody The raw request, read for which fields the caller actually sent
-     * @param unhonoured  The fields this path cannot act on
+     * <p>Rendered, not decided, here. Which entries belong on one answer depends on what the
+     * caller sent and on what this node's retrieval stages could do with it, and neither of
+     * those is a question about JSON.</p>
+     *
+     * @param sb      The response being built
+     * @param ignored What this answer did not act on
      */
-    private static void appendIgnoredFields(StringBuilder sb, String requestBody,
-                                            List<String> unhonoured) {
+    private static void appendIgnoredFields(StringBuilder sb, List<String> ignored) {
         sb.append("\"ignored_fields\": [");
-        boolean first = true;
-        for (String field : unhonoured) {
-            if (!JsonText.has(requestBody, field)) {
-                continue;
-            }
-            if (!first) {
-                sb.append(", ");
-            }
-            sb.append('"').append(JsonText.escape(field)).append('"');
-            first = false;
-        }
+        appendStrings(sb, ignored);
         sb.append("], ");
     }
 
     /**
+     * Renders how much of the ranking this answer is, and how much there is.
+     *
+     * <p>Both blocks on every answer, and the expansion only when the request asked to be
+     * told why - an expansion block on an answer nobody asked to have explained is a list of
+     * terms with nothing beside it to read them against.</p>
+     *
+     * @param sb     The response being built
+     * @param answer What this response says beyond the ranking
+     */
+    private static void appendAnswer(StringBuilder sb, QueryAnswer answer) {
+        ResultPage page = answer.page();
+        sb.append("\"page\": {\"offset\": ").append(page.offset())
+          .append(", \"limit\": ").append(page.limit())
+          .append(", \"returned\": ").append(page.returned())
+          .append(", \"next_offset\": ")
+          .append(page.nextOffset() == null ? "null" : page.nextOffset().toString())
+          .append("}, ");
+        sb.append("\"result_total\": {\"value\": ").append(answer.total().value())
+          .append(", \"relation\": \"").append(answer.total().relation()).append("\"}, ");
+        if (answer.explanation() == null) {
+            return;
+        }
+        QueryExpansion expansion = answer.explanation().expansion();
+        sb.append("\"query_expansion\": {\"status\": \"").append(expansion.status())
+          .append("\", \"terms\": [");
+        List<QueryExpansion.Term> terms = expansion.terms();
+        for (int i = 0; i < terms.size(); i++) {
+            sb.append(i > 0 ? ", " : "")
+              .append("{\"term\": \"").append(JsonText.escape(terms.get(i).text()))
+              .append("\", \"weight\": ").append(JsonText.number(terms.get(i).weight(), 2))
+              .append('}');
+        }
+        sb.append("], \"terms_truncated\": ").append(expansion.truncated()).append("}, ");
+    }
+
+    /**
+     * Writes a list of strings as JSON string literals, escaped.
+     *
+     * @param sb     The response being built
+     * @param values The strings, every one of them caller-influenced
+     */
+    private static void appendStrings(StringBuilder sb, List<String> values) {
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append('"').append(JsonText.escape(values.get(i))).append('"');
+        }
+    }
+
+    /**
      * Closes the envelope with what happened to the request itself.
+     *
+     * <p>{@code from_cache} is on every answer, false included. Without it beside
+     * {@code query_time_ms}, a cache hit reads as a search that suddenly got faster: the
+     * duration on a hit is how long this request took, not how long the search took, and
+     * nothing else in the answer distinguishes the two.</p>
      */
     private static void appendTail(StringBuilder sb, boolean timedOut, boolean cancelled,
-                                   long durationMs) {
+                                   long durationMs, boolean fromCache) {
         sb.append("\"timed_out\": ").append(timedOut).append(", ");
         // A withdrawn request and an exhausted deadline produce the same empty, degraded
         // answer. Only this says which - or that neither happened and the corpus held no match.
         sb.append("\"cancelled\": ").append(cancelled).append(", ");
+        sb.append("\"from_cache\": ").append(fromCache).append(", ");
         sb.append("\"query_time_ms\": ").append(durationMs);
         sb.append("}");
     }

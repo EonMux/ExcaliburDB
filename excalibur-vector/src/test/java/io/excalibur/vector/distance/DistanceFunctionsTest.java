@@ -1,6 +1,6 @@
 package io.excalibur.vector.distance;
 
-import io.excalibur.config.Config;
+import io.excalibur.config.QueryConfig;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -76,9 +76,9 @@ class DistanceFunctionsTest {
     @DisplayName("Every metric the configuration accepts resolves here")
     void coversTheConfiguredMetricVocabulary() {
         Set<String> configured = Set.of(
-            Config.Query.METRIC_COSINE,
-            Config.Query.METRIC_L2,
-            Config.Query.METRIC_INNER_PRODUCT);
+            QueryConfig.METRIC_COSINE,
+            QueryConfig.METRIC_L2,
+            QueryConfig.METRIC_INNER_PRODUCT);
 
         assertThat(DistanceFunctions.names()).containsAll(configured);
         for (String name : configured) {

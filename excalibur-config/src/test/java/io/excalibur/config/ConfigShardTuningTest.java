@@ -22,8 +22,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @DisplayName("Shard tuning configuration")
 class ConfigShardTuningTest {
 
-    private static Config.Shard shard(Map<String, String> props) {
-        return new Config.Shard(new HashMap<>(props));
+    private static ShardConfig shard(Map<String, String> props) {
+        return new ShardConfig(new HashMap<>(props));
     }
 
     @Nested
@@ -33,7 +33,7 @@ class ConfigShardTuningTest {
         @Test
         @DisplayName("a node keeps sixteen neighbours above layer 0 and twice that at it")
         void documentedDefaults() {
-            Config.Shard settings = shard(Map.of());
+            ShardConfig settings = shard(Map.of());
 
             assertThat(settings.getMaxConnections()).isEqualTo(16);
             assertThat(settings.getMaxConnectionsLayer0()).isEqualTo(32);
@@ -42,7 +42,7 @@ class ConfigShardTuningTest {
         @Test
         @DisplayName("layer 0 follows the configured connectivity when it is not named")
         void layerZeroDerivesFromM() {
-            Config.Shard settings =
+            ShardConfig settings =
                 shard(Map.of("excalibur.shard.default-max-connections", "24"));
 
             assertThat(settings.getMaxConnectionsLayer0()).isEqualTo(48);
@@ -51,7 +51,7 @@ class ConfigShardTuningTest {
         @Test
         @DisplayName("layer 0 can be named explicitly")
         void layerZeroCanBeSet() {
-            Config.Shard settings = shard(Map.of(
+            ShardConfig settings = shard(Map.of(
                 "excalibur.shard.default-max-connections", "16",
                 "excalibur.shard.default-max-connections-layer0", "64"));
 
@@ -87,7 +87,7 @@ class ConfigShardTuningTest {
         @Test
         @DisplayName("a connectivity that would double past the ceiling stops at it")
         void derivedLayerZeroStopsAtTheCeiling() {
-            Config.Shard settings =
+            ShardConfig settings =
                 shard(Map.of("excalibur.shard.default-max-connections", "256"));
 
             assertThat(settings.getMaxConnectionsLayer0()).isEqualTo(512);
@@ -113,7 +113,7 @@ class ConfigShardTuningTest {
         @Test
         @DisplayName("the shipped policy is the one the workers were built with")
         void documentedDefaults() {
-            Config.Shard settings = shard(Map.of());
+            ShardConfig settings = shard(Map.of());
 
             assertThat(settings.getCompactionIntervalMs()).isEqualTo(5000L);
             assertThat(settings.getCompactionTombstoneRatio()).isEqualTo(0.2);
@@ -162,7 +162,7 @@ class ConfigShardTuningTest {
         @Test
         @DisplayName("the shipped index shape is fifteen tables of sixteen bits, three probes")
         void documentedDefaults() {
-            Config.Shard settings = shard(Map.of());
+            ShardConfig settings = shard(Map.of());
 
             assertThat(settings.getLshHashTables()).isEqualTo(15);
             assertThat(settings.getLshHashFunctions()).isEqualTo(16);
@@ -229,7 +229,7 @@ class ConfigShardTuningTest {
         @Test
         @DisplayName("volumes are read in the order given, with blanks dropped")
         void parsesAList() {
-            Config.Shard settings =
+            ShardConfig settings =
                 shard(Map.of("excalibur.shard.volumes", " /mnt/a , ,/mnt/b "));
 
             assertThat(settings.getVolumes()).containsExactly("/mnt/a", "/mnt/b");
@@ -243,7 +243,7 @@ class ConfigShardTuningTest {
         @Test
         @DisplayName("the quantised first pass is off until a deployment asks for it")
         void offByDefault() {
-            Config.Shard settings = shard(Map.of());
+            ShardConfig settings = shard(Map.of());
 
             assertThat(settings.isPqSearchEnabled()).isFalse();
             assertThat(settings.getPqOversample()).isEqualTo(4);

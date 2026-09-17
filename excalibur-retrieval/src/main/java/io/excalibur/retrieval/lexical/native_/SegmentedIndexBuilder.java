@@ -172,6 +172,14 @@ public final class SegmentedIndexBuilder implements AutoCloseable {
         PostingsMerger.merge(round, destination, bm25);
     }
 
+    /**
+     * Moves a finished piece into place as the index itself.
+     *
+     * <p>The piece's own files were forced where they were written, but every one of them now
+     * has a new name in a directory that has never been forced, and a name that is not durable
+     * is a file the index does not have. The merge paths end in a write that forces their
+     * destination; this path has no write left to do, so it forces it here.</p>
+     */
     private static void moveDirectory(Path from, Path to) throws IOException {
         Files.createDirectories(to);
         try (Stream<Path> files = Files.list(from)) {
@@ -180,6 +188,7 @@ public final class SegmentedIndexBuilder implements AutoCloseable {
                     java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
         }
+        Durability.FILE_SYSTEM.forceDirectory(to);
     }
 
     /** Removes the intermediate pieces. */

@@ -2,14 +2,20 @@ package excalibur.api.server;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.ResponseBody;
 import excalibur.api.security.RequestGuard;
+import io.excalibur.tenancy.NamespaceId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
 
 /**
  * The combinators every route on this node is built from.
@@ -28,6 +34,9 @@ import java.nio.charset.StandardCharsets;
 final class HttpRouting {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(HttpRouting.class);
+
+    /** The namespace a request with no header belongs to, and the only one these routes serve. */
+    private static final String SHARED_NAMESPACE = NamespaceId.SHARED.value();
 
     private HttpRouting() {
     }
@@ -144,15 +153,34 @@ final class HttpRouting {
     static HttpHandler createMethodRouter(String firstMethod, HttpHandler first,
                                           String secondMethod, HttpHandler second,
                                           HttpHandler otherwise) {
+        return createMethodRouter(Map.of(firstMethod, first, secondMethod, second), otherwise);
+    }
+
+    /**
+     * Routes one context by request method, for a noun that carries more than two verbs.
+     *
+     * <p>{@code /v1/ingest} is the case: a source can be registered, read back and stopped, and
+     * three paths for three verbs on one resource is what the method exists to avoid. The
+     * guarantees are the two-handler version's - each branch is a whole handler carrying its own
+     * {@link RequestGuard} decision, including the fall-through, so a method the route does not
+     * serve is still charged for.</p>
+     *
+     * @param handlers  The handler for each method, keyed by method name
+     * @param otherwise The handler for every other method
+     * @return A handler that dispatches on the request method
+     */
+    static HttpHandler createMethodRouter(Map<String, HttpHandler> handlers,
+                                          HttpHandler otherwise) {
+        // Upper-cased once here rather than compared case-insensitively per request: the map
+        // lookup is what makes this scale past two verbs, and a case-insensitive map would give
+        // that back.
+        Map<String, HttpHandler> byMethod = new HashMap<>();
+        handlers.forEach((method, handler) -> byMethod.put(
+            method.toUpperCase(Locale.ROOT), Objects.requireNonNull(handler, method)));
         return exchange -> {
-            String method = exchange.getRequestMethod();
-            if (firstMethod.equalsIgnoreCase(method)) {
-                first.handle(exchange);
-            } else if (secondMethod.equalsIgnoreCase(method)) {
-                second.handle(exchange);
-            } else {
-                otherwise.handle(exchange);
-            }
+            HttpHandler handler = byMethod.get(
+                exchange.getRequestMethod().toUpperCase(Locale.ROOT));
+            (handler == null ? otherwise : handler).handle(exchange);
         };
     }
 
@@ -178,6 +206,46 @@ final class HttpRouting {
      */
     static HttpHandler unavailable(String message) {
         return exchange -> sendError(exchange, 503, message);
+    }
+
+    /**
+     * Refuses a request that names a namespace this route cannot serve.
+     *
+     * <p>{@value GraphTenants#NAMESPACE_HEADER} scopes a request to one tenant's graph. A node
+     * holds one corpus, so the routes over the corpus - query, documents, erasure, reindex,
+     * compaction and the statistics drawn from them - have no namespace to switch to. Reading
+     * the header, ignoring it and answering from the shared index is the one outcome that must
+     * not happen: the caller asked for tenant A, was given tenant-neutral data, and nothing in
+     * the response says which it got, so a tenancy mistake is indistinguishable from a working
+     * request. A 400 is the only answer that cannot be mistaken for isolation.</p>
+     *
+     * <p>Naming the shared namespace is accepted, because it is what these routes actually
+     * serve: a client that stamps the header on every request it makes is telling the truth,
+     * and refusing it would break that client for saying so.</p>
+     *
+     * <p>Applied beneath the {@link RequestGuard}, so an anonymous caller is answered 401 before
+     * this is reached and cannot use a header to learn which routes exist.</p>
+     *
+     * @param delegate The handler for a request that names no namespace
+     * @return A handler that refuses a foreign namespace and otherwise delegates
+     */
+    static HttpHandler refusingNamespace(HttpHandler delegate) {
+        Objects.requireNonNull(delegate, "delegate cannot be null");
+        return exchange -> {
+            String named = exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER);
+            if (named == null || named.isBlank()
+                || SHARED_NAMESPACE.equalsIgnoreCase(named.trim())) {
+                delegate.handle(exchange);
+                return;
+            }
+            // The name the caller sent is deliberately not echoed. It is attacker-controlled
+            // text on a path that answers before any other validation, and naming the header
+            // is what the caller needs to fix the request.
+            sendError(exchange, 400, GraphTenants.NAMESPACE_HEADER + " named a namespace, and "
+                + "this route serves the shared corpus rather than any one namespace. "
+                + "Namespaces are honoured on the /v1/graph/* routes; remove the header or "
+                + "set it to '" + SHARED_NAMESPACE + "'.");
+        };
     }
 
     /**

@@ -20,6 +20,8 @@ import excalibur.shard.allocator.VolumeManager;
 import io.excalibur.config.Config;
 import io.excalibur.config.ConfigLoader;
 import io.excalibur.config.ConfigValidation;
+import io.excalibur.config.ShardConfig;
+import io.excalibur.core.memory.ForeignMemoryBootstrap;
 import io.excalibur.metrics.Metrics;
 import io.excalibur.metrics.MetricsRegistry;
 import io.excalibur.store.StorageEngine;
@@ -74,6 +76,12 @@ public final class ExcaliburApplication {
      * Default configuration file path.
      */
     public static final String DEFAULT_CONFIG_PATH = "excalibur.properties";
+
+    /** Exit code when the command line could not be understood, as in {@code excalibur-fsck}. */
+    private static final int EXIT_USAGE = 2;
+
+    /** Exit code when the server could not start, or failed while running. */
+    private static final int EXIT_FAILED = 1;
 
     /**
      * Default data directory for storage.
@@ -156,19 +164,85 @@ public final class ExcaliburApplication {
      * @param args Command-line arguments
      */
     public static void main(String[] args) {
+        // First, while the process is still single-threaded. Two threads reaching
+        // java.lang.foreign for the first time at the same instant deadlock the JVM on its
+        // class-initialization monitors, and no timeout or interrupt can break that - the
+        // server would hang rather than fail. Once the classes are initialized the race has
+        // nothing left to lose.
+        ForeignMemoryBootstrap.ensureInitialized();
+
+        if (isHelpRequest(args)) {
+            System.out.print(usage());
+            return;
+        }
+
+        ConfigSource configSource;
+        try {
+            configSource = configSource(args);
+        } catch (IllegalArgumentException e) {
+            // Before the logging bridge and before anything is opened: a line the server
+            // cannot read is a line it must not act on part of.
+            System.err.println("excalibur: " + e.getMessage());
+            System.err.println();
+            System.err.print(usage());
+            System.exit(EXIT_USAGE);
+            return;
+        }
+
         routeStorageEngineLogsToTheConfiguredAppender();
         try {
-            // Parse command-line arguments
-            String configPath = parseConfigPath(args);
-
-            // Create and run the application
-            ExcaliburApplication app = new ExcaliburApplication(configPath);
+            ExcaliburApplication app = new ExcaliburApplication(configSource);
             app.run();
-
         } catch (Exception e) {
             LOGGER.error("Failed to start ExcaliburDB: {}", e.getMessage(), e);
-            System.exit(1);
+            System.exit(EXIT_FAILED);
         }
+    }
+
+    /**
+     * Reports whether the line is asking how to start the server rather than starting it.
+     *
+     * <p>Recognised anywhere on the line. {@code excalibur --config node.properties --help}
+     * is a half-typed command, and the one outcome the operator did not ask for is a
+     * database running on that file.</p>
+     *
+     * @param args Command-line arguments
+     * @return true if help was asked for
+     */
+    static boolean isHelpRequest(String[] args) {
+        for (String arg : args) {
+            if (arg.equals("--help") || arg.equals("-h") || arg.equals("help")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns the usage text.
+     *
+     * @return How to start the server
+     */
+    static String usage() {
+        return """
+            Usage: excalibur [--config <file>]
+
+            Starts an ExcaliburDB node. Settings not named in the file take their documented
+            defaults, and any of them can be overridden by an EXCALIBUR_<SECTION>_<NAME>
+            environment variable.
+
+            Options:
+              --config, -c <file>  Read settings from this file. Also accepted as
+                                   --config=<file>. Without it the server reads
+                                   %s from the working directory if it is
+                                   there, and starts on the packaged defaults if it is not.
+              --help, -h           Print this and do nothing else.
+
+            Exit codes:
+              0  the server stopped cleanly
+              1  the server could not start, or failed while running
+              2  the command line was wrong
+            """.formatted(DEFAULT_CONFIG_PATH);
     }
 
     /**
@@ -193,31 +267,80 @@ public final class ExcaliburApplication {
     }
 
     /**
-     * Parses the --config argument from command-line arguments.
+     * Where the configuration is read from, and whether the operator chose it.
+     *
+     * <p>The distinction decides what an unreadable file means. A path the operator typed is a
+     * statement about where this node's settings live, and falling back from it starts a
+     * different node than the one asked for. The default name is not a statement: running with
+     * no properties file at all is supported, so its absence has to stay non-fatal.</p>
+     *
+     * @param path  The file to read
+     * @param named Whether it came from {@code --config} rather than from the default
+     */
+    record ConfigSource(String path, boolean named) {
+    }
+
+    /**
+     * Reads the {@code --config} argument, if there is one.
      *
      * @param args Command-line arguments
-     * @return The configuration file path, or default if not specified
+     * @return The path the operator named, or the default nobody chose
      */
-    private static String parseConfigPath(String[] args) {
-        for (int i = 0; i < args.length - 1; i++) {
-            if ("--config".equals(args[i]) || "-c".equals(args[i])) {
-                return args[i + 1];
+    static ConfigSource configSource(String[] args) {
+        String named = null;
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
+            if (arg.startsWith("--config=")) {
+                named = requireValue(arg, arg.substring("--config=".length()), named);
+                continue;
             }
+            if (!"--config".equals(arg) && !"-c".equals(arg)) {
+                throw new IllegalArgumentException("unknown argument: " + arg);
+            }
+            if (i + 1 >= args.length) {
+                throw new IllegalArgumentException(arg + " needs the path of a settings file");
+            }
+            named = requireValue(arg, args[++i], named);
         }
-        return DEFAULT_CONFIG_PATH;
+        return named != null
+            ? new ConfigSource(named, true)
+            : new ConfigSource(DEFAULT_CONFIG_PATH, false);
+    }
+
+    /**
+     * Accepts one settings file and refuses a second, or an empty one.
+     *
+     * <p>Two {@code --config} arguments are a line whose author disagrees with themselves,
+     * and whichever one this method preferred would be the wrong half of the time.</p>
+     *
+     * @param flag    The argument that carried the value, for the message
+     * @param value   The path given
+     * @param already What an earlier argument already named, or null
+     * @return The path
+     * @throws IllegalArgumentException if the value is empty or a second one was given
+     */
+    private static String requireValue(String flag, String value, String already) {
+        if (value.isEmpty()) {
+            throw new IllegalArgumentException(flag + " needs the path of a settings file");
+        }
+        if (already != null) {
+            throw new IllegalArgumentException(
+                "a node reads one settings file; got both " + already + " and " + value);
+        }
+        return value;
     }
 
     /**
      * Creates a new ExcaliburApplication with the specified configuration.
      *
-     * @param configPath Path to the configuration file
+     * @param configSource Where the configuration is read from
      * @throws IOException if configuration cannot be loaded or initialization fails
      */
-    public ExcaliburApplication(String configPath) throws IOException {
+    public ExcaliburApplication(ConfigSource configSource) throws IOException {
         LOGGER.info("Starting ExcaliburDB...");
 
         // Load configuration
-        this.config = loadConfiguration(configPath);
+        this.config = loadConfiguration(configSource);
 
         // Initialize metrics registry and register JMX MBeans
         // This enables observability for query latency, queue depth, coverage, etc.
@@ -233,7 +356,7 @@ public final class ExcaliburApplication {
         Metrics.setEstimatedCoverage(0.0);
         Metrics.recordEpoch(0);
 
-        // Initialize HNSW config factory from Config.Shard settings
+        // Initialize HNSW config factory from ShardConfig settings
         // This ensures property file values (efConstruction, efSearch) are used for HNSW graphs
         this.hnswConfigFactory = HnswConfigFactory.fromShardConfig(config.shard());
         LOGGER.info("HNSW config factory initialized: efConstruction={}, efSearch={}",
@@ -306,20 +429,31 @@ public final class ExcaliburApplication {
      * their allowed ranges. If validation fails, an IllegalStateException is
      * thrown and the application will not start.</p>
      *
-     * @param configPath Path to configuration file
+     * @param source Where the configuration is read from
      * @return Loaded configuration
-     * @throws IOException if file cannot be read
+     * @throws IOException if a file the operator named cannot be read
      * @throws IllegalStateException if configuration validation fails
      */
-    private Config loadConfiguration(String configPath) throws IOException {
+    static Config loadConfiguration(ConfigSource source) throws IOException {
+        String configPath = source.path();
         LOGGER.info("Loading configuration from: {}", configPath);
 
         Config cfg;
         try {
             cfg = ConfigLoader.load(configPath, System.getenv());
         } catch (IOException e) {
-            LOGGER.warn("Could not load configuration file: {}. Using defaults.", e.getMessage());
-            // Create default configuration
+            // A path the operator typed is not a suggestion. Starting on the packaged defaults
+            // instead gives a node with no allowed ingest roots, the shipped index tuning and a
+            // loopback bind - one that comes up, reports itself healthy, and is configured by
+            // nobody. That is harder to diagnose than not starting, which is the same argument
+            // ListenPort makes for refusing a port it cannot parse.
+            if (source.named()) {
+                throw new IOException("Configuration file named on the command line could not be"
+                    + " read: " + configPath + ". Refusing to start on the packaged defaults,"
+                    + " which would run a node this deployment did not configure.", e);
+            }
+            LOGGER.warn("No configuration file at the default path {}; using defaults. {}",
+                configPath, e.getMessage());
             cfg = new Config(configPath, System.getenv(), new java.util.HashMap<>());
             // ConfigLoader does this on the path it owns; this path bypasses it, and the
             // environment can carry the same typo a file can.
@@ -330,7 +464,7 @@ public final class ExcaliburApplication {
         // The excalibur.api.* half, which the config module deliberately does not judge because
         // nothing there reads those keys. They are this node's rate limits and request bounds,
         // and a typo in one is a policy the operator believes is in force and is not.
-        excalibur.api.security.ApiConfigKeys.reportUnrecognised(cfg.getEffectiveProperties());
+        excalibur.api.bootstrap.ApiConfigKeys.reportUnrecognised(cfg.getEffectiveProperties());
 
         // Validate configuration - validation failures are fatal
         // Do NOT catch IllegalStateException - let it propagate to main() which calls System.exit(1)
@@ -407,17 +541,6 @@ public final class ExcaliburApplication {
     private void configureReindexer() {
         LOGGER.info("Configuring document reindexer...");
 
-        // Reindexing re-embeds every chunk it rewrites, so it needs the same embedding endpoint
-        // ingestion used. A node that does not embed its corpus has nothing for this to do that
-        // would not contradict the way its index was built.
-        if (!excalibur.api.bootstrap.RetrievalCapabilities.from(config.llm()).embedCorpus()) {
-            LOGGER.warn("This node does not embed its corpus, so POST /v1/reindex will answer "
-                + "503: reindexing re-embeds what it rewrites. Set excalibur.llm.api-key (or "
-                + "EXCALIBUR_LLM_API_KEY), and leave excalibur.llm.embeddings-enabled at its "
-                + "default, to enable it.");
-            return;
-        }
-
         DocumentReindexer reindexer = ReindexerFactory.create(
             config,
             storageEngine,
@@ -468,12 +591,19 @@ public final class ExcaliburApplication {
         // the chunk index the pipeline opened.
         registerDocumentErasure(srv);
 
+        // The same registry the erasure service resolves documents through, read-only. It is
+        // the only thing that knows which documents this node holds, and every id an erasure
+        // request needs had to come from somewhere.
+        srv.withDocumentRegistry(documentVisibilityTracker.getRegistry());
+
         // Both graph routes, whether or not a graph exists yet: a node that has ingested and not
         // built needs the build route, and one that builds later must start answering without a
         // restart.
         srv.withGraphSupport(graphTenants);
         LOGGER.info("Graph-RAG endpoints registered: /v1/graph/query, /v1/graph/build, "
-            + "/v1/graph/erasure ({} namespace(s) open)", graphTenants.openCount());
+            + "/v1/graph/build/status, /v1/graph/erasure, /v1/graph/namespaces "
+            + "({} namespace(s) open)",
+            graphTenants.openCount());
 
         LOGGER.info("HTTP server created");
         return srv;
@@ -650,7 +780,7 @@ public final class ExcaliburApplication {
      * Gets the HNSW configuration factory.
      *
      * <p>This factory creates {@link io.excalibur.vector.hnsw.HnswConfig} instances
-     * configured with values from the Config.Shard settings:</p>
+     * configured with values from the ShardConfig settings:</p>
      * <ul>
      *   <li>{@code excalibur.shard.default-ef-construction} - efConstruction parameter</li>
      *   <li>{@code excalibur.shard.default-ef-search} - efSearch parameter</li>

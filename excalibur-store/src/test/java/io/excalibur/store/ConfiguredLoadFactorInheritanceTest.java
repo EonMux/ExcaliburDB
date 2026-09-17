@@ -57,6 +57,11 @@ class ConfiguredLoadFactorInheritanceTest {
                 .as("the split published its children")
                 .isTrue();
 
+            // The callback runs in the middle of the split, and this arena closes at the end of
+            // the block: without draining the requested split first, the rest of it would be
+            // reading and writing memory that is being unmapped underneath it.
+            worker.stop();
+
             assertThat(left.get().loadFactorThreshold()).isEqualTo(CONFIGURED);
             assertThat(right.get().loadFactorThreshold()).isEqualTo(CONFIGURED);
         }
@@ -88,6 +93,10 @@ class ConfiguredLoadFactorInheritanceTest {
             assertThat(swapped.await(30, TimeUnit.SECONDS))
                 .as("compaction swapped in a replacement")
                 .isTrue();
+
+            // Same reason as above: the swap is not the end of the rewrite, and stop() is what
+            // waits for the rest of it before this arena goes away.
+            worker.stop();
 
             assertThat(replacement.get().loadFactorThreshold()).isEqualTo(CONFIGURED);
         }

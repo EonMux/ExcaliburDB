@@ -7,6 +7,11 @@ import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.mcp.Json;
 
 import io.excalibur.config.Config;
+import io.excalibur.graph.dictionary.LabelDictionaryWriter;
+import io.excalibur.graph.provenance.Provenance;
+import io.excalibur.graph.provenance.SourceType;
+import io.excalibur.graph.staging.ExtractedTriple;
+import io.excalibur.graph.staging.GraphStagingStore;
 import io.excalibur.tenancy.MappingBudget;
 
 import org.junit.jupiter.api.AfterEach;
@@ -25,6 +30,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -391,5 +397,140 @@ class GraphErasureEndpointTest {
                 .as("a namespace that could escape its directory must not fall back to shared")
                 .isEqualTo(400);
         }
+    }
+
+    @Nested
+    @DisplayName("naming a person rather than an integer")
+    class ByName {
+
+        /** A term of the person's name, as the segment files hold it. */
+        private static final String NAME_TERM = "quazzlethorpe";
+
+        /** Stages one person's facts and prose in the shared namespace and builds the graph. */
+        private int buildSharedGraph() throws IOException {
+            GraphStagingStore staging = tenants.shared().staging();
+            int ada = staging.entityIdOf("Ada Quazzlethorpe");
+            staging.append(ExtractedTriple.alwaysValid("Ada Quazzlethorpe", "knows",
+                "Bob Ordinary", new Provenance(SourceType.DOCUMENT, 42, 90, 1)));
+            staging.appendEntityText(ada, "Ada Quazzlethorpe designed the engine",
+                new Provenance(SourceType.DOCUMENT, 42, 90, 1));
+            staging.flush();
+            assertThat(tenants.shared().buildService().build().published()).isTrue();
+            return ada;
+        }
+
+        @Test
+        @DisplayName("an entity named rather than numbered is erased from the served graph")
+        void aNamedEntityIsErased() throws IOException {
+            // The id is internal and nothing hands one out, so requiring it meant "erase
+            // everything about this person" could only be asked by somebody who had already
+            // seen them in an answer and read the id out of its free text.
+            Path directory = tenants.shared().directory();
+            buildSharedGraph();
+            assertThat(anyFileContains(directory, NAME_TERM)).isTrue();
+
+            Response response = post(
+                "{\"scope\": \"entity\", \"entity_name\": \"Ada Quazzlethorpe\", "
+                    + "\"compact\": true}");
+
+            assertThat(response.status()).isEqualTo(202);
+            assertThat(Json.at(response.json(), "requests_satisfied")).isEqualTo(1L);
+            assertThat(anyFileContains(directory, NAME_TERM))
+                .as("the person the caller named is the person whose bytes went")
+                .isFalse();
+        }
+
+        @Test
+        @DisplayName("the name is matched exactly, not the way a search would match it")
+        void aPartialNameResolvesToNobody() throws IOException {
+            buildSharedGraph();
+
+            Response response = post(
+                "{\"scope\": \"entity\", \"entity_name\": \"Quazzlethorpe\"}");
+
+            assertThat(response.status())
+                .as("an erasure that accepted near matches would erase the wrong person")
+                .isEqualTo(404);
+            assertThat(Json.stringAt(response.json(), "error")).contains("Quazzlethorpe");
+        }
+
+        @Test
+        @DisplayName("a name is resolved before the graph has ever been built")
+        void aStagedNameResolves() throws IOException {
+            GraphStagingStore staging = tenants.shared().staging();
+            staging.entityIdOf("Ada Quazzlethorpe");
+            staging.flush();
+
+            Response response = post(
+                "{\"scope\": \"entity\", \"entity_name\": \"ada quazzlethorpe\"}");
+
+            assertThat(response.status())
+                .as("an obligation about somebody whose facts are staged is just as real")
+                .isEqualTo(202);
+            assertThat(Json.at(response.json(), "accepted")).isEqualTo(Boolean.TRUE);
+        }
+
+        @Test
+        @DisplayName("a name two entities share is refused with the ids to choose between")
+        void anAmbiguousNameIsRefused() throws IOException {
+            // A graph built before a name was re-interned serves the old id under it while
+            // staging has assigned a new one. Picking either would be erasing somebody on a
+            // guess, so the caller is handed both and asked which.
+            int ada = buildSharedGraph();
+            new LabelDictionaryWriter()
+                .put(ada, "Ada Quazzlethorpe")
+                .put(ada + 50, "Ada Quazzlethorpe")
+                .write(tenants.shared().directory(), "entities");
+
+            Response response = post(
+                "{\"scope\": \"entity\", \"entity_name\": \"Ada Quazzlethorpe\"}");
+
+            assertThat(response.status()).isEqualTo(409);
+            assertThat(Json.at(response.json(), "candidates"))
+                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.LIST)
+                .hasSize(2);
+        }
+
+        @Test
+        @DisplayName("a name and an id together are refused rather than reconciled")
+        void bothIsRefused() throws IOException {
+            Response response = post(
+                "{\"scope\": \"entity\", \"entity_id\": 3, \"entity_name\": \"Ada\"}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(Json.stringAt(response.json(), "error")).contains("not both");
+        }
+
+        @Test
+        @DisplayName("neither a name nor an id names nobody, and says so")
+        void neitherIsRefused() throws IOException {
+            Response response = post("{\"scope\": \"entity\"}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(Json.stringAt(response.json(), "error")).contains("entity_name");
+        }
+    }
+
+    /** Whether any file at or under {@code root} holds {@code text} as bytes. */
+    private static boolean anyFileContains(Path root, String text) throws IOException {
+        byte[] needle = text.getBytes(StandardCharsets.UTF_8);
+        if (!Files.exists(root)) {
+            return false;
+        }
+        try (var walk = Files.walk(root)) {
+            for (Path path : walk.filter(Files::isRegularFile).toList()) {
+                byte[] haystack = Files.readAllBytes(path);
+                outer:
+                for (int i = 0; i + needle.length <= haystack.length; i++) {
+                    for (int j = 0; j < needle.length; j++) {
+                        if (haystack[i + j] != needle[j]) {
+                            continue outer;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 }

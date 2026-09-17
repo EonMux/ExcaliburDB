@@ -1,6 +1,6 @@
 package excalibur.llm.client;
 
-import io.excalibur.config.Config;
+import io.excalibur.config.LlmConfig;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -303,7 +303,7 @@ public final class LLMClientConfig {
      * Creates an LLMClientConfig from the application configuration.
      *
      * <p>This adapter method bridges the properties file configuration
-     * ({@link Config.Llm}) to the runtime LLM client configuration.
+     * ({@link LlmConfig}) to the runtime LLM client configuration.
      * It maps all configuration values from the properties file to
      * the corresponding fields in LLMClientConfig.</p>
      *
@@ -315,7 +315,7 @@ public final class LLMClientConfig {
      * @return A new LLMClientConfig instance with values from the config
      * @throws NullPointerException if llmConfig is null
      */
-    public static LLMClientConfig fromConfig(Config.Llm llmConfig) {
+    public static LLMClientConfig fromConfig(LlmConfig llmConfig) {
         Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
 
         return builder()

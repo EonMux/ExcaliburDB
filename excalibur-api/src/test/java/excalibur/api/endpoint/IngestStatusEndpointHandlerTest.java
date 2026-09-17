@@ -126,6 +126,26 @@ class IngestStatusEndpointHandlerTest {
     class BodyShape {
 
         @Test
+        @DisplayName("the status says when the source last did anything")
+        void theStatusCarriesATime() throws IOException {
+            long before = System.currentTimeMillis();
+            IngestStatusEndpoint.InMemoryIngestionStatusRegistry registry = registryWith();
+            registry.getOrCreate("my-docs").update("crawling", 0.5, 10, 10);
+
+            Response response = call(new IngestStatusEndpoint(registry),
+                "GET", "/v1/ingest/status?source_id=my-docs");
+
+            Object timestamp = Json.at(response.json(), "last_updated_ms");
+            assertThat(timestamp)
+                .as("an idle source with no time on it cannot be told from one crawled "
+                    + "a minute ago, so 'is the index following the source?' is unanswerable")
+                .isNotNull();
+            assertThat(((Number) timestamp).longValue())
+                .isGreaterThanOrEqualTo(before)
+                .isLessThanOrEqualTo(System.currentTimeMillis());
+        }
+
+        @Test
         @DisplayName("with no source_id every source is listed")
         void allSourcesAreListed() throws IOException {
             IngestStatusEndpoint.InMemoryIngestionStatusRegistry registry = registryWith("a", "b", "c");

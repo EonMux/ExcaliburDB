@@ -1,5 +1,6 @@
 package excalibur.filter.lsh;
 
+import io.excalibur.core.integrity.IntegrityReport;
 import io.excalibur.core.mapped.MappedFile;
 
 import java.io.IOException;
@@ -26,25 +27,27 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * <h2>Memory Layout</h2>
  * <p>The hash table is stored in a memory-mapped file with the following layout:</p>
  * <pre>
- * HEADER (56 bytes):
+ * HEADER (128 bytes in version 3, 56 in version 2):
  *   [0:4]   Magic (0x4C534854 "LSHT")
- *   [4:8]   Version (2)
+ *   [4:8]   Version (3)
  *   [8:12]  NumBits
  *   [12:16] Dimensions
  *   [16:24] Seed
  *   [24:32] EntryCount
  *   [32:40] BucketCount
  *   [40:48] BucketDirectoryCapacity
- *   [48:56] EntryStorageOffset
+ *   [48:56] EntryStorageEnd - the bump allocator's cursor, the end of live entry storage
+ *   [56:128] Integrity block, version 3 only; see {@link LshHashTableIntegrity}
  *
- * BUCKET DIRECTORY (starting at offset 56):
+ * BUCKET DIRECTORY (starting immediately behind the header):
  *   Array of BucketEntry (24 bytes each):
  *   [0:8]   Hash value
  *   [8:16]  EntryOffset (absolute file offset of the first entry, 0 if empty)
  *   [16:20] EntryCount (number of entries in this bucket)
  *   [20:24] Reserved (padding)
  *
- * ENTRY STORAGE (starting at EntryStorageOffset):
+ * ENTRY STORAGE (starting immediately behind the bucket directory, ending at
+ * EntryStorageEnd):
  *   Variable-length entry list per bucket:
  *   [0:8]   EntryId
  *   [8:16]  NextEntryOffset (absolute file offset, 0 if last in bucket)
@@ -73,13 +76,22 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public class LshHashTable implements AutoCloseable {
 
     /** Magic number for file validation. */
-    private static final int MAGIC = 0x4C534854; // "LSHT" in ASCII
+    static final int MAGIC = 0x4C534854; // "LSHT" in ASCII
 
-    /** Current file format version. */
-    private static final int VERSION = 2;
+    /**
+     * Current file format version. Version 3 added the integrity block described on
+     * {@link LshHashTableIntegrity} and moved the bucket directory from offset 56 to 128.
+     */
+    static final int VERSION = 3;
 
-    /** Header size in bytes. */
-    static final int HEADER_SIZE = 56;
+    /** The version written before the header carried checksums. */
+    static final int VERSION_WITHOUT_CHECKSUM = 2;
+
+    /** Header size in bytes, and the offset the bucket directory starts at, in this version. */
+    static final int HEADER_SIZE = 128;
+
+    /** Header size in bytes of a version 1 or 2 file. */
+    static final int HEADER_SIZE_V2 = 56;
 
     // Header field offsets
     static final int OFFSET_MAGIC = 0;
@@ -90,6 +102,15 @@ public class LshHashTable implements AutoCloseable {
     static final int OFFSET_ENTRY_COUNT = 24;
     static final int OFFSET_BUCKET_COUNT = 32;
     static final int OFFSET_BUCKET_DIR_CAPACITY = 40;
+    /**
+     * Where the bump allocator's cursor lives: the offset entry storage currently ends at.
+     *
+     * <p>The end rather than the start. The start is not stored anywhere, because it is
+     * always {@code bucketDirOffset + bucketDirCapacity * BUCKET_ENTRY_SIZE} and both of
+     * those are in the header already - whereas the end is the one thing about the table's
+     * layout that cannot be derived, and a reopen that restores the allocator to the wrong
+     * place writes new records over the records already there.</p>
+     */
     static final int OFFSET_ENTRY_STORAGE_OFFSET = 48;
 
     /** Size of each bucket directory entry in bytes. */
@@ -118,9 +139,6 @@ public class LshHashTable implements AutoCloseable {
     /** Load factor threshold for growing bucket directory. */
     private static final float LOAD_FACTOR_THRESHOLD = 0.7f;
 
-    /** Chunk size used when relocating the entry-storage region. */
-    private static final int RELOCATION_CHUNK_SIZE = 8192;
-
     /** Value layouts for memory access. */
     private static final ValueLayout.OfInt INT_LAYOUT =
         ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
@@ -142,6 +160,15 @@ public class LshHashTable implements AutoCloseable {
 
     /** Random seed used for hash function. */
     private final long seed;
+
+    /**
+     * Where the bucket directory starts in the backing file.
+     *
+     * <p>Fixed by the file's format version, not by this build: a version 2 file keeps its
+     * directory at 56 and a version 3 file at 128. Reading one at the other's offset walks
+     * bucket rows as entry records, which is why this is carried per table.</p>
+     */
+    private final long bucketDirOffset;
 
     /** The memory-mapped file backing this hash table. */
     private MappedFile mappedFile;
@@ -167,12 +194,30 @@ public class LshHashTable implements AutoCloseable {
      * @param seed       Random seed for hash function
      */
     public LshHashTable(int dimensions, int numBits, long seed) {
+        this(dimensions, numBits, seed, HEADER_SIZE);
+    }
+
+    /**
+     * Creates a new in-memory LshHashTable laid out for a given format version.
+     *
+     * <p>The directory offset is a parameter rather than a constant because a table built to
+     * receive a copy of another table's image must be laid out the way that image is: a
+     * version 2 image copied over a version 3 layout puts the copy's bucket rows where this
+     * table looks for entry records, and every query comes back empty.</p>
+     *
+     * @param dimensions      Vector dimensionality
+     * @param numBits         Number of hash bits
+     * @param seed            Random seed for hash function
+     * @param bucketDirOffset Where the bucket directory starts, fixed by the format version
+     */
+    private LshHashTable(int dimensions, int numBits, long seed, long bucketDirOffset) {
         this.numBits = numBits;
         this.dimensions = dimensions;
         this.seed = seed;
         this.hashFunction = new RandomHyperplaneHash(dimensions, numBits, seed);
         this.probeGenerator = new MultiProbeGenerator(numBits);
         this.ownsMappedFile = true;
+        this.bucketDirOffset = bucketDirOffset;
 
         // Create a temporary file for memory-mapped storage
         try {
@@ -215,28 +260,66 @@ public class LshHashTable implements AutoCloseable {
         this.ownsMappedFile = true;
 
         boolean fileExists = java.nio.file.Files.exists(path) && java.nio.file.Files.size(path) > 0;
+        this.bucketDirOffset = fileExists ? bucketDirOffsetOf(path) : HEADER_SIZE;
 
         // Never map less than the file already holds: a short mapping hides the tail, and the
-        // next extend() would truncate the file back down to the mapped length.
-        long requestedSize = initialSize > 0 ? initialSize : DEFAULT_INITIAL_SIZE;
+        // next extend() would truncate the file back down to the mapped length. Never map
+        // less than an empty table needs either: a caller asking for less than the bucket
+        // directory occupies gets a table whose first insert probes past the end of its own
+        // mapping, and whose header describes a layout the file cannot hold.
+        long requestedSize = Math.max(initialSize > 0 ? initialSize : DEFAULT_INITIAL_SIZE,
+            calculateInitialEntryStorageOffset());
         long size = fileExists ? Math.max(requestedSize, java.nio.file.Files.size(path)) : requestedSize;
         this.mappedFile = MappedFile.create(path, size);
 
         if (fileExists) {
-            // Read existing header
-            validateHeader();
+            // Read existing header, and refuse a damaged one before the bucket directory is
+            // walked. A table that has rotted drops candidates silently, and a short answer
+            // is indistinguishable from a correct one.
+            LshHashTableIntegrity.requireIntact(
+                mappedFile.segment(), path, validateHeader(), bucketDirOffset);
             // Rebuild the hash function from the persisted seed. Hashing with the
             // caller's seed instead would send every vector to a different bucket
             // than the one holding its entries, silently emptying every query.
             this.seed = mappedFile.segment().get(LONG_LAYOUT, OFFSET_SEED);
             this.hashFunction = new RandomHyperplaneHash(dimensions, numBits, this.seed);
             this.entryStorageOffset = new AtomicLong(readEntryStorageOffset());
+            breakSeal();
         } else {
             // Initialize new file
             this.seed = seed;
             this.hashFunction = new RandomHyperplaneHash(dimensions, numBits, seed);
             this.entryStorageOffset = new AtomicLong(calculateInitialEntryStorageOffset());
             initializeHeader();
+        }
+    }
+
+    /**
+     * Reads the format version out of an existing table file to place its bucket directory.
+     *
+     * <p>Read from the file rather than assumed, and before the mapping is made: the version
+     * decides where every bucket row is, so guessing it would misparse the whole table.</p>
+     *
+     * @param path An existing table file
+     * @return The offset its bucket directory starts at
+     * @throws IOException if the file cannot be read, or is not a table this build knows
+     */
+    private static long bucketDirOffsetOf(Path path) throws IOException {
+        try (java.nio.channels.FileChannel channel =
+                java.nio.channels.FileChannel.open(path, java.nio.file.StandardOpenOption.READ)) {
+            java.nio.ByteBuffer probe = java.nio.ByteBuffer.allocate(Integer.BYTES * 2)
+                .order(ByteOrder.LITTLE_ENDIAN);
+            while (probe.hasRemaining()) {
+                if (channel.read(probe, probe.position()) < 0) {
+                    throw new IOException("LSH table file " + path + " is too short to hold a "
+                        + "header: " + channel.size() + " bytes");
+                }
+            }
+            if (probe.getInt(OFFSET_MAGIC) != MAGIC) {
+                throw new IOException("LSH table file " + path
+                    + " does not start with the table magic number");
+            }
+            return LshTableHeader.bucketDirOffsetFor(probe.getInt(OFFSET_VERSION));
         }
     }
 
@@ -284,19 +367,22 @@ public class LshHashTable implements AutoCloseable {
         this.mappedFile = mappedFile;
         this.ownsMappedFile = ownsMappedFile;
 
-        if (mappedFile.size() < HEADER_SIZE) {
+        if (mappedFile.size() < HEADER_SIZE_V2) {
             throw new IllegalArgumentException("MappedFile too small for LSH hash table");
         }
+        this.bucketDirOffset = LshTableHeader.bucketDirOffsetFor(
+            mappedFile.segment().get(INT_LAYOUT, OFFSET_VERSION));
 
-        validateHeader();
+        requireIntact(validateHeader());
         this.entryStorageOffset = new AtomicLong(readEntryStorageOffset());
+        breakSeal();
     }
 
     /**
      * Calculates the initial entry storage offset based on header and initial bucket capacity.
      */
     private long calculateInitialEntryStorageOffset() {
-        return HEADER_SIZE + (long) INITIAL_BUCKET_CAPACITY * BUCKET_ENTRY_SIZE;
+        return bucketDirOffset + (long) INITIAL_BUCKET_CAPACITY * BUCKET_ENTRY_SIZE;
     }
 
     /**
@@ -316,6 +402,9 @@ public class LshHashTable implements AutoCloseable {
             segment.set(LONG_LAYOUT, OFFSET_BUCKET_COUNT, 0L);
             segment.set(LONG_LAYOUT, OFFSET_BUCKET_DIR_CAPACITY, INITIAL_BUCKET_CAPACITY);
             segment.set(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET, entryStorageOffset.get());
+            if (bucketDirOffset == HEADER_SIZE) {
+                LshHashTableIntegrity.markOpen(segment);
+            }
 
         } finally {
             lock.writeLock().unlock();
@@ -325,9 +414,10 @@ public class LshHashTable implements AutoCloseable {
     /**
      * Validates the header of an existing hash table file.
      *
+     * @return The format version the file is written at
      * @throws IllegalArgumentException if the header is invalid
      */
-    private void validateHeader() {
+    private int validateHeader() {
         lock.readLock().lock();
         try {
             MemorySegment segment = mappedFile.segment();
@@ -340,7 +430,7 @@ public class LshHashTable implements AutoCloseable {
             }
 
             int version = segment.get(INT_LAYOUT, OFFSET_VERSION);
-            if (version != VERSION) {
+            if (!LshTableHeader.isSupportedVersion(version)) {
                 throw new IllegalArgumentException(
                     "Unsupported version: " + version + " (expected " + VERSION + ")");
             }
@@ -357,13 +447,14 @@ public class LshHashTable implements AutoCloseable {
                     "Dimensions mismatch: " + storedDimensions + " (expected " + dimensions + ")");
             }
 
+            return version;
         } finally {
             lock.readLock().unlock();
         }
     }
 
     /**
-     * Reads the entry storage offset from the header.
+     * Reads the allocator cursor - the end of live entry storage - from the header.
      */
     private long readEntryStorageOffset() {
         MemorySegment segment = mappedFile.segment();
@@ -465,7 +556,7 @@ public class LshHashTable implements AutoCloseable {
         // Linear probe to find the bucket
         for (int i = 0; i < bucketDirCapacity; i++) {
             int index = (int) ((startIndex + i) % bucketDirCapacity);
-            long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
+            long bucketOffset = bucketDirOffset + (long) index * BUCKET_ENTRY_SIZE;
 
             long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
             int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
@@ -522,168 +613,15 @@ public class LshHashTable implements AutoCloseable {
     }
 
     /**
-     * Grows the bucket directory by doubling its capacity.
+     * Doubles the bucket directory, moving the entry-storage region out of its way.
      *
-     * <p>The entry-storage region starts immediately behind the directory, so doubling
-     * the directory relocates it. Bucket-to-entry and entry-to-next links are absolute
-     * file offsets, therefore every one of them is rebased by the relocation delta. Skipping
-     * the rebase would leave every chain pointing into the rewritten directory, where the
-     * walk in {@link #collectEntriesFromBucket} would read bucket rows as entry records.</p>
+     * <p>The write lock must be held: the file describes no valid table between the first
+     * write of the move and the last. See {@link BucketDirectoryGrowth} for what the move
+     * has to repair.</p>
      */
     private void growBucketDirectory() throws IOException {
-        MemorySegment segment = mappedFile.segment();
-        long oldCapacity = segment.get(LONG_LAYOUT, OFFSET_BUCKET_DIR_CAPACITY);
-        long newCapacity = oldCapacity * 2;
-
-        long oldEntryStorageOffset = segment.get(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET);
-        long entryStorageSize = entryStorageOffset.get() - oldEntryStorageOffset;
-
-        long newEntryStorageOffset = HEADER_SIZE + newCapacity * BUCKET_ENTRY_SIZE;
-        long relocationDelta = newEntryStorageOffset - oldEntryStorageOffset;
-        long newFileSize = newEntryStorageOffset + entryStorageSize + DEFAULT_INITIAL_SIZE;
-
-        // Snapshot the directory before anything moves.
-        BucketSnapshot snapshot = snapshotBuckets(segment, oldCapacity);
-
-        // Extend only when the mapping is genuinely too small: allocateEntry() grows the
-        // file in doublings, so it is frequently already large enough, and MappedFile.extend()
-        // rejects a negative extension.
-        if (newFileSize > mappedFile.size()) {
-            mappedFile.extend(newFileSize - mappedFile.size());
-            segment = mappedFile.segment(); // extend() remaps; the previous segment is dead
-        }
-
-        if (entryStorageSize > 0) {
-            relocateEntryStorage(segment, oldEntryStorageOffset, newEntryStorageOffset, entryStorageSize);
-            rebaseEntryLinks(segment, newEntryStorageOffset, entryStorageSize, relocationDelta);
-        }
-
-        // Update entry storage offset
-        entryStorageOffset.set(newEntryStorageOffset + entryStorageSize);
-
-        // Update header
-        segment.set(LONG_LAYOUT, OFFSET_BUCKET_DIR_CAPACITY, newCapacity);
-        segment.set(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET, newEntryStorageOffset);
-
-        // Rehash all buckets
-        rehashBuckets(segment, snapshot, newCapacity, relocationDelta);
-    }
-
-    /**
-     * The bucket directory rows captured before a relocation.
-     */
-    private record BucketSnapshot(long[] hashes, long[] entryOffsets, int[] entryCounts) {
-    }
-
-    /**
-     * Copies the bucket directory into heap arrays so the relocation and the rewrite of the
-     * enlarged directory cannot destroy the rows still to be re-inserted.
-     */
-    private static BucketSnapshot snapshotBuckets(MemorySegment segment, long capacity) {
-        long[] hashes = new long[(int) capacity];
-        long[] entryOffsets = new long[(int) capacity];
-        int[] entryCounts = new int[(int) capacity];
-
-        for (int i = 0; i < capacity; i++) {
-            long bucketOffset = HEADER_SIZE + (long) i * BUCKET_ENTRY_SIZE;
-            hashes[i] = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
-            entryOffsets[i] = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
-            entryCounts[i] = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
-        }
-
-        return new BucketSnapshot(hashes, entryOffsets, entryCounts);
-    }
-
-    /**
-     * Moves the entry-storage region to a higher offset.
-     *
-     * <p>Source and destination overlap whenever the directory grows by less than the size
-     * of the region, so the copy runs from the high end downwards and never writes over
-     * bytes it has not read yet.</p>
-     *
-     * @param fromOffset Current start of the region
-     * @param toOffset   New start of the region; must not be below {@code fromOffset}
-     * @param size       Region size in bytes
-     */
-    private static void relocateEntryStorage(MemorySegment segment, long fromOffset,
-                                             long toOffset, long size) {
-        byte[] buffer = new byte[(int) Math.min(size, RELOCATION_CHUNK_SIZE)];
-        long copied = 0;
-
-        while (copied < size) {
-            int chunkSize = (int) Math.min(buffer.length, size - copied);
-            long readOffset = fromOffset + size - copied - chunkSize;
-            long writeOffset = toOffset + size - copied - chunkSize;
-
-            MemorySegment.copy(segment, BYTE_LAYOUT, readOffset, buffer, 0, chunkSize);
-            MemorySegment.copy(buffer, 0, segment, BYTE_LAYOUT, writeOffset, chunkSize);
-            copied += chunkSize;
-        }
-    }
-
-    /**
-     * Adds the relocation delta to every non-zero next-entry link inside the relocated region.
-     * Records are fixed size and densely bump-allocated, so the region can be walked directly.
-     */
-    private static void rebaseEntryLinks(MemorySegment segment, long regionOffset,
-                                         long regionSize, long delta) {
-        long regionEnd = regionOffset + regionSize;
-
-        for (long offset = regionOffset; offset + ENTRY_SIZE <= regionEnd; offset += ENTRY_SIZE) {
-            long next = segment.get(LONG_LAYOUT, offset + ENTRY_NEXT_OFFSET);
-            if (next != 0) {
-                segment.set(LONG_LAYOUT, offset + ENTRY_NEXT_OFFSET, next + delta);
-            }
-        }
-    }
-
-    /**
-     * Rehashes the snapshotted buckets into the enlarged directory.
-     *
-     * <p>Chain heads are rebased by the same delta the entry region moved by. Slots that were
-     * emptied by deletion are dropped rather than re-inserted, which compacts the directory
-     * and shortens every probe run; the header bucket count is recomputed to match.</p>
-     */
-    private static void rehashBuckets(MemorySegment segment, BucketSnapshot snapshot,
-                                      long newCapacity, long relocationDelta) {
-        // Clear all buckets
-        for (int i = 0; i < newCapacity; i++) {
-            long bucketOffset = HEADER_SIZE + (long) i * BUCKET_ENTRY_SIZE;
-            segment.set(LONG_LAYOUT, bucketOffset + BUCKET_HASH, 0L);
-            segment.set(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET, 0L);
-            segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, 0);
-        }
-
-        long occupied = 0;
-
-        // Re-insert non-empty buckets
-        for (int i = 0; i < snapshot.entryCounts().length; i++) {
-            if (snapshot.entryCounts()[i] <= 0) {
-                continue;
-            }
-
-            long hash = snapshot.hashes()[i];
-            long entryOffset = snapshot.entryOffsets()[i];
-            long rebasedEntryOffset = entryOffset == 0 ? 0 : entryOffset + relocationDelta;
-            int newIndex = (int) ((hash & 0x7FFFFFFFFFFFFFFFL) % newCapacity);
-
-            // Linear probe to find empty slot
-            for (int j = 0; j < newCapacity; j++) {
-                int index = (int) ((newIndex + j) % newCapacity);
-                long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
-                int count = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
-
-                if (count == 0) {
-                    segment.set(LONG_LAYOUT, bucketOffset + BUCKET_HASH, hash);
-                    segment.set(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET, rebasedEntryOffset);
-                    segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, snapshot.entryCounts()[i]);
-                    occupied++;
-                    break;
-                }
-            }
-        }
-
-        segment.set(LONG_LAYOUT, OFFSET_BUCKET_COUNT, occupied);
+        entryStorageOffset.set(BucketDirectoryGrowth.doubleCapacity(
+            mappedFile, bucketDirOffset, entryStorageOffset.get(), DEFAULT_INITIAL_SIZE));
     }
 
     /**
@@ -701,7 +639,55 @@ public class LshHashTable implements AutoCloseable {
             mappedFile.extend(newSize - mappedFile.size());
         }
 
+        // Allocating is not complete until the cursor is durable. It is the only record of
+        // where entry storage ends, nothing else in the file implies it, and a reopen that
+        // restores it from anywhere else hands the next insert an offset on top of a record
+        // already written there. Stamped after the extend, because extend() installs a new
+        // mapping and closes the arena behind any segment captured before it.
+        mappedFile.segment().set(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET, requiredSize);
+
         return offset;
+    }
+
+    /**
+     * The most records a chain may visit before it is provably not a chain.
+     *
+     * <p>Every link is an absolute file offset. Damage that never reaches a checksum - a
+     * version 2 file, a file a crash left unsealed, a growth step interrupted halfway - can
+     * point one of them back into the chain, and an unbounded walk over that does not return
+     * wrong results, it does not return at all: the query thread spins holding the read
+     * lock, and the next close() waits on it for good. The entry region cannot hold more
+     * records than this, so a walk that passes the bound is following a cycle.</p>
+     *
+     * @param segment The table's mapping
+     * @return The bound, in records
+     */
+    private long chainLimit(MemorySegment segment) {
+        long capacity = segment.get(LONG_LAYOUT, OFFSET_BUCKET_DIR_CAPACITY);
+        long regionStart = bucketDirOffset + capacity * BUCKET_ENTRY_SIZE;
+        return Math.max(0, (segment.byteSize() - regionStart) / ENTRY_SIZE);
+    }
+
+    /**
+     * Follows one link of a bucket's entry chain, refusing a chain that cannot be honest.
+     *
+     * @param segment     The table's mapping
+     * @param entryOffset The record the chain is at
+     * @param visited     How many records the walk has already passed
+     * @param limit       The bound from {@link #chainLimit(MemorySegment)}
+     * @return The next record's offset, or 0 at the end of the chain
+     * @throws IllegalStateException if the walk has passed the bound
+     */
+    private long nextInChain(MemorySegment segment, long entryOffset, long visited,
+                             long limit) {
+        if (visited >= limit) {
+            throw new IllegalStateException("LSH table " + path() + " has a bucket chain "
+                + "longer than the " + limit + " records its entry region can hold, so the "
+                + "chain loops back on itself. The table is corrupt; the query is refused "
+                + "rather than left to spin on it. Restore the file from a backup or "
+                + "reindex this shard.");
+        }
+        return segment.get(LONG_LAYOUT, entryOffset + ENTRY_NEXT_OFFSET);
     }
 
     /**
@@ -763,7 +749,7 @@ public class LshHashTable implements AutoCloseable {
         // Linear probe to find the bucket
         for (int i = 0; i < bucketDirCapacity; i++) {
             int index = (int) ((startIndex + i) % bucketDirCapacity);
-            long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
+            long bucketOffset = bucketDirOffset + (long) index * BUCKET_ENTRY_SIZE;
 
             long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
             int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
@@ -777,6 +763,8 @@ public class LshHashTable implements AutoCloseable {
             if (bucketHash == hash) {
                 // Found bucket - collect all entries
                 long entryOffset = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
+                long limit = chainLimit(segment);
+                long visited = 0;
 
                 while (entryOffset != 0) {
                     byte tombstone = segment.get(BYTE_LAYOUT, entryOffset + ENTRY_TOMBSTONE);
@@ -785,7 +773,7 @@ public class LshHashTable implements AutoCloseable {
                         candidates.add(entryId);
                     }
 
-                    entryOffset = segment.get(LONG_LAYOUT, entryOffset + ENTRY_NEXT_OFFSET);
+                    entryOffset = nextInChain(segment, entryOffset, visited++, limit);
                 }
 
                 return;
@@ -840,10 +828,11 @@ public class LshHashTable implements AutoCloseable {
             long bucketCount = segment.get(LONG_LAYOUT, OFFSET_BUCKET_COUNT);
             boolean found = false;
             int deletedCount = 0;
+            long limit = chainLimit(segment);
 
             // Scan all buckets
             for (int i = 0; i < bucketDirCapacity; i++) {
-                long bucketOffset = HEADER_SIZE + (long) i * BUCKET_ENTRY_SIZE;
+                long bucketOffset = bucketDirOffset + (long) i * BUCKET_ENTRY_SIZE;
                 int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
 
                 if (bucketEntryCount == 0) {
@@ -851,6 +840,7 @@ public class LshHashTable implements AutoCloseable {
                 }
 
                 long entryOffset = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
+                long visited = 0;
 
                 while (entryOffset != 0) {
                     byte tombstone = segment.get(BYTE_LAYOUT, entryOffset + ENTRY_TOMBSTONE);
@@ -873,7 +863,7 @@ public class LshHashTable implements AutoCloseable {
                         }
                     }
 
-                    entryOffset = segment.get(LONG_LAYOUT, entryOffset + ENTRY_NEXT_OFFSET);
+                    entryOffset = nextInChain(segment, entryOffset, visited++, limit);
                 }
             }
 
@@ -914,7 +904,7 @@ public class LshHashTable implements AutoCloseable {
             // Linear probe to find the bucket
             for (int i = 0; i < bucketDirCapacity; i++) {
                 int index = (int) ((startIndex + i) % bucketDirCapacity);
-                long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
+                long bucketOffset = bucketDirOffset + (long) index * BUCKET_ENTRY_SIZE;
 
                 long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
                 int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
@@ -926,6 +916,8 @@ public class LshHashTable implements AutoCloseable {
                 if (bucketHash == hash) {
                     // Found bucket - search for entry
                     long entryOffset = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
+                    long limit = chainLimit(segment);
+                    long visited = 0;
 
                     while (entryOffset != 0) {
                         byte tombstone = segment.get(BYTE_LAYOUT, entryOffset + ENTRY_TOMBSTONE);
@@ -952,7 +944,7 @@ public class LshHashTable implements AutoCloseable {
                             return true;
                         }
 
-                        entryOffset = segment.get(LONG_LAYOUT, entryOffset + ENTRY_NEXT_OFFSET);
+                        entryOffset = nextInChain(segment, entryOffset, visited++, limit);
                     }
 
                     return false;
@@ -982,7 +974,7 @@ public class LshHashTable implements AutoCloseable {
 
             for (int i = 0; i < bucketDirCapacity; i++) {
                 int index = (int) ((startIndex + i) % bucketDirCapacity);
-                long bucketOffset = HEADER_SIZE + (long) index * BUCKET_ENTRY_SIZE;
+                long bucketOffset = bucketDirOffset + (long) index * BUCKET_ENTRY_SIZE;
 
                 long bucketHash = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_HASH);
                 int bucketEntryCount = segment.get(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT);
@@ -993,6 +985,8 @@ public class LshHashTable implements AutoCloseable {
 
                 if (bucketHash == hash) {
                     long entryOffset = segment.get(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET);
+                    long limit = chainLimit(segment);
+                    long visited = 0;
 
                     while (entryOffset != 0) {
                         byte tombstone = segment.get(BYTE_LAYOUT, entryOffset + ENTRY_TOMBSTONE);
@@ -1002,7 +996,7 @@ public class LshHashTable implements AutoCloseable {
                             return true;
                         }
 
-                        entryOffset = segment.get(LONG_LAYOUT, entryOffset + ENTRY_NEXT_OFFSET);
+                        entryOffset = nextInChain(segment, entryOffset, visited++, limit);
                     }
 
                     return false;
@@ -1087,7 +1081,7 @@ public class LshHashTable implements AutoCloseable {
             // Clear bucket directory
             long bucketDirCapacity = segment.get(LONG_LAYOUT, OFFSET_BUCKET_DIR_CAPACITY);
             for (int i = 0; i < bucketDirCapacity; i++) {
-                long bucketOffset = HEADER_SIZE + (long) i * BUCKET_ENTRY_SIZE;
+                long bucketOffset = bucketDirOffset + (long) i * BUCKET_ENTRY_SIZE;
                 segment.set(LONG_LAYOUT, bucketOffset + BUCKET_HASH, 0L);
                 segment.set(LONG_LAYOUT, bucketOffset + BUCKET_ENTRY_OFFSET, 0L);
                 segment.set(INT_LAYOUT, bucketOffset + BUCKET_ENTRY_COUNT, 0);
@@ -1096,7 +1090,7 @@ public class LshHashTable implements AutoCloseable {
             // Restart the bump allocator behind the CURRENT directory. The directory may
             // have been grown past its initial capacity, and resetting to the initial end
             // would hand out entry offsets that land on top of live directory slots.
-            long entryStorageBase = HEADER_SIZE + bucketDirCapacity * BUCKET_ENTRY_SIZE;
+            long entryStorageBase = bucketDirOffset + bucketDirCapacity * BUCKET_ENTRY_SIZE;
             entryStorageOffset.set(entryStorageBase);
             segment.set(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET, entryStorageBase);
 
@@ -1131,7 +1125,16 @@ public class LshHashTable implements AutoCloseable {
             }
             closed = true;
 
-            if (mappedFile != null && ownsMappedFile) {
+            if (mappedFile == null || mappedFile.isClosed()) {
+                return;
+            }
+            // Sealing is not tied to ownership, because breaking the seal is not either.
+            // Attaching to a mapping this table does not own still marks the file open, so
+            // walking away without re-sealing leaves it reported unsealed for good - the
+            // borrower downgrades a file it was only reading. Whoever broke it restores it;
+            // only the close of the mapping itself belongs to the owner.
+            sealIntegrity();
+            if (ownsMappedFile) {
                 mappedFile.close();
             }
         } finally {
@@ -1146,6 +1149,72 @@ public class LshHashTable implements AutoCloseable {
      */
     public boolean isClosed() {
         return closed;
+    }
+
+    /**
+     * Verifies a table file on disk without mapping it or attaching a table to it.
+     *
+     * <p>The checking entry point for this format. It reads the header and streams the bucket
+     * directory and entry storage past a digest, so a file too damaged to serve can still be
+     * judged - which is what a checking tool needs and what an open cannot offer.</p>
+     *
+     * @param path The table file to verify
+     * @return What the check concluded, including whether the file carries a checksum at all
+     * @throws NullPointerException if path is null
+     */
+    public static IntegrityReport verifyIntegrity(Path path) {
+        return LshHashTableIntegrity.verify(path);
+    }
+
+    /**
+     * Refuses a mapping whose stored checksums no longer describe it.
+     *
+     * @param version The format version read from the header
+     * @throws IllegalArgumentException wrapping the refusal, because the constructors that
+     *         reach this point cannot declare a checked exception
+     */
+    private void requireIntact(int version) {
+        try {
+            LshHashTableIntegrity.requireIntact(
+                mappedFile.segment(), mappedFile.path(), version, bucketDirOffset);
+        } catch (IOException e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Records that this process is writing to the table, so its stored checksums lapse.
+     *
+     * <p>Once per attach rather than on every insert: an insert touches a bucket row, an
+     * entry record and three counters, and a checksum cannot be held current against that.
+     * A table left open is reported unsealed rather than intact.</p>
+     */
+    private void breakSeal() {
+        if (bucketDirOffset != HEADER_SIZE || mappedFile == null || mappedFile.isReadOnly()) {
+            return;
+        }
+        LshHashTableIntegrity.markOpen(mappedFile.segment());
+
+        // Forced while the mapping is still clean, so the cleared seal cannot reach storage
+        // after the writes it disclaims. A crash in that window would leave a sound table
+        // claiming a checksum it no longer matches, which the next open would refuse.
+        mappedFile.flush();
+    }
+
+    /**
+     * Covers the table with checksums a later open can check.
+     *
+     * <p>On close rather than on flush. Sealing digests the whole live region, and flush runs
+     * on the ingestion path, so sealing there would put a full pass over the table into every
+     * batch. A version 2 file is left alone: it has no integrity block, and writing one now
+     * would vouch for bytes that have never been covered by a checksum.</p>
+     */
+    private void sealIntegrity() {
+        if (bucketDirOffset != HEADER_SIZE || mappedFile.isReadOnly()) {
+            return;
+        }
+        LshHashTableIntegrity.seal(
+            mappedFile.segment(), bucketDirOffset, entryStorageOffset.get());
     }
 
     /**
@@ -1189,6 +1258,9 @@ public class LshHashTable implements AutoCloseable {
             long size = entryStorageOffset.get();
             MemorySegment dest = arena.allocate(size);
             MemorySegment.copy(source, 0, dest, 0, size);
+            if (bucketDirOffset == HEADER_SIZE) {
+                LshHashTableIntegrity.seal(dest, bucketDirOffset, size);
+            }
             return dest;
         } finally {
             lock.readLock().unlock();
@@ -1206,59 +1278,57 @@ public class LshHashTable implements AutoCloseable {
         if (segment == null) {
             throw new IllegalArgumentException("segment cannot be null");
         }
-        if (segment.byteSize() < HEADER_SIZE) {
-            throw new IllegalArgumentException(
-                "Segment too small: " + segment.byteSize() + " < " + HEADER_SIZE);
-        }
+        LshTableHeader header = LshTableHeader.read(segment);
 
-        // Read header
-        int magic = segment.get(INT_LAYOUT, OFFSET_MAGIC);
-        if (magic != MAGIC) {
-            throw new IllegalArgumentException(
-                "Invalid magic number: 0x" + Integer.toHexString(magic));
-        }
-
-        int version = segment.get(INT_LAYOUT, OFFSET_VERSION);
-        if (version != VERSION && version != 1) {
-            throw new IllegalArgumentException(
-                "Unsupported version: " + version);
-        }
-
-        int numBits = segment.get(INT_LAYOUT, OFFSET_NUM_BITS);
-        int dimensions = segment.get(INT_LAYOUT, OFFSET_DIMENSIONS);
-        long seed = segment.get(LONG_LAYOUT, OFFSET_SEED);
-
-        // Create new table
-        LshHashTable table = new LshHashTable(dimensions, numBits, seed);
-
-        // Copy data
-        table.lock.writeLock().lock();
+        // The image toMemorySegment writes is sealed. Checking that seal here is what makes
+        // writing it worth anything: without this, a flipped byte round-trips accepted and
+        // the checksum is decoration.
         try {
-            MemorySegment dest = table.mappedFile.segment();
+            LshHashTableIntegrity.requireIntact(
+                segment, null, header.version(), header.bucketDirOffset());
+        } catch (IOException e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
 
-            // Ensure destination is large enough
-            if (dest.byteSize() < segment.byteSize()) {
-                table.mappedFile.extend(segment.byteSize() - dest.byteSize());
-                dest = table.mappedFile.segment();
+        // Laid out the way the source is, not the way this build writes: the copy below
+        // lands the source's bucket directory at the source's offset, and a destination
+        // that looks for it anywhere else reads bucket rows out of nothing.
+        LshHashTable table = new LshHashTable(header.dimensions(), header.numBits(),
+            header.seed(), header.bucketDirOffset());
+        table.copyImageIn(segment);
+        return table;
+    }
+
+    /**
+     * Overwrites this table with an image laid out the way this table is.
+     *
+     * @param source The image to copy in
+     * @throws RuntimeException if the backing file cannot be grown to hold the image
+     */
+    private void copyImageIn(MemorySegment source) {
+        lock.writeLock().lock();
+        try {
+            MemorySegment dest = mappedFile.segment();
+            if (dest.byteSize() < source.byteSize()) {
+                mappedFile.extend(source.byteSize() - dest.byteSize());
+                dest = mappedFile.segment();
             }
 
-            MemorySegment.copy(segment, 0, dest, 0, segment.byteSize());
+            MemorySegment.copy(source, 0, dest, 0, source.byteSize());
 
-            // Update entry storage offset
-            if (version == VERSION) {
-                table.entryStorageOffset.set(dest.get(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET));
-            } else {
-                // Version 1 format - recalculate entry storage offset
-                long entryCount = dest.get(LONG_LAYOUT, OFFSET_ENTRY_COUNT);
-                table.entryStorageOffset.set(HEADER_SIZE + entryCount * ENTRY_SIZE);
-            }
+            // The allocator cursor comes from the header, at every version. Deriving one
+            // from the entry count instead puts it inside the bucket directory, where the
+            // next insert overwrites bucket rows and turns a chain head into a cycle.
+            entryStorageOffset.set(dest.get(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET));
+
+            // This table is now live over the copy, so the seal the copy carried no longer
+            // describes it.
+            breakSeal();
         } catch (IOException e) {
             throw new RuntimeException("Failed to deserialize LSH hash table", e);
         } finally {
-            table.lock.writeLock().unlock();
+            lock.writeLock().unlock();
         }
-
-        return table;
     }
 
     /**
@@ -1285,6 +1355,12 @@ public class LshHashTable implements AutoCloseable {
             try (MappedFile newFile = MappedFile.create(path, size)) {
                 MemorySegment dest = newFile.segment();
                 MemorySegment.copy(source, 0, dest, 0, size);
+
+                // The copy is sealed, not this table: this table stays live, and a checksum
+                // over it would be stale before the next insert returns.
+                if (bucketDirOffset == HEADER_SIZE) {
+                    LshHashTableIntegrity.seal(dest, bucketDirOffset, size);
+                }
             }
         } finally {
             lock.readLock().unlock();
@@ -1304,45 +1380,27 @@ public class LshHashTable implements AutoCloseable {
         }
 
         long size = Files.size(path);
-        if (size < HEADER_SIZE) {
+        if (size < HEADER_SIZE_V2) {
             throw new IOException("File too small: " + size);
         }
 
-        // Open the file
+        // Open the file. Every failure from here on has to release it: the constructor
+        // below throws for a header this build will not accept, and an exception that
+        // escapes with the mapping still open leaks the mapping and the descriptor.
         MappedFile mappedFile = MappedFile.open(path, size);
-        MemorySegment segment = mappedFile.segment();
+        try {
+            LshTableHeader header = LshTableHeader.read(mappedFile.segment());
 
-        // Read header
-        int magic = segment.get(INT_LAYOUT, OFFSET_MAGIC);
-        if (magic != MAGIC) {
+            // The existing MappedFile is handed over: load() opened it, so the returned
+            // table owns it and close() must release the mapping and descriptor. The
+            // constructor reads the allocator cursor out of the header, at every version.
+            return new LshHashTable(mappedFile, header.dimensions(), header.numBits(),
+                header.seed(), true);
+        } catch (RuntimeException e) {
             mappedFile.close();
-            throw new IOException("Invalid magic number: 0x" + Integer.toHexString(magic));
+            throw new IOException("Cannot load " + LshHashTableIntegrity.FORMAT + " file "
+                + path + ": " + e.getMessage(), e);
         }
-
-        int version = segment.get(INT_LAYOUT, OFFSET_VERSION);
-        if (version != VERSION && version != 1) {
-            mappedFile.close();
-            throw new IOException("Unsupported version: " + version);
-        }
-
-        int numBits = segment.get(INT_LAYOUT, OFFSET_NUM_BITS);
-        int dimensions = segment.get(INT_LAYOUT, OFFSET_DIMENSIONS);
-        long seed = segment.get(LONG_LAYOUT, OFFSET_SEED);
-
-        // Create new table using the existing MappedFile. load() opened it, so the
-        // returned table owns it and close() must release the mapping and descriptor.
-        LshHashTable table = new LshHashTable(mappedFile, dimensions, numBits, seed, true);
-
-        // Read entry storage offset
-        if (version == VERSION) {
-            table.entryStorageOffset.set(segment.get(LONG_LAYOUT, OFFSET_ENTRY_STORAGE_OFFSET));
-        } else {
-            // Version 1 format - recalculate entry storage offset
-            long entryCount = segment.get(LONG_LAYOUT, OFFSET_ENTRY_COUNT);
-            table.entryStorageOffset.set(HEADER_SIZE + entryCount * ENTRY_SIZE);
-        }
-
-        return table;
     }
 
 

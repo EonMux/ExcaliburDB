@@ -131,18 +131,29 @@ public final class JsonText {
     /**
      * Extracts a string field.
      *
+     * <p>A field that is present but does not hold a string is rejected rather than read as
+     * absent, for the reason the numeric accessors reject one: the two are not the same thing
+     * and several callers act on the difference. A guard written as "the caller supplied no
+     * document ids" is defeated by document ids of the wrong type, and the request it was
+     * written to refuse goes through instead.</p>
+     *
      * @param json  The JSON document
      * @param field The field name
-     * @return The decoded value, or null when absent
+     * @return The decoded value, or null when absent or explicitly null
+     * @throws IllegalArgumentException if the field is present and is not a string
      */
     public static String string(String json, String field) {
         int start = valueStart(json, field);
-        if (start < 0 || json.charAt(start) != '"') {
+        if (start < 0 || isExplicitNull(json, start)) {
             return null;
+        }
+        if (json.charAt(start) != '"') {
+            throw new IllegalArgumentException("Field '" + field + "' must be a string");
         }
         int end = closingQuote(json, start + 1);
         if (end < 0) {
-            return null;
+            throw new IllegalArgumentException(
+                "Field '" + field + "' is a string that is never closed");
         }
         return unescape(json.substring(start + 1, end));
     }
@@ -171,33 +182,44 @@ public final class JsonText {
      *
      * @param json  The JSON document
      * @param field The field name
-     * @return The object text including braces, or null when absent
+     * @return The object text including braces, or null when absent or explicitly null
+     * @throws IllegalArgumentException if the field is present and is not a closed object
      */
     public static String object(String json, String field) {
         int start = valueStart(json, field);
-        if (start < 0 || json.charAt(start) != '{') {
+        if (start < 0 || isExplicitNull(json, start)) {
             return null;
         }
+        if (json.charAt(start) != '{') {
+            throw new IllegalArgumentException("Field '" + field + "' must be an object");
+        }
         int end = endOfContainer(json, start);
-        return end < 0 ? null : json.substring(start, end);
+        if (end < 0) {
+            throw new IllegalArgumentException(
+                "Field '" + field + "' is an object that is never closed");
+        }
+        return json.substring(start, end);
     }
 
     /**
      * Extracts an array of strings.
      *
+     * <p>An element that is not a string is refused rather than skipped. Skipping shortens the
+     * list silently: a batch of three document ids becomes a batch of two, is answered 200,
+     * and nothing in the response names the one that was dropped.</p>
+     *
      * @param json  The JSON document
      * @param field The field name
-     * @return The decoded values, or null when absent or malformed
+     * @return The decoded values, or null when absent or explicitly null
+     * @throws IllegalArgumentException if the field is present and is not a closed array of
+     *                                  strings
      */
     public static String[] stringArray(String json, String field) {
         int start = valueStart(json, field);
-        if (start < 0 || json.charAt(start) != '[') {
+        if (start < 0 || isExplicitNull(json, start)) {
             return null;
         }
-        int limit = endOfContainer(json, start);
-        if (limit < 0) {
-            return null;
-        }
+        int limit = requireArray(json, field, start);
         List<String> items = new ArrayList<>();
         int i = start + 1;
         while (i < limit) {
@@ -205,18 +227,24 @@ public final class JsonText {
             if (c == ']') {
                 return items.toArray(new String[0]);
             }
-            if (c == '"') {
-                int closeQuote = closingQuote(json, i + 1);
-                if (closeQuote < 0 || closeQuote >= limit) {
-                    return null;
-                }
-                items.add(unescape(json.substring(i + 1, closeQuote)));
-                i = closeQuote + 1;
-            } else {
+            if (isBetweenElements(c)) {
                 i++;
+                continue;
             }
+            if (c != '"') {
+                throw new IllegalArgumentException(
+                    "Field '" + field + "' must hold strings, and one element is not one");
+            }
+            int closeQuote = closingQuote(json, i + 1);
+            if (closeQuote < 0 || closeQuote >= limit) {
+                throw new IllegalArgumentException(
+                    "Field '" + field + "' holds a string that is never closed");
+            }
+            items.add(unescape(json.substring(i + 1, closeQuote)));
+            i = closeQuote + 1;
         }
-        return null;
+        throw new IllegalArgumentException(
+            "Field '" + field + "' is an array that is never closed");
     }
 
     /**
@@ -227,20 +255,22 @@ public final class JsonText {
      * to be widened for every caller. Each element is bounded by brace matching that knows about
      * strings, so a brace inside a text value does not split the array in the wrong place.</p>
      *
+     * <p>An element that is not an object is refused rather than skipped, for the reason a
+     * non-string element of a string array is.</p>
+     *
      * @param json  The JSON document
      * @param field The field name
      * @return One raw object per element, empty for an empty array, or null when the field is
-     *         absent, is not an array, or is never closed
+     *         absent or explicitly null
+     * @throws IllegalArgumentException if the field is present and is not a closed array of
+     *                                  objects
      */
     public static String[] objectArray(String json, String field) {
         int start = valueStart(json, field);
-        if (start < 0 || json.charAt(start) != '[') {
+        if (start < 0 || isExplicitNull(json, start)) {
             return null;
         }
-        int limit = endOfContainer(json, start);
-        if (limit < 0) {
-            return null;
-        }
+        int limit = requireArray(json, field, start);
         List<String> items = new ArrayList<>();
         int i = start + 1;
         while (i < limit) {
@@ -248,18 +278,66 @@ public final class JsonText {
             if (c == ']') {
                 return items.toArray(new String[0]);
             }
-            if (c == '{') {
-                int end = endOfContainer(json, i);
-                if (end < 0 || end > limit) {
-                    return null;
-                }
-                items.add(json.substring(i, end));
-                i = end;
-            } else {
+            if (isBetweenElements(c)) {
                 i++;
+                continue;
             }
+            if (c != '{') {
+                throw new IllegalArgumentException(
+                    "Field '" + field + "' must hold objects, and one element is not one");
+            }
+            int end = endOfContainer(json, i);
+            if (end < 0 || end > limit) {
+                throw new IllegalArgumentException(
+                    "Field '" + field + "' holds an object that is never closed");
+            }
+            items.add(json.substring(i, end));
+            i = end;
         }
-        return null;
+        throw new IllegalArgumentException(
+            "Field '" + field + "' is an array that is never closed");
+    }
+
+    /**
+     * Requires the value at {@code start} to be an array, and returns where it ends.
+     *
+     * @param json  The JSON document
+     * @param field The field name, for the message
+     * @param start Where its value begins
+     * @return The index just past the array
+     * @throws IllegalArgumentException if it is not an array, or is never closed
+     */
+    private static int requireArray(String json, String field, int start) {
+        if (json.charAt(start) != '[') {
+            throw new IllegalArgumentException("Field '" + field + "' must be an array");
+        }
+        int limit = endOfContainer(json, start);
+        if (limit < 0) {
+            throw new IllegalArgumentException(
+                "Field '" + field + "' is an array that is never closed");
+        }
+        return limit;
+    }
+
+    /** Whether a character separates elements rather than beginning one. */
+    private static boolean isBetweenElements(char c) {
+        return c == ',' || Character.isWhitespace(c);
+    }
+
+    /**
+     * Whether the value at {@code start} is the literal {@code null}.
+     *
+     * <p>Treated as absence everywhere, because that is what a caller means by it. Clients
+     * serialise an optional field as {@code null} rather than omitting it - it is the default
+     * of most encoders - so refusing it would turn an encoder setting into a 400 on requests
+     * that are asking for exactly what an omitted field asks for.</p>
+     *
+     * @param json  The JSON document
+     * @param start Where the value begins, or a negative index for an absent field
+     * @return true if the field carries an explicit null
+     */
+    private static boolean isExplicitNull(String json, int start) {
+        return start >= 0 && json.startsWith("null", start);
     }
 
     /**
@@ -369,7 +447,7 @@ public final class JsonText {
      */
     public static boolean booleanValue(String json, String field, boolean defaultValue) {
         int start = valueStart(json, field);
-        if (start < 0) {
+        if (start < 0 || isExplicitNull(json, start)) {
             return defaultValue;
         }
         if (json.startsWith("true", start)) {
@@ -396,7 +474,7 @@ public final class JsonText {
      */
     private static String numericToken(String json, String field, boolean fractional) {
         int start = valueStart(json, field);
-        if (start < 0) {
+        if (start < 0 || isExplicitNull(json, start)) {
             return null;
         }
         int end = start;

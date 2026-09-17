@@ -3,10 +3,12 @@ package excalibur.integration;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import excalibur.api.endpoint.HealthEndpoint;
+import excalibur.api.endpoint.ReadinessEndpoint;
 import excalibur.api.server.ExcaliburDBServer;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.VisibilityTracker;
 import io.excalibur.config.Config;
+import io.excalibur.config.HealthConfig;
 import io.excalibur.store.SegmentCatalog;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -308,7 +310,7 @@ class HealthConfigurationIntegrationTest {
     class EndToEndConfigLoading {
 
         @Test
-        @DisplayName("Config.Health has correct defaults when no properties set")
+        @DisplayName("HealthConfig has correct defaults when no properties set")
         void configHealthHasCorrectDefaults() {
             Config config = new Config(new HashMap<>());
 
@@ -319,19 +321,26 @@ class HealthConfigurationIntegrationTest {
                 .isEqualTo(HealthEndpoint.DEFAULT_HEALTHY_THRESHOLD);
             assertThat(config.health().getMaxLatencyMs())
                 .isEqualTo(HealthEndpoint.DEFAULT_MAX_LATENCY_MS);
+            assertThat(config.health().getMinFreeDiskRatio())
+                .as("the configured floor and the compiled-in one are one number, and a node "
+                    + "started without a properties file must use the same value as one with an "
+                    + "empty key")
+                .isEqualTo(ReadinessEndpoint.DEFAULT_MIN_FREE_DISK_RATIO);
         }
 
         @Test
-        @DisplayName("Config.Health parses properties correctly")
+        @DisplayName("HealthConfig parses properties correctly")
         void configHealthParsesPropertiesCorrectly() {
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.health.readiness-threshold", "0.7");
             props.put("excalibur.health.healthy-threshold", "0.95");
             props.put("excalibur.health.max-latency-ms", "3000");
+            props.put("excalibur.health.min-free-disk-ratio", "0.2");
 
             Config config = new Config(props);
 
             assertThat(config.health().getReadinessThreshold()).isEqualTo(0.7);
+            assertThat(config.health().getMinFreeDiskRatio()).isEqualTo(0.2);
             assertThat(config.health().getHealthyThreshold()).isEqualTo(0.95);
             assertThat(config.health().getMaxLatencyMs()).isEqualTo(3000);
         }

@@ -30,9 +30,10 @@ import java.util.Set;
  * </pre>
  * <p>It speaks MCP over stdin and stdout and reaches the node over HTTP; see
  * {@link ExcaliburClient} for the environment it reads. Pass {@code --print-schema} instead to
- * write the tool definitions to stdout and exit, which is the same catalogue in the form the
- * OpenAI and Anthropic function-calling APIs take - so a caller not using MCP still does not have
- * to write the schemas by hand.</p>
+ * write the tool definitions to stdout and exit. Follow it with {@code anthropic},
+ * {@code openai} or {@code mcp} to get exactly the shape that API accepts, ready to send; with
+ * no shape it writes all three under their own keys. The three are not interchangeable - see
+ * {@link FunctionSchemas} - which is why the flag names them rather than picking one.</p>
  *
  * <h2>Why stdout carries nothing else</h2>
  * <p>stdout is the protocol channel: one JSON-RPC message per line, and a single stray line of
@@ -60,6 +61,9 @@ public final class ExcaliburMcpServer {
     /** Protocol revisions this server understands. */
     public static final Set<String> SUPPORTED_PROTOCOL_VERSIONS =
         Set.of("2025-06-18", "2025-03-26", "2024-11-05");
+
+    /** The flag that writes the tool catalogue and exits instead of serving. */
+    public static final String PRINT_SCHEMA = "--print-schema";
 
     /** JSON-RPC: the message was not valid JSON. */
     public static final int PARSE_ERROR = -32700;
@@ -96,12 +100,13 @@ public final class ExcaliburMcpServer {
     /**
      * Entry point.
      *
-     * @param args {@code --print-schema} to write the tool catalogue and exit; otherwise none
+     * @param args {@code --print-schema}, optionally followed by or joined with a shape name,
+     *             to write the tool catalogue and exit; otherwise none
      * @throws IOException if stdin cannot be read
      */
     public static void main(String[] args) throws IOException {
-        if (args.length > 0 && "--print-schema".equals(args[0])) {
-            System.out.println(Json.write(Map.of("tools", McpTools.catalogue())));
+        if (args.length > 0 && args[0].startsWith(PRINT_SCHEMA)) {
+            System.exit(printSchema(args));
             return;
         }
 
@@ -119,6 +124,47 @@ public final class ExcaliburMcpServer {
         err.println("excaliburdb-mcp: serving tools against " + client.baseUri());
 
         new ExcaliburMcpServer(new McpTools(client), out, err).serve(System.in);
+    }
+
+    /**
+     * Writes the tool catalogue in the shape the caller asked for.
+     *
+     * <p>Three shapes, because the APIs that take this file disagree about how to spell a tool
+     * and each rejects the other two - see {@link FunctionSchemas}. Naming one writes just that
+     * one, ready to be sent; naming none writes all three under their own keys, which is
+     * honest about there being a choice and is what a caller piping this into {@code jq}
+     * wants.</p>
+     *
+     * <p>Both spellings of the argument work: {@code --print-schema anthropic} and
+     * {@code --print-schema=anthropic}. Someone reaching for this flag is at a shell, and
+     * having to remember which of the two this program wanted is a failure for no reason.</p>
+     *
+     * @param args The command line, whose first element opened with {@link #PRINT_SCHEMA}
+     * @return The process exit code
+     */
+    static int printSchema(String[] args) {
+        String shape = null;
+        if (args[0].length() > PRINT_SCHEMA.length()) {
+            if (args[0].charAt(PRINT_SCHEMA.length()) != '=') {
+                System.err.println("excaliburdb-mcp: unknown option " + args[0]);
+                return 1;
+            }
+            shape = args[0].substring(PRINT_SCHEMA.length() + 1);
+        } else if (args.length > 1) {
+            shape = args[1];
+        }
+
+        try {
+            System.out.println(shape == null
+                ? FunctionSchemas.allShapes()
+                : FunctionSchemas.shaped(shape));
+            return 0;
+        } catch (IllegalArgumentException e) {
+            // On stderr and with a non-zero exit, because the caller is piping stdout into an
+            // API: a usage message that went out on stdout would be sent to it as the tools.
+            System.err.println("excaliburdb-mcp: " + e.getMessage());
+            return 1;
+        }
     }
 
     /**

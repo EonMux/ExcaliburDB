@@ -16,11 +16,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * retrieval was built for: a corpus of identifiers and error codes indexed for BM25, with the chat
  * model spent on expanding the query instead of on embedding every document.</p>
  */
-@DisplayName("Config.Llm corpus embedding")
+@DisplayName("LlmConfig corpus embedding")
 class ConfigLlmEmbeddingsTest {
 
-    private static Config.Llm llm(Map<String, String> props) {
-        return new Config.Llm(new HashMap<>(props));
+    private static LlmConfig llm(Map<String, String> props) {
+        return new LlmConfig(new HashMap<>(props));
     }
 
     @Test

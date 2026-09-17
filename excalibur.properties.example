@@ -235,6 +235,12 @@ excalibur.ingest.bm25-b=0.75
 excalibur.health.readiness-threshold=0.5
 excalibur.health.healthy-threshold=0.9
 excalibur.health.max-latency-ms=5000
+# The share of volume capacity below which this node reports itself unready. Not a
+# "disk is filling up" warning - that is the volumes block on /v1/stats - but the point past
+# which the replacement segment a compaction or a rolling reindex writes can no longer be
+# relied on to fit. Raise it on volumes that need more headroom than a rewrite of the largest
+# segment; lower it on a deployment whose volumes sit deliberately full.
+excalibur.health.min-free-disk-ratio=0.05
 
 # Query Configuration
 excalibur.query.top-k-default=100
@@ -247,6 +253,30 @@ excalibur.query.threshold=0.0
 excalibur.query.include-partial-segments=true
 excalibur.query.vector-dimensions=1536
 excalibur.query.llm-timeout-ms=60000
+# What one query-expansion call is allowed, separate from the scoring call above. Expansion runs
+# before the search it expands, inside a request a caller is holding open, so it has to be bounded
+# by something smaller than the query budget rather than by the ingestion client's 60s. An
+# expansion that does not arrive in time is skipped and the query runs on the words the caller
+# actually typed, which is the answer it would have given anyway on a node with no chat model.
+excalibur.query.expansion-timeout-ms=5000
+# Whether a node that embeds its corpus also expands the BM25 half of a hybrid query. Off means
+# the vector signal carries the meaning of the question and BM25 matches the words as typed,
+# which is what a node with vectors has always done. On, the lexical half is expanded too, so it
+# contributes the same recall it would on a node with no embeddings at all - at one extra chat
+# call per query. Whether it pays depends on the corpus; excalibur-bench measures both.
+excalibur.query.expand-hybrid-queries=false
+# Whether a repeated identical query may be answered without searching again. Off: a cache is a
+# bet that the same question arrives twice before the corpus moves, and whether it pays is a
+# property of a deployment's traffic rather than something a default can know. Correctness does
+# not rest on the bet - every lookup re-reads a fingerprint of the live corpus and an entry is
+# served only to a lookup presenting the identical one - so an entry is discarded the moment
+# anything it was computed against changes. A node with no cache takes no fingerprint at all.
+excalibur.query.cache.enabled=false
+# How many answers the cache may hold. Entries, not bytes: one entry is one answer, whose result
+# list is bounded by excalibur.api.max-top-k, so the worst case is this many times that many
+# result items. 1 to 1000000; a value outside that is refused rather than clamped, because this
+# is the figure a deployment sizes its heap against.
+excalibur.query.cache.max-entries=1024
 # Whether a node holding both signals answers /v1/query from both. The BM25 index over the
 # chunks is written, compacted and erasure-swept whether or not a query reads it, so leaving
 # this on is what stops a node that has it from paying for an index it never consults. It
@@ -317,8 +347,16 @@ excalibur.shard.default-max-connections-layer0=0
 # machine on rewrites; it is 1 to 16, and a value outside that is refused at startup against the
 # property name rather than aborting the boot with a message naming no key.
 excalibur.shard.compaction-interval-ms=5000
+# How often the index registry is reconciled with the storage engine's directory. The sweep is
+# what notices a segment the engine created without announcing it, so this is the longest a new
+# segment can stay unsearchable after it appears. Lower costs a directory listing more often;
+# higher widens that window. Below the sweep's own floor it is refused rather than clamped.
+excalibur.shard.segment-sync-interval-ms=1000
 excalibur.shard.compaction-tombstone-ratio=0.2
 excalibur.shard.compaction-write-log-mb=32
+# How many segments the scheduled sweep will rewrite in one pass. They go one after another on a
+# single thread, not at once, so this bounds how long a sweep lasts rather than how much of the
+# machine it uses. POST /v1/compact is not subject to it and walks every live segment.
 excalibur.shard.compaction-max-concurrent=4
 # The same question for the vector graph, which reclaims deleted nodes by renumbering rather than
 # by rewriting a log, and is therefore asked less often.
@@ -367,3 +405,14 @@ excalibur.shard.lsh-probes=3
 # quantised pass collects per result asked for.
 excalibur.shard.pq-search-enabled=false
 excalibur.shard.pq-oversample=4
+
+# The shape every segment's codebook is trained to. A vector is split into pq-subspaces parts and
+# each part is clustered to pq-centroids centroids, so the code is one byte per subspace. More
+# subspaces means better recall and a larger index; high-dimensional embeddings need more of them
+# to keep each part small enough for that many clusters to describe. Training runs while a segment
+# is warming and nothing may query it, which is what pq-training-samples bounds - set it to 0 to
+# train on every vector the segment holds. It must be at least pq-centroids: k-means cannot fill a
+# codebook from fewer samples than it has centroids.
+excalibur.shard.pq-subspaces=8
+excalibur.shard.pq-centroids=256
+excalibur.shard.pq-training-samples=100000

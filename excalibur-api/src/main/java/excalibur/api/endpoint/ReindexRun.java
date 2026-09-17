@@ -9,6 +9,7 @@ import io.excalibur.store.SegmentCatalog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
@@ -32,6 +33,20 @@ import java.util.Objects;
  * something a caller asked for, and the two must not disagree about whether the same corpus
  * reindexed successfully.</p>
  *
+ * <h2>Cancelled is not failed</h2>
+ * <p>{@code DELETE /v1/reindex} interrupts the run thread and tells the caller to poll the
+ * status for when it has stopped. The interrupt arrives here as an exception like any other, and
+ * recording it as a failure made the one readback the route points at unable to answer the
+ * question the route was asked. Both shapes the interrupt can take are recognised: the
+ * exception, wrapped however deeply by whatever was blocked at the time, and the thread's own
+ * interrupt flag, which is what survives when the blocked call reported the interrupt by
+ * returning rather than by throwing.</p>
+ *
+ * <h2>Progress is counted, not assumed</h2>
+ * <p>What the status reports is what the reindexer says it has finished, document by document.
+ * The three constants this class used to publish instead described a run that nobody had
+ * measured, and in units - chunks, in the total - that nothing else on the route used.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe. Every field is final and the mutual exclusion that matters - one reindex per
  * source - is the caller's lease, taken before {@link #execute(String)} is reached.</p>
@@ -53,6 +68,15 @@ final class ReindexRun {
      * reason goes to the log, where it belongs; the readback says where to find it.</p>
      */
     private static final String SEE_THE_LOG = "; see the node's log for the reason";
+
+    /** Reported while the source is being listed and its changed documents worked out. */
+    private static final String STATE_CRAWLING = "crawling";
+
+    /** Reported per document on a node that turns the chunks it writes into vectors. */
+    private static final String STATE_EMBEDDING = "embedding";
+
+    /** Reported per document on a node that indexes its corpus lexically. */
+    private static final String STATE_INDEXING = "indexing";
 
     private final DocumentReindexer reindexer;
     private final SourceResolver sourceResolver;
@@ -113,7 +137,9 @@ final class ReindexRun {
                 return;
             }
 
-            statusRegistry.updateProgress(sourceId, "crawling", 0.1, 0, 0);
+            // 0.0, not an invented tenth: nothing has been counted yet, and the first thing
+            // the reindexer publishes is the size of the run.
+            statusRegistry.updateProgress(sourceId, STATE_CRAWLING, 0.0, 0, 0);
 
             boolean useRollingReplacement = volumeManager != null && segmentCatalog != null
                 && reindexer.hasRollingReplacement();
@@ -124,11 +150,99 @@ final class ReindexRun {
             }
 
         } catch (Exception e) {
+            if (wasCancelled(e)) {
+                LOGGER.info("[reindex-{}] Reindex of source {} stopped on request after {} of "
+                        + "{} document(s)", threadName, sourceId,
+                    processedSoFar(sourceId), totalSoFar(sourceId));
+                statusRegistry.cancelReindex(sourceId);
+                return;
+            }
             LOGGER.error("[reindex-{}] Reindex failed for source {}: {}",
                 threadName, sourceId, e.getMessage(), e);
             statusRegistry.failReindex(sourceId,
                 "Reindex failed (" + e.getClass().getSimpleName() + ")" + SEE_THE_LOG);
         }
+    }
+
+    /**
+     * Whether this run stopped because someone asked it to, rather than because it broke.
+     *
+     * <p>Both shapes are checked because the interrupt takes whichever the blocked call gave
+     * it. A call that threw {@link InterruptedException} cleared the flag on the way out and is
+     * findable only in the cause chain - and it may be wrapped several deep, because every
+     * layer between here and the fetch wraps what it catches. A call that was interrupted
+     * inside a channel throws {@link ClosedByInterruptException}, an {@code IOException},
+     * which no cause-chain test for {@code InterruptedException} would find. And a call that
+     * noticed the interrupt and returned without throwing leaves only the flag.</p>
+     *
+     * @param failure What ended the run
+     * @return true if the run was cancelled
+     */
+    private static boolean wasCancelled(Exception failure) {
+        if (Thread.currentThread().isInterrupted()) {
+            return true;
+        }
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof InterruptedException
+                    || cause instanceof ClosedByInterruptException) {
+                return true;
+            }
+            if (cause.getCause() == cause) {
+                // A self-referencing cause is a malformed exception chain, not a cancellation,
+                // and walking it would not terminate.
+                break;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * How many documents the run had finished with, for the log line about its cancellation.
+     *
+     * @param sourceId The source
+     * @return The count the run last published, or 0 if it published none
+     */
+    private long processedSoFar(String sourceId) {
+        ReindexEndpoint.ReindexStatus status = statusRegistry.getStatus(sourceId);
+        return status == null ? 0 : status.entriesProcessed();
+    }
+
+    /**
+     * How many documents the run was going to finish with.
+     *
+     * @param sourceId The source
+     * @return The total the run last published, or 0 if it published none
+     */
+    private long totalSoFar(String sourceId) {
+        ReindexEndpoint.ReindexStatus status = statusRegistry.getStatus(sourceId);
+        return status == null ? 0 : status.entriesTotal();
+    }
+
+    /**
+     * Builds the listener that turns the reindexer's counts into the status a caller polls.
+     *
+     * <p>The phase is settled once, from what this node can do, rather than guessed per
+     * document: a node with no embedding endpoint never enters an embedding phase, and
+     * reporting one would be reporting work it does not perform.</p>
+     *
+     * @param sourceId The source being reindexed
+     * @return The listener to hand the reindexer
+     */
+    private DocumentReindexer.ReindexProgress progressFor(String sourceId) {
+        String state = reindexer.embedsChunks() ? STATE_EMBEDDING : STATE_INDEXING;
+        return (processed, total) -> statusRegistry.updateProgress(sourceId, state,
+            fractionDone(processed, total), processed, total);
+    }
+
+    /**
+     * How far through the run is, as a fraction.
+     *
+     * @param processed Documents finished with
+     * @param total     Documents the run will finish with
+     * @return The fraction, and 1.0 for a run that found nothing to do
+     */
+    private static double fractionDone(long processed, long total) {
+        return total <= 0 ? 1.0 : (double) processed / total;
     }
 
     /**
@@ -160,13 +274,8 @@ final class ReindexRun {
         LOGGER.info("[reindex-{}] Selected volume {} for new segment of source: {}",
             threadName, volumePath, sourceId);
 
-        statusRegistry.updateProgress(sourceId, "embedding", 0.3, 0, 0);
-
         DocumentReindexer.RollingReindexResult result =
-            reindexer.reindexWithRollingReplacement(source, volumePath);
-
-        statusRegistry.updateProgress(sourceId, "indexing", 0.7, result.getDocumentsIndexed(),
-            result.getDocumentsIndexed() + result.getBasicResult().getChunksFailed());
+            reindexer.reindexWithRollingReplacement(source, volumePath, progressFor(sourceId));
 
         reportRolling(threadName, sourceId, result);
     }
@@ -218,12 +327,8 @@ final class ReindexRun {
         LOGGER.info("[reindex-{}] Using standard reindex (rolling replacement not configured) "
             + "for source: {}", threadName, sourceId);
 
-        statusRegistry.updateProgress(sourceId, "embedding", 0.3, 0, 0);
-
-        DocumentReindexer.ReindexResult result = reindexer.reindexAll(source);
-
-        statusRegistry.updateProgress(sourceId, "indexing", 0.7, result.getDocumentsIndexed(),
-            result.getDocumentsIndexed() + result.getChunksFailed());
+        DocumentReindexer.ReindexResult result =
+            reindexer.reindexAll(source, progressFor(sourceId));
 
         reportStandard(threadName, sourceId, result);
     }

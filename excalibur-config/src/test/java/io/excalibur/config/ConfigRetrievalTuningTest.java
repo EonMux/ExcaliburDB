@@ -22,16 +22,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @DisplayName("Retrieval tuning configuration")
 class ConfigRetrievalTuningTest {
 
-    private static Config.Query query(Map<String, String> props) {
-        return new Config.Query(new HashMap<>(props));
+    private static QueryConfig query(Map<String, String> props) {
+        return new QueryConfig(new HashMap<>(props));
     }
 
-    private static Config.Ingest ingest(Map<String, String> props) {
-        return new Config.Ingest(new HashMap<>(props));
+    private static IngestConfig ingest(Map<String, String> props) {
+        return new IngestConfig(new HashMap<>(props));
     }
 
-    private static Config.Graph graph(Map<String, String> props) {
-        return new Config.Graph(new HashMap<>(props));
+    private static GraphConfig graph(Map<String, String> props) {
+        return new GraphConfig(new HashMap<>(props));
     }
 
     @Nested
@@ -47,7 +47,7 @@ class ConfigRetrievalTuningTest {
         @Test
         @DisplayName("the three metrics the index can be built with are accepted")
         void acceptsEveryImplementedMetric() {
-            for (String metric : Config.Query.METRICS) {
+            for (String metric : QueryConfig.METRICS) {
                 assertThat(query(Map.of("excalibur.query.distance-metric", metric))
                     .getDistanceMetric()).isEqualTo(metric);
             }
@@ -57,7 +57,7 @@ class ConfigRetrievalTuningTest {
         @DisplayName("case and surrounding space do not change which metric is meant")
         void normalisesTheName() {
             assertThat(query(Map.of("excalibur.query.distance-metric", "  L2 "))
-                .getDistanceMetric()).isEqualTo(Config.Query.METRIC_L2);
+                .getDistanceMetric()).isEqualTo(QueryConfig.METRIC_L2);
         }
 
         @Test
@@ -81,7 +81,7 @@ class ConfigRetrievalTuningTest {
         @Test
         @DisplayName("fusion uses the published rank offset and over-fetches three deep")
         void documentedDefaults() {
-            Config.Query settings = query(Map.of());
+            QueryConfig settings = query(Map.of());
 
             assertThat(settings.getRrfK()).isEqualTo(60);
             assertThat(settings.getPerSignalOverFetch()).isEqualTo(3);
@@ -112,7 +112,7 @@ class ConfigRetrievalTuningTest {
         @Test
         @DisplayName("the defaults are the ones the method is usually published with")
         void documentedDefaults() {
-            Config.Ingest settings = ingest(Map.of());
+            IngestConfig settings = ingest(Map.of());
 
             assertThat(settings.getBm25K1()).isEqualTo(1.2);
             assertThat(settings.getBm25B()).isEqualTo(0.75);

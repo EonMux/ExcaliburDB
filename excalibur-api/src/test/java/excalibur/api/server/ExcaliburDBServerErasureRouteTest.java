@@ -1,5 +1,6 @@
 package excalibur.api.server;
 
+import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.security.ApiSecurityConfig;
 import excalibur.ingest.erasure.DocumentErasureService;
 import excalibur.ingest.registry.DocumentMetadata;
@@ -114,6 +115,27 @@ class ExcaliburDBServerErasureRouteTest {
         return call("POST", body, token);
     }
 
+    private Response postInNamespace(String body, String namespace) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) URI
+            .create("http://127.0.0.1:" + server.getPort() + "/v1/erasure")
+            .toURL().openConnection();
+        connection.setRequestMethod("POST");
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Content-Type", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + TOKEN);
+        connection.setRequestProperty(GraphTenants.NAMESPACE_HEADER, namespace);
+        try (OutputStream out = connection.getOutputStream()) {
+            out.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+        int status = connection.getResponseCode();
+        var stream = status < 400 ? connection.getInputStream() : connection.getErrorStream();
+        String responseBody = stream == null
+            ? ""
+            : new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+        connection.disconnect();
+        return new Response(status, responseBody);
+    }
+
     private Response call(String method, String body, String token) throws IOException {
         return call("/v1/erasure", method, body, token);
     }
@@ -176,6 +198,26 @@ class ExcaliburDBServerErasureRouteTest {
             .as("an unauthenticated request must not have erased anything on its way to being "
                 + "refused")
             .hasSize(1);
+    }
+
+    @Test
+    @DisplayName("a request naming a namespace is refused rather than erasing from the shared corpus")
+    void refusesANamedNamespace() throws Exception {
+        // The worst shape this mistake can take. A caller erasing "tenant-a's copy" of a
+        // document would have had the shared one removed instead, told 200, and had no way to
+        // tell - an erasure is not reversible, so being wrong here costs data that no retry
+        // brings back.
+        startWithErasure();
+        ingest("docs", "handbook.md", 2);
+
+        Response response = postInNamespace(
+            "{\"source_id\": \"docs\", \"document_id\": \"handbook.md\"}", "tenant-a");
+
+        assertThat(response.status()).isEqualTo(400);
+        assertThat(response.body()).contains(GraphTenants.NAMESPACE_HEADER);
+        assertThat(storage)
+            .as("a refused erasure must not have erased anything")
+            .hasSize(2);
     }
 
     @Test

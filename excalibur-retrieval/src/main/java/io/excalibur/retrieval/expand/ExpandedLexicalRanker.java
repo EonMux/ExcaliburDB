@@ -40,6 +40,14 @@ import java.util.Set;
  * across the clauses. One query lets the engine do what it is good at, and it is the difference
  * between expansion costing a fraction of a search and costing N of them.</p>
  *
+ * <h2>Weights</h2>
+ * <p>Boosted clauses of one boolean query sum where they overlap, so a term two formulations
+ * share is scored twice - which is right, agreement is stronger evidence than a single
+ * suggestion, and wrong the moment the sum passes the weight of a word the user actually typed.
+ * {@link ExpansionWeights} is what bounds it, over the analyzer's own tokens because those are
+ * the terms Lucene will score, and over the formulations that survive the vocabulary gate so a
+ * dropped clause does not scale down the ones that were searched.</p>
+ *
  * <h2>Degradation</h2>
  * <p>A formulation that will not parse is dropped rather than failing the search: the text came
  * from a language model, so a stray bracket or colon is an ordinary event. If every clause drops,
@@ -81,34 +89,105 @@ public final class ExpandedLexicalRanker implements Ranker {
     }
 
     /**
+     * The terms this index would look a formulation's text up by.
+     *
+     * <p>The index's own analyzer, because that is what decides which terms the dictionary
+     * holds and what a clause will score against. Splitting the text some other way asks about
+     * strings no index has - a run of CJK the analyzer indexed as bigrams, a contraction it
+     * kept whole - and every answer comes back "absent".</p>
+     *
+     * @param text One formulation's text
+     * @return Its terms, in order and including repeats, empty if the text cannot be analysed
+     */
+    private List<String> tokensOf(String text) {
+        List<String> analysed = new ArrayList<>();
+        try (TokenStream tokens = index.analyzer().tokenStream(LexicalIndex.FIELD_TEXT, text)) {
+            CharTermAttribute token = tokens.addAttribute(CharTermAttribute.class);
+            tokens.reset();
+            while (tokens.incrementToken()) {
+                analysed.add(token.toString());
+            }
+            tokens.end();
+        } catch (IOException e) {
+            // Discarded rather than returned half-read: a partial term list is a gate answer
+            // about a formulation nobody analysed, and an analyzer that cannot be read must
+            // not be the reason a query returns nothing. An empty list passes the gate.
+            LOGGER.debug("Could not analyse '{}': {}", text, e.getMessage());
+            analysed.clear();
+        }
+        return analysed;
+    }
+
+    /**
      * Whether any token of a formulation occurs in the corpus.
      *
      * <p>Any rather than all: a multi-word formulation whose head term is present is still worth
      * searching, and requiring every token would discard phrases over one incidental word.</p>
      *
-     * <p>Tokenised by the index's own analyzer, because that is what decides which terms the
-     * dictionary holds. Splitting the text some other way asks about strings no index has - a run
-     * of CJK the analyzer indexed as bigrams, a contraction it kept whole - and every answer comes
-     * back "absent", so the gate drops formulations the corpus really can match.</p>
+     * <p>A formulation that produced no tokens - because it has none, or because the analyzer
+     * could not be read - passes: a gate that cannot read must not be the reason a query
+     * returns nothing.</p>
      */
     private boolean inVocabulary(String text) {
-        boolean sawToken = false;
-        try (TokenStream tokens = index.analyzer().tokenStream(LexicalIndex.FIELD_TEXT, text)) {
-            CharTermAttribute token = tokens.addAttribute(CharTermAttribute.class);
-            tokens.reset();
-            while (tokens.incrementToken()) {
-                sawToken = true;
-                if (vocabulary.mayContain(token.toString())) {
-                    return true;
-                }
+        List<String> tokens = tokensOf(text);
+        for (String token : tokens) {
+            if (vocabulary.mayContain(token)) {
+                return true;
             }
-            tokens.end();
-        } catch (IOException e) {
-            // A gate that cannot read must not be the reason a query returns nothing.
-            return true;
         }
-        // A formulation with no searchable token at all is not evidence of anything.
-        return !sawToken;
+        return tokens.isEmpty();
+    }
+
+    /**
+     * The formulations worth searching: the user's own, and the guesses the corpus can match.
+     *
+     * <p>The user's own query is never gated and stays first: it is what was asked, not a guess
+     * about vocabulary, so a query for words the corpus lacks must still return nothing rather
+     * than silently become a different query - and the weight it carries is what every
+     * expansion is measured against.</p>
+     *
+     * @param formulations What the expander produced, the original first
+     * @return The survivors, the original still first
+     */
+    private List<SearchFormulation> inCorpus(List<SearchFormulation> formulations) {
+        List<SearchFormulation> kept = new ArrayList<>(formulations.size());
+        kept.add(formulations.get(0));
+        for (int i = 1; i < formulations.size(); i++) {
+            SearchFormulation formulation = formulations.get(i);
+            if (!inVocabulary(formulation.text())) {
+                LOGGER.debug("Dropping '{}': no term of it occurs in the corpus",
+                    formulation.text());
+                continue;
+            }
+            kept.add(formulation);
+        }
+        return kept;
+    }
+
+    /**
+     * Adds one boosted {@code SHOULD} clause per formulation.
+     *
+     * @param formulations The formulations to search, weights already bounded
+     * @param builder      The query being assembled
+     * @return How many clauses were added
+     */
+    private int boost(List<SearchFormulation> formulations, BooleanQuery.Builder builder) {
+        QueryParser parser = new QueryParser(LexicalIndex.FIELD_TEXT, index.analyzer());
+        int clauses = 0;
+        for (SearchFormulation formulation : formulations) {
+            Query parsed;
+            try {
+                parsed = parser.parse(QueryParser.escape(formulation.text()));
+            } catch (ParseException e) {
+                LOGGER.debug("Dropping unparseable formulation '{}': {}",
+                    formulation.text(), e.getMessage());
+                continue;
+            }
+            builder.add(new BoostQuery(parsed, (float) formulation.weight()),
+                BooleanClause.Occur.SHOULD);
+            clauses++;
+        }
+        return clauses;
     }
 
     @Override
@@ -127,32 +206,9 @@ public final class ExpandedLexicalRanker implements Ranker {
             return RankedList.empty(name);
         }
 
-        QueryParser parser = new QueryParser(LexicalIndex.FIELD_TEXT, index.analyzer());
         BooleanQuery.Builder builder = new BooleanQuery.Builder();
-        int clauses = 0;
-        boolean first = true;
-        for (SearchFormulation formulation : formulations) {
-            // The user's own query is never gated: it is what was asked, not a guess about
-            // vocabulary, and a query for words the corpus lacks must still return nothing
-            // rather than silently become a different query.
-            if (!first && !inVocabulary(formulation.text())) {
-                LOGGER.debug("Dropping '{}': no term of it occurs in the corpus",
-                    formulation.text());
-                continue;
-            }
-            first = false;
-            Query parsed;
-            try {
-                parsed = parser.parse(QueryParser.escape(formulation.text()));
-            } catch (ParseException e) {
-                LOGGER.debug("Dropping unparseable formulation '{}': {}",
-                    formulation.text(), e.getMessage());
-                continue;
-            }
-            builder.add(new BoostQuery(parsed, (float) formulation.weight()),
-                BooleanClause.Occur.SHOULD);
-            clauses++;
-        }
+        int clauses = boost(ExpansionWeights.bounded(inCorpus(formulations), this::tokensOf),
+            builder);
         if (clauses == 0) {
             return RankedList.empty(name);
         }

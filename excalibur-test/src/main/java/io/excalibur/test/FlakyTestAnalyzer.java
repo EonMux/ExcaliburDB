@@ -185,101 +185,71 @@ public final class FlakyTestAnalyzer {
         System.out.println("Gradle: " + gradlePath);
         System.out.println();
 
-        // Track results for each test across all runs
-        Map<String, List<TestRunResult>> testResults = new LinkedHashMap<>();
         List<RunSummary> runSummaries = new ArrayList<>();
-
         for (int run = 1; run <= runCount; run++) {
             System.out.println("--- Run " + run + "/" + runCount + " ---");
 
             RunSummary summary = runTests(run);
             runSummaries.add(summary);
 
-            // Aggregate results
+            System.out.println("  Passed: " + summary.passed() + ", Failed: " + summary.failed()
+                + ", Skipped: " + summary.skipped()
+                + ", Duration: " + summary.duration().toMillis() + "ms");
+            System.out.println();
+        }
+
+        return classify(moduleName, runSummaries, verbose);
+    }
+
+    /**
+     * Draws the verdict from runs that have already happened.
+     *
+     * <p>Separate from {@link #analyze()}, which launches Gradle {@code runCount} times to
+     * produce them. The verdict is the analyzer's whole output and the part that can be
+     * wrong in a way nobody notices - a flaky test filed as sound, or a broken one filed as
+     * flaky - and a judgement reachable only by launching a build five times is a judgement
+     * nothing tests.</p>
+     *
+     * @param moduleName   The module the runs came from, carried into the report
+     * @param runSummaries What each run found, in order
+     * @param verbose      Whether to narrate each test's tally
+     * @return What the runs say about each test
+     * @throws NullPointerException if moduleName or runSummaries is null
+     */
+    static FlakyTestReport classify(String moduleName, List<RunSummary> runSummaries,
+                                    boolean verbose) {
+        Objects.requireNonNull(moduleName, "moduleName is required");
+        Objects.requireNonNull(runSummaries, "runSummaries is required");
+
+        Map<String, List<TestRunResult>> testResults = new LinkedHashMap<>();
+        for (RunSummary summary : runSummaries) {
             for (TestRunResult result : summary.results()) {
                 testResults.computeIfAbsent(result.testName(), k -> new ArrayList<>())
                     .add(result);
             }
-
-            System.out.println("  Passed: " + summary.passed() + ", Failed: " + summary.failed() +
-                ", Skipped: " + summary.skipped() + ", Duration: " + summary.duration().toMillis() + "ms");
-            System.out.println();
         }
 
-        // Analyze for flakiness
         List<FlakyTestResult> flakyTests = new ArrayList<>();
         List<ConsistentFailure> consistentFailures = new ArrayList<>();
         List<String> alwaysPassing = new ArrayList<>();
 
         for (Map.Entry<String, List<TestRunResult>> entry : testResults.entrySet()) {
-            String testName = entry.getKey();
-            List<TestRunResult> results = entry.getValue();
-
-            int passCount = (int) results.stream().filter(TestRunResult::passed).count();
-            int failCount = (int) results.stream().filter(TestRunResult::failed).count();
-            // Only runs that actually executed the test carry a verdict. Counting SKIPPED
-            // runs here would both distort the pass rate and break the FlakyTestResult
-            // invariant passCount + failCount == totalRuns.
-            int executedRuns = passCount + failCount;
-
-            if (executedRuns == 0) {
-                // Skipped in every run - there is no evidence either way
-                if (verbose) {
-                    System.out.println("Test: " + testName + " | skipped in all " + results.size() + " runs");
-                }
-                continue;
-            }
-
-            // Calculate flakiness score (0 = consistent, 1.0 = maximally flaky)
-            double passRate = (double) passCount / executedRuns;
-            double flakinessScore = calculateFlakinessScore(passRate);
-
-            if (verbose) {
-                System.out.println("Test: " + testName +
-                    " | Passes: " + passCount + "/" + executedRuns +
-                    " | Flakiness: " + String.format("%.2f", flakinessScore));
-            }
-
-            if (flakinessScore > FLAKINESS_THRESHOLD && failCount > 0 && passCount > 0) {
-                // Flaky test - sometimes passes, sometimes fails
-                flakyTests.add(new FlakyTestResult(
-                    testName,
-                    passCount,
-                    failCount,
-                    executedRuns,
-                    flakinessScore,
-                    passRate,
-                    extractFailurePatterns(results)
-                ));
-            } else if (failCount == executedRuns) {
-                // Consistently failing
-                String errorMessage = results.stream()
-                    .filter(TestRunResult::failed)
-                    .map(TestRunResult::errorMessage)
-                    .filter(Objects::nonNull)
-                    .findFirst()
-                    .orElse("Unknown error");
-                consistentFailures.add(new ConsistentFailure(testName, executedRuns, errorMessage));
-            } else if (passCount == executedRuns) {
-                // Consistently passing
-                alwaysPassing.add(testName);
-            }
+            verdict(entry.getKey(), entry.getValue(), verbose,
+                flakyTests, consistentFailures, alwaysPassing);
         }
 
-        // Sort flaky tests by flakiness score (highest first)
+        // Triage starts at the top of the list, so the worst offender belongs there.
         flakyTests.sort(Comparator.comparingDouble(FlakyTestResult::flakinessScore).reversed());
 
-        // Categorize failures using existing FailureCategorizer
         Map<String, FailureCategory> categorizedFailures = new LinkedHashMap<>();
         for (ConsistentFailure failure : consistentFailures) {
-            FailureCategory category = FailureCategorizer.categorize(
-                failure.testName(), failure.errorMessage());
-            categorizedFailures.put(failure.testName(), category);
+            categorizedFailures.put(failure.testName(),
+                FailureCategorizer.categorize(failure.testName(), failure.errorMessage()));
         }
 
         return new FlakyTestReport(
             moduleName,
-            runCount,
+            runSummaries.size(),
             runSummaries,
             flakyTests,
             consistentFailures,
@@ -287,6 +257,61 @@ public final class FlakyTestAnalyzer {
             categorizedFailures,
             testResults
         );
+    }
+
+    /**
+     * Files one test's results under flaky, consistently failing, or sound.
+     *
+     * @param testName          The test
+     * @param results           Its result from every run, including the runs that skipped it
+     * @param verbose           Whether to narrate the tally
+     * @param flakyTests        Collects tests that both passed and failed
+     * @param consistentFailures Collects tests that never passed
+     * @param alwaysPassing     Collects tests that never failed
+     */
+    private static void verdict(String testName, List<TestRunResult> results, boolean verbose,
+                                List<FlakyTestResult> flakyTests,
+                                List<ConsistentFailure> consistentFailures,
+                                List<String> alwaysPassing) {
+        int passCount = (int) results.stream().filter(TestRunResult::passed).count();
+        int failCount = (int) results.stream().filter(TestRunResult::failed).count();
+        // Only runs that actually executed the test carry a verdict. Counting SKIPPED
+        // runs here would both distort the pass rate and break the FlakyTestResult
+        // invariant passCount + failCount == totalRuns.
+        int executedRuns = passCount + failCount;
+
+        if (executedRuns == 0) {
+            // Skipped in every run - there is no evidence either way
+            if (verbose) {
+                System.out.println("Test: " + testName + " | skipped in all "
+                    + results.size() + " runs");
+            }
+            return;
+        }
+
+        double passRate = (double) passCount / executedRuns;
+        double flakinessScore = calculateFlakinessScore(passRate);
+
+        if (verbose) {
+            System.out.println("Test: " + testName
+                + " | Passes: " + passCount + "/" + executedRuns
+                + " | Flakiness: " + String.format("%.2f", flakinessScore));
+        }
+
+        if (flakinessScore > FLAKINESS_THRESHOLD && failCount > 0 && passCount > 0) {
+            flakyTests.add(new FlakyTestResult(testName, passCount, failCount, executedRuns,
+                flakinessScore, passRate, extractFailurePatterns(results)));
+        } else if (failCount == executedRuns) {
+            String errorMessage = results.stream()
+                .filter(TestRunResult::failed)
+                .map(TestRunResult::errorMessage)
+                .filter(Objects::nonNull)
+                .findFirst()
+                .orElse("Unknown error");
+            consistentFailures.add(new ConsistentFailure(testName, executedRuns, errorMessage));
+        } else if (passCount == executedRuns) {
+            alwaysPassing.add(testName);
+        }
     }
 
     /**
@@ -298,7 +323,7 @@ public final class FlakyTestAnalyzer {
      * @param passRate The pass rate (0.0 to 1.0)
      * @return Flakiness score (0.0 to 1.0)
      */
-    private double calculateFlakinessScore(double passRate) {
+    private static double calculateFlakinessScore(double passRate) {
         // Domain correctness: clamp to valid range
         double clampedRate = Math.max(0.0, Math.min(1.0, passRate));
         // Distance from 0 or 1, scaled to [0,1]
@@ -311,7 +336,7 @@ public final class FlakyTestAnalyzer {
     /**
      * Extract common failure patterns from a list of test results.
      */
-    private List<String> extractFailurePatterns(List<TestRunResult> results) {
+    private static List<String> extractFailurePatterns(List<TestRunResult> results) {
         List<String> patterns = new ArrayList<>();
         Map<String, Integer> errorCounts = new HashMap<>();
 

@@ -530,122 +530,122 @@ class StatsEndpointTest {
         @DisplayName("validates all record constraints in one test")
         void validatesAllRecordConstraints() {
             // SegmentStats - negative values rejected
-            assertThatThrownBy(() -> new StatsEndpoint.SegmentStats(-1, 0, 0, 0, 0, 0, 0))
+            assertThatThrownBy(() -> new NodeStats.SegmentStats(-1, 0, 0, 0, 0, 0, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.SegmentStats(0, -1, 0, 0, 0, 0, 0))
+            assertThatThrownBy(() -> new NodeStats.SegmentStats(0, -1, 0, 0, 0, 0, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.SegmentStats(0, 0, 0, 0, 0, 0, 0))
+            assertThatCode(() -> new NodeStats.SegmentStats(0, 0, 0, 0, 0, 0, 0))
                 .doesNotThrowAnyException();
 
             // EntryStats - negative rejected
-            assertThatThrownBy(() -> new StatsEndpoint.EntryStats(-1))
+            assertThatThrownBy(() -> new NodeStats.EntryStats(-1))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.EntryStats(0))
+            assertThatCode(() -> new NodeStats.EntryStats(0))
                 .doesNotThrowAnyException();
 
             // VolumeStats - all fields validated
-            assertThatThrownBy(() -> new StatsEndpoint.VolumeStats(-1, 0, 0))
+            assertThatThrownBy(() -> new NodeStats.VolumeStats(-1, 0, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.VolumeStats(0, -1, 0))
+            assertThatThrownBy(() -> new NodeStats.VolumeStats(0, -1, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.VolumeStats(0, 0, -1))
+            assertThatThrownBy(() -> new NodeStats.VolumeStats(0, 0, -1))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.VolumeStats(0, 0, 0))
+            assertThatCode(() -> new NodeStats.VolumeStats(0, 0, 0))
                 .doesNotThrowAnyException();
 
             // HnswStats - all fields validated
-            assertThatThrownBy(() -> new StatsEndpoint.HnswStats(-1, 0, 0))
+            assertThatThrownBy(() -> new NodeStats.HnswStats(-1, 0, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.HnswStats(0, -1, 0))
+            assertThatThrownBy(() -> new NodeStats.HnswStats(0, -1, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.HnswStats(0, 0, -1))
+            assertThatThrownBy(() -> new NodeStats.HnswStats(0, 0, -1))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.HnswStats(0, 0, 0))
+            assertThatCode(() -> new NodeStats.HnswStats(0, 0, 0))
                 .doesNotThrowAnyException();
 
             // CuckooStats - all fields validated
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(-1, 0, 0.0, 0.0, false, 0))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(-1, 0, 0.0, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, -1, 0.0, 0.0, false, 0))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, -1, 0.0, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, -0.1, 0.0, false, 0))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, -0.1, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, -0.1, false, 0))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 0.0, -0.1, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 1.1, 0.0, false, 0))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 1.1, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 1.1, false, 0))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 0.0, 1.1, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, Double.NaN, 0.0, false, 0))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, Double.NaN, 0.0, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, Double.NaN, false, 0))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 0.0, Double.NaN, false, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0, false, 0))
+            assertThatCode(() -> new NodeStats.CuckooStats(0, 0, 0.0, 0.0, false, 0))
                 .doesNotThrowAnyException();
-            assertThatThrownBy(() -> new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0, false, -1))
+            assertThatThrownBy(() -> new NodeStats.CuckooStats(0, 0, 0.0, 0.0, false, -1))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.CuckooStats(0, 0, 1.0, 1.0, false, 0))
+            assertThatCode(() -> new NodeStats.CuckooStats(0, 0, 1.0, 1.0, false, 0))
                 .doesNotThrowAnyException();
 
             // VisibilityStats - all fields validated
-            assertThatThrownBy(() -> new StatsEndpoint.VisibilityStats(-1, 0, 0))
+            assertThatThrownBy(() -> new NodeStats.VisibilityStats(-1, 0, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.VisibilityStats(0, -1, 0))
+            assertThatThrownBy(() -> new NodeStats.VisibilityStats(0, -1, 0))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.VisibilityStats(0, 0, -1))
+            assertThatThrownBy(() -> new NodeStats.VisibilityStats(0, 0, -1))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.VisibilityStats(0, 0, 0))
+            assertThatCode(() -> new NodeStats.VisibilityStats(0, 0, 0))
                 .doesNotThrowAnyException();
         }
 
         @Test
         @DisplayName("validates SystemStats constraints")
         void validatesSystemStatsConstraints() {
-            StatsEndpoint.SegmentStats segments = new StatsEndpoint.SegmentStats(0, 0, 0, 0, 0, 0, 0);
-            StatsEndpoint.EntryStats entries = new StatsEndpoint.EntryStats(0);
-            StatsEndpoint.VolumeStats volumes = new StatsEndpoint.VolumeStats(0, 0, 0);
-            StatsEndpoint.HnswStats hnsw = new StatsEndpoint.HnswStats(0, 0, 0);
-            StatsEndpoint.CuckooStats cuckoo = new StatsEndpoint.CuckooStats(0, 0, 0.0, 0.0, false, 0);
-            StatsEndpoint.VisibilityStats visibility = new StatsEndpoint.VisibilityStats(0, 0, 0);
+            NodeStats.SegmentStats segments = new NodeStats.SegmentStats(0, 0, 0, 0, 0, 0, 0);
+            NodeStats.EntryStats entries = new NodeStats.EntryStats(0);
+            NodeStats.VolumeStats volumes = new NodeStats.VolumeStats(0, 0, 0);
+            NodeStats.HnswStats hnsw = new NodeStats.HnswStats(0, 0, 0);
+            NodeStats.CuckooStats cuckoo = new NodeStats.CuckooStats(0, 0, 0.0, 0.0, false, 0);
+            NodeStats.VisibilityStats visibility = new NodeStats.VisibilityStats(0, 0, 0);
 
             // Coverage validation
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, Double.NaN, null))
+            assertThatThrownBy(() -> new NodeStats(
+                segments, entries, volumes, hnsw, cuckoo, visibility, Double.NaN, null, null, true, null))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, -0.1, null))
+            assertThatThrownBy(() -> new NodeStats(
+                segments, entries, volumes, hnsw, cuckoo, visibility, -0.1, null, null, true, null))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 1.1, null))
+            assertThatThrownBy(() -> new NodeStats(
+                segments, entries, volumes, hnsw, cuckoo, visibility, 1.1, null, null, true, null))
                 .isInstanceOf(IllegalArgumentException.class);
-            assertThatCode(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 0.0, null))
+            assertThatCode(() -> new NodeStats(
+                segments, entries, volumes, hnsw, cuckoo, visibility, 0.0, null, null, true, null))
                 .doesNotThrowAnyException();
-            assertThatCode(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 1.0, null))
+            assertThatCode(() -> new NodeStats(
+                segments, entries, volumes, hnsw, cuckoo, visibility, 1.0, null, null, true, null))
                 .doesNotThrowAnyException();
 
             // Null validation
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                null, entries, volumes, hnsw, cuckoo, visibility, 0.5, null))
+            assertThatThrownBy(() -> new NodeStats(
+                null, entries, volumes, hnsw, cuckoo, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, null, volumes, hnsw, cuckoo, visibility, 0.5, null))
+            assertThatThrownBy(() -> new NodeStats(
+                segments, null, volumes, hnsw, cuckoo, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, null, hnsw, cuckoo, visibility, 0.5, null))
+            assertThatThrownBy(() -> new NodeStats(
+                segments, entries, null, hnsw, cuckoo, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, null, cuckoo, visibility, 0.5, null))
+            assertThatThrownBy(() -> new NodeStats(
+                segments, entries, volumes, null, cuckoo, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, null, visibility, 0.5, null))
+            assertThatThrownBy(() -> new NodeStats(
+                segments, entries, volumes, hnsw, null, visibility, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
-            assertThatThrownBy(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, null, 0.5, null))
+            assertThatThrownBy(() -> new NodeStats(
+                segments, entries, volumes, hnsw, cuckoo, null, 0.5, null, null, true, null))
                 .isInstanceOf(NullPointerException.class);
-            assertThatCode(() -> new StatsEndpoint.SystemStats(
-                segments, entries, volumes, hnsw, cuckoo, visibility, 0.5, null))
+            assertThatCode(() -> new NodeStats(
+                segments, entries, volumes, hnsw, cuckoo, visibility, 0.5, null, null, true, null))
                 .as("a node that keeps no lexical index reports no lexical block")
                 .doesNotThrowAnyException();
         }

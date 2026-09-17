@@ -1,6 +1,7 @@
 package excalibur.api.bootstrap;
 
 import io.excalibur.config.Config;
+import io.excalibur.config.GraphConfig;
 import io.excalibur.graph.dictionary.LabelDictionary;
 import io.excalibur.graph.store.MappedEdgeStore;
 import io.excalibur.planner.QueryClassifier;
@@ -147,7 +148,7 @@ public final class GraphRagFactory {
             return null;
         }
 
-        Config.Graph settings = config.graph();
+        GraphConfig settings = config.graph();
         Deque<AutoCloseable> opened = new ArrayDeque<>();
         try {
             MappedEdgeStore edges = MappedEdgeStore.open(directory);

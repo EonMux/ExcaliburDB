@@ -89,7 +89,14 @@ public final class DocumentErasureService {
     /**
      * What an erasure removed.
      *
-     * @param documentsErased     Documents this node held and no longer holds any part of
+     * @param erasedDocumentIds   The documents this node held and no longer holds any part of,
+     *                            by their id within the source. Named and not merely counted
+     *                            because the erasure of a document has a second half this
+     *                            service does not perform: the facts extracted from it are in
+     *                            the graph, addressed by a provenance id derived from the
+     *                            document's key, and a caller withdrawing those has to know
+     *                            which documents actually went. A source-scoped request never
+     *                            knew - the node chose the batch
      * @param documentsIncomplete Documents this node still holds part of: something refused to
      *                            release their content, so their registry entry was kept and the
      *                            request can be repeated
@@ -110,14 +117,24 @@ public final class DocumentErasureService {
      * @param outstanding         Erasure requests this node still owes, including this one
      * @param detail              Why the compaction ran, or why it did not
      */
-    public record Outcome(int documentsErased, int documentsIncomplete, int documentsNotFound,
-                          int documentsRemaining, int chunksTombstoned, int chunksUnindexed,
-                          int chunksNotRemoved, int chunksStillSearchable, int vectorsHidden,
-                          boolean compacted, int chunksReclaimed, int outstanding,
-                          String detail) {
+    public record Outcome(List<String> erasedDocumentIds, int documentsIncomplete,
+                          int documentsNotFound, int documentsRemaining, int chunksTombstoned,
+                          int chunksUnindexed, int chunksNotRemoved, int chunksStillSearchable,
+                          int vectorsHidden, boolean compacted, int chunksReclaimed,
+                          int outstanding, String detail) {
 
         public Outcome {
             Objects.requireNonNull(detail, "detail must not be null");
+            erasedDocumentIds = List.copyOf(erasedDocumentIds);
+        }
+
+        /**
+         * How many documents this node held and no longer holds any part of.
+         *
+         * @return The count, which is exactly what {@link #erasedDocumentIds()} lists
+         */
+        public int documentsErased() {
+            return erasedDocumentIds.size();
         }
     }
 
@@ -333,7 +350,7 @@ public final class DocumentErasureService {
 
         CompactionResult compaction = reclaim(compactNow);
         report(sourceId, removed, notFound, remaining);
-        return new Outcome(removed.documents(), removed.incomplete(),
+        return new Outcome(removed.erasedIds(), removed.incomplete(),
             notFound + removed.notFound(), remaining, removed.tombstoned(), removed.unindexed(),
             removed.notRemoved(), removed.stillSearchable(), removed.vectorsHidden(),
             compaction.performed(), compaction.documentsRemoved(), outstanding(),
@@ -374,15 +391,15 @@ public final class DocumentErasureService {
                         + "in storage and {} are still searchable, so its registry entry is kept "
                         + "and the request can be repeated",
                     documentKey, chunkIds.size(), held, searchable);
-                return new Removed(0, 1, 0, stored.removed(), lexical.erased(), held, searchable,
-                    vectors);
+                return new Removed(List.of(), 1, 0, stored.removed(), lexical.erased(), held,
+                    searchable, vectors);
             }
 
             registry.remove(sourceId, documentId);
             if (visibility != null) {
                 visibility.removeDocument(documentKey);
             }
-            return new Removed(1, 0, 0, stored.removed(), lexical.erased(), 0, 0, vectors);
+            return Removed.erased(documentId, stored.removed(), lexical.erased(), vectors);
         });
     }
 
@@ -404,7 +421,7 @@ public final class DocumentErasureService {
      * What removing documents achieved, so the reply is assembled from what happened rather than
      * from what was asked for.
      *
-     * @param documents     Documents no part of which this node still holds
+     * @param erasedIds     Documents no part of which this node still holds, by id
      * @param incomplete    Documents something refused to release, whose entries were kept
      * @param notFound      Documents that were gone before this request reached them
      * @param tombstoned    Chunks storage had and no longer has
@@ -415,15 +432,29 @@ public final class DocumentErasureService {
      *                      can be in both states and adding the two would double it
      * @param vectorsHidden Graph nodes retired
      */
-    private record Removed(int documents, int incomplete, int notFound, int tombstoned,
+    private record Removed(List<String> erasedIds, int incomplete, int notFound, int tombstoned,
                            int unindexed, int notRemoved, int stillSearchable,
                            int vectorsHidden) {
 
-        static final Removed NOTHING = new Removed(0, 0, 0, 0, 0, 0, 0, 0);
-        static final Removed NOT_FOUND = new Removed(0, 0, 1, 0, 0, 0, 0, 0);
+        static final Removed NOTHING = new Removed(List.of(), 0, 0, 0, 0, 0, 0, 0);
+        static final Removed NOT_FOUND = new Removed(List.of(), 0, 1, 0, 0, 0, 0, 0);
+
+        /** One document that came out whole. */
+        static Removed erased(String documentId, int tombstoned, int unindexed,
+                              int vectorsHidden) {
+            return new Removed(List.of(documentId), 0, 0, tombstoned, unindexed, 0, 0,
+                vectorsHidden);
+        }
+
+        int documents() {
+            return erasedIds.size();
+        }
 
         Removed and(Removed other) {
-            return new Removed(documents + other.documents, incomplete + other.incomplete,
+            List<String> ids = new ArrayList<>(erasedIds.size() + other.erasedIds.size());
+            ids.addAll(erasedIds);
+            ids.addAll(other.erasedIds);
+            return new Removed(ids, incomplete + other.incomplete,
                 notFound + other.notFound, tombstoned + other.tombstoned,
                 unindexed + other.unindexed, notRemoved + other.notRemoved,
                 stillSearchable + other.stillSearchable,

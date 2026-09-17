@@ -1,5 +1,6 @@
 package excalibur.bench.benchmark;
 
+import excalibur.bench.kernel.ScalarDistances;
 import io.excalibur.vector.distance.CosineSimilarity;
 import io.excalibur.vector.distance.InnerProduct;
 import io.excalibur.vector.distance.L2Distance;
@@ -140,107 +141,6 @@ public class DistanceVectorApiBenchmark {
         }
     }
 
-    // ==================== SCALAR IMPLEMENTATIONS ====================
-
-    /**
-     * Scalar-only cosine similarity implementation.
-     * Uses Kahan summation for numerical stability.
-     */
-    private float scalarCosineSimilarity(float[] v1, float[] v2) {
-        final int len = v1.length;
-        if (len == 0) return 0.0f;
-
-        double dotProduct = 0.0;
-        double norm1 = 0.0;
-        double norm2 = 0.0;
-
-        // Kahan summation for each accumulator
-        double dotC = 0.0, norm1C = 0.0, norm2C = 0.0;
-
-        for (int i = 0; i < len; i++) {
-            final double a = v1[i];
-            final double b = v2[i];
-
-            // Dot product
-            final double prod = a * b;
-            final double dotY = prod - dotC;
-            final double dotT = dotProduct + dotY;
-            dotC = (dotT - dotProduct) - dotY;
-            dotProduct = dotT;
-
-            // Norm 1
-            final double sq1 = a * a;
-            final double n1Y = sq1 - norm1C;
-            final double n1T = norm1 + n1Y;
-            norm1C = (n1T - norm1) - n1Y;
-            norm1 = n1T;
-
-            // Norm 2
-            final double sq2 = b * b;
-            final double n2Y = sq2 - norm2C;
-            final double n2T = norm2 + n2Y;
-            norm2C = (n2T - norm2) - n2Y;
-            norm2 = n2T;
-        }
-
-        final double normProduct = norm1 * norm2;
-        if (normProduct == 0.0) return 0.0f;
-
-        final double similarity = dotProduct / Math.sqrt(normProduct);
-        return clampToUnitRange(similarity);
-    }
-
-    /**
-     * Scalar-only L2 distance implementation.
-     */
-    private float scalarL2Distance(float[] v1, float[] v2) {
-        final int len = v1.length;
-        if (len == 0) return 0.0f;
-
-        double sum = 0.0;
-        double compensation = 0.0;
-
-        for (int i = 0; i < len; i++) {
-            final double diff = (double) v1[i] - (double) v2[i];
-            final double squared = diff * diff;
-
-            final double y = squared - compensation;
-            final double t = sum + y;
-            compensation = (t - sum) - y;
-            sum = t;
-        }
-
-        return (float) Math.sqrt(Math.max(0.0, sum));
-    }
-
-    /**
-     * Scalar-only inner product implementation.
-     */
-    private float scalarInnerProduct(float[] v1, float[] v2) {
-        final int len = v1.length;
-        if (len == 0) return 0.0f;
-
-        double sum = 0.0;
-        double compensation = 0.0;
-
-        for (int i = 0; i < len; i++) {
-            final double prod = (double) v1[i] * (double) v2[i];
-
-            final double y = prod - compensation;
-            final double t = sum + y;
-            compensation = (t - sum) - y;
-            sum = t;
-        }
-
-        return (float) sum;
-    }
-
-    private static float clampToUnitRange(double value) {
-        if (value > 1.0) return 1.0f;
-        if (value < -1.0) return -1.0f;
-        return (float) value;
-    }
-
     // ==================== COSINE SIMILARITY: SCALAR VS VECTOR API ====================
 
     /**
@@ -249,7 +149,7 @@ public class DistanceVectorApiBenchmark {
     @Benchmark
     public float cosine_scalar() {
         int idx = currentIndex++ % batchSize;
-        return scalarCosineSimilarity(vectors1[idx], vectors2[idx]);
+        return ScalarDistances.cosineSimilarity(vectors1[idx], vectors2[idx]);
     }
 
     /**
@@ -269,7 +169,7 @@ public class DistanceVectorApiBenchmark {
     @Benchmark
     public float cosine_normalized_scalar() {
         int idx = currentIndex++ % batchSize;
-        return scalarInnerProduct(normalizedVectors1[idx], normalizedVectors2[idx]);
+        return ScalarDistances.innerProduct(normalizedVectors1[idx], normalizedVectors2[idx]);
     }
 
     /**
@@ -289,7 +189,7 @@ public class DistanceVectorApiBenchmark {
     @Benchmark
     public float l2_scalar() {
         int idx = currentIndex++ % batchSize;
-        return scalarL2Distance(vectors1[idx], vectors2[idx]);
+        return ScalarDistances.l2Distance(vectors1[idx], vectors2[idx]);
     }
 
     /**
@@ -308,7 +208,7 @@ public class DistanceVectorApiBenchmark {
     @Benchmark
     public float l2Squared_scalar() {
         int idx = currentIndex++ % batchSize;
-        return scalarL2Squared(vectors1[idx], vectors2[idx]);
+        return ScalarDistances.l2Squared(vectors1[idx], vectors2[idx]);
     }
 
     /**
@@ -320,26 +220,6 @@ public class DistanceVectorApiBenchmark {
         return l2Distance.computeSquared(vectors1[idx], vectors2[idx]);
     }
 
-    private float scalarL2Squared(float[] v1, float[] v2) {
-        final int len = v1.length;
-        if (len == 0) return 0.0f;
-
-        double sum = 0.0;
-        double compensation = 0.0;
-
-        for (int i = 0; i < len; i++) {
-            final double diff = (double) v1[i] - (double) v2[i];
-            final double squared = diff * diff;
-
-            final double y = squared - compensation;
-            final double t = sum + y;
-            compensation = (t - sum) - y;
-            sum = t;
-        }
-
-        return (float) Math.max(0.0, sum);
-    }
-
     // ==================== INNER PRODUCT: SCALAR VS VECTOR API ====================
 
     /**
@@ -348,7 +228,7 @@ public class DistanceVectorApiBenchmark {
     @Benchmark
     public float innerProduct_scalar() {
         int idx = currentIndex++ % batchSize;
-        return scalarInnerProduct(vectors1[idx], vectors2[idx]);
+        return ScalarDistances.innerProduct(vectors1[idx], vectors2[idx]);
     }
 
     /**
@@ -370,7 +250,7 @@ public class DistanceVectorApiBenchmark {
         int count = 0;
         for (int i = 0; i < 100; i++) {
             int idx = i % batchSize;
-            float result = scalarCosineSimilarity(vectors1[idx], vectors2[idx]);
+            float result = ScalarDistances.cosineSimilarity(vectors1[idx], vectors2[idx]);
             bh.consume(result);
             count++;
         }
@@ -400,7 +280,7 @@ public class DistanceVectorApiBenchmark {
         int count = 0;
         for (int i = 0; i < 100; i++) {
             int idx = i % batchSize;
-            float result = scalarL2Distance(vectors1[idx], vectors2[idx]);
+            float result = ScalarDistances.l2Distance(vectors1[idx], vectors2[idx]);
             bh.consume(result);
             count++;
         }
@@ -430,7 +310,7 @@ public class DistanceVectorApiBenchmark {
         int count = 0;
         for (int i = 0; i < 100; i++) {
             int idx = i % batchSize;
-            float result = scalarInnerProduct(vectors1[idx], vectors2[idx]);
+            float result = ScalarDistances.innerProduct(vectors1[idx], vectors2[idx]);
             bh.consume(result);
             count++;
         }
@@ -465,7 +345,7 @@ public class DistanceVectorApiBenchmark {
 
         for (int i = 0; i < 100; i++) {
             int idx = (i + 1) % batchSize;
-            float distance = scalarL2Distance(query, vectors2[idx]);
+            float distance = ScalarDistances.l2Distance(query, vectors2[idx]);
             if (distance < bestDistance) {
                 bestDistance = distance;
                 bestIdx = idx;
@@ -509,7 +389,7 @@ public class DistanceVectorApiBenchmark {
 
         for (int i = 0; i < 100; i++) {
             int idx = (i + 1) % batchSize;
-            float similarity = scalarCosineSimilarity(query, vectors2[idx]);
+            float similarity = ScalarDistances.cosineSimilarity(query, vectors2[idx]);
             if (similarity > bestSimilarity) {
                 bestSimilarity = similarity;
                 bestIdx = idx;
@@ -553,9 +433,9 @@ public class DistanceVectorApiBenchmark {
         float[] v1 = vectors1[idx];
         float[] v2 = vectors2[idx];
 
-        float cosine = scalarCosineSimilarity(v1, v2);
-        float l2 = scalarL2Distance(v1, v2);
-        float ip = scalarInnerProduct(v1, v2);
+        float cosine = ScalarDistances.cosineSimilarity(v1, v2);
+        float l2 = ScalarDistances.l2Distance(v1, v2);
+        float ip = ScalarDistances.innerProduct(v1, v2);
 
         bh.consume(cosine);
         bh.consume(l2);

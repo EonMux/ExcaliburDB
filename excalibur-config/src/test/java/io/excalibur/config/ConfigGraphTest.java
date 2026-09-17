@@ -17,11 +17,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * thresholds are what separates "here is the evidence" from "I do not trust this". A silently
  * mis-parsed threshold turns one into the other, so the cases here are the malformed ones.
  */
-@DisplayName("Config.Graph")
+@DisplayName("GraphConfig")
 class ConfigGraphTest {
 
-    private static Config.Graph graph(Map<String, String> props) {
-        return new Config.Graph(new HashMap<>(props));
+    private static GraphConfig graph(Map<String, String> props) {
+        return new GraphConfig(new HashMap<>(props));
     }
 
     @Nested
@@ -31,20 +31,20 @@ class ConfigGraphTest {
         @Test
         @DisplayName("an empty configuration produces the documented defaults")
         void documentedDefaults() {
-            Config.Graph settings = graph(Map.of());
+            GraphConfig settings = graph(Map.of());
 
             assertThat(settings.getPath()).isNull();
-            assertThat(settings.getTopK()).isEqualTo(Config.Graph.DEFAULT_TOP_K);
+            assertThat(settings.getTopK()).isEqualTo(GraphConfig.DEFAULT_TOP_K);
             assertThat(settings.getContextTokenBudget())
-                .isEqualTo(Config.Graph.DEFAULT_CONTEXT_TOKEN_BUDGET);
-            assertThat(settings.getMinScore()).isEqualTo(Config.Graph.DEFAULT_MIN_SCORE);
+                .isEqualTo(GraphConfig.DEFAULT_CONTEXT_TOKEN_BUDGET);
+            assertThat(settings.getMinScore()).isEqualTo(GraphConfig.DEFAULT_MIN_SCORE);
             assertThat(settings.getMinSeparation())
-                .isEqualTo(Config.Graph.DEFAULT_MIN_SEPARATION);
+                .isEqualTo(GraphConfig.DEFAULT_MIN_SEPARATION);
             assertThat(settings.getMinMeanConfidence())
-                .isEqualTo(Config.Graph.DEFAULT_MIN_MEAN_CONFIDENCE);
+                .isEqualTo(GraphConfig.DEFAULT_MIN_MEAN_CONFIDENCE);
             assertThat(settings.getMaxAmbiguousCandidates())
-                .isEqualTo(Config.Graph.DEFAULT_MAX_AMBIGUOUS_CANDIDATES);
-            assertThat(settings.getRamBufferMb()).isEqualTo(Config.Graph.DEFAULT_RAM_BUFFER_MB);
+                .isEqualTo(GraphConfig.DEFAULT_MAX_AMBIGUOUS_CANDIDATES);
+            assertThat(settings.getRamBufferMb()).isEqualTo(GraphConfig.DEFAULT_RAM_BUFFER_MB);
         }
 
         @Test
@@ -63,7 +63,7 @@ class ConfigGraphTest {
         @Test
         @DisplayName("every key is read")
         void everyKeyIsRead() {
-            Config.Graph settings = graph(Map.of(
+            GraphConfig settings = graph(Map.of(
                 "excalibur.graph.path", "/srv/graph",
                 "excalibur.graph.top-k", "42",
                 "excalibur.graph.context-token-budget", "8000",
@@ -86,7 +86,7 @@ class ConfigGraphTest {
         @Test
         @DisplayName("the namespace tiers are read as lists, trimmed and without blanks")
         void namespaceTiersAreLists() {
-            Config.Graph settings = graph(Map.of(
+            GraphConfig settings = graph(Map.of(
                 "excalibur.graph.hot-namespaces", " vip , , flagship ",
                 "excalibur.graph.cold-namespaces", "bulk-import,archive,"));
 

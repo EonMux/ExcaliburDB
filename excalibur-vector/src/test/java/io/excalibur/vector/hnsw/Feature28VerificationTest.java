@@ -1,6 +1,7 @@
 package io.excalibur.vector.hnsw;
 
 import io.excalibur.config.Config;
+import io.excalibur.config.ShardConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -14,7 +15,7 @@ import java.util.Map;
  * <p>This test verifies that:</p>
  * <ul>
  *   <li>Default values match specification (efConstruction=128, efSearch=64)</li>
- *   <li>Values are configurable via Config.Shard</li>
+ *   <li>Values are configurable via ShardConfig</li>
  *   <li>Values flow through HnswConfigFactory to HnswConfig</li>
  *   <li>Values are used in HNSW graph operations</li>
  * </ul>
@@ -24,13 +25,13 @@ class Feature28VerificationTest {
     @Test
     @DisplayName("Default efConstruction should be 128")
     void defaultEfConstructionShouldBe128() {
-        assertThat(Config.Shard.DEFAULT_EF_CONSTRUCTION).isEqualTo(128);
+        assertThat(ShardConfig.DEFAULT_EF_CONSTRUCTION).isEqualTo(128);
     }
 
     @Test
     @DisplayName("Default efSearch should be 64")
     void defaultEfSearchShouldBe64() {
-        assertThat(Config.Shard.DEFAULT_EF_SEARCH).isEqualTo(64);
+        assertThat(ShardConfig.DEFAULT_EF_SEARCH).isEqualTo(64);
     }
 
     @Test

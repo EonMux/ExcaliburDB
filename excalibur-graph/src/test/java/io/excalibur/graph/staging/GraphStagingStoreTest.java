@@ -189,6 +189,59 @@ class GraphStagingStoreTest {
         }
 
         @Test
+        @DisplayName("a corrupt fact with intact facts after it fails the replay, never truncates")
+        void midLogCorruptionFailsTheReplay(@TempDir Path tempDir) throws IOException {
+            // The replay used to log a warning and stop at the damage, so a build silently
+            // dropped every fact after it and reported success. The erasure path refuses the
+            // identical condition, and refusing is the honest half: a partial graph presented as
+            // a whole one is a wrong answer nobody can see, where a failed build is one anybody
+            // can act on.
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir)) {
+                staging.append(fact("Ada", "knows", "Babbage"));
+                staging.append(fact("Babbage", "knows", "Boole"));
+                staging.append(fact("Boole", "knows", "Turing"));
+            }
+
+            Path log = tempDir.resolve(GraphStagingStore.TRIPLE_LOG);
+            byte[] all = Files.readAllBytes(log);
+            int second = GraphStagingStore.HEADER_BYTES + GraphStagingStore.RECORD_BYTES;
+            all[second + 2] ^= (byte) 0xFF;
+            Files.write(log, all);
+
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir)) {
+                assertThatThrownBy(() -> staging.forEach((s, r, o, from, to, provenance) -> { }))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("corrupt record");
+            }
+        }
+
+        @Test
+        @DisplayName("a build over a corrupt log fails rather than publishing a partial graph")
+        void midLogCorruptionFailsTheBuild(@TempDir Path tempDir) throws IOException {
+            Path staged = tempDir.resolve("staging");
+            try (GraphStagingStore staging = GraphStagingStore.open(staged)) {
+                staging.append(fact("Ada", "knows", "Babbage"));
+                staging.append(fact("Babbage", "knows", "Boole"));
+                staging.append(fact("Boole", "knows", "Turing"));
+            }
+
+            Path log = staged.resolve(GraphStagingStore.TRIPLE_LOG);
+            byte[] all = Files.readAllBytes(log);
+            int second = GraphStagingStore.HEADER_BYTES + GraphStagingStore.RECORD_BYTES;
+            all[second + 2] ^= (byte) 0xFF;
+            Files.write(log, all);
+
+            Path target = tempDir.resolve("graph");
+            try (GraphStagingStore staging = GraphStagingStore.open(staged)) {
+                assertThatThrownBy(() -> GraphBuilder.build(staging, target))
+                    .isInstanceOf(IOException.class);
+            }
+            assertThat(target)
+                .as("nothing partial is published where a whole graph is expected")
+                .doesNotExist();
+        }
+
+        @Test
         @DisplayName("a store that has been closed refuses further facts")
         void aClosedStoreRefuses(@TempDir Path tempDir) throws IOException {
             GraphStagingStore staging = GraphStagingStore.open(tempDir);

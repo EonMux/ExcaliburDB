@@ -1,6 +1,7 @@
 package excalibur.llm.client;
 
 import io.excalibur.config.Config;
+import io.excalibur.config.LlmConfig;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -389,13 +390,13 @@ class LLMClientConfigTest {
     }
 
     @Nested
-    @DisplayName("Config.Llm Integration")
+    @DisplayName("LlmConfig Integration")
     class ConfigLlmIntegrationTests {
 
         @Test
-        @DisplayName("fromConfig() creates LLMClientConfig from Config.Llm")
+        @DisplayName("fromConfig() creates LLMClientConfig from LlmConfig")
         void fromConfigCreatesLlmClientConfigFromConfigLlm() {
-            // Create a Config.Llm with custom values
+            // Create a LlmConfig with custom values
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "https://api.custom.com/v1");
             props.put("excalibur.llm.api-key", "test-api-key");
@@ -411,7 +412,7 @@ class LLMClientConfigTest {
             props.put("excalibur.llm.max-batch-tokens", "8000");
 
             Config config = new Config(props);
-            Config.Llm llmConfig = config.llm();
+            LlmConfig llmConfig = config.llm();
 
             LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
 
@@ -434,27 +435,27 @@ class LLMClientConfigTest {
         @Test
         @DisplayName("fromConfig() uses defaults for missing properties")
         void fromConfigUsesDefaultsForMissingProperties() {
-            // Create Config.Llm with minimal properties
+            // Create LlmConfig with minimal properties
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "http://localhost:11434");
 
             Config config = new Config(props);
-            Config.Llm llmConfig = config.llm();
+            LlmConfig llmConfig = config.llm();
 
             LLMClientConfig clientConfig = LLMClientConfig.fromConfig(llmConfig);
 
             // Verify defaults are applied
             assertEquals("http://localhost:11434", clientConfig.getBaseUrl());
             assertEquals("", clientConfig.getApiKey());
-            assertEquals(Config.Llm.DEFAULT_CHAT_MODEL, clientConfig.getChatModel());
-            assertEquals(Config.Llm.DEFAULT_EMBEDDING_MODEL, clientConfig.getEmbeddingModel());
-            assertEquals(Duration.ofMillis(Config.Llm.DEFAULT_TIMEOUT_MS), clientConfig.getTimeout());
-            assertEquals(Config.Llm.DEFAULT_MAX_RETRIES, clientConfig.getMaxRetries());
-            assertEquals(Config.Llm.DEFAULT_FAILURE_THRESHOLD, clientConfig.getFailureThreshold());
-            assertEquals(Duration.ofMillis(Config.Llm.DEFAULT_COOLDOWN_PERIOD_MS), clientConfig.getCooldownPeriod());
-            assertEquals(Config.Llm.DEFAULT_MAX_PROMPTS_PER_QUERY, clientConfig.getMaxPromptsPerQuery());
-            assertEquals(Config.Llm.DEFAULT_EMBEDDINGS_DIMENSIONS, clientConfig.getEmbeddingDimension());
-            assertEquals(Config.Llm.DEFAULT_MAX_BATCH_TOKENS, clientConfig.getMaxBatchTokens());
+            assertEquals(LlmConfig.DEFAULT_CHAT_MODEL, clientConfig.getChatModel());
+            assertEquals(LlmConfig.DEFAULT_EMBEDDING_MODEL, clientConfig.getEmbeddingModel());
+            assertEquals(Duration.ofMillis(LlmConfig.DEFAULT_TIMEOUT_MS), clientConfig.getTimeout());
+            assertEquals(LlmConfig.DEFAULT_MAX_RETRIES, clientConfig.getMaxRetries());
+            assertEquals(LlmConfig.DEFAULT_FAILURE_THRESHOLD, clientConfig.getFailureThreshold());
+            assertEquals(Duration.ofMillis(LlmConfig.DEFAULT_COOLDOWN_PERIOD_MS), clientConfig.getCooldownPeriod());
+            assertEquals(LlmConfig.DEFAULT_MAX_PROMPTS_PER_QUERY, clientConfig.getMaxPromptsPerQuery());
+            assertEquals(LlmConfig.DEFAULT_EMBEDDINGS_DIMENSIONS, clientConfig.getEmbeddingDimension());
+            assertEquals(LlmConfig.DEFAULT_MAX_BATCH_TOKENS, clientConfig.getMaxBatchTokens());
         }
 
         @Test
@@ -469,13 +470,13 @@ class LLMClientConfigTest {
         @Test
         @DisplayName("fromConfig() validates all values through builder")
         void fromConfigValidatesAllValuesThroughBuilder() {
-            // Create Config.Llm with invalid values - failure-threshold of 0 is below minimum
+            // Create LlmConfig with invalid values - failure-threshold of 0 is below minimum
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "https://api.test.com");
             props.put("excalibur.llm.failure-threshold", "0"); // Invalid: must be >= 1
 
             Config config = new Config(props);
-            Config.Llm llmConfig = config.llm();
+            LlmConfig llmConfig = config.llm();
 
             // Should throw due to validation in the builder (0 is below minimum of 1)
             assertThrows(
@@ -528,7 +529,7 @@ class LLMClientConfigTest {
             props.put("excalibur.llm.base-url", "https://api.test.com");
             props.put("excalibur.llm.relevancy-threshold", "0.75");
 
-            Config.Llm llmConfig = new Config(props).llm();
+            LlmConfig llmConfig = new Config(props).llm();
 
             assertEquals(0.75, llmConfig.getRelevancyThreshold(), 0.001);
             assertThat(LLMClientConfig.fromConfig(llmConfig))
@@ -537,17 +538,17 @@ class LLMClientConfigTest {
         }
 
         @Test
-        @DisplayName("Config.Llm maxPromptsPerQuery maps to LLMClientConfig")
+        @DisplayName("LlmConfig maxPromptsPerQuery maps to LLMClientConfig")
         void configLlmMaxPromptsPerQueryMapsToLLMClientConfig() {
-            // Create a Config.Llm with custom maxPromptsPerQuery
+            // Create a LlmConfig with custom maxPromptsPerQuery
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "https://api.test.com");
             props.put("excalibur.llm.max-prompts-per-query", "25");
 
             Config config = new Config(props);
-            Config.Llm llmConfig = config.llm();
+            LlmConfig llmConfig = config.llm();
 
-            // Verify Config.Llm has the correct value
+            // Verify LlmConfig has the correct value
             assertEquals(25, llmConfig.getMaxPromptsPerQuery());
 
             // Verify LLMClientConfig.fromConfig() maps it correctly
@@ -556,17 +557,17 @@ class LLMClientConfigTest {
         }
 
         @Test
-        @DisplayName("Config.Llm retryBaseDelayMs maps to LLMClientConfig")
+        @DisplayName("LlmConfig retryBaseDelayMs maps to LLMClientConfig")
         void retryBaseDelayMsMapsCorrectly() {
-            // Create a Config.Llm with custom retry-base-delay-ms
+            // Create a LlmConfig with custom retry-base-delay-ms
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.llm.base-url", "https://api.test.com/v1");
             props.put("excalibur.llm.retry-base-delay-ms", "1000");
 
             Config config = new Config(props);
-            Config.Llm llmConfig = config.llm();
+            LlmConfig llmConfig = config.llm();
 
-            // Verify Config.Llm has the correct value
+            // Verify LlmConfig has the correct value
             assertEquals(1000, llmConfig.getRetryBaseDelayMs());
 
             // Verify LLMClientConfig.fromConfig() maps it correctly

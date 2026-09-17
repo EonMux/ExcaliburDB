@@ -96,8 +96,13 @@ class DocumentRegistryPersistenceTest {
         registry.register(metadata("src", "good-doc", "src:good-doc:chunk:0"));
         registry.persist();
 
-        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-        lines.add("this is not a record");
+        // In among the records rather than after the end marker: a line past the marker is a
+        // file that did not end where it says it does, which is truncation's signature and is
+        // refused. The count is corrected with it, because what is under test here is a record
+        // this build cannot parse, not a file that lost its tail.
+        List<String> lines = new java.util.ArrayList<>(Files.readAllLines(file, StandardCharsets.UTF_8));
+        lines.add(lines.size() - 1, "this is not a record");
+        lines.set(lines.size() - 1, "\\#end|2");
         Files.write(file, lines, StandardCharsets.UTF_8);
 
         DocumentRegistry reloaded = new DocumentRegistry(file);

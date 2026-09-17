@@ -37,7 +37,11 @@ class McpToolsTest {
     void theCatalogueIsWellFormed() {
         List<Object> catalogue = McpTools.catalogue();
 
-        assertThat(catalogue).hasSize(6);
+        assertThat(catalogue.stream().map(t -> Json.stringAt(t, "name")))
+            .containsExactlyInAnyOrder(McpTools.SEARCH_DOCUMENTS, McpTools.SEARCH_GRAPH,
+                McpTools.BUILD_GRAPH, McpTools.INGEST_DOCUMENTS, McpTools.ADD_DOCUMENTS,
+                McpTools.INGESTION_STATUS, McpTools.CRAWL_WEBSITE, McpTools.DEREGISTER_SOURCE,
+                McpTools.REINDEX_SOURCE, McpTools.REINDEX_STATUS, McpTools.GRAPH_BUILD_STATUS);
         for (Object described : catalogue) {
             assertThat(Json.stringAt(described, "name")).isNotBlank();
             assertThat(Json.stringAt(described, "description"))
@@ -293,6 +297,34 @@ class McpToolsTest {
 
             assertThat(node.onlyRequest().method()).isEqualTo("POST");
             assertThat(node.onlyRequest().path()).isEqualTo("/v1/graph/build");
+        }
+    }
+
+    @Test
+    @DisplayName("build_graph tells the model the build is only accepted, not finished")
+    void buildGraphDescribesItsOwnAsynchrony() {
+        // The route answers 202 and runs behind the response. A description promising the
+        // published counts leaves a model believing a build it never waited for is done.
+        String description = Json.stringAt(tool(McpTools.BUILD_GRAPH), "description");
+
+        assertThat(description).contains(McpTools.GRAPH_BUILD_STATUS);
+        assertThat(description)
+            .as("the old wording promised the counts came back from this call")
+            .doesNotContain("Returns how many edges, entities and relations were published");
+    }
+
+    @Test
+    @DisplayName("graph_build_status reads the build's outcome, scoped to the namespace")
+    void graphBuildStatusReadsTheOutcome() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            new McpTools(node.client(Map.of()))
+                .call(McpTools.GRAPH_BUILD_STATUS, Map.of("namespace", "acme"));
+
+            assertThat(node.onlyRequest().method()).isEqualTo("GET");
+            assertThat(node.onlyRequest().path()).isEqualTo("/v1/graph/build/status");
+            assertThat(node.onlyRequest().headers())
+                .as("a build is per namespace, so its status must be asked for per namespace")
+                .containsEntry(ExcaliburClient.NAMESPACE_HEADER, "acme");
         }
     }
 

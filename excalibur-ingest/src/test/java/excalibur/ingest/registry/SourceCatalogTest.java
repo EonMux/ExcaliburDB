@@ -2,6 +2,8 @@ package excalibur.ingest.registry;
 
 import excalibur.ingest.source.SourceDescriptor;
 
+import io.excalibur.tenancy.NamespaceId;
+
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -104,7 +106,7 @@ class SourceCatalogTest {
         Path file = dataDir.resolve(SourceCatalog.FILE);
         List<String> lines = new ArrayList<>(readRecords(file));
         lines.add("not-a-record");
-        lines.add(END_MARKER + lines.size());
+        lines.add(END_MARKER + (lines.size() - 1));
         Files.write(file, lines, StandardCharsets.UTF_8);
 
         assertThat(SourceCatalog.open(dataDir).all())
@@ -194,7 +196,7 @@ class SourceCatalogTest {
 
         Path file = dataDir.resolve(SourceCatalog.FILE);
         List<String> lines = new ArrayList<>(readRecords(file));
-        lines.add(END_MARKER + (lines.size() + 1));
+        lines.add(END_MARKER + lines.size());
         Files.write(file, lines, StandardCharsets.UTF_8);
 
         assertThatThrownBy(() -> SourceCatalog.open(dataDir))
@@ -217,8 +219,118 @@ class SourceCatalogTest {
                 new SourceDescriptor("filesystem", "after", Map.of("root_path", "/b")));
     }
 
+    @Test
+    @DisplayName("a catalog written by a newer build is refused rather than reinterpreted")
+    void aCatalogFromANewerBuildIsRefused(@TempDir Path dataDir) throws IOException {
+        SourceCatalog.open(dataDir).record(
+            new SourceDescriptor("filesystem", "docs", Map.of("root_path", "/a")));
+
+        Path file = dataDir.resolve(SourceCatalog.FILE);
+        List<String> lines = new ArrayList<>(Files.readAllLines(file));
+        lines.set(0, "\\#source-catalog|99");
+        Files.write(file, lines, StandardCharsets.UTF_8);
+
+        assertThatThrownBy(() -> SourceCatalog.open(dataDir))
+            .as("a format this build does not know is not one to guess at")
+            .isInstanceOf(SourceCatalog.CatalogLoadException.class)
+            .hasMessageContaining("99");
+    }
+
+    @Test
+    @DisplayName("a catalog from a build that wrote no version is still openable")
+    void aCatalogWithoutAVersionStillOpens(@TempDir Path dataDir) throws IOException {
+        // What the build that introduced the end marker left behind: records, marker, no header.
+        Path file = dataDir.resolve(SourceCatalog.FILE);
+        Files.write(file, List.of("filesystem|legacy|root_path=/a", "\\#end|1"),
+            StandardCharsets.UTF_8);
+
+        assertThat(SourceCatalog.open(dataDir).all())
+            .extracting(SourceDescriptor::sourceId)
+            .containsExactly("legacy");
+    }
+
+    @Test
+    @DisplayName("the namespace a source was registered in survives the process")
+    void aNamespaceSurvivesTheProcess(@TempDir Path dataDir) throws IOException {
+        SourceCatalog.open(dataDir).record(new SourceDescriptor("filesystem", "acme-docs",
+            Map.of("root_path", "/srv/acme"), NamespaceId.of("acme")));
+
+        assertThat(SourceCatalog.open(dataDir).all())
+            .as("a re-crawl after a restart has to stage where the first crawl staged; the "
+                + "caller who named the namespace is long gone by then")
+            .extracting(SourceDescriptor::namespace)
+            .containsExactly(NamespaceId.of("acme"));
+    }
+
+    @Test
+    @DisplayName("a record written before the format carried a namespace loads as the shared one")
+    void aRecordWithoutANamespaceIsShared(@TempDir Path dataDir) throws IOException {
+        // Version 1: type, id and the configuration pairs, with no namespace between them. The
+        // build that wrote this staged every document into the shared namespace, so that is
+        // what the record means - and refusing it would leave a node unable to start on the
+        // catalog it was running on before the upgrade.
+        Path file = dataDir.resolve(SourceCatalog.FILE);
+        Files.write(file, List.of("\\#source-catalog|1", "filesystem|legacy|root_path=/a",
+            "\\#end|1"), StandardCharsets.UTF_8);
+
+        assertThat(SourceCatalog.open(dataDir).all())
+            .containsExactly(new SourceDescriptor("filesystem", "legacy",
+                Map.of("root_path", "/a"), NamespaceId.SHARED));
+    }
+
+    @Test
+    @DisplayName("a record from before the version header also loads as the shared namespace")
+    void aHeaderlessRecordIsShared(@TempDir Path dataDir) throws IOException {
+        Path file = dataDir.resolve(SourceCatalog.FILE);
+        Files.write(file, List.of("filesystem|legacy|root_path=/a", "\\#end|1"),
+            StandardCharsets.UTF_8);
+
+        assertThat(SourceCatalog.open(dataDir).all())
+            .extracting(SourceDescriptor::namespace)
+            .containsExactly(NamespaceId.SHARED);
+    }
+
+    @Test
+    @DisplayName("an old record is rewritten with its namespace at the next registration")
+    void anOldCatalogIsRewrittenWithNamespaces(@TempDir Path dataDir) throws IOException {
+        Path file = dataDir.resolve(SourceCatalog.FILE);
+        Files.write(file, List.of("\\#source-catalog|1", "filesystem|legacy|root_path=/a",
+            "\\#end|1"), StandardCharsets.UTF_8);
+
+        SourceCatalog catalog = SourceCatalog.open(dataDir);
+        catalog.record(new SourceDescriptor("filesystem", "acme-docs",
+            Map.of("root_path", "/srv/acme"), NamespaceId.of("acme")));
+
+        assertThat(Files.readAllLines(file).get(0))
+            .as("the rewrite states the format it is in, or the next start reads three fields "
+                + "as two")
+            .isEqualTo("\\#source-catalog|" + SourceCatalog.FORMAT_VERSION);
+        assertThat(SourceCatalog.open(dataDir).all())
+            .extracting(SourceDescriptor::sourceId, SourceDescriptor::namespace)
+            .containsExactlyInAnyOrder(
+                org.assertj.core.groups.Tuple.tuple("legacy", NamespaceId.SHARED),
+                org.assertj.core.groups.Tuple.tuple("acme-docs", NamespaceId.of("acme")));
+    }
+
+    @Test
+    @DisplayName("a record naming a namespace that is not one costs that source, not the catalog")
+    void aCorruptNamespaceCostsOneSource(@TempDir Path dataDir) throws IOException {
+        Path file = dataDir.resolve(SourceCatalog.FILE);
+        Files.write(file, List.of("\\#source-catalog|2",
+            "filesystem|bad|Not A Namespace|root_path=/a",
+            "filesystem|good|acme|root_path=/b", "\\#end|2"), StandardCharsets.UTF_8);
+
+        assertThat(SourceCatalog.open(dataDir).all())
+            .as("a namespace that did not survive names no tenant to stage into, and staging "
+                + "that source anywhere else would put one tenant's documents in another's index")
+            .extracting(SourceDescriptor::sourceId)
+            .containsExactly("good");
+    }
+
     /**
-     * Returns a catalog's record lines, dropping the end marker so a test can rewrite the file.
+     * Returns a catalog's header and record lines, dropping the end marker so a test can rewrite
+     * the file. The count a test then writes into a new marker counts the records alone, which is
+     * one less than the lines returned here.
      */
     private static List<String> readRecords(Path file) throws IOException {
         List<String> lines = Files.readAllLines(file);

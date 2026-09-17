@@ -2,6 +2,8 @@ package excalibur.ingest.registry;
 
 import excalibur.ingest.source.SourceDescriptor;
 
+import io.excalibur.tenancy.NamespaceId;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,15 +39,36 @@ import java.util.concurrent.ConcurrentHashMap;
  * the crawler is built from it the same way the original request built one.</p>
  *
  * <h2>Record format</h2>
- * <p>One line per source, {@code type|id|key=value|key=value}, with {@code \}, {@code |},
- * {@code =}, and the line terminators escaped. Roots and URLs are caller-supplied text and
- * contain all of those, so escaping is not optional.</p>
+ * <p>A first line, {@code \#source-catalog|<version>}, names the format. One line per source
+ * follows, {@code type|id|namespace|key=value|key=value}, with {@code \}, {@code |}, {@code =},
+ * and the line terminators escaped. Roots and URLs are caller-supplied text and contain all of
+ * those, so escaping is not optional.</p>
  *
  * <p>A last line, {@code \#end|count}, closes the file. Without it a catalog that lost its tail
  * is a catalog of whole, well-formed records that simply omits sources - which reads exactly like
  * a catalog those sources were never registered in, and is the one failure a registry of promises
- * must not be able to make quietly. The marker cannot collide with a record: {@link
+ * must not be able to make quietly. Neither line can collide with a record: {@link
  * #escape(String)} doubles every backslash, so no formatted record begins with a single one.</p>
+ *
+ * <h2>Reading an older or newer file</h2>
+ * <p>The header is what tells a short file from an old one. Truncation takes the tail, so the
+ * header is present in every file this build wrote and its absence can only mean an older build.
+ * A catalog with no header but with an end marker is from the build that added the marker: its
+ * count is checked, it loads, and the next registration rewrites it with a header. A catalog with
+ * neither is older still, and is refused - not because the build cannot read it, but because a
+ * file of bare records is exactly what a truncated marker-era catalog also looks like, and
+ * loading one silently drops the sources it lost. A header naming a version this build does not
+ * know is refused too, naming the version found: a format that is not understood is not one to
+ * guess at.</p>
+ *
+ * <p>Every version this build has ever written is still read, because the alternative is a
+ * node that refuses to start after an upgrade. Version 1 carried no namespace field, so its
+ * records name two fixed fields rather than three and load into the shared namespace - which is
+ * exactly what they meant, since the build that wrote them staged every document there. The
+ * declared version is therefore carried from the header down into {@link #parse(String, int)}:
+ * how many fields precede the configuration is a property of the format the line was written in,
+ * and guessing it from the line itself would turn a source whose namespace happens to contain an
+ * {@code =} into a configuration pair.</p>
  *
  * <h2>Durability</h2>
  * <p>Every mutation rewrites the whole file into a sibling, forces it, and renames it over the
@@ -76,14 +99,40 @@ public final class SourceCatalog {
     /** Introduces an escape sequence. */
     private static final char ESCAPE = '\\';
 
-    /** Fields before the configuration pairs: the type and the id. */
-    private static final int FIXED_FIELDS = 2;
+    /** Fields before the configuration pairs in version 1: the type and the id. */
+    private static final int FIXED_FIELDS_V1 = 2;
+
+    /** Fields before the configuration pairs from version 2 on: type, id and namespace. */
+    private static final int FIXED_FIELDS_V2 = 3;
 
     /** Suffix of the sibling a rewrite is assembled in before it is published. */
     private static final String REPLACEMENT_SUFFIX = ".tmp";
 
     /** Opens the last line, which states how many records precede it. */
     private static final String END_MARKER = "\\#end";
+
+    /** Opens the first line, which names the format the rest of the file is in. */
+    private static final String HEADER_MARKER = "\\#source-catalog";
+
+    /** The format this build writes. */
+    static final int FORMAT_VERSION = 2;
+
+    /**
+     * The oldest format this build still reads.
+     *
+     * <p>Also what a file with no header at all is read as: the build that wrote one of those
+     * wrote version 1 records, it simply had no version to declare yet.</p>
+     */
+    static final int OLDEST_READABLE_VERSION = 1;
+
+    /** The version that first carried a namespace field. */
+    private static final int FIRST_NAMESPACED_VERSION = 2;
+
+    /** What {@link #declaredVersion(String)} reports for a file written before the header. */
+    private static final int NO_HEADER = -1;
+
+    /** What {@link #declaredVersion(String)} reports for a header whose version is not a number. */
+    private static final int UNREADABLE_HEADER = -2;
 
     private final Path file;
     private final CatalogWriter writer;
@@ -326,6 +375,11 @@ public final class SourceCatalog {
      */
     private void write(Path replacement) throws IOException {
         try (BufferedWriter out = Files.newBufferedWriter(replacement)) {
+            out.write(HEADER_MARKER);
+            out.write(FIELD_SEPARATOR);
+            out.write(Integer.toString(FORMAT_VERSION));
+            out.newLine();
+
             int written = 0;
             for (SourceDescriptor descriptor : sources.values()) {
                 out.write(format(descriptor));
@@ -384,8 +438,9 @@ public final class SourceCatalog {
             throw new CatalogLoadException(file, e);
         }
 
-        for (String line : records(lines)) {
-            SourceDescriptor descriptor = parse(line);
+        Body body = body(lines);
+        for (String line : body.records()) {
+            SourceDescriptor descriptor = parse(line, body.version());
             if (descriptor == null) {
                 skipped++;
                 continue;
@@ -401,7 +456,16 @@ public final class SourceCatalog {
     }
 
     /**
-     * Strips the end marker and checks that the file in front of it is all there.
+     * A catalog's records, and the format version they are to be read in.
+     *
+     * @param version The format the records were written in
+     * @param records The record lines, header and end marker removed
+     */
+    private record Body(int version, List<String> records) {
+    }
+
+    /**
+     * Strips the header and the end marker, and checks that what is between them is all there.
      *
      * <p>A catalog that lost its tail keeps whole records, so nothing about the lines themselves
      * says anything is missing; only the marker and the count it carries can. Refusing to load is
@@ -410,27 +474,92 @@ public final class SourceCatalog {
      * next registration, with nothing on the way saying so.</p>
      *
      * @param lines Every line of the file
-     * @return The record lines, marker removed
-     * @throws CatalogLoadException if the marker is missing or disagrees with what is there
+     * @return The record lines and the version to read them in
+     * @throws CatalogLoadException if the version is not one this build reads, or the marker is
+     *                              missing or disagrees with what is there
      */
-    private List<String> records(List<String> lines) {
+    private Body body(List<String> lines) {
         if (lines.isEmpty()) {
             throw new CatalogLoadException(file,
                 "the file is empty, so the write that created it never reached the disk");
         }
 
-        List<String> records = lines.subList(0, lines.size() - 1);
-        int declared = declaredCount(lines.get(lines.size() - 1));
+        int declaredVersion = declaredVersion(lines.get(0));
+        int version = readableVersion(declaredVersion, lines.get(0));
+        List<String> body = declaredVersion == NO_HEADER
+            ? lines : lines.subList(1, lines.size());
+        if (body.isEmpty()) {
+            throw new CatalogLoadException(file,
+                "it carries a header and nothing else, so the write that published it never "
+                    + "finished");
+        }
+
+        List<String> records = body.subList(0, body.size() - 1);
+        int declared = declaredCount(body.get(body.size() - 1));
         if (declared < 0) {
             throw new CatalogLoadException(file,
                 "it does not end with a record count, so it was cut short before the write that "
-                    + "published it finished, or it was written by hand");
+                    + "published it finished, or it predates the record count entirely");
         }
         if (declared != records.size()) {
             throw new CatalogLoadException(file, "it declares " + declared
                 + " record(s) and carries " + records.size());
         }
-        return records;
+        return new Body(version, records);
+    }
+
+    /**
+     * Settles which format the records are to be read in, refusing one this build cannot.
+     *
+     * <p>A catalog with no header at all is one an older build wrote. It is read under the rules
+     * that build followed - the count check still applies, because that build wrote the marker -
+     * and the next registration rewrites it with a header. A version this build once wrote is
+     * read as that version rather than refused: an upgrade must not leave a node unable to start
+     * on the catalog it was running on a minute earlier.</p>
+     *
+     * @param declared The version the header names, or the sentinel for no or an unreadable one
+     * @param header   The first line, for a message that shows what was found
+     * @return The version to parse the records in
+     * @throws CatalogLoadException if the header names a version this build does not read
+     */
+    private int readableVersion(int declared, String header) {
+        if (declared == UNREADABLE_HEADER) {
+            throw new CatalogLoadException(file,
+                "its first line names no format version this build can read: " + header);
+        }
+        if (declared == NO_HEADER) {
+            LOGGER.warn("Source catalog at {} was written before the format carried a version; it "
+                + "will be rewritten in version {} at the next registration", file, FORMAT_VERSION);
+            return OLDEST_READABLE_VERSION;
+        }
+        if (declared < OLDEST_READABLE_VERSION || declared > FORMAT_VERSION) {
+            throw new CatalogLoadException(file, "it declares format version " + declared
+                + " and this build reads versions " + OLDEST_READABLE_VERSION + " to "
+                + FORMAT_VERSION);
+        }
+        if (declared < FORMAT_VERSION) {
+            LOGGER.info("Source catalog at {} is in format version {}; it will be rewritten in "
+                + "version {} at the next registration", file, declared, FORMAT_VERSION);
+        }
+        return declared;
+    }
+
+    /**
+     * Reads the format version out of a candidate header line.
+     *
+     * @return The declared version, {@link #NO_HEADER} if the line is not a header, or
+     *         {@link #UNREADABLE_HEADER} if it is a header whose version is not a number
+     */
+    private static int declaredVersion(String line) {
+        String prefix = HEADER_MARKER + FIELD_SEPARATOR;
+        if (!line.startsWith(prefix)) {
+            return NO_HEADER;
+        }
+        try {
+            return Integer.parseInt(line.substring(prefix.length()));
+        } catch (NumberFormatException e) {
+            return UNREADABLE_HEADER;
+        }
     }
 
     /**
@@ -455,7 +584,9 @@ public final class SourceCatalog {
         StringBuilder record = new StringBuilder()
             .append(escape(descriptor.sourceType()))
             .append(FIELD_SEPARATOR)
-            .append(escape(descriptor.sourceId()));
+            .append(escape(descriptor.sourceId()))
+            .append(FIELD_SEPARATOR)
+            .append(escape(descriptor.namespace().value()));
         for (Map.Entry<String, String> entry : new TreeMap<>(descriptor.config()).entrySet()) {
             record.append(FIELD_SEPARATOR)
                 .append(escape(entry.getKey()))
@@ -466,22 +597,25 @@ public final class SourceCatalog {
     }
 
     /**
-     * Parses one persisted record.
+     * Parses one persisted record, in the format version the file declared.
      *
+     * @param line    The record line
+     * @param version The format the record was written in
      * @return The descriptor, or null if the line is malformed
      */
-    private static SourceDescriptor parse(String line) {
+    private static SourceDescriptor parse(String line, int version) {
         if (line == null || line.isBlank()) {
             return null;
         }
 
+        int fixed = version >= FIRST_NAMESPACED_VERSION ? FIXED_FIELDS_V2 : FIXED_FIELDS_V1;
         List<String> fields = splitEscaped(line, FIELD_SEPARATOR);
-        if (fields.size() < FIXED_FIELDS) {
+        if (fields.size() < fixed) {
             return null;
         }
 
         Map<String, String> config = new LinkedHashMap<>();
-        for (String field : fields.subList(FIXED_FIELDS, fields.size())) {
+        for (String field : fields.subList(fixed, fields.size())) {
             List<String> pair = splitEscaped(field, PAIR_SEPARATOR);
             if (pair.size() != 2) {
                 return null;
@@ -490,11 +624,33 @@ public final class SourceCatalog {
         }
 
         try {
-            return new SourceDescriptor(unescape(fields.get(0)), unescape(fields.get(1)), config);
+            NamespaceId namespace = fixed == FIXED_FIELDS_V2
+                ? namespaceOf(unescape(fields.get(2))) : NamespaceId.SHARED;
+            return new SourceDescriptor(unescape(fields.get(0)), unescape(fields.get(1)), config,
+                namespace);
         } catch (IllegalArgumentException e) {
-            // A record whose type or id did not survive the round trip names no crawler.
+            // A record whose type, id or namespace did not survive the round trip names no
+            // crawler, or names no tenant to stage what it crawls into. Either way it is one
+            // source lost rather than a whole catalog, and load() counts and reports it.
             return null;
         }
+    }
+
+    /**
+     * Reads a namespace back out of a record.
+     *
+     * <p>{@link NamespaceId#of(String)} refuses the shared namespace by name, because a caller
+     * naming it in a header is claiming a namespace that is not theirs to claim. A record is not
+     * a caller: {@code shared} is exactly what this catalog writes for a registration that named
+     * no namespace, so it has to read back as the constant rather than as a corrupt line.</p>
+     *
+     * @param value The namespace field, unescaped
+     * @return The namespace
+     * @throws IllegalArgumentException if it is not a legal namespace id
+     */
+    private static NamespaceId namespaceOf(String value) {
+        return NamespaceId.SHARED.value().equals(value) ? NamespaceId.SHARED
+            : NamespaceId.of(value);
     }
 
     /**

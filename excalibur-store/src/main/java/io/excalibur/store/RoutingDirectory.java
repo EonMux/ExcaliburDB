@@ -1,11 +1,17 @@
 package io.excalibur.store;
 
+import io.excalibur.vector.durability.DurableFiles;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * The slot-to-segment routing table, on disk.
@@ -33,21 +39,38 @@ import java.nio.file.StandardCopyOption;
  * </pre>
  * Little-endian, matching the other on-disk structures. The file is written beside its
  * destination and moved into place, so a crash mid-write leaves the previous directory rather
- * than a half-written one — and a half-written directory is worse than none, because the
- * fallback below at least knows it is guessing.
+ * than a half-written one.
+ *
+ * <h2>Durability</h2>
+ * <p>The staged file is forced before the rename and the containing directory is forced after
+ * it. A rename is what makes the new content authoritative, so bytes still sitting in the page
+ * cache when it happens are content the file claims to have and does not; and the directory
+ * entry the rename creates is metadata of its own, which a crash can lose while keeping the
+ * file it names. Neither failure looks like a failure afterwards: the file parses, and every
+ * slot in it is a plausible segment index.
+ *
+ * <h2>When it cannot be read</h2>
+ * <p>{@link #read(Path)} reports nothing rather than throwing, because "no directory" is also
+ * what a store written by an earlier build looks like. Deciding what to do about it belongs to
+ * the caller, which is the only place that knows whether the heuristic above can still be
+ * exact for the segments actually on disk — and, per the worked example, it cannot be once two
+ * segments have split.
  */
-final class RoutingDirectory {
+public final class RoutingDirectory {
+
+    private static final Logger LOGGER = Logger.getLogger(RoutingDirectory.class.getName());
 
     /** File name inside the data directory. */
-    static final String FILE_NAME = "routing.dir";
+    public static final String FILE_NAME = "routing.dir";
 
     /** Distinguishes this file from anything else in the data directory. */
-    static final long MAGIC = 0x4558434C42524F55L;
+    public static final long MAGIC = 0x4558434C42524F55L;
 
     /** Format version. */
-    static final int VERSION = 1;
+    public static final int VERSION = 1;
 
-    private static final int HEADER_BYTES = 16;
+    /** Bytes before the first slot entry: magic, version and width. */
+    public static final int HEADER_BYTES = 16;
 
     private RoutingDirectory() {
         // Utility class
@@ -72,17 +95,52 @@ final class RoutingDirectory {
         }
 
         Path temp = dataDir.resolve(FILE_NAME + ".tmp");
-        Files.write(temp, buffer.array());
-        Files.move(temp, dataDir.resolve(FILE_NAME),
-            StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        Path destination = dataDir.resolve(FILE_NAME);
+        try {
+            writeAndForce(temp, buffer.array());
+            Files.move(temp, destination,
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException | RuntimeException e) {
+            // A staged file left behind would be picked up by nothing and re-staged over by
+            // the next write, but it would also sit in the data directory looking like state.
+            try {
+                Files.deleteIfExists(temp);
+            } catch (IOException suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            throw e;
+        }
+        DurableFiles.syncContainingDirectory(destination);
+    }
+
+    /**
+     * Writes the staged file and forces its contents to storage.
+     *
+     * <p>Separate from the rename because the order is the whole point: content first, then
+     * the name that makes it authoritative.
+     *
+     * @param temp    The staging path
+     * @param content The directory's bytes
+     * @throws IOException if the write or the force fails
+     */
+    private static void writeAndForce(Path temp, byte[] content) throws IOException {
+        try (FileChannel channel = FileChannel.open(temp, StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            ByteBuffer remaining = ByteBuffer.wrap(content);
+            while (remaining.hasRemaining()) {
+                channel.write(remaining);
+            }
+            channel.force(true);
+        }
     }
 
     /**
      * Reads the directory, or returns null when there is none to read.
      *
-     * <p>A file that is present but unreadable returns null rather than throwing: the caller can
-     * still fall back to rebuilding, and refusing to start over a corrupt routing file would be
-     * a worse outcome than starting with a directory the engine says out loud it guessed.
+     * <p>A file that is present but unreadable reports the same nothing as a file that is
+     * absent, because to a reader they are the same situation: this build has no record of how
+     * slots were assigned. What to do about that is the caller's decision, not this one's —
+     * see the class javadoc.
      *
      * @param dataDir The data directory
      * @return Canonical segment index per slot, or null
@@ -112,6 +170,12 @@ final class RoutingDirectory {
             }
             return canonicalPerSlot;
         } catch (IOException | RuntimeException e) {
+            // Null is the documented answer - see above - but it is also the answer for a
+            // directory that is simply absent, and the difference is the whole cost of the
+            // rebuild the caller is about to do. Say which one this was.
+            LOGGER.log(Level.WARNING, e,
+                () -> "The routing directory at " + path + " is present but could not be read; "
+                    + "slot routing will be rebuilt as if it were absent");
             return null;
         }
     }

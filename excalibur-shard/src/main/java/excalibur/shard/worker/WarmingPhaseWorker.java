@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
@@ -111,6 +112,9 @@ public class WarmingPhaseWorker {
     private volatile long checkIntervalMs;
     private volatile int minVectorsForTraining;
     private volatile PQConfig pqConfig;
+
+    /** Dimensions already warned about, so the substitution is logged once each. */
+    private final Set<Integer> warnedDimensions = ConcurrentHashMap.newKeySet();
 
     private volatile Thread workerThread;
 
@@ -367,7 +371,7 @@ public class WarmingPhaseWorker {
             int dimension = graph.config().dimension();
 
             // Create PQ config compatible with the dimension
-            PQConfig config = getPQConfigForDimension(dimension);
+            PQConfig config = pqConfigForDimension(dimension);
             if (config == null) {
                 LOGGER.warn("Segment {} dimension {} not compatible with PQ. " +
                     "Skipping PQ, transitioning to ACTIVE.", segmentId, dimension);
@@ -431,24 +435,49 @@ public class WarmingPhaseWorker {
     }
 
     /**
-     * Gets a PQ configuration compatible with the given dimension.
+     * The quantiser shape to train a segment of the given dimension to.
+     *
+     * <p>A vector is split into equal parts, so the configured subspace count has to divide
+     * the dimension. Configuration cannot check that - the dimension comes from the embedding
+     * model, not from a property file - so it is checked here, and a split that does not fit
+     * is replaced by one that does. Only the split: the configured codebook size and sample
+     * ceiling are perfectly usable at any dimension, and replacing the whole shape would leave
+     * a node training the defaults it was explicitly configured away from.</p>
+     *
+     * <p>Package-private so a test can hold the substitution against what was configured.</p>
      *
      * @param dimension The vector dimension
-     * @return A compatible PQConfig, or null if dimension is not compatible
+     * @return The shape to train, or null if no split fits this dimension
      */
-    private PQConfig getPQConfigForDimension(int dimension) {
-        // First check if the configured PQ config is compatible
-        if (pqConfig.isCompatible(dimension)) {
-            return pqConfig;
+    PQConfig pqConfigForDimension(int dimension) {
+        PQConfig configured = pqConfig;
+        if (configured.isCompatible(dimension)) {
+            return configured;
         }
 
-        // Try to create a compatible config using the factory method
+        int substitute;
         try {
-            return PQConfig.forDimension(dimension);
+            substitute = PQConfig.forDimension(dimension).numSubspaces();
         } catch (IllegalArgumentException e) {
             LOGGER.warn("Cannot create PQ config for dimension {}: {}", dimension, e.getMessage());
             return null;
         }
+
+        PQConfig adjusted = PQConfig.builder()
+            .numSubspaces(substitute)
+            .numCentroids(configured.numCentroids())
+            .maxTrainingSamples(configured.maxTrainingSamples())
+            .build();
+        // Once per dimension: this runs for every segment that warms, and a line per segment
+        // would bury the one that matters. Silence was worse - the startup log reported the
+        // configured split as though it were in force, and every segment trained another one.
+        if (warnedDimensions.add(dimension)) {
+            LOGGER.warn("excalibur.shard.pq-subspaces is {}, which does not divide the {}-"
+                    + "dimensional vectors this node embeds; training {} subspaces instead. "
+                    + "Set it to a divisor of {} to choose the split yourself.",
+                configured.numSubspaces(), dimension, substitute, dimension);
+        }
+        return adjusted;
     }
 
     /**

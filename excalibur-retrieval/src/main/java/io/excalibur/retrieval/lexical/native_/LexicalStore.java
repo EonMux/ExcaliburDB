@@ -24,6 +24,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
+import java.util.function.IntPredicate;
 import java.util.stream.Stream;
 
 /**
@@ -141,6 +142,14 @@ public final class LexicalStore implements AutoCloseable {
     private final Map<String, PostingsIndex> open = new LinkedHashMap<>();
     private final Map<String, SegmentKeys> keys = new LinkedHashMap<>();
     private final Map<String, boolean[]> tombstones = new LinkedHashMap<>();
+
+    /**
+     * Segments the manifest names that this store could not open, and why.
+     *
+     * <p>Filled once at open and never afterwards, because a segment's files do not change while
+     * the store holds them.</p>
+     */
+    private final Map<String, String> unreadable = new LinkedHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong nextSegment =
         new java.util.concurrent.atomic.AtomicLong();
 
@@ -201,33 +210,79 @@ public final class LexicalStore implements AutoCloseable {
         LexicalStore store = new LexicalStore(directory, SegmentManifest.read(directory), planner,
             clock, bm25, DocumentErasureLog.open(directory));
         store.removeUnreferenced();
-        store.requireSegmentsMatchBm25();
+        store.inspectSegments();
         store.reapplyErasures();
         return store;
     }
 
     /**
-     * Refuses the whole store when any segment disagrees with the configured BM25 pair.
+     * Checks every named segment before a query can, and decides what to do about the bad ones.
      *
+     * <h2>Why the BM25 pair fails the whole store</h2>
      * <p>Checked here rather than left to the first query that touches a segment. Segments are
      * opened lazily, but writing one is not: a store that opened under a changed pair would go on
      * accepting documents and end up holding segments built two different ways, with only the
-     * older ones failing and only when something searched them.</p>
+     * older ones failing and only when something searched them. That is a configuration mistake
+     * with an obvious remedy, so it stops the open.</p>
      *
-     * <p>A segment whose metadata cannot be read is left to the reader that needs it, which
-     * reports what is actually wrong with it. This is a check on the values, not a fsck.</p>
+     * <h2>Why a damaged segment does not</h2>
+     * <p>A torn segment is the opposite kind of problem: nothing the operator can change makes
+     * it open, so failing here makes the store unopenable for good, and the manifest names the
+     * segment so nothing will ever clean it up either. Dropping it quietly is no better - its
+     * documents would simply stop being found. So it is neither: the segment is left exactly
+     * where it is, with its entry in the manifest, which is what keeps
+     * {@link #removeUnreferenced()} from deleting the bytes somebody may yet recover; it is kept
+     * out of every query, because half a segment is a wrong answer rather than a partial one;
+     * and it is reported, in the log at open and through {@link #unreadableSegments()}, so that
+     * a store answering from four segments out of five says so. Restoring or rebuilding the
+     * files makes it searchable again at the next open, with nothing to undo.</p>
      */
-    private void requireSegmentsMatchBm25() throws IOException {
+    private void inspectSegments() throws IOException {
         for (SegmentManifest.Entry entry : manifest.entries()) {
             Path segment = directory.resolve(entry.name());
-            if (!Files.exists(segment.resolve(IndexMeta.FILE_NAME))) {
-                continue;
-            }
-            Bm25Parameters persisted = IndexMeta.read(segment).bm25();
-            if (!persisted.equals(bm25)) {
-                throw new Bm25MismatchException(segment, persisted, bm25);
+            try {
+                IndexMeta meta = IndexMeta.read(segment);
+                if (!meta.bm25().equals(bm25)) {
+                    throw new Bm25MismatchException(segment, meta.bm25(), bm25);
+                }
+                SegmentGeometry.verify(segment, meta);
+                LexicalSegmentIntegrity.requireIntact(segment, meta);
+            } catch (Bm25MismatchException e) {
+                throw e;
+            } catch (IOException e) {
+                unreadable.put(entry.name(), e.getMessage());
+                LOGGER.error("Segment {} of the lexical store at {} cannot be opened, so the {} "
+                    + "document(s) it holds will not be found by any query until it is restored "
+                    + "or rebuilt; its files are left untouched: {}",
+                    entry.name(), directory, entry.liveCount(), e.getMessage());
             }
         }
+    }
+
+    /**
+     * Segments the manifest names that could not be opened, mapped to what is wrong with them.
+     *
+     * <p>Empty for a healthy store. A caller that reports on this store should surface it: the
+     * documents in these segments are still counted by {@link #liveDocuments(long)} and are
+     * still on disk, and they are the difference between what the store contains and what it can
+     * answer with.</p>
+     */
+    public Map<String, String> unreadableSegments() {
+        return java.util.Collections.unmodifiableMap(new LinkedHashMap<>(unreadable));
+    }
+
+    /** The entries a query may actually read, which is all of them on a healthy store. */
+    private List<SegmentManifest.Entry> readable(List<SegmentManifest.Entry> entries) {
+        if (unreadable.isEmpty()) {
+            return entries;
+        }
+        List<SegmentManifest.Entry> usable = new ArrayList<>(entries.size());
+        for (SegmentManifest.Entry entry : entries) {
+            if (!unreadable.containsKey(entry.name())) {
+                usable.add(entry);
+            }
+        }
+        return usable;
     }
 
     /**
@@ -448,7 +503,7 @@ public final class LexicalStore implements AutoCloseable {
      */
     public List<Hit> search(String[] terms, double[] weights, int limit, long epoch)
             throws IOException {
-        List<SegmentManifest.Entry> visible = manifest.visibleAt(epoch);
+        List<SegmentManifest.Entry> visible = readable(manifest.visibleAt(epoch));
         PostingsIndex.Stats stats = collectionStats(visible, terms);
         List<Hit> merged = new ArrayList<>();
         for (SegmentManifest.Entry entry : visible) {
@@ -458,13 +513,12 @@ public final class LexicalStore implements AutoCloseable {
             PostingsIndex index = openSegment(entry.name());
             SegmentKeys segmentKeys = keys.get(entry.name());
             boolean[] erased = tombstones.get(entry.name());
-            // Over-fetch: a segment's best hits may all be tombstoned, and stopping at `limit`
-            // per segment would then return fewer results than the store can actually offer.
-            int fetch = entry.tombstoned() == 0 ? limit : Math.min(limit * 4, entry.docCount());
-            for (PostingsIndex.Hit hit : index.search(terms, weights, fetch, stats)) {
-                if (erased != null && erased[hit.docId()]) {
-                    continue;
-                }
+            // The tombstones are handed to the scorer rather than applied to what it returns. A
+            // segment's best matches are often exactly the documents that were erased, and
+            // filtering afterwards would then leave the page short of live documents the segment
+            // still holds.
+            IntPredicate live = erased == null ? null : doc -> !erased[doc];
+            for (PostingsIndex.Hit hit : index.search(terms, weights, limit, stats, live)) {
                 merged.add(new Hit(segmentKeys.at(hit.docId()), hit.score()));
             }
         }
@@ -482,7 +536,7 @@ public final class LexicalStore implements AutoCloseable {
      */
     public boolean knowsTerm(String term, long epoch) throws IOException {
         Objects.requireNonNull(term, "term must not be null");
-        for (SegmentManifest.Entry entry : manifest.visibleAt(epoch)) {
+        for (SegmentManifest.Entry entry : readable(manifest.visibleAt(epoch))) {
             if (openSegment(entry.name()).termId(term) >= 0) {
                 return true;
             }
@@ -935,7 +989,7 @@ public final class LexicalStore implements AutoCloseable {
      * alternative being to serialise every query behind the one that happened to be first.</p>
      */
     public void warm() throws IOException {
-        for (SegmentManifest.Entry entry : manifest.entries()) {
+        for (SegmentManifest.Entry entry : readable(manifest.entries())) {
             openSegment(entry.name());
         }
     }
@@ -961,16 +1015,26 @@ public final class LexicalStore implements AutoCloseable {
      * reader will ever consult. The manifest is the sole authority on what the store contains, so
      * what it does not name is not part of the store - and left alone these would accumulate as
      * dead weight nothing ever accounts for.</p>
+     *
+     * <p>That authority is only as good as the file. On a manifest that cannot be shown to be
+     * all of itself, "the manifest does not name it" and "the line that named it is no longer
+     * there" are indistinguishable, and this method is the step that would turn the second into
+     * a deletion of the whole index. So an unverified manifest sweeps nothing: the cost is some
+     * dead weight until the next write republishes the manifest in a form that can be checked.
+     * The scratch directories are swept either way - no manifest ever names one, so nothing
+     * about the manifest's state makes them anything but leftovers.</p>
      */
     private void removeUnreferenced() throws IOException {
         Set<String> known = new HashSet<>(manifest.names());
+        boolean sweepSegments = manifest.verified();
         List<Path> orphans = new ArrayList<>();
         try (Stream<Path> listing = Files.list(directory)) {
             for (Path path : listing.toList()) {
                 String fileName = path.getFileName().toString();
                 if (fileName.startsWith(SCRATCH_PREFIX)) {
                     orphans.add(path);
-                } else if (fileName.startsWith(SEGMENT_PREFIX) && !known.contains(baseName(fileName))) {
+                } else if (sweepSegments && fileName.startsWith(SEGMENT_PREFIX)
+                        && !known.contains(baseName(fileName))) {
                     orphans.add(path);
                 }
             }

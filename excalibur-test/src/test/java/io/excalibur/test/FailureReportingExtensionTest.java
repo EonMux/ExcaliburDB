@@ -9,7 +9,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -239,12 +242,30 @@ class FailureReportingExtensionTest {
 
         @Test
         @DisplayName("the default extension reports to the console and writes nothing")
-        void defaultsAreConsoleOnly() throws Exception {
+        void defaultsAreConsoleOnly(@TempDir Path directory) throws Exception {
             FailureReportingExtension extension = new FailureReportingExtension();
 
             recordFailure(extension, DefaultsSubject.class, "failing()",
                 new AssertionError("boom"));
-            extension.afterAll(contextFor(DefaultsSubject.class, "DefaultsSubject"));
+
+            PrintStream original = System.out;
+            ByteArrayOutputStream captured = new ByteArrayOutputStream();
+            try {
+                System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+                extension.afterAll(contextFor(DefaultsSubject.class, "DefaultsSubject"));
+            } finally {
+                System.setOut(original);
+            }
+
+            // Both halves of the name. Without the first, a default that reported nothing at
+            // all would pass; without the second, one that quietly wrote a file would.
+            assertThat(captured.toString(StandardCharsets.UTF_8))
+                .as("the default extension reports to the console")
+                .contains(DefaultsSubject.class.getSimpleName())
+                .contains("boom");
+            assertThat(directory)
+                .as("and writes nothing, having been given no report directory")
+                .isEmptyDirectory();
         }
     }
 }

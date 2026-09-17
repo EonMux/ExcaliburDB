@@ -2,7 +2,9 @@ package excalibur.api.bootstrap;
 
 import io.excalibur.config.Config;
 import io.excalibur.retrieval.lexical.native_.SegmentManifest;
+import io.excalibur.store.CompactionWorker;
 import io.excalibur.store.Segment;
+import io.excalibur.store.SegmentLifecycleManager;
 import io.excalibur.vector.hnsw.HnswConfigFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -229,6 +231,49 @@ class CoreComponentsTest {
 
             assertThat(components.indexOrchestrator().getVisibilityTracker().currentEpoch())
                 .isZero();
+        }
+    }
+
+    @Nested
+    @DisplayName("compaction callback")
+    class CompactionCallbackTests {
+
+        /**
+         * The lifecycle manager marks a segment handled on what this callback returns, and
+         * stops asking. Reporting a refusal as a dispatch strands the tombstoned space.
+         */
+        @Test
+        @DisplayName("reports scheduled while the worker is live and not-scheduled once it has stopped")
+        void reportsWhatTheWorkerActuallyDid(@TempDir Path dataDir) {
+            components = CoreComponents.create(config(), dataDir, HnswConfigFactory.withDefaults());
+            CompactionWorker worker = components.indexOrchestrator().getCompactionWorker();
+            assertThat(worker).as("the orchestrator wires a compaction worker").isNotNull();
+
+            SegmentLifecycleManager.CompactionCallback callback =
+                CoreComponents.compactionCallback(components.storageEngine(), worker);
+            long segmentId = components.storageEngine().getSegments().keySet().iterator().next();
+
+            assertThat(callback.onCompactionNeeded(segmentId))
+                .as("a live worker takes the rewrite, so the segment really is handled")
+                .isTrue();
+
+            worker.stop();
+
+            assertThat(callback.onCompactionNeeded(segmentId))
+                .as("a stopped worker rewrites nothing, and the manager must not record it as handled")
+                .isFalse();
+        }
+
+        @Test
+        @DisplayName("reports not-scheduled for a segment the engine does not know")
+        void reportsNotScheduledForAnUnknownSegment(@TempDir Path dataDir) {
+            components = CoreComponents.create(config(), dataDir, HnswConfigFactory.withDefaults());
+            CompactionWorker worker = components.indexOrchestrator().getCompactionWorker();
+
+            SegmentLifecycleManager.CompactionCallback callback =
+                CoreComponents.compactionCallback(components.storageEngine(), worker);
+
+            assertThat(callback.onCompactionNeeded(Long.MAX_VALUE)).isFalse();
         }
     }
 

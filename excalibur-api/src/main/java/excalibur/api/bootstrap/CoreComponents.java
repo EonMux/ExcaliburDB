@@ -6,8 +6,12 @@ import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
 import excalibur.shard.allocator.VolumePlacements;
 import io.excalibur.config.Config;
+import io.excalibur.config.QueryConfig;
+import io.excalibur.config.ShardConfig;
 import io.excalibur.core.memory.MemorySegmentFactory;
+import io.excalibur.store.CompactionWorker;
 import io.excalibur.store.Segment;
+import io.excalibur.store.SegmentLifecycleManager;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import io.excalibur.vector.distance.DistanceFunctions;
@@ -398,28 +402,49 @@ public record CoreComponents(Arena arena,
 
         LOGGER.info("Wiring compaction callback...");
 
-        var lifecycleManager = storageEngine.getLifecycleManager();
+        storageEngine.getLifecycleManager()
+            .setCompactionCallback(compactionCallback(storageEngine, compactionWorker));
 
-        lifecycleManager.setCompactionCallback(segmentId -> {
+        LOGGER.info("Compaction callback wired successfully");
+    }
+
+    /**
+     * Builds the callback the lifecycle manager asks for a rewrite through.
+     *
+     * <p>The manager records a segment as handled on what this returns and stops asking, so it
+     * returns scheduled only when the worker actually took the rewrite. A worker that has been
+     * stopped refuses the request; reporting that as scheduled would strand the segment's
+     * tombstoned space with nothing left that will ask for it again.</p>
+     *
+     * @param storageEngine    The engine the segment id is resolved against
+     * @param compactionWorker The worker the rewrite is dispatched to
+     * @return The callback, which reports whether the rewrite was scheduled
+     */
+    static SegmentLifecycleManager.CompactionCallback compactionCallback(
+            StorageEngine storageEngine, CompactionWorker compactionWorker) {
+        return segmentId -> {
             var segment = storageEngine.getSegment(segmentId);
             if (segment == null) {
                 LOGGER.warn("Compaction callback received for unknown segment: {}", segmentId);
                 return false;
             }
 
-            compactionWorker.requestCompaction(segment);
-            LOGGER.debug("Compaction requested for segment {} via lifecycle callback", segmentId);
-            return true;
-        });
-
-        LOGGER.info("Compaction callback wired successfully");
+            boolean scheduled = compactionWorker.requestCompaction(segment);
+            if (scheduled) {
+                LOGGER.debug("Compaction requested for segment {} via lifecycle callback", segmentId);
+            } else {
+                LOGGER.warn("Compaction worker refused the rewrite of segment {}; the segment "
+                    + "keeps its tombstoned space", segmentId);
+            }
+            return scheduled;
+        };
     }
 
     /**
      * Creates the HNSW initializer the storage engine attaches to every segment.
      *
-     * <p>Uses the configuration from Config.Shard (efConstruction, efSearch) and the
-     * vector dimension from Config.Query.</p>
+     * <p>Uses the configuration from ShardConfig (efConstruction, efSearch) and the
+     * vector dimension from QueryConfig.</p>
      *
      * @return The initializer, to be installed before the engine starts
      */
@@ -431,7 +456,7 @@ public record CoreComponents(Arena arena,
             dimension = io.excalibur.store.HnswInitializer.DEFAULT_VECTOR_DIMENSION;
         }
 
-        // Create HNSW initializer with configuration from Config.Shard
+        // Create HNSW initializer with configuration from ShardConfig
         io.excalibur.store.HnswInitializer initializer =
             new io.excalibur.store.HnswInitializer(
                 hnswConfigFactory,

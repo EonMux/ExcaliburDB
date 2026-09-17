@@ -1,6 +1,6 @@
 package io.excalibur.vector.hnsw;
 
-import io.excalibur.config.Config;
+import io.excalibur.config.ShardConfig;
 
 /**
  * Configuration for HNSW (Hierarchical Navigable Small World) graph.
@@ -215,7 +215,7 @@ public final class HnswConfig {
     }
 
     /**
-     * Creates an HnswConfig configured from Config.Shard settings.
+     * Creates an HnswConfig configured from ShardConfig settings.
      *
      * <p>This factory method wires the shard configuration values to the appropriate
      * HNSW parameters:</p>
@@ -229,19 +229,19 @@ public final class HnswConfig {
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>efConstruction and efSearch must be at least 1 (enforced by Config.Shard validation)</li>
+     *   <li>efConstruction and efSearch must be at least 1 (enforced by ShardConfig validation)</li>
      *   <li>Values from config override HnswConfig defaults for user-configurability</li>
      *   <li>The connection bounds fix a graph's on-disk adjacency layout, so they take effect
      *       when a graph is created; one already on disk keeps the bounds it was built with</li>
      * </ul>
      *
      * @param dimension Vector dimension (must be in range [1, 4096])
-     * @param shard The shard configuration from Config.Shard
+     * @param shard The shard configuration from ShardConfig
      * @return A new HnswConfig configured with shard settings
      * @throws IllegalArgumentException if dimension is invalid
      * @throws NullPointerException if shard is null
      */
-    public static HnswConfig fromShardConfig(int dimension, Config.Shard shard) {
+    public static HnswConfig fromShardConfig(int dimension, ShardConfig shard) {
         if (shard == null) {
             throw new NullPointerException("shard config cannot be null");
         }

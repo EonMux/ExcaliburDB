@@ -19,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p>These tests verify that:
  * <ul>
- *   <li>Segments created at runtime via createSegmentAtIndex() have WriteLog attached</li>
+ *   <li>Segments created at runtime via createSegment() have WriteLog attached</li>
  *   <li>Segments created via preAllocateSegment() have WriteLog attached</li>
  *   <li>Data written to newly created segments survives a simulated crash</li>
  *   <li>WAL files are created with correct naming convention</li>

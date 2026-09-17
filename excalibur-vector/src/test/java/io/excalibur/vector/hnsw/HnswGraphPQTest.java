@@ -13,8 +13,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Random;
 
+import static io.excalibur.vector.hnsw.HnswGraphTestVectors.randomVector;
 import static org.assertj.core.api.Assertions.*;
 
 /**
@@ -43,15 +43,6 @@ class HnswGraphPQTest {
         graphPath = tempDir.resolve("test-pq.hnsw");
         config = HnswConfig.create(64);
         distanceFunction = CosineSimilarity.getInstance();
-    }
-
-    private float[] randomVector(int dim) {
-        Random random = new Random();
-        float[] vector = new float[dim];
-        for (int i = 0; i < dim; i++) {
-            vector[i] = random.nextFloat() * 2 - 1;
-        }
-        return vector;
     }
 
     @Nested

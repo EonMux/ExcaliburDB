@@ -125,6 +125,13 @@ public class ReindexStatusEndpoint implements HttpHandler {
      * <p>{@code documents_}, not {@code entries_}: a reindex counts documents, and the ingest
      * status's {@code entries_} names chunks. Giving the two the same name for different units
      * would be worse than giving them different names.</p>
+     *
+     * <p>{@code cancelled} is its own field rather than something to be read out of
+     * {@code state}, for the same reason {@code /v1/query} carries one: a caller that has just
+     * issued {@code DELETE /v1/reindex} is polling for exactly this fact, and making it
+     * string-match a state name - or worse, an error message - to find it is how a deliberate
+     * stop ends up filed as an outage. {@code finished_at_ms} is 0 while the run is going, and
+     * with {@code started_at_ms} it is how long the run took.</p>
      */
     private String toJson(ReindexEndpoint.ReindexStatus status) {
         // Locale.ROOT, because the default locale picks the decimal separator: under de_DE a
@@ -134,18 +141,22 @@ public class ReindexStatusEndpoint implements HttpHandler {
             "{"
                 + "\"source_id\": \"%s\", "
                 + "\"state\": \"%s\", "
+                + "\"cancelled\": %b, "
                 + "\"progress\": %.4f, "
                 + "\"documents_processed\": %d, "
                 + "\"documents_total\": %d, "
                 + "\"started_at_ms\": %d, "
+                + "\"finished_at_ms\": %d, "
                 + "\"last_error\": %s"
                 + "}",
             JsonText.escape(status.sourceId()),
             JsonText.escape(status.state()),
+            status.cancelled(),
             status.progress(),
             status.entriesProcessed(),
             status.entriesTotal(),
             status.startTimeMs(),
+            status.finishedAtMs(),
             status.lastError() != null
                 ? "\"" + JsonText.escape(status.lastError()) + "\""
                 : "null"

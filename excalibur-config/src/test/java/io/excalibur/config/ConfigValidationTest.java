@@ -210,6 +210,20 @@ class ConfigValidationTest {
         }
 
         @Test
+        @DisplayName("rejects min-free-disk-ratio outside [0.0, 1.0]")
+        void rejectsMinFreeDiskRatioOutsideRange() {
+            baseProps.put("excalibur.health.min-free-disk-ratio", "-0.1");
+            assertThatThrownBy(() -> ConfigValidation.validate(new Config(baseProps)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("health.min-free-disk-ratio must be >= 0.0");
+
+            baseProps.put("excalibur.health.min-free-disk-ratio", "1.1");
+            assertThatThrownBy(() -> ConfigValidation.validate(new Config(baseProps)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("health.min-free-disk-ratio must be <= 1.0");
+        }
+
+        @Test
         @DisplayName("rejects healthy-threshold below 0.0")
         void rejectsHealthyThresholdBelowZero() {
             baseProps.put("excalibur.health.healthy-threshold", "-0.1");
@@ -689,31 +703,6 @@ class ConfigValidationTest {
             assertThatThrownBy(() -> ConfigValidation.validate(config))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("shard.hnsw-integration-queue-depth-limit must be <= 1000000");
-        }
-    }
-
-    @Nested
-    @DisplayName("getInstance()")
-    class GetInstance {
-
-        @Test
-        @DisplayName("returns new instance")
-        void returnsNewInstance() {
-            ConfigValidation instance = ConfigValidation.getInstance();
-            assertThat(instance).isNotNull();
-        }
-    }
-
-    @Nested
-    @DisplayName("validateRequiredSections()")
-    class ValidateRequiredSections {
-
-        @Test
-        @DisplayName("accepts config with all sections")
-        void acceptsConfigWithAllSections() {
-            Config config = new Config(baseProps);
-            assertThatCode(() -> ConfigValidation.validateRequiredSections(config))
-                .doesNotThrowAnyException();
         }
     }
 

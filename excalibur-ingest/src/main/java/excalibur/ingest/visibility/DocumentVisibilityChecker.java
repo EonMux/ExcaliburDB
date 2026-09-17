@@ -62,6 +62,14 @@ public interface DocumentVisibilityChecker {
      * is unknown. Treating unknown as invisible drops all of them from every result the moment
      * one new document is ingested - silently, and more of them the longer the node runs.
      *
+     * <p>Unknown is safe to pass through only because in flight is not unknown. A document
+     * whose ingest was interrupted has to come back from a restart still in flight rather than
+     * as one of the documents nobody has heard of, or the two states collapse and every
+     * half-written document is served. An implementation that keeps no record across a restart
+     * cannot make that distinction and should say so rather than imply the guarantee; see
+     * {@link DocumentVisibilityTracker}, which records the in-flight set beside the document
+     * registry.
+     *
      * <p>True by default, which preserves the two-state reading for an implementation that
      * genuinely knows about everything.
      *

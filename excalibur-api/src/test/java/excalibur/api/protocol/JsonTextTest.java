@@ -138,6 +138,67 @@ class JsonTextTest {
                 .isInstanceOf(IllegalArgumentException.class);
         }
 
+        @Test
+        @DisplayName("a string, object or array field of the wrong type is refused too")
+        void rejectsWrongTypedStructures() {
+            // These four read as "absent" when the field was present with the wrong type,
+            // which is the same silent substitution the numeric accessors already refuse -
+            // and worse here, because several guards are written as "this field was not
+            // supplied". A wrong-typed document_ids defeated the check that stops a
+            // source-scoped erasure removing a whole source the caller meant to name part of.
+            assertThatThrownBy(() -> JsonText.string("{\"query\": 5}", "query"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("query");
+            assertThatThrownBy(() -> JsonText.stringArray("{\"ids\": \"a\"}", "ids"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("ids");
+            assertThatThrownBy(() -> JsonText.object("{\"config\": 7}", "config"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("config");
+            assertThatThrownBy(() -> JsonText.objectArray("{\"documents\": {}}", "documents"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("documents");
+        }
+
+        @Test
+        @DisplayName("an element of the wrong type is refused rather than dropped")
+        void rejectsWrongTypedElements() {
+            // Dropping one silently shortens the list: a batch of three documents becomes a
+            // batch of two, answered 200, and nothing says which one was not indexed.
+            assertThatThrownBy(() -> JsonText.stringArray("{\"ids\": [\"a\", 5, \"b\"]}", "ids"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("ids");
+            assertThatThrownBy(() -> JsonText.objectArray("{\"docs\": [{\"a\":1}, 5]}", "docs"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("docs");
+        }
+
+        @Test
+        @DisplayName("an array that is never closed is refused, not read as absent")
+        void rejectsAnUnclosedArray() {
+            assertThatThrownBy(() -> JsonText.stringArray("{\"ids\": [\"a\"", "ids"))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> JsonText.string("{\"query\": \"unterminated", "query"))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        @Test
+        @DisplayName("an explicit null is the same as saying nothing")
+        void anExplicitNullIsAbsent() {
+            // Clients serialise optional fields as null rather than omitting them, and
+            // "as_of": null means the caller named no instant. Refusing it would turn a
+            // perfectly ordinary encoder setting into a 400.
+            String json = "{\"as_of\": null, \"ids\": null, \"config\": null, \"top_k\": null,"
+                + " \"flag\": null, \"docs\": null}";
+
+            assertThat(JsonText.string(json, "as_of")).isNull();
+            assertThat(JsonText.stringArray(json, "ids")).isNull();
+            assertThat(JsonText.object(json, "config")).isNull();
+            assertThat(JsonText.objectArray(json, "docs")).isNull();
+            assertThat(JsonText.integer(json, "top_k", 10)).isEqualTo(10);
+            assertThat(JsonText.booleanValue(json, "flag", true)).isTrue();
+        }
+
         /**
          * Python's and JavaScript's JSON encoders both emit exponent form for large float
          * values, so this arrives from ordinary clients, not only from hostile ones. Reading
@@ -221,10 +282,15 @@ class JsonTextTest {
         }
 
         @Test
-        @DisplayName("an absent array field does not adopt the next array in the document")
+        @DisplayName("an array field does not adopt the next array in the document")
         void anArrayFieldDoesNotRunOn() {
+            // The point of the test is that "included" does not read the value of
+            // "excluded". It is refused rather than read as absent because it is present
+            // and is not an array, which is a caller mistake either way.
             String body = "{\"included\":\".md\",\"excluded\":[\".git\",\"node_modules\"]}";
-            assertThat(JsonText.stringArray(body, "included")).isNull();
+            assertThatThrownBy(() -> JsonText.stringArray(body, "included"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("included");
             assertThat(JsonText.stringArray(body, "excluded"))
                 .containsExactly(".git", "node_modules");
         }
@@ -233,7 +299,9 @@ class JsonTextTest {
         @DisplayName("an object field does not adopt the next object in the document")
         void anObjectFieldDoesNotRunOn() {
             String body = "{\"name\":\"x\",\"config\":{\"a\":1}}";
-            assertThat(JsonText.object(body, "name")).isNull();
+            assertThatThrownBy(() -> JsonText.object(body, "name"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("name");
             assertThat(JsonText.object(body, "config")).isEqualTo("{\"a\":1}");
         }
 
@@ -293,17 +361,24 @@ class JsonTextTest {
         }
 
         @Test
-        @DisplayName("returns null when the field is absent or is not an array")
-        void nullWhenAbsentOrWrongType() {
+        @DisplayName("null for an absent field, refused for one of the wrong type")
+        void nullWhenAbsentRefusedWhenWrongType() {
             assertThat(JsonText.objectArray("{\"a\": 1}", "documents")).isNull();
-            assertThat(JsonText.objectArray("{\"documents\": \"text\"}", "documents")).isNull();
+            assertThatThrownBy(
+                () -> JsonText.objectArray("{\"documents\": \"text\"}", "documents"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("documents");
         }
 
         @Test
-        @DisplayName("returns null for an array that is never closed")
-        void nullWhenUnterminated() {
-            assertThat(JsonText.objectArray("{\"documents\": [{\"id\": \"a\"}", "documents"))
-                .isNull();
+        @DisplayName("an array that is never closed is refused rather than read as absent")
+        void refusesAnUnterminatedArray() {
+            // Read as absent, a truncated body indexed nothing and answered 200. The caller
+            // sent documents and none of them arrived.
+            assertThatThrownBy(
+                () -> JsonText.objectArray("{\"documents\": [{\"id\": \"a\"}", "documents"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("documents");
         }
     }
 }

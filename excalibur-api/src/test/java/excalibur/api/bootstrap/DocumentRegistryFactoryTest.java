@@ -10,6 +10,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -105,15 +107,20 @@ class DocumentRegistryFactoryTest {
     @Test
     @DisplayName("a damaged record costs its own document and not the rest")
     void damagedRecordsAreSkipped(@TempDir Path dataDir) throws Exception {
-        // Line-granular rather than all-or-nothing: a registry truncated by a full disk should
-        // cost the documents it lost, not every document the node ever indexed.
+        // Line-granular rather than all-or-nothing: a record this build cannot parse should cost
+        // the document it describes, not every document the node ever indexed.
         DocumentRegistry first = DocumentRegistryFactory.open(dataDir);
         first.register(document("docs", "good.md", 1));
         first.persist();
         Path file = dataDir.resolve(DocumentRegistryFactory.FILE);
-        Files.writeString(file,
-            Files.readString(file, StandardCharsets.UTF_8) + "not a registry record\n",
-            StandardCharsets.UTF_8);
+        // Among the records, not after the end marker. A line past the marker is what a file
+        // truncated by a crash looks like, and that is refused rather than skipped - a different
+        // case from the one under test here, so the count moves with the line.
+        List<String> lines =
+            new ArrayList<>(Files.readAllLines(file, StandardCharsets.UTF_8));
+        lines.add(lines.size() - 1, "not a registry record");
+        lines.set(lines.size() - 1, "\\#end|2");
+        Files.write(file, lines, StandardCharsets.UTF_8);
 
         DocumentRegistry reopened = DocumentRegistryFactory.open(dataDir);
 

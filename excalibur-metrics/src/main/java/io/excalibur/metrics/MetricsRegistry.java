@@ -164,17 +164,41 @@ public final class MetricsRegistry {
     }
 
     /**
-     * Gets query latency percentile from MBean if available.
+     * The tail percentile, written the way this codebase has always written it.
      *
-     * @param percentile Percentile (50, 90, 95, 99)
-     * @return Latency in ms, or histogram value if MBean not available
+     * <p>{@code 999} means 99.9, matching {@link Metrics#getP999()} and the {@code p99.9}
+     * attribute the bean publishes. It is the one percentile of interest that is not a whole
+     * number, and an {@code int} parameter has no other way to say it.</p>
+     */
+    private static final int TAIL_PERCENTILE_SPELLING = 999;
+
+    /** The tail percentile {@link #TAIL_PERCENTILE_SPELLING} stands for. */
+    private static final double TAIL_PERCENTILE = 99.9;
+
+    /**
+     * Gets a query latency percentile, from the MBean when one is registered and from the
+     * histogram otherwise.
+     *
+     * <p>Pass a whole percentile in 0-100, or {@code 999} for p99.9 - the spelling
+     * {@link Metrics#getP999()} uses, and the only way an {@code int} can name the one
+     * published percentile that is not whole.</p>
+     *
+     * <p>Anything else is refused rather than answered. It used to fall through to the
+     * histogram, which reports the edge of its range for a target past every bucket, so
+     * {@code getLatencyPercentile(999)} returned {@value FixedBucketHistogram#RANGE_MS} - ten
+     * seconds presented as a real measurement of the tail. A caller cannot tell a fabricated
+     * latency from a measured one, and only an error gets investigated.</p>
+     *
+     * @param percentile A whole percentile in 0-100, or 999 meaning 99.9
+     * @return Latency in ms at that percentile
+     * @throws IllegalArgumentException if the argument names no percentile
      */
     public long getLatencyPercentile(int percentile) {
+        double requested = toPercentile(percentile);
         DynamicMBean mbean = getMBean("io.excalibur:type=QueryLatency");
         if (mbean != null) {
             try {
-                String attrName = "p" + percentile;
-                Object value = mbean.getAttribute(attrName);
+                Object value = mbean.getAttribute(attributeNameFor(requested));
                 if (value != null && value instanceof Long) {
                     return ((Long) value).longValue();
                 }
@@ -182,7 +206,43 @@ public final class MetricsRegistry {
                 // Ignore
             }
         }
-        return Metrics.QueryLatency().getPercentile(percentile);
+        return Metrics.QueryLatency().getPercentile(requested);
+    }
+
+    /**
+     * Reads the argument as the percentile it names.
+     *
+     * @param percentile A whole percentile in 0-100, or 999 meaning 99.9
+     * @return The percentile as a number in [0.0, 100.0]
+     * @throws IllegalArgumentException if the argument names no percentile
+     */
+    private static double toPercentile(int percentile) {
+        if (percentile == TAIL_PERCENTILE_SPELLING) {
+            return TAIL_PERCENTILE;
+        }
+        if (percentile < 0 || percentile > 100) {
+            throw new IllegalArgumentException(
+                "percentile must be 0-100, or " + TAIL_PERCENTILE_SPELLING + " for p"
+                    + TAIL_PERCENTILE + ", got: " + percentile);
+        }
+        return percentile;
+    }
+
+    /**
+     * The attribute the QueryLatency bean would publish a percentile under.
+     *
+     * <p>Spelled the way the bean spells it - {@code p50}, {@code p99.9} - so that the lookup
+     * finds the published value instead of silently missing and falling back. A percentile the
+     * bean does not publish simply misses, which is what the fallback is for.</p>
+     *
+     * @param percentile The percentile
+     * @return The JMX attribute name
+     */
+    private static String attributeNameFor(double percentile) {
+        if (percentile == Math.rint(percentile)) {
+            return "p" + (long) percentile;
+        }
+        return "p" + java.math.BigDecimal.valueOf(percentile).stripTrailingZeros().toPlainString();
     }
 
     /**
@@ -277,6 +337,10 @@ public final class MetricsRegistry {
 
     /**
      * Clears the recorded metric values.
+     *
+     * <p>This discards the Cuckoo filter false-positive samples along with the latencies:
+     * both live in the one histogram this node measures into, and {@code reset()} clears it
+     * whole. Sampling repopulates the FP rates on the next tick.</p>
      *
      * <p>The visibility epoch is deliberately left alone: it is monotone state that drives
      * which entries are visible to queries, so winding it back would corrupt reads rather

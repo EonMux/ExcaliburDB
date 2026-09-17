@@ -22,6 +22,13 @@ import java.util.stream.Collectors;
  * the entire document becomes visible. Queries can then check if a document is fully
  * visible at their captured epoch.</p>
  *
+ * <h2>Within one process</h2>
+ * <p>Every map here is in memory, so the guarantee is a guarantee for as long as the process
+ * lives and no longer: a document this registry was holding back when the node stopped comes
+ * back unknown, and unknown is passed through. Nothing is written to disk and nothing is read
+ * from it at startup. {@link DocumentVisibilityTracker} is the implementation that carries its
+ * in-flight set across a restart, and is the one production wiring uses for that reason.</p>
+ *
  * <h2>Document Atomicity</h2>
  * <p>A document is considered "atomic" when:</p>
  * <ul>

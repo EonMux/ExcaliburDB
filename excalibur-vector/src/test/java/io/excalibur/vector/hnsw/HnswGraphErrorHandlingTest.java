@@ -14,8 +14,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Random;
 
+import static io.excalibur.vector.hnsw.HnswGraphTestVectors.randomVector;
 import static org.assertj.core.api.Assertions.*;
 
 /**
@@ -363,15 +363,5 @@ class HnswGraphErrorHandlingTest {
                 assertThat(reopened.config().maxConnections()).isEqualTo(32);
             }
         }
-    }
-
-    // Helper
-    private float[] randomVector(int dim) {
-        Random random = new Random();
-        float[] vec = new float[dim];
-        for (int i = 0; i < dim; i++) {
-            vec[i] = (float) random.nextGaussian();
-        }
-        return vec;
     }
 }

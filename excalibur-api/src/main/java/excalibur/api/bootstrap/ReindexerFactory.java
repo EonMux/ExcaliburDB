@@ -14,6 +14,7 @@ import excalibur.llm.client.LLMClientConfig;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
 import io.excalibur.config.Config;
+import io.excalibur.config.LlmConfig;
 import io.excalibur.llm.client.LLMHttpClient;
 import io.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -33,6 +34,11 @@ import java.util.Objects;
  * query could still be matching, so a reindexer that wrote to storage alone would leave deleted
  * documents answering BM25 queries under identifiers whose chunks are gone.</p>
  *
+ * <p>The embedding half is optional, because on many deployments it is simply not there. A node
+ * with no embedding endpoint chunked, stored and term-indexed its corpus at ingestion; a reindex
+ * of that corpus does exactly the same again, and the chunks it writes carry no vector - which
+ * is what the ones already in storage carry.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Stateless; the components it returns carry their own thread-safety guarantees.</p>
  *
@@ -47,6 +53,31 @@ public final class ReindexerFactory {
 
     private ReindexerFactory() {
         // Utility class
+    }
+
+    /**
+     * Builds the client a reindex re-embeds through, or none on a node that indexes lexically.
+     *
+     * <p>A reindex is two halves - re-chunk and re-index, and re-embed - and only the second
+     * needs an embedding endpoint. Tying the whole operation to that endpoint is what left a
+     * BM25-only node answering 503 to every {@code POST /v1/reindex} for the life of the
+     * process: its corpus could be indexed once at registration and could never follow a later
+     * edit through any documented route.</p>
+     *
+     * <p>The test is the same one ingestion applied when it built the corpus, so the two cannot
+     * disagree about whether this node's chunks carry vectors. A node that declined embeddings
+     * stored none, and a reindex that produced them would leave one corpus indexed two ways.</p>
+     *
+     * @param llm The node's LLM configuration
+     * @return A client, or null when this node does not embed its corpus
+     */
+    static LLMHttpClient embeddingClient(LlmConfig llm) {
+        if (!RetrievalCapabilities.from(llm).embedCorpus()) {
+            LOGGER.info("Reindexing will re-chunk and re-index without embedding: this node "
+                + "does not embed its corpus, and its chunks are stored and ranked lexically.");
+            return null;
+        }
+        return new LLMHttpClient(LLMClientConfig.fromConfig(llm));
     }
 
     /**
@@ -80,8 +111,7 @@ public final class ReindexerFactory {
         TextChunker chunker = new TextChunker(config.ingest().getChunkTargetTokens(),
             config.ingest().getChunkOverlapTokens());
 
-        LLMClientConfig llmClientConfig = LLMClientConfig.fromConfig(config.llm());
-        LLMHttpClient llmClient = new LLMHttpClient(llmClientConfig);
+        LLMHttpClient llmClient = embeddingClient(config.llm());
 
         UpsertHandler upsertHandler = new UpsertHandler(
             registry,

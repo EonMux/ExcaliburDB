@@ -1,6 +1,7 @@
 package excalibur.api.mcp;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -111,7 +112,9 @@ class ExcaliburMcpServerTest {
             assertThat(((List<?>) tools).stream().map(t -> Json.stringAt(t, "name")).toList())
                 .containsExactlyInAnyOrder(McpTools.SEARCH_DOCUMENTS, McpTools.SEARCH_GRAPH,
                     McpTools.BUILD_GRAPH, McpTools.INGEST_DOCUMENTS, McpTools.ADD_DOCUMENTS,
-                    McpTools.INGESTION_STATUS);
+                    McpTools.INGESTION_STATUS, McpTools.CRAWL_WEBSITE,
+                    McpTools.DEREGISTER_SOURCE, McpTools.REINDEX_SOURCE,
+                    McpTools.REINDEX_STATUS, McpTools.GRAPH_BUILD_STATUS);
         }
     }
 
@@ -288,6 +291,96 @@ class ExcaliburMcpServerTest {
             List<String> lines = harness.stdout().lines().toList();
             assertThat(lines).hasSize(2);
             assertThat(Json.at(Json.parse(lines.get(1)), "id")).isEqualTo(2L);
+        }
+    }
+
+    @Nested
+    @DisplayName("--print-schema")
+    class PrintSchema {
+
+        /**
+         * Runs the flag and returns what went to stdout.
+         *
+         * <p>{@code System.out} is swapped rather than injected, because the flag runs before
+         * anything is constructed and writing to the real stdout is the whole behaviour under
+         * test: a caller pipes it into an API.</p>
+         *
+         * @param args The command line
+         * @return The exit code and the captured stdout
+         */
+        private Printed run(String... args) {
+            PrintStream realOut = System.out;
+            PrintStream realErr = System.err;
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            ByteArrayOutputStream err = new ByteArrayOutputStream();
+            try {
+                System.setOut(new PrintStream(out, true, StandardCharsets.UTF_8));
+                System.setErr(new PrintStream(err, true, StandardCharsets.UTF_8));
+                int code = ExcaliburMcpServer.printSchema(args);
+                return new Printed(code, out.toString(StandardCharsets.UTF_8),
+                    err.toString(StandardCharsets.UTF_8));
+            } finally {
+                System.setOut(realOut);
+                System.setErr(realErr);
+            }
+        }
+
+        private record Printed(int exitCode, String out, String err) {
+        }
+
+        @Test
+        @DisplayName("with no shape it writes all three, each under its own key")
+        void noShapeWritesEveryShape() {
+            Printed printed = run("--print-schema");
+
+            assertThat(printed.exitCode()).isZero();
+            Object document = Json.parse(printed.out());
+            assertThat(Json.at(document, "mcp")).isInstanceOf(List.class);
+            assertThat(Json.at(document, "anthropic")).isInstanceOf(List.class);
+            assertThat(Json.at(document, "openai")).isInstanceOf(List.class);
+        }
+
+        @Test
+        @DisplayName("a named shape is written ready to send, and no other")
+        void aNamedShapeIsWrittenAlone() {
+            Printed printed = run("--print-schema", "anthropic");
+
+            assertThat(printed.exitCode()).isZero();
+            Object document = Json.parse(printed.out());
+            Object first = ((List<?>) Json.at(document, "tools")).get(0);
+            assertThat(Json.objectAt(first, "input_schema")).isNotNull();
+            assertThat(Json.at(document, "openai")).isNull();
+        }
+
+        @Test
+        @DisplayName("the equals spelling of the argument works too")
+        void theEqualsSpellingWorks() {
+            Printed printed = run("--print-schema=openai");
+
+            assertThat(printed.exitCode()).isZero();
+            Object first = ((List<?>) Json.at(Json.parse(printed.out()), "tools")).get(0);
+            assertThat(Json.stringAt(first, "type")).isEqualTo("function");
+        }
+
+        @Test
+        @DisplayName("the MCP wire shape is still reachable by name")
+        void theMcpShapeIsStillReachable() {
+            Printed printed = run("--print-schema", "mcp");
+
+            Object first = ((List<?>) Json.at(Json.parse(printed.out()), "tools")).get(0);
+            assertThat(Json.objectAt(first, "inputSchema")).isNotNull();
+        }
+
+        @Test
+        @DisplayName("an unknown shape fails on stderr, leaving stdout empty")
+        void anUnknownShapeLeavesStdoutEmpty() {
+            Printed printed = run("--print-schema", "langchain");
+
+            assertThat(printed.exitCode()).isNotZero();
+            assertThat(printed.out())
+                .as("stdout is piped into an API; a usage message there would be sent as tools")
+                .isEmpty();
+            assertThat(printed.err()).contains("langchain");
         }
     }
 }

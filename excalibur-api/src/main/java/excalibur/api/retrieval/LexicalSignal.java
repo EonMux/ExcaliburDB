@@ -1,6 +1,5 @@
 package excalibur.api.retrieval;
 
-import excalibur.query.QueryResultItem;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -156,30 +155,6 @@ public final class LexicalSignal {
             return null;
         } catch (CancellationException | ExecutionException e) {
             LOGGER.warn("The BM25 signal failed; nothing to fall back to: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Fuses this signal's ranking with the vector ranking, inside the request's remaining budget.
-     *
-     * @param dense    What the vector pipeline produced, best first
-     * @param topK     Most results to return
-     * @param budgetMs How long the request has left
-     * @return The fused ranking, or null when only the vector signal answered
-     * @throws InterruptedException if the request is interrupted while waiting
-     */
-    public List<HybridFusion.Result> fuseWith(List<QueryResultItem> dense, int topK,
-                                              long budgetMs) throws InterruptedException {
-        List<LexicalQueryService.Hit> hits = await(budgetMs);
-        if (hits == null) {
-            return null;
-        }
-        try {
-            return HybridFusion.fuse(dense, hits, topK, service.rrfK());
-        } catch (RuntimeException e) {
-            LOGGER.warn("Could not fuse the two signals; answering from vector search alone: {}",
-                e.getMessage(), e);
             return null;
         }
     }

@@ -1,7 +1,5 @@
 package excalibur.bench;
 
-import java.util.Locale;
-
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
@@ -49,19 +47,19 @@ public class BenchmarkRunner {
      */
     public static final double TARGET_OPS_PER_SEC = 1_000_000_000.0;
 
-    public static void main(String[] args) throws Exception {
-        // Determine which benchmark to run based on args
-        String benchmarkPattern = ".*Benchmark.*"; // Default: run all benchmarks
+    /** Exit code used when the arguments name no benchmark. */
+    public static final int EXIT_USAGE = 2;
 
-        if (args.length > 0) {
-            String benchmarkName = args[0].toLowerCase(Locale.ROOT);
-            if (benchmarkName.contains("segment")) {
-                benchmarkPattern = ".*SegmentBenchmark.*";
-            } else if (benchmarkName.contains("cuckoo") && benchmarkName.contains("insert")) {
-                benchmarkPattern = ".*CuckooFilterInsertBenchmark.*";
-            } else if (benchmarkName.contains("cuckoo")) {
-                benchmarkPattern = ".*CuckooFilter.*Benchmark.*";
-            }
+    public static void main(String[] args) throws Exception {
+        final String benchmarkPattern;
+        try {
+            benchmarkPattern = BenchmarkSelection.patternFor(args);
+        } catch (IllegalArgumentException e) {
+            // Falling back to "run everything" would turn a typo into an hours-long
+            // run of the wrong benchmarks, so a selector that names nothing stops here.
+            System.err.println(e.getMessage());
+            System.exit(EXIT_USAGE);
+            return;
         }
 
         System.out.println("========================================");

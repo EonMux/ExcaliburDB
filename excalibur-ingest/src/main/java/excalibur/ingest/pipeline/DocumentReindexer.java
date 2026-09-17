@@ -1,53 +1,39 @@
 package excalibur.ingest.pipeline;
 
-import io.excalibur.core.text.ChunkIdentifiers;
 import excalibur.ingest.erasure.DocumentErasureService;
 import excalibur.ingest.lexical.ChunkIndex;
-import excalibur.ingest.processor.TextChunk;
 import excalibur.ingest.processor.TextChunker;
 import excalibur.ingest.registry.ChangeDetector;
-import excalibur.ingest.registry.ChangeSet;
-import excalibur.ingest.registry.DocumentLocks;
-import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
 import excalibur.ingest.registry.UpsertHandler;
 import excalibur.ingest.source.FetchedDocument;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceException;
 import io.excalibur.llm.client.LLMHttpClient;
-import io.excalibur.llm.LLMException;
-import io.excalibur.store.LifecycleState;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.SegmentLifecycleManager;
 import io.excalibur.store.VisibilityTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collection;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 /**
- * Coordinates re-indexing of changed documents: re-chunking, re-embedding via Phase 7,
- * and upserting with tombstoning of old versions.
+ * Coordinates re-indexing of changed documents: re-chunking, re-embedding where this node
+ * embeds at all, and upserting with tombstoning of old versions.
  *
  * <h2>Re-indexing Process</h2>
  * <p>For each changed document, this coordinator:
  * <ol>
  *   <li>Fetches the updated document content from the source</li>
  *   <li>Re-chunks the document using the configured chunker (512 tokens / 64 overlap)</li>
- *   <li>Generates embeddings for each chunk via the Phase 7 LLM client</li>
+ *   <li>Generates an embedding for each chunk, on a node configured with an embedding
+ *       endpoint; a node that indexes its corpus lexically skips this step and stores the
+ *       chunk with no vector, exactly as its ingestion did</li>
  *   <li>Upserts the new chunks into storage</li>
  *   <li>Tombstones old chunks via the UpsertHandler</li>
  *   <li>Removes old chunks from the Cuckoo filter hierarchy</li>
@@ -64,10 +50,19 @@ import java.util.function.Function;
  *   <li>Cuckoo filter insertion for chunk membership</li>
  * </ul>
  *
+ * <h2>What this class itself does</h2>
+ * <p>It owns the wiring and the entry points, and hands each phase to the collaborator that
+ * owns it: {@link SourceReindexPass} for one pass over a source's change set,
+ * {@link DocumentReindexStep} for one document end to end, {@link RollingReplacement} for the
+ * segment choreography, and {@link ReindexLexicalIndex} and {@link ReindexRollback} for the two
+ * things a reindex has to be able to undo. Each of those carries the reasoning for its own
+ * phase, and this one carries none of it twice.</p>
+ *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Chunk token counts: 512±10% tokens as per TextChunker specification</li>
- *   <li>Embedding dimensions: configured dimension (typically 1536 for OpenAI ada-002)</li>
+ *   <li>Embedding dimensions: configured dimension (typically 1536 for OpenAI ada-002), or
+ *       none at all on a lexical-only node</li>
  *   <li>Chunk IDs: unique, format "{documentId}:chunk:{index}"</li>
  *   <li>Old chunks are tombstoned atomically before new chunks are visible</li>
  *   <li>Errors are collected and reported, not thrown, to continue processing other documents</li>
@@ -95,9 +90,9 @@ import java.util.function.Function;
 public class DocumentReindexer {
 
     private static final Logger LOG = LoggerFactory.getLogger(DocumentReindexer.class);
-    private static final int MAX_CONTENT_LENGTH = 100 * 1024 * 1024;
 
     private final TextChunker chunker;
+    /** Embeds the chunks this reindexer writes, or null on a node that indexes lexically. */
     private final LLMHttpClient llmClient;
     private final UpsertHandler upsertHandler;
     private final DocumentRegistry registry;
@@ -109,7 +104,6 @@ public class DocumentReindexer {
 
     // Optional segment lifecycle management for rolling replacement
     private final SegmentCatalog segmentCatalog;
-    private final SegmentLifecycleManager lifecycleManager;
     private final VisibilityTracker visibilityTracker;
 
     /** The lexical index this reindex keeps in step with storage, if the node has one. */
@@ -144,6 +138,42 @@ public class DocumentReindexer {
     }
 
     /**
+     * Told how far a reindex has got, as it gets there.
+     *
+     * <p>A reindex answers 202 and runs on a background thread, so the only thing anyone can
+     * learn about it afterwards is what it published while it ran. Publishing a constant - which
+     * is what the reindex endpoint did - makes a run that is working and a run that is wedged
+     * report the same thing for as long as either lasts.</p>
+     *
+     * <p>The unit is documents, deliberately. Chunks are an implementation detail of how a
+     * document is indexed, they vary by an order of magnitude between documents, and a total
+     * expressed in them cannot be compared with anything a caller knows about its own
+     * corpus.</p>
+     */
+    @FunctionalInterface
+    public interface ReindexProgress {
+
+        /** A run whose progress nobody is watching. */
+        ReindexProgress NONE = (processed, total) -> { };
+
+        /**
+         * Reports that the run has finished with a document, successfully or not.
+         *
+         * <p>Called once before the first document with a processed count of zero, so a caller
+         * learns the size of the run before it learns anything else, and once after each
+         * document thereafter. A document that could not be fetched counts as processed: the
+         * run has moved past it, and a counter that stalls on a failure reads as a hang.</p>
+         *
+         * <p>Must not throw, and must not block: it is called from the reindex thread between
+         * documents.</p>
+         *
+         * @param documentsProcessed How many documents the run has finished with
+         * @param documentsTotal     How many it will finish with, new and changed together
+         */
+        void documentsDone(long documentsProcessed, long documentsTotal);
+    }
+
+    /**
      * Creates a new DocumentReindexer with basic storage writer (no atomic publication).
      *
      * <p>When using this constructor, documents are written directly to storage
@@ -152,7 +182,8 @@ public class DocumentReindexer {
      * for full atomic publication support.</p>
      *
      * @param chunker Text chunker for splitting documents
-     * @param llmClient LLM client for generating embeddings
+     * @param llmClient Embeds the chunks this reindexer writes, or null on a node that
+     *                  indexes its corpus lexically and has no embedding endpoint
      * @param upsertHandler Handler for tombstoning old chunks
      * @param registry Document registry for metadata tracking
      * @param storageWriter Storage writer for persisting chunks
@@ -164,14 +195,13 @@ public class DocumentReindexer {
                             DocumentRegistry registry,
                             StorageWriter storageWriter) {
         this.chunker = Objects.requireNonNull(chunker, "chunker must not be null");
-        this.llmClient = Objects.requireNonNull(llmClient, "llmClient must not be null");
+        this.llmClient = llmClient;
         this.upsertHandler = Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.storageWriter = Objects.requireNonNull(storageWriter, "storageWriter must not be null");
         this.batchPublisher = null;
         this.offsetAwareWriter = null;
         this.segmentCatalog = null;
-        this.lifecycleManager = null;
         this.visibilityTracker = null;
     }
 
@@ -188,7 +218,8 @@ public class DocumentReindexer {
      * </ul>
      *
      * @param chunker Text chunker for splitting documents
-     * @param llmClient LLM client for generating embeddings
+     * @param llmClient Embeds the chunks this reindexer writes, or null on a node that
+     *                  indexes its corpus lexically and has no embedding endpoint
      * @param upsertHandler Handler for tombstoning old chunks
      * @param registry Document registry for metadata tracking
      * @param offsetAwareWriter Storage writer that returns write log offsets
@@ -202,14 +233,13 @@ public class DocumentReindexer {
                             OffsetAwareStorageWriter offsetAwareWriter,
                             DocumentBatchPublisher batchPublisher) {
         this.chunker = Objects.requireNonNull(chunker, "chunker must not be null");
-        this.llmClient = Objects.requireNonNull(llmClient, "llmClient must not be null");
+        this.llmClient = llmClient;
         this.upsertHandler = Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.storageWriter = (chunkId, content, embedding) -> offsetAwareWriter.writeChunkWithOffset(chunkId, content, embedding) >= 0;
         this.offsetAwareWriter = Objects.requireNonNull(offsetAwareWriter, "offsetAwareWriter must not be null");
         this.batchPublisher = Objects.requireNonNull(batchPublisher, "batchPublisher must not be null");
         this.segmentCatalog = null;
-        this.lifecycleManager = null;
         this.visibilityTracker = null;
 
         LOG.info("DocumentReindexer configured with atomic batch publication support");
@@ -236,7 +266,8 @@ public class DocumentReindexer {
      * </ul>
      *
      * @param chunker Text chunker for splitting documents
-     * @param llmClient LLM client for generating embeddings
+     * @param llmClient Embeds the chunks this reindexer writes, or null on a node that
+     *                  indexes its corpus lexically and has no embedding endpoint
      * @param upsertHandler Handler for tombstoning old chunks
      * @param registry Document registry for metadata tracking
      * @param offsetAwareWriter Storage writer that returns write log offsets
@@ -256,17 +287,31 @@ public class DocumentReindexer {
                             SegmentLifecycleManager lifecycleManager,
                             VisibilityTracker visibilityTracker) {
         this.chunker = Objects.requireNonNull(chunker, "chunker must not be null");
-        this.llmClient = Objects.requireNonNull(llmClient, "llmClient must not be null");
+        this.llmClient = llmClient;
         this.upsertHandler = Objects.requireNonNull(upsertHandler, "upsertHandler must not be null");
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
         this.storageWriter = (chunkId, content, embedding) -> offsetAwareWriter.writeChunkWithOffset(chunkId, content, embedding) >= 0;
         this.offsetAwareWriter = Objects.requireNonNull(offsetAwareWriter, "offsetAwareWriter must not be null");
         this.batchPublisher = Objects.requireNonNull(batchPublisher, "batchPublisher must not be null");
         this.segmentCatalog = Objects.requireNonNull(segmentCatalog, "segmentCatalog must not be null");
-        this.lifecycleManager = Objects.requireNonNull(lifecycleManager, "lifecycleManager must not be null");
+        // Validated but not held. The rolling replacement drives every transition through
+        // the catalog itself - beginIndexing, completeIndexing, tombstone - so a manager was
+        // never read after construction. The parameter and its contract stay: excalibur-api
+        // builds this reindexer by this signature, and a caller that has not got one has not
+        // got a node configured for rolling replacement either.
+        Objects.requireNonNull(lifecycleManager, "lifecycleManager must not be null");
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
 
         LOG.info("DocumentReindexer configured with rolling replacement support (segment lifecycle enabled)");
+    }
+
+    /**
+     * Whether this reindexer turns the chunks it writes into vectors.
+     *
+     * @return true when an embedding client is configured
+     */
+    public boolean embedsChunks() {
+        return llmClient != null;
     }
 
     /**
@@ -296,81 +341,6 @@ public class DocumentReindexer {
     }
 
     /**
-     * Undoes the writes of a document that could not be published.
-     *
-     * <p>Built per failure rather than held as a field: it is only reached on the path where a
-     * document did not publish, and building it there keeps it reading the lexical index that is
-     * wired now rather than the one that was wired at construction.</p>
-     */
-    private ReindexRollback rollback() {
-        return new ReindexRollback(registry, upsertHandler, lexical::retire);
-    }
-
-    /**
-     * Retires the graph nodes of every document the source has stopped listing.
-     *
-     * <p>Beside the lexical erasure and for the same reason: storage tombstones the chunks and
-     * the registry stops naming them, but a graph node is attributed to a document rather than
-     * to a chunk, so nothing either of those does reaches it. Left behind, the document goes on
-     * being ranked by vector search - reported by name, with a distance, and with no text.</p>
-     *
-     * <p>A <em>changed</em> document's surplus tail is deliberately not retired here. Attribution
-     * is per document, so the only call available would retire the replacement's nodes as well as
-     * the previous version's, and the integration worker has no reason to insert them again.</p>
-     *
-     * @return How many nodes were retired
-     */
-    private int retireVectors(String sourceId, ChangeSet changeSet) {
-        DocumentErasureService.VectorEraser eraser = this.vectorEraser;
-        if (eraser == null) {
-            return 0;
-        }
-        int retired = 0;
-        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            String documentKey = ChunkIdentifiers.documentKey(sourceId, deleted.getDocumentId());
-            try {
-                retired += eraser.erase(documentKey);
-            } catch (RuntimeException e) {
-                // Reported rather than thrown, as the erasure service does: the chunks leaving
-                // storage is the part this run can always complete, and a graph that will not
-                // take the write must not cost that.
-                LOG.warn("Document {} stays rankable by vector search: {}",
-                    documentKey, e.getMessage());
-            }
-        }
-        if (retired > 0) {
-            LOG.info("Reindex of {} retired {} graph node(s) of {} deleted document(s)",
-                sourceId, retired, changeSet.getDeletedDocuments().size());
-        }
-        return retired;
-    }
-
-    /** The chunk ids of every document this change set says has been deleted outright. */
-    private static Set<String> deletedChunkIds(ChangeSet changeSet) {
-        Set<String> ids = new LinkedHashSet<>();
-        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            ids.addAll(deleted.getChunkIds());
-        }
-        return ids;
-    }
-
-    /**
-     * Writes the registry, so what this reindex changed survives a restart.
-     *
-     * <p>A reindex is the operation whose whole input is the registry's previous contents: it
-     * compares what a source lists now against what was recorded last time. Not writing the result
-     * would make the next run repeat this one.</p>
-     */
-    private void persistRegistry() {
-        try {
-            registry.persist();
-        } catch (IOException e) {
-            LOG.warn("Document registry not persisted; the next reindex would repeat this one: {}",
-                e.getMessage());
-        }
-    }
-
-    /**
      * Returns true if this reindexer is configured with atomic batch publication.
      *
      * @return true if atomic publication is enabled
@@ -392,42 +362,16 @@ public class DocumentReindexer {
      * @return true if rolling replacement is enabled
      */
     public boolean hasRollingReplacement() {
-        return segmentCatalog != null && lifecycleManager != null && visibilityTracker != null;
+        return segmentCatalog != null && visibilityTracker != null;
     }
 
     /**
      * Re-indexes all documents from a source with zero-downtime rolling replacement.
      *
-     * <p>This method implements the complete rolling replacement workflow:</p>
-     * <ol>
-     *   <li>Creates a new segment in BOOTSTRAPPING state for the source</li>
-     *   <li>Transitions the segment to INDEXING (becomes queryable)</li>
-     *   <li>Re-indexes all documents into the new segment</li>
-     *   <li>Transitions the segment through WARMING → ACTIVE</li>
-     *   <li>Tombstones old segments for the same source</li>
-     * </ol>
-     *
-     * <p><strong>Zero-Downtime:</strong> Old segments stay queryable for the whole run and are
-     * tombstoned once the new segment reaches WARMING, not ACTIVE - the WARMING to ACTIVE
-     * transition is made asynchronously by the warming phase worker after PQ training, and this
-     * method does not wait for it. WARMING is a queryable state, so a query still reaches the new
-     * data; a query that opts out of partial segments does not, and sees neither the old segments
-     * nor the new one until training finishes.</p>
-     *
-     * <p><strong>Requires a writable target, and a hash-routed engine never offers one.</strong>
-     * The segment created here is a catalog entry, and the catalog draws IDs from a counter it
-     * advances past every ID it issues - the indices a split registers included - so a created
-     * entry always names an index the engine holds no segment of its own at. Before the first
-     * split that index is past the routing directory and resolves to nothing; after one it
-     * resolves to a buddy pointer, and filling it would write this source's data into a segment
-     * routing unrelated keys and then retire the source's real segments in favour of it. Neither
-     * is a target, so the steps above do not currently run on this engine.</p>
-     *
-     * <p>That is detected before any document is fetched, and the run falls back to re-indexing
-     * through the routing directory: the documents are re-indexed, the created entry is
-     * tombstoned, no segment is replaced and the returned segment ID is {@code -1}. Rolling
-     * replacement becomes reachable when the engine can hand out a segment that is not a routing
-     * target, which it cannot today.</p>
+     * <p>The workflow, the reason a hash-routed engine offers no writable target, and what the
+     * run does instead when it does not, are all set out on {@link RollingReplacement}. In
+     * short: the old segments stay queryable for the whole run, and the returned segment ID is
+     * {@code -1} when no segment was replaced.</p>
      *
      * <p><strong>Prerequisites:</strong> This method requires rolling replacement
      * support to be enabled (see
@@ -439,134 +383,47 @@ public class DocumentReindexer {
      * @return Result containing counts, new segment ID, and any errors
      * @throws SourceException if crawling or fetching fails catastrophically
      * @throws NullPointerException if source or volumePath is null
+     * @see RollingReplacement
      */
     public RollingReindexResult reindexWithRollingReplacement(Source source, Path volumePath) throws SourceException {
+        return reindexWithRollingReplacement(source, volumePath, ReindexProgress.NONE);
+    }
+
+    /**
+     * Re-indexes by rolling replacement, reporting progress as it goes.
+     *
+     * <p>The progress a caller sees is the same whichever branch this run takes - a real
+     * replacement, or the fall back to re-indexing through the routing directory. Which of the
+     * two happens is a property of the storage engine rather than of anything the caller asked
+     * for, and a status that went silent on one of them would be reporting on the deployment
+     * rather than on the run.</p>
+     *
+     * @param source     The source to re-index
+     * @param volumePath Where the new segment file should be created
+     * @param progress   Told how many documents the run has finished with
+     * @return Result containing counts, new segment ID, and any errors
+     * @throws SourceException      if crawling or fetching fails catastrophically
+     * @throws NullPointerException if any argument is null
+     * @see RollingReplacement
+     */
+    public RollingReindexResult reindexWithRollingReplacement(Source source, Path volumePath,
+                                                              ReindexProgress progress)
+            throws SourceException {
         Objects.requireNonNull(source, "source must not be null");
         Objects.requireNonNull(volumePath, "volumePath must not be null");
-
-        String sourceId = source.getSourceId();
-        long startTime = System.currentTimeMillis();
+        Objects.requireNonNull(progress, "progress must not be null");
 
         // Fall back to regular reindex if rolling replacement not configured
         if (!hasRollingReplacement()) {
-            LOG.warn("Rolling replacement not configured for source {}, falling back to regular reindex", sourceId);
-            ReindexResult basicResult = reindexAll(source);
+            LOG.warn("Rolling replacement not configured for source {}, falling back to regular reindex",
+                source.getSourceId());
+            ReindexResult basicResult = reindexAll(source, progress);
             return new RollingReindexResult(basicResult, -1, List.of());
         }
 
-        LOG.info("Starting rolling reindex for source: {} with volume: {}", sourceId, volumePath);
-
-        // Step 1: Create new segment in BOOTSTRAPPING state
-        SegmentCatalog.SegmentMetadata newSegment;
-        try {
-            newSegment = segmentCatalog.create(sourceId, volumePath);
-            LOG.info("Created new segment {} in BOOTSTRAPPING state for source {}", newSegment.getSegmentId(), sourceId);
-        } catch (Exception e) {
-            LOG.error("Failed to create new segment for source {}: {}", sourceId, e.getMessage());
-            throw new SourceException("Failed to create new segment: " + e.getMessage(), e);
-        }
-
-        long newSegmentId = newSegment.getSegmentId();
-
-        List<Long> oldSegmentIds = new ArrayList<>();
-
-        try {
-            // Step 2: Find old segments for this source (to tombstone later)
-            List<SegmentCatalog.SegmentMetadata> existingSegments = segmentCatalog.getSegmentsBySource(sourceId);
-            for (SegmentCatalog.SegmentMetadata seg : existingSegments) {
-                if (seg.getSegmentId() != newSegmentId &&
-                    seg.getLifecycleState() != LifecycleState.TOMBSTONED &&
-                    seg.getLifecycleState() != LifecycleState.PURGED) {
-                    oldSegmentIds.add(seg.getSegmentId());
-                }
-            }
-            LOG.info("Found {} existing segments for source {} to tombstone after reindex", oldSegmentIds.size(), sourceId);
-
-            // Step 3: Transition new segment to INDEXING (makes it queryable)
-            segmentCatalog.beginIndexing(newSegmentId);
-            LOG.info("Segment {} transitioned from BOOTSTRAPPING to INDEXING", newSegmentId);
-
-            // The catalog mints IDs from its own counter, which continues past the storage
-            // engine's routing width, so a created segment routinely names no segment the engine
-            // can write to. Discovering that one chunk at a time costs a crawl, a chunking pass
-            // and an embedding call for every chunk of every document in the source before the
-            // first write is even attempted, and the run then ends having written nothing. Ask
-            // once, and re-index the way the engine supports rather than an expensive way it
-            // does not. Checked after the segment is INDEXING because that is the state it has
-            // to be in to be discarded.
-            if (!offsetAwareWriter.canWriteTo(newSegmentId)) {
-                LOG.warn("Segment {} created for source {} is not a write target for the storage "
-                    + "engine; re-indexing through the routing directory instead of replacing "
-                    + "segments. No old segment is retired.", newSegmentId, sourceId);
-                segmentCatalog.tombstone(newSegmentId, visibilityTracker.currentEpoch());
-                ReindexResult basicResult = reindexAll(source);
-                return new RollingReindexResult(basicResult, -1, List.of());
-            }
-
-            // Step 4: Create segment-targeted writers for the new segment
-            // This is CRITICAL: all reindexed data must go to the NEW segment, not the old one
-            OffsetAwareStorageWriter segmentWriter = offsetAwareWriter.forSegment(newSegmentId);
-            DocumentBatchPublisher segmentPublisher = batchPublisher.withTargetSegment(newSegmentId);
-            LOG.info("Created segment-targeted writers for segment {}", newSegmentId);
-
-            // Step 5: Perform the actual reindexing with segment-targeted writers
-            ReindexResult reindexResult = reindexAllWithSegmentWriter(source, segmentWriter, segmentPublisher);
-
-            // The new segment is only usable if something was actually written to it. Guarding on
-            // the document count alone lets a run in which every document failed fall through and
-            // tombstone every populated old segment.
-            // Skips count here as well as errors: a source whose every document turned out
-            // empty wrote nothing, and retiring populated old segments in favour of the empty
-            // new one would erase a corpus on the strength of a crawl that returned no bodies.
-            if (reindexResult.getChunksCreated() == 0
-                    && (reindexResult.hasErrors() || reindexResult.getDocumentsSkipped() > 0)) {
-                // Complete failure - mark segment for cleanup
-                LOG.error("Reindex failed completely for source {}, tombstoning new segment {}", sourceId, newSegmentId);
-                segmentCatalog.tombstone(newSegmentId, visibilityTracker.currentEpoch());
-                return new RollingReindexResult(reindexResult, newSegmentId, List.of());
-            }
-
-            // Step 6: Transition new segment to WARMING state
-            // WarmingPhaseWorker will handle PQ training and the WARMING → ACTIVE transition asynchronously
-            segmentCatalog.completeIndexing(newSegmentId);
-            LOG.info("Segment {} transitioned from INDEXING to WARMING, awaiting PQ training by WarmingPhaseWorker", newSegmentId);
-
-            // Note: completeWarmup() is called by WarmingPhaseWorker after PQ training completes
-            // This ensures PQ codebooks are trained before the segment becomes ACTIVE
-
-            // Step 7: Tombstone old segments for this source
-            List<Long> tombstonedSegments = new ArrayList<>();
-            long currentEpoch = visibilityTracker.currentEpoch();
-
-            for (Long oldSegmentId : oldSegmentIds) {
-                try {
-                    segmentCatalog.tombstone(oldSegmentId, currentEpoch);
-                    tombstonedSegments.add(oldSegmentId);
-                    LOG.info("Tombstoned old segment {} for source {} at epoch {}", oldSegmentId, sourceId, currentEpoch);
-                } catch (Exception e) {
-                    LOG.warn("Failed to tombstone old segment {} for source {}: {}", oldSegmentId, sourceId, e.getMessage());
-                }
-            }
-
-            // Step 8: Advance epoch to make changes visible
-            visibilityTracker.advanceEpoch();
-
-            long elapsed = System.currentTimeMillis() - startTime;
-            LOG.info("Rolling reindex complete for source {}: new segment={}, {} docs indexed, {} old segments tombstoned, {}ms",
-                sourceId, newSegmentId, reindexResult.getDocumentsIndexed(), tombstonedSegments.size(), elapsed);
-
-            return new RollingReindexResult(reindexResult, newSegmentId, tombstonedSegments);
-
-        } catch (Exception e) {
-            LOG.error("Rolling reindex failed for source {}: {}", sourceId, e.getMessage(), e);
-            // Try to tombstone the new segment if it was created
-            try {
-                segmentCatalog.tombstone(newSegmentId, visibilityTracker.currentEpoch());
-            } catch (Exception cleanupError) {
-                LOG.warn("Failed to tombstone segment {} during cleanup: {}", newSegmentId, cleanupError.getMessage());
-            }
-            throw new SourceException("Rolling reindex failed: " + e.getMessage(), e);
-        }
+        return new RollingReplacement(segmentCatalog, visibilityTracker, offsetAwareWriter,
+            batchPublisher, this::reindexAll, this::reindexAllWithSegmentWriter)
+            .run(source, volumePath, progress);
     }
 
     /**
@@ -666,72 +523,27 @@ public class DocumentReindexer {
      * @throws NullPointerException if source is null
      */
     public ReindexResult reindexAll(Source source) throws SourceException {
+        return reindexAll(source, ReindexProgress.NONE);
+    }
+
+    /**
+     * Re-indexes all changed and new documents from a source, reporting progress as it goes.
+     *
+     * @param source   The source to re-index
+     * @param progress Told how many documents the run has finished with, as it finishes with
+     *                 them
+     * @return Result containing counts and any errors
+     * @throws SourceException      if crawling or fetching fails catastrophically
+     * @throws NullPointerException if either argument is null
+     * @see SourceReindexPass
+     */
+    public ReindexResult reindexAll(Source source, ReindexProgress progress)
+            throws SourceException {
         Objects.requireNonNull(source, "source must not be null");
-        
-        String sourceId = source.getSourceId();
-        LOG.info("Starting re-index for source: {}", sourceId);
-        
-        ChangeDetector detector = new ChangeDetector(registry);
-        ChangeSet changeSet = detector.detectChanges(source);
-        
-        LOG.info("Change detection complete for {}: new={}, changed={}, deleted={}", 
-                sourceId, changeSet.getNewCount(), changeSet.getChangedCount(), 
-                changeSet.getDeletedCount());
-        
-        ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId);
+        Objects.requireNonNull(progress, "progress must not be null");
 
-        // Only removals are safe to apply before the replacement content exists; see
-        // UpsertHandler.processDeletions. The lexical index is erased first: a document that has
-        // been deleted should stop being findable before its bytes go, not after.
-        lexical.retire(deletedChunkIds(changeSet));
-        retireVectors(sourceId, changeSet);
-        UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processDeletions(changeSet);
-        resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
-        int chunksTombstoned = tombstoneResult.getChunksTombstoned();
-        tombstoneResult.getErrors().forEach(error -> 
-            resultBuilder.addError("tombstone", error.getChunkId(), error.getMessage()));
-        
-        for (String newDocId : changeSet.getNewDocuments()) {
-            try {
-                FetchedDocument fetched = source.fetch(newDocId);
-                DocumentResult docResult = reindexDocument(sourceId, newDocId, fetched);
-                resultBuilder.addDocumentResult(docResult);
-            } catch (SourceException e) {
-                String msg = "Failed to fetch new document " + newDocId + ": " + e.getMessage();
-                LOG.error(msg, e);
-                resultBuilder.addError("fetch", newDocId, msg);
-            } catch (Exception e) {
-                String msg = "Failed to re-index new document " + newDocId + ": " + e.getMessage();
-                LOG.error(msg, e);
-                resultBuilder.addError("reindex", newDocId, msg);
-            }
-        }
-        
-        for (ChangeSet.ChangedDocument changed : changeSet.getChangedDocuments()) {
-            try {
-                FetchedDocument fetched = source.fetch(changed.getDocumentId());
-                DocumentResult docResult = reindexDocument(sourceId, changed.getDocumentId(), fetched);
-                resultBuilder.addDocumentResult(docResult);
-                chunksTombstoned += retireReplacedVersion(changed, docResult);
-            } catch (SourceException e) {
-                String msg = "Failed to fetch changed document " + changed.getDocumentId() + ": " + e.getMessage();
-                LOG.error(msg, e);
-                resultBuilder.addError("fetch", changed.getDocumentId(), msg);
-            } catch (Exception e) {
-                String msg = "Failed to re-index changed document " + changed.getDocumentId() + ": " + e.getMessage();
-                LOG.error(msg, e);
-                resultBuilder.addError("reindex", changed.getDocumentId(), msg);
-            }
-        }
-
-        resultBuilder.chunksTombstoned(chunksTombstoned);
-        lexical.settle();
-        persistRegistry();
-        ReindexResult result = resultBuilder.build();
-        LOG.info("Re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
-                sourceId, result.getDocumentsIndexed(), result.getChunksCreated(), result.getErrorCount());
-
-        return result;
+        return pass(this::reindexDocument, SourceReindexPass.Route.THROUGH_ROUTING_DIRECTORY)
+            .run(source, progress);
     }
 
     /**
@@ -761,252 +573,37 @@ public class DocumentReindexer {
             Source source,
             OffsetAwareStorageWriter segmentWriter,
             DocumentBatchPublisher segmentPublisher) throws SourceException {
+        return reindexAllWithSegmentWriter(source, segmentWriter, segmentPublisher,
+            ReindexProgress.NONE);
+    }
+
+    /**
+     * Re-indexes into a target segment, reporting progress as it goes.
+     *
+     * @param source           The source to re-index
+     * @param segmentWriter    Storage writer bound to the target segment
+     * @param segmentPublisher Publisher bound to the target segment
+     * @param progress         Told how many documents the run has finished with
+     * @return Result containing counts and any errors
+     * @throws SourceException      if crawling or fetching fails catastrophically
+     * @throws NullPointerException if any parameter is null
+     * @see SourceReindexPass
+     */
+    public ReindexResult reindexAllWithSegmentWriter(
+            Source source,
+            OffsetAwareStorageWriter segmentWriter,
+            DocumentBatchPublisher segmentPublisher,
+            ReindexProgress progress) throws SourceException {
 
         Objects.requireNonNull(source, "source must not be null");
         Objects.requireNonNull(segmentWriter, "segmentWriter must not be null");
         Objects.requireNonNull(segmentPublisher, "segmentPublisher must not be null");
+        Objects.requireNonNull(progress, "progress must not be null");
 
-        String sourceId = source.getSourceId();
-        LOG.info("Starting segment-targeted re-index for source: {}", sourceId);
-
-        ChangeDetector detector = new ChangeDetector(registry);
-        ChangeSet changeSet = detector.detectChanges(source);
-
-        LOG.info("Change detection complete for {}: new={}, changed={}, deleted={}",
-                sourceId, changeSet.getNewCount(), changeSet.getChangedCount(),
-                changeSet.getDeletedCount());
-
-        ReindexResult.Builder resultBuilder = ReindexResult.builder(sourceId);
-
-        // Only removals are safe to apply before the replacement content exists; see
-        // UpsertHandler.processDeletions. The lexical index is erased first: a document that has
-        // been deleted should stop being findable before its bytes go, not after.
-        lexical.retire(deletedChunkIds(changeSet));
-        retireVectors(sourceId, changeSet);
-        UpsertHandler.UpsertResult tombstoneResult = upsertHandler.processDeletions(changeSet);
-        resultBuilder.documentsTombstoned(tombstoneResult.getDocumentsDeleted());
-        int chunksTombstoned = tombstoneResult.getChunksTombstoned();
-        tombstoneResult.getErrors().forEach(error ->
-            resultBuilder.addError("tombstone", error.getChunkId(), error.getMessage()));
-
-        // Index new documents using segment-targeted writers
-        for (String newDocId : changeSet.getNewDocuments()) {
-            try {
-                FetchedDocument fetched = source.fetch(newDocId);
-                DocumentResult docResult = reindexDocumentWithSegmentWriter(
-                    sourceId, newDocId, fetched, segmentWriter, segmentPublisher);
-                resultBuilder.addDocumentResult(docResult);
-            } catch (SourceException e) {
-                String msg = "Failed to fetch new document " + newDocId + ": " + e.getMessage();
-                LOG.error(msg, e);
-                resultBuilder.addError("fetch", newDocId, msg);
-            } catch (Exception e) {
-                String msg = "Failed to re-index new document " + newDocId + ": " + e.getMessage();
-                LOG.error(msg, e);
-                resultBuilder.addError("reindex", newDocId, msg);
-            }
-        }
-
-        // Index changed documents using segment-targeted writers
-        for (ChangeSet.ChangedDocument changed : changeSet.getChangedDocuments()) {
-            try {
-                FetchedDocument fetched = source.fetch(changed.getDocumentId());
-                DocumentResult docResult = reindexDocumentWithSegmentWriter(
-                    sourceId, changed.getDocumentId(), fetched, segmentWriter, segmentPublisher);
-                resultBuilder.addDocumentResult(docResult);
-                chunksTombstoned += retireReplacedVersion(changed, docResult);
-            } catch (SourceException e) {
-                String msg = "Failed to fetch changed document " + changed.getDocumentId() + ": " + e.getMessage();
-                LOG.error(msg, e);
-                resultBuilder.addError("fetch", changed.getDocumentId(), msg);
-            } catch (Exception e) {
-                String msg = "Failed to re-index changed document " + changed.getDocumentId() + ": " + e.getMessage();
-                LOG.error(msg, e);
-                resultBuilder.addError("reindex", changed.getDocumentId(), msg);
-            }
-        }
-
-        resultBuilder.chunksTombstoned(chunksTombstoned);
-        lexical.settle();
-        persistRegistry();
-        ReindexResult result = resultBuilder.build();
-        LOG.info("Segment-targeted re-index complete for {}: {} docs indexed, {} chunks created, {} errors",
-                sourceId, result.getDocumentsIndexed(), result.getChunksCreated(), result.getErrorCount());
-
-        return result;
-    }
-
-    /**
-     * Tombstones whatever remains of a changed document's previous version once its replacement
-     * has been published.
-     *
-     * <p>Tombstoning before the replacement exists is what makes a failed re-embed destructive:
-     * the old chunks are gone and nothing re-inserts them. Doing it here, after publication, means
-     * a failed document simply keeps serving its previous version. Chunk ids are deterministic, so
-     * the new version has already overwritten the ids it reuses; only the surplus tail is
-     * removed.</p>
-     *
-     * @param changed   The changed document, carrying the previous version's metadata
-     * @param docResult The outcome of re-indexing it
-     * @return The number of obsolete chunks tombstoned
-     */
-    private int retireReplacedVersion(ChangeSet.ChangedDocument changed, DocumentResult docResult) {
-        if (docResult.getSuccessfulChunks() == 0) {
-            LOG.warn("Keeping previous version of document {}: replacement produced no chunks",
-                changed.getDocumentId());
-            return 0;
-        }
-        List<String> obsolete = new ArrayList<>(changed.getOldMetadata().getChunkIds());
-        obsolete.removeAll(docResult.getChunkIds());
-        lexical.retire(obsolete);
-        return upsertHandler.tombstoneObsoleteChunks(
-            changed.getOldMetadata().getChunkIds(), docResult.getChunkIds());
-    }
-
-    /**
-     * Re-indexes a single document using segment-targeted writers.
-     *
-     * <p>This method is similar to {@link #reindexDocumentWithAtomicPublication} but
-     * accepts segment-targeted writers, ensuring all data is written to the correct
-     * segment during rolling replacement.</p>
-     *
-     * @param sourceId Source identifier
-     * @param documentId Document identifier
-     * @param fetched The fetched document content
-     * @param segmentWriter Storage writer bound to the target segment
-     * @param segmentPublisher Publisher bound to the target segment
-     * @return Result of re-indexing this document
-     */
-    private DocumentResult reindexDocumentWithSegmentWriter(
-            String sourceId,
-            String documentId,
-            FetchedDocument fetched,
-            OffsetAwareStorageWriter segmentWriter,
-            DocumentBatchPublisher segmentPublisher) {
-
-        long startTime = System.currentTimeMillis();
-
-        byte[] content = fetched.getContent();
-        if (content == null || content.length == 0) {
-            return new DocumentResult(documentId, 0, 0, 0,
-                System.currentTimeMillis() - startTime, "Empty content");
-        }
-
-        if (content.length > MAX_CONTENT_LENGTH) {
-            throw new IllegalArgumentException(
-                "Content length " + content.length + " exceeds maximum " + MAX_CONTENT_LENGTH);
-        }
-
-        String text = fetched.getText();
-
-        List<TextChunk> chunks = chunker.chunk(documentId, text);
-        if (chunks.isEmpty()) {
-            return new DocumentResult(documentId, 0, 0, 0,
-                System.currentTimeMillis() - startTime, "No chunks produced");
-        }
-
-        DocumentBatchBuffer batchBuffer = new DocumentBatchBuffer(documentId, sourceId);
-        AtomicInteger successCount = new AtomicInteger(0);
-        AtomicInteger failureCount = new AtomicInteger(0);
-        List<String> errors = new ArrayList<>();
-        List<String> chunkIds = new ArrayList<>(chunks.size());
-
-        // Write all chunks to the TARGET SEGMENT and accumulate in batch buffer
-        for (int i = 0; i < chunks.size(); i++) {
-            TextChunk chunk = chunks.get(i);
-            String chunkId = generateChunkId(sourceId, documentId, i);
-
-            try {
-                float[] embedding = llmClient.generateEmbedding(chunk.getText(),
-                    "reindex:" + sourceId + ":" + documentId);
-
-                // Write to the TARGET SEGMENT via segmentWriter
-                long writeLogOffset = segmentWriter.writeChunkWithOffset(chunkId, chunk.getText(), embedding);
-
-                if (writeLogOffset >= 0) {
-                    // Add to batch buffer for atomic publication
-                    batchBuffer.addChunk(chunkId, chunk, writeLogOffset, embedding);
-                    chunkIds.add(chunkId);
-                    successCount.incrementAndGet();
-                } else {
-                    failureCount.incrementAndGet();
-                    errors.add("Storage write failed for chunk " + i);
-                    LOG.warn("Failed to write chunk {} for document {} to target segment", i, documentId);
-                }
-            } catch (LLMException e) {
-                failureCount.incrementAndGet();
-                errors.add("Embedding failed for chunk " + i + ": " + e.getMessage());
-                LOG.error("Failed to generate embedding for chunk {} of document {}: {}",
-                    i, documentId, e.getMessage());
-            }
-        }
-
-        // A document is indexed whole or not at all. Publishing the chunks that survived would
-        // register the new content hash beside a partial chunk list, and change detection compares
-        // exactly that hash: the document would then read as unchanged forever, so the chunks that
-        // failed would never be retried and their content would be permanently missing. Leaving
-        // the previous registry entry alone keeps the document classified as changed, so the next
-        // run picks it up again.
-        if (failureCount.get() > 0) {
-            // Left unchanged means left as it was, which includes the chunks this attempt had
-            // already written past the surviving entry: nothing names those, so nothing could
-            // ever remove them either.
-            rollback().undo(sourceId, documentId, chunkIds);
-            return new DocumentResult(documentId, chunks.size(), 0, failureCount.get(),
-                System.currentTimeMillis() - startTime,
-                "Document left unchanged, " + failureCount.get() + " of " + chunks.size()
-                    + " chunks failed: " + String.join("; ", errors));
-        }
-
-        // Seal the buffer for atomic publication
-        batchBuffer.seal();
-
-        // Build document metadata
-        long contentHash = DocumentRegistry.computeContentHash(content);
-        DocumentMetadata metadata = DocumentMetadata.builder()
-            .sourceId(sourceId)
-            .documentId(documentId)
-            .lastModifiedMillis(fetched.getLastModifiedMillis())
-            .contentHash(contentHash)
-            .contentLength(content.length)
-            .chunkIds(chunkIds)
-            .indexTimeMillis(System.currentTimeMillis())
-            .build();
-
-        // Publish atomically to the TARGET SEGMENT
-        try {
-            // Under the document's lock, as ingestion publishes and erasure removes: the
-            // registry and visibility entries this writes are the ones an erasure of the same
-            // document is removing, and between them they decide whether a chunk in storage is
-            // still named by anything.
-            DocumentBatchPublisher.PublicationResult result = DocumentLocks.shared().inDocument(
-                ChunkIdentifiers.documentKey(sourceId, documentId),
-                () -> segmentPublisher.publish(batchBuffer, metadata));
-
-            long elapsed = System.currentTimeMillis() - startTime;
-            String errorMsg = errors.isEmpty() ? null : String.join("; ", errors);
-
-            LOG.info("Document {} published atomically to target segment at epoch {}: {} chunks ({} successful, {} failed) in {}ms",
-                documentId, result.epoch(), chunks.size(), successCount.get(), failureCount.get(), elapsed);
-
-            lexical.index(chunkIds, chunks);
-            return new DocumentResult(documentId, chunks.size(), successCount.get(),
-                failureCount.get(), elapsed, errorMsg, chunkIds);
-
-        } catch (DocumentBatchPublisher.PublicationException e) {
-            // Publication failed - document should not be visible
-            String errorMsg = "Atomic publication to target segment failed: " + e.getMessage();
-            if (!errors.isEmpty()) {
-                errorMsg += "; " + String.join("; ", errors);
-            }
-
-            long elapsed = System.currentTimeMillis() - startTime;
-            LOG.error("Atomic publication to target segment failed for document {}: {}", documentId, e.getMessage());
-
-            rollback().undo(sourceId, documentId, chunkIds);
-            return new DocumentResult(documentId, chunks.size(), 0, chunks.size(),
-                elapsed, errorMsg);
-        }
+        DocumentReindexStep step =
+            step(new DocumentReindexStep.AtomicTarget(segmentWriter, segmentPublisher, true));
+        return pass(step::reindex, SourceReindexPass.Route.INTO_TARGET_SEGMENT)
+            .run(source, progress);
     }
 
     /**
@@ -1017,7 +614,7 @@ public class DocumentReindexer {
      *   <li>Validates content length is within bounds</li>
      *   <li>Decodes content as UTF-8 text</li>
      *   <li>Splits text into overlapping chunks</li>
-     *   <li>Generates embeddings for each chunk via LLM</li>
+     *   <li>Generates an embedding for each chunk, where this node embeds its corpus</li>
      *   <li>Writes chunks to storage</li>
      *   <li>Updates document registry with new metadata</li>
      * </ol>
@@ -1037,265 +634,37 @@ public class DocumentReindexer {
      * @param fetched The fetched document content
      * @return Result of re-indexing this document
      * @throws IllegalArgumentException if content exceeds maximum length
+     * @see DocumentReindexStep
      */
     public DocumentResult reindexDocument(String sourceId, String documentId, FetchedDocument fetched) {
         Objects.requireNonNull(sourceId, "sourceId must not be null");
         Objects.requireNonNull(documentId, "documentId must not be null");
         Objects.requireNonNull(fetched, "fetched must not be null");
 
-        long startTime = System.currentTimeMillis();
-
-        byte[] content = fetched.getContent();
-        if (content == null || content.length == 0) {
-            return new DocumentResult(documentId, 0, 0, 0,
-                System.currentTimeMillis() - startTime, "Empty content");
-        }
-
-        if (content.length > MAX_CONTENT_LENGTH) {
-            throw new IllegalArgumentException(
-                "Content length " + content.length + " exceeds maximum " + MAX_CONTENT_LENGTH);
-        }
-
-        String text = fetched.getText();
-
-        List<TextChunk> chunks = chunker.chunk(documentId, text);
-        if (chunks.isEmpty()) {
-            return new DocumentResult(documentId, 0, 0, 0,
-                System.currentTimeMillis() - startTime, "No chunks produced");
-        }
-
-        // Use atomic publication if configured
-        if (hasAtomicPublication()) {
-            return reindexDocumentWithAtomicPublication(sourceId, documentId, content, text, chunks,
-                fetched.getLastModifiedMillis(), startTime);
-        }
-
-        // Fall back to legacy direct-write path
-        return reindexDocumentDirect(sourceId, documentId, content, chunks, fetched.getLastModifiedMillis(), startTime);
+        DocumentReindexStep step = hasAtomicPublication()
+            ? step(new DocumentReindexStep.AtomicTarget(offsetAwareWriter, batchPublisher, false))
+            : DocumentReindexStep.writingDirectly(chunker, llmClient, registry, upsertHandler,
+                lexical, storageWriter);
+        return step.reindex(sourceId, documentId, fetched);
     }
 
     /**
-     * Re-indexes using atomic batch publication for document-atomic visibility.
+     * Builds the pass that walks a source's change set.
      *
-     * <p>This method writes all chunks to storage, accumulates them in a
-     * {@link DocumentBatchBuffer}, and then publishes them atomically via
-     * {@link DocumentBatchPublisher}.</p>
+     * <p>Built per run rather than held as a field, for the reason the rollback is: the vector
+     * eraser and the lexical index are wired after construction, and a pass built once at
+     * construction would go on reindexing as though neither had ever been attached.</p>
      */
-    private DocumentResult reindexDocumentWithAtomicPublication(
-            String sourceId,
-            String documentId,
-            byte[] content,
-            String text,
-            List<TextChunk> chunks,
-            long lastModifiedMillis,
-            long startTime) {
-
-        DocumentBatchBuffer batchBuffer = new DocumentBatchBuffer(documentId, sourceId);
-        AtomicInteger successCount = new AtomicInteger(0);
-        AtomicInteger failureCount = new AtomicInteger(0);
-        List<String> errors = new ArrayList<>();
-        List<String> chunkIds = new ArrayList<>(chunks.size());
-
-        // Write all chunks to storage and accumulate in batch buffer
-        for (int i = 0; i < chunks.size(); i++) {
-            TextChunk chunk = chunks.get(i);
-            String chunkId = generateChunkId(sourceId, documentId, i);
-
-            try {
-                float[] embedding = llmClient.generateEmbedding(chunk.getText(),
-                    "reindex:" + sourceId + ":" + documentId);
-
-                // Write to storage and get offset
-                long writeLogOffset = offsetAwareWriter.writeChunkWithOffset(chunkId, chunk.getText(), embedding);
-
-                if (writeLogOffset >= 0) {
-                    // Add to batch buffer for atomic publication
-                    batchBuffer.addChunk(chunkId, chunk, writeLogOffset, embedding);
-                    chunkIds.add(chunkId);
-                    successCount.incrementAndGet();
-                } else {
-                    failureCount.incrementAndGet();
-                    errors.add("Storage write failed for chunk " + i);
-                    LOG.warn("Failed to write chunk {} for document {}", i, documentId);
-                }
-            } catch (LLMException e) {
-                failureCount.incrementAndGet();
-                errors.add("Embedding failed for chunk " + i + ": " + e.getMessage());
-                LOG.error("Failed to generate embedding for chunk {} of document {}: {}",
-                    i, documentId, e.getMessage());
-            }
-        }
-
-        // A document is indexed whole or not at all. Publishing the chunks that survived would
-        // register the new content hash beside a partial chunk list, and change detection compares
-        // exactly that hash: the document would then read as unchanged forever, so the chunks that
-        // failed would never be retried and their content would be permanently missing. Leaving
-        // the previous registry entry alone keeps the document classified as changed, so the next
-        // run picks it up again.
-        if (failureCount.get() > 0) {
-            // Left unchanged means left as it was, which includes the chunks this attempt had
-            // already written past the surviving entry: nothing names those, so nothing could
-            // ever remove them either.
-            rollback().undo(sourceId, documentId, chunkIds);
-            return new DocumentResult(documentId, chunks.size(), 0, failureCount.get(),
-                System.currentTimeMillis() - startTime,
-                "Document left unchanged, " + failureCount.get() + " of " + chunks.size()
-                    + " chunks failed: " + String.join("; ", errors));
-        }
-
-        // Seal the buffer for atomic publication
-        batchBuffer.seal();
-
-        // Build document metadata
-        long contentHash = DocumentRegistry.computeContentHash(content);
-        DocumentMetadata metadata = DocumentMetadata.builder()
-            .sourceId(sourceId)
-            .documentId(documentId)
-            .lastModifiedMillis(lastModifiedMillis)
-            .contentHash(contentHash)
-            .contentLength(content.length)
-            .chunkIds(chunkIds)
-            .indexTimeMillis(System.currentTimeMillis())
-            .build();
-
-        // Publish atomically - advances visibility epoch, inserts to Cuckoo filter, registers document
-        try {
-            // Under the document's lock; see reindexDocumentWithSegmentWriter.
-            DocumentBatchPublisher.PublicationResult result = DocumentLocks.shared().inDocument(
-                ChunkIdentifiers.documentKey(sourceId, documentId),
-                () -> batchPublisher.publish(batchBuffer, metadata));
-
-            long elapsed = System.currentTimeMillis() - startTime;
-            String errorMsg = errors.isEmpty() ? null : String.join("; ", errors);
-
-            LOG.info("Document {} published atomically at epoch {}: {} chunks ({} successful, {} failed) in {}ms",
-                documentId, result.epoch(), chunks.size(), successCount.get(), failureCount.get(), elapsed);
-
-            lexical.index(chunkIds, chunks);
-            return new DocumentResult(documentId, chunks.size(), successCount.get(),
-                failureCount.get(), elapsed, errorMsg, chunkIds);
-
-        } catch (DocumentBatchPublisher.PublicationException e) {
-            // Publication failed - document should not be visible
-            String errorMsg = "Atomic publication failed: " + e.getMessage();
-            if (!errors.isEmpty()) {
-                errorMsg += "; " + String.join("; ", errors);
-            }
-
-            long elapsed = System.currentTimeMillis() - startTime;
-            LOG.error("Atomic publication failed for document {}: {}", documentId, e.getMessage());
-
-            rollback().undo(sourceId, documentId, chunkIds);
-            return new DocumentResult(documentId, chunks.size(), 0, chunks.size(),
-                elapsed, errorMsg);
-        }
+    private SourceReindexPass pass(SourceReindexPass.DocumentStep documentStep,
+                                   SourceReindexPass.Route route) {
+        return new SourceReindexPass(registry, upsertHandler, lexical, vectorEraser, documentStep,
+            route);
     }
 
-    /**
-     * Re-indexes using direct writes without atomic publication (legacy path).
-     *
-     * <p>This method writes chunks directly to storage without epoch-based
-     * visibility management. Used when no {@link DocumentBatchPublisher} is configured.</p>
-     */
-    private DocumentResult reindexDocumentDirect(
-            String sourceId,
-            String documentId,
-            byte[] content,
-            List<TextChunk> chunks,
-            long lastModifiedMillis,
-            long startTime) {
-
-        List<String> chunkIds = new ArrayList<>(chunks.size());
-        AtomicInteger successCount = new AtomicInteger(0);
-        AtomicInteger failureCount = new AtomicInteger(0);
-        List<String> errors = new ArrayList<>();
-
-        for (int i = 0; i < chunks.size(); i++) {
-            TextChunk chunk = chunks.get(i);
-            String chunkId = generateChunkId(sourceId, documentId, i);
-
-            try {
-                float[] embedding = llmClient.generateEmbedding(chunk.getText(),
-                    "reindex:" + sourceId + ":" + documentId);
-
-                boolean written = storageWriter.writeChunk(chunkId, chunk.getText(), embedding);
-                if (written) {
-                    chunkIds.add(chunkId);
-                    successCount.incrementAndGet();
-                } else {
-                    failureCount.incrementAndGet();
-                    errors.add("Storage write failed for chunk " + i);
-                    LOG.warn("Failed to write chunk {} for document {}", i, documentId);
-                }
-            } catch (LLMException e) {
-                failureCount.incrementAndGet();
-                errors.add("Embedding failed for chunk " + i + ": " + e.getMessage());
-                LOG.error("Failed to generate embedding for chunk {} of document {}: {}",
-                    i, documentId, e.getMessage());
-            }
-        }
-
-        // As in the atomic paths: the registry entry is what change detection reads, so recording
-        // the new hash for anything less than a complete document retires it from ever being
-        // reindexed again. This path had no such guard at all - a run with the embedding endpoint
-        // down replaced the entry with one naming no chunks, leaving the previous chunks in
-        // storage with nothing recording their ids.
-        if (failureCount.get() > 0) {
-            long failedElapsed = System.currentTimeMillis() - startTime;
-            LOG.warn("Document {} left unchanged: {} of {} chunks failed",
-                documentId, failureCount.get(), chunks.size());
-            // As in the atomic paths: what was written past the surviving entry is named by
-            // nothing and has to go with the rest of the attempt.
-            rollback().undo(sourceId, documentId, chunkIds);
-            return new DocumentResult(documentId, chunks.size(), 0, failureCount.get(),
-                failedElapsed,
-                "Document left unchanged, " + failureCount.get() + " of " + chunks.size()
-                    + " chunks failed: " + String.join("; ", errors));
-        }
-
-        long contentHash = DocumentRegistry.computeContentHash(content);
-        DocumentMetadata metadata = DocumentMetadata.builder()
-            .sourceId(sourceId)
-            .documentId(documentId)
-            .lastModifiedMillis(lastModifiedMillis)
-            .contentHash(contentHash)
-            .contentLength(content.length)
-            .chunkIds(chunkIds)
-            .indexTimeMillis(System.currentTimeMillis())
-            .build();
-
-        // Under the document's lock; see reindexDocumentWithSegmentWriter.
-        DocumentLocks.shared().inDocument(ChunkIdentifiers.documentKey(sourceId, documentId),
-            () -> registry.register(metadata));
-
-        long elapsed = System.currentTimeMillis() - startTime;
-        String errorMsg = errors.isEmpty() ? null : String.join("; ", errors);
-
-        LOG.debug("Re-indexed document {}: {} chunks ({} successful, {} failed) in {}ms",
-            documentId, chunks.size(), successCount.get(), failureCount.get(), elapsed);
-
-        lexical.index(chunkIds, chunks);
-        return new DocumentResult(documentId, chunks.size(), successCount.get(),
-            failureCount.get(), elapsed, errorMsg, chunkIds);
-    }
-
-    /**
-     * Generates a unique chunk ID from a source ID, document ID and chunk index.
-     *
-     * <p>Format: {@code sourceId:documentId:chunk:index}. The source-qualified form is what
-     * excalibur-shard parses back into a document id when it registers an HNSW node, and what
-     * the ingestion pipeline writes, so a reindex overwrites and tombstones exactly the keys the
-     * initial ingest created. See {@link ChunkIdentifiers}.</p>
-     *
-     * <p>Domain correctness: chunk IDs are unique, deterministic, and URL-safe.</p>
-     *
-     * @param sourceId The source ID
-     * @param documentId The document ID
-     * @param chunkIndex The chunk index (0-based)
-     * @return Unique chunk identifier
-     */
-    private String generateChunkId(String sourceId, String documentId, int chunkIndex) {
-        return ChunkIdentifiers.chunkId(sourceId, documentId, chunkIndex);
+    /** Builds the per-document step for a run that publishes atomically. */
+    private DocumentReindexStep step(DocumentReindexStep.AtomicTarget target) {
+        return DocumentReindexStep.publishing(chunker, llmClient, registry, upsertHandler, lexical,
+            target);
     }
 
     /**
@@ -1381,7 +750,10 @@ public class DocumentReindexer {
         }
 
         public boolean isSuccess() {
-            return failedChunks == 0 && totalChunks > 0;
+            // The reason has to be consulted, not just the counters. A document whose chunks
+            // all wrote and whose publication then failed has no failed chunks and is not a
+            // success: nothing of it reached the corpus, and it carries the reason why.
+            return !hasError() && failedChunks == 0 && totalChunks > 0;
         }
 
         @Override

@@ -166,7 +166,9 @@ class ReindexIntegrationTest {
             AtomicReference<String> reindexedSourceId = new AtomicReference<>();
 
             DocumentReindexer mockReindexer = mock(DocumentReindexer.class);
-            when(mockReindexer.reindexAll(any())).thenAnswer(invocation -> {
+            // Two arguments now: the run publishes its per-document counts through the
+            // progress listener it is handed, which is what /v1/reindex/status serves.
+            when(mockReindexer.reindexAll(any(), any())).thenAnswer(invocation -> {
                 reindexCalled.set(true);
                 Source source = invocation.getArgument(0);
                 reindexedSourceId.set(source.getSourceId());

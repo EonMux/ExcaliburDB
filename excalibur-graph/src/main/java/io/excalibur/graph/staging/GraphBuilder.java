@@ -1,6 +1,7 @@
 package io.excalibur.graph.staging;
 
 import io.excalibur.graph.dictionary.LabelDictionaryWriter;
+import io.excalibur.graph.file.Durability;
 import io.excalibur.graph.store.EdgeStoreWriter;
 import io.excalibur.graph.temporal.SupersessionPolicy;
 
@@ -214,20 +215,55 @@ public final class GraphBuilder {
     }
 
     /**
-     * Moves a completed build into place.
+     * Moves a completed build into place, durably.
+     *
+     * @param scratch Where the build was assembled
+     * @param target  Where it is to be served from
+     * @throws IOException if the build cannot be forced or the move fails
+     */
+    public static void publish(Path scratch, Path target) throws IOException {
+        publish(scratch, target, Durability.DEVICE);
+    }
+
+    /**
+     * As above, with how the build is forced to the device under the caller's control.
      *
      * <p>Two renames within one filesystem, so the target is a whole graph at every moment a
      * reader could look at it. The previous graph is kept until the new one is in place and is
      * removed afterwards, which means a failure between the two leaves something serveable rather
      * than nothing.
      *
-     * @param scratch Where the build was assembled
-     * @param target  Where it is to be served from
-     * @throws IOException if the move fails
+     * <h3>Why a publish forces and an assembly does not</h3>
+     * <p>Nothing earlier in a build needs to reach the device: a build whose bytes were lost is a
+     * build to run again from the staging log that outlived it, and a half-assembled scratch
+     * directory is never the one being served. The last line here is what changes that, by
+     * deleting the graph this replaced. From that point the new directory is the only copy there
+     * is, and a rename that reached the platter ahead of the bytes it names leaves a descriptor
+     * over columns of zeros - a graph that will not open, with nothing to fall back to.
+     *
+     * <p>The whole tree is forced, not only what this module wrote. A caller assembles its own
+     * artifacts into the same scratch directory precisely so that they are published by this one
+     * move; forcing only the files this class knows about would make the Lucene indexes and the
+     * entity vectors the part that comes back empty.
+     *
+     * @param scratch    Where the build was assembled
+     * @param target     Where it is to be served from
+     * @param durability How the assembled build and the published name are forced
+     * @throws IOException if the build cannot be forced or the move fails
+     * @throws NullPointerException if any argument is null
      */
-    public static void publish(Path scratch, Path target) throws IOException {
+    public static void publish(Path scratch, Path target, Durability durability)
+            throws IOException {
+        Objects.requireNonNull(scratch, "scratch must not be null");
+        Objects.requireNonNull(target, "target must not be null");
+        Objects.requireNonNull(durability, "durability must not be null");
+
         Path previous = target.resolveSibling(target.getFileName() + PREVIOUS_SUFFIX);
         deleteRecursively(previous);
+
+        // Before either rename, and therefore while the previous graph is still the one being
+        // served. A device error here costs the build and no data.
+        durability.fsyncTree(scratch);
 
         boolean hadPrevious = Files.exists(target);
         if (hadPrevious) {
@@ -241,6 +277,14 @@ public final class GraphBuilder {
                 Files.move(previous, target, StandardCopyOption.ATOMIC_MOVE);
             }
             throw e;
+        }
+
+        // Both renames happened in the parent, and a forced file whose name is not yet durable
+        // can come back with no directory entry pointing at it. Forced before the previous graph
+        // is deleted, so the new one is reachable by name before the fallback stops existing.
+        Path parent = target.getParent();
+        if (parent != null) {
+            durability.fsyncDirectory(parent);
         }
         deleteRecursively(previous);
     }

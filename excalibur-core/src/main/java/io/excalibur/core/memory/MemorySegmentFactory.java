@@ -28,8 +28,6 @@ import java.nio.file.StandardOpenOption;
  * <p>The factory uses a multi-stage detection approach:</p>
  * <ol>
  *   <li>Check system property {@code excalibur.useFallback} - if true, use fallback</li>
- *   <li>Check if running on Java 21+ via runtime version</li>
- *   <li>Attempt to load {@code java.lang.foreign.MemorySegment} class</li>
  *   <li>Attempt a small memory allocation to verify native access permissions</li>
  * </ol>
  *
@@ -94,6 +92,14 @@ public final class MemorySegmentFactory {
             return panamaAvailable;
         }
 
+        // Outside detectionLock, deliberately. Detection reaches java.lang.foreign, whose
+        // classes deadlock when two threads initialize them at once; doing that while holding
+        // a lock adds every other caller to the pile-up. Not in a static initializer either -
+        // that would hold this class's own initialization monitor instead, which is the same
+        // pile-up somewhere jstack cannot see it, and would leave the class permanently
+        // unloadable if the warm-up ever threw.
+        ForeignMemoryBootstrap.ensureInitialized();
+
         synchronized (detectionLock) {
             if (panamaAvailable != null) {
                 return panamaAvailable;
@@ -118,34 +124,12 @@ public final class MemorySegmentFactory {
             return false;
         }
 
-        // Check Java version (Panama FFM requires Java 21+)
-        int majorVersion = Runtime.version().feature();
-        if (majorVersion < 21) {
-            if (enableLog) {
-                LOGGER.info("Panama FFM unavailable: Java 21+ required, running on Java {}", majorVersion);
-            }
-            return false;
-        }
-
-        // Check if MemorySegment class exists
-        try {
-            Class.forName("java.lang.foreign.MemorySegment");
-        } catch (ClassNotFoundException e) {
-            if (enableLog) {
-                LOGGER.info("Panama FFM unavailable: java.lang.foreign.MemorySegment class not found");
-            }
-            return false;
-        }
-
-        // Check if Arena class exists
-        try {
-            Class.forName("java.lang.foreign.Arena");
-        } catch (ClassNotFoundException e) {
-            if (enableLog) {
-                LOGGER.info("Panama FFM unavailable: java.lang.foreign.Arena class not found");
-            }
-            return false;
-        }
+        // Neither the Java version nor the presence of MemorySegment and Arena is worth
+        // asking about. This class is compiled for Java 21 with preview features enabled and
+        // names both types in its own signatures, so a JVM that lacked either would have
+        // rejected this class before it could run a check. The allocation below is the only
+        // question whose answer can vary: the classes are always there, and permission to use
+        // them is not.
 
         // Try to actually allocate native memory to verify permissions.
         // Only conditions that genuinely mean "Panama is not usable here" are caught:
@@ -324,16 +308,4 @@ public final class MemorySegmentFactory {
         return isPanamaAvailable() ? "Panama" : "Fallback";
     }
 
-    /**
-     * Resets the cached detection result.
-     *
-     * <p>This method is primarily for testing purposes. After calling this
-     * method, the next call to {@link #isPanamaAvailable()} will perform
-     * detection again.</p>
-     */
-    static void resetDetection() {
-        synchronized (detectionLock) {
-            panamaAvailable = null;
-        }
-    }
 }

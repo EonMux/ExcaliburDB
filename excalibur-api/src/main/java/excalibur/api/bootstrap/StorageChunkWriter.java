@@ -177,11 +177,19 @@ public final class StorageChunkWriter implements OffsetAwareStorageWriter {
      * <p>Delegated so that the reindex path and the ingest path cannot write two different
      * layouts into the same storage keys.
      *
+     * <p>A chunk with no vector is a normal chunk, not a malformed one: a node with no embedding
+     * endpoint chunks, stores and term-indexes its corpus and never embeds any of it, and
+     * ingestion already writes those chunks with the layout's dimension-0 form. A reindex of
+     * that corpus has to write the same form, or the run fails one chunk at a time on a node
+     * that has nothing to embed with.</p>
+     *
      * @param content   Chunk text
-     * @param embedding Embedding vector
+     * @param embedding Embedding vector, or null or empty on a chunk that was never embedded
      * @return The encoded value
      */
     static byte[] encode(String content, float[] embedding) {
-        return ChunkPayloadCodec.encode(content, embedding);
+        return embedding == null || embedding.length == 0
+            ? ChunkPayloadCodec.encodeTextOnly(content)
+            : ChunkPayloadCodec.encode(content, embedding);
     }
 }

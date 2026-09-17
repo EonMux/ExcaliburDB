@@ -3,17 +3,28 @@ package excalibur.api.endpoint;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 
+import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.mcp.Json;
 import excalibur.ingest.erasure.DocumentErasureService;
+import excalibur.ingest.graph.LlmRelationExtractor;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.registry.DocumentMetadata;
 import excalibur.ingest.registry.DocumentRegistry;
 import excalibur.ingest.registry.UpsertHandler;
 
+import io.excalibur.config.Config;
+import io.excalibur.graph.provenance.Provenance;
+import io.excalibur.graph.provenance.SourceType;
+import io.excalibur.graph.staging.ExtractedTriple;
+import io.excalibur.graph.staging.GraphStagingStore;
+import io.excalibur.tenancy.MappingBudget;
+
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 
 import java.io.ByteArrayInputStream;
@@ -21,6 +32,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -125,6 +139,150 @@ class DocumentErasureEndpointTest {
         ArgumentCaptor<Integer> status = ArgumentCaptor.forClass(Integer.class);
         verify(exchange).sendResponseHeaders(status.capture(), anyLong());
         return new Response(status.getValue(), out.toString(StandardCharsets.UTF_8));
+    }
+
+    @Nested
+    @DisplayName("the graph half of an erasure")
+    class TheGraphHalf {
+
+        /** A term of the prose the erased document contributed to the graph. */
+        private static final String TERM = "zymurgic";
+
+        @TempDir
+        private Path graphRoot;
+
+        private GraphTenants tenants;
+
+        @BeforeEach
+        void openGraph() throws IOException {
+            // A policy that fires only when the whole store is tombstoned and not before a
+            // day has passed, so a request left to the policy really is left to it. The
+            // default would compact a two-edge store the moment one edge was erased, and the
+            // test would be asserting the default rather than the behaviour.
+            Config config = new Config(new HashMap<>(Map.of(
+                "excalibur.graph.ram-buffer-mb", "4.0",
+                "excalibur.graph.erasure-tombstone-ratio", "1.0",
+                "excalibur.graph.erasure-max-latency-seconds", "86400")));
+            tenants = new GraphTenants(graphRoot, config, MappingBudget.detect(), 2);
+            endpoint = new DocumentErasureEndpoint(
+                new DocumentErasureService(registry, storageAdapter(), null, null),
+                sources, suppliedSources, tenants);
+        }
+
+        @AfterEach
+        void closeGraph() {
+            if (tenants != null) {
+                tenants.close();
+            }
+        }
+
+        /** Stages the facts an extractor would have produced from one document, and builds. */
+        private void extractedFrom(String sourceId, String documentId) throws IOException {
+            long provenanceId = LlmRelationExtractor.sourceIdOf(sourceId + ":" + documentId);
+            Provenance origin = new Provenance(SourceType.DOCUMENT, provenanceId, 90, 1);
+            GraphStagingStore staging = tenants.shared().staging();
+            int ada = staging.entityIdOf("Ada Lovelace");
+            staging.append(ExtractedTriple.alwaysValid(
+                "Ada Lovelace", "knows", "Charles Babbage", origin));
+            staging.appendEntityText(ada, "Ada Lovelace studied zymurgic notation", origin);
+            // A second document's fact, so erasing the first does not tombstone the whole
+            // store: an erasure is ordinarily a fraction of a graph, not all of it.
+            staging.append(ExtractedTriple.alwaysValid("Charles Babbage", "knows",
+                "Ada Lovelace", new Provenance(SourceType.DOCUMENT, 7, 90, 1)));
+            staging.flush();
+            assertThat(tenants.shared().buildService().build().published()).isTrue();
+        }
+
+        @Test
+        @DisplayName("erasing a document withdraws what was extracted from it into the graph")
+        void theGraphLosesWhatTheDocumentContributed() throws IOException {
+            // The corpus half removed the chunks, the postings and the registry entry, and left
+            // every fact extracted from the document - plus up to 2 KB of its text per entity
+            // mentioned - in the graph and in the staging log the next build replays.
+            ingest("docs", "a.md", 2);
+            extractedFrom("docs", "a.md");
+            Path served = tenants.shared().directory();
+            assertThat(anyFileContains(served, TERM)).isTrue();
+
+            Response response = post("{\"source_id\": \"docs\", \"document_id\": \"a.md\", "
+                + "\"compact\": true}");
+
+            assertThat(Json.at(response.json(), "graph_requests_submitted")).isEqualTo(1L);
+            assertThat(Json.at(response.json(), "graph_requests_satisfied")).isEqualTo(1L);
+            assertThat(anyFileContains(served, TERM))
+                .as("the prose the withdrawn document contributed has to go with it")
+                .isFalse();
+        }
+
+        @Test
+        @DisplayName("a graph obligation still queued is a 202, not a 200")
+        void aQueuedGraphHalfIsNotReportedComplete() throws IOException {
+            // The corpus half is done and the graph half is recorded and not yet carried out.
+            // Answering 200 would tell a caller under an obligation that the erasure was
+            // complete when a derivation of the withdrawn text is still being served.
+            ingest("docs", "a.md", 1);
+            extractedFrom("docs", "a.md");
+
+            Response response = post("{\"source_id\": \"docs\", \"document_id\": \"a.md\"}");
+
+            assertThat(response.status())
+                .as("accepted, and explicitly not yet complete")
+                .isEqualTo(202);
+            assertThat(Json.at(response.json(), "graph_erasure_complete"))
+                .isEqualTo(Boolean.FALSE);
+            assertThat(Json.at(response.json(), "graph_outstanding")).isEqualTo(1L);
+        }
+
+        @Test
+        @DisplayName("a document this node never held submits no graph obligation")
+        void anAbsentDocumentSubmitsNothing() throws IOException {
+            Response response = post("{\"source_id\": \"docs\", \"document_id\": \"gone.md\"}");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(Json.at(response.json(), "graph_requests_submitted")).isEqualTo(0L);
+            assertThat(Json.at(response.json(), "graph_erasure_complete"))
+                .as("nothing was erased, so nothing about it is outstanding")
+                .isEqualTo(Boolean.TRUE);
+        }
+
+        @Test
+        @DisplayName("a whole source withdraws each of its documents from the graph")
+        void aSourceScopeWithdrawsEveryDocument() throws IOException {
+            ingest("docs", "a.md", 1);
+            ingest("docs", "b.md", 1);
+            extractedFrom("docs", "a.md");
+
+            Response response = post("{\"source_id\": \"docs\", \"scope\": \"source\", "
+                + "\"compact\": true}");
+
+            assertThat(Json.at(response.json(), "graph_requests_submitted"))
+                .as("one per document actually erased, which the caller never named")
+                .isEqualTo(2L);
+            assertThat(anyFileContains(tenants.shared().directory(), TERM)).isFalse();
+        }
+
+        /** Whether any file at or under {@code root} holds {@code text} as bytes. */
+        private boolean anyFileContains(Path root, String text) throws IOException {
+            byte[] needle = text.getBytes(StandardCharsets.UTF_8);
+            if (!Files.exists(root)) {
+                return false;
+            }
+            try (var walk = Files.walk(root)) {
+                for (Path path : walk.filter(Files::isRegularFile).toList()) {
+                    byte[] haystack = Files.readAllBytes(path);
+                    outer:
+                    for (int i = 0; i + needle.length <= haystack.length; i++) {
+                        for (int j = 0; j < needle.length; j++) {
+                            if (haystack[i + j] != needle[j]) {
+                                continue outer;
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
     }
 
     @Nested

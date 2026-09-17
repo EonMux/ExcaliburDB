@@ -119,6 +119,16 @@ public class QueryPipeline {
     private final CoverageCounts coverageCounts;
 
     /**
+     * Reads what a query would see right now, for the cache that has to decide whether an
+     * earlier answer is still an answer.
+     *
+     * <p>Built here rather than by the caller because it reads the pipeline's own
+     * collaborators through the pipeline's own accessors, which is the only way a fingerprint
+     * can be guaranteed to move whenever a query's inputs do.</p>
+     */
+    private final CorpusFingerprint corpusFingerprint;
+
+    /**
      * How long {@link #shutdown()} lets in-flight queries finish, and then how long it waits
      * after interrupting them.
      *
@@ -355,6 +365,8 @@ public class QueryPipeline {
         this.epochIsolationValidator = epochIsolationValidator;
         this.payloadResolver = new ResultPayloadResolver(this.storageEngine);
         this.coverageCounts = new CoverageCounts(this.storageEngine);
+        this.corpusFingerprint = new CorpusFingerprint(this.storageEngine,
+            this.visibilityTracker, this.graphProvider);
         this.epochSnapshotStage = new EpochSnapshotStage(this.storageEngine,
             this.visibilityTracker, this.graphProvider);
         this.hnswSearchStage = new HnswSearchStage(this::getDispatcher, this.distanceFunction,
@@ -731,6 +743,27 @@ public class QueryPipeline {
      */
     public IndexCoverage.Builder segmentCensus() {
         return coverageCounts.census().onto(IndexCoverage.builder());
+    }
+
+    /**
+     * A fingerprint of everything a query starting now would read.
+     *
+     * <p>For the query result cache, which may serve an earlier answer only to a request
+     * that observes the same fingerprint. It is deliberately not the visibility epoch: the
+     * epoch moves on a timer when nothing has changed, and stands still when segment
+     * compaction or graph integration has changed what a search returns. See
+     * {@link excalibur.query.cache.CorpusVersion} for the argument in full, and
+     * {@code CorpusFingerprint} for what is read and why.</p>
+     *
+     * <p>Cheap: a set of visible segment ids and a fixed number of field reads per segment,
+     * with no locks and no file access. Never throws - a corpus that cannot be read is
+     * reported as {@link excalibur.query.cache.CorpusVersion#UNREADABLE}, which the cache
+     * neither serves from nor stores to.</p>
+     *
+     * @return The current corpus fingerprint, never null
+     */
+    public excalibur.query.cache.CorpusVersion corpusVersion() {
+        return corpusFingerprint.current();
     }
 
     // ==================== Inner Classes ====================

@@ -1,6 +1,7 @@
 package excalibur.filter;
 
 import io.excalibur.core.hash.XxHash64;
+import io.excalibur.core.integrity.IntegrityReport;
 import io.excalibur.core.util.SegmentVarHandle;
 
 import java.lang.foreign.Arena;
@@ -113,8 +114,12 @@ public class CuckooFilter {
     // Magic number for serialization validation
     private static final int MAGIC = 0x4355434B; // "CUCK" in ASCII
 
-    // Current version for serialization
-    private static final int VERSION = 1;
+    // Current version for serialization. Version 2 added the integrity block described on
+    // CuckooFilterIntegrity and widened the header from 32 bytes to 64.
+    static final int VERSION = 2;
+
+    // The version written before the header carried checksums.
+    private static final int VERSION_WITHOUT_CHECKSUM = 1;
 
     // Header layout (with alignment padding for memory-mapped I/O):
     // offset 0: magic (4 bytes)
@@ -123,8 +128,12 @@ public class CuckooFilter {
     // offset 12: padding (4 bytes) - for 8-byte alignment of long fields
     // offset 16: numBuckets (8 bytes)
     // offset 24: seed (8 bytes)
-    // Total: 32 bytes
-    private static final int HEADER_SIZE = 32;
+    // offset 32: the integrity block, see CuckooFilterIntegrity
+    // Total: 64 bytes
+    private static final int HEADER_SIZE = 64;
+
+    // Header size of a version 1 image, which ended where the integrity block now starts.
+    private static final int HEADER_SIZE_V1 = 32;
 
     /** Fewest buckets any filter has, however small its capacity. */
     private static final int MIN_BUCKETS = 4;
@@ -281,6 +290,7 @@ public class CuckooFilter {
         segment.set(ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_FINGERPRINT_BITS, fingerprintBits);
         segment.set(ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_NUM_BUCKETS, numBuckets);
         segment.set(ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_SEED, seed);
+        CuckooFilterIntegrity.markOpen(segment);
 
         return new CuckooFilter(segment, arena);
     }
@@ -309,9 +319,9 @@ public class CuckooFilter {
         }
 
         // Validate minimum size
-        if (segment.byteSize() < HEADER_SIZE) {
+        if (segment.byteSize() < HEADER_SIZE_V1) {
             throw new IllegalArgumentException(
-                "Segment too small: " + segment.byteSize() + " < " + HEADER_SIZE);
+                "Segment too small: " + segment.byteSize() + " < " + HEADER_SIZE_V1);
         }
 
         // Read and validate header (EXACT SPECIFICATION)
@@ -323,9 +333,14 @@ public class CuckooFilter {
         }
 
         int version = segment.get(ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_VERSION);
-        if (version != VERSION) {
+        if (version != VERSION && version != VERSION_WITHOUT_CHECKSUM) {
             throw new IllegalArgumentException(
                 "Unsupported version: " + version + ", expected " + VERSION);
+        }
+        int headerSize = version == VERSION ? HEADER_SIZE : HEADER_SIZE_V1;
+        if (segment.byteSize() < headerSize) {
+            throw new IllegalArgumentException("Segment too small for a version " + version
+                + " header: " + segment.byteSize() + " < " + headerSize);
         }
 
         this.fingerprintBits = segment.get(ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_FINGERPRINT_BITS);
@@ -343,7 +358,7 @@ public class CuckooFilter {
         this.fingerprintMask = (1 << fingerprintBits) - 1;
         this.bucketMask = numBuckets - 1;
         this.maxDisplacements = DEFAULT_MAX_DISPLACEMENTS;
-        this.bucketDataOffset = HEADER_SIZE;
+        this.bucketDataOffset = headerSize;
 
         // Use the same aligned stride that create() uses for allocation.
         // The packed size would be (4 * fingerprintBits + 7) / 8 but the allocator
@@ -352,10 +367,22 @@ public class CuckooFilter {
         this.bytesPerBucket = ALIGNED_BYTES_PER_BUCKET;
 
         // Validate segment size
-        long expectedSize = HEADER_SIZE + numBuckets * bytesPerBucket;
+        long expectedSize = bucketDataOffset + numBuckets * bytesPerBucket;
         if (segment.byteSize() < expectedSize) {
             throw new IllegalArgumentException(
                 "Segment size " + segment.byteSize() + " < expected " + expectedSize);
+        }
+
+        // Before a single fingerprint is read out of it, and before the filter starts
+        // answering from it.
+        long payloadLength = numBuckets * bytesPerBucket;
+        CuckooFilterIntegrity.requireIntact(segment, version, bucketDataOffset, payloadLength);
+
+        // The image is about to become a live filter, so whatever checksum it carried no
+        // longer describes it. Saying so is what keeps the next read from refusing an image
+        // this process legitimately changed.
+        if (version == VERSION && !segment.isReadOnly()) {
+            CuckooFilterIntegrity.markOpen(segment);
         }
 
         this.segment = segment;
@@ -684,6 +711,20 @@ public class CuckooFilter {
      */
     public void writeTo(MemorySegment target, long offset) {
         MemorySegment.copy(segment, 0, target, offset, segment.byteSize());
+
+        // The copy is sealed, not this filter: this filter goes on being mutated, and a
+        // checksum over it would be stale before the next insert returns. The image that
+        // leaves here is the thing that has to be checkable when it comes back.
+        //
+        // A filter attached to a version 1 image is copied out as one. Its header ends where
+        // the integrity block would start, so stamping one would overwrite the first buckets,
+        // and widening the header would mean relaying out every bucket behind it rather than
+        // copying. Such an image gains a checksum when the filter is rebuilt.
+        if (bucketDataOffset != HEADER_SIZE) {
+            return;
+        }
+        MemorySegment image = target.asSlice(offset, segment.byteSize());
+        CuckooFilterIntegrity.seal(image, bucketDataOffset, numBuckets * bytesPerBucket);
     }
 
     /**
@@ -696,6 +737,45 @@ public class CuckooFilter {
     public static CuckooFilter readFrom(MemorySegment source, long offset) {
         MemorySegment slice = source.asSlice(offset);
         return new CuckooFilter(slice);
+    }
+
+    /**
+     * Verifies a serialized filter image without building a filter over it.
+     *
+     * <p>The checking entry point for this format. Nothing is mutated, so an image that is
+     * about to be refused is left exactly as it was found for whatever inspects it next.</p>
+     *
+     * @param source The memory holding the image
+     * @param offset Where the image starts within {@code source}
+     * @return What the check concluded, including whether the image carries a checksum at all
+     * @throws IllegalArgumentException if there is no readable filter header at that offset
+     * @throws NullPointerException if source is null
+     */
+    public static IntegrityReport verifyIntegrity(MemorySegment source, long offset) {
+        if (source == null) {
+            throw new NullPointerException("MemorySegment cannot be null");
+        }
+        MemorySegment image = source.asSlice(offset);
+        ValueLayout.OfInt intLayout = ValueLayout.JAVA_INT.withOrder(ByteOrder.BIG_ENDIAN);
+        if (image.byteSize() < HEADER_SIZE_V1) {
+            throw new IllegalArgumentException("Segment too small to hold a filter header: "
+                + image.byteSize() + " < " + HEADER_SIZE_V1);
+        }
+        if (image.get(intLayout, OFFSET_MAGIC) != MAGIC) {
+            throw new IllegalArgumentException(
+                "No Cuckoo filter image at offset " + offset + " (bad magic number)");
+        }
+        int version = image.get(intLayout, OFFSET_VERSION);
+        int headerSize = version == VERSION ? HEADER_SIZE : HEADER_SIZE_V1;
+        long buckets = image.get(
+            ValueLayout.JAVA_LONG.withOrder(ByteOrder.BIG_ENDIAN), OFFSET_NUM_BUCKETS);
+        long payload = buckets * ALIGNED_BYTES_PER_BUCKET;
+        if (buckets < 0 || payload > image.byteSize() - headerSize) {
+            return IntegrityReport.corrupt(null, CuckooFilterIntegrity.FORMAT,
+                "the header claims " + buckets + " buckets, which need " + payload
+                    + " bytes, but the image holds only " + (image.byteSize() - headerSize));
+        }
+        return CuckooFilterIntegrity.inspect(image, version, headerSize, payload);
     }
 
     /**

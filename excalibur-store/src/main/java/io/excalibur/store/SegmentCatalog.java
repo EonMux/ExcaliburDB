@@ -4,62 +4,55 @@ import io.excalibur.store.catalog.CatalogFile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Path;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * SegmentCatalog manages metadata for all segments in the storage engine.
+ * The metadata for every segment in the storage engine.
  *
- * <p>The catalog stores persistent metadata about each segment including:
+ * <p>One {@link SegmentMetadata} record per segment - where its file is, how many entries it
+ * holds, what state it is in, how far its index has absorbed its write log - held in memory
+ * and mirrored to disk. It is what a restart reads to learn which segments exist and what
+ * each was doing, and what a query reads to decide which to search.</p>
+ *
+ * <h2>Structure</h2>
+ * <p>This class is the published surface; the work is done by four collaborators, each of
+ * which carries the reasoning for its own part:
  * <ul>
- *   <li>segmentId - unique identifier</li>
- *   <li>volumePath - path to the segment file</li>
- *   <li>entryCount - current number of entries</li>
- *   <li>lifecycleState - current lifecycle state</li>
- *   <li>lastIntegratedOffset - write log offset up to which entries are integrated</li>
- *   <li>lastCompactionTime - timestamp of last compaction</li>
- *   <li>creationTime - timestamp when segment was created</li>
- *   <li>size - current size in bytes</li>
+ *   <li>{@link CatalogRegistry} - the in-memory records, the two indexes over them, and
+ *       every operation that changes one</li>
+ *   <li>{@link CatalogPersistence} - the on-disk copy, and why a close-time failure is
+ *       reported rather than thrown</li>
+ *   <li>{@link CatalogQueries} - the derived views: selections, aggregates and write-log
+ *       offsets, none of them stored</li>
+ *   <li>{@link EntryStateMapping} - the correspondence between a segment's lifecycle
+ *       state and the older entry-state integer its on-disk record stores</li>
  * </ul>
  *
- * <h2>Lifecycle State Integration</h2>
- * <p>The catalog uses {@link LifecycleState} enum for consistent lifecycle state
- * management across the storage engine. This ensures:
- * <ul>
- *   <li>Valid state transitions only</li>
- *   <li>Consistent query visibility</li>
- *   <li>Proper segment lifecycle tracking</li>
- * </ul>
+ * <h2>Lifecycle and entry state</h2>
+ * <p>Each segment's position is held twice: as a {@link LifecycleState}, which the engine
+ * reasons about and the transition rules govern, and as the older {@code ENTRY_STATE_*}
+ * integer below, which the on-disk record stores. {@link EntryStateMapping} holds both
+ * directions of the mapping, and the two are kept in step.</p>
  *
- * <h2>Entry State</h2>
- * <p>The catalog tracks the state of entries within each segment:
- * <ul>
- *   <li>{@link #ENTRY_STATE_NONE} - No entries yet</li>
- *   <li>{@link #ENTRY_STATE_INDEXING} - Entries being written</li>
- *   <li>{@link #ENTRY_STATE_WARMING} - Entries written, being warmed up</li>
- *   <li>{@link #ENTRY_STATE_ACTIVE} - Fully indexed and optimized</li>
- *   <li>{@link #ENTRY_STATE_DELETED} - All entries deleted (tombstoned)</li>
- *   <li>{@link #ENTRY_STATE_COMPACTING} - Entries being rewritten by compaction</li>
- * </ul>
- *
- * <h2>Thread Safety</h2>
- * <p>The catalog is fully thread-safe. All operations are synchronized
- * to ensure consistent state across concurrent operations.</p>
+ * <h2>Thread safety</h2>
+ * <p>Fully thread-safe; every operation that changes a record is synchronized.</p>
  *
  * @author ExcaliburDB
  * @since 2.0
  */
 public class SegmentCatalog {
 
-    private static final Logger logger = LoggerFactory.getLogger(SegmentCatalog.class);
+    /**
+     * The logger every part of the catalog writes to.
+     *
+     * <p>Declared here, and shared with the collaborators, so that the whole catalog logs
+     * under one name however its work is divided up. An operator filtering on it must not
+     * have to know that registration and persistence live in different classes.</p>
+     */
+    static final Logger logger = LoggerFactory.getLogger(SegmentCatalog.class);
 
     // ==================== Entry State ====================
 
@@ -95,46 +88,14 @@ public class SegmentCatalog {
 
     // ==================== Instance Fields ====================
 
-    /**
-     * Registry of segments by ID.
-     * 
-     * <p>Key: segmentId → Value: SegmentMetadata</p>
-     */
-    private final Map<Long, SegmentMetadata> segments = new ConcurrentHashMap<>();
+    /** The durable copy of every record. */
+    private final CatalogPersistence persistence;
 
-    /**
-     * Registry of segments by volume path.
-     * 
-     * <p>Used for reverse lookup when we need to find all segments
-     * in a specific volume.</p>
-     * 
-     * <p>Key: volumePath → Value: list of segmentIds</p>
-     */
-    private final Map<Path, java.util.List<Long>> volumeToSegments = new ConcurrentHashMap<>();
+    /** The in-memory records and the indexes over them. */
+    private final CatalogRegistry registry;
 
-    /**
-     * Global segment ID generator.
-     */
-    private final AtomicLong segmentIdGenerator = new AtomicLong(0);
-
-    /**
-     * Catalog metadata for the entire keyspace.
-     */
-    private final CatalogMetadata metadata = new CatalogMetadata();
-
-    /**
-     * Persistent catalog file for durable storage.
-     * May be null if persistence is not enabled (in-memory only mode).
-     */
-    private final CatalogFile catalogFile;
-
-    /**
-     * First failure seen while closing, or null when the catalog closed durably.
-     *
-     * <p>Volatile because {@link #closeFailure()} is read by whichever thread is winding the
-     * process down, which is not always the one that closed the catalog.</p>
-     */
-    private volatile Throwable closeFailure;
+    /** The derived views over those records. */
+    private final CatalogQueries queries;
 
     // ==================== Constructors ====================
 
@@ -146,7 +107,7 @@ public class SegmentCatalog {
      * {@link #SegmentCatalog(Path)} instead.</p>
      */
     public SegmentCatalog() {
-        this.catalogFile = null;
+        this((CatalogFile) null);
     }
 
     /**
@@ -159,7 +120,7 @@ public class SegmentCatalog {
      * @throws UncheckedIOException if the catalog file cannot be created or opened
      */
     public SegmentCatalog(Path catalogPath) {
-        this(open(catalogPath));
+        this(CatalogPersistence.open(catalogPath));
     }
 
     /**
@@ -173,7 +134,7 @@ public class SegmentCatalog {
      * @throws UncheckedIOException if the catalog file cannot be created or opened
      */
     public SegmentCatalog(Path catalogPath, Arena arena) {
-        this(open(catalogPath));
+        this(CatalogPersistence.open(catalogPath));
     }
 
     /**
@@ -185,22 +146,9 @@ public class SegmentCatalog {
      * @param catalogFile The file to persist metadata to, or null for in-memory only
      */
     public SegmentCatalog(CatalogFile catalogFile) {
-        this.catalogFile = catalogFile;
-    }
-
-    /**
-     * Opens the catalog file at the given path.
-     *
-     * @param catalogPath Path to the catalog file
-     * @return The open file
-     * @throws UncheckedIOException if the file cannot be created or opened
-     */
-    private static CatalogFile open(Path catalogPath) {
-        try {
-            return new CatalogFile(catalogPath);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to open catalog file: " + catalogPath, e);
-        }
+        this.persistence = new CatalogPersistence(catalogFile);
+        this.registry = new CatalogRegistry(persistence);
+        this.queries = new CatalogQueries(registry);
     }
 
     // ==================== Public API - Segment Operations ====================
@@ -208,81 +156,16 @@ public class SegmentCatalog {
     /**
      * Updates the metadata for a segment.
      *
-     * <p>This is the primary method for updating segment metadata. It atomically
-     * updates all fields for a given segment ID.</p>
-     *
-     * <p><strong>Important:</strong> This method now synchronizes both the entry state
-     * AND the lifecycle state. The lifecycle state is derived from the entry state
-     * to ensure consistency.</p>
+     * <p>Sets the entry state and adjusts the entry count together, deriving the lifecycle
+     * state from the entry state so the two stay consistent. See {@link CatalogRegistry}
+     * for why that derivation bypasses transition validation.</p>
      *
      * @param segmentId Unique segment identifier
      * @param entryState Current state of entries in the segment
      * @param deltaChange In delta for entry count
      */
     public void update(long segmentId, int entryState, int deltaChange) {
-        SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
-            new SegmentMetadata(segmentId));
-
-        // Update entry state
-        metadata.setEntryState(entryState);
-
-        // Update entry count using delta for atomic updates
-        metadata.setEntryCount(metadata.getEntryCount() + deltaChange);
-
-        // Synchronize lifecycle state with entry state for consistency
-        syncLifecycleState(metadata, entryState);
-
-        // Track catalog statistics
-        if (entryState == ENTRY_STATE_ACTIVE) {
-            metadata.setLastActiveTime(System.currentTimeMillis());
-            metadata.incrementActiveSegments();
-        } else if (entryState == ENTRY_STATE_DELETED) {
-            metadata.incrementDeletedSegments();
-        }
-
-        // Persist to disk
-        persistSegment(metadata);
-    }
-
-    /**
-     * Synchronizes the lifecycle state with the entry state.
-     *
-     * <p>This ensures the lifecycle state enum stays in sync with the entry state integer,
-     * maintaining backward compatibility while properly utilizing the lifecycle state machine.</p>
-     *
-     * @param metadata The segment metadata to update
-     * @param entryState The entry state to sync from
-     */
-    private void syncLifecycleState(SegmentMetadata metadata, int entryState) {
-        LifecycleState targetLifecycleState = entryStateToLifecycleState(entryState);
-        if (targetLifecycleState != null && metadata.getLifecycleState() != targetLifecycleState) {
-            try {
-                // Use internal setter to bypass transition validation for sync operations
-                metadata.setLifecycleStateInternal(targetLifecycleState);
-            } catch (Exception e) {
-                // Log but don't fail the update if transition is invalid
-                // This allows the entry state to be updated even if lifecycle
-                // state can't transition
-            }
-        }
-    }
-
-    /**
-     * Converts an entry state constant to the corresponding lifecycle state.
-     *
-     * @param entryState The entry state
-     * @return The corresponding lifecycle state, or null if no mapping exists
-     */
-    private LifecycleState entryStateToLifecycleState(int entryState) {
-        switch (entryState) {
-            case ENTRY_STATE_NONE: return LifecycleState.BOOTSTRAPPING;
-            case ENTRY_STATE_INDEXING: return LifecycleState.INDEXING;
-            case ENTRY_STATE_WARMING: return LifecycleState.WARMING;
-            case ENTRY_STATE_ACTIVE: return LifecycleState.ACTIVE;
-            case ENTRY_STATE_COMPACTING: return LifecycleState.COMPACTING;
-            case ENTRY_STATE_DELETED: return LifecycleState.TOMBSTONED;
-            default: return null;
-        }
+        registry.update(segmentId, entryState, deltaChange);
     }
 
     /**
@@ -292,10 +175,7 @@ public class SegmentCatalog {
      * @param deltaChange Change in entry count (can be negative for deletions)
      */
     public void updateEntryCount(long segmentId, int deltaChange) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata != null) {
-            metadata.addEntryCount(deltaChange);
-        }
+        registry.updateEntryCount(segmentId, deltaChange);
     }
 
     /**
@@ -307,10 +187,7 @@ public class SegmentCatalog {
      * @param segmentId Unique segment identifier
      */
     public void recordTombstone(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata != null) {
-            metadata.addTombstoneCount(1);
-        }
+        registry.recordTombstone(segmentId);
     }
 
     /**
@@ -320,7 +197,7 @@ public class SegmentCatalog {
      * @return SegmentMetadata, or null if segment not found
      */
     public SegmentMetadata get(long segmentId) {
-        return segments.get(segmentId);
+        return registry.get(segmentId);
     }
 
     /**
@@ -330,12 +207,7 @@ public class SegmentCatalog {
      * @return List of SegmentMetadata for segments in the volume
      */
     public java.util.List<SegmentMetadata> getByVolume(Path volumePath) {
-        java.util.List<Long> segmentIds = volumeToSegments.getOrDefault(volumePath, java.util.Collections.emptyList());
-        java.util.List<SegmentMetadata> result = new java.util.ArrayList<>();
-        for (long segmentId : segmentIds) {
-            result.add(segments.get(segmentId));
-        }
-        return result;
+        return registry.getByVolume(volumePath);
     }
 
     /**
@@ -344,121 +216,44 @@ public class SegmentCatalog {
      * @return Map of segmentId to SegmentMetadata
      */
     public Map<Long, SegmentMetadata> getAll() {
-        return new HashMap<>(segments);
+        return registry.getAll();
     }
 
     /**
      * Adds a new segment to the catalog.
+     *
+     * <p>A newly created record is moved into INDEXING; one that is being re-registered in
+     * a later state is left where it is. See {@link CatalogRegistry} for why.</p>
      *
      * @param segmentId Unique segment identifier
      * @param volumePath Path to the segment file
      * @return The created metadata
      */
     public SegmentMetadata add(long segmentId, Path volumePath) {
-        SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
-            new SegmentMetadata(segmentId));
-
-        // A caller-supplied id must never be handed out again by create().
-        reserveSegmentId(segmentId);
-
-        metadata.setVolumePath(volumePath);
-        metadata.setCreationTime(System.currentTimeMillis());
-
-        // Only a freshly created entry is moved into INDEXING. Re-registering a segment
-        // whose recovered state is already ACTIVE (or later) must not be rejected -
-        // ACTIVE -> INDEXING is not a legal transition, and throwing here would abort
-        // startup or leave a split half-applied.
-        if (metadata.getLifecycleState() == LifecycleState.BOOTSTRAPPING) {
-            metadata.transitionToIndexing();
-        }
-
-        indexByVolume(volumePath, segmentId);
-
-        // Persist to disk
-        persistSegment(metadata);
-
-        return metadata;
+        return registry.add(segmentId, volumePath);
     }
 
     /**
      * Registers or re-points a segment file without forcing a lifecycle transition.
      *
      * <p>Used when a segment's backing file is replaced in place - split publication
-     * repoints the parent's index at the left child, compaction repoints an index at
-     * the compacted file. Both can happen while the segment is ACTIVE, and
-     * {@code ACTIVE -> INDEXING} is not a legal transition, so {@link #add(long, Path)}
-     * cannot be used for them.</p>
+     * repoints the parent's index at the left child, compaction at the compacted file. Both
+     * can happen while the segment is ACTIVE, and {@code ACTIVE -> INDEXING} is not a legal
+     * transition, so {@link #add(long, Path)} cannot serve.</p>
      *
      * @param segmentId  The segment index whose file changed
      * @param volumePath The new segment file path
      * @return The metadata for the segment
      */
     public SegmentMetadata registerFile(long segmentId, Path volumePath) {
-        SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
-            new SegmentMetadata(segmentId));
-
-        reserveSegmentId(segmentId);
-
-        Path previousPath = metadata.getVolumePath();
-        if (previousPath != null && !previousPath.equals(volumePath)) {
-            java.util.List<Long> ids = volumeToSegments.get(previousPath);
-            if (ids != null) {
-                synchronized (ids) {
-                    ids.remove(Long.valueOf(segmentId));
-                }
-            }
-        }
-
-        metadata.setVolumePath(volumePath);
-        if (metadata.getCreationTime() == 0) {
-            metadata.setCreationTime(System.currentTimeMillis());
-        }
-
-        indexByVolume(volumePath, segmentId);
-        persistSegment(metadata);
-
-        return metadata;
-    }
-
-    /**
-     * Records a segment id in the volume index exactly once.
-     *
-     * @param volumePath The segment file path
-     * @param segmentId  The segment id
-     */
-    private void indexByVolume(Path volumePath, long segmentId) {
-        java.util.List<Long> ids = volumeToSegments.computeIfAbsent(
-            volumePath, k -> java.util.Collections.synchronizedList(new java.util.ArrayList<>()));
-        synchronized (ids) {
-            if (!ids.contains(segmentId)) {
-                ids.add(segmentId);
-            }
-        }
-    }
-
-    /**
-     * Ensures the id generator can never hand out an id that is already in use.
-     *
-     * @param segmentId The id that has just been taken
-     */
-    private void reserveSegmentId(long segmentId) {
-        segmentIdGenerator.accumulateAndGet(segmentId, Math::max);
+        return registry.registerFile(segmentId, volumePath);
     }
 
     /**
      * Creates a new segment in BOOTSTRAPPING state for a specific source.
      *
-     * <p>This method is used by the reindexer to create new segments for rolling
-     * replacement. The segment starts in BOOTSTRAPPING state and is invisible
-     * to queries until it transitions to INDEXING state.</p>
-     *
-     * <p><strong>Domain Correctness:</strong></p>
-     * <ul>
-     *   <li>Segment ID is generated atomically and is unique</li>
-     *   <li>Segment starts in BOOTSTRAPPING state (invisible to queries)</li>
-     *   <li>Creation time is set to current time</li>
-     *   <li>Source ID is associated for rolling replacement tracking</li>
-     * </ul>
+     * <p>For the reindexer's rolling replacement. The id is allocated atomically and the
+     * segment is invisible to queries until {@link #beginIndexing(long)} moves it on.</p>
      *
      * @param sourceId The source ID this segment belongs to
      * @param volumePath Path to the segment file
@@ -466,42 +261,7 @@ public class SegmentCatalog {
      * @throws NullPointerException if sourceId or volumePath is null
      */
     public SegmentMetadata create(String sourceId, Path volumePath) {
-        if (sourceId == null) {
-            throw new NullPointerException("sourceId cannot be null");
-        }
-        if (volumePath == null) {
-            throw new NullPointerException("volumePath cannot be null");
-        }
-
-        // Generate a unique segment ID. The generator is also advanced by add() and
-        // recover(), but a concurrent add() can still take the next id, so keep
-        // drawing until an unused key is claimed rather than overwriting a live
-        // routing segment's metadata with a blind put().
-        long segmentId;
-        SegmentMetadata metadata;
-        while (true) {
-            segmentId = segmentIdGenerator.incrementAndGet();
-            metadata = new SegmentMetadata(segmentId);
-            if (segments.putIfAbsent(segmentId, metadata) == null) {
-                break;
-            }
-        }
-
-        metadata.setVolumePath(volumePath);
-        metadata.setSourceId(sourceId);
-        metadata.setCreationTime(System.currentTimeMillis());
-        // Segment is in BOOTSTRAPPING state by default - invisible to queries
-        // Caller should call beginIndexing() to make it queryable
-
-        indexByVolume(volumePath, segmentId);
-
-        // Persist to disk
-        persistSegment(metadata);
-
-        logger.info("Created segment {} in BOOTSTRAPPING state for source {} at {}",
-            segmentId, sourceId, volumePath);
-
-        return metadata;
+        return registry.create(sourceId, volumePath);
     }
 
     /**
@@ -514,13 +274,7 @@ public class SegmentCatalog {
      * @return List of segment metadata for segments belonging to the source
      */
     public java.util.List<SegmentMetadata> getSegmentsBySource(String sourceId) {
-        if (sourceId == null) {
-            return java.util.Collections.emptyList();
-        }
-
-        return segments.values().stream()
-            .filter(m -> sourceId.equals(m.getSourceId()))
-            .collect(java.util.stream.Collectors.toList());
+        return queries.bySource(sourceId);
     }
 
     /**
@@ -533,63 +287,21 @@ public class SegmentCatalog {
      * @return List of segment IDs for ACTIVE segments belonging to the source
      */
     public java.util.List<Long> getActiveSegmentsBySource(String sourceId) {
-        if (sourceId == null) {
-            return java.util.Collections.emptyList();
-        }
-
-        return segments.values().stream()
-            .filter(m -> sourceId.equals(m.getSourceId()))
-            .filter(m -> m.getLifecycleState() == LifecycleState.ACTIVE)
-            .map(SegmentMetadata::getSegmentId)
-            .collect(java.util.stream.Collectors.toList());
+        return queries.activeBySource(sourceId);
     }
 
     /**
      * Removes a segment from the catalog.
      *
-     * <p>This is typically called when a segment is purged or tombstoned.
-     * The segment remains in memory until explicitly removed.</p>
-     *
-     * <p><strong>CRITICAL:</strong> This method transitions the segment to PURGED state.
-     * The segment MUST be in TOMBSTONED state before calling this method,
-     * otherwise an IllegalStateException will be thrown.</p>
+     * <p>Transitions the segment to PURGED and persists that before dropping the record,
+     * so a crash mid-removal leaves a purged row rather than a live one. The segment must
+     * already be TOMBSTONED.</p>
      *
      * @param segmentId Unique segment identifier
      * @throws IllegalStateException if segment is not in TOMBSTONED state
      */
     public void remove(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            return; // Already removed
-        }
-
-        // Validate state before removal - segment must be TOMBSTONED
-        if (metadata.getLifecycleState() != LifecycleState.TOMBSTONED) {
-            throw new IllegalStateException(
-                "Cannot remove segment " + segmentId + " in state " + metadata.getLifecycleState() +
-                ". Segment must be in TOMBSTONED state before removal.");
-        }
-
-        // Transition to PURGED first (validates TOMBSTONED -> PURGED transition)
-        metadata.transitionToPurged();
-
-        // Persist the PURGED state before removing from memory
-        persistSegment(metadata);
-
-        // Now remove from collections
-        segments.remove(segmentId);
-
-        if (metadata.getVolumePath() != null) {
-            java.util.List<Long> segmentIds = volumeToSegments.get(metadata.getVolumePath());
-            if (segmentIds != null) {
-                synchronized (segmentIds) {
-                    segmentIds.remove(Long.valueOf(segmentId));
-                }
-                if (segmentIds.isEmpty()) {
-                    volumeToSegments.remove(metadata.getVolumePath());
-                }
-            }
-        }
+        registry.remove(segmentId);
     }
 
     /**
@@ -599,120 +311,86 @@ public class SegmentCatalog {
      * @return true if segment exists
      */
     public boolean contains(long segmentId) {
-        return segments.containsKey(segmentId);
+        return registry.contains(segmentId);
     }
 
     // ==================== Lifecycle Transition Methods ====================
+    //
+    // Each validates the transition, applies it and persists the record. The rules
+    // themselves are in LifecycleState; the ordering is in CatalogRegistry.
 
     /**
      * Completes the indexing phase for a segment and transitions it to WARMING.
      *
-     * <p>This method should be called when all entries for a batch have been
-     * written to the segment and the Cuckoo filter and LSH have been populated.</p>
+     * <p>Called once every entry for a batch has been written to the segment and the
+     * Cuckoo filter and LSH have been populated.</p>
      *
      * @param segmentId Unique segment identifier
      * @throws IllegalStateException if the segment is not in INDEXING state
      * @throws IllegalArgumentException if segment not found
      */
     public void completeIndexing(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            throw new IllegalArgumentException("Segment not found: " + segmentId);
-        }
-        metadata.transitionToWarming();
-        persistSegment(metadata);
+        registry.completeIndexing(segmentId);
     }
 
     /**
      * Completes the warming phase for a segment and transitions it to ACTIVE.
      *
-     * <p>This method should be called when HNSW edge optimization and PQ
-     * codebook training are complete.</p>
+     * <p>Called once HNSW edge optimization and PQ codebook training are complete.</p>
      *
      * @param segmentId Unique segment identifier
      * @throws IllegalStateException if the segment is not in WARMING state
      * @throws IllegalArgumentException if segment not found
      */
     public void completeWarmup(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            throw new IllegalArgumentException("Segment not found: " + segmentId);
-        }
-        metadata.transitionToActive();
-        persistSegment(metadata);
+        registry.completeWarmup(segmentId);
     }
 
     /**
      * Begins compaction for a segment and transitions it to COMPACTING.
-     *
-     * <p>This method should be called when a compaction worker starts
-     * cleaning up tombstones in the segment.</p>
      *
      * @param segmentId Unique segment identifier
      * @throws IllegalStateException if the segment is not in ACTIVE state
      * @throws IllegalArgumentException if segment not found
      */
     public void beginCompaction(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            throw new IllegalArgumentException("Segment not found: " + segmentId);
-        }
-        metadata.transitionToCompacting();
-        persistSegment(metadata);
+        registry.beginCompaction(segmentId);
     }
 
     /**
      * Completes compaction for a segment and transitions it back to ACTIVE.
      *
-     * <p>This method should be called when a compaction worker finishes
-     * cleaning up tombstones in the segment.</p>
+     * <p>The tombstone count starts over, since compaction is what removes the tombstoned
+     * records it counted.</p>
      *
      * @param segmentId Unique segment identifier
      * @throws IllegalStateException if the segment is not in COMPACTING state
      * @throws IllegalArgumentException if segment not found
      */
     public void completeCompaction(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            throw new IllegalArgumentException("Segment not found: " + segmentId);
-        }
-        // Transition from COMPACTING back to ACTIVE
-        metadata.setLifecycleState(LifecycleState.ACTIVE);
-        metadata.setEntryState(ENTRY_STATE_ACTIVE);
-        metadata.setLastCompactionTime(System.currentTimeMillis());
-        // Compaction is what removes tombstoned records, so the count starts over.
-        metadata.clearTombstoneCount();
-        persistSegment(metadata);
+        registry.completeCompaction(segmentId);
     }
 
     /**
      * Updates the path for a segment after compaction.
      *
-     * <p>This method should be called when a compaction worker creates
-     * a new segment file to replace the old one. The path is updated
-     * to point to the new segment file.</p>
+     * <p>Called when a compaction worker has written a new segment file to replace the old
+     * one, so that the catalog names the file that now holds the data.</p>
      *
      * @param segmentId Unique segment identifier
      * @param newPath The new path to the segment file
      * @throws IllegalArgumentException if segment not found or path is null
      */
     public void updatePath(long segmentId, Path newPath) {
-        if (newPath == null) {
-            throw new IllegalArgumentException("New path cannot be null");
-        }
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            throw new IllegalArgumentException("Segment not found: " + segmentId);
-        }
-        metadata.setVolumePath(newPath);
-        persistSegment(metadata);
+        registry.updatePath(segmentId, newPath);
     }
 
     /**
      * Marks a segment as TOMBSTONED, making it invisible to new queries.
      *
-     * <p>This method should be called when a segment is scheduled for deletion.
-     * The segment remains on disk until epoch-based reclamation completes.</p>
+     * <p>Records no visibility epoch, so the segment is invisible to every query rather
+     * than to those that start after this point. Use {@link #tombstone(long, long)}
+     * wherever an epoch is available.</p>
      *
      * @param segmentId Unique segment identifier
      * @throws IllegalStateException if the segment is not in ACTIVE or COMPACTING state
@@ -725,9 +403,9 @@ public class SegmentCatalog {
     /**
      * Marks a segment as TOMBSTONED with visibility epoch tracking.
      *
-     * <p>This method should be called when a segment is scheduled for deletion.
-     * The segment remains on disk until epoch-based reclamation completes.
-     * The visibility epoch is recorded to enable epoch-based visibility tracking.</p>
+     * <p>The segment remains on disk until epoch-based reclamation completes. Recording the
+     * epoch is what lets a query that started before this point keep reading the segment;
+     * see {@link SegmentVisibilityWindow}.</p>
      *
      * @param segmentId Unique segment identifier
      * @param visibilityEpoch The current visibility epoch from the StorageEngine
@@ -735,16 +413,7 @@ public class SegmentCatalog {
      * @throws IllegalArgumentException if segment not found
      */
     public void tombstone(long segmentId, long visibilityEpoch) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            throw new IllegalArgumentException("Segment not found: " + segmentId);
-        }
-        if (visibilityEpoch >= 0) {
-            metadata.transitionToTombstoned(visibilityEpoch);
-        } else {
-            metadata.transitionToTombstoned();
-        }
-        persistSegment(metadata);
+        registry.tombstone(segmentId, visibilityEpoch);
     }
 
     /**
@@ -757,12 +426,7 @@ public class SegmentCatalog {
      * @throws IllegalArgumentException if segment not found
      */
     public void beginIndexing(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            throw new IllegalArgumentException("Segment not found: " + segmentId);
-        }
-        metadata.transitionToIndexing();
-        persistSegment(metadata);
+        registry.beginIndexing(segmentId);
     }
 
     /**
@@ -772,10 +436,7 @@ public class SegmentCatalog {
      * @return List of segment IDs in the specified state
      */
     public java.util.List<Long> getSegmentsByState(LifecycleState state) {
-        return segments.values().stream()
-            .filter(m -> m.getLifecycleState() == state)
-            .map(SegmentMetadata::getSegmentId)
-            .collect(java.util.stream.Collectors.toList());
+        return queries.byState(state);
     }
 
     /**
@@ -784,10 +445,7 @@ public class SegmentCatalog {
      * @return List of queryable segment IDs
      */
     public java.util.List<Long> getQueryableSegments() {
-        return segments.values().stream()
-            .filter(m -> m.getLifecycleState().isQueryable())
-            .map(SegmentMetadata::getSegmentId)
-            .collect(java.util.stream.Collectors.toList());
+        return queries.queryable();
     }
 
     /**
@@ -796,7 +454,7 @@ public class SegmentCatalog {
      * @return Segment count
      */
     public int size() {
-        return segments.size();
+        return registry.size();
     }
 
     /**
@@ -805,9 +463,7 @@ public class SegmentCatalog {
      * <p>Use with caution - this removes all segment metadata.</p>
      */
     public void clear() {
-        segments.clear();
-        volumeToSegments.clear();
-        segmentIdGenerator.set(0);
+        registry.clear();
     }
 
     // ==================== Persistence Methods ====================
@@ -815,103 +471,43 @@ public class SegmentCatalog {
     /**
      * Recovers persisted catalog metadata from disk.
      *
-     * <p>This method loads all segment metadata from the catalog file and
-     * populates the in-memory catalog. It should be called after construction
-     * when using persistent storage.</p>
-     *
-     * <p>If persistence is not enabled (in-memory only mode), this method
-     * does nothing.</p>
-     *
-     * <p>Records that fail CRC validation are skipped, providing graceful
-     * recovery from partial writes or corruption.</p>
+     * <p>Loads every persisted record into memory, and should be called once after
+     * construction. A record that fails CRC validation is skipped, so a partial write costs
+     * one segment rather than the whole catalog, and a PURGED record is skipped because the
+     * segment it names is already gone. Does nothing when persistence is off.</p>
      *
      * @throws UncheckedIOException if the catalog file cannot be read
      */
     public void recover() {
-        if (catalogFile == null) {
+        if (!persistence.isPersistent()) {
             return; // No persistence enabled
         }
-
-        try {
-            List<SegmentMetadata> persisted = catalogFile.readAll();
-
-            for (SegmentMetadata segMetadata : persisted) {
-                // Skip PURGED segments - they're fully deleted
-                if (segMetadata.getLifecycleState() == LifecycleState.PURGED) {
-                    continue;
-                }
-
-                // Add to in-memory structures
-                segments.put(segMetadata.getSegmentId(), segMetadata);
-
-                if (segMetadata.getVolumePath() != null) {
-                    volumeToSegments.computeIfAbsent(segMetadata.getVolumePath(), k -> new java.util.ArrayList<>())
-                        .add(segMetadata.getSegmentId());
-                }
-
-                // Update ID generator to avoid conflicts
-                segmentIdGenerator.accumulateAndGet(segMetadata.getSegmentId(), Math::max);
-            }
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to recover catalog from: " + catalogFile.getPath(), e);
-        }
+        registry.restore(persistence.readAll());
     }
 
     /**
      * Flushes all pending changes to the catalog file.
      *
-     * <p>This forces all metadata changes to be written to disk, ensuring
-     * durability. Call this before shutting down to ensure no data loss.</p>
-     *
-     * <p>If persistence is not enabled (in-memory only mode), this method
-     * does nothing.</p>
+     * <p>Forces every metadata change to the device; call it before shutting down. Does
+     * nothing when persistence is off.</p>
      *
      * @throws UncheckedIOException if the flush fails
      */
     public void flush() {
-        if (catalogFile == null) {
-            return; // No persistence enabled
-        }
-
-        try {
-            catalogFile.flush();
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to flush catalog file: " + catalogFile.getPath(), e);
-        }
+        persistence.flush();
     }
 
     /**
      * Closes the catalog file and releases resources.
      *
-     * <p>This flushes any pending changes and closes the underlying file.
-     * After calling this method, the catalog is still usable in-memory but
-     * persistence operations will fail.</p>
-     *
-     * <p>If persistence is not enabled (in-memory only mode), this method
-     * does nothing.</p>
-     *
-     * <p>The close always completes: a failure is recorded on {@link #closeFailure()} and logged
-     * rather than thrown, because the steps that follow a catalog close in a shutdown - releasing
-     * mappings above all - must still run. Callers that report the shutdown's outcome read
-     * {@link #closeFailure()}.</p>
+     * <p>The catalog stays usable in memory afterwards, but persistence operations will
+     * fail. The close always completes: a failure is recorded on {@link #closeFailure()}
+     * and logged rather than thrown, because the steps that follow a catalog close in a
+     * shutdown - releasing mappings above all - must still run. See
+     * {@link CatalogPersistence} for why.</p>
      */
     public void close() {
-        if (catalogFile == null) {
-            return;
-        }
-
-        try {
-            catalogFile.close();
-        } catch (Exception e) {
-            recordCloseFailure(e);
-        }
-
-        // The file records a final flush that did not reach the device even when close() itself
-        // returns normally. That is the case this catalog exists to report.
-        Throwable fileFailure = catalogFile.closeFailure();
-        if (fileFailure != null) {
-            recordCloseFailure(fileFailure);
-        }
+        persistence.close();
     }
 
     /**
@@ -923,20 +519,7 @@ public class SegmentCatalog {
      * @return The first close-time failure, or null when the close was clean
      */
     public Throwable closeFailure() {
-        return closeFailure;
-    }
-
-    /**
-     * Logs a close-time failure and keeps the first one.
-     *
-     * @param failure The failure to record
-     */
-    private void recordCloseFailure(Throwable failure) {
-        logger.error("Catalog {} did not close durably; on-disk segment metadata may be stale",
-            catalogFile.getPath(), failure);
-        if (closeFailure == null) {
-            closeFailure = failure;
-        }
+        return persistence.closeFailure();
     }
 
     /**
@@ -945,28 +528,7 @@ public class SegmentCatalog {
      * @return true if the catalog has a persistent backing store
      */
     public boolean isPersistent() {
-        return catalogFile != null;
-    }
-
-    /**
-     * Persists a single segment's metadata to disk.
-     *
-     * <p>This is an internal method called after in-memory updates to ensure
-     * the change is durable. If persistence is not enabled, this method does
-     * nothing.</p>
-     *
-     * @param metadata The metadata to persist
-     */
-    private void persistSegment(SegmentMetadata metadata) {
-        if (catalogFile == null || metadata == null) {
-            return;
-        }
-
-        try {
-            catalogFile.writeSegment(metadata);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to persist segment metadata: " + metadata.getSegmentId(), e);
-        }
+        return persistence.isPersistent();
     }
 
     /**
@@ -975,7 +537,7 @@ public class SegmentCatalog {
      * @param volumePath Path to the volume
      */
     public void registerVolume(Path volumePath) {
-        volumeToSegments.computeIfAbsent(volumePath, k -> new java.util.ArrayList<>());
+        registry.registerVolume(volumePath);
     }
 
     /**
@@ -984,72 +546,30 @@ public class SegmentCatalog {
      * @param volumePath Path to the volume
      */
     public void unregisterVolume(Path volumePath) {
-        volumeToSegments.remove(volumePath);
+        registry.unregisterVolume(volumePath);
     }
 
     // ==================== Catalog Metadata ====================
 
-    /**
-     * Entry state constants for external use.
-     */
+    /** Alias of {@link #ENTRY_STATE_ACTIVE} for external use. */
     public static final int ACTIVE = ENTRY_STATE_ACTIVE;
+
+    /** Alias of {@link #ENTRY_STATE_DELETED} for external use. */
     public static final int DELETED = ENTRY_STATE_DELETED;
+
+    /** Alias of {@link #ENTRY_STATE_INDEXING} for external use. */
     public static final int INDEXING = ENTRY_STATE_INDEXING;
 
     /**
      * Returns the catalog metadata.
      *
-     * <p>Recalculates all counts from current segment states to ensure accuracy.
-     * Returns an immutable snapshot that will not be affected by subsequent updates.</p>
+     * <p>Recomputed from the current segment states on every call, so it cannot be
+     * stale, and immutable once returned.</p>
      *
      * @return Immutable CatalogMetadata snapshot
      */
     public CatalogMetadata getCatalogMetadata() {
-        return computeCatalogMetadataSnapshot();
-    }
-
-    /**
-     * Computes and returns an immutable snapshot of catalog metadata.
-     *
-     * <p>This method iterates through all segments to compute accurate counts,
-     * ensuring no stale data. The returned snapshot is immutable and safe to
-     * cache by callers.</p>
-     *
-     * <p>Domain correctness guarantees:</p>
-     * <ul>
-     *   <li>All counts are computed from current segment states</li>
-     *   <li>No cached/stale values are returned</li>
-     *   <li>The snapshot is immutable after creation</li>
-     * </ul>
-     *
-     * @return Immutable CatalogMetadata snapshot
-     */
-    private CatalogMetadata computeCatalogMetadataSnapshot() {
-        long total = segments.size();
-        long active = 0;
-        long indexing = 0;
-        long warming = 0;
-        long compacting = 0;
-        long tombstoned = 0;
-        long purged = 0;
-        long totalEntryCount = 0;
-
-        for (SegmentMetadata m : segments.values()) {
-            LifecycleState state = m.getLifecycleState();
-            switch (state) {
-                case ACTIVE -> active++;
-                case INDEXING -> indexing++;
-                case WARMING -> warming++;
-                case COMPACTING -> compacting++;
-                case TOMBSTONED -> tombstoned++;
-                case PURGED -> purged++;
-                default -> {}
-            }
-            totalEntryCount += m.getEntryCount();
-        }
-
-        return new CatalogMetadata(total, active, indexing, warming, compacting,
-                                   tombstoned, purged, totalEntryCount);
+        return queries.snapshot();
     }
 
     /**
@@ -1058,9 +578,7 @@ public class SegmentCatalog {
      * @return Total entry count
      */
     public long getTotalEntryCount() {
-        return segments.values().stream()
-            .mapToLong(SegmentMetadata::getEntryCount)
-            .sum();
+        return queries.totalEntryCount();
     }
 
     /**
@@ -1076,123 +594,75 @@ public class SegmentCatalog {
     }
 
     // ==================== Offset Tracking Methods ====================
+    //
+    // Both offsets are non-negative, monotonically increasing, and ordered
+    // lastIntegratedOffset <= writeLogHead. The difference between them is the tail a query
+    // still has to scan for itself. See CatalogQueries and MonotonicOffset.
 
     /**
      * Gets the last integrated offset for a segment.
      *
-     * <p>The last integrated offset is the write log offset up to which all entries
-     * have been linked into the HNSW graph. Entries beyond this offset exist in
-     * the write log but are not yet in the graph.</p>
-     *
-     * <p><strong>Domain Constraints:</strong></p>
-     * <ul>
-     *   <li>Value is always non-negative (≥ 0)</li>
-     *   <li>Value is monotonically increasing</li>
-     *   <li>Value ≤ writeLogHead</li>
-     * </ul>
+     * <p>The write log offset up to which all entries have been linked into the HNSW graph.
+     * Entries beyond it exist in the write log but are not yet in the graph.</p>
      *
      * @param segmentId Unique segment identifier
      * @return Last integrated offset, or 0 if segment not found
      */
     public long getLastIntegratedOffset(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        return metadata != null ? metadata.getLastIntegratedOffset() : 0L;
+        return queries.lastIntegratedOffset(segmentId);
     }
 
     /**
-     * Sets the last integrated offset for a segment.
+     * Advances the last integrated offset for a segment.
      *
-     * <p>This method should be called by the HNSW integration worker after
-     * successfully linking entries into the graph.</p>
-     *
-     * <p><strong>Thread Safety:</strong> This method delegates to
-     * {@link SegmentMetadata#compareAndSetLastIntegratedOffset(long)} which
-     * ensures atomic monotonic updates.</p>
+     * <p>Called by the HNSW integration worker after linking entries into the graph; the
+     * update is atomic and monotonic, as
+     * {@link SegmentMetadata#compareAndSetLastIntegratedOffset(long)} explains.</p>
      *
      * @param segmentId Unique segment identifier
-     * @param offset The new last integrated offset (must be ≥ 0)
+     * @param offset The new last integrated offset (must be &ge; 0)
      * @return true if the offset was updated, false if segment not found or offset not greater
+     * @throws IllegalArgumentException if offset is negative
      */
     public boolean setLastIntegratedOffset(long segmentId, long offset) {
-        if (offset < 0) {
-            throw new IllegalArgumentException("Offset must be non-negative: " + offset);
-        }
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            return false;
-        }
-        return metadata.compareAndSetLastIntegratedOffset(offset);
+        return queries.setLastIntegratedOffset(segmentId, offset);
     }
 
     /**
      * Gets the write log head offset for a segment.
      *
-     * <p>The write log head is the offset of the next byte to be written.
-     * All entries with offset &lt; writeLogHead have been persisted to the write log.</p>
-     *
-     * <p><strong>Domain Constraints:</strong></p>
-     * <ul>
-     *   <li>Value is always non-negative (≥ 0)</li>
-     *   <li>Value is monotonically increasing</li>
-     *   <li>Value ≥ lastIntegratedOffset</li>
-     * </ul>
+     * <p>The offset of the next byte to write; everything below it is in the log.</p>
      *
      * @param segmentId Unique segment identifier
      * @return Write log head offset, or 0 if segment not found
      */
     public long getWriteLogHead(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        return metadata != null ? metadata.getWriteLogHead() : 0L;
+        return queries.writeLogHead(segmentId);
     }
 
     /**
-     * Sets the write log head offset for a segment.
+     * Advances the write log head offset for a segment.
      *
-     * <p>This method should be called by the storage engine after successfully
-     * appending entries to the write log.</p>
-     *
-     * <p><strong>Thread Safety:</strong> This method uses atomic CAS operations
-     * to ensure monotonic updates.</p>
+     * <p>Called by the storage engine after appending entries to the write log. The update
+     * is atomic and monotonic.</p>
      *
      * @param segmentId Unique segment identifier
-     * @param offset The new write log head offset (must be ≥ 0)
+     * @param offset The new write log head offset (must be &ge; 0)
      * @return true if the offset was updated, false if segment not found or offset not greater
+     * @throws IllegalArgumentException if offset is negative
      */
     public boolean setWriteLogHead(long segmentId, long offset) {
-        if (offset < 0) {
-            throw new IllegalArgumentException("Offset must be non-negative: " + offset);
-        }
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            return false;
-        }
-        return metadata.compareAndSetWriteLogHead(offset);
+        return queries.setWriteLogHead(segmentId, offset);
     }
 
     /**
-     * Gets the tail scan size for a segment.
-     *
-     * <p>The tail scan size is the number of bytes that need to be scanned
-     * in the write log for entries not yet integrated into the HNSW graph.</p>
-     *
-     * <p><strong>Domain Constraints:</strong></p>
-     * <ul>
-     *   <li>Value is always non-negative (≥ 0)</li>
-     *   <li>Value = writeLogHead - lastIntegratedOffset</li>
-     * </ul>
+     * Gets the tail scan size for a segment: the write-log bytes its index has not absorbed.
      *
      * @param segmentId Unique segment identifier
-     * @return Tail scan size in bytes, or 0 if segment not found
+     * @return Tail scan size in bytes, never negative; 0 if segment not found
      */
     public long getTailScanSize(long segmentId) {
-        SegmentMetadata metadata = segments.get(segmentId);
-        if (metadata == null) {
-            return 0L;
-        }
-        long writeLogHead = metadata.getWriteLogHead();
-        long lastIntegrated = metadata.getLastIntegratedOffset();
-        // Clamp to non-negative to handle edge cases
-        return Math.max(0L, writeLogHead - lastIntegrated);
+        return queries.tailScanSize(segmentId);
     }
 
     /**
@@ -1213,33 +683,24 @@ public class SegmentCatalog {
     /**
      * Metadata for a single segment.
      *
-     * <p><strong>Thread Safety:</strong> This class provides atomic updates for
-     * the {@code lastIntegratedOffset} field. All offset updates use CAS operations
-     * and ensure monotonic increase. Other fields are not thread-safe and should
-     * be updated from a single thread or with external synchronization.</p>
+     * <p>The record the catalog keeps per segment, and the one
+     * {@link io.excalibur.store.catalog.CatalogFile} reads and writes. Parts of it carry
+     * their own reasoning elsewhere: the two counts are a {@link SegmentOccupancy}, each
+     * write-log offset a {@link MonotonicOffset}, and the epoch span over which the segment
+     * answers queries a {@link SegmentVisibilityWindow}.</p>
+     *
+     * <p><strong>Thread Safety:</strong> the counts, the offsets and the lifecycle
+     * transitions are each individually atomic. The plain timestamps are not, and should be
+     * written from a single thread or with external synchronization.
      */
     public static class SegmentMetadata {
         private final long segmentId;
         private volatile Path volumePath;
 
-        /**
-         * Entry count. Atomic because every put and delete adjusts it by a delta from
-         * whichever ingest thread performed the write.
-         */
-        private final java.util.concurrent.atomic.AtomicInteger entryCount =
-            new java.util.concurrent.atomic.AtomicInteger(0);
+        /** Live entries and tombstones, the two counts compaction is scheduled on. */
+        private final SegmentOccupancy occupancy = new SegmentOccupancy();
 
         private volatile int entryState = ENTRY_STATE_NONE;
-
-        /**
-         * Number of entries tombstoned in this segment since the last compaction.
-         *
-         * <p>Atomic for the same reason as {@code entryCount}: it is adjusted from
-         * whichever thread performed the delete. Reset to zero when compaction
-         * completes, since compaction is what removes tombstoned records.</p>
-         */
-        private final java.util.concurrent.atomic.AtomicInteger tombstoneCount =
-            new java.util.concurrent.atomic.AtomicInteger(0);
 
         /**
          * Lifecycle state. Volatile because query threads read it lock-free while
@@ -1260,45 +721,30 @@ public class SegmentCatalog {
         private volatile String sourceId;
 
         /**
-         * Atomic last integrated offset for thread-safe updates.
-         * Uses AtomicLong to ensure monotonic increase and visibility across threads.
-         *
-         * <p>This is the write log offset up to which all entries have been
-         * linked into the HNSW graph. Entries beyond this offset exist in
-         * the write log but are not yet in the graph.</p>
+         * The write log offset up to which all entries have been linked into the HNSW
+         * graph. Entries beyond this offset exist in the write log but are not yet in the
+         * graph.
          */
-        private final AtomicLong lastIntegratedOffset = new AtomicLong(0);
+        private final MonotonicOffset lastIntegratedOffset = new MonotonicOffset();
 
         /**
-         * Atomic write log head offset for thread-safe updates.
-         * Uses AtomicLong to ensure monotonic increase and visibility across threads.
-         *
-         * <p>This is the offset of the next byte to be written to the write log.
-         * All entries with offset < writeLogHead have been persisted to the write log.</p>
+         * The offset of the next byte to be written to the write log. All entries with
+         * offset below it have been persisted to the write log.
          */
-        private final AtomicLong writeLogHead = new AtomicLong(0);
+        private final MonotonicOffset writeLogHead = new MonotonicOffset();
 
         private long lastCompactionTime = 0;
         private long creationTime = 0;
+
+        /**
+         * When the segment last entered the ACTIVE or DELETED entry state, and the reference
+         * the wall-clock reclamation grace period runs from for a tombstone carrying no
+         * visibility epoch. See {@code SegmentLifecycleManager#isPastGracePeriod}.
+         */
         private long lastActiveTime = 0;
 
-        /**
-         * Epoch at which this segment was created.
-         * Set when the segment is first registered.
-         * Used for visibility tracking: queries with epoch < creationEpoch
-         * cannot see this segment.
-         * A value of -1 indicates the creation epoch has not been set.
-         */
-        private volatile long creationEpoch = -1;
-
-        /**
-         * Epoch at which this segment was tombstoned.
-         * Set when the segment transitions to TOMBSTONED state.
-         * Used for epoch-based reclamation: queries started before this epoch
-         * can still see the segment, while queries started after cannot.
-         * A value of -1 indicates the segment has not been tombstoned.
-         */
-        private volatile long tombstoneEpoch = -1;
+        /** The span of visibility epochs over which this segment answers queries. */
+        private final SegmentVisibilityWindow visibility = new SegmentVisibilityWindow();
 
         /**
          * Reference to the Count-Min Sketch for term frequency estimation.
@@ -1380,7 +826,7 @@ public class SegmentCatalog {
          * @return Entry count
          */
         public int getEntryCount() {
-            return entryCount.get();
+            return occupancy.entries();
         }
 
         /**
@@ -1389,7 +835,7 @@ public class SegmentCatalog {
          * @param entryCount Entry count
          */
         public void setEntryCount(int entryCount) {
-            this.entryCount.set(entryCount);
+            occupancy.entries(entryCount);
         }
 
         /**
@@ -1399,7 +845,7 @@ public class SegmentCatalog {
          * @return The updated entry count
          */
         public int addEntryCount(int delta) {
-            return entryCount.addAndGet(delta);
+            return occupancy.addEntries(delta);
         }
 
         /**
@@ -1408,7 +854,7 @@ public class SegmentCatalog {
          * @return Tombstone count
          */
         public int getTombstoneCount() {
-            return tombstoneCount.get();
+            return occupancy.tombstones();
         }
 
         /**
@@ -1418,14 +864,14 @@ public class SegmentCatalog {
          * @return The updated tombstone count
          */
         public int addTombstoneCount(int delta) {
-            return tombstoneCount.addAndGet(delta);
+            return occupancy.addTombstones(delta);
         }
 
         /**
          * Clears the tombstone count, e.g. after a compaction removed the records.
          */
         public void clearTombstoneCount() {
-            tombstoneCount.set(0);
+            occupancy.clearTombstones();
         }
 
         /**
@@ -1437,9 +883,7 @@ public class SegmentCatalog {
          * @return Tombstone ratio in [0.0, 1.0]; 0.0 when the segment holds no records
          */
         public double tombstoneRatio() {
-            int tombstones = tombstoneCount.get();
-            long total = (long) entryCount.get() + tombstones;
-            return total <= 0 ? 0.0 : (double) tombstones / total;
+            return occupancy.tombstoneRatio();
         }
 
         /**
@@ -1472,8 +916,7 @@ public class SegmentCatalog {
         /**
          * Sets the lifecycle state.
          *
-         * <p>Validates the state transition before applying the new state.
-         * Triggers catalog metadata update to reflect the new state.</p>
+         * <p>Validates the state transition before applying the new state.</p>
          *
          * @param state The new lifecycle state
          * @throws IllegalStateException if the transition is invalid
@@ -1488,13 +931,9 @@ public class SegmentCatalog {
         /**
          * Sets the lifecycle state without transition validation.
          *
-         * <p>This is an internal method used by the catalog to sync lifecycle state
-         * with entry state. It bypasses validation to allow state synchronization
-         * during recovery or migration scenarios.</p>
-         *
-         * <p><strong>Warning:</strong> This method should only be used for internal
-         * synchronization. External callers should use {@link #setLifecycleState(LifecycleState)}
-         * to ensure valid transitions.</p>
+         * <p>Used by the catalog to sync the lifecycle state with the entry state, which
+         * may name a position the state machine cannot legally reach from where it is.
+         * Everything else uses {@link #setLifecycleState(LifecycleState)}.</p>
          *
          * @param state The new lifecycle state
          */
@@ -1527,6 +966,7 @@ public class SegmentCatalog {
          *
          * @param value The lifecycle state value
          * @return The new lifecycle state
+         * @throws IllegalArgumentException if the value names no lifecycle state
          */
         public LifecycleState setLifecycleStateFromValue(int value) {
             LifecycleState state = LifecycleState.fromValue(value);
@@ -1614,12 +1054,24 @@ public class SegmentCatalog {
          * tombstoned. Queries started before this epoch will still see the segment,
          * while queries started at or after this epoch will not.</p>
          *
+         * <p><strong>The state is written before the epoch, and that order is the invariant.</strong>
+         * The two writes are not one critical section - the state under {@code stateLock}, the epoch as
+         * a volatile store on the visibility window - so a reader can land between them and see
+         * {@code TOMBSTONED} with the tombstone epoch still at its {@code -1} sentinel. That reader
+         * concludes the segment is visible (see {@link SegmentVisibilityWindow#visibleAt(long)}), which
+         * is what it would have concluded an instant earlier anyway: the window can only delay a
+         * tombstone taking effect, never retire a segment out from under a query entitled to see it.
+         * The opposite order would not fail safe, because {@link #setLifecycleState(LifecycleState)}
+         * validates and throws: recording the epoch first would leave a tombstone epoch on a segment
+         * that never became tombstoned, one that reads as invisible to every query at or after that
+         * epoch while it is still ACTIVE.</p>
+         *
          * @param visibilityEpoch The current visibility epoch from the StorageEngine
          * @throws IllegalStateException if not in ACTIVE or COMPACTING state
          */
         public void transitionToTombstoned(long visibilityEpoch) {
             setLifecycleState(LifecycleState.TOMBSTONED);
-            this.tombstoneEpoch = visibilityEpoch;
+            visibility.tombstoneEpoch(visibilityEpoch);
         }
 
         /**
@@ -1637,16 +1089,15 @@ public class SegmentCatalog {
          * @throws IllegalStateException if not in PURGED state
          */
         public void resetToBootstrapping() {
-            LifecycleState.validateTransition(this.lifecycleState, LifecycleState.BOOTSTRAPPING);
-            this.lifecycleState = LifecycleState.BOOTSTRAPPING;
+            setLifecycleState(LifecycleState.BOOTSTRAPPING);
         }
 
         /**
          * Gets the last integrated offset.
          *
          * <p><strong>Atomicity:</strong> This method returns a consistent snapshot
-         * of the offset value. The returned value is always >= any value that has
-         * been persisted to disk.</p>
+         * of the offset value. The returned value is always at or beyond any value that
+         * has been persisted to disk.</p>
          *
          * @return Last integrated offset
          */
@@ -1655,16 +1106,13 @@ public class SegmentCatalog {
         }
 
         /**
-         * Sets the last integrated offset.
-         *
-         * <p><strong>Domain Constraint:</strong> The offset must be non-negative.
-         * This method validates the input and throws an exception if negative.</p>
+         * Sets the last integrated offset, whether or not it advances.
          *
          * <p><strong>Note:</strong> This method directly sets the offset without
          * checking monotonicity. Use {@link #compareAndSetLastIntegratedOffset(long)}
          * for thread-safe updates that guarantee monotonic increase.</p>
          *
-         * @param lastIntegratedOffset Last integrated offset (must be >= 0)
+         * @param lastIntegratedOffset Last integrated offset (must be &ge; 0)
          * @throws IllegalArgumentException if lastIntegratedOffset is negative
          */
         public void setLastIntegratedOffset(long lastIntegratedOffset) {
@@ -1676,47 +1124,28 @@ public class SegmentCatalog {
         }
 
         /**
-         * Atomically sets the last integrated offset with monotonicity guarantee.
+         * Atomically advances the last integrated offset, never lowering it.
          *
-         * <p>This method only updates the offset if the new value is greater than
-         * the current value, ensuring the offset never decreases.</p>
+         * <p>A negative offset is refused rather than ignored, because the caller is
+         * reporting progress and there is no such thing as negative progress.</p>
          *
-         * <p><strong>Domain Constraints:</strong></p>
-         * <ul>
-         *   <li>Offset must be non-negative (returns false if negative)</li>
-         *   <li>Offset must be greater than current value (monotonicity)</li>
-         * </ul>
-         *
-         * <p><strong>Thread Safety:</strong> This operation is atomic and thread-safe.
-         * Multiple threads can call this method concurrently without corrupting the offset.</p>
-         *
-         * @param newOffset The new offset value (must be >= 0)
+         * @param newOffset The new offset value (must be &ge; 0)
          * @return true if the offset was updated (new value was greater and non-negative)
          */
         public boolean compareAndSetLastIntegratedOffset(long newOffset) {
             if (newOffset < 0) {
                 return false;
             }
-            while (true) {
-                long current = lastIntegratedOffset.get();
-                if (newOffset <= current) {
-                    return false;
-                }
-                if (lastIntegratedOffset.compareAndSet(current, newOffset)) {
-                    return true;
-                }
-                // CAS failed, retry
-            }
+            return lastIntegratedOffset.advanceTo(newOffset);
         }
 
         /**
          * Atomically updates the offset to the maximum of current and new value.
          *
-         * <p>This method is useful for batch updates where you want to advance
-         * the offset to the maximum of multiple values.</p>
-         *
-         * <p><strong>Domain Constraint:</strong> Silently ignores negative values
-         * to maintain the non-negative invariant.</p>
+         * <p>Differs from {@link #compareAndSetLastIntegratedOffset(long)} only in saying
+         * nothing about what it did: for a batch that advances the offset to the largest of
+         * several values, whether any individual one won is not the caller's question.
+         * Negative values are silently ignored to maintain the non-negative invariant.</p>
          *
          * @param newOffset The new offset value (negative values are ignored)
          */
@@ -1724,15 +1153,7 @@ public class SegmentCatalog {
             if (newOffset < 0) {
                 return; // Ignore negative values
             }
-            while (true) {
-                long current = lastIntegratedOffset.get();
-                if (newOffset <= current) {
-                    return; // Current is already >= new
-                }
-                if (lastIntegratedOffset.compareAndSet(current, newOffset)) {
-                    return;
-                }
-            }
+            lastIntegratedOffset.advanceTo(newOffset);
         }
 
         // ==================== Write Log Head Methods ====================
@@ -1741,7 +1162,8 @@ public class SegmentCatalog {
          * Gets the write log head offset.
          *
          * <p><strong>Atomicity:</strong> This method returns a consistent snapshot
-         * of the offset value. The returned value is always ≥ lastIntegratedOffset.</p>
+         * of the offset value. The returned value is always at or beyond
+         * lastIntegratedOffset.</p>
          *
          * @return Write log head offset
          */
@@ -1750,7 +1172,7 @@ public class SegmentCatalog {
         }
 
         /**
-         * Sets the write log head offset.
+         * Sets the write log head offset, whether or not it advances.
          *
          * <p><strong>Note:</strong> This method directly sets the offset without
          * checking monotonicity. Use {@link #compareAndSetWriteLogHead(long)}
@@ -1763,48 +1185,25 @@ public class SegmentCatalog {
         }
 
         /**
-         * Atomically sets the write log head offset with monotonicity guarantee.
-         *
-         * <p>This method only updates the offset if the new value is greater than
-         * the current value, ensuring the offset never decreases.</p>
-         *
-         * <p><strong>Thread Safety:</strong> This operation is atomic and thread-safe.
-         * Multiple threads can call this method concurrently without corrupting the offset.</p>
+         * Atomically advances the write log head offset, never lowering it.
          *
          * @param newOffset The new offset value
          * @return true if the offset was updated (new value was greater)
          */
         public boolean compareAndSetWriteLogHead(long newOffset) {
-            while (true) {
-                long current = writeLogHead.get();
-                if (newOffset <= current) {
-                    return false;
-                }
-                if (writeLogHead.compareAndSet(current, newOffset)) {
-                    return true;
-                }
-                // CAS failed, retry
-            }
+            return writeLogHead.advanceTo(newOffset);
         }
 
         /**
          * Atomically updates the write log head to the maximum of current and new value.
          *
-         * <p>This method is useful for batch updates where you want to advance
-         * the offset to the maximum of multiple values.</p>
+         * <p>For batch updates that advance the head to the largest of several values and
+         * do not care which one won.</p>
          *
          * @param newOffset The new offset value
          */
         public void updateWriteLogHeadToMax(long newOffset) {
-            while (true) {
-                long current = writeLogHead.get();
-                if (newOffset <= current) {
-                    return; // Current is already >= new
-                }
-                if (writeLogHead.compareAndSet(current, newOffset)) {
-                    return;
-                }
-            }
+            writeLogHead.advanceTo(newOffset);
         }
 
         /**
@@ -1862,68 +1261,47 @@ public class SegmentCatalog {
         }
 
         /**
-         * Increments the active segment counter.
-         */
-        public void incrementActiveSegments() {
-            this.lastActiveTime = System.currentTimeMillis();
-        }
-
-        /**
-         * Increments the deleted segment counter.
-         */
-        public void incrementDeletedSegments() {
-            this.lastActiveTime = System.currentTimeMillis();
-        }
-
-        /**
          * Gets the epoch at which this segment was created.
          *
-         * <p>The creation epoch is the visibility epoch value at the time
-         * the segment was first registered. Queries with epoch &lt; creationEpoch
-         * cannot see this segment.</p>
+         * <p>Queries with an epoch below it cannot see this segment. See
+         * {@link SegmentVisibilityWindow}.</p>
          *
          * @return The creation epoch, or -1 if not set
          */
         public long getCreationEpoch() {
-            return creationEpoch;
+            return visibility.creationEpoch();
         }
 
         /**
-         * Sets the creation epoch.
-         *
-         * <p>This should be called when a segment is first registered.
-         * The value should be the current visibility epoch from the VisibilityTracker.</p>
+         * Sets the creation epoch, which should be the current visibility epoch at the
+         * moment the segment is first registered.
          *
          * @param epoch The visibility epoch at which the segment was created
          */
         public void setCreationEpoch(long epoch) {
-            this.creationEpoch = epoch;
+            visibility.creationEpoch(epoch);
         }
 
         /**
          * Gets the epoch at which this segment was tombstoned.
          *
-         * <p>The tombstone epoch is the visibility epoch value at the time
-         * the segment transitioned to TOMBSTONED state. Queries started
-         * before this epoch will still see the segment, while queries
-         * started at or after this epoch will not.</p>
+         * <p>Queries started before it still see the segment; queries started at or after
+         * it do not. See {@link SegmentVisibilityWindow}.</p>
          *
          * @return The tombstone epoch, or -1 if the segment has not been tombstoned
          */
         public long getTombstoneEpoch() {
-            return tombstoneEpoch;
+            return visibility.tombstoneEpoch();
         }
 
         /**
-         * Sets the tombstone epoch.
-         *
-         * <p>This should be called when a segment transitions to TOMBSTONED state.
-         * The value should be the current visibility epoch from the StorageEngine.</p>
+         * Sets the tombstone epoch, which should be the current visibility epoch at the
+         * moment the segment transitions to TOMBSTONED.
          *
          * @param epoch The visibility epoch at which the segment was tombstoned
          */
         public void setTombstoneEpoch(long epoch) {
-            this.tombstoneEpoch = epoch;
+            visibility.tombstoneEpoch(epoch);
         }
 
         /**
@@ -1962,50 +1340,19 @@ public class SegmentCatalog {
         /**
          * Checks if this segment is visible at the given query epoch.
          *
-         * <p>A segment is visible at epoch E if:</p>
-         * <ul>
-         *   <li>{@code creationEpoch <= E} (segment existed at query start)</li>
-         *   <li>{@code E < tombstoneEpoch} (segment was not tombstoned before query started)</li>
-         * </ul>
+         * <p>Visible when the segment already existed when the query started and had not
+         * been tombstoned by then; {@link SegmentVisibilityWindow} carries the rule and the
+         * meaning of the -1 sentinels.</p>
          *
-         * <p><strong>Note:</strong> This method only checks epoch visibility, not lifecycle state.
-         * Callers should also check {@link #getLifecycleState()}.isQueryable() if needed.</p>
+         * <p><strong>Note:</strong> This method only checks epoch visibility, not lifecycle
+         * state. Callers should also check {@link #getLifecycleState()}.isQueryable() if
+         * needed.</p>
          *
          * @param queryEpoch The epoch at which a query started
          * @return true if the segment is visible to the query
          */
         public boolean isVisibleAtEpoch(long queryEpoch) {
-            // If creation epoch is set and query epoch is before creation, not visible
-            if (creationEpoch >= 0 && queryEpoch < creationEpoch) {
-                return false;
-            }
-            // If not tombstoned, visible
-            if (tombstoneEpoch < 0) {
-                return true;
-            }
-            // If tombstoned after query started, visible to that query
-            return tombstoneEpoch > queryEpoch;
-        }
-
-        /**
-         * Checks if this segment was tombstoned after the given query epoch.
-         *
-         * <p>This is used for epoch-based visibility: a query that started at
-         * queryEpoch should still see segments that were tombstoned after
-         * the query started.</p>
-         *
-         * @param queryEpoch The epoch at which a query started
-         * @return true if the segment is visible to the query (tombstoned after query started, or not tombstoned)
-         * @deprecated Use {@link #isVisibleAtEpoch(long)} instead for full epoch visibility check
-         */
-        @Deprecated
-        public boolean wasTombstonedAfter(long queryEpoch) {
-            // If not tombstoned, always visible
-            if (tombstoneEpoch < 0) {
-                return true;
-            }
-            // If tombstoned after query started, visible to that query
-            return tombstoneEpoch > queryEpoch;
+            return visibility.visibleAt(queryEpoch);
         }
 
         @Override
@@ -2018,7 +1365,8 @@ public class SegmentCatalog {
             // rather than merely unhelpful.
             return String.format(
                 "SegmentMetadata{id=%d, state=%s, entries=%d, tombstones=%d, source=%s}",
-                segmentId, lifecycleState, entryCount.get(), tombstoneCount.get(), sourceId);
+                segmentId, lifecycleState, occupancy.entries(), occupancy.tombstones(),
+                sourceId);
         }
     }
 
@@ -2100,56 +1448,36 @@ public class SegmentCatalog {
         /**
          * The live corpus: everything the catalog holds that is not retired.
          *
-         * <p>Retired means TOMBSTONED or PURGED. Subtracting only the purged ones would leave
-         * a denominator that is really the whole catalog, because PURGED is not a state this
-         * catalog ever holds - {@link SegmentCatalog#remove(long)} sets it and drops the record
-         * in the same breath, and recovery skips any that was persisted. A tombstoned segment
-         * would then sit in the denominator and never in the numerator, so a node that had
-         * compacted a third of its segments would report a third of its corpus missing.</p>
+         * <p>Retired means TOMBSTONED or PURGED; {@link CatalogCoverage} says why both are
+         * subtracted and what goes wrong if only PURGED is.</p>
          *
          * @return The count, which may be zero
          */
         public long getLiveSegments() {
-            return totalSegments - tombstonedSegments - purgedSegments;
+            return CatalogCoverage.liveSegments(totalSegments, tombstonedSegments,
+                purgedSegments);
         }
 
         /**
          * The share of the live corpus a query can read, in [0, 1].
          *
-         * <p>Both halves are the live corpus: the numerator is what a query may read, and the
-         * denominator what this node holds and has not retired. Counting retired segments in
-         * the denominator instead - as "everything not purged" does, PURGED being a state the
-         * catalog never holds - makes a healthy node that has compacted a third of its
-         * segments report a third of its corpus permanently gone, with no state it can reach
-         * to recover, because reclamation may legitimately never come.</p>
-         *
-         * <p>What this can and cannot say is worth being plain about, because it is the
-         * node-level readiness signal. Every state the catalog holds is either queryable or
-         * retired, so on a node whose segments are all accounted for this reads 1.0 - it
-         * detects a segment stranded in a state no query reads, and an index with no live
-         * corpus at all, and it is not a warm-up gauge. A segment still absorbing its write
-         * log is queryable and is searched, so it counts; the per-query
-         * {@code estimated_corpus_coverage} is where a partial answer shows up.</p>
-         *
-         * <p>Zero when there is no live corpus: an empty index has nothing to read, which is
-         * the reading that keeps "coverage is low, this node is not ready" true in every case
-         * it is consulted.</p>
+         * <p>This node's readiness signal: 1.0 when every segment it holds is either
+         * queryable or deliberately retired, lower when one is stranded in a state no query
+         * reads, and 0.0 when there is no live corpus at all. It is not a warm-up gauge.
+         * {@link CatalogCoverage} carries the reasoning and the failure it was written to
+         * avoid.</p>
          *
          * @return The ratio
          */
         public double getEstimatedCoverage() {
-            long live = getLiveSegments();
-            if (live <= 0) {
-                return 0.0;
-            }
-            return Math.max(0.0, Math.min(1.0, (double) getQueryableSegments() / live));
+            return CatalogCoverage.estimatedCoverage(getQueryableSegments(), getLiveSegments());
         }
 
         @Override
         public String toString() {
             return String.format(
-                "CatalogMetadata{total=%d, active=%d, indexing=%d, warming=%d, " +
-                "compacting=%d, tombstoned=%d, purged=%d, entries=%d}",
+                "CatalogMetadata{total=%d, active=%d, indexing=%d, warming=%d, "
+                + "compacting=%d, tombstoned=%d, purged=%d, entries=%d}",
                 totalSegments, activeSegments, indexingSegments, warmSegments,
                 compactingSegments, tombstonedSegments, purgedSegments, totalEntryCount);
         }

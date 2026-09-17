@@ -2,10 +2,16 @@ package excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import excalibur.api.bootstrap.GraphErasureService;
+import excalibur.api.bootstrap.GraphTenant;
+import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.RequestBody;
 import excalibur.api.protocol.ResponseBody;
 import excalibur.ingest.erasure.DocumentErasureService;
+import io.excalibur.core.text.ChunkIdentifiers;
+import io.excalibur.tenancy.NamespaceId;
+import io.excalibur.tenancy.NamespaceRegistry;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,6 +52,23 @@ import java.util.Objects;
  * <p>Bounded per request, with {@code documents_remaining} saying how much is left, because the
  * work is a storage delete and an index probe per chunk. A large source is a loop of requests, and
  * the count is what tells a caller when the loop is done.</p>
+ *
+ * <h3>The graph half</h3>
+ * <p>A document that was ingested into the knowledge graph left two things there that removing
+ * its chunks does not touch: the facts an extractor read out of it, and up to two kilobytes of
+ * its text against every entity it mentioned. Both are keyed by a provenance id derived from the
+ * document's key, so withdrawing them is a source-scoped graph obligation per document - which
+ * is submitted here, for exactly the documents that were actually erased.
+ *
+ * <p>That half is a queued obligation rather than an immediate removal, so this reply can no
+ * longer be a flat 200. When the graph still owes something the status is 202 and
+ * {@code graph_erasure_complete} is false: the content is out of the corpus, an obligation for
+ * the rest is recorded durably, and a caller under an obligation of their own must be able to
+ * see the difference. {@code "compact": true} discharges both halves before replying, which is
+ * what turns it back into a 200.
+ *
+ * <p>A node serving no graph reports nothing submitted and {@code graph_erasure_complete} true,
+ * because nothing was ever extracted into one.
  *
  * <h3>Why this is separate from reindexing</h3>
  * <p>A document also disappears when its source stops listing it and {@code POST /v1/reindex} runs.
@@ -104,6 +127,16 @@ public class DocumentErasureEndpoint implements HttpHandler {
     private final InlineSourceIds suppliedSources;
 
     /**
+     * The namespaces whose graphs hold what was extracted from these documents, or null.
+     *
+     * <p>The shared one is the only one that can: ingestion is not namespace-aware and hands
+     * every published document to one sink, which stages into the shared tenant. Reading the
+     * namespace header here would submit the obligation against a graph that never held the
+     * facts, and report it discharged.
+     */
+    private final GraphTenants graphTenants;
+
+    /**
      * Creates the endpoint.
      *
      * @param erasureService The service that performs the removal
@@ -141,10 +174,31 @@ public class DocumentErasureEndpoint implements HttpHandler {
     public DocumentErasureEndpoint(DocumentErasureService erasureService,
                                    SourceRegistry sourceRegistry,
                                    InlineSourceIds suppliedSources) {
+        this(erasureService, sourceRegistry, suppliedSources, null);
+    }
+
+    /**
+     * Creates the endpoint, able to withdraw the erased documents from the graph as well.
+     *
+     * @param erasureService  The service that performs the removal
+     * @param sourceRegistry  The registered ingestion sources, or null on a node that keeps none
+     * @param suppliedSources The ids documents have been supplied directly under, or null
+     * @param graphTenants    The namespaces whose graphs hold what was extracted from these
+     *                        documents, or null on a node that serves no graph. Without it an
+     *                        erasure removes the document's text and leaves every fact read out
+     *                        of it, and up to two kilobytes of that text per entity mentioned,
+     *                        in the graph and in the staging log the next build replays
+     * @throws NullPointerException if the service is null
+     */
+    public DocumentErasureEndpoint(DocumentErasureService erasureService,
+                                   SourceRegistry sourceRegistry,
+                                   InlineSourceIds suppliedSources,
+                                   GraphTenants graphTenants) {
         this.erasureService = Objects.requireNonNull(erasureService,
             "erasureService cannot be null");
         this.sourceRegistry = sourceRegistry;
         this.suppliedSources = suppliedSources;
+        this.graphTenants = graphTenants;
     }
 
     @Override
@@ -202,7 +256,8 @@ public class DocumentErasureEndpoint implements HttpHandler {
                 outcome = erasureService.erase(sourceId, documentIds, compactNow);
             }
 
-            sendOutcome(exchange, sourceId, scope, deregistered, outcome);
+            sendOutcome(exchange, sourceId, scope, deregistered, outcome,
+                eraseFromGraph(sourceId, outcome.erasedDocumentIds(), compactNow));
         } catch (SourceCatalogException e) {
             // Nothing has been erased: the source comes off the crawl before its documents go,
             // and that is the step that failed. A 500 would be true and would not say that the
@@ -210,12 +265,53 @@ public class DocumentErasureEndpoint implements HttpHandler {
             LOGGER.error("Erasure of source {} could not deregister it: {}", sourceId, e.getMessage(), e);
             ResponseBody.sendJson(exchange, SourceCatalogException.STATUS_CODE,
                 "{\"error\": \"" + SourceCatalogException.CLIENT_MESSAGE + "\"}");
-        } catch (RuntimeException e) {
+        } catch (IOException | RuntimeException e) {
+            // IOException as well as RuntimeException: recording the graph obligation is a
+            // durable write, and one that fails must be answered rather than escaping the
+            // handler with no response sent at all.
+            //
             // Logged with detail, answered without it: the message names the path the node
             // failed on, which a client has no business seeing.
             LOGGER.error("Erasure of {} document(s) from source {} failed",
                 documentIds.size(), sourceId, e);
             ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
+        }
+    }
+
+    /**
+     * Withdraws from the graph what was extracted from the documents that were actually erased.
+     *
+     * <p>Only the ones that came out whole. Submitting an obligation for a document whose
+     * chunks are still in storage would withdraw its facts while its text is still being served,
+     * which is the wrong half to erase first and would leave the reply claiming a graph erasure
+     * for content the corpus still holds.
+     *
+     * @param sourceId    The source the documents belong to
+     * @param documentIds The documents this node no longer holds any part of
+     * @param compactNow  Rewrite the served graph now rather than leaving it to the policy
+     * @return What the graph half did
+     * @throws IOException if an obligation cannot be recorded or the compaction fails
+     */
+    private GraphErasureService.DocumentGraphOutcome eraseFromGraph(
+            String sourceId, List<String> documentIds, boolean compactNow) throws IOException {
+        if (graphTenants == null) {
+            return GraphErasureService.DocumentGraphOutcome.NO_GRAPH;
+        }
+        List<String> keys = new ArrayList<>(documentIds.size());
+        for (String documentId : documentIds) {
+            keys.add(ChunkIdentifiers.documentKey(sourceId, documentId));
+        }
+        try (NamespaceRegistry.Lease<GraphTenant> lease =
+                 graphTenants.borrow(NamespaceId.SHARED)) {
+            GraphErasureService.DocumentGraphOutcome outcome =
+                lease.resource().erasureService().eraseDocuments(keys, compactNow);
+            if (outcome.compacted()) {
+                // The compaction reopened the rewritten store into the tenant's holder already.
+                // What is left is the accounting: the store it now maps is not the one the
+                // mapping budget was told about.
+                graphTenants.recost(NamespaceId.SHARED);
+            }
+            return outcome;
         }
     }
 
@@ -233,11 +329,14 @@ public class DocumentErasureEndpoint implements HttpHandler {
      * @param scope        What it asked to erase
      * @param deregistered Whether the source was taken out of the crawl
      * @param outcome      What the service reports it did
+     * @param graph        What the graph half of the erasure managed
      * @throws IOException if the response cannot be written
      */
     private static void sendOutcome(HttpExchange exchange, String sourceId, String scope,
                                     boolean deregistered,
-                                    DocumentErasureService.Outcome outcome) throws IOException {
+                                    DocumentErasureService.Outcome outcome,
+                                    GraphErasureService.DocumentGraphOutcome graph)
+            throws IOException {
         boolean incomplete = outcome.documentsIncomplete() > 0;
         if (incomplete) {
             LOGGER.error("Erasure of source {} left {} document(s) unfinished: {} chunk(s) "
@@ -245,7 +344,11 @@ public class DocumentErasureEndpoint implements HttpHandler {
                 outcome.documentsIncomplete(), outcome.chunksNotRemoved(),
                 outcome.chunksStillSearchable(), outcome.detail());
         }
-        ResponseBody.sendJson(exchange, incomplete ? 500 : 200,
+        // 500 first, then 202, then 200. A document the corpus could not release is a failure;
+        // a graph obligation recorded and not yet carried out is an acceptance; only both
+        // halves being done is a completion. Collapsing the middle case into 200 is what would
+        // let a partial erasure read as a complete one.
+        ResponseBody.sendJson(exchange, incomplete ? 500 : graph.complete() ? 200 : 202,
             "{"
                 + (incomplete ? "\"error\": \"Some documents could not be fully erased; "
                     + "repeat the request\", " : "")
@@ -264,6 +367,16 @@ public class DocumentErasureEndpoint implements HttpHandler {
                 + "\"compacted\": " + outcome.compacted() + ", "
                 + "\"chunks_reclaimed\": " + outcome.chunksReclaimed() + ", "
                 + "\"outstanding\": " + outcome.outstanding() + ", "
+                // The graph half, reported separately because it is a separate removal that can
+                // fall short on its own. A caller reading only the corpus counts would think a
+                // document was gone while every fact read out of it was still being served.
+                + "\"graph_requests_submitted\": " + graph.submitted() + ", "
+                + "\"graph_requests_satisfied\": " + graph.satisfied() + ", "
+                + "\"graph_requests_withheld\": " + graph.withheld() + ", "
+                + "\"graph_outstanding\": " + graph.outstanding() + ", "
+                + "\"graph_compacted\": " + graph.compacted() + ", "
+                + "\"graph_erasure_complete\": " + graph.complete() + ", "
+                + "\"graph_detail\": \"" + JsonText.escape(graph.detail()) + "\", "
                 + "\"detail\": \"" + JsonText.escape(outcome.detail()) + "\""
                 + "}");
     }

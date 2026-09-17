@@ -137,6 +137,17 @@ subprojects {
         testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.3")
         testImplementation("org.assertj:assertj-core:3.26.3")
 
+        // Initializes java.lang.foreign on one thread before the first test runs. Two threads
+        // reaching it first at the same instant deadlock the JVM on class-initialization
+        // monitors, which no timeout can break because such a thread cannot be interrupted -
+        // the build hangs with no failing test to point at. This is not about parallel test
+        // execution: components across storage, query, retrieval, graph and shard hand work to
+        // virtual threads, so one sequential test is already enough to race. Every module gets
+        // it; the module itself cannot depend on its own output.
+        if (project.name != "excalibur-test-bootstrap") {
+            testRuntimeOnly(project(":excalibur-test-bootstrap"))
+        }
+
         // Declared once. Six modules pinned Mockito individually and two of them had drifted to a
         // different version, so the same mock could behave differently depending on which module's
         // tests you were reading.
@@ -226,11 +237,16 @@ subprojects {
     tasks.jacocoTestReport {
         dependsOn(tasks.test)
 
-        // Same exclusion as the aggregate: JMH's generated harness classes are machine-written
-        // and never unit-tested by design, so counting them measures code generation.
+        // Same exclusions as the aggregate: JMH's generated harness classes are machine-written
+        // and never unit-tested by design, so counting them measures code generation. The
+        // hand-written @Benchmark bodies beside them are excluded for the same reason -- see
+        // the aggregate task below for why, and for what was pulled out of them first.
         classDirectories.setFrom(
             fileTree(layout.buildDirectory.dir("classes/java/main")) {
-                exclude("**/jmh_generated/**", "**/generated/**")
+                exclude(
+                    "**/jmh_generated/**",
+                    "**/generated/**",
+                    "**/excalibur/bench/benchmark/**")
             })
 
         reports {
@@ -240,31 +256,15 @@ subprojects {
         }
     }
 
-    // Coverage floors, enforced as part of `check`.
+    // Per-module coverage floors, enforced as part of `check`.
     //
-    // The project target is 80%, and fourteen modules meet it. The three below are held at their
-    // measured level instead, so this is a ratchet rather than a lowered bar: coverage cannot
-    // slide backwards, and each floor is a visible debt to be raised towards 0.80 rather than a
-    // number chosen to make the build pass.
+    // Empty, and meant to stay that way: every module is held to the project's 0.80 bar. An
+    // entry here lowers that bar for one module, so each one is a debt with a name, and it is
+    // deleted the moment the module clears 0.80 -- a floor left where coverage used to be lets
+    // it fall back there unnoticed, which is the one thing a floor exists to prevent.
     //
-    // Each floor sits about a point under the module's measured coverage. The headroom is for
-    // the concurrency tests, whose branch mix varies slightly between runs; without it the
-    // build fails intermittently for no reason anyone can act on.
-    //
-    // excalibur-bench is the outlier and will stay one. Most of what it contains is JMH state
-    // classes, @Benchmark methods and runner mains, which exist to be executed by a benchmark
-    // run lasting minutes to hours -- not by `check`. Its validators, report writers and result
-    // parsing are ordinary code and are tested; the harness around them is deliberately not,
-    // for the same reason jmh_generated is excluded below.
-    //
-    // Measured with generated code excluded; JMH's harness classes are machine-written and
-    // counting them measures code generation rather than testing.
-    val coverageFloors = mapOf(
-        "excalibur-test" to "0.78",
-        "excalibur-shard" to "0.74",
-        "excalibur-ingest" to "0.73",
-        "excalibur-bench" to "0.40"
-    )
+    // Measured with generated code excluded; see the exclusions above for which, and why.
+    val coverageFloors = mapOf<String, String>()
 
     tasks.jacocoTestCoverageVerification {
         dependsOn(tasks.test)
@@ -284,7 +284,10 @@ subprojects {
 
         classDirectories.setFrom(
             fileTree(layout.buildDirectory.dir("classes/java/main")) {
-                exclude("**/jmh_generated/**", "**/generated/**")
+                exclude(
+                    "**/jmh_generated/**",
+                    "**/generated/**",
+                    "**/excalibur/bench/benchmark/**")
             })
 
         violationRules {
@@ -330,9 +333,21 @@ tasks.register<JacocoReport>("jacocoAggregateReport") {
     // never unit-tested by design, and in this repo it is 58% of all bytecode -- including it
     // drags the aggregate from the high seventies to 35% and makes the number describe code
     // generation rather than the project.
+    //
+    // excalibur/bench/benchmark holds the hand-written half of the same harness: @Benchmark
+    // bodies, @Setup fixtures and @State classes. They are established by being run -- a trial
+    // builds hundred-thousand-vector indexes and multi-gigabyte mapped files over minutes --
+    // and a unit test of one would either not run it or not be a unit test. What they used to
+    // contain that is ordinary code (the scalar distance kernels, brute-force ground truth and
+    // recall, false-positive accumulation, latency percentiles) now lives in
+    // excalibur.bench.kernel, which is counted here and tested directly. Only the measurement
+    // loop is excluded, and only where it cannot be separated from the thing being measured.
     classDirectories.from(covered.map { project ->
         project.fileTree(project.layout.buildDirectory.dir("classes/java/main")) {
-            exclude("**/jmh_generated/**", "**/generated/**")
+            exclude(
+                "**/jmh_generated/**",
+                "**/generated/**",
+                "**/excalibur/bench/benchmark/**")
         }
     })
 

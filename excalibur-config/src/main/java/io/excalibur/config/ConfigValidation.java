@@ -6,21 +6,29 @@ import java.util.Locale;
  * Configuration validator that checks configuration values for correctness.
  *
  * <h2>Thread-Safety</h2>
- * <p>This class is NOT thread-safe. It is a stateless validator that
- * can be instantiated and reused safely.</p>
+ * <p>This class holds no state and is never instantiated. Every entry point is static, so it
+ * is safe to call from any thread.</p>
  *
- * <h2>What this adds to {@link Config}'s own checking</h2>
- * <p>{@link Config} refuses an out-of-range value as it reads the property, so a node loaded from
- * a file is already bounded by the time it gets here. This pass exists for the two things that
- * cannot do: a configuration built in code rather than parsed, which never went through a
- * setter's range check, and the invariants that span more than one key - that the readiness
- * threshold does not exceed the healthy one, that the query's vector dimensions agree with the
- * embedding model's, that an API key is not about to be sent in clear to a host that is not
- * loopback.</p>
+ * <h2>What this adds to a section's own checking</h2>
+ * <p>A section rejects a value it cannot parse as it reads the property, but for six of the
+ * seven sections that is a type check and little more: the domain those keys have to fall in
+ * is declared beside them as {@code MIN_*}/{@code MAX_*} constants, and this is the pass that
+ * applies them. On top of that come the invariants no single section can see - that the
+ * readiness threshold does not exceed the healthy one, that the query's vector dimensions
+ * agree with the embedding model's, that an API key is not about to be sent in clear to a host
+ * that is not loopback.</p>
  *
- * <p>Every bound below is read from the {@code MIN_*}/{@code MAX_*} constants on {@link Config},
- * never restated. The numbers are deliberately not repeated in prose anywhere: a second copy is
- * a copy that drifts, and a stale one misleads an operator more than no copy at all.</p>
+ * <p>{@link GraphConfig} is the seventh, and deliberately has no pass here. It declares no
+ * {@code MIN_*}/{@code MAX_*} constants: every bound it has is applied in its constructor as
+ * the key is read, and it shares no invariant with another section. A {@code validateGraph}
+ * could therefore only restate bounds that are already enforced - a second copy that drifts
+ * from the one in force - or do nothing at all. A section's bounds are checked in exactly one
+ * place; for six sections that place is here, and for the graph it is parse time.</p>
+ *
+ * <p>Where a bound has a {@code MIN_*}/{@code MAX_*} constant it is read from the section that
+ * declares it, never restated. The numbers are deliberately not repeated in prose anywhere: a
+ * second copy is a copy that drifts, and a stale one misleads an operator more than no copy at
+ * all.</p>
  *
  * @author ExcaliburDB
  */
@@ -28,6 +36,10 @@ public final class ConfigValidation {
 
     private static final String HTTP_PREFIX = "http://";
     private static final String HTTPS_PREFIX = "https://";
+
+    private ConfigValidation() {
+        // Utility class
+    }
 
     /**
      * Validates the configuration and throws IllegalStateException if invalid.
@@ -42,6 +54,8 @@ public final class ConfigValidation {
         validateQuery(config.query());
         validateLlm(config.llm());
         validateShard(config.shard());
+        // No validateGraph: GraphConfig applies every bound it has in its own constructor and
+        // shares no invariant with another section. See the class comment.
         validateDimensionsAgree(config.query(), config.llm());
     }
 
@@ -65,7 +79,7 @@ public final class ConfigValidation {
      * @param llm   The LLM configuration
      * @throws IllegalStateException if the two disagree
      */
-    private static void validateDimensionsAgree(Config.Query query, Config.Llm llm) {
+    private static void validateDimensionsAgree(QueryConfig query, LlmConfig llm) {
         int index = query.getVectorDimensions();
         int model = llm.getEmbeddingsDimensions();
         if (index != model) {
@@ -86,11 +100,11 @@ public final class ConfigValidation {
      * @param visibility Visibility configuration
      * @throws IllegalStateException if invalid
      */
-    private static void validateVisibility(Config.Visibility visibility) {
+    private static void validateVisibility(VisibilityConfig visibility) {
         requireInRange("visibility.epoch-tick-ms", visibility.getEpochTickMs(),
-            Config.Visibility.MIN_EPOCH_TICK_MS, Config.Visibility.MAX_EPOCH_TICK_MS);
+            VisibilityConfig.MIN_EPOCH_TICK_MS, VisibilityConfig.MAX_EPOCH_TICK_MS);
         requireInRange("visibility.query-timeout-ms", visibility.getQueryTimeoutMs(),
-            Config.Visibility.MIN_QUERY_TIMEOUT_MS, Config.Visibility.MAX_QUERY_TIMEOUT_MS);
+            VisibilityConfig.MIN_QUERY_TIMEOUT_MS, VisibilityConfig.MAX_QUERY_TIMEOUT_MS);
     }
 
     /**
@@ -99,15 +113,15 @@ public final class ConfigValidation {
      * @param ingest Ingest configuration
      * @throws IllegalStateException if invalid
      */
-    private static void validateIngest(Config.Ingest ingest) {
+    private static void validateIngest(IngestConfig ingest) {
         requireInRange("ingest.document-atomicity-timeout-ms", ingest.getDocumentTimeoutMs(),
-            Config.Ingest.MIN_DOCUMENT_TIMEOUT_MS, Config.Ingest.MAX_DOCUMENT_TIMEOUT_MS);
+            IngestConfig.MIN_DOCUMENT_TIMEOUT_MS, IngestConfig.MAX_DOCUMENT_TIMEOUT_MS);
 
         // The shard module's reindex scheduler rejects an interval outside this window
         // when a source registers, which happens inside the /v1/ingest request path and
         // after the source has already been recorded. Reject it at startup instead.
         requireInRange("ingest.reindex-interval-ms", ingest.getReindexIntervalMs(),
-            Config.Ingest.MIN_REINDEX_INTERVAL_MS, Config.Ingest.MAX_REINDEX_INTERVAL_MS);
+            IngestConfig.MIN_REINDEX_INTERVAL_MS, IngestConfig.MAX_REINDEX_INTERVAL_MS);
     }
 
     /**
@@ -116,14 +130,21 @@ public final class ConfigValidation {
      * @param health Health configuration
      * @throws IllegalStateException if invalid
      */
-    private static void validateHealth(Config.Health health) {
+    private static void validateHealth(HealthConfig health) {
         double readinessThreshold = health.getReadinessThreshold();
         requireInRange("health.readiness-threshold", readinessThreshold,
-            Config.Health.MIN_THRESHOLD, Config.Health.MAX_THRESHOLD);
+            HealthConfig.MIN_THRESHOLD, HealthConfig.MAX_THRESHOLD);
 
         double healthyThreshold = health.getHealthyThreshold();
         requireInRange("health.healthy-threshold", healthyThreshold,
-            Config.Health.MIN_THRESHOLD, Config.Health.MAX_THRESHOLD);
+            HealthConfig.MIN_THRESHOLD, HealthConfig.MAX_THRESHOLD);
+
+        // A share of capacity, like the two above, and range-checked the same way. A value near
+        // 1.0 is not refused: a deployment that wants a node out of rotation while its volumes
+        // are anything but nearly empty is entitled to say so, and refusing it here would be
+        // this file deciding an operational policy it cannot see the reasons for.
+        requireInRange("health.min-free-disk-ratio", health.getMinFreeDiskRatio(),
+            HealthConfig.MIN_THRESHOLD, HealthConfig.MAX_THRESHOLD);
 
         // Semantic invariant: readiness is a lower bar than full health, so
         // readiness-threshold must not exceed healthy-threshold. Otherwise a
@@ -136,7 +157,7 @@ public final class ConfigValidation {
         }
 
         requireInRange("health.max-latency-ms", health.getMaxLatencyMs(),
-            Config.Health.MIN_MAX_LATENCY_MS, Config.Health.MAX_MAX_LATENCY_MS);
+            HealthConfig.MIN_MAX_LATENCY_MS, HealthConfig.MAX_MAX_LATENCY_MS);
     }
 
     /**
@@ -145,15 +166,17 @@ public final class ConfigValidation {
      * @param query Query configuration
      * @throws IllegalStateException if invalid
      */
-    private static void validateQuery(Config.Query query) {
+    private static void validateQuery(QueryConfig query) {
         requireInRange("query.top-k-default", query.getDefaultTopK(),
-            Config.Query.MIN_TOP_K, Config.Query.MAX_TOP_K);
+            QueryConfig.MIN_TOP_K, QueryConfig.MAX_TOP_K);
         requireInRange("query.threshold", query.getThreshold(),
-            Config.Query.MIN_PROBABILITY, Config.Query.MAX_PROBABILITY);
+            QueryConfig.MIN_PROBABILITY, QueryConfig.MAX_PROBABILITY);
         requireInRange("query.vector-dimensions", query.getVectorDimensions(),
-            Config.Query.MIN_VECTOR_DIMENSIONS, Config.Query.MAX_VECTOR_DIMENSIONS);
+            QueryConfig.MIN_VECTOR_DIMENSIONS, QueryConfig.MAX_VECTOR_DIMENSIONS);
         requireInRange("query.llm-timeout-ms", query.getLlmTimeoutMs(),
-            Config.Query.MIN_LLM_TIMEOUT_MS, Config.Query.MAX_LLM_TIMEOUT_MS);
+            QueryConfig.MIN_LLM_TIMEOUT_MS, QueryConfig.MAX_LLM_TIMEOUT_MS);
+        requireInRange("query.expansion-timeout-ms", query.getExpansionTimeoutMs(),
+            QueryConfig.MIN_EXPANSION_TIMEOUT_MS, QueryConfig.MAX_EXPANSION_TIMEOUT_MS);
     }
 
     /**
@@ -162,7 +185,7 @@ public final class ConfigValidation {
      * @param llm LLM configuration
      * @throws IllegalStateException if invalid
      */
-    private static void validateLlm(Config.Llm llm) {
+    private static void validateLlm(LlmConfig llm) {
         validateLlmEndpoint(llm);
         validateLlmLimits(llm);
     }
@@ -173,7 +196,7 @@ public final class ConfigValidation {
      * @param llm LLM configuration
      * @throws IllegalStateException if invalid
      */
-    private static void validateLlmEndpoint(Config.Llm llm) {
+    private static void validateLlmEndpoint(LlmConfig llm) {
         String baseUrl = llm.getBaseUrl();
         if (baseUrl == null) {
             return;
@@ -207,25 +230,25 @@ public final class ConfigValidation {
      * @param llm LLM configuration
      * @throws IllegalStateException if invalid
      */
-    private static void validateLlmLimits(Config.Llm llm) {
+    private static void validateLlmLimits(LlmConfig llm) {
         requireInRange("llm.embeddings-dimensions", llm.getEmbeddingsDimensions(),
-            Config.Llm.MIN_EMBEDDINGS_DIMENSIONS, Config.Llm.MAX_EMBEDDINGS_DIMENSIONS);
+            LlmConfig.MIN_EMBEDDINGS_DIMENSIONS, LlmConfig.MAX_EMBEDDINGS_DIMENSIONS);
         requireInRange("llm.timeout-ms", llm.getTimeoutMs(),
-            Config.Llm.MIN_TIMEOUT_MS, Config.Llm.MAX_TIMEOUT_MS);
+            LlmConfig.MIN_TIMEOUT_MS, LlmConfig.MAX_TIMEOUT_MS);
         requireInRange("llm.max-retries", llm.getMaxRetries(),
-            Config.Llm.MIN_MAX_RETRIES, Config.Llm.MAX_MAX_RETRIES);
+            LlmConfig.MIN_MAX_RETRIES, LlmConfig.MAX_MAX_RETRIES);
         requireInRange("llm.failure-threshold", llm.getFailureThreshold(),
-            Config.Llm.MIN_FAILURE_THRESHOLD, Config.Llm.MAX_FAILURE_THRESHOLD);
+            LlmConfig.MIN_FAILURE_THRESHOLD, LlmConfig.MAX_FAILURE_THRESHOLD);
         requireInRange("llm.cooldown-period-ms", llm.getCooldownPeriodMs(),
-            Config.Llm.MIN_COOLDOWN_PERIOD_MS, Config.Llm.MAX_COOLDOWN_PERIOD_MS);
+            LlmConfig.MIN_COOLDOWN_PERIOD_MS, LlmConfig.MAX_COOLDOWN_PERIOD_MS);
         requireInRange("llm.max-prompts-per-query", llm.getMaxPromptsPerQuery(),
-            Config.Llm.MIN_MAX_PROMPTS_PER_QUERY, Config.Llm.MAX_MAX_PROMPTS_PER_QUERY);
+            LlmConfig.MIN_MAX_PROMPTS_PER_QUERY, LlmConfig.MAX_MAX_PROMPTS_PER_QUERY);
         requireInRange("llm.relevancy-threshold", llm.getRelevancyThreshold(),
-            Config.Llm.MIN_RELEVANCY_THRESHOLD, Config.Llm.MAX_RELEVANCY_THRESHOLD);
+            LlmConfig.MIN_RELEVANCY_THRESHOLD, LlmConfig.MAX_RELEVANCY_THRESHOLD);
         requireInRange("llm.max-batch-tokens", llm.getMaxBatchTokens(),
-            Config.Llm.MIN_MAX_BATCH_TOKENS, Config.Llm.MAX_MAX_BATCH_TOKENS);
+            LlmConfig.MIN_MAX_BATCH_TOKENS, LlmConfig.MAX_MAX_BATCH_TOKENS);
         requireInRange("llm.retry-base-delay-ms", llm.getRetryBaseDelayMs(),
-            Config.Llm.MIN_RETRY_BASE_DELAY_MS, Config.Llm.MAX_RETRY_BASE_DELAY_MS);
+            LlmConfig.MIN_RETRY_BASE_DELAY_MS, LlmConfig.MAX_RETRY_BASE_DELAY_MS);
     }
 
     /**
@@ -234,12 +257,15 @@ public final class ConfigValidation {
      * @param shard Shard configuration
      * @throws IllegalStateException if invalid
      */
-    private static void validateShard(Config.Shard shard) {
-        requireInRange("shard.segment-load-factor", shard.getLoadFactor(), 0.5, 0.9);
-        requireInRange("shard.default-ef-construction", shard.getEfConstruction(), 16, 1024);
-        requireInRange("shard.default-ef-search", shard.getEfSearch(), 8, 1024);
+    private static void validateShard(ShardConfig shard) {
+        requireInRange("shard.segment-load-factor", shard.getLoadFactor(),
+            ShardConfig.MIN_LOAD_FACTOR, ShardConfig.MAX_LOAD_FACTOR);
+        requireInRange("shard.default-ef-construction", shard.getEfConstruction(),
+            ShardConfig.MIN_EF_CONSTRUCTION, ShardConfig.MAX_EF_CONSTRUCTION);
+        requireInRange("shard.default-ef-search", shard.getEfSearch(),
+            ShardConfig.MIN_EF_SEARCH, ShardConfig.MAX_EF_SEARCH);
         requireInRange("shard.hnsw-integration-queue-depth-limit", shard.getHnswQueueLimit(),
-            10000, 1000000);
+            ShardConfig.MIN_HNSW_QUEUE_DEPTH_LIMIT, ShardConfig.MAX_HNSW_QUEUE_DEPTH_LIMIT);
     }
 
     /**
@@ -263,18 +289,18 @@ public final class ConfigValidation {
     /**
      * Requires a floating-point setting to fall within an inclusive range.
      *
-     * <p>NaN is rejected explicitly: it fails no ordered comparison, so an unguarded
-     * range check admits it and every downstream score comparison then evaluates
-     * false.</p>
+     * <p>No NaN guard: {@link PropertyParser#parseDouble} refuses every non-finite value as
+     * it reads the property, so nothing that reaches here can fail an ordered comparison the
+     * way NaN would.</p>
      *
      * @param key Setting name used in the failure message
      * @param value Configured value
      * @param min Inclusive lower bound
      * @param max Inclusive upper bound
-     * @throws IllegalStateException if the value is out of range or NaN
+     * @throws IllegalStateException if the value is out of range
      */
     private static void requireInRange(String key, double value, double min, double max) {
-        if (Double.isNaN(value) || value < min) {
+        if (value < min) {
             throw new IllegalStateException(key + " must be >= " + min + ", got: " + value);
         }
         if (value > max) {
@@ -364,25 +390,5 @@ public final class ConfigValidation {
             || normalized.equals("::1")
             || normalized.equals("[::1]")
             || normalized.startsWith("127.");
-    }
-
-    /**
-     * Validates that all required configuration sections are present.
-     *
-     * @param config Configuration to validate
-     * @throws IllegalStateException if required sections are missing
-     */
-    public static void validateRequiredSections(Config config) {
-        // All sections are non-null by default (created with default values)
-        // This validation ensures that custom Config instances are properly initialized
-    }
-
-    /**
-     * Creates a new ConfigValidation instance.
-     *
-     * @return New validator instance
-     */
-    public static ConfigValidation getInstance() {
-        return new ConfigValidation();
     }
 }

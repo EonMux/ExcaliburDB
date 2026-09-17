@@ -476,6 +476,44 @@ class WarmingPhaseWorkerTest {
         return new Segment(segmentPath, capacityBytes, arena);
     }
 
+    @Test
+    @DisplayName("a configured shape that divides the dimension is the shape trained")
+    void configuredShapeIsUsedWhenItDivides() {
+        worker.setPqConfig(PQConfig.builder()
+            .numSubspaces(12).numCentroids(64).maxTrainingSamples(5_000).build());
+
+        PQConfig chosen = worker.pqConfigForDimension(768);
+
+        assertThat(chosen.numSubspaces()).isEqualTo(12);
+        assertThat(chosen.numCentroids()).isEqualTo(64);
+        assertThat(chosen.maxTrainingSamples()).isEqualTo(5_000);
+    }
+
+    @Test
+    @DisplayName("a subspace count that does not divide the dimension keeps the rest of the shape")
+    void anIncompatibleSplitKeepsTheRestOfTheShape() {
+        // Only the split is impossible - 768 does not divide by 5. Dropping the centroid count
+        // and the sample ceiling with it throws away two settings that were perfectly usable,
+        // and leaves the node training defaults it was explicitly configured away from.
+        worker.setPqConfig(PQConfig.builder()
+            .numSubspaces(5).numCentroids(64).maxTrainingSamples(5_000).build());
+
+        PQConfig chosen = worker.pqConfigForDimension(768);
+
+        assertThat(chosen.numSubspaces())
+            .as("the split had to change, and what replaces it must divide the dimension")
+            .isNotEqualTo(5);
+        assertThat(768 % chosen.numSubspaces()).isZero();
+        assertThat(chosen.numCentroids()).isEqualTo(64);
+        assertThat(chosen.maxTrainingSamples()).isEqualTo(5_000);
+    }
+
+    @Test
+    @DisplayName("a dimension no split fits is refused rather than trained wrongly")
+    void anImpossibleDimensionIsRefused() {
+        assertThat(worker.pqConfigForDimension(0)).isNull();
+    }
+
     private static class TestWarmingListener implements WarmingPhaseWorker.WarmingListener {
         final AtomicInteger completeCount = new AtomicInteger(0);
         final AtomicBoolean lastPqSuccess = new AtomicBoolean(false);

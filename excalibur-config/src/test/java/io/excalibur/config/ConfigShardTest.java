@@ -10,7 +10,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Unit tests for Config.Shard configuration class.
+ * Unit tests for ShardConfig configuration class.
  *
  * <p>Tests verify:</p>
  * <ul>

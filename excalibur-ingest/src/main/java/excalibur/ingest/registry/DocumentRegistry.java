@@ -48,6 +48,27 @@ import java.util.stream.Collectors;
  *       present in the registry</li>
  * </ul>
  *
+ * <h2>Record format</h2>
+ * <p>A first line, {@code \#document-registry|<version>}, names the format. One line per
+ * document follows, and a last line, {@code \#end|count}, closes the file. The header cannot
+ * collide with a record and neither can the marker: {@link #escape(String)} doubles every
+ * backslash, so no formatted record begins with a single one.</p>
+ *
+ * <p>Both lines earn their place against the same failure. A registry that lost its tail is a
+ * registry of whole, well-formed records that simply omits documents, and those documents are
+ * then neither erasable nor reindexable while their chunks stay in storage and stay queryable -
+ * the count is what makes that detectable. The header is what tells a short file from an old
+ * one: truncation takes the tail, so a header is present in every file this build wrote, and
+ * its absence can only mean a build that wrote no header.</p>
+ *
+ * <h2>Reading an older or newer file</h2>
+ * <p>A file with no header is read as one an older build wrote: its lines are records, there is
+ * nothing to check them against, and it is loaded with a warning saying so and rewritten in the
+ * current format at the next save. A file whose header names a version this build does not know
+ * is refused rather than reinterpreted - guessing at an unknown layout is how a registry turns
+ * into a shorter registry. A file carrying a header and no matching count was cut short by a
+ * crash, and is refused for the same reason {@link RegistryLoadException} exists.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>This class is fully thread-safe. All operations use ConcurrentHashMap and
  * atomic operations. Multiple threads can safely read and write concurrently.</p>
@@ -77,6 +98,21 @@ public final class DocumentRegistry {
     /** Introduces an escape sequence in a persisted field. */
     private static final char ESCAPE_CHAR = '\\';
 
+    /** The format this build writes. */
+    static final int FORMAT_VERSION = 1;
+
+    /** Opens the first line, which names the format the rest of the file is in. */
+    private static final String HEADER_MARKER = "\\#document-registry";
+
+    /** Opens the last line, which states how many records precede it. */
+    private static final String END_MARKER = "\\#end";
+
+    /** What {@link #declaredVersion(String)} reports for a file written before the header. */
+    private static final int NO_HEADER = -1;
+
+    /** What {@link #declaredVersion(String)} reports for a header whose version is not a number. */
+    private static final int UNREADABLE_HEADER = -2;
+
     private final ConcurrentHashMap<String, DocumentMetadata> documents;
     /** Extension of the file a save is written to before it is renamed over the registry. */
     private static final String REPLACEMENT_SUFFIX = ".new";
@@ -86,6 +122,7 @@ public final class DocumentRegistry {
         new java.util.concurrent.atomic.AtomicLong();
 
     private final Path persistencePath;
+    private final RegistryWriter writer;
     /**
      * Counts mutations, so a save can tell what it wrote from what arrived while it was writing.
      *
@@ -115,26 +152,107 @@ public final class DocumentRegistry {
      * Creates a DocumentRegistry with optional file persistence.
      *
      * @param persistencePath Path to the registry file, or null for in-memory only
+     * @throws RegistryLoadException if a registry exists at that path and cannot be trusted
      */
     public DocumentRegistry(Path persistencePath) {
+        this(persistencePath, fileSystemWriter());
+    }
+
+    /**
+     * Creates a registry against an explicit set of disk operations.
+     *
+     * <p>Exists so a test can observe the order the contents and the rename are made durable in,
+     * which is the whole of the crash-safety this class claims and is otherwise only visible to
+     * a power cut.</p>
+     *
+     * @param persistencePath Path to the registry file, or null for in-memory only
+     * @param writer          The operations that publish a save
+     * @throws NullPointerException  if the writer is null
+     * @throws RegistryLoadException if a registry exists at that path and cannot be trusted
+     */
+    DocumentRegistry(Path persistencePath, RegistryWriter writer) {
         this.documents = new ConcurrentHashMap<>();
         this.persistencePath = persistencePath;
-        
+        this.writer = Objects.requireNonNull(writer, "writer must not be null");
+
         if (persistencePath != null && Files.exists(persistencePath)) {
             loadFromFile(persistencePath);
         }
     }
 
     /**
-     * Thrown when a persisted registry exists but cannot be read.
+     * Where this registry is kept, so that what belongs beside it can be put beside it.
+     *
+     * @return The registry file, or null when this registry is in memory only
+     */
+    public Path persistencePath() {
+        return persistencePath;
+    }
+
+    /**
+     * The disk operations that publish a saved registry.
+     *
+     * <p>Durability here is an ordering rather than any single call: the replacement's contents
+     * have to reach the platter before the rename that names it the registry, and the rename is
+     * itself a directory change that is no more durable than the contents were. A test cannot cut
+     * the power between two of those steps, so the ordering is pinned by recording the steps as
+     * they are taken.</p>
+     */
+    interface RegistryWriter {
+
+        /**
+         * Forces a written file's contents to the underlying device.
+         *
+         * @param path The file to force
+         * @throws IOException if the contents cannot be made durable
+         */
+        void force(Path path) throws IOException;
+
+        /**
+         * Renames a finished replacement over the live registry.
+         *
+         * @param replacement The file holding the new contents
+         * @param target      The registry path
+         * @throws IOException if the replacement cannot be published
+         */
+        void publish(Path replacement, Path target) throws IOException;
+
+        /**
+         * Forces the directory entry a rename has just changed.
+         *
+         * @param directory The directory holding the registry
+         */
+        void forceDirectory(Path directory);
+    }
+
+    /**
+     * Returns the operations as the filesystem performs them.
+     *
+     * @return A writer that forces and renames for real
+     */
+    static RegistryWriter fileSystemWriter() {
+        return new FileSystemWriter();
+    }
+
+    /**
+     * Thrown when a persisted registry exists but cannot be read, or cannot be trusted.
      *
      * <p>An unreadable registry is not an empty registry: starting empty makes every previously
      * indexed document look new, so a re-crawl duplicates the whole corpus and tombstones none of
-     * the old chunks. Failing here is the only way the caller can tell the two apart.</p>
+     * the old chunks. A registry cut short is the same failure over the documents it lost, and is
+     * refused for the same reason. Failing here is the only way the caller can tell either from a
+     * node that has genuinely indexed nothing.</p>
      */
     public static final class RegistryLoadException extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
         RegistryLoadException(Path path, IOException cause) {
             super("Failed to load document registry from " + path, cause);
+        }
+
+        RegistryLoadException(Path path, String reason) {
+            super("Failed to load document registry from " + path + ": " + reason);
         }
     }
 
@@ -340,7 +458,15 @@ public final class DocumentRegistry {
      *
      * <p>The replacement is forced to disk before the rename, because the rename being durable
      * while the content is not would publish an empty or partial file after a power loss - the
-     * same failure the rename exists to prevent, arrived at from the other side.</p>
+     * same failure the rename exists to prevent, arrived at from the other side. The directory
+     * is forced after the rename, because a rename is a directory change and is no more durable
+     * on its own than the contents were.</p>
+     *
+     * <p>Forcing the contents is not best effort. Every caller of this method - an ingest run, an
+     * erasure, a reindex, shutdown - goes on to behave as though the documents it holds are
+     * recorded, so a force that failed has to reach them rather than be logged and passed over.
+     * Forcing the directory is best effort: a platform that will not open a directory channel is
+     * not a reason to fail a save whose contents are otherwise on disk.</p>
      *
      * @throws IOException if persistence fails
      */
@@ -376,16 +502,9 @@ public final class DocumentRegistry {
             Path replacement = persistencePath.resolveSibling(persistencePath.getFileName()
                 + "." + saveCounter.incrementAndGet() + REPLACEMENT_SUFFIX);
             try {
-                try (BufferedWriter writer = Files.newBufferedWriter(replacement,
-                        StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-                    for (DocumentMetadata metadata : documents.values()) {
-                        writer.write(formatMetadata(metadata));
-                        writer.newLine();
-                    }
-                    writer.flush();
-                    force(replacement);
-                }
-                move(replacement, persistencePath);
+                write(replacement);
+                writer.force(replacement);
+                writer.publish(replacement, persistencePath);
             } catch (IOException e) {
                 // The old registry is still the published one, so the only thing to undo is the
                 // half-written replacement. Left behind it would never be read, but a failed
@@ -399,74 +518,230 @@ public final class DocumentRegistry {
                 throw e;
             }
 
+            if (parent != null) {
+                writer.forceDirectory(parent);
+            }
             persistedVersion = writing;
         }
     }
 
     /**
-     * Forces a written file to disk.
+     * Writes the header, every record, and the end marker that proves the file is whole.
      *
-     * <p>Best effort: a filesystem that does not support syncing a file channel is not a reason
-     * to fail a save that has otherwise succeeded, and the rename below still gives a reader
-     * either the whole old registry or the whole new one.</p>
-     *
-     * @param path The file to force
+     * <p>The count is taken from the same pass that writes the records rather than from
+     * {@code documents.size()}, so it states what actually reached the file.</p>
      */
-    private static void force(Path path) {
-        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
-            channel.force(true);
-        } catch (IOException e) {
-            LOGGER.warn("Could not force the document registry to disk before publishing it: {}",
-                e.getMessage());
+    private void write(Path replacement) throws IOException {
+        try (BufferedWriter out = Files.newBufferedWriter(replacement,
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+            out.write(HEADER_MARKER);
+            out.write(FIELD_SEPARATOR_CHAR);
+            out.write(Integer.toString(FORMAT_VERSION));
+            out.newLine();
+
+            int written = 0;
+            for (DocumentMetadata metadata : documents.values()) {
+                out.write(formatMetadata(metadata));
+                out.newLine();
+                written++;
+            }
+
+            out.write(END_MARKER);
+            out.write(FIELD_SEPARATOR_CHAR);
+            out.write(Integer.toString(written));
+            out.newLine();
         }
     }
 
     /**
-     * Publishes the replacement over the live registry.
-     *
-     * @param replacement The file just written
-     * @param target      The registry path
-     * @throws IOException if the file cannot be published
+     * The operations as the filesystem performs them.
      */
-    private static void move(Path replacement, Path target) throws IOException {
-        try {
-            Files.move(replacement, target,
-                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException e) {
-            // A filesystem that cannot rename atomically leaves no better option than the
-            // replacing move. Said out loud rather than silently accepted: on such a deployment
-            // the window this method exists to close is open again.
-            LOGGER.warn("This filesystem cannot rename atomically; the document registry is "
-                + "published with a plain replace and a crash during it can truncate the file");
-            Files.move(replacement, target, StandardCopyOption.REPLACE_EXISTING);
+    private static final class FileSystemWriter implements RegistryWriter {
+
+        @Override
+        public void force(Path path) throws IOException {
+            try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+                channel.force(true);
+            }
+        }
+
+        @Override
+        public void publish(Path replacement, Path target) throws IOException {
+            try {
+                Files.move(replacement, target,
+                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                // A filesystem that cannot rename atomically leaves no better option than the
+                // replacing move. Said out loud rather than silently accepted: on such a
+                // deployment the window the rename closes is open again.
+                LOGGER.warn("This filesystem cannot rename atomically; the document registry is "
+                    + "published with a plain replace and a crash during it can truncate the file");
+                Files.move(replacement, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+
+        @Override
+        public void forceDirectory(Path directory) {
+            try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+                channel.force(true);
+            } catch (IOException e) {
+                LOGGER.warn("Could not force the directory entry for the document registry at {}; "
+                    + "a host crash immediately after a save can lose the rename that published "
+                    + "it: {}", directory, e.getMessage());
+            }
         }
     }
 
     /**
-     * Loads the registry from a file.
+     * Loads the registry from a file, refusing one that cannot be trusted to be whole.
      *
      * @param path The path to load from
-     * @throws RegistryLoadException if the file exists but cannot be read
+     * @throws RegistryLoadException if the file exists but cannot be read, names a format this
+     *                               build does not know, or is missing records it declares
      */
     private void loadFromFile(Path path) {
-        int skipped = 0;
         try (BufferedReader reader = Files.newBufferedReader(path)) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                DocumentMetadata metadata = parseMetadata(line);
-                if (metadata == null) {
-                    skipped++;
-                    continue;
-                }
-                documents.put(makeKey(metadata.getSourceId(), metadata.getDocumentId()), metadata);
+            String first = reader.readLine();
+            if (first == null) {
+                // Indistinguishable from a registry an older build wrote while holding nothing,
+                // and the consequence of reading it as empty is the documented one for a missing
+                // registry: the next re-crawl treats every document as new.
+                LOGGER.warn("Document registry at {} is empty; every document will read as new "
+                    + "to the next re-crawl", path);
+                return;
             }
+
+            int version = declaredVersion(first);
+            if (version == NO_HEADER) {
+                loadWithoutHeader(path, first, reader);
+                return;
+            }
+            if (version == UNREADABLE_HEADER) {
+                throw new RegistryLoadException(path,
+                    "its first line names no format version this build can read: " + first);
+            }
+            if (version != FORMAT_VERSION) {
+                throw new RegistryLoadException(path, "it declares format version " + version
+                    + " and this build reads version " + FORMAT_VERSION);
+            }
+            loadRecords(path, reader);
         } catch (IOException e) {
             throw new RegistryLoadException(path, e);
         }
+    }
 
+    /**
+     * Loads a file that names its format, checking it against the count it ends with.
+     *
+     * <p>Held one line behind, because the last line is the end marker rather than a record and
+     * a registry is too large to read into a list first only to drop its tail.</p>
+     */
+    private void loadRecords(Path path, BufferedReader reader) throws IOException {
+        int records = 0;
+        int skipped = 0;
+        String previous = reader.readLine();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            records++;
+            if (!accept(previous)) {
+                skipped++;
+            }
+            previous = line;
+        }
+
+        int declared = declaredCount(previous);
+        if (declared < 0) {
+            throw new RegistryLoadException(path, "it does not end with a record count, so it was "
+                + "cut short before the save that published it finished");
+        }
+        if (declared != records) {
+            throw new RegistryLoadException(path,
+                "it declares " + declared + " record(s) and carries " + records);
+        }
+        reportSkipped(path, skipped);
+    }
+
+    /**
+     * Loads a file from a build that wrote neither a header nor a count.
+     *
+     * <p>Every line is a record and nothing states how many there should be, so a file this
+     * shape cannot be checked for truncation - which is the whole reason the header exists. It
+     * is accepted rather than refused because refusing would strand a working node on an upgrade,
+     * and the registry is rewritten in the current format at the next save: the version counter
+     * is bumped so the save actually happens, even if nothing is ingested or erased first.</p>
+     */
+    private void loadWithoutHeader(Path path, String first, BufferedReader reader)
+            throws IOException {
+        int records = 0;
+        int skipped = 0;
+        for (String line = first; line != null; line = reader.readLine()) {
+            records++;
+            if (!accept(line)) {
+                skipped++;
+            }
+        }
+
+        version.incrementAndGet();
+        LOGGER.warn("Document registry at {} was written before the format carried a version, so "
+            + "its {} record(s) cannot be checked against a count; it will be rewritten in "
+            + "version {} at the next save", path, records, FORMAT_VERSION);
+        reportSkipped(path, skipped);
+    }
+
+    /**
+     * Parses one line and registers what it describes.
+     *
+     * @return false if the line is not a record this build can read
+     */
+    private boolean accept(String line) {
+        DocumentMetadata metadata = parseMetadata(line);
+        if (metadata == null) {
+            return false;
+        }
+        documents.put(makeKey(metadata.getSourceId(), metadata.getDocumentId()), metadata);
+        return true;
+    }
+
+    private static void reportSkipped(Path path, int skipped) {
         if (skipped > 0) {
             LOGGER.warn("Skipped {} unparseable record(s) while loading document registry from {}",
                 skipped, path);
+        }
+    }
+
+    /**
+     * Reads the format version out of a candidate header line.
+     *
+     * @return The declared version, {@link #NO_HEADER} if the line is not a header, or -2 if it
+     *         is a header whose version is not a number this build can compare
+     */
+    private static int declaredVersion(String line) {
+        String prefix = HEADER_MARKER + FIELD_SEPARATOR;
+        if (!line.startsWith(prefix)) {
+            return NO_HEADER;
+        }
+        try {
+            return Integer.parseInt(line.substring(prefix.length()));
+        } catch (NumberFormatException e) {
+            return UNREADABLE_HEADER;
+        }
+    }
+
+    /**
+     * Reads the count out of a candidate end marker.
+     *
+     * @return The declared record count, or -1 if the line is not an end marker
+     */
+    private static int declaredCount(String line) {
+        String prefix = END_MARKER + FIELD_SEPARATOR;
+        if (line == null || !line.startsWith(prefix)) {
+            return -1;
+        }
+        try {
+            int count = Integer.parseInt(line.substring(prefix.length()));
+            return count < 0 ? -1 : count;
+        } catch (NumberFormatException e) {
+            return -1;
         }
     }
 

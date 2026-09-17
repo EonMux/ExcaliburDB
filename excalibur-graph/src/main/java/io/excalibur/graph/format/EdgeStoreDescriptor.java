@@ -1,5 +1,7 @@
 package io.excalibur.graph.format;
 
+import io.excalibur.graph.file.Durability;
+
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
@@ -8,7 +10,6 @@ import java.io.UncheckedIOException;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 
 /**
  * The one file in an edge store that carries metadata, and the only place the format's decisions
@@ -113,12 +114,37 @@ public record EdgeStoreDescriptor(
     }
 
     /**
-     * Writes the descriptor into {@code directory}, atomically.
+     * Writes the descriptor into {@code directory}, atomically and durably.
+     *
+     * @param directory The store directory
+     * @throws IOException if the descriptor cannot be written, forced or moved into place
+     */
+    public void write(Path directory) throws IOException {
+        write(directory, Durability.DEVICE);
+    }
+
+    /**
+     * As above, with how the descriptor is forced to the device under the caller's control.
      *
      * <p>Written to a sibling and moved into place so that a store is never observed with a
      * descriptor that describes a size its columns have not reached.
+     *
+     * <p>Forced before the move, because this file is what makes a directory a store at all and
+     * the ordering the format depends on is worth nothing if it only holds against the page
+     * cache. A rename that reached the platter ahead of its own contents names a descriptor of
+     * zeros; a durable descriptor whose directory entry is not durable can come back with no
+     * name pointing at it. Both are a store that will not open, and the caller of a build has
+     * already deleted the graph it replaced.
+     *
+     * @param directory  The store directory
+     * @param durability How the descriptor is forced before and after it takes its name
+     * @throws IOException if the descriptor cannot be written, forced or moved into place
+     * @throws IllegalArgumentException if {@code durability} is null
      */
-    public void write(Path directory) throws IOException {
+    public void write(Path directory, Durability durability) throws IOException {
+        if (durability == null) {
+            throw new IllegalArgumentException("durability must not be null");
+        }
         Path target = directory.resolve(FILE_NAME);
         Path temp = directory.resolve(FILE_NAME + ".tmp");
         try (DataOutputStream out = new DataOutputStream(
@@ -133,8 +159,7 @@ public record EdgeStoreDescriptor(
             out.writeLong(edgeCount);
         }
         try {
-            Files.move(temp, target,
-                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            durability.replaceDurably(temp, target);
         } catch (IOException e) {
             Files.deleteIfExists(temp);
             throw e;

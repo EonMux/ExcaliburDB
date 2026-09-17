@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -516,11 +517,12 @@ class MockLLMServerTest {
     @Test
     @DisplayName("Valid status code boundaries are accepted")
     void validStatusCodeBoundaries_accepted() {
-        // Minimum valid: 100
-        server.setChatHandler(server.errorHandler(100, "Continue"));
-        // Maximum valid: 599
-        server.setChatHandler(server.errorHandler(599, "Network timeout"));
-        // Neither should throw during handler creation
+        assertThatCode(() -> {
+            // Minimum valid: 100
+            server.setChatHandler(server.errorHandler(100, "Continue"));
+            // Maximum valid: 599
+            server.setChatHandler(server.errorHandler(599, "Network timeout"));
+        }).doesNotThrowAnyException();
     }
 
     @Test

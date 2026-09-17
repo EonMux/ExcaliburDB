@@ -1,13 +1,17 @@
 package excalibur.api.bootstrap;
 
+import excalibur.ingest.graph.LlmRelationExtractor;
 import io.excalibur.config.Config;
 import io.excalibur.graph.erasure.ErasureScope;
 import io.excalibur.graph.erasure.GraphErasureCoordinator;
+import io.excalibur.graph.provenance.SourceType;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -77,6 +81,87 @@ public final class GraphErasureService {
         long id = coordinator.submit(scope);
         LOGGER.info("erasure request {} accepted: {}", id, scope);
         return id;
+    }
+
+    /**
+     * What withdrawing a set of documents did to the graph.
+     *
+     * @param submitted  How many source-scoped obligations this recorded, one per document
+     * @param satisfied  How many obligations the compaction that followed discharged. The
+     *                   coordinator reports per pass rather than per request, so this counts
+     *                   everything the node owed and not only what was submitted here
+     * @param withheld   How many it deliberately left outstanding as not yet reachable
+     * @param outstanding How many obligations the node still owes in this namespace
+     * @param compacted  Whether the served graph was actually rewritten
+     * @param complete   Whether the obligations submitted here can be said to be discharged.
+     *                   False whenever the pass withheld anything or discharged fewer than were
+     *                   submitted, because the coordinator's counts cannot be attributed to
+     *                   individual requests and reporting an erasure that did not happen is the
+     *                   worse of the two errors
+     * @param detail     Why the compaction ran, or why it did not
+     */
+    public record DocumentGraphOutcome(int submitted, int satisfied, int withheld,
+                                       int outstanding, boolean compacted, boolean complete,
+                                       String detail) {
+
+        /** What a node serving no graph reports: nothing was extracted into one. */
+        public static final DocumentGraphOutcome NO_GRAPH = new DocumentGraphOutcome(
+            0, 0, 0, 0, false, true,
+            "this node serves no graph, so nothing was extracted from these documents into one");
+
+        /** What a node with a graph but nothing to withdraw reports. */
+        static DocumentGraphOutcome none(String detail) {
+            return new DocumentGraphOutcome(0, 0, 0, 0, false, true, detail);
+        }
+    }
+
+    /**
+     * Withdraws from the graph everything that was extracted from the named documents.
+     *
+     * <h3>Why the corpus erasure cannot do this itself</h3>
+     * <p>Removing a document's chunks, postings and registry entry leaves every fact extracted
+     * from it in the graph store, and up to two kilobytes of its text against each entity it
+     * mentioned in the staging log - where the next build replays both. The obligation is
+     * derivable and was simply never submitted: each fact and snippet carries
+     * {@link LlmRelationExtractor#sourceIdOf} of the document's key, which is exactly what a
+     * source-scoped request selects on.
+     *
+     * <p>One request per document rather than one for the batch, because that is the shape of
+     * the obligation: a caller repeating a source erasure until the source is empty submits the
+     * documents it actually erased each time, and a request that named a document the node
+     * never held submits nothing.
+     *
+     * @param documentKeys The documents actually erased, as
+     *                     {@link io.excalibur.core.text.ChunkIdentifiers#documentKey} forms them
+     * @param compactNow   Rewrite the served graph now rather than leaving it to the policy
+     * @return What was submitted and what the compaction that followed managed
+     * @throws IOException if an obligation cannot be recorded or the compaction fails
+     * @throws NullPointerException if {@code documentKeys} is null
+     */
+    public DocumentGraphOutcome eraseDocuments(Collection<String> documentKeys,
+                                               boolean compactNow) throws IOException {
+        Objects.requireNonNull(documentKeys, "documentKeys must not be null");
+        if (documentKeys.isEmpty()) {
+            return DocumentGraphOutcome.none(
+                "no document was erased, so the graph holds nothing more of one");
+        }
+        for (String documentKey : List.copyOf(documentKeys)) {
+            submit(new ErasureScope.Source(SourceType.DOCUMENT,
+                LlmRelationExtractor.sourceIdOf(documentKey)));
+        }
+
+        ErasureOutcome outcome = compactNow ? compactNow() : compactIfDue();
+        int submitted = documentKeys.size();
+        boolean complete = outcome.requestsWithheld() == 0
+            && outcome.requestsSatisfied() >= submitted;
+        if (!complete) {
+            LOGGER.info("{} document(s) withdrawn from the corpus and still owed by the graph: "
+                + "{} obligation(s) outstanding after {}", submitted, outstandingCount(),
+                outcome.reason());
+        }
+        return new DocumentGraphOutcome(submitted, outcome.requestsSatisfied(),
+            outcome.requestsWithheld(), outstandingCount(), outcome.ran(), complete,
+            outcome.reason());
     }
 
     /**

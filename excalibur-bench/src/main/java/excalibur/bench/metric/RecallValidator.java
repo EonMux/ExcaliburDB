@@ -314,7 +314,7 @@ public final class RecallValidator {
         ValidationResult validation = validateWithTarget(recall);
 
         StringBuilder sb = new StringBuilder();
-        sb.append("Recall Validation:%n");
+        sb.append(String.format("Recall Validation:%n"));
         sb.append(String.format("  recall: %s (%s)%n", formatDecimal(recall), formatPercent(recall)));
         sb.append(String.format("  target: %s (%.0f%%)%n", formatDecimal(TARGET_RECALL_10), TARGET_RECALL_10 * 100));
         sb.append(String.format("  meets target: %s%n", validation.meetsTarget() ? "YES" : "NO"));

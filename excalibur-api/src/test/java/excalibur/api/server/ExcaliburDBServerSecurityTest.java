@@ -293,7 +293,11 @@ class ExcaliburDBServerSecurityTest {
         void refusesOverBudgetOnAnUnroutedIngestMethod() throws IOException {
             restartWithReadBudget();
 
-            assertThat(statuses("GET", "/v1/ingest", 6))
+            // PUT rather than GET: /v1/ingest serves three verbs now - POST registers, GET reads
+            // the registrations back, DELETE stops crawling - so GET reaches a guarded handler
+            // and answers 401 rather than falling through. PUT is a method the route genuinely
+            // does not serve, which is what this is about.
+            assertThat(statuses("PUT", "/v1/ingest", 6))
                 .startsWith(405, 405)
                 .endsWith(429);
         }

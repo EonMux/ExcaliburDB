@@ -12,8 +12,8 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Random;
 
+import static io.excalibur.vector.hnsw.HnswGraphTestVectors.randomVector;
 import static org.assertj.core.api.Assertions.*;
 
 /**
@@ -348,26 +348,51 @@ class HnswInvariantVerifierTest {
         }
     }
 
+    /**
+     * Deletion may legitimately fragment the graph, so full connectivity is not a
+     * post-condition. What is: the verifier still completes, still counts every
+     * surviving active node, and reports reachability against that count — and the only
+     * shortfall it is allowed to report is fragmentation. A vanished entry point, a
+     * miscounted survivor set or an unreachable graph are all real defects, and each
+     * fails here.
+     *
+     * <p>{@code verifyConnectivity} reuses the result's two counters for its own meaning:
+     * {@code nodesChecked} is the active node count and {@code edgesChecked} is the number
+     * reachable from the entry point.</p>
+     */
     @Test
     void shouldReportConnectivityAfterDeletion() throws IOException {
+        int inserted = 50;
+        int deleted = 10;
+
         try (HnswGraph graph = new HnswGraph(graphPath, config, distanceFunction, 1000)) {
-            // Insert nodes
-            for (int i = 0; i < 50; i++) {
+            for (int i = 0; i < inserted; i++) {
                 graph.insert(randomVector(64));
             }
 
-            // Delete some nodes
-            for (int i = 0; i < 10; i++) {
+            // Delete every other node among the first 20.
+            for (int i = 0; i < deleted; i++) {
                 graph.delete(i * 2);
             }
 
-            // Graph should still be connected (remaining nodes)
             HnswInvariantVerifier.VerificationResult result =
                 HnswInvariantVerifier.verifyConnectivity(graph);
 
-            // Note: Deletion might fragment the graph, but remaining active nodes
-            // should still be connected via active edges
-            // We don't strictly require connectivity after deletion
+            int survivors = inserted - deleted;
+            assertThat(graph.activeNodeCount())
+                .as("Each delete should have tombstoned exactly one node")
+                .isEqualTo(survivors);
+            assertThat(result.nodesChecked())
+                .as("Report should count the surviving active nodes, not the tombstoned ones")
+                .isEqualTo(survivors);
+            assertThat(result.edgesChecked())
+                .as("Report should reach at least the entry point and at most the survivors")
+                .isBetween(1, survivors);
+            assertThat(result.violations())
+                .as("Fragmentation is the only shortfall deletion may cause; "
+                    + "a lost entry point is not")
+                .allSatisfy(violation ->
+                    assertThat(violation).startsWith("Graph is not fully connected"));
         }
     }
 
@@ -558,27 +583,5 @@ class HnswInvariantVerifierTest {
                 }
             }
         }
-    }
-
-    // ==================== Helper Methods ====================
-
-    private float[] randomVector(int dim) {
-        Random random = new Random();
-        float[] vec = new float[dim];
-        for (int i = 0; i < dim; i++) {
-            vec[i] = (float) random.nextGaussian(); // Gaussian for better distribution
-        }
-        // Normalize
-        float norm = 0.0f;
-        for (int i = 0; i < dim; i++) {
-            norm += vec[i] * vec[i];
-        }
-        norm = (float) Math.sqrt(norm);
-        if (norm > 0) {
-            for (int i = 0; i < dim; i++) {
-                vec[i] /= norm;
-            }
-        }
-        return vec;
     }
 }

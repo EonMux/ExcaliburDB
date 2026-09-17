@@ -1,6 +1,7 @@
 package io.excalibur.vector.hnsw;
 
 import io.excalibur.config.Config;
+import io.excalibur.config.ShardConfig;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
@@ -162,9 +163,9 @@ class HnswConfigTest {
         Config config = new Config("test", Map.of(), new HashMap<>());
         HnswConfig hnsw = HnswConfig.fromShardConfig(256, config.shard());
 
-        assertThat(hnsw.maxConnections()).isEqualTo(Config.Shard.DEFAULT_MAX_CONNECTIONS);
+        assertThat(hnsw.maxConnections()).isEqualTo(ShardConfig.DEFAULT_MAX_CONNECTIONS);
         assertThat(hnsw.maxConnectionsLayer0())
-            .isEqualTo(2 * Config.Shard.DEFAULT_MAX_CONNECTIONS);
+            .isEqualTo(2 * ShardConfig.DEFAULT_MAX_CONNECTIONS);
     }
 
     @Test

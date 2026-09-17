@@ -1,5 +1,6 @@
 package io.excalibur.vector.hnsw;
 
+import io.excalibur.core.integrity.IntegrityReport;
 import io.excalibur.vector.durability.DurableFiles;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -82,20 +83,31 @@ public class NodeDocumentMapping {
     /**
      * Magic number for file format validation ("NODEMAPS").
      */
-    private static final long MAGIC = 0x4E4F44454D415053L;
+    static final long MAGIC = 0x4E4F44454D415053L;
 
     /**
-     * Current file format version.
+     * Current file format version. Version 2 added the integrity block described on
+     * {@link NodeMappingIntegrity}.
      */
-    private static final int VERSION = 1;
+    static final int VERSION = 2;
+
+    /**
+     * The version written before the header carried checksums.
+     */
+    static final int VERSION_V1 = 1;
 
     /**
      * Header size in bytes.
      */
-    private static final int HEADER_SIZE = 24;
+    static final int HEADER_SIZE = 48;
 
     /**
-     * Byte offset of the entry-count field within the header.
+     * Header size in bytes of a version 1 file.
+     */
+    static final int HEADER_SIZE_V1 = 24;
+
+    /**
+     * Byte offset of the entry-count field within the header, in both versions.
      */
     private static final int OFFSET_ENTRY_COUNT = 16;
 
@@ -324,41 +336,22 @@ public class NodeDocumentMapping {
         try {
             Path tempPath = mappingPath.resolveSibling(mappingPath.getFileName() + ".tmp");
 
-            // Calculate total size needed
             int entryCount = nodeToDocument.size();
+            ByteBuffer payload = encodeEntries();
+            ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+            header.putLong(0, MAGIC);
+            header.putInt(Long.BYTES, VERSION);
+            header.putLong(OFFSET_ENTRY_COUNT, entryCount);
+
+            // The payload is digested before either part is written, so the checksum in the
+            // header describes exactly the bytes that follow it in this same file.
+            NodeMappingIntegrity.seal(header, payload.array(), payload.limit());
 
             try (FileChannel channel = FileChannel.open(tempPath,
                     StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE,
                     StandardOpenOption.TRUNCATE_EXISTING)) {
-
-                long totalSize = HEADER_SIZE;
-
-                // Estimate entry sizes
-                for (Map.Entry<Long, String> entry : nodeToDocument.entrySet()) {
-                    totalSize += 8 + 4 + entry.getValue().getBytes(StandardCharsets.UTF_8).length;
-                }
-
-                // Allocate buffer
-                ByteBuffer buffer = ByteBuffer.allocate((int) totalSize + 1024)
-                    .order(ByteOrder.LITTLE_ENDIAN);
-
-                // Write header
-                buffer.putLong(MAGIC);
-                buffer.putInt(VERSION);
-                buffer.putInt(0); // Reserved
-                buffer.putLong(entryCount);
-
-                // Write entries
-                for (Map.Entry<Long, String> entry : nodeToDocument.entrySet()) {
-                    buffer.putLong(entry.getKey());
-                    byte[] docIdBytes = entry.getValue().getBytes(StandardCharsets.UTF_8);
-                    buffer.putInt(docIdBytes.length);
-                    buffer.put(docIdBytes);
-                }
-
-                buffer.flip();
-                channel.write(buffer);
+                channel.write(new ByteBuffer[] {header, payload});
                 channel.force(true);
             }
 
@@ -373,6 +366,48 @@ public class NodeDocumentMapping {
         } finally {
             persistenceLock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Encodes every mapping into the entry region that follows the header.
+     *
+     * <p>Returned as a buffer over a whole array, so the checksum can be taken over the same
+     * bytes the write will emit rather than over a re-encoding of them.</p>
+     *
+     * @return A flipped buffer whose backing array holds exactly the entry region
+     */
+    private ByteBuffer encodeEntries() {
+        int size = 0;
+        Map<Long, byte[]> encoded = new java.util.LinkedHashMap<>();
+        for (Map.Entry<Long, String> entry : nodeToDocument.entrySet()) {
+            byte[] documentId = entry.getValue().getBytes(StandardCharsets.UTF_8);
+            encoded.put(entry.getKey(), documentId);
+            size += ENTRY_HEADER_SIZE + documentId.length;
+        }
+
+        ByteBuffer payload = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN);
+        for (Map.Entry<Long, byte[]> entry : encoded.entrySet()) {
+            payload.putLong(entry.getKey());
+            payload.putInt(entry.getValue().length);
+            payload.put(entry.getValue());
+        }
+        payload.flip();
+        return payload;
+    }
+
+    /**
+     * Verifies a mapping file on disk without loading it.
+     *
+     * <p>The checking entry point for this format: it reads the header and streams the
+     * entries past a digest, so a file can be judged without the mapping it describes being
+     * attached to a graph.</p>
+     *
+     * @param mappingPath The mapping file to verify
+     * @return What the check concluded, including whether the file carries a checksum at all
+     * @throws NullPointerException if mappingPath is null
+     */
+    public static IntegrityReport verifyIntegrity(Path mappingPath) {
+        return NodeMappingIntegrity.verify(mappingPath);
     }
 
     /**
@@ -399,31 +434,34 @@ public class NodeDocumentMapping {
 
             try (FileChannel channel = FileChannel.open(mappingPath, StandardOpenOption.READ)) {
                 long fileSize = channel.size();
-                if (fileSize < HEADER_SIZE) {
+                if (fileSize < HEADER_SIZE_V1) {
                     throw new IOException("Truncated mapping file (no header): " + mappingPath);
                 }
 
-                ByteBuffer headerBuffer = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
-                readFully(channel, headerBuffer, "mapping header");
-                headerBuffer.flip();
-
-                long magic = headerBuffer.getLong();
-                if (magic != MAGIC) {
-                    throw new IOException("Invalid mapping file: bad magic number");
+                int version = readVersion(channel, mappingPath);
+                int headerSize = version == VERSION_V1 ? HEADER_SIZE_V1 : HEADER_SIZE;
+                if (fileSize < headerSize) {
+                    throw new IOException("Truncated mapping file (header of a version "
+                        + version + " file is " + headerSize + " bytes): " + mappingPath);
                 }
 
-                int version = headerBuffer.getInt();
-                if (version != VERSION) {
-                    throw new IOException("Unsupported mapping file version: " + version);
-                }
+                ByteBuffer headerBuffer = ByteBuffer.allocate(headerSize)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+                readFully(channel, headerBuffer, 0, "mapping header");
 
-                headerBuffer.getInt(); // Skip reserved
-                long entryCount = headerBuffer.getLong();
+                // Before a single entry is decoded. A mapping that has rotted re-attributes
+                // vectors to other documents, which erasure and document filtering both act
+                // on without anything in their answers showing it.
+                NodeMappingIntegrity.inspect(mappingPath, channel, headerBuffer, version)
+                    .requireIntact();
+
+                long entryCount = headerBuffer.getLong(OFFSET_ENTRY_COUNT);
+                channel.position(headerSize);
 
                 // An entry is at least ENTRY_HEADER_SIZE bytes, so a count larger
                 // than the file can hold means the header is corrupt. Reject it
                 // before allocating anything sized from the file's own claims.
-                long maxPossibleEntries = (fileSize - HEADER_SIZE) / ENTRY_HEADER_SIZE;
+                long maxPossibleEntries = (fileSize - headerSize) / ENTRY_HEADER_SIZE;
                 if (entryCount < 0 || entryCount > maxPossibleEntries) {
                     throw new IOException("Corrupt mapping file " + mappingPath + ": entryCount=" +
                         entryCount + " exceeds the " + maxPossibleEntries + " entries the file can hold");
@@ -489,7 +527,8 @@ public class NodeDocumentMapping {
                     StandardOpenOption.READ,
                     StandardOpenOption.WRITE)) {
 
-                long entryCount = readOrInitializeHeader(channel);
+                ByteBuffer header = readOrInitializeHeader(channel, mappingPath);
+                long entryCount = header.getLong(OFFSET_ENTRY_COUNT);
 
                 byte[] docIdBytes = documentId.getBytes(StandardCharsets.UTF_8);
                 if (docIdBytes.length > MAX_DOCUMENT_ID_BYTES) {
@@ -506,11 +545,11 @@ public class NodeDocumentMapping {
                 writeFully(channel, buffer, channel.size());
 
                 // Publish the new entry by bumping the count last: an interrupted
-                // append then leaves trailing bytes that load() simply ignores.
-                ByteBuffer countBuffer = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.LITTLE_ENDIAN);
-                countBuffer.putLong(entryCount + 1);
-                countBuffer.flip();
-                writeFully(channel, countBuffer, OFFSET_ENTRY_COUNT);
+                // append then leaves trailing bytes that load() simply ignores. The seal goes
+                // with it - this call never reads the entries it is adding to, so it has no
+                // checksum to offer over them and must not leave the previous one standing.
+                header.putLong(OFFSET_ENTRY_COUNT, entryCount + 1);
+                NodeMappingIntegrity.breakSeal(channel, header);
 
                 LOGGER.trace("Appended mapping: nodeId={} -> documentId={}", nodeId, documentId);
             }
@@ -526,30 +565,47 @@ public class NodeDocumentMapping {
      * @return The entry count currently recorded in the header
      * @throws IOException if the existing header is not a valid mapping header
      */
-    private static long readOrInitializeHeader(FileChannel channel) throws IOException {
+    private static ByteBuffer readOrInitializeHeader(FileChannel channel, Path mappingPath)
+            throws IOException {
+        ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
         if (channel.size() < HEADER_SIZE) {
-            ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
-            header.putLong(MAGIC);
-            header.putInt(VERSION);
-            header.putInt(0); // Reserved
-            header.putLong(0L); // Entry count
-            header.flip();
-            writeFully(channel, header, 0);
-            return 0L;
+            header.putLong(0, MAGIC);
+            header.putInt(Long.BYTES, VERSION);
+            header.putLong(OFFSET_ENTRY_COUNT, 0L);
+            return header;
         }
 
-        ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
-        readFully(channel, header, 0, "mapping header");
-        header.flip();
-        if (header.getLong() != MAGIC) {
-            throw new IOException("Invalid mapping file: bad magic number");
-        }
-        int version = header.getInt();
+        int version = readVersion(channel, mappingPath);
         if (version != VERSION) {
-            throw new IOException("Unsupported mapping file version: " + version);
+            throw new IOException("Mapping file " + mappingPath + " is at format version "
+                + version + ", which cannot be appended to by this build; compact the mapping "
+                + "to rewrite it at version " + VERSION);
         }
-        header.getInt(); // Reserved
-        return header.getLong();
+        readFully(channel, header, 0, "mapping header");
+        return header;
+    }
+
+    /**
+     * Reads and validates the magic number, returning the format version behind it.
+     *
+     * @param channel     The open mapping file
+     * @param mappingPath The file, for the error message
+     * @return The format version recorded in the header
+     * @throws IOException if the file does not start with a mapping header this build knows
+     */
+    private static int readVersion(FileChannel channel, Path mappingPath) throws IOException {
+        ByteBuffer probe = ByteBuffer.allocate(Long.BYTES + Integer.BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN);
+        readFully(channel, probe, 0, "mapping header");
+        if (probe.getLong(0) != MAGIC) {
+            throw new IOException("Invalid mapping file (bad magic number): " + mappingPath);
+        }
+        int version = probe.getInt(Long.BYTES);
+        if (version != VERSION && version != VERSION_V1) {
+            throw new IOException("Unsupported mapping file version " + version + " in "
+                + mappingPath);
+        }
+        return version;
     }
 
     /**
@@ -567,7 +623,7 @@ public class NodeDocumentMapping {
     /**
      * Reads exactly {@code buffer.remaining()} bytes from an absolute position.
      */
-    private static void readFully(FileChannel channel, ByteBuffer buffer, long position, String what)
+    static void readFully(FileChannel channel, ByteBuffer buffer, long position, String what)
             throws IOException {
         long at = position;
         while (buffer.hasRemaining()) {

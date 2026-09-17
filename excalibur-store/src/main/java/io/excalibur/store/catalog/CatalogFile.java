@@ -49,17 +49,28 @@ import java.util.zip.CRC32;
  * <p>The header is never rewritten in place. Each update goes to whichever of the two
  * slots is older, carrying a higher generation number, so a crash mid-write always
  * leaves the previous slot intact. On open the newest slot with a valid CRC wins. Only
- * if both slots fail is the record area scanned to rebuild the count - the catalog is
- * never reset to empty while records still checksum.</p>
+ * if both slots fail is the record area scanned to rebuild the count, and that scan runs
+ * to the end of the file rather than stopping at the first damaged row: each record carries
+ * its own CRC, so one bad row costs itself and nothing behind it.</p>
+ *
+ * <p>The catalog is never reset to empty. A file with no usable header and no record that
+ * checksums is refused, because starting fresh over it would keep the segment files and
+ * silently discard every segment's lifecycle state, integrated offset, source and epochs -
+ * arriving as a node that looks like a first start. The one exception is a file of zeroes,
+ * which is a create that never reached its first header and has lost nothing.</p>
  *
  * <h2>Version 1 Files</h2>
  * <p>Version 1 files (single 32-byte header, 306-byte records without source ID or
  * epochs) are read and migrated in place on open, defaulting the missing fields.</p>
  *
  * <h2>Thread Safety</h2>
- * <p>This class is thread-safe for read and write operations. All writes
- * are synchronized to prevent concurrent modification. Reads can proceed
- * concurrently with other reads.</p>
+ * <p>Every entry point that touches the mapping, the record count or the closed flag holds
+ * this object's monitor, readers included. The count and the mapping handle are plain fields
+ * that {@code writeSegment} and {@code close} rewrite, so a read taken outside the monitor can
+ * see a count already raised for a record not yet written, or a mapping {@code close} has
+ * released. Reads therefore serialise with each other as well as with writes; this file is
+ * written once per catalog change and read on recovery, so the contention that buys is not
+ * worth a torn view of the state a node is rebuilt from.</p>
  *
  * <h2>Recovery</h2>
  * <p>On recovery, the catalog file is read and all valid segment records
@@ -90,8 +101,11 @@ public class CatalogFile implements AutoCloseable {
     public static final int VERSION_V1 = 1;
 
     /**
-     * Maximum number of segments that can be stored.
-     * This limits the file size to a reasonable maximum.
+     * Maximum number of rows the catalog file may hold, and so of segments a store may own.
+     *
+     * <p>A bound on live segments, not on the segments a store has had over its lifetime: a
+     * purged row is reused by the next registration rather than left occupying a slot. It
+     * limits the file to a reasonable size.</p>
      */
     public static final int MAX_SEGMENTS = 65536;
 
@@ -151,6 +165,9 @@ public class CatalogFile implements AutoCloseable {
      * Initial capacity for the catalog file (in segments).
      */
     private static final int INITIAL_CAPACITY = 128;
+
+    /** How much of the file {@link #isEntirelyBlank()} reads at a time. */
+    private static final int BLANK_SCAN_CHUNK = 64 * 1024;
 
     // ==================== Instance Fields ====================
 
@@ -263,10 +280,20 @@ public class CatalogFile implements AutoCloseable {
      * on a full disk must leave the catalog exactly as it was, not counting an entry no write
      * ever made room for.</p>
      *
+     * <p>A row the file already holds for a purged segment is taken over instead of a new one
+     * being added, so the file's ceiling bounds live segments rather than every segment the
+     * store has ever had. See {@link #findPurgedRecordPosition()}.</p>
+     *
      * @param metadata The segment metadata to append
      * @throws IOException if the file cannot be grown or written
      */
     private void appendSegment(SegmentCatalog.SegmentMetadata metadata) throws IOException {
+        long reusable = findPurgedRecordPosition();
+        if (reusable >= 0) {
+            reuseRecordAt(reusable, metadata);
+            return;
+        }
+
         int appended = segmentCount + 1;
         ensureCapacity(appended);
 
@@ -280,6 +307,59 @@ public class CatalogFile implements AutoCloseable {
     }
 
     /**
+     * Finds a row whose segment no longer exists, so a new segment can take its place.
+     *
+     * <p>A purged row is the one row in the file that names nothing: the segment's disk has
+     * been freed and recovery skips it. Without reuse the file only ever grows, and
+     * {@link #MAX_SEGMENTS} stops counting how many segments a store has and starts counting
+     * how many it has ever had - so a store that splits and purges, which is what a long-lived
+     * store does, eventually cannot register another segment and the wall arrives as a split
+     * that fails for no visible reason.</p>
+     *
+     * <p>Reuse is safe because nothing addresses a row by its position. Lookups scan for a
+     * segment id ({@link #findRecordPosition(long)}), recovery reads the rows as a set, and
+     * {@link #countValidRecords()} only counts. The scan is linear, which is the same cost
+     * {@link #findRecordPosition(long)} already pays on every write, and it runs only on the
+     * rare write that brings a new segment into existence.</p>
+     *
+     * <p>Only rows that pass their own checksum are considered. A corrupt row might have a
+     * lifecycle byte that happens to read as purged while actually describing a live segment,
+     * and overwriting it on that basis would turn a row recovery might still report into one
+     * it certainly cannot.</p>
+     *
+     * @return Position of a reusable row, or -1 if every row is still in use
+     */
+    private long findPurgedRecordPosition() {
+        for (int i = 0; i < segmentCount; i++) {
+            long position = HEADER_SIZE + (long) i * RECORD_SIZE;
+            SegmentCatalog.SegmentMetadata existing = readRecordAt(position);
+            if (existing != null && existing.getLifecycleState() == LifecycleState.PURGED) {
+                return position;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Writes a new segment's record over a purged one, and makes it durable.
+     *
+     * <p>Forced for the same reason an append is: the segment file is already on the device,
+     * and a host that loses power before the row reaches it comes back holding a segment
+     * nothing in the catalog claims. The count does not move, so there is no header write to
+     * order this against - the row either lands whole or fails its checksum and is skipped,
+     * which is the same exposure an append has in the window between its two forces.</p>
+     *
+     * @param position Position of the purged row being taken over
+     * @param metadata The segment metadata to write
+     * @throws IOException if the write fails
+     */
+    private void reuseRecordAt(long position, SegmentCatalog.SegmentMetadata metadata)
+            throws IOException {
+        writeRecordAt(position, metadata);
+        mappedFile.flush();
+    }
+
+    /**
      * Reads a segment metadata record by segment ID.
      *
      * @param segmentId The segment ID to look up
@@ -287,7 +367,7 @@ public class CatalogFile implements AutoCloseable {
      * @throws IOException if the read fails
      * @throws IllegalStateException if the catalog file is closed
      */
-    public SegmentCatalog.SegmentMetadata readSegment(long segmentId) throws IOException {
+    public synchronized SegmentCatalog.SegmentMetadata readSegment(long segmentId) throws IOException {
         checkOpen();
 
         long position = findRecordPosition(segmentId);
@@ -327,8 +407,11 @@ public class CatalogFile implements AutoCloseable {
     /**
      * Removes a segment record from the catalog.
      *
-     * <p>This is implemented by marking the record as PURGED. The physical
-     * removal happens during compaction.</p>
+     * <p>The row is marked PURGED rather than cut out of the file, because cutting it out
+     * would mean moving every row behind it while readers are scanning them. A purged row
+     * names nothing - recovery skips it - and the next segment to be registered writes itself
+     * over it, so the row is reclaimed by the next append rather than by a sweep that has to
+     * be scheduled. See {@link #findPurgedRecordPosition()}.</p>
      *
      * @param segmentId The segment ID to remove
      * @return true if the segment was found and marked for removal
@@ -444,7 +527,7 @@ public class CatalogFile implements AutoCloseable {
      *
      * @return true if closed
      */
-    public boolean isClosed() {
+    public synchronized boolean isClosed() {
         return closed;
     }
 
@@ -462,7 +545,7 @@ public class CatalogFile implements AutoCloseable {
      *
      * @return Segment count
      */
-    public int getSegmentCount() {
+    public synchronized int getSegmentCount() {
         return segmentCount;
     }
 
@@ -474,9 +557,18 @@ public class CatalogFile implements AutoCloseable {
     private void openExisting() throws IOException {
         long fileSize = Files.size(catalogPath);
 
-        // Minimum valid file size is a single header slot
+        // Too small to hold even one header slot. A file of zeroes at this size is a create
+        // that never got as far as its first header and has lost nothing; anything else is a
+        // catalog that was truncated, and starting fresh over it would discard the segment
+        // state it used to hold without saying so.
         if (fileSize < HEADER_SLOT_SIZE) {
-            // File too small, recreate
+            if (!isBlankOnDisk(fileSize)) {
+                throw new IOException("Catalog " + catalogPath + " is " + fileSize + " bytes, "
+                    + "too short to hold a header, and is not blank: it has been truncated. "
+                    + "Refusing to start on an empty catalog, which would silently discard "
+                    + "every segment's lifecycle state. Restore it from a backup, or move it "
+                    + "aside deliberately.");
+            }
             createNew();
             return;
         }
@@ -486,10 +578,12 @@ public class CatalogFile implements AutoCloseable {
             Math.max(fileSize, calculateFileSize(INITIAL_CAPACITY)));
 
         int version = peekVersion();
-        if (version == VERSION_V1) {
+        if (version == VERSION_V1 && !hasChecksummedCurrentHeader()) {
             migrateFromV1();
             return;
         }
+
+        refuseUnreadableVersion();
 
         if (readAndValidateHeader()) {
             return;
@@ -506,8 +600,195 @@ public class CatalogFile implements AutoCloseable {
             return;
         }
 
+        refuseUnreadableCatalog();
         mappedFile.close();
         createNew();
+    }
+
+    /**
+     * Refuses a catalog whose headers and records are all unreadable, unless it is blank.
+     *
+     * <p>What this replaces is the worst outcome the recovery path had: writing a fresh empty
+     * header over the file and carrying on. The corpus itself survives that - startup
+     * rediscovers segment files from the filesystem - but every segment's lifecycle state,
+     * integrated offset, source and epochs are gone, and the node comes up looking exactly like
+     * a first start. Nothing in its logs or its health says otherwise, so the loss is found
+     * later, by something behaving oddly, with no way back to the cause. The same argument is
+     * already made for an unreadable format version a few lines below; this is the other way
+     * into the same erasure.</p>
+     *
+     * <p>A blank file is exempt, and has to be: a crash between creating the catalog and
+     * writing its first header leaves zeroes, and nothing has been lost there. Zero bytes are
+     * the evidence - a file that was ever written holds a magic number, and any non-zero byte
+     * in a file whose records will not checksum is damage rather than absence.</p>
+     *
+     * @throws IOException if the file holds something that cannot be read back
+     */
+    private void refuseUnreadableCatalog() throws IOException {
+        if (isEntirelyBlank()) {
+            return;
+        }
+        releaseMappingBeforeRefusing();
+        throw new IOException("Catalog " + catalogPath + " has no usable header and no record "
+            + "that passes its checksum, and it is not blank, so it was written and then "
+            + "damaged. Refusing to start on an empty catalog: that would keep the segment "
+            + "files and silently discard every segment's lifecycle state, integrated offset, "
+            + "source and epochs, and would come up looking like a first start. Restore the "
+            + "catalog from a backup, or move it aside deliberately if losing that state is "
+            + "acceptable - the segment files themselves are rediscovered either way.");
+    }
+
+    /**
+     * Reports whether a file too small to map is all zeroes.
+     *
+     * @param fileSize Its size in bytes
+     * @return true if nothing has ever been written to it
+     * @throws IOException if it cannot be read
+     */
+    private boolean isBlankOnDisk(long fileSize) throws IOException {
+        if (fileSize == 0) {
+            return true;
+        }
+        for (byte b : Files.readAllBytes(catalogPath)) {
+            if (b != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Reports whether every byte of the file is zero.
+     *
+     * <p>Read through the mapping rather than from the path, so it describes the same bytes the
+     * recovery just failed on.</p>
+     *
+     * @return true if nothing has ever been written
+     */
+    private boolean isEntirelyBlank() {
+        byte[] buffer = new byte[BLANK_SCAN_CHUNK];
+        long size = mappedFile.size();
+        for (long position = 0; position < size; position += BLANK_SCAN_CHUNK) {
+            int length = (int) Math.min(BLANK_SCAN_CHUNK, size - position);
+            mappedFile.read(position, buffer, 0, length);
+            for (int i = 0; i < length; i++) {
+                if (buffer[i] != 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Refuses a catalog written in a format version this build cannot read.
+     *
+     * <p>Without this the file is not rejected, it is erased. An unknown version reaches
+     * {@link #readAndValidateHeader()}, which skips every slot whose version is not the
+     * current one and reports no usable header; the record recovery behind it then parses
+     * records of an unknown width at this build's record size, fails their checksums and
+     * finds none; and what is left is {@link #createNew()}, writing an empty header over the
+     * only record of which segment files this store owns. A downgrade or a rollback therefore
+     * discards every segment's lifecycle state, integrated offset, source and epochs, and
+     * comes up looking exactly like a first start.</p>
+     *
+     * <p>Keyed off a header slot that passes its own checksum, not off the version field
+     * alone. A version garbled by a torn write is a corruption the record-level recovery can
+     * still get past, and turning it into a refusal would stop a node that had nothing wrong
+     * with its catalog. A slot whose checksum covers the version is the only evidence that the
+     * version is what the writer meant to write.</p>
+     *
+     * @throws IOException if a checksummed header slot names a version this build cannot read
+     */
+    private void refuseUnreadableVersion() throws IOException {
+        for (int slot = 0; slot < 2; slot++) {
+            int version = checksummedVersionAt(slot);
+            if (version < 0 || version == VERSION || version == VERSION_V1) {
+                continue;
+            }
+            releaseMappingBeforeRefusing();
+            throw new IOException("Catalog " + catalogPath + " is format version " + version
+                + ", which this build cannot read; it supports versions " + VERSION_V1
+                + " and " + VERSION + ". The file was written by a newer build and has been "
+                + "left untouched: run that build, or move the catalog aside only if losing "
+                + "every segment's lifecycle state is acceptable.");
+        }
+    }
+
+    /**
+     * Reports whether some header slot is a checksummed header in the current format.
+     *
+     * <p>Guards the version 1 migration, which has nothing else to go on. A version 1 header
+     * carries no checksum, so the only evidence that a file is version 1 is the version field
+     * itself - and a torn write that leaves a current-format file reading as version 1 sends
+     * it through a migration that parses 450-byte records at 306 bytes, recovers none of them
+     * and rewrites the catalog empty. A slot that passes the current format's checksum is
+     * proof the file is not version 1, whatever the other slot's version field says; a genuine
+     * version 1 file cannot produce one.</p>
+     *
+     * @return true if either slot is a valid header in the current format
+     */
+    private boolean hasChecksummedCurrentHeader() {
+        return checksummedVersionAt(0) == VERSION || checksummedVersionAt(1) == VERSION;
+    }
+
+    /**
+     * Reads the version out of a header slot, but only if the slot's own checksum agrees.
+     *
+     * <p>The checksum covers the version field, so a slot that passes it is a slot whose
+     * version was written deliberately. The header slot layout - magic, version, count,
+     * timestamp, generation, CRC - is what the version field exists to let a reader dispatch
+     * on, so it is read the same way whatever version it turns out to name.</p>
+     *
+     * @param slot Index of the header slot, 0 or 1
+     * @return The version, or -1 if the slot has no magic number or fails its checksum
+     */
+    private int checksummedVersionAt(int slot) {
+        long base = (long) slot * HEADER_SLOT_SIZE;
+        try {
+            if (mappedFile.readInt(base) != MAGIC_NUMBER) {
+                return -1;
+            }
+            int version = mappedFile.readInt(base + 4);
+            int count = mappedFile.readInt(base + 8);
+            long timestamp = mappedFile.readLong(base + 12);
+            long generation = mappedFile.readLong(base + 20);
+            int storedCrc = mappedFile.readInt(base + 28);
+
+            crc32.reset();
+            crc32.update(intToBytes(MAGIC_NUMBER));
+            crc32.update(intToBytes(version));
+            crc32.update(intToBytes(count));
+            crc32.update(longToBytes(timestamp));
+            crc32.update(longToBytes(generation));
+
+            return storedCrc == (int) crc32.getValue() ? version : -1;
+        } catch (RuntimeException e) {
+            // Distinct from the -1 above: that is a slot that says it holds no valid header,
+            // this is a slot nothing could read. The caller cannot tell them apart, so the
+            // difference is only recoverable from the log.
+            LOGGER.log(java.util.logging.Level.FINE, e,
+                () -> "Header slot " + slot + " of the catalog at " + catalogPath
+                    + " could not be read");
+            return -1;
+        }
+    }
+
+    /**
+     * Releases the mapping when the constructor is about to fail.
+     *
+     * <p>A constructor that throws never returns an object for anyone to close, so the mapping
+     * and the descriptor behind it are released here or not at all.</p>
+     */
+    private void releaseMappingBeforeRefusing() {
+        try {
+            mappedFile.close();
+        } catch (Exception e) {
+            LOGGER.warning("Could not release the mapping for the catalog this build refused "
+                + "to open at " + catalogPath + ": " + e);
+        } finally {
+            mappedFile = null;
+        }
     }
 
     /**
@@ -522,8 +803,11 @@ public class CatalogFile implements AutoCloseable {
                 if (mappedFile.readInt(base) == MAGIC_NUMBER) {
                     return mappedFile.readInt(base + 4);
                 }
-            } catch (Exception e) {
-                // Try the other slot
+            } catch (RuntimeException e) {
+                int unreadableSlot = slot;
+                LOGGER.log(java.util.logging.Level.FINE, e,
+                    () -> "Header slot " + unreadableSlot + " of the catalog at " + catalogPath
+                        + " could not be read while looking for the format version");
             }
         }
         return -1;
@@ -564,7 +848,12 @@ public class CatalogFile implements AutoCloseable {
         int count;
         try {
             count = mappedFile.readInt(8);
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
+            // Every record is about to be dropped and the catalog rewritten empty. That is
+            // the loudest thing this class can do to a catalog, so it does not do it quietly.
+            LOGGER.log(java.util.logging.Level.SEVERE, e,
+                () -> "Could not read the record count of the version 1 catalog at "
+                    + catalogPath + "; it will be migrated with no segments");
             return result;
         }
         if (count < 0 || count > MAX_SEGMENTS) {
@@ -583,24 +872,32 @@ public class CatalogFile implements AutoCloseable {
     }
 
     /**
-     * Counts the records at the head of the file that still pass their CRC check.
+     * Finds how many record slots the file must be read back over to recover everything intact.
      *
-     * @return Number of consecutive valid records
+     * <p>Every record carries its own CRC, so damage to one says nothing about the others, and
+     * {@link #readAll()} already skips the rows that fail. Stopping at the first failure - which
+     * this did - therefore discarded every intact row behind a single bad one: one torn record
+     * at index 0 was enough to lose the whole catalog. Scanning to the end and returning the
+     * position just past the last row that still checksums keeps each row's fate its own.</p>
+     *
+     * <p>Rows past the count are zeroes or a previous generation's bytes, and neither passes a
+     * CRC, so the scan cannot resurrect a row the catalog had moved beyond.</p>
+     *
+     * @return One past the index of the last record that passes its CRC, or 0 if none does
      */
     private int countValidRecords() {
-        int count = 0;
+        int end = 0;
         long capacity = mappedFile.size();
-        while (true) {
-            long position = HEADER_SIZE + (long) count * RECORD_SIZE;
-            if (position + RECORD_SIZE > capacity || count >= MAX_SEGMENTS) {
+        for (int index = 0; index < MAX_SEGMENTS; index++) {
+            long position = HEADER_SIZE + (long) index * RECORD_SIZE;
+            if (position + RECORD_SIZE > capacity) {
                 break;
             }
-            if (readRecordAt(position) == null) {
-                break;
+            if (readRecordAt(position) != null) {
+                end = index + 1;
             }
-            count++;
         }
-        return count;
+        return end;
     }
 
     /**
@@ -627,7 +924,10 @@ public class CatalogFile implements AutoCloseable {
      */
     private void ensureCapacity(int requiredCapacity) throws IOException {
         if (requiredCapacity > MAX_SEGMENTS) {
-            throw new IOException("Catalog exceeds maximum segment count: " + MAX_SEGMENTS);
+            throw new IOException("Catalog " + catalogPath + " already holds " + segmentCount
+                + " segments and cannot hold more than " + MAX_SEGMENTS
+                + ". Every row belongs to a segment that has not been purged, so this is a "
+                + "live-segment count: the store needs fewer, larger segments.");
         }
 
         long requiredSize = calculateFileSize(requiredCapacity);
@@ -714,8 +1014,11 @@ public class CatalogFile implements AutoCloseable {
                     bestSlot = slot;
                     bestCount = count;
                 }
-            } catch (Exception e) {
-                // Slot unreadable - try the other one
+            } catch (RuntimeException e) {
+                int unreadableSlot = slot;
+                LOGGER.log(java.util.logging.Level.FINE, e,
+                    () -> "Header slot " + unreadableSlot + " of the catalog at " + catalogPath
+                        + " could not be read");
             }
         }
 
@@ -956,8 +1259,12 @@ public class CatalogFile implements AutoCloseable {
             }
 
             return metadata;
-        } catch (Exception e) {
-            // Invalid record - skip
+        } catch (RuntimeException e) {
+            // Dropping a segment record during recovery loses whatever that segment held, so
+            // the position it was dropped from is recorded even though recovery continues.
+            LOGGER.log(java.util.logging.Level.WARNING, e,
+                () -> "Skipping the unreadable catalog record at offset " + position + " of "
+                    + catalogPath);
             return null;
         }
     }

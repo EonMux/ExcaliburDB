@@ -32,6 +32,13 @@ class WandExactnessTest {
     /** Scores every document against every term, with no skipping whatsoever. */
     private static List<double[]> bruteForce(PostingsIndex index, String[] terms,
                                           double[] weights, int limit) {
+        return bruteForce(index, terms, weights, limit, null);
+    }
+
+    /** As above, considering only the documents {@code live} admits. */
+    private static List<double[]> bruteForce(PostingsIndex index, String[] terms,
+                                          double[] weights, int limit,
+                                          java.util.function.IntPredicate live) {
         int docCount = index.docCount();
         double[] scores = new double[docCount];
         int[] lengths = index.documentLengths();
@@ -68,9 +75,12 @@ class WandExactnessTest {
             docs[i] = i;
         }
         java.util.Arrays.sort(docs, (a, b) -> Double.compare(scores[b], scores[a]));
-        for (int i = 0; i < Math.min(limit, docCount); i++) {
+        for (int i = 0; i < docCount && ranked.size() < limit; i++) {
             if (scores[docs[i]] <= 0) {
                 break;
+            }
+            if (live != null && !live.test(docs[i])) {
+                continue;
             }
             ranked.add(new double[] {docs[i], scores[docs[i]]});
         }
@@ -236,6 +246,87 @@ class WandExactnessTest {
             for (int i = 0; i < fast.length; i++) {
                 assertThat(fast[i].score()).as("rank %d", i)
                     .isCloseTo(slow.get(i)[1], org.assertj.core.data.Offset.offset(1e-9));
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("filtered search returns exactly what exhaustive scoring of the survivors returns")
+    void matchesBruteForceWithDocumentsFilteredOut(@TempDir Path root) throws Exception {
+        // Erasure is the case the filter exists for, and erasing the best match is the ordinary
+        // shape of it: a document is usually removed because it is the very thing being found.
+        // So the filter has to reach the pruning, not the results - a scorer that ranks first and
+        // discards afterwards returns a short page here, and a short page is indistinguishable
+        // from a corpus that held no more.
+        Random random = new Random(777);
+        String[] common = {"the", "of", "and", "to", "a"};
+        String[] mid = {"memory", "process", "system", "kernel", "patient", "journal"};
+        String[] rare = {"sigkill", "enomem", "transhydrogenase", "nephilengys", "apocolocyntosis"};
+
+        PostingsWriter writer = new PostingsWriter();
+        for (int i = 0; i < 700; i++) {
+            StringBuilder sb = new StringBuilder();
+            for (int w = 0; w < 25 + random.nextInt(80); w++) {
+                double roll = random.nextDouble();
+                if (roll < 0.6) {
+                    sb.append(common[random.nextInt(common.length)]);
+                } else if (roll < 0.95) {
+                    sb.append(mid[random.nextInt(mid.length)]);
+                } else {
+                    sb.append(rare[random.nextInt(rare.length)]);
+                }
+                sb.append(' ');
+            }
+            writer.add(sb.toString());
+        }
+        writer.write(root);
+
+        try (PostingsIndex index = PostingsIndex.open(root)) {
+            List<String> pool = new ArrayList<>();
+            pool.addAll(List.of(common));
+            pool.addAll(List.of(mid));
+            pool.addAll(List.of(rare));
+
+            for (int trial = 0; trial < 300; trial++) {
+                int termCount = 1 + random.nextInt(5);
+                String[] terms = new String[termCount];
+                double[] weights = new double[termCount];
+                for (int i = 0; i < termCount; i++) {
+                    terms[i] = pool.get(random.nextInt(pool.size()));
+                    weights[i] = 0.2 + random.nextDouble();
+                }
+                int limit = 1 + random.nextInt(15);
+
+                // Two shapes of tombstone: a scattered fraction, and - every third trial - the
+                // whole leading run of doc ids, which is what an erasure of a source's earliest
+                // documents leaves behind.
+                boolean[] dead = new boolean[index.docCount()];
+                if (trial % 3 == 0) {
+                    int run = Math.min(dead.length, 50 + random.nextInt(250));
+                    for (int d = 0; d < run; d++) {
+                        dead[d] = true;
+                    }
+                } else {
+                    for (int d = 0; d < dead.length; d++) {
+                        dead[d] = random.nextDouble() < 0.4;
+                    }
+                }
+                java.util.function.IntPredicate live = doc -> !dead[doc];
+
+                PostingsIndex.Hit[] fast = index.search(terms, weights, limit, null, live);
+                List<double[]> slow = bruteForce(index, terms, weights, limit, live);
+
+                assertThat(fast.length)
+                    .as("trial %d, terms %s", trial, String.join(",", terms))
+                    .isEqualTo(slow.size());
+                for (int i = 0; i < fast.length; i++) {
+                    assertThat(live.test(fast[i].docId()))
+                        .as("trial %d rank %d returned a filtered document", trial, i)
+                        .isTrue();
+                    assertThat(fast[i].score())
+                        .as("trial %d rank %d, terms %s", trial, i, String.join(",", terms))
+                        .isCloseTo(slow.get(i)[1], org.assertj.core.data.Offset.offset(1e-9));
+                }
             }
         }
     }

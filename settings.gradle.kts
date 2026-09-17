@@ -20,6 +20,7 @@ include(
     "excalibur-metrics",
     "excalibur-core",
     "excalibur-test",
+    "excalibur-test-bootstrap",
     "excalibur-store",
     "excalibur-filter",
     "excalibur-vector",
@@ -32,6 +33,8 @@ include(
     "excalibur-llm",
     "excalibur-ingest",
     "excalibur-api",
+    "excalibur-backup",
+    "excalibur-fsck",
     "excalibur-bench",
     "excalibur-integration"
 )

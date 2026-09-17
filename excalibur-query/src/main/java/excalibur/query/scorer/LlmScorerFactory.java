@@ -4,6 +4,7 @@ import excalibur.query.pipeline.QueryPipeline.LlmScorer;
 import io.excalibur.llm.client.LLMHttpClient;
 import excalibur.llm.client.LLMClientConfig;
 import io.excalibur.config.Config;
+import io.excalibur.config.LlmConfig;
 
 import java.util.Objects;
 
@@ -109,7 +110,7 @@ public final class LlmScorerFactory {
     }
 
     /**
-     * Creates an LLM scorer from the application's Config.Llm.
+     * Creates an LLM scorer from the application's LlmConfig.
      *
      * <p>This is the primary factory method for production use, creating
      * an LLM scorer from the properties file configuration. All configuration
@@ -128,7 +129,7 @@ public final class LlmScorerFactory {
      * @throws NullPointerException if llmConfig is null
      * @throws IllegalArgumentException if configuration values are invalid
      */
-    public static LlmScorer fromConfig(Config.Llm llmConfig) {
+    public static LlmScorer fromConfig(LlmConfig llmConfig) {
         Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
         LLMClientConfig config = LLMClientConfig.fromConfig(llmConfig);
         LLMHttpClient llmClient = new LLMHttpClient(config);
@@ -155,7 +156,7 @@ public final class LlmScorerFactory {
      * @throws NullPointerException if llmConfig is null
      * @throws IllegalArgumentException if configuration values are invalid
      */
-    public static LlmScorer fromConfigWithQueryTimeout(Config.Llm llmConfig, int queryLlmTimeoutMs) {
+    public static LlmScorer fromConfigWithQueryTimeout(LlmConfig llmConfig, int queryLlmTimeoutMs) {
         Objects.requireNonNull(llmConfig, "llmConfig cannot be null");
         if (queryLlmTimeoutMs <= 0) {
             throw new IllegalArgumentException("queryLlmTimeoutMs must be positive: " + queryLlmTimeoutMs);

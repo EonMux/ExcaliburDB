@@ -4,28 +4,44 @@ import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.bootstrap.SourceRestoration;
+import excalibur.api.endpoint.CompactionCancelEndpoint;
 import excalibur.api.endpoint.CompactionEndpoint;
 import excalibur.api.endpoint.CompactionRunner;
 import excalibur.api.endpoint.CompactionStatusEndpoint;
 import excalibur.api.endpoint.DocumentErasureEndpoint;
 import excalibur.api.endpoint.DocumentFetchEndpoint;
+import excalibur.api.endpoint.DocumentListEndpoint;
 import excalibur.api.endpoint.DocumentUpsertEndpoint;
+import excalibur.api.endpoint.DrainEndpoint;
+import excalibur.api.endpoint.GraphBuildCancelEndpoint;
 import excalibur.api.endpoint.GraphBuildEndpoint;
+import excalibur.api.endpoint.GraphBuildRunner;
+import excalibur.api.endpoint.GraphBuildStatusEndpoint;
 import excalibur.api.endpoint.GraphErasureEndpoint;
+import excalibur.api.endpoint.GraphNamespaceDeleteEndpoint;
+import excalibur.api.endpoint.GraphNamespacesEndpoint;
 import excalibur.api.endpoint.GraphQueryEndpoint;
 import excalibur.api.endpoint.HealthEndpoint;
 import excalibur.api.endpoint.InMemorySourceRegistry;
 import excalibur.api.endpoint.IngestEndpoint;
+import excalibur.api.endpoint.IngestCancelEndpoint;
 import excalibur.api.endpoint.IngestStatusEndpoint;
 import excalibur.api.endpoint.InlineSourceIds;
+import excalibur.api.endpoint.MetricsEndpoint;
+import excalibur.api.endpoint.NodeStatsCollector;
 import excalibur.api.endpoint.QueryCancelEndpoint;
 import excalibur.api.endpoint.QueryEndpoint;
+import excalibur.api.endpoint.QueryStatusEndpoint;
+import excalibur.api.endpoint.ReadinessEndpoint;
 import excalibur.api.endpoint.ReindexEndpoint;
 import excalibur.api.endpoint.ReindexStatusEndpoint;
+import excalibur.api.endpoint.ServiceReadiness;
 import excalibur.api.endpoint.SourceDeregisterEndpoint;
+import excalibur.api.endpoint.SourceListEndpoint;
 import excalibur.api.endpoint.SourceFactory;
 import excalibur.api.endpoint.SourceRegistry;
 import excalibur.api.endpoint.StatsEndpoint;
+import excalibur.api.endpoint.VersionEndpoint;
 import excalibur.api.reindex.ReindexCoordinator;
 import excalibur.api.retrieval.ChunkTextResolver;
 import excalibur.api.retrieval.LexicalQueryService;
@@ -37,27 +53,36 @@ import excalibur.ingest.lexical.ChunkIndex;
 import excalibur.ingest.lexical.StoredChunkText;
 import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
+import excalibur.ingest.registry.DocumentRegistry;
 import excalibur.ingest.registry.SourceCatalog;
 import excalibur.ingest.source.SourceResolver;
 import excalibur.llm.embedding.EmbeddingClient;
+import excalibur.query.cache.QueryResultCache;
 import excalibur.query.executor.QueryRegistry;
 import excalibur.query.pipeline.QueryPipeline;
+import excalibur.query.scorer.LlmRelevancyScorer;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.allocator.VolumeManager;
 import excalibur.shard.worker.SegmentReindexScheduler;
 import io.excalibur.config.Config;
+import io.excalibur.llm.client.CircuitBreaker;
 import io.excalibur.retrieval.pipeline.GraphRagPipeline;
+import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
+import java.util.function.DoubleSupplier;
 import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.Map;
 
 import static excalibur.api.server.HttpRouting.createMethodRouter;
 import static excalibur.api.server.HttpRouting.exactPath;
 import static excalibur.api.server.HttpRouting.methodNotAllowed;
 import static excalibur.api.server.HttpRouting.pathOrChild;
+import static excalibur.api.server.HttpRouting.refusingNamespace;
 import static excalibur.api.server.HttpRouting.unavailable;
 import static excalibur.api.server.HttpRouting.wrapHandler;
 
@@ -72,11 +97,19 @@ import static excalibur.api.server.HttpRouting.wrapHandler;
  * was when the routes read the fields directly.</p>
  *
  * <h2>Every path goes through the guard</h2>
- * <p>{@code /health} is the one unauthenticated route, because a liveness probe cannot carry a
- * token, and it is still rate limited. Every context below is pinned to its own path: HttpServer
- * matches on the longest prefix, so without that a path that merely begins with a route's name
- * is served by that route - {@code /healthz} reads back as healthy and {@code /v1/statsfoo}
- * returns the statistics.</p>
+ * <p>{@code /health} and {@code /health/ready} are the two unauthenticated routes, because the
+ * infrastructure that reads them - a kubelet, a service mesh, a cloud load balancer's
+ * target-group health check - is often not the operator's to configure and several of those
+ * cannot attach an Authorization header at all. Both are still rate limited. Everything else
+ * added for observability is authenticated: {@code /metrics} is read by a scraper the operator
+ * does control, and every scraper supports a bearer token, so requiring one costs a line of
+ * configuration and keeps disk capacity, corpus size and error rates away from an anonymous
+ * caller - and {@code READ} degrades to open on a node with no token configured, which
+ * {@code PUBLIC} could never be closed on a node that has one.</p>
+ *
+ * <p>Every context below is pinned to its own path: HttpServer matches on the longest prefix,
+ * so without that a path that merely begins with a route's name is served by that route -
+ * {@code /healthz} reads back as healthy and {@code /v1/statsfoo} returns the statistics.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Not thread-safe, and does not need to be: one instance serves one {@code start()}.</p>
@@ -117,6 +150,7 @@ final class EndpointRegistrar {
      * @param queryRegistry        In-flight queries, for cancellation
      * @param embeddingClient      Embeds raw query text, or null when this node cannot
      * @param lexicalQueryService  Lexical retrieval, or null when this node keeps no index
+     * @param queryExpander       The expander the lexical half widens queries with, or null
      * @param chunkIndex           The chunk lexical index stats report on, or null
      * @param ingestSourceRegistry Where ingestion sources are registered
      * @param sourceCatalog        Where registrations are recorded across restarts, or null
@@ -129,6 +163,7 @@ final class EndpointRegistrar {
      * @param documentErasure      The service behind {@code POST /v1/erasure}, or null
      * @param graphTenants         Every namespace's graph, or null
      * @param graphPipeline        A graph pipeline somebody else owns, or null
+     * @param documentRegistry     What this node has ingested, or null
      */
     record Inputs(ApiSecurityConfig security,
                   Config config,
@@ -139,6 +174,7 @@ final class EndpointRegistrar {
                   QueryRegistry queryRegistry,
                   EmbeddingClient embeddingClient,
                   LexicalQueryService lexicalQueryService,
+                  io.excalibur.retrieval.expand.QueryExpander queryExpander,
                   ChunkIndex chunkIndex,
                   SourceRegistry ingestSourceRegistry,
                   SourceCatalog sourceCatalog,
@@ -150,7 +186,8 @@ final class EndpointRegistrar {
                   ReindexCoordinator reindexCoordinator,
                   DocumentErasureService documentErasure,
                   GraphTenants graphTenants,
-                  GraphRagPipeline graphPipeline) {
+                  GraphRagPipeline graphPipeline,
+                  DocumentRegistry documentRegistry) {
     }
 
     /**
@@ -159,8 +196,11 @@ final class EndpointRegistrar {
      * @param query      Serves {@code POST /v1/query}
      * @param reindex    Serves {@code POST} and {@code DELETE /v1/reindex}
      * @param compaction Runs what {@code POST /v1/compact} asked for, behind the response
+     * @param graphBuild Runs what {@code POST /v1/graph/build} asked for, behind the response,
+     *                   or null on a node that serves no graph of its own
      */
-    record Endpoints(QueryEndpoint query, ReindexEndpoint reindex, CompactionRunner compaction) {
+    record Endpoints(QueryEndpoint query, ReindexEndpoint reindex, CompactionRunner compaction,
+                     GraphBuildRunner graphBuild) {
     }
 
     /**
@@ -179,17 +219,24 @@ final class EndpointRegistrar {
 
     private Endpoints registerOn(HttpServer target) {
         HealthEndpoint healthEndpoint = newHealthEndpoint();
-        StatsEndpoint statsEndpoint = new StatsEndpoint(
-            in.indexOrchestrator(), in.storageEngine(), in.volumeManager());
-        statsEndpoint.withLexicalIndex(in.chunkIndex());
+        // One collector, two renderings. /v1/stats serves it as JSON and /metrics in the
+        // Prometheus text exposition format; the way two views of one node come to disagree
+        // is by each gathering its own.
+        NodeStatsCollector collector = newStatsCollector();
+        StatsEndpoint statsEndpoint = new StatsEndpoint(collector);
 
         // Where a result's text is read back from when a request asks for it. The indexes hold
         // postings and vectors and no text, so without this a search answers with identifiers a
         // caller can only resolve against the store the corpus was ingested from - which, for a
         // crawled corpus, it does not have. One reader for every route that quotes the corpus,
         // so a query and a fetch of the same chunk cannot disagree about what it says.
+        // One instance, two holders. The endpoint fills it and /v1/stats reports it; a second
+        // instance would report a cache nothing is using, which is worse than reporting none.
+        QueryResultCache queryResultCache = newQueryResultCache();
+        collector.withQueryResultCache(queryResultCache);
+
         Function<String, String> chunkText = StoredChunkText.of(in.storageEngine());
-        QueryEndpoint queryHandler = newQueryEndpoint(chunkText);
+        QueryEndpoint queryHandler = newQueryEndpoint(chunkText, queryResultCache);
 
         // Shared by the two routes that can write under one source id, so that neither takes an
         // id the other is already using. The crawl half of the guard reads the source registry;
@@ -203,6 +250,7 @@ final class EndpointRegistrar {
 
         HttpHandler notFound = guard.protect(RequestGuard.Access.PUBLIC, HttpRouting::handleNotFound);
         registerCore(target, notFound, healthEndpoint, statsEndpoint);
+        registerObservability(target, notFound, collector);
         registerQuery(target, notFound, queryHandler);
         registerIngest(target, notFound, ingestEndpoint);
         registerDocuments(target, notFound, chunkText, suppliedSources);
@@ -211,10 +259,15 @@ final class EndpointRegistrar {
         CompactionRunner compactionRunner = new CompactionRunner(
             in.indexOrchestrator()::compactNow);
         registerCompaction(target, notFound, compactionRunner);
-        registerGraph(target, notFound);
+        // Only where there are namespaces to build. A node serving somebody else's pipeline
+        // has no staged facts of its own, and a runner with no work is a thread to drain.
+        GraphBuildRunner graphBuildRunner = in.graphTenants() != null
+            ? new GraphBuildRunner(in.graphTenants())
+            : null;
+        registerGraph(target, notFound, graphBuildRunner);
         target.createContext("/", wrapHandler(notFound));
 
-        return new Endpoints(queryHandler, reindexHandler, compactionRunner);
+        return new Endpoints(queryHandler, reindexHandler, compactionRunner, graphBuildRunner);
     }
 
     // ==================== Endpoint construction ====================
@@ -242,10 +295,12 @@ final class EndpointRegistrar {
      * embedding client is what lets a client submit raw query text - the recommended path -
      * instead of computing embeddings itself.</p>
      *
-     * @param chunkText Reads a chunk's text back out of the store
+     * @param chunkText   Reads a chunk's text back out of the store
+     * @param resultCache Answers a repeated query without searching again, or null
      * @return The endpoint behind {@code POST /v1/query}
      */
-    private QueryEndpoint newQueryEndpoint(Function<String, String> chunkText) {
+    private QueryEndpoint newQueryEndpoint(Function<String, String> chunkText,
+                                           QueryResultCache resultCache) {
         QueryEndpoint queryHandler = new QueryEndpoint(in.queryPipeline(), in.config(), null,
             in.queryRegistry(), in.embeddingClient(), in.security());
         // Lexical retrieval, when this node keeps a chunk index. On a node with no embedding
@@ -254,7 +309,14 @@ final class EndpointRegistrar {
         // the same thing - the chunk id ingestion assigned - which is what makes them fusible
         // rather than two id spaces to reconcile.
         queryHandler.setLexicalQueryService(in.lexicalQueryService());
+        // The same instance the index was given, so an explained answer can say what the
+        // query was widened with without generating a second, different expansion.
+        queryHandler.setQueryExpander(in.queryExpander());
         queryHandler.setChunkText(chunkText);
+        // Valid only while the corpus fingerprint an answer was computed against is unchanged,
+        // which is re-read from the live corpus on every lookup rather than trusted from when
+        // the entry was stored.
+        queryHandler.setQueryResultCache(resultCache);
         return queryHandler;
     }
 
@@ -347,7 +409,103 @@ final class EndpointRegistrar {
         return reindexHandler;
     }
 
+    /**
+     * The one reader of this node's state, shared by {@code /v1/stats} and {@code /metrics}.
+     *
+     * @return A collector with every optional signal this deployment has attached
+     */
+    private NodeStatsCollector newStatsCollector() {
+        NodeStatsCollector collector = new NodeStatsCollector(
+            in.indexOrchestrator(), in.storageEngine(), in.volumeManager());
+        collector.withLexicalIndex(in.chunkIndex());
+        collector.withEmbeddingBreaker(embeddingBreakerState());
+        collector.withLlmRelevancyBreaker(llmRelevancyBreakerState());
+        return collector;
+    }
+
+    /**
+     * The query result cache, or null on a deployment that has not asked for one.
+     *
+     * <p>Off unless {@code excalibur.query.cache.enabled} says otherwise. Null is not a cache
+     * of size zero: with no cache the endpoint takes no corpus fingerprint at all, and a
+     * request costs exactly what it did before one existed.</p>
+     *
+     * @return The cache, or null
+     */
+    private QueryResultCache newQueryResultCache() {
+        Config config = in.config();
+        if (config == null || !config.query().isCacheEnabled()) {
+            return null;
+        }
+        int entries = config.query().getCacheMaxEntries();
+        LOGGER.info("Query result cache enabled, holding at most {} answers; every lookup "
+            + "re-reads the corpus fingerprint, so an entry is discarded as soon as anything "
+            + "it was computed against changes", entries);
+        return new QueryResultCache(entries);
+    }
+
+    /**
+     * Reads the embedding circuit breaker's state, or null on a node with no embeddings.
+     *
+     * <p>The breaker is the node's main degradation mode and was readable only from log
+     * statements: when it opens, retrieval silently drops to lexical-only and the node keeps
+     * answering 200, so a caller gets worse results with no signal anywhere that it has. The
+     * embedding client is the one place in this process it is reachable from.</p>
+     *
+     * @return A supplier of the state's name, or null where there is no breaker
+     */
+    private Supplier<String> embeddingBreakerState() {
+        EmbeddingClient embeddings = in.embeddingClient();
+        if (embeddings == null) {
+            return null;
+        }
+        return () -> {
+            CircuitBreaker breaker = embeddings.getCircuitBreaker();
+            return breaker == null ? null : breaker.getState().name();
+        };
+    }
+
+    /**
+     * Reads the stage-5 relevancy breaker's state, or null on a node that does no scoring.
+     *
+     * <p>The scorer arrives as a {@code QueryPipeline.LlmScorer}, and only the shipped
+     * implementation owns a breaker; anything else - a no-op scorer, a test double - reports
+     * absence, which is the same statement a node with no chat model makes. Read through the
+     * pipeline the registrar was handed, which is the pipeline the query route will execute:
+     * {@code withLlmScorer} replaces it before {@code start()} takes this snapshot.</p>
+     *
+     * @return A supplier of the state's name, or null where there is no breaker
+     */
+    private Supplier<String> llmRelevancyBreakerState() {
+        QueryPipeline pipeline = in.queryPipeline();
+        if (pipeline == null
+            || !(pipeline.getLlmScorer() instanceof LlmRelevancyScorer scorer)) {
+            return null;
+        }
+        return () -> {
+            CircuitBreaker breaker = scorer.getCircuitBreaker();
+            return breaker == null ? null : breaker.getState().name();
+        };
+    }
+
     // ==================== Route registration ====================
+
+    /**
+     * Guards a route over the corpus, which is one corpus and not one per namespace.
+     *
+     * <p>The guard first, so an anonymous caller is answered 401 and learns nothing from the
+     * header; then {@link HttpRouting#refusingNamespace}, so a caller that named a namespace is
+     * told this route cannot serve one rather than being handed the shared index as though it
+     * could. Every route that reads or rewrites the corpus goes through here, which is what
+     * keeps the answer the same across all of them.</p>
+     *
+     * @param access  What the route costs a caller
+     * @param handler The route
+     * @return The guarded handler
+     */
+    private HttpHandler corpusRoute(RequestGuard.Access access, HttpHandler handler) {
+        return guard.protect(access, refusingNamespace(handler));
+    }
 
     private void registerCore(HttpServer target, HttpHandler notFound,
                               HealthEndpoint healthEndpoint, StatsEndpoint statsEndpoint) {
@@ -356,7 +514,110 @@ final class EndpointRegistrar {
                 guard.protect(RequestGuard.Access.PUBLIC, healthEndpoint), notFound)));
         target.createContext("/v1/stats",
             wrapHandler(exactPath("/v1/stats",
-                guard.protect(RequestGuard.Access.READ, statsEndpoint), notFound)));
+                corpusRoute(RequestGuard.Access.READ, statsEndpoint), notFound)));
+    }
+
+    /**
+     * Registers the routes a monitoring system, a probe and an operator read.
+     *
+     * <p>{@code /health/ready}, {@code /v1/version} and {@code /v1/query/status} are longer
+     * paths than the routes they sit under, so the server's longest-prefix matching sends
+     * them here rather than to {@code /health} or {@code /v1/query}.</p>
+     *
+     * <p>Auth posture, route by route. {@code /health/ready} is PUBLIC for the reason
+     * {@code /health} is - it is read by infrastructure that frequently cannot send a header -
+     * and is charged against the read budget like every other unauthenticated request.
+     * {@code /metrics} is READ: its consumer is a scraper the operator configures, every
+     * scraper supports a bearer token, and the exposition names disk capacity, corpus size and
+     * error rates. {@code /v1/version} is READ because no probe needs it and build identity is
+     * the first thing worth knowing about a host you intend to attack.
+     * {@code /v1/query/status} is READ, like the ingest and reindex status routes it matches.
+     * {@code /v1/drain} is MUTATE: it changes how this node presents itself to a load
+     * balancer, and an anonymous caller able to drain a node has a one-request outage.</p>
+     *
+     * @param target    The server to register on
+     * @param notFound  What answers every other path under these contexts
+     * @param collector The shared reader of this node's state
+     */
+    private void registerObservability(HttpServer target, HttpHandler notFound,
+                                       NodeStatsCollector collector) {
+        ServiceReadiness readiness = new ServiceReadiness();
+
+        target.createContext("/health/ready",
+            wrapHandler(exactPath("/health/ready", guard.protect(RequestGuard.Access.PUBLIC,
+                newReadinessEndpoint(readiness)), notFound)));
+        target.createContext("/metrics",
+            wrapHandler(exactPath("/metrics", guard.protect(RequestGuard.Access.READ,
+                new MetricsEndpoint(collector, in.queryRegistry(), readiness)), notFound)));
+        target.createContext("/v1/version",
+            wrapHandler(exactPath("/v1/version", guard.protect(RequestGuard.Access.READ,
+                new VersionEndpoint()), notFound)));
+        target.createContext("/v1/query/status",
+            wrapHandler(exactPath("/v1/query/status", guard.protect(RequestGuard.Access.READ,
+                new QueryStatusEndpoint(in.queryRegistry())), notFound)));
+
+        // Two verbs on one noun, the shape /v1/ingest and /v1/reindex already use: beginning
+        // a drain and ending one are one resource. Each branch carries its own guard, so the
+        // 405 is charged rather than served below it.
+        DrainEndpoint drain = new DrainEndpoint(readiness);
+        target.createContext("/v1/drain", wrapHandler(exactPath("/v1/drain", createMethodRouter(
+            "POST", guard.protect(RequestGuard.Access.MUTATE, drain),
+            "DELETE", guard.protect(RequestGuard.Access.MUTATE, drain),
+            guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                "Method Not Allowed - Use POST to drain or DELETE to undrain"))), notFound)));
+    }
+
+    /**
+     * Readiness over the four signals it is decided from.
+     *
+     * <p>The coverage threshold is the one {@code /health} uses, so the two agree about that
+     * half of the question. The free-disk floor is compiled in: it is not a tuning knob but
+     * the point past which a compaction or a rolling reindex can no longer be relied on to
+     * write its replacement segment.</p>
+     *
+     * @param readiness The operator-controlled drain flag
+     * @return The endpoint behind {@code GET /health/ready}
+     */
+    private ReadinessEndpoint newReadinessEndpoint(ServiceReadiness readiness) {
+        double readinessThreshold = in.config() != null
+            ? in.config().health().getReadinessThreshold()
+            : HealthEndpoint.DEFAULT_READINESS_THRESHOLD;
+        double minFreeDiskRatio = in.config() != null
+            ? in.config().health().getMinFreeDiskRatio()
+            : ReadinessEndpoint.DEFAULT_MIN_FREE_DISK_RATIO;
+        return new ReadinessEndpoint(readiness, this::coverage,
+            in.indexOrchestrator()::isRunning, freeDiskRatio(), readinessThreshold,
+            minFreeDiskRatio);
+    }
+
+    /**
+     * The share of live segments a query reads, from the same catalog {@code /health} asks.
+     *
+     * @return Coverage in [0, 1], or 0 on a node with no catalog
+     */
+    private double coverage() {
+        SegmentCatalog catalog = in.storageEngine().getCatalog();
+        return catalog == null ? 0.0 : catalog.getCatalogMetadata().getEstimatedCoverage();
+    }
+
+    /**
+     * The share of volume capacity still free.
+     *
+     * <p>A node started without a volume manager has not been told where its disks are, which
+     * is not the same as having run out of them: it reports full capacity rather than none,
+     * so an absent manager cannot by itself take a node out of rotation.</p>
+     *
+     * @return A supplier of a ratio in [0, 1]
+     */
+    private DoubleSupplier freeDiskRatio() {
+        VolumeManager volumes = in.volumeManager();
+        if (volumes == null) {
+            return () -> 1.0;
+        }
+        return () -> {
+            VolumeManager.VolumeStats stats = volumes.getAggregatedVolumeStats();
+            return stats == null ? 1.0 : stats.availableRatio();
+        };
     }
 
     /**
@@ -372,28 +633,41 @@ final class EndpointRegistrar {
         QueryCancelEndpoint queryCancelEndpoint = new QueryCancelEndpoint(in.queryRegistry());
         target.createContext("/v1/query", wrapHandler(pathOrChild("/v1/query", createMethodRouter(
             "POST", exactPath("/v1/query",
-                guard.protect(RequestGuard.Access.READ, queryHandler), notFound),
-            "DELETE", guard.protect(RequestGuard.Access.MUTATE, queryCancelEndpoint),
+                corpusRoute(RequestGuard.Access.READ, queryHandler), notFound),
+            "DELETE", corpusRoute(RequestGuard.Access.MUTATE, queryCancelEndpoint),
             exactPath("/v1/query", guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                 "Method Not Allowed - Use POST for queries or DELETE for cancellation")),
                 notFound)), notFound)));
     }
 
     /**
-     * Registers {@code /v1/ingest}: POST registers a source, DELETE stops crawling one.
+     * Registers {@code /v1/ingest}: POST registers a source, GET reads the registrations back,
+     * DELETE stops crawling one.
      *
-     * <p>Both mutate, and both are charged against the mutate budget; the same shape
-     * {@code /v1/query} uses for query and cancel. {@code /v1/ingest/status} is the readback.</p>
+     * <p>The two that mutate are charged against the mutate budget and the read-back against the
+     * read one; the same shape {@code /v1/query} uses for query and cancel.
+     * {@code /v1/ingest/status} is the progress readback, and {@code /v1/ingest/run} stops the
+     * run in progress without deregistering the source - a crawl hammering a site has to be
+     * stoppable without also throwing away what the source was configured as.</p>
      */
     private void registerIngest(HttpServer target, HttpHandler notFound,
                                 IngestEndpoint ingestEndpoint) {
         target.createContext("/v1/ingest", wrapHandler(exactPath("/v1/ingest", createMethodRouter(
-            "POST", guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint),
-            "DELETE", guard.protect(RequestGuard.Access.MUTATE,
-                new SourceDeregisterEndpoint(in.ingestSourceRegistry())),
+            Map.of(
+                "POST", guard.protect(RequestGuard.Access.MUTATE, ingestEndpoint),
+                // The read budget, like every other read-back: an operator asking what a source
+                // was registered as is not changing anything, and charging it against the
+                // mutate budget would let a status poll starve an ingestion.
+                "GET", guard.protect(RequestGuard.Access.READ,
+                    new SourceListEndpoint(in.ingestSourceRegistry(), in.sourceCatalog())),
+                "DELETE", guard.protect(RequestGuard.Access.MUTATE,
+                    new SourceDeregisterEndpoint(in.ingestSourceRegistry()))),
             guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
-                "Method Not Allowed - Use POST to register a source "
-                    + "or DELETE to stop crawling one"))), notFound)));
+                "Method Not Allowed - Use GET to read the registrations, POST to register a "
+                    + "source or DELETE to stop crawling one"))), notFound)));
+        target.createContext("/v1/ingest/run",
+            wrapHandler(exactPath("/v1/ingest/run", guard.protect(RequestGuard.Access.MUTATE,
+                new IngestCancelEndpoint(in.ingestSourceRegistry())), notFound)));
         target.createContext("/v1/ingest/status",
             wrapHandler(exactPath("/v1/ingest/status", guard.protect(RequestGuard.Access.READ,
                 new IngestStatusEndpoint(in.ingestionStatus())), notFound)));
@@ -422,7 +696,16 @@ final class EndpointRegistrar {
         // matching routes it here rather than to the POST above, which supplies documents.
         target.createContext("/v1/documents/fetch",
             wrapHandler(exactPath("/v1/documents/fetch",
-                guard.protect(RequestGuard.Access.READ, documentFetch), notFound)));
+                corpusRoute(RequestGuard.Access.READ, documentFetch), notFound)));
+        // Only on a node that keeps a document registry. Without one the node holds no record
+        // of what it ingested, and an empty listing would read as an empty corpus rather than
+        // as an unanswerable question.
+        if (in.documentRegistry() != null) {
+            target.createContext("/v1/documents/list",
+                wrapHandler(exactPath("/v1/documents/list",
+                    corpusRoute(RequestGuard.Access.READ,
+                        new DocumentListEndpoint(in.documentRegistry())), notFound)));
+        }
     }
 
     /**
@@ -437,20 +720,20 @@ final class EndpointRegistrar {
         HttpHandler wrongMethod = guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
             "Method Not Allowed - Use GET to read a document's text "
                 + "or POST to supply documents"));
-        HttpHandler read = guard.protect(RequestGuard.Access.READ, documentFetch);
+        HttpHandler read = corpusRoute(RequestGuard.Access.READ, documentFetch);
         if (in.ingestionOrchestrator() == null) {
             // MUTATE, not PUBLIC, even though there is nothing behind it. The guard checks
             // the rate limit and then authentication, so a PUBLIC 503 here answered an
             // anonymous caller while a node that does have a pipeline answers 401 - which
             // tells a prober which deployment it is looking at, and describes it.
             return createMethodRouter("GET", read,
-                "POST", guard.protect(RequestGuard.Access.MUTATE, unavailable(
+                "POST", corpusRoute(RequestGuard.Access.MUTATE, unavailable(
                     "Supplying documents directly requires an ingestion pipeline, "
                         + "which this node was started without")),
                 wrongMethod);
         }
         return createMethodRouter("GET", read,
-            "POST", guard.protect(RequestGuard.Access.MUTATE,
+            "POST", corpusRoute(RequestGuard.Access.MUTATE,
                 new DocumentUpsertEndpoint(in.ingestionOrchestrator(), in.ingestSourceRegistry(),
                     suppliedSources, MAX_SUPPLIED_DOCUMENTS)),
             wrongMethod);
@@ -466,8 +749,8 @@ final class EndpointRegistrar {
                                  ReindexEndpoint reindexHandler) {
         target.createContext("/v1/reindex", wrapHandler(exactPath("/v1/reindex",
             createMethodRouter(
-                "POST", guard.protect(RequestGuard.Access.MUTATE, reindexHandler),
-                "DELETE", guard.protect(RequestGuard.Access.MUTATE, reindexHandler),
+                "POST", corpusRoute(RequestGuard.Access.MUTATE, reindexHandler),
+                "DELETE", corpusRoute(RequestGuard.Access.MUTATE, reindexHandler),
                 guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
                     "Method Not Allowed - Use POST to start a reindex or DELETE to stop one"))),
             notFound)));
@@ -476,7 +759,7 @@ final class EndpointRegistrar {
         // /v1/reindex, so the server's longest-prefix matching routes it here rather than to
         // the reindex handler, which answers 405 to a GET.
         target.createContext("/v1/reindex/status",
-            wrapHandler(exactPath("/v1/reindex/status", guard.protect(RequestGuard.Access.READ,
+            wrapHandler(exactPath("/v1/reindex/status", corpusRoute(RequestGuard.Access.READ,
                 new ReindexStatusEndpoint(in.reindexStatus())), notFound)));
     }
 
@@ -487,9 +770,9 @@ final class EndpointRegistrar {
             return;
         }
         target.createContext("/v1/erasure", wrapHandler(exactPath("/v1/erasure",
-            guard.protect(RequestGuard.Access.MUTATE,
+            corpusRoute(RequestGuard.Access.MUTATE,
                 new DocumentErasureEndpoint(in.documentErasure(), in.ingestSourceRegistry(),
-                    suppliedSources)), notFound)));
+                    suppliedSources, in.graphTenants())), notFound)));
     }
 
     /**
@@ -505,12 +788,20 @@ final class EndpointRegistrar {
     private void registerCompaction(HttpServer target, HttpHandler notFound,
                                     CompactionRunner runner) {
         target.createContext("/v1/compact", wrapHandler(exactPath("/v1/compact",
-            guard.protect(RequestGuard.Access.MUTATE, new CompactionEndpoint(runner)),
+            createMethodRouter(
+                "POST", corpusRoute(RequestGuard.Access.MUTATE, new CompactionEndpoint(runner)),
+                // A mutation too: it ends a rewrite of the served data. An anonymous caller
+                // able to stop every compaction is a node that never reclaims anything.
+                "DELETE", corpusRoute(RequestGuard.Access.MUTATE,
+                    new CompactionCancelEndpoint(runner)),
+                guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                    "Method Not Allowed - Use POST to start a compaction or DELETE to stop "
+                        + "the one in progress"))),
             notFound)));
         // A longer path than /v1/compact, so the server's longest-prefix matching routes it
         // here rather than to the handler above, which answers 405 to a GET.
         target.createContext("/v1/compact/status",
-            wrapHandler(exactPath("/v1/compact/status", guard.protect(RequestGuard.Access.READ,
+            wrapHandler(exactPath("/v1/compact/status", corpusRoute(RequestGuard.Access.READ,
                 new CompactionStatusEndpoint(runner)), notFound)));
     }
 
@@ -520,18 +811,53 @@ final class EndpointRegistrar {
      * <p>The query is a read, not a mutation: it walks the graph and returns context, and
      * charging it against the smaller mutate budget would throttle ordinary questions.</p>
      */
-    private void registerGraph(HttpServer target, HttpHandler notFound) {
+    private void registerGraph(HttpServer target, HttpHandler notFound,
+                               GraphBuildRunner graphBuildRunner) {
         if (in.graphTenants() != null) {
             target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
                 guard.protect(RequestGuard.Access.READ,
                     new GraphQueryEndpoint(in.graphTenants())), notFound)));
-            // Both mutations: they rewrite the served graph.
+            // Both mutations: they rewrite the served graph. The build answers 202 and runs
+            // behind the response, so the DELETE beside it is how one started at the wrong
+            // moment is ended - a mutation too, since an anonymous caller able to stop every
+            // build is a node whose graph never changes.
             target.createContext("/v1/graph/build", wrapHandler(exactPath("/v1/graph/build",
-                guard.protect(RequestGuard.Access.MUTATE,
-                    new GraphBuildEndpoint(in.graphTenants())), notFound)));
+                createMethodRouter(
+                    "POST", guard.protect(RequestGuard.Access.MUTATE,
+                        new GraphBuildEndpoint(graphBuildRunner)),
+                    "DELETE", guard.protect(RequestGuard.Access.MUTATE,
+                        new GraphBuildCancelEndpoint(graphBuildRunner)),
+                    guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                        "Method Not Allowed - Use POST to start a graph build or DELETE to "
+                            + "stop the one in progress"))),
+                notFound)));
+            // A longer path than /v1/graph/build, so the server's longest-prefix matching
+            // routes it here rather than to the handler above, which answers 405 to a GET. A
+            // read, like every other /status route: polling for the verdict of a build that
+            // takes minutes must not be rationed against the smaller mutate budget.
+            target.createContext("/v1/graph/build/status", wrapHandler(
+                exactPath("/v1/graph/build/status", guard.protect(RequestGuard.Access.READ,
+                    new GraphBuildStatusEndpoint(graphBuildRunner)), notFound)));
             target.createContext("/v1/graph/erasure", wrapHandler(exactPath("/v1/graph/erasure",
                 guard.protect(RequestGuard.Access.MUTATE,
                     new GraphErasureEndpoint(in.graphTenants())), notFound)));
+            // The namespace inventory and the drop. One context with pathOrChild, because the
+            // collection is a GET and its members carry the namespace in the path. Registered
+            // only where graphTenants is: a node serving somebody else's pipeline has no
+            // namespaces of its own to list, let alone remove.
+            target.createContext("/v1/graph/namespaces", wrapHandler(
+                pathOrChild("/v1/graph/namespaces", createMethodRouter(
+                    "GET", guard.protect(RequestGuard.Access.READ,
+                        exactPath("/v1/graph/namespaces",
+                            new GraphNamespacesEndpoint(in.graphTenants()), notFound)),
+                    // A mutation, and the most destructive one this node offers: it removes a
+                    // tenant's graph, its staged facts and the log of what it still owed.
+                    "DELETE", guard.protect(RequestGuard.Access.MUTATE,
+                        new GraphNamespaceDeleteEndpoint(in.graphTenants())),
+                    guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                        "Method Not Allowed - Use GET /v1/graph/namespaces to list them or "
+                            + "DELETE /v1/graph/namespaces/{namespace} to drop one"))),
+                notFound)));
         } else if (in.graphPipeline() != null) {
             target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
                 guard.protect(RequestGuard.Access.READ,

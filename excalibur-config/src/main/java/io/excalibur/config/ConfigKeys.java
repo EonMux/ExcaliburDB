@@ -64,6 +64,7 @@ public final class ConfigKeys {
         "excalibur.graph.top-k",
         "excalibur.health.healthy-threshold",
         "excalibur.health.max-latency-ms",
+        "excalibur.health.min-free-disk-ratio",
         "excalibur.health.readiness-threshold",
         // Read by excalibur-api's ApiSecurityConfig, not by a Config section: the two crawl
         // allow-lists and the bound on registered sources.
@@ -95,9 +96,13 @@ public final class ConfigKeys {
         "excalibur.llm.relevancy-threshold",
         "excalibur.llm.retry-base-delay-ms",
         "excalibur.llm.timeout-ms",
+        "excalibur.query.cache.enabled",
+        "excalibur.query.cache.max-entries",
         "excalibur.query.distance-metric",
         "excalibur.query.hybrid-retrieval",
         "excalibur.query.include-partial-segments",
+        "excalibur.query.expand-hybrid-queries",
+        "excalibur.query.expansion-timeout-ms",
         "excalibur.query.llm-timeout-ms",
         "excalibur.query.per-signal-over-fetch",
         "excalibur.query.rrf-k",
@@ -119,8 +124,12 @@ public final class ConfigKeys {
         "excalibur.shard.lsh-hash-functions",
         "excalibur.shard.lsh-hash-tables",
         "excalibur.shard.lsh-probes",
+        "excalibur.shard.pq-centroids",
         "excalibur.shard.pq-oversample",
         "excalibur.shard.pq-search-enabled",
+        "excalibur.shard.pq-subspaces",
+        "excalibur.shard.segment-sync-interval-ms",
+        "excalibur.shard.pq-training-samples",
         "excalibur.shard.segment-load-factor",
         "excalibur.shard.volumes",
         "excalibur.visibility.epoch-tick-ms",
@@ -159,6 +168,20 @@ public final class ConfigKeys {
      */
     public static boolean isKnown(String key) {
         return KNOWN.contains(key);
+    }
+
+    /**
+     * Every key this module reads, in a stable order.
+     *
+     * <p>Exposed so a test can hold the inventory against the annotated template an operator
+     * copies. A setting that exists and is not in that file can only be found by reading the
+     * source, and a key in that file this module does not know is reported at every start as a
+     * setting being ignored.</p>
+     *
+     * @return The inventory, sorted
+     */
+    public static List<String> known() {
+        return SORTED_KNOWN;
     }
 
     /**

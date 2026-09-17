@@ -181,6 +181,60 @@ class ReindexStatusEndpointTest {
         }
     }
 
+    @Nested
+    @DisplayName("Telling a cancellation from a failure")
+    class Cancellation {
+
+        @Test
+        @DisplayName("a cancelled run is not reported as a crash")
+        void aCancelledRunSaysSo() throws IOException {
+            registry.startReindex("docs");
+            registry.cancelReindex("docs");
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+            endpoint.handle(get("?source_id=docs", body));
+
+            String json = body.toString(StandardCharsets.UTF_8);
+            assertThat(json)
+                .as("DELETE /v1/reindex points the caller here to learn that the run has "
+                    + "stopped; a deliberate stop reported as a failure is an incident report")
+                .contains("\"cancelled\": true");
+            assertThat(json).contains("\"state\": \"cancelled\"");
+        }
+
+        @Test
+        @DisplayName("a failed run is not reported as a cancellation")
+        void aFailedRunIsNotCancelled() throws IOException {
+            registry.startReindex("docs");
+            registry.failReindex("docs", "Reindex failed completely with 4 errors");
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+            endpoint.handle(get("?source_id=docs", body));
+
+            assertThat(body.toString(StandardCharsets.UTF_8)).contains("\"cancelled\": false");
+        }
+
+        @Test
+        @DisplayName("a run that has ended says when, and one still going does not")
+        void endedRunsCarryAFinishTime() throws IOException {
+            registry.startReindex("running");
+            registry.updateProgress("running", "indexing", 0.5, 5, 10);
+            registry.startReindex("done");
+            registry.completeReindex("done");
+            ByteArrayOutputStream running = new ByteArrayOutputStream();
+            ByteArrayOutputStream done = new ByteArrayOutputStream();
+
+            endpoint.handle(get("?source_id=running", running));
+            endpoint.handle(get("?source_id=done", done));
+
+            assertThat(running.toString(StandardCharsets.UTF_8))
+                .as("a run with an end time that has not ended cannot be told from one that has")
+                .contains("\"finished_at_ms\": 0");
+            assertThat(done.toString(StandardCharsets.UTF_8))
+                .doesNotContain("\"finished_at_ms\": 0");
+        }
+    }
+
     private HttpExchange get(String query, ByteArrayOutputStream body) throws IOException {
         HttpExchange exchange = mock(HttpExchange.class);
         when(exchange.getRequestMethod()).thenReturn("GET");

@@ -126,6 +126,57 @@ class DocumentErasureServiceTest {
     }
 
     @Nested
+    @DisplayName("What it tells a caller it erased")
+    class Reporting {
+
+        @Test
+        @DisplayName("names the documents it erased, not only how many")
+        void namesWhatItErased() throws IOException {
+            // A count cannot be joined to anything. The facts a document contributed to the
+            // graph are addressed by a provenance id derived from its key, so a caller that has
+            // to withdraw the graph half of an erasure needs the keys this actually removed -
+            // which for a source-scoped request it never knew, because the node chose the batch.
+            ingest("docs", "a.md", "alpha content");
+            ingest("docs", "b.md", "beta content");
+
+            DocumentErasureService.Outcome outcome =
+                service().eraseSource("docs", 10, false);
+
+            assertThat(outcome.documentsErased()).isEqualTo(2);
+            assertThat(outcome.erasedDocumentIds())
+                .containsExactlyInAnyOrder("a.md", "b.md");
+        }
+
+        @Test
+        @DisplayName("does not name a document it could not finish erasing")
+        void doesNotNameAnUnfinishedDocument() throws IOException {
+            ingest("docs", "a.md", "alpha content");
+            DocumentErasureService refusing = new DocumentErasureService(
+                registry, key -> {
+                    throw new IllegalStateException("storage is down");
+                }, null, null);
+
+            DocumentErasureService.Outcome outcome =
+                refusing.erase("docs", List.of("a.md"), false);
+
+            assertThat(outcome.documentsIncomplete()).isEqualTo(1);
+            assertThat(outcome.erasedDocumentIds())
+                .as("naming it would have the graph half withdrawn for content still here")
+                .isEmpty();
+        }
+
+        @Test
+        @DisplayName("does not name a document this node never held")
+        void doesNotNameAnAbsentDocument() {
+            DocumentErasureService.Outcome outcome =
+                service().erase("docs", List.of("missing.md"), false);
+
+            assertThat(outcome.documentsNotFound()).isEqualTo(1);
+            assertThat(outcome.erasedDocumentIds()).isEmpty();
+        }
+    }
+
+    @Nested
     @DisplayName("What it removes")
     class Removal {
 

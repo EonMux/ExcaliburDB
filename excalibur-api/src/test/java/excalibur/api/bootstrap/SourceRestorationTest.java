@@ -7,6 +7,7 @@ import excalibur.api.security.IngestTargetValidator;
 import excalibur.ingest.registry.SourceCatalog;
 import excalibur.ingest.source.SourceDescriptor;
 import excalibur.shard.worker.SegmentReindexScheduler;
+import io.excalibur.tenancy.NamespaceId;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -123,6 +124,38 @@ class SourceRestorationTest {
         assertThat(restored).isEqualTo(1);
         assertThat(registry.isRegistered("my-docs")).isTrue();
         assertThat(registry.isRegistered("from-a-newer-build")).isFalse();
+    }
+
+    @Test
+    @DisplayName("a restored source is crawling again in the namespace it was registered in")
+    void aRestoredSourceKeepsItsNamespace(@TempDir Path tempDir) throws IOException {
+        Path corpus = Files.createDirectory(tempDir.resolve("corpus"));
+        SourceCatalog catalog = SourceCatalog.open(tempDir);
+        catalog.record(new SourceDescriptor("filesystem", "acme-docs",
+            Map.of("root_path", corpus.toString()), NamespaceId.of("acme")));
+        InMemorySourceRegistry registry = registryWith(mock(SegmentReindexScheduler.class));
+
+        SourceRestoration.restore(catalog, factoryAllowing(corpus), registry);
+
+        assertThat(registry.namespaceOf("acme-docs"))
+            .as("the re-crawl this restore schedules must stage where the first crawl staged; "
+                + "dropping the namespace would move one tenant's facts into the shared index "
+                + "at the first restart after they were registered")
+            .contains(NamespaceId.of("acme"));
+    }
+
+    @Test
+    @DisplayName("a source recorded before namespaces existed is restored into the shared one")
+    void aSourceWithNoRecordedNamespaceIsShared(@TempDir Path tempDir) throws IOException {
+        Path corpus = Files.createDirectory(tempDir.resolve("corpus"));
+        SourceCatalog catalog = SourceCatalog.open(tempDir);
+        catalog.record(new SourceDescriptor("filesystem", "my-docs",
+            Map.of("root_path", corpus.toString())));
+        InMemorySourceRegistry registry = registryWith(mock(SegmentReindexScheduler.class));
+
+        SourceRestoration.restore(catalog, factoryAllowing(corpus), registry);
+
+        assertThat(registry.namespaceOf("my-docs")).contains(NamespaceId.SHARED);
     }
 
     @Test

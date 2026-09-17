@@ -82,9 +82,9 @@ public final class StreamingIndexWriter implements AutoCloseable {
             tokens += length;
         }
         this.averageDocLength = docLengths.length == 0 ? 1.0 : (double) tokens / docLengths.length;
-        this.dict = stream(directory.resolve("terms.dict"));
-        this.blocks = stream(directory.resolve("post.blk"));
-        this.data = stream(directory.resolve("post.dat"));
+        this.dict = stream(directory.resolve(SegmentFiles.TERMS_DICT));
+        this.blocks = stream(directory.resolve(SegmentFiles.POST_BLK));
+        this.data = stream(directory.resolve(SegmentFiles.POST_DAT));
     }
 
     /**
@@ -151,13 +151,13 @@ public final class StreamingIndexWriter implements AutoCloseable {
         }
     }
 
-    /** Writes the remaining columns and closes the streams. */
+    /** Writes the remaining columns, closes the streams, and makes the index durable. */
     public void finish() throws IOException {
         dict.close();
         blocks.close();
         data.close();
 
-        try (DataOutputStream off = stream(directory.resolve("post.off"))) {
+        try (DataOutputStream off = stream(directory.resolve(SegmentFiles.POST_OFF))) {
             for (int t = 0; t < termCount; t++) {
                 off.writeInt((int) blockStart[t]);
             }
@@ -167,7 +167,7 @@ public final class StreamingIndexWriter implements AutoCloseable {
             }
         }
 
-        try (DataOutputStream lengths = stream(directory.resolve("docs.len"))) {
+        try (DataOutputStream lengths = stream(directory.resolve(SegmentFiles.DOCS_LEN))) {
             for (int length : docLengths) {
                 lengths.writeInt(length);
             }
@@ -177,8 +177,8 @@ public final class StreamingIndexWriter implements AutoCloseable {
             Math.max(16, (int) Math.min(Integer.MAX_VALUE / 2, termCount / HASH_LOAD))) * 2;
         writeHash(slots);
 
-        IndexMeta.current(termCount, docLengths.length, slots, averageDocLength, bm25)
-            .write(directory);
+        SegmentFiles.commit(directory,
+            IndexMeta.current(termCount, docLengths.length, slots, averageDocLength, bm25));
     }
 
     /** Builds the term hash by reading back the dictionary, so no term strings are retained. */
@@ -190,7 +190,7 @@ public final class StreamingIndexWriter implements AutoCloseable {
             table.putInt(i * PostingsWriter.SLOT_BYTES + 4, -1);
         }
         int mask = slots - 1;
-        byte[] dictBytes = Files.readAllBytes(directory.resolve("terms.dict"));
+        byte[] dictBytes = Files.readAllBytes(directory.resolve(SegmentFiles.TERMS_DICT));
         int cursor = 0;
         for (int id = 0; id < termCount; id++) {
             int length = ((dictBytes[cursor] & 0xFF) << 24) | ((dictBytes[cursor + 1] & 0xFF) << 16)
@@ -205,7 +205,7 @@ public final class StreamingIndexWriter implements AutoCloseable {
             table.putInt(slot * PostingsWriter.SLOT_BYTES, (int) (hash >>> 32));
             table.putInt(slot * PostingsWriter.SLOT_BYTES + 4, id);
         }
-        Files.write(directory.resolve("terms.hash"), table.array());
+        Files.write(directory.resolve(SegmentFiles.TERMS_HASH), table.array());
     }
 
     @Override

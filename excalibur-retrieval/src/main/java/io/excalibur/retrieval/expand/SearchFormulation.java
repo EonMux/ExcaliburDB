@@ -18,6 +18,22 @@ public record SearchFormulation(String text, double weight) {
     /** The weight carried by the user's own query. Expansions are scored beneath it. */
     public static final double ORIGINAL_WEIGHT = 1.0;
 
+    /**
+     * The most weight an expansion may carry, however many formulations agree on the term.
+     *
+     * <p>Two bounds are needed, not one. This record's own check bounds a single formulation,
+     * which is not the weight that reaches the index: every consumer sums the weights of the
+     * formulations sharing a term, because a term several of them agreed on is stronger
+     * evidence than one only the best of them suggested. The sum is what has to stay beneath
+     * the user's own words, and {@link ExpansionWeights} is what holds it there.</p>
+     *
+     * <p>Strictly below {@link #ORIGINAL_WEIGHT} rather than equal to it: an expansion that
+     * ties with the typed word has displaced it in every ranking where something else breaks
+     * the tie, and "cannot be outranked" has to be a statement about the search rather than
+     * about arithmetic.</p>
+     */
+    public static final double MAX_EXPANSION_WEIGHT = 0.9;
+
     public SearchFormulation {
         Objects.requireNonNull(text, "text must not be null");
         text = text.trim();

@@ -82,9 +82,16 @@ public class WriteLog implements AutoCloseable {
     private static final long INITIAL_FILE_SIZE = 1024 * 1024;
 
     /**
-     * Maximum file size before rotation is recommended (64 MB).
+     * The capacity of a log, and a hard limit rather than a recommendation (64 MiB).
+     *
+     * <p>The file is mapped once at this size and never re-mapped (see the comment on the
+     * {@code openFileChannel} call in the constructor), so an append that would cross it is
+     * refused and stays refused: nothing grows the log, and only compaction replaces it. That
+     * makes this the ceiling every write-log-driven compaction trigger has to sit below, which
+     * is why it is public - {@link CompactionWorker#MAX_WRITE_LOG_SIZE_THRESHOLD} is derived
+     * from it, and a trigger above it would be a trigger that can never fire.</p>
      */
-    private static final long MAX_FILE_SIZE = 64 * 1024 * 1024;
+    public static final long MAX_FILE_SIZE = 64L * 1024 * 1024;
 
     /**
      * File extension for rotated log files.
@@ -955,6 +962,7 @@ public class WriteLog implements AutoCloseable {
         try {
             return LogEntry.sizeAt(mappedSegmentWrapper, offset);
         } catch (Exception e) {
+            LOGGER.fine("Failed to read the entry size at offset " + offset + ": " + e.getMessage());
             return -1;
         }
     }
@@ -1077,6 +1085,7 @@ public class WriteLog implements AutoCloseable {
         try {
             return LogEntry.sizeAt(segment, offset);
         } catch (Exception e) {
+            LOGGER.fine("Failed to read the entry size at offset " + offset + ": " + e.getMessage());
             return -1;
         }
     }

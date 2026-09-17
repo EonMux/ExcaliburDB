@@ -234,6 +234,36 @@ public final class LabelDictionary implements AutoCloseable, LongFunction<String
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
+    /**
+     * Hands every recorded (id, name) pair to {@code visitor}, in ascending id order.
+     *
+     * <p>Lookup is the hot path and needs nothing but {@link #apply}, but rewriting a dictionary
+     * needs to know what is in it - which an erasure has to do, because the erased entity's name
+     * is in here and a tombstone over it is not a deletion of it. Reading the pairs back out of
+     * the file this way is what lets a rewrite keep every other id exactly where it was.
+     *
+     * @param visitor Receives each id and the name recorded for it
+     * @throws NullPointerException if {@code visitor} is null
+     */
+    public void forEach(Entry visitor) {
+        java.util.Objects.requireNonNull(visitor, "visitor must not be null");
+        for (int slot = 0; slot < count; slot++) {
+            long id = index.get(LONG, HEADER_BYTES + (long) slot * ENTRY_BYTES);
+            visitor.visit(id, apply(id));
+        }
+    }
+
+    /** One recorded name, as {@link #forEach} reads it back. */
+    @FunctionalInterface
+    public interface Entry {
+
+        /**
+         * @param id   The entity or relation id
+         * @param name The name recorded for it
+         */
+        void visit(long id, String name);
+    }
+
     /** Binary search over the id column; the insertion point is not needed, so misses return -1. */
     private int search(long id) {
         int low = 0;

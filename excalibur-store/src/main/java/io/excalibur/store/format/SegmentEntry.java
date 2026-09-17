@@ -31,6 +31,15 @@ import java.util.Objects;
  *   <li>{@code tombstone}: Exactly 0 (live) or 1 (deleted)</li>
  * </ul>
  *
+ * <h2>Which Format These Codecs Read</h2>
+ * <p>The static readers and writers here describe {@link SegmentFormat#V1}: a 17-byte
+ * header with no checksum. They are self-consistent - what {@code writeTo} lays down,
+ * {@code readFrom} reads back - and are used that way, over buffers this class itself
+ * filled. They must not be pointed at the data region of a {@link SegmentFormat#V2}
+ * segment file, whose records carry four more header bytes; that file is read through
+ * {@code io.excalibur.store.Segment}, which knows its own format and verifies each
+ * record's checksum before handing it over.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Read operations are thread-safe. Write operations require external synchronization.
  * Instances of this class are immutable once created.</p>

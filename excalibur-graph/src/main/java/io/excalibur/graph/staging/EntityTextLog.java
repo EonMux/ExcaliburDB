@@ -1,5 +1,6 @@
 package io.excalibur.graph.staging;
 
+import io.excalibur.graph.build.BuildCancellation;
 import io.excalibur.graph.file.Durability;
 import io.excalibur.graph.file.TailIntegrity;
 import io.excalibur.graph.provenance.Provenance;
@@ -13,6 +14,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -158,10 +160,17 @@ public final class EntityTextLog implements AutoCloseable {
      * unreachable by a source-scoped erasure for as long as they remain, which is why
      * {@link Erased#ofUnknownOrigin} exists: the gap is reported rather than papered over.
      *
+     * <h3>What a crash mid-append leaves behind</h3>
+     * <p>A partial record at the end is cut off here, before anything is appended after it; see
+     * {@link #trimTornTail}. Leaving it would wedge the log permanently, because the very next
+     * append puts an intact record behind the damage and that is indistinguishable from
+     * corruption in the middle of a log - which {@link #forEach} and {@link #erase} both refuse,
+     * correctly and for ever.
+     *
      * @param path The file to read and append to; created, with its parent, if absent
      * @return The log
      * @throws IOException if the file is not one of these logs, is damaged other than at the tail,
-     *                     or cannot be upgraded or opened
+     *                     or cannot be upgraded, trimmed or opened
      * @throws NullPointerException if {@code path} is null
      */
     public static EntityTextLog open(Path path) throws IOException {
@@ -174,7 +183,51 @@ public final class EntityTextLog implements AutoCloseable {
             && versionOf(path) == VERSION_WITHOUT_PROVENANCE) {
             upgrade(path);
         }
+        trimTornTail(path);
         return new EntityTextLog(path, openForAppend(path));
+    }
+
+    /**
+     * Cuts a write that was interrupted off the end, before anything is appended after it.
+     *
+     * <h3>Why the next append is what does the damage</h3>
+     * <p>A process killed mid-append leaves a partial record, and the records before it are
+     * intact and are what every artifact built from this log refers to. Left in place, though,
+     * the tear is not stable: the next run opens the log in append mode and writes after the
+     * partial bytes, so the damage now has a perfectly good record behind it. That is the exact
+     * shape of corruption in the middle of a log, which {@link TailIntegrity} refuses - so from
+     * that append onwards every replay and every erasure throws, the graph can never be built
+     * again and the erasure obligations aimed at this log can never be discharged. Trimming here
+     * is what keeps a crash costing the one snippet that was in flight.
+     *
+     * <p>Refused, rather than trimmed, when a readable record already follows the break. Those
+     * records were written and acknowledged after a write that failed for a reason the file
+     * outlived, and truncating to the damage would destroy prose nobody asked to erase.
+     *
+     * @param path The log
+     * @throws IOException if the file cannot be read, holds damage that is not a torn tail, or
+     *                     cannot be truncated
+     */
+    private static void trimTornTail(Path path) throws IOException {
+        if (!Files.exists(path) || Files.size(path) < HEADER_BYTES) {
+            return;
+        }
+        byte[] all = Files.readAllBytes(path);
+        Cursor cursor = new Cursor(all);
+        while (cursor.next()) {
+            // Walked only for where the readable records end; nothing here decodes a snippet.
+        }
+        if (cursor.position >= all.length) {
+            return;
+        }
+
+        cursor.requireTornTail(path);
+        LOGGER.warn("truncating {} from {} to {} bytes after {} snippet(s): a write was cut "
+            + "short, and appending after it would leave every later snippet behind damage that "
+            + "replay stops at", path, all.length, cursor.position, cursor.read);
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+            channel.truncate(cursor.position);
+        }
     }
 
     /**
@@ -229,7 +282,12 @@ public final class EntityTextLog implements AutoCloseable {
             return 0;
         }
         Cursor cursor = new Cursor(all);
+        // The replay both Lucene indexes and every entity vector are built from, so this is
+        // where a build spends its time and where it is asked to stop. Nothing is published
+        // until every phase has finished, so stopping here costs the build and no data.
+        BuildCancellation.checkpoint();
         while (cursor.next()) {
+            BuildCancellation.checkpoint(cursor.read);
             visitor.visit(cursor.entityId, cursor.snippet(), cursor.provenance);
         }
         cursor.requireTornTail(path);

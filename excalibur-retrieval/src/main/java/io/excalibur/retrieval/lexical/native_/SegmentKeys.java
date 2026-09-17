@@ -342,10 +342,17 @@ final class SegmentKeys implements AutoCloseable {
                 return;
             }
             mapped = true;
+            // The names and their offsets are the only part of a segment that cannot be
+            // reconstructed from anything else, and the manifest names the segment on the
+            // strength of this method returning. The table is rebuilt whenever its length
+            // disagrees, so it needs no such promise.
+            Durability.FILE_SYSTEM.force(directory.resolve(segment + KEYS_SUFFIX));
+            Durability.FILE_SYSTEM.force(directory.resolve(segment + INDEX_SUFFIX));
             try (MappedFile keyFile = MappedFile.open(directory.resolve(segment + KEYS_SUFFIX));
                  MappedFile indexFile = MappedFile.open(directory.resolve(segment + INDEX_SUFFIX))) {
                 writeMap(directory.resolve(segment + MAP_SUFFIX), keyFile, indexFile, written);
             }
+            Durability.FILE_SYSTEM.forceDirectory(directory);
         }
     }
 }

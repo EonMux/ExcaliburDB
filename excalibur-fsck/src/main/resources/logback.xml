@@ -1,0 +1,22 @@
+<!--
+  Logging for the offline checker, which is a command rather than a service.
+
+  Everything goes to stderr, and nothing below WARN goes anywhere. stdout is the report:
+  in JSON mode it is a single document a pipeline parses, and one INFO line from a library
+  initialising a memory mapping is enough to make that document unparseable. The level is
+  raised for the same reason a check is not a server: the libraries these formats are read
+  with narrate their start-up, and none of that narration is an answer to the question the
+  tool was run to ask.
+-->
+<configuration>
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} : %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="WARN">
+        <appender-ref ref="STDERR"/>
+    </root>
+</configuration>

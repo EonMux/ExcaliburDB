@@ -16,9 +16,16 @@ plugins {
 // and the shadow start scripts.
 application {
     mainClass.set("excalibur.api.ExcaliburApplication")
+    // The two preview flags are required to start at all. The rest are the flags that decide
+    // whether the first failure in production is diagnosable: a memory-mapped engine that runs
+    // out of heap leaves no artefact unless it is asked for one, and a JVM that survives an
+    // OutOfMemoryError in a worker thread keeps answering /health while doing no work.
     applicationDefaultJvmArgs = listOf(
         "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED"
+        "--enable-native-access=ALL-UNNAMED",
+        "-XX:+HeapDumpOnOutOfMemoryError",
+        "-XX:HeapDumpPath=.",
+        "-XX:+ExitOnOutOfMemoryError"
     )
 }
 
@@ -101,6 +108,12 @@ tasks.shadowJar {
     manifest {
         attributes["Main-Class"] = "excalibur.api.ExcaliburApplication"
         attributes["Enable-Native-Access"] = "ALL-UNNAMED"
+        // Stamped so a running node can say which build it is. "Which version is on this host"
+        // is the first question of an incident and of a rollback, and a jar that cannot answer
+        // it makes both guesswork.
+        attributes["Implementation-Title"] = "ExcaliburDB"
+        attributes["Implementation-Version"] = project.version.toString()
+        attributes["Build-Jdk"] = System.getProperty("java.version")
     }
 
     // `java -jar` cannot be told to enable preview from the manifest, so the fat JAR is

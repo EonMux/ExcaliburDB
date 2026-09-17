@@ -281,10 +281,18 @@ public final class LlmRelationExtractor implements RelationExtractor {
      * <p>Stable across runs, so an erasure request naming a document resolves to the same edges it
      * did when they were written.
      *
-     * @param documentKey The document key
+     * <p>Public because an erasure has to be able to ask the same question from the other end.
+     * Every fact and every snippet this node stages from a document carries this id, and nothing
+     * else records which document a fact came from - so withdrawing a document means submitting
+     * a source-scoped obligation for exactly this number. A second definition of it somewhere
+     * else would be a second answer the day either one changed, and the symptom would be an
+     * erasure that reported success and removed nothing.
+     *
+     * @param documentKey The document key, as
+     *                    {@link io.excalibur.core.text.ChunkIdentifiers#documentKey} forms it
      * @return Its id
      */
-    private static long sourceIdOf(String documentKey) {
+    public static long sourceIdOf(String documentKey) {
         return io.excalibur.store.hash.XxHash64.hash(documentKey.getBytes(StandardCharsets.UTF_8));
     }
 

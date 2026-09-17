@@ -97,10 +97,12 @@ public final class ColumnFileWriter implements AutoCloseable {
     /**
      * Flushes and closes.
      *
-     * <p>Does not force to disk. The descriptor is written last and moved into place atomically, so
-     * a store whose columns are still in the page cache when the process dies simply has no
-     * descriptor and will not open — which is the outcome that matters. Forcing every column would
-     * cost far more than it buys.
+     * <p>Does not force to disk, because whether a column is durable is not this writer's
+     * decision to make: the ordering that matters is every column before the descriptor, and only
+     * the build that writes both knows when that point is. {@code EdgeStoreWriter.build} forces
+     * them there, and {@code EdgeStoreCompactor} forces the whole replacement tree before it
+     * swaps. Forcing here as well would buy nothing and turn a streaming write into a fsync per
+     * buffer's worth of column.
      */
     @Override
     public void close() throws IOException {

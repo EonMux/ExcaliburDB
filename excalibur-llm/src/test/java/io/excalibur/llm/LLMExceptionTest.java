@@ -1,5 +1,6 @@
 package io.excalibur.llm;
 
+import io.excalibur.llm.client.HttpStatus;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -348,16 +349,31 @@ class LLMExceptionTest {
     @DisplayName("Domain Correctness")
     class DomainCorrectnessTests {
 
+        /**
+         * An out-of-range code is not clamped into [100, 599] at both ends. Per
+         * {@link HttpStatus#clamp(int)} a code below 100 becomes the -1 "not applicable"
+         * sentinel rather than 100, and only a code above 599 is clamped, to 599.
+         *
+         * <p>Retryability is derived from the code as given, before that normalization:
+         * 600 is retryable because it is {@code >= 500}, even though the stored code
+         * ends up as 599.</p>
+         */
         @Test
-        @DisplayName("Status code is clamped to valid range")
-        void statusCodeClampedToValidRange() {
-            // Valid range is [100, 599] or -1
-            LLMException ex1 = new LLMException("Test", LLMException.ErrorType.HTTP_ERROR, 99);
-            // Status codes below 100 are clamped by HttpStatus.clamp()
-            // The actual behavior depends on HttpStatus implementation
+        @DisplayName("Out-of-range status code is normalized, not clamped at both ends")
+        void outOfRangeStatusCodeIsNormalized() {
+            LLMException belowRange =
+                new LLMException("Test", LLMException.ErrorType.HTTP_ERROR, 99);
+            assertEquals(-1, belowRange.getStatusCode(),
+                "A code below 100 becomes the -1 sentinel, not HttpStatus.MIN_STATUS_CODE");
+            assertFalse(belowRange.isRetryable(),
+                "HTTP_ERROR below 500 is not retryable");
 
-            LLMException ex2 = new LLMException("Test", LLMException.ErrorType.HTTP_ERROR, 600);
-            // Status codes above 599 are also clamped
+            LLMException aboveRange =
+                new LLMException("Test", LLMException.ErrorType.HTTP_ERROR, 600);
+            assertEquals(HttpStatus.MAX_STATUS_CODE, aboveRange.getStatusCode(),
+                "A code above 599 is clamped down to HttpStatus.MAX_STATUS_CODE");
+            assertTrue(aboveRange.isRetryable(),
+                "Retryability is decided from the raw code, so 600 counts as a 5xx");
         }
 
         @Test

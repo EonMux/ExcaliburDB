@@ -59,6 +59,11 @@ class LexicalAnswerSaturationTest {
         return new QueryRequestParser(null, ApiSecurityConfig.defaults(), 5000L);
     }
 
+    /** The presentation fields the query route resolves, over a node with no chunk storage. */
+    private static QueryContexts contexts() {
+        return new QueryContexts(ApiSecurityConfig.defaults(), new ResultText(4096));
+    }
+
     @Test
     @DisplayName("a query is refused rather than started when every permit is taken")
     void refusesWhenSaturated() throws IOException {
@@ -70,7 +75,7 @@ class LexicalAnswerSaturationTest {
             .isGreaterThan(0);
 
         LexicalQueryService lexical = mock(LexicalQueryService.class);
-        LexicalAnswer answer = new LexicalAnswer(parser(), executor, null, new ResultText(4096));
+        LexicalAnswer answer = new LexicalAnswer(parser(), executor, null, contexts());
 
         HttpExchange exchange = mock(HttpExchange.class);
         ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
@@ -100,7 +105,7 @@ class LexicalAnswerSaturationTest {
         when(lexical.stats()).thenReturn(null);
 
         int before = LexicalSearchPermits.available();
-        LexicalAnswer answer = new LexicalAnswer(parser(), executor, null, new ResultText(4096));
+        LexicalAnswer answer = new LexicalAnswer(parser(), executor, null, contexts());
 
         HttpExchange exchange = mock(HttpExchange.class);
         when(exchange.getRequestMethod()).thenReturn("POST");

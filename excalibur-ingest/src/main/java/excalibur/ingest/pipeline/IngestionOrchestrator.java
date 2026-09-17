@@ -155,7 +155,7 @@ public class IngestionOrchestrator {
 
     /**
      * Default document timeout in milliseconds.
-     * Used when no config is provided. Matches Config.Ingest.DEFAULT_DOCUMENT_TIMEOUT_MS.
+     * Used when no config is provided. Matches IngestConfig.DEFAULT_DOCUMENT_TIMEOUT_MS.
      */
     public static final int DEFAULT_DOCUMENT_TIMEOUT_MS = 2000;
 

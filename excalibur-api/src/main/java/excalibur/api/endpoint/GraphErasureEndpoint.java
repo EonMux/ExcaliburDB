@@ -3,11 +3,13 @@ package excalibur.api.endpoint;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import excalibur.api.bootstrap.GraphErasureService;
+import excalibur.api.bootstrap.GraphRagFactory;
 import excalibur.api.bootstrap.GraphTenant;
 import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.RequestBody;
 import excalibur.api.protocol.ResponseBody;
+import io.excalibur.graph.dictionary.LabelDictionary;
 import io.excalibur.graph.erasure.ErasureScope;
 import io.excalibur.graph.provenance.SourceType;
 import io.excalibur.tenancy.NamespaceId;
@@ -17,8 +19,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.SortedSet;
+import java.util.TreeSet;
 
 /**
  * {@code POST /v1/graph/erasure} - accepts an obligation to remove data from the graph.
@@ -36,9 +41,29 @@ import java.util.Objects;
  * <h3>Request</h3>
  * <pre>
  * {"scope": "entity",   "entity_id": 42}
+ * {"scope": "entity",   "entity_name": "Ada Lovelace"}
  * {"scope": "source",   "source_type": "DOCUMENT", "source_id": 1234}
  * {"scope": "extractor","version": 7}
  * </pre>
+ *
+ * <h3>Naming a person rather than an integer</h3>
+ * <p>An entity id is an internal number. Nothing this node serves hands one out - a graph answer
+ * carries names and prose - so requiring one meant "erase everything about this person" could
+ * only be asked by someone who had already seen that person in an answer and read the id out of
+ * the free text. {@code entity_name} closes that: it names the person the way the request that
+ * created the obligation names them.
+ *
+ * <p>Resolved by exact match, ignoring case and surrounding space, against the entity names this
+ * namespace knows - the served entity dictionary and the staged labels it is built from, which
+ * between them cover a person whose facts are built and one whose facts are only staged.
+ * Deliberately <em>not</em> against the {@code labels} Lucene index, which is the other obvious
+ * place to look: that index exists to rank near matches, and its whole value at query time - that
+ * "Lovelace" finds "Ada Lovelace" - is a defect here. An erasure is irreversible, so the only
+ * acceptable resolution is one that cannot return somebody whose name merely resembles the one
+ * given.
+ *
+ * <p>A name no entity has is a 404, and a name two entities share is a 409 listing their ids,
+ * because guessing which of two people to erase is not a decision this endpoint may take.
  *
  * <p>Optionally {@code "compact": true} to run the compaction immediately rather than leaving it to
  * the policy - for a caller under a deadline that must be able to say the data is gone.</p>
@@ -79,12 +104,12 @@ public class GraphErasureEndpoint implements HttpHandler {
         }
 
         NamespaceId namespace;
-        ErasureScope scope;
+        Requested requested;
         boolean compactNow;
         try {
             namespace = GraphTenants.namespaceOf(
                 exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER));
-            scope = scopeFrom(body);
+            requested = scopeFrom(body);
             // Every field of the request is read before any of it is acted on. Reading this one
             // after the obligation was submitted meant a body with a malformed "compact" was
             // durably recorded and then answered 500, so the caller retried and recorded it
@@ -97,6 +122,15 @@ public class GraphErasureEndpoint implements HttpHandler {
         }
 
         try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
+            ErasureScope scope = requested.scope();
+            if (scope == null) {
+                // Resolved here rather than at parse time because it takes this namespace's
+                // names, and which namespace that is comes from the header.
+                scope = resolved(exchange, lease.resource(), requested.entityName());
+                if (scope == null) {
+                    return;
+                }
+            }
             GraphErasureService erasureService = lease.resource().erasureService();
             long id = erasureService.submit(scope);
 
@@ -138,13 +172,26 @@ public class GraphErasureEndpoint implements HttpHandler {
     }
 
     /**
+     * What a request asked for: a scope, or a name still to be resolved against a namespace.
+     *
+     * <p>Two fields rather than a resolved scope, because resolving a name needs the namespace's
+     * entity names and the namespace is not known until the header has been read. Exactly one is
+     * ever set.
+     *
+     * @param scope      The scope, or null when a name has to be resolved first
+     * @param entityName The name to resolve, or null when the scope is already known
+     */
+    private record Requested(ErasureScope scope, String entityName) {
+    }
+
+    /**
      * Reads the scope a request names.
      *
      * @param body The request body
-     * @return The scope
+     * @return The scope, or the name that stands in for one
      * @throws IllegalArgumentException if the scope is missing, unknown, or missing its field
      */
-    private static ErasureScope scopeFrom(String body) {
+    private static Requested scopeFrom(String body) {
         String scope = JsonText.string(body, "scope");
         if (scope == null || scope.isBlank()) {
             throw new IllegalArgumentException(
@@ -152,15 +199,110 @@ public class GraphErasureEndpoint implements HttpHandler {
         }
 
         return switch (scope.trim().toLowerCase(Locale.ROOT)) {
-            case "entity" -> new ErasureScope.Entity(
-                requireLong(body, "entity_id", "scope 'entity' requires 'entity_id'"));
-            case "source" -> new ErasureScope.Source(
+            case "entity" -> entityScopeFrom(body);
+            case "source" -> new Requested(new ErasureScope.Source(
                 sourceTypeFrom(body),
-                requireLong(body, "source_id", "scope 'source' requires 'source_id'"));
-            case "extractor" -> new ErasureScope.ExtractorVersion(extractorVersionFrom(body));
+                requireLong(body, "source_id", "scope 'source' requires 'source_id'")), null);
+            case "extractor" ->
+                new Requested(new ErasureScope.ExtractorVersion(extractorVersionFrom(body)),
+                    null);
             default -> throw new IllegalArgumentException(
                 "unknown scope '" + scope + "'; expected entity, source or extractor");
         };
+    }
+
+    /**
+     * Reads which entity an entity-scoped request is about, by id or by name.
+     *
+     * <p>Both at once is refused rather than reconciled. They can disagree, and the way to find
+     * out which the caller meant is not to pick one and erase whoever it names.
+     *
+     * @param body The request body
+     * @return The scope, or the name to resolve
+     * @throws IllegalArgumentException if neither is given, or both are
+     */
+    private static Requested entityScopeFrom(String body) {
+        String name = JsonText.string(body, "entity_name");
+        boolean named = name != null && !name.isBlank();
+        long id = JsonText.longValue(body, "entity_id", Long.MIN_VALUE);
+        if (named && id != Long.MIN_VALUE) {
+            throw new IllegalArgumentException(
+                "scope 'entity' takes 'entity_id' or 'entity_name', not both: they can name "
+                    + "different entities and an erasure is not reversible");
+        }
+        if (named) {
+            return new Requested(null, name.trim());
+        }
+        if (id == Long.MIN_VALUE) {
+            throw new IllegalArgumentException(
+                "scope 'entity' requires 'entity_id' or 'entity_name'");
+        }
+        return new Requested(new ErasureScope.Entity(id), null);
+    }
+
+    /**
+     * Turns a name into the one entity that has it, or answers the caller and returns null.
+     *
+     * @param exchange The request, answered here when the name resolves to none or to several
+     * @param tenant   The namespace's graph
+     * @param name     The name to resolve
+     * @return The scope, or null when this has already replied
+     * @throws IOException if the names cannot be read or the reply cannot be written
+     */
+    private static ErasureScope resolved(HttpExchange exchange, GraphTenant tenant, String name)
+            throws IOException {
+        SortedSet<Long> ids = idsNamed(tenant, name);
+        if (ids.isEmpty()) {
+            ResponseBody.sendJson(exchange, 404,
+                "{\"error\": \"no entity in this namespace is named \\\"" + JsonText.escape(name)
+                    + "\\\"; erasure resolves a name exactly rather than approximately\"}");
+            return null;
+        }
+        if (ids.size() > 1) {
+            // Listing the ids is what makes this answerable: the caller repeats the request with
+            // the entity_id of the one they meant. Withholding them would leave a person who
+            // shares a name with somebody unerasable through this endpoint.
+            ResponseBody.sendJson(exchange, 409,
+                "{\"error\": \"" + ids.size() + " entities are named \\\""
+                    + JsonText.escape(name) + "\\\"; repeat the request with the 'entity_id' "
+                    + "of the one to erase\", \"candidates\": " + ids + "}");
+            return null;
+        }
+        return new ErasureScope.Entity(ids.first());
+    }
+
+    /**
+     * Every entity id this namespace calls {@code name}.
+     *
+     * <p>Both the served dictionary and the staged labels, because they answer different halves
+     * of the question. The dictionary names what the node is serving now; the staged labels name
+     * what it will serve after the next build, which includes a person whose facts have been
+     * ingested and not yet built - and an obligation about them is exactly as real.
+     *
+     * @param tenant The namespace's graph
+     * @param name   The name, already trimmed
+     * @return The ids, in order, possibly empty
+     * @throws IOException if the staged labels or the dictionary cannot be read
+     */
+    private static SortedSet<Long> idsNamed(GraphTenant tenant, String name) throws IOException {
+        SortedSet<Long> ids = new TreeSet<>();
+        List<String> staged = tenant.staging().entityLabels();
+        for (int id = 0; id < staged.size(); id++) {
+            if (name.equalsIgnoreCase(staged.get(id))) {
+                ids.add((long) id);
+            }
+        }
+        try (LabelDictionary dictionary = LabelDictionary.openIfPresent(
+                tenant.directory(), GraphRagFactory.ENTITY_DICTIONARY, "E")) {
+            if (dictionary != null) {
+                dictionary.forEach((id, served) -> {
+                    if (name.equalsIgnoreCase(served)) {
+                        ids.add(id);
+                    }
+                });
+            }
+        }
+        return ids;
     }
 
     /**

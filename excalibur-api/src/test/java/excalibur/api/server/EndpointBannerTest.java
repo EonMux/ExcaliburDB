@@ -23,7 +23,7 @@ class EndpointBannerTest {
     @DisplayName("On a node with nothing optional configured")
     class Minimal {
 
-        private final List<String> lines = EndpointBanner.lines(false, false, false, false);
+        private final List<String> lines = EndpointBanner.lines(routes());
 
         @Test
         @DisplayName("names every route that is always registered")
@@ -44,6 +44,25 @@ class EndpointBannerTest {
             assertThat(lines).anyMatch(line -> line.contains("/v1/documents/fetch"));
             assertThat(lines).anyMatch(line -> line.contains("POST") && line.contains("/v1/compact "));
             assertThat(lines).anyMatch(line -> line.contains("/v1/compact/status"));
+        }
+
+        /**
+         * The observability surface. A route an operator is never told about is a route
+         * nobody configures a scraper or a probe against, so each of these has to be here
+         * for the same reason the rest are.
+         */
+        @Test
+        @DisplayName("names the routes a monitoring system and a probe are pointed at")
+        void namesTheObservabilityRoutes() {
+            assertThat(lines).anyMatch(line -> line.contains("GET") && line.contains("/metrics"));
+            assertThat(lines).anyMatch(
+                line -> line.contains("GET") && line.contains("/health/ready"));
+            assertThat(lines).anyMatch(line -> line.contains("GET") && line.contains("/v1/version"));
+            assertThat(lines).anyMatch(
+                line -> line.contains("GET") && line.contains("/v1/query/status"));
+            assertThat(lines).anyMatch(line -> line.contains("POST") && line.contains("/v1/drain"));
+            assertThat(lines).anyMatch(
+                line -> line.contains("DELETE") && line.contains("/v1/drain"));
         }
 
         /**
@@ -72,40 +91,86 @@ class EndpointBannerTest {
         @Test
         @DisplayName("names the document write route once an ingestion pipeline is wired")
         void namesDocumentWrite() {
-            assertThat(EndpointBanner.lines(false, false, false, true))
+            assertThat(EndpointBanner.lines(withIngestion()))
                 .anyMatch(line -> line.contains("POST") && line.contains("/v1/documents "));
         }
 
         @Test
         @DisplayName("names erasure once it is wired")
         void namesErasure() {
-            assertThat(EndpointBanner.lines(true, false, false, false))
+            assertThat(EndpointBanner.lines(withErasure()))
                 .anyMatch(line -> line.contains("/v1/erasure"));
         }
 
         @Test
-        @DisplayName("names all three graph routes when a graph store is configured")
+        @DisplayName("names every graph route when a graph store is configured")
         void namesTheGraphRoutes() {
-            List<String> lines = EndpointBanner.lines(false, true, false, false);
+            List<String> lines = EndpointBanner.lines(withGraphTenanted());
             assertThat(lines).anyMatch(line -> line.contains("/v1/graph/query"));
             assertThat(lines).anyMatch(line -> line.contains("/v1/graph/build"));
             assertThat(lines).anyMatch(line -> line.contains("/v1/graph/erasure"));
+            assertThat(lines).anyMatch(line -> line.contains("GET")
+                && line.contains("/v1/graph/namespaces "));
+            assertThat(lines).anyMatch(line -> line.contains("DELETE")
+                && line.contains("/v1/graph/namespaces/{namespace}"));
         }
 
         @Test
         @DisplayName("names only the query route on a node wired with a bare pipeline")
         void namesOnlyGraphQueryForABarePipeline() {
-            List<String> lines = EndpointBanner.lines(false, false, true, false);
+            List<String> lines = EndpointBanner.lines(withGraphQueryOnly());
             assertThat(lines).anyMatch(line -> line.contains("/v1/graph/query"));
             assertThat(lines).noneMatch(line -> line.contains("/v1/graph/build"));
             assertThat(lines).noneMatch(line -> line.contains("/v1/graph/erasure"));
+            assertThat(lines).noneMatch(line -> line.contains("/v1/graph/namespaces"));
         }
+    }
+
+    @Test
+    @DisplayName("names the document listing once the node keeps a registry")
+    void namesDocumentListing() {
+        assertThat(EndpointBanner.lines(routes()))
+            .as("a node that keeps no registry does not serve the route, and must not name it")
+            .noneMatch(line -> line.contains("/v1/documents/list"));
+        assertThat(EndpointBanner.lines(withDocumentListing()))
+            .anyMatch(line -> line.contains("GET") && line.contains("/v1/documents/list"));
+    }
+
+    // Named factories rather than five anonymous booleans at every call site.
+
+    /** A node with nothing optional wired. */
+    private static EndpointBanner.Routes routes() {
+        return new EndpointBanner.Routes(false, false, false, false, false);
+    }
+
+    private static EndpointBanner.Routes withErasure() {
+        return new EndpointBanner.Routes(true, false, false, false, false);
+    }
+
+    private static EndpointBanner.Routes withGraphTenanted() {
+        return new EndpointBanner.Routes(false, true, false, false, false);
+    }
+
+    private static EndpointBanner.Routes withGraphQueryOnly() {
+        return new EndpointBanner.Routes(false, false, true, false, false);
+    }
+
+    private static EndpointBanner.Routes withIngestion() {
+        return new EndpointBanner.Routes(false, false, false, true, false);
+    }
+
+    private static EndpointBanner.Routes withDocumentListing() {
+        return new EndpointBanner.Routes(false, false, false, false, true);
+    }
+
+    private static EndpointBanner.Routes everything() {
+        return new EndpointBanner.Routes(true, true, false, true, true);
     }
 
     @Test
     @DisplayName("lines up the descriptions, so the banner reads as a table")
     void isAligned() {
-        List<String> lines = EndpointBanner.lines(true, true, false, true);
+        List<String> lines = EndpointBanner.lines(everything());
         assertThat(lines).allMatch(line -> line.indexOf(" - ") == lines.get(0).indexOf(" - "));
     }
 }

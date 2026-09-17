@@ -5,9 +5,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 
+import io.excalibur.graph.file.Durability;
 import io.excalibur.graph.format.ColumnFileWriter;
 import io.excalibur.graph.format.EdgeColumn;
 import io.excalibur.graph.format.EdgeStoreDescriptor;
+import io.excalibur.graph.build.BuildCancellation;
 import io.excalibur.graph.provenance.Provenance;
 import io.excalibur.graph.temporal.SupersessionPolicy;
 import io.excalibur.graph.temporal.TemporalFilter;
@@ -153,6 +155,32 @@ public final class EdgeStoreWriter {
      *                    entities happened to be mentioned.
      */
     public void build(Path directory, long entityCount) throws IOException {
+        build(directory, entityCount, Durability.DEVICE);
+    }
+
+    /**
+     * As above, with how the store is forced to the device under the caller's control.
+     *
+     * <p>The columns are forced before the descriptor is written, which is what turns "the
+     * descriptor is written last" from a statement about the order of two writes into the
+     * guarantee the format actually needs. Until this, the ordering held against the page cache
+     * and nothing else: a power loss could leave the descriptor durable over columns that were
+     * not, producing the one outcome the ordering exists to prevent — a directory that opens as
+     * a store and reads truncated columns.
+     *
+     * @param directory   where the store goes
+     * @param entityCount how many entity ids the store addresses
+     * @param durability  how the columns and the descriptor are forced
+     * @throws IOException if any column or the descriptor cannot be written or forced
+     * @throws IllegalArgumentException if {@code durability} is null, or the counts do not agree
+     * @throws io.excalibur.graph.build.BuildCancelledException if the graph build on this
+     *         thread was asked to stop, which it is between phases and never part-way through
+     *         one
+     */
+    public void build(Path directory, long entityCount, Durability durability) throws IOException {
+        if (durability == null) {
+            throw new IllegalArgumentException("durability must not be null");
+        }
         if (entityCount < 0) {
             throw new IllegalArgumentException("entityCount must not be negative: " + entityCount);
         }
@@ -169,14 +197,28 @@ public final class EdgeStoreWriter {
             LOGGER.debug("closed {} superseded intervals", superseded);
         }
 
+        // Between the phases, which is where a build that has been asked to stop ends. Each is
+        // a sort or one pass over the edges, and none of them has written anything the caller
+        // serves: the directory is not a store until the descriptor below exists.
+        BuildCancellation.checkpoint();
         int[] forwardOrder = sortForward();
         writeForward(directory, forwardOrder, entityCount);
 
+        BuildCancellation.checkpoint();
         int[] reverseOrder = sortReverse();
         writeReverse(directory, forwardOrder, reverseOrder, entityCount);
 
+        BuildCancellation.checkpoint();
+
+        // Every column, on the device, before the file that says they are a store exists. The
+        // enum is walked rather than a list kept alongside, so a column added later is covered
+        // by this without anybody having to remember.
+        for (EdgeColumn column : EdgeColumn.values()) {
+            durability.fsyncFile(directory.resolve(column.fileName()));
+        }
+
         // Last, and atomically. Before this line the directory is not a store.
-        EdgeStoreDescriptor.of(entityCount, count).write(directory);
+        EdgeStoreDescriptor.of(entityCount, count).write(directory, durability);
         LOGGER.info("built edge store at {}: {} entities, {} edges", directory, entityCount, count);
     }
 

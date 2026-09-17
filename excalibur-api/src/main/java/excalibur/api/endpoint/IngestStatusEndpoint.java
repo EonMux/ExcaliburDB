@@ -43,6 +43,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *   "progress": 0.7300,
  *   "entries_ingested": 450000,
  *   "entries_pending": 170000,
+ *   "last_updated_ms": 1730000000000,
  *   "last_error": null
  * }
  * }</pre>
@@ -200,6 +201,12 @@ public class IngestStatusEndpoint implements HttpHandler {
 
     /**
      * Converts IngestionStatus to JSON.
+     *
+     * <p>{@code last_updated_ms} is when this source last did anything - finished a crawl,
+     * failed one, reported progress. The status object had no time of any kind on it, so a
+     * source sitting at {@code idle} was indistinguishable whether it had been crawled a
+     * minute ago or before a restart three weeks back, and "is the index following the
+     * source?" could not be answered from the API at all.</p>
      */
     private String toJson(IngestionStatus status) {
         // Locale.ROOT, because the default locale picks the decimal separator: under de_DE
@@ -212,6 +219,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             "\"progress\": %.4f, " +
             "\"entries_ingested\": %d, " +
             "\"entries_pending\": %d, " +
+            "\"last_updated_ms\": %d, " +
             "\"last_error\": %s" +
             "}",
             JsonText.escape(status.sourceId()),
@@ -219,6 +227,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             status.progress(),
             status.entriesIngested(),
             status.entriesPending(),
+            status.lastUpdatedMs(),
             status.lastError() != null ? "\"" + JsonText.escape(status.lastError()) + "\"" : "null"
         );
     }

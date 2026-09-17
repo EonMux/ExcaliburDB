@@ -1,7 +1,7 @@
 package excalibur.shard;
 
 import excalibur.shard.worker.HnswCompactionWorker;
-import io.excalibur.config.Config;
+import io.excalibur.config.ShardConfig;
 import io.excalibur.store.CompactionWorker;
 
 import java.util.Objects;
@@ -65,7 +65,7 @@ public record CompactionSettings(
      * @throws IllegalArgumentException if a configured value is outside the range its worker
      *                                  accepts
      */
-    public static CompactionSettings fromConfig(Config.Shard shard) {
+    public static CompactionSettings fromConfig(ShardConfig shard) {
         Objects.requireNonNull(shard, "shard config cannot be null");
 
         long graphIntervalMs = shard.getHnswCompactionIntervalMs();
@@ -84,12 +84,20 @@ public record CompactionSettings(
                     + HnswCompactionWorker.MAX_TOMBSTONE_THRESHOLD + ", got: " + graphRatio);
         }
 
+        // Bounded by the size of the log it triggers on, not by an arbitrary ceiling. A write
+        // log is mapped once and never grown, so a trigger at or above its capacity never
+        // fires: the log fills, the segment refuses every further write for good, and the
+        // error it raises tells the operator to unblock a compaction that could not have run.
         long writeLogBytes = shard.getCompactionWriteLogMb() * BYTES_PER_MIB;
         if (writeLogBytes > CompactionWorker.MAX_WRITE_LOG_SIZE_THRESHOLD) {
             throw new IllegalArgumentException(
-                "excalibur.shard.compaction-write-log-mb must be at most "
+                "excalibur.shard.compaction-write-log-mb is " + shard.getCompactionWriteLogMb()
+                    + " and must be at most "
                     + (CompactionWorker.MAX_WRITE_LOG_SIZE_THRESHOLD / BYTES_PER_MIB)
-                    + ", got: " + shard.getCompactionWriteLogMb());
+                    + ": a write-ahead log holds "
+                    + (io.excalibur.store.WriteLog.MAX_FILE_SIZE / BYTES_PER_MIB)
+                    + " MiB and cannot grow, so a compaction trigger above that never fires "
+                    + "and the segment stops accepting writes with no way back");
         }
 
         int maxConcurrent = shard.getCompactionMaxConcurrent();

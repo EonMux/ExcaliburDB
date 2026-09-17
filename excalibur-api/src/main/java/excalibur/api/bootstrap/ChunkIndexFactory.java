@@ -5,6 +5,7 @@ import excalibur.ingest.lexical.ChunkLexicalIndex;
 import excalibur.ingest.lexical.NativeChunkIndex;
 
 import io.excalibur.config.Config;
+import io.excalibur.config.IngestConfig;
 import io.excalibur.retrieval.lexical.Bm25Parameters;
 import io.excalibur.retrieval.lexical.native_.CompactionPlanner;
 
@@ -56,7 +57,7 @@ public final class ChunkIndexFactory {
         Objects.requireNonNull(epochs, "epochs must not be null");
         Bm25Parameters bm25 = new Bm25Parameters(
             config.ingest().getBm25K1(), config.ingest().getBm25B());
-        if (Config.Ingest.LEXICAL_ENGINE_LUCENE.equals(config.ingest().getLexicalEngine())) {
+        if (IngestConfig.LEXICAL_ENGINE_LUCENE.equals(config.ingest().getLexicalEngine())) {
             return ChunkLexicalIndex.open(dataDirectory.resolve(LUCENE_DIRECTORY),
                 config.graph().getRamBufferMb(), bm25);
         }

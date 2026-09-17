@@ -1,6 +1,6 @@
 package io.excalibur.vector.hnsw;
 
-import io.excalibur.config.Config;
+import io.excalibur.config.ShardConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -9,7 +9,7 @@ import java.util.Objects;
 /**
  * Factory for creating HnswConfig instances from configuration settings.
  *
- * <p>This factory bridges the {@link Config.Shard} configuration properties
+ * <p>This factory bridges the {@link ShardConfig} configuration properties
  * to the {@link HnswConfig} class, ensuring that property file values for
  * {@code excalibur.shard.default-ef-construction} and
  * {@code excalibur.shard.default-ef-search} are automatically applied
@@ -17,7 +17,7 @@ import java.util.Objects;
  *
  * <h2>Usage</h2>
  * <pre>{@code
- * // Create factory from Config.Shard
+ * // Create factory from ShardConfig
  * HnswConfigFactory factory = HnswConfigFactory.fromShardConfig(config.shard());
  *
  * // Create HnswConfig for a specific dimension
@@ -37,7 +37,7 @@ import java.util.Objects;
  *
  * <h2>Domain Correctness</h2>
  * <ul>
- *   <li>efConstruction and efSearch must be at least 1 (enforced by Config.Shard validation)</li>
+ *   <li>efConstruction and efSearch must be at least 1 (enforced by ShardConfig validation)</li>
  *   <li>maxConnections and maxConnectionsLayer0 fix the on-disk adjacency layout, so they
  *       reach a graph only when it is created</li>
  *   <li>mL follows maxConnections rather than being configured on its own</li>
@@ -49,7 +49,7 @@ import java.util.Objects;
  * @author ExcaliburDB
  * @since 4.0
  * @see HnswConfig
- * @see Config.Shard
+ * @see ShardConfig
  */
 public final class HnswConfigFactory {
 
@@ -58,12 +58,12 @@ public final class HnswConfigFactory {
     /**
      * Creates a factory with default values.
      *
-     * <p>This uses the Config.Shard defaults: efConstruction=128, efSearch=64.</p>
+     * <p>This uses the ShardConfig defaults: efConstruction=128, efSearch=64.</p>
      *
      * @return A new HnswConfigFactory with default values
      */
     public static HnswConfigFactory withDefaults() {
-        return new HnswConfigFactory(Config.Shard.DEFAULT_EF_CONSTRUCTION, Config.Shard.DEFAULT_EF_SEARCH);
+        return new HnswConfigFactory(ShardConfig.DEFAULT_EF_CONSTRUCTION, ShardConfig.DEFAULT_EF_SEARCH);
     }
 
     /**
@@ -134,7 +134,7 @@ public final class HnswConfigFactory {
     }
 
     /**
-     * Creates an HnswConfigFactory from Config.Shard settings.
+     * Creates an HnswConfigFactory from ShardConfig settings.
      *
      * <p>This factory method is the primary integration point between
      * the configuration system and the HNSW graph configuration. It reads
@@ -143,18 +143,18 @@ public final class HnswConfigFactory {
      *
      * <h3>Domain Correctness</h3>
      * <ul>
-     *   <li>efConstruction and efSearch are validated by Config.Shard</li>
+     *   <li>efConstruction and efSearch are validated by ShardConfig</li>
      *   <li>Values are used directly from configuration (no transformation)</li>
      * </ul>
      *
-     * @param shard The shard configuration from Config.Shard
+     * @param shard The shard configuration from ShardConfig
      * @return A new HnswConfigFactory configured with shard settings
      * @throws NullPointerException if shard is null
      */
-    public static HnswConfigFactory fromShardConfig(Config.Shard shard) {
+    public static HnswConfigFactory fromShardConfig(ShardConfig shard) {
         Objects.requireNonNull(shard, "shard config cannot be null");
 
-        LOGGER.info("Creating HnswConfigFactory from Config.Shard: efConstruction={}, efSearch={}, "
+        LOGGER.info("Creating HnswConfigFactory from ShardConfig: efConstruction={}, efSearch={}, "
             + "maxConnections={}, maxConnectionsLayer0={}",
             shard.getEfConstruction(), shard.getEfSearch(),
             shard.getMaxConnections(), shard.getMaxConnectionsLayer0());
@@ -171,14 +171,14 @@ public final class HnswConfigFactory {
      * Creates an HnswConfigFactory with default values.
      *
      * <p>Uses the default efConstruction (128) and efSearch (64) from
-     * Config.Shard defaults.</p>
+     * ShardConfig defaults.</p>
      *
      * @return A new HnswConfigFactory with default settings
      */
     public static HnswConfigFactory defaults() {
         return new HnswConfigFactory(
-            Config.Shard.DEFAULT_EF_CONSTRUCTION,
-            Config.Shard.DEFAULT_EF_SEARCH
+            ShardConfig.DEFAULT_EF_CONSTRUCTION,
+            ShardConfig.DEFAULT_EF_SEARCH
         );
     }
 
@@ -187,10 +187,10 @@ public final class HnswConfigFactory {
      *
      * <p>The created config uses:</p>
      * <ul>
-     *   <li>maxConnections = from this factory (from Config.Shard)</li>
-     *   <li>maxConnectionsLayer0 = from this factory (from Config.Shard)</li>
-     *   <li>efConstruction = from this factory (from Config.Shard)</li>
-     *   <li>efSearch = from this factory (from Config.Shard)</li>
+     *   <li>maxConnections = from this factory (from ShardConfig)</li>
+     *   <li>maxConnectionsLayer0 = from this factory (from ShardConfig)</li>
+     *   <li>efConstruction = from this factory (from ShardConfig)</li>
+     *   <li>efSearch = from this factory (from ShardConfig)</li>
      *   <li>mL = 1/ln(M), derived from the configured maxConnections</li>
      * </ul>
      *

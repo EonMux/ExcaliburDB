@@ -154,11 +154,21 @@ class GraphRecoveryAndPqTest {
         }
     }
 
+    /**
+     * Leaves the file in the state a crash between the two stores would have left it in: the
+     * header's count ahead of the index slot it names, and the graph unsealed because nothing
+     * closed it. The seal has to go with the count - a sealed file whose header has been
+     * edited is corruption rather than a torn write, and the integrity check refuses it.
+     */
     private static void writeHeaderNodeCount(Path path, long nodeCount) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
-            ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.nativeOrder());
+            ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.BIG_ENDIAN);
             buffer.putLong(nodeCount).flip();
             channel.write(buffer, OFFSET_NODE_COUNT);
+
+            ByteBuffer seal = ByteBuffer.allocate(Integer.BYTES).order(ByteOrder.BIG_ENDIAN);
+            seal.putInt(HnswGraphIntegrity.STATE_OPEN).flip();
+            channel.write(seal, HnswGraphIntegrity.OFFSET_STATE);
         }
     }
 

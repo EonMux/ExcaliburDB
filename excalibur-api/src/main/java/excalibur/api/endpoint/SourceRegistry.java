@@ -3,6 +3,9 @@ package excalibur.api.endpoint;
 import excalibur.ingest.source.Source;
 import excalibur.ingest.source.SourceDescriptor;
 
+import io.excalibur.tenancy.NamespaceId;
+
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -74,6 +77,48 @@ public interface SourceRegistry extends AutoCloseable {
      * @return true if a source was registered under that id
      */
     boolean remove(String sourceId);
+
+    /**
+     * Stops an ingestion run without touching the registration behind it.
+     *
+     * <p>Half of what {@link #remove(String)} does, and the half an operator usually wants.
+     * A crawl that is hammering a site, or walking a root that turned out to be far larger
+     * than whoever registered it expected, has to be stoppable without also cancelling the
+     * registration, clearing its status and taking it out of the re-crawl schedule - all of
+     * which have to be rebuilt by re-registering, which starts the same crawl again.</p>
+     *
+     * <p>Like every other cancellation here it is a request: the run stops at its next
+     * document boundary, so a document already being written is finished rather than
+     * abandoned half-way.</p>
+     *
+     * <p>The default does nothing, for a registry with no ingestion behind it to stop.</p>
+     *
+     * @param sourceId The source whose run should stop
+     * @return true if a run was in flight and has been asked to stop
+     */
+    default boolean stopIngestion(String sourceId) {
+        return false;
+    }
+
+    /**
+     * The namespace a registered source's documents belong to.
+     *
+     * <p>Asked once per published document, by the graph sink deciding which tenant's staging
+     * store the facts extracted from it are appended to. The answer has to be empty rather than
+     * a guess for a source this registry does not hold: a sink that read "unknown" as "shared"
+     * would put a deregistered tenant's last in-flight documents into the index every other
+     * tenant reads, which is the one mistake a tenancy boundary exists to make impossible.</p>
+     *
+     * <p>The default is what a registry that records no namespaces means: every source it holds
+     * is in the shared namespace, which is exactly how a node that has never seen the
+     * {@code X-Excalibur-Namespace} header behaves.</p>
+     *
+     * @param sourceId The source id
+     * @return Its namespace, or empty if no source is registered under that id
+     */
+    default Optional<NamespaceId> namespaceOf(String sourceId) {
+        return isRegistered(sourceId) ? Optional.of(NamespaceId.SHARED) : Optional.empty();
+    }
 
     /**
      * Gets all registered source IDs.

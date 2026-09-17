@@ -56,6 +56,15 @@ public final class CompactionRunner implements AutoCloseable {
     public static final String STATE_FAILED = "failed";
 
     /**
+     * The last run was asked to stop and ended early, having reclaimed what it reports.
+     *
+     * <p>A state of its own rather than {@code completed}: a run that stopped at the third of
+     * sixty segments reclaimed real space and its counts are worth reading, but reporting it as
+     * completed would say the other fifty-seven had nothing worth reclaiming.</p>
+     */
+    public static final String STATE_CANCELLED = "cancelled";
+
+    /**
      * The compaction work itself, as the shard layer exposes it.
      *
      * <p>Narrower than the orchestrator it is normally bound to, so the route can be tested
@@ -104,6 +113,21 @@ public final class CompactionRunner implements AutoCloseable {
     private final AtomicReference<Snapshot> snapshot = new AtomicReference<>(NOTHING_YET);
 
     /**
+     * Whether the run currently in progress has been asked to stop.
+     *
+     * <p>Separate from interrupting the thread, because the interrupt is how the run is told
+     * and this is how its outcome is named. A run that has already passed its last boundary
+     * finishes everything it was going to and is still reported as cancelled, which is true:
+     * the request was made and the run ended earlier than it otherwise would have.</p>
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean cancelRequested =
+        new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** The task of the run in progress, held so it can be interrupted. */
+    private final AtomicReference<java.util.concurrent.Future<?>> running =
+        new AtomicReference<>();
+
+    /**
      * Creates a runner over the given compaction work.
      *
      * @param compactor What a run actually does
@@ -145,8 +169,9 @@ public final class CompactionRunner implements AutoCloseable {
             // published its result. Either way this request did not start anything.
             return null;
         }
+        cancelRequested.set(false);
         try {
-            executor.execute(() -> run(force, startedAtMs));
+            running.set(executor.submit(() -> run(force, startedAtMs)));
         } catch (RuntimeException e) {
             // A rejected task would otherwise leave the claim held and every later run
             // answered 409 for the life of the process.
@@ -168,6 +193,35 @@ public final class CompactionRunner implements AutoCloseable {
     }
 
     /**
+     * Asks the run in progress to stop.
+     *
+     * <p>A request rather than a stop, in the same sense {@code DELETE /v1/reindex} is: the
+     * run ends at its next segment boundary, returns what it had reclaimed by then and reports
+     * itself {@link #STATE_CANCELLED}. It is safe at any point - a rewrite builds the
+     * replacement beside the original and swaps it in only at the end, so what an interrupted
+     * run loses is its own work and never data.</p>
+     *
+     * <p>Why it exists: a forced compaction rewrites every live segment and rebuilds every
+     * graph, which on a large corpus is minutes of saturated I/O. Until this, the only way to
+     * end one started at the wrong time was to stop the process - which is the more dangerous
+     * act of the two, since shutdown closes the arena the segments are mapped out of.</p>
+     *
+     * @return true if a run was in progress and has been asked to stop
+     */
+    public boolean cancel() {
+        java.util.concurrent.Future<?> task = running.get();
+        if (task == null || task.isDone() || !snapshot.get().isRunning()) {
+            return false;
+        }
+        cancelRequested.set(true);
+        // May interrupt: the run reads the flag between segments, and the interrupt is what
+        // makes a run blocked on I/O notice at all.
+        task.cancel(true);
+        LOGGER.info("On-demand compaction was asked to stop");
+        return true;
+    }
+
+    /**
      * Performs one run and records its outcome.
      *
      * @param force       Whether the thresholds were to be ignored
@@ -176,9 +230,11 @@ public final class CompactionRunner implements AutoCloseable {
     private void run(boolean force, long startedAtMs) {
         try {
             CompactionReport report = compactor.compact(force);
-            snapshot.set(new Snapshot(STATE_COMPLETED, force, startedAtMs,
-                System.currentTimeMillis(), report, null));
-            LOGGER.info("On-demand compaction finished: {}", report);
+            boolean cancelled = cancelRequested.get();
+            snapshot.set(new Snapshot(cancelled ? STATE_CANCELLED : STATE_COMPLETED, force,
+                startedAtMs, System.currentTimeMillis(), report, null));
+            LOGGER.info("On-demand compaction {}: {}",
+                cancelled ? "stopped early" : "finished", report);
         } catch (RuntimeException | Error e) {
             // Recorded, not just logged. The operator who asked for this run reads the
             // status, and a failure that reaches only the log reads there as a run that
@@ -186,6 +242,13 @@ public final class CompactionRunner implements AutoCloseable {
             snapshot.set(new Snapshot(STATE_FAILED, force, startedAtMs,
                 System.currentTimeMillis(), null, String.valueOf(e.getMessage())));
             LOGGER.error("On-demand compaction failed", e);
+        } finally {
+            // The compaction leaves the interrupt flag set for whoever set it, and this pool
+            // has one thread that every later run uses. Carrying the flag forward would make
+            // the next run die on its first blocking call, for a reason nothing in its own
+            // request explains.
+            Thread.interrupted();
+            running.set(null);
         }
     }
 

@@ -19,11 +19,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * any error, because an index with nothing in it is indistinguishable from a corpus that does not
  * match. The tests below pin that it fails at startup instead.
  */
-@DisplayName("Config.Ingest chunk index")
+@DisplayName("IngestConfig chunk index")
 class ConfigIngestLexicalTest {
 
-    private static Config.Ingest ingest(Map<String, String> props) {
-        return new Config.Ingest(new HashMap<>(props));
+    private static IngestConfig ingest(Map<String, String> props) {
+        return new IngestConfig(new HashMap<>(props));
     }
 
     @Nested
@@ -33,25 +33,25 @@ class ConfigIngestLexicalTest {
         @Test
         @DisplayName("an empty configuration indexes with the engine's own index")
         void documentedDefaults() {
-            Config.Ingest settings = ingest(Map.of());
+            IngestConfig settings = ingest(Map.of());
 
             assertThat(settings.getLexicalEngine())
-                .isEqualTo(Config.Ingest.LEXICAL_ENGINE_NATIVE);
+                .isEqualTo(IngestConfig.LEXICAL_ENGINE_NATIVE);
             assertThat(settings.getLexicalTombstoneRatio())
-                .isEqualTo(Config.Ingest.DEFAULT_LEXICAL_TOMBSTONE_RATIO);
+                .isEqualTo(IngestConfig.DEFAULT_LEXICAL_TOMBSTONE_RATIO);
             assertThat(settings.getLexicalMaxLatencySeconds())
-                .isEqualTo(Config.Ingest.DEFAULT_LEXICAL_MAX_LATENCY_SECONDS);
+                .isEqualTo(IngestConfig.DEFAULT_LEXICAL_MAX_LATENCY_SECONDS);
             assertThat(settings.getLexicalMaxSegments())
-                .isEqualTo(Config.Ingest.DEFAULT_LEXICAL_MAX_SEGMENTS);
+                .isEqualTo(IngestConfig.DEFAULT_LEXICAL_MAX_SEGMENTS);
         }
 
         @Test
         @DisplayName("either engine can be asked for by name, in any case")
         void bothEnginesAreSelectable() {
             assertThat(ingest(Map.of("excalibur.ingest.lexical-engine", "lucene"))
-                .getLexicalEngine()).isEqualTo(Config.Ingest.LEXICAL_ENGINE_LUCENE);
+                .getLexicalEngine()).isEqualTo(IngestConfig.LEXICAL_ENGINE_LUCENE);
             assertThat(ingest(Map.of("excalibur.ingest.lexical-engine", "  NATIVE "))
-                .getLexicalEngine()).isEqualTo(Config.Ingest.LEXICAL_ENGINE_NATIVE);
+                .getLexicalEngine()).isEqualTo(IngestConfig.LEXICAL_ENGINE_NATIVE);
         }
     }
 

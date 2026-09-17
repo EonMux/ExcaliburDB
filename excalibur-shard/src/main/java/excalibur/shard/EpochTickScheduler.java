@@ -262,6 +262,7 @@ public class EpochTickScheduler implements AutoCloseable {
                 VisibilityTracker.VisibilityStats stats = visibilityTracker.getStats();
                 double coverage = stats.visibilityRatio();
                 Metrics.setEstimatedCoverage(coverage);
+                publishHealthScore(coverage);
 
                 LOGGER.trace("Epoch tick: {} -> {}, coverage={}", previousEpoch, newEpoch, coverage);
 
@@ -292,9 +293,37 @@ public class EpochTickScheduler implements AutoCloseable {
         VisibilityTracker.VisibilityStats stats = visibilityTracker.getStats();
         double coverage = stats.visibilityRatio();
         Metrics.setEstimatedCoverage(coverage);
+        publishHealthScore(coverage);
 
         LOGGER.trace("Immediate epoch tick: new epoch = {}, coverage = {}", newEpoch, coverage);
         return newEpoch;
+    }
+
+    /**
+     * Publishes the health score the {@code SystemHealth} MBean reports.
+     *
+     * <p>The score had two writers: the bootstrap, which sets 0.5 once, and the HTTP health
+     * endpoint. So it only moved when somebody polled {@code /health} over HTTP, and a
+     * monitor watching this node through JMX alone - which is what those MBeans exist for -
+     * read 0.5 for ever, through a total loss of the corpus included. The tick is where a
+     * background signal belongs, and it is already where coverage is refreshed from.</p>
+     *
+     * <p>Coverage is the score, because it is the one health signal measured here on the
+     * scale the MBean carries. It is the same number the health endpoint publishes, so the
+     * two cannot disagree; the difference is that this one keeps moving with nobody
+     * watching.</p>
+     *
+     * <p>A metrics sink that refuses the value must not stop the epoch advancing: visibility
+     * is the node's job and reporting on it is not.</p>
+     *
+     * @param coverage The coverage just computed, in [0, 1]
+     */
+    private static void publishHealthScore(double coverage) {
+        try {
+            Metrics.setHealthScore(coverage);
+        } catch (RuntimeException e) {
+            LOGGER.debug("Could not publish the health score: {}", e.toString());
+        }
     }
 
     // ==================== Statistics ====================

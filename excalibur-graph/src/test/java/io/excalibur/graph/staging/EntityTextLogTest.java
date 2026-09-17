@@ -222,26 +222,102 @@ class EntityTextLogTest {
             // The sibling triples path throws for exactly this, and the rewrite's own contract
             // promises the logs are left alone. Breaking at a bad length field and then renaming
             // the short temp over the real log discarded every snippet after the damage.
+            //
+            // The damage is inflicted while the log is open, because that is now the only way
+            // the rewrite can meet it: a file already damaged this way is refused by open. A
+            // device error under a running process is the case this leaves covered.
+            try (EntityTextLog log = EntityTextLog.open(file(dir))) {
+                log.append(1, "first", DOC_42);
+                log.append(2, "second", DOC_77);
+                log.append(3, "third", DOC_77);
+                log.flush();
+
+                byte[] all = Files.readAllBytes(file(dir));
+                // The length field of the second record, made implausible.
+                int second = EntityTextLog.HEADER_BYTES + 20 + "first".length() + Integer.BYTES;
+                java.nio.ByteBuffer.wrap(all).putInt(second + 16, Integer.MAX_VALUE);
+                Files.write(file(dir), all);
+                byte[] damaged = Files.readAllBytes(file(dir));
+
+                assertThatThrownBy(() -> log.erase((entityId, provenance) -> entityId == 1))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("intact record");
+                assertThatThrownBy(() -> log.forEach((id, snippet, provenance) -> { }))
+                    .as("the replay refuses it too, rather than publishing a prefix")
+                    .isInstanceOf(IOException.class);
+
+                assertThat(Files.readAllBytes(file(dir)))
+                    .as("a corrupt record aborts the rewrite with the log untouched")
+                    .isEqualTo(damaged);
+            }
+        }
+
+        @Test
+        @DisplayName("a torn tail is trimmed on open, so what is appended after it is readable")
+        void aTornTailIsTrimmedOnOpen(@TempDir Path dir) throws IOException {
+            // A crash mid-append leaves a partial record. The next run opens the log and appends
+            // after it, and from that moment the damage has an intact record behind it - which is
+            // the shape mid-file corruption has. Every later replay and every later erasure then
+            // refuses the log, for ever, with nothing an operator can do about it.
+            try (EntityTextLog log = EntityTextLog.open(file(dir))) {
+                log.append(1, "before the crash", DOC_42);
+                log.append(2, "cut short by the crash", DOC_77);
+            }
+            byte[] all = Files.readAllBytes(file(dir));
+            Files.write(file(dir), java.util.Arrays.copyOf(all, all.length - 3));
+
+            try (EntityTextLog log = EntityTextLog.open(file(dir))) {
+                log.append(3, "after the restart", DOC_42);
+            }
+
+            assertThat(dump(file(dir))).containsExactly(
+                "1|before the crash|DOCUMENT#42/3",
+                "3|after the restart|DOCUMENT#42/3");
+        }
+
+        @Test
+        @DisplayName("erasure still reaches the log after a crash mid-append and a restart")
+        void erasureSurvivesATornTailFollowedByAnAppend(@TempDir Path dir) throws IOException {
+            // The consequence with teeth: the snippet is the prose an erasure exists to destroy,
+            // and a log wedged this way refuses every erasure aimed at it from then on.
+            try (EntityTextLog log = EntityTextLog.open(file(dir))) {
+                log.append(1, "confidential prose about Jane", DOC_42);
+                log.append(2, "cut short by the crash", DOC_77);
+            }
+            byte[] all = Files.readAllBytes(file(dir));
+            Files.write(file(dir), java.util.Arrays.copyOf(all, all.length - 3));
+
+            try (EntityTextLog log = EntityTextLog.open(file(dir))) {
+                log.append(3, "more prose about Jane", DOC_42);
+
+                assertThat(log.erase((entityId, provenance) -> entityId == 1 || entityId == 3)
+                    .removed()).isEqualTo(2);
+            }
+
+            assertThat(new String(Files.readAllBytes(file(dir)), StandardCharsets.UTF_8))
+                .as("the prose has to be gone from the bytes")
+                .doesNotContain("Jane");
+        }
+
+        @Test
+        @DisplayName("a trimmed tail is still refused when it is really mid-file corruption")
+        void openRefusesCorruptionInTheMiddle(@TempDir Path dir) throws IOException {
+            // Trimming on open must not become a licence to truncate: a partial record with
+            // perfectly good records after it is a write that failed for a reason the file
+            // outlived, and cutting there would destroy snippets that were acknowledged.
             try (EntityTextLog log = EntityTextLog.open(file(dir))) {
                 log.append(1, "first", DOC_42);
                 log.append(2, "second", DOC_77);
                 log.append(3, "third", DOC_77);
             }
             byte[] all = Files.readAllBytes(file(dir));
-            // The length field of the second record, made implausible.
             int second = EntityTextLog.HEADER_BYTES + 20 + "first".length() + Integer.BYTES;
             java.nio.ByteBuffer.wrap(all).putInt(second + 16, Integer.MAX_VALUE);
             Files.write(file(dir), all);
-            byte[] damaged = Files.readAllBytes(file(dir));
 
-            try (EntityTextLog log = EntityTextLog.open(file(dir))) {
-                assertThatThrownBy(() -> log.erase((entityId, provenance) -> entityId == 1))
-                    .isInstanceOf(IOException.class);
-            }
-
-            assertThat(Files.readAllBytes(file(dir)))
-                .as("a corrupt record aborts the rewrite with the log untouched")
-                .isEqualTo(damaged);
+            assertThatThrownBy(() -> EntityTextLog.open(file(dir)))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("intact record");
         }
 
         @Test

@@ -1,5 +1,6 @@
 package excalibur.bench.benchmark;
 
+import excalibur.bench.kernel.FalsePositiveTally;
 import excalibur.filter.CuckooFilter;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
@@ -338,8 +339,8 @@ public class CuckooFilterFPRateBenchmark {
      */
     @State(Scope.Thread)
     public static class FPRateAccumulator {
-        private long totalFalsePositives = 0;
-        private long totalQueries = 0;
+
+        private final FalsePositiveTally tally = new FalsePositiveTally(MAX_ACCEPTABLE_FP_RATE);
 
         /**
          * Records the result of a batch of FP checks.
@@ -348,8 +349,7 @@ public class CuckooFilterFPRateBenchmark {
          * @param batchSize Number of queries in the batch
          */
         public void record(int falsePositives, int batchSize) {
-            totalFalsePositives += falsePositives;
-            totalQueries += batchSize;
+            tally.record(falsePositives, batchSize);
         }
 
         /**
@@ -358,31 +358,34 @@ public class CuckooFilterFPRateBenchmark {
          * @return FP rate in range [0.0, 1.0]
          */
         public double getAccumulatedFPRate() {
-            if (totalQueries == 0) return 0.0;
-            return (double) totalFalsePositives / totalQueries;
+            return tally.rate();
         }
 
         /**
          * Checks if the accumulated FP rate meets specification.
          *
-         * @return true if FP rate ≤ 0.1%
+         * @return true if probes were made and their FP rate is ≤ 0.1%
          */
         public boolean meetsSpecification() {
-            return getAccumulatedFPRate() <= MAX_ACCEPTABLE_FP_RATE;
+            return tally.meetsSpecification();
         }
 
         /**
          * Gets total false positives recorded.
+         *
+         * @return the accumulated false positive count
          */
         public long getTotalFalsePositives() {
-            return totalFalsePositives;
+            return tally.falsePositives();
         }
 
         /**
          * Gets total queries performed.
+         *
+         * @return the accumulated probe count
          */
         public long getTotalQueries() {
-            return totalQueries;
+            return tally.queries();
         }
     }
 

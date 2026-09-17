@@ -182,6 +182,55 @@ class EntityVectorsTest {
     }
 
     @Test
+    @DisplayName("a write that fails leaves no vector file rather than a broken one")
+    void aFailedFinishLeavesNothingRatherThanRawFloats(@TempDir Path dir) throws IOException {
+        // The vectors were streamed straight into the file the reader opens and only then given
+        // a header, by a move that was not even atomic. Anything going wrong in between - a
+        // crash, a full disk - left entity_vectors.vec as headerless raw floats, which open()
+        // refuses. The graph beside it then would not open at all, for want of a file whose
+        // absence is a supported configuration.
+        Path path = dir.resolve(EntityVectors.FILE_NAME);
+        // Standing where the assembled file has to be written, so finishing cannot succeed.
+        Files.createDirectories(path.resolveSibling(path.getFileName() + ".assembled"));
+
+        try (EntityVectorWriter writer = new EntityVectorWriter(path, 4, 2)) {
+            writer.put(vector(4, 1f));
+            writer.put(vector(4, 2f));
+            assertThatThrownBy(writer::finish).isInstanceOf(IOException.class);
+        }
+
+        assertThat(EntityVectors.openIfPresent(dir))
+            .as("absent is a configuration; half-written is a graph that will not open")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("a finished file is forced and moved onto its name, in that order")
+    void finishingIsDurable(@TempDir Path dir) throws IOException {
+        // finish() is the only writer in this module with no fallback behind it: the caller
+        // publishes the directory immediately afterwards and the previous graph is deleted.
+        Path path = dir.resolve(EntityVectors.FILE_NAME);
+        io.excalibur.graph.file.RecordingDurability durability =
+            new io.excalibur.graph.file.RecordingDurability();
+
+        try (EntityVectorWriter writer = new EntityVectorWriter(path, 4, 1, durability)) {
+            writer.put(vector(4, 1f));
+            writer.finish();
+        }
+
+        assertThat(durability.files).as("the contents reach the device").isNotEmpty();
+        assertThat(durability.directories).as("then the name that points at them").contains(dir);
+        try (EntityVectors vectors = EntityVectors.open(path)) {
+            assertThat(vectors.vectorOf(0)).containsExactly(vector(4, 1f));
+        }
+        try (var entries = Files.list(dir)) {
+            assertThat(entries.map(entry -> entry.getFileName().toString()))
+                .as("and nothing of the assembly is left lying beside it")
+                .containsExactly(EntityVectors.FILE_NAME);
+        }
+    }
+
+    @Test
     @DisplayName("a file of many entities is addressed correctly throughout")
     void offsetsHoldAcrossManyEntities(@TempDir Path dir) throws IOException {
         int entities = 500;

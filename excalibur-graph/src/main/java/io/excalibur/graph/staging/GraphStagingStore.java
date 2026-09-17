@@ -1,5 +1,6 @@
 package io.excalibur.graph.staging;
 
+import io.excalibur.graph.build.BuildCancellation;
 import io.excalibur.graph.file.Durability;
 import io.excalibur.graph.provenance.Provenance;
 import io.excalibur.graph.provenance.SourceType;
@@ -49,10 +50,14 @@ import java.util.zip.CRC32;
  *                      [sourceId : int64][crc32 : int32]
  * </pre>
  *
- * <p>Fixed-width records, so a torn tail is a file whose length is not a whole number of records
- * and a half-written record is caught by its checksum. Either ends the replay at the last good
- * record, which is the same tolerance the interners apply and for the same reason: a crash during
- * ingestion must cost the facts that were in flight, not the graph.</p>
+ * <p>Fixed-width records, so a crash mid-append leaves a file whose length is not a whole number
+ * of records. That partial record is cut off when the log is opened, which is the same tolerance
+ * the interners apply and for the same reason: a crash during ingestion must cost the facts that
+ * were in flight, not the graph.</p>
+ *
+ * <p>A checksum that fails over a whole record is therefore not a torn tail - every record the
+ * scan reaches was written whole - and both the replay and the erasure rewrite refuse the log
+ * rather than stopping at the damage. See {@link #forEach}.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent appends, which is what ingestion does - one virtual thread per document.
@@ -211,9 +216,14 @@ public final class GraphStagingStore implements AutoCloseable {
      *
      * <p>Reads the file rather than any in-memory copy, so only what has been flushed is seen.
      *
+     * <p>A damaged record ends the replay by failing it, not by stopping at it. The replay is
+     * what a build reads, and a build that stopped at the damage would publish a graph missing
+     * every fact after it and report success - the same condition {@link #erase} refuses, decided
+     * the same way. See {@link #corrupt}.
+     *
      * @param visitor Receives each fact, with ids resolved
      * @return How many facts were replayed
-     * @throws IOException if the log cannot be read
+     * @throws IOException if the log cannot be read, or holds a record whose checksum fails
      */
     public long forEach(TripleVisitor visitor) throws IOException {
         Objects.requireNonNull(visitor, "visitor must not be null");
@@ -223,31 +233,101 @@ public final class GraphStagingStore implements AutoCloseable {
             return 0;
         }
 
-        byte[] all = Files.readAllBytes(logPath);
-        // The header is written by DataOutputStream, which is big-endian; the fixed-width records
-        // after it are little-endian like every other column this system stores. Reading the
-        // header through the record view turns the magic into its own byte reversal.
-        ByteBuffer buffer = ByteBuffer.wrap(all);
-        long magic = buffer.getLong();
-        if (magic != MAGIC) {
-            throw new IOException("not a triple log (magic 0x" + Long.toHexString(magic)
-                + "): " + logPath);
+        Cursor cursor = new Cursor(Files.readAllBytes(logPath), logPath);
+        // A build asked to stop before it reached the log does no work at all.
+        BuildCancellation.checkpoint();
+        while (cursor.next()) {
+            // Between two facts, which is a safe place for a build to stop: what it has
+            // assembled so far is in a scratch directory nothing is served from.
+            BuildCancellation.checkpoint(cursor.read);
+            visitor.visit(cursor.subject, cursor.relation, cursor.object,
+                cursor.validFrom, cursor.validTo, cursor.provenance);
         }
-        int version = buffer.getInt();
-        if (version != VERSION) {
-            throw new IOException("unsupported triple log version " + version + ": " + logPath);
-        }
-        buffer.getInt();
-        buffer.order(ByteOrder.LITTLE_ENDIAN);
+        return cursor.read;
+    }
 
-        long replayed = 0;
-        while (buffer.remaining() >= RECORD_BYTES) {
-            int start = buffer.position();
-            int subject = buffer.getInt();
-            int relation = buffer.getInt();
-            int object = buffer.getInt();
-            int validFrom = buffer.getInt();
-            int validTo = buffer.getInt();
+    /**
+     * The one refusal both the replay and the erasure rewrite raise for a failed checksum.
+     *
+     * <h3>Why a failed checksum here is never a torn tail</h3>
+     * <p>The records are fixed width and a partial trailing one is cut off when the log is
+     * opened, so every record the scan reaches was written whole. A checksum that fails over a
+     * whole record is therefore rot or a device error, and the facts after it were written and
+     * acknowledged to whoever staged them.
+     *
+     * <h3>Why both paths refuse rather than stop</h3>
+     * <p>Neither of the two alternatives is honest. Building from the facts before the damage
+     * publishes a graph missing the rest while reporting success, which nobody can see. Erasing
+     * around it reports an obligation discharged that never reached the records past it. A log
+     * that will not open is the only outcome an operator can act on, and they still have the log.
+     *
+     * @param logPath      The log, named in the failure
+     * @param factsBefore  How many records read cleanly before the damage
+     * @return The failure to throw
+     */
+    private static IOException corrupt(Path logPath, long factsBefore) {
+        return new IOException("triple log " + logPath + " has a corrupt record at fact "
+            + factsBefore + ". The records are fixed width and a partial trailing one is trimmed "
+            + "when the log is opened, so this is rot rather than a write cut short, and the "
+            + "facts after it were written and acknowledged. Building from the facts before it "
+            + "would publish a partial graph and report success, and erasing around it would "
+            + "report an obligation discharged that had not reached them; this build refuses the "
+            + "log instead. Recover or quarantine the file before restarting.");
+    }
+
+    /**
+     * Walks the fixed-width records of a triple log already in memory.
+     *
+     * <p>One place that knows the framing, shared by the replay and the erasure rewrite so the
+     * two cannot disagree about where a record ends or about what a failed checksum means. They
+     * did disagree: the replay stopped at damage and the rewrite refused it, so a build quietly
+     * published a prefix of the facts an erasure had just refused to touch.
+     */
+    private static final class Cursor {
+
+        private final byte[] all;
+        private final ByteBuffer buffer;
+        private final Path path;
+
+        private long read;
+        private int start;
+        private int subject;
+        private int relation;
+        private int object;
+        private int validFrom;
+        private int validTo;
+        private Provenance provenance = Provenance.UNKNOWN;
+
+        /**
+         * @param all  The whole log as read
+         * @param path The log, for any failure raised while walking it
+         * @throws IOException if the file is not a triple log of a version this build reads
+         */
+        Cursor(byte[] all, Path path) throws IOException {
+            this.all = all;
+            this.path = path;
+            // The header is written by DataOutputStream, which is big-endian; the fixed-width
+            // records after it are little-endian like every other column this system stores.
+            // Reading the header through the record view turns the magic into its own reversal.
+            this.buffer = readHeader(all, path, "triple log").order(ByteOrder.LITTLE_ENDIAN);
+        }
+
+        /**
+         * Decodes the next record.
+         *
+         * @return false once the log is exhausted
+         * @throws IOException if a record's checksum does not match
+         */
+        boolean next() throws IOException {
+            if (buffer.remaining() < RECORD_BYTES) {
+                return false;
+            }
+            start = buffer.position();
+            subject = buffer.getInt();
+            relation = buffer.getInt();
+            object = buffer.getInt();
+            validFrom = buffer.getInt();
+            validTo = buffer.getInt();
             byte sourceType = buffer.get();
             byte confidence = buffer.get();
             short extractorVersion = buffer.getShort();
@@ -257,17 +337,13 @@ public final class GraphStagingStore implements AutoCloseable {
             CRC32 crc = new CRC32();
             crc.update(all, start, RECORD_PAYLOAD_BYTES);
             if (stored != (int) crc.getValue()) {
-                LOGGER.warn("triple log {} has a corrupt record at fact {}; "
-                    + "building from the {} facts before it", logPath, replayed, replayed);
-                break;
+                throw corrupt(path, read);
             }
-
-            visitor.visit(subject, relation, object, validFrom, validTo,
-                new Provenance(SourceType.fromByte(sourceType), sourceId,
-                    Byte.toUnsignedInt(confidence), extractorVersion));
-            replayed++;
+            provenance = new Provenance(SourceType.fromByte(sourceType), sourceId,
+                Byte.toUnsignedInt(confidence), extractorVersion);
+            read++;
+            return true;
         }
-        return replayed;
     }
 
     /**
@@ -346,41 +422,19 @@ public final class GraphStagingStore implements AutoCloseable {
             return 0;
         }
         byte[] all = Files.readAllBytes(logPath);
-        ByteBuffer buffer = readHeader(all, logPath, "triple log");
-        buffer.order(ByteOrder.LITTLE_ENDIAN);
+        Cursor cursor = new Cursor(all, logPath);
 
         // Scanned before anything is written, so a log that loses nothing is not churned. A
         // request that can never be satisfied stays outstanding, and rewriting both logs on every
         // compaction from then on would be a steady cost for no change.
         List<Integer> kept = new ArrayList<>();
         long removed = 0;
-        while (buffer.remaining() >= RECORD_BYTES) {
-            int start = buffer.position();
-            int subject = buffer.getInt();
-            int relation = buffer.getInt();
-            int object = buffer.getInt();
-            int validFrom = buffer.getInt();
-            int validTo = buffer.getInt();
-            byte sourceType = buffer.get();
-            byte confidence = buffer.get();
-            short extractorVersion = buffer.getShort();
-            long sourceId = buffer.getLong();
-            int stored = buffer.getInt();
-
-            CRC32 crc = new CRC32();
-            crc.update(all, start, RECORD_PAYLOAD_BYTES);
-            if (stored != (int) crc.getValue()) {
-                throw new IOException("triple log " + logPath + " has a corrupt record at "
-                    + "fact " + (kept.size() + removed) + "; refusing to rewrite it for an "
-                    + "erasure, because truncating here would remove facts nobody asked to erase");
-            }
-
-            Provenance provenance = new Provenance(SourceType.fromByte(sourceType), sourceId,
-                Byte.toUnsignedInt(confidence), extractorVersion);
-            if (erasure.erasesFact(subject, relation, object, validFrom, validTo, provenance)) {
+        while (cursor.next()) {
+            if (erasure.erasesFact(cursor.subject, cursor.relation, cursor.object,
+                    cursor.validFrom, cursor.validTo, cursor.provenance)) {
                 removed++;
             } else {
-                kept.add(start);
+                kept.add(cursor.start);
             }
         }
         if (removed == 0) {

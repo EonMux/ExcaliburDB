@@ -1,5 +1,7 @@
 package excalibur.bench.benchmark;
 
+import excalibur.bench.kernel.LatencySamples;
+import excalibur.bench.kernel.Vectors;
 import excalibur.bench.metric.LatencyPercentileValidator;
 import excalibur.query.QueryRequest;
 import excalibur.query.QueryResponse;
@@ -107,14 +109,14 @@ public class EndToEndQueryBenchmark {
     private int queryIndex;
 
     // Latency samples for percentile calculation (Double for sub-millisecond precision)
-    private List<Double> latencySamples;
+    private LatencySamples latencySamples;
 
     @Setup(Level.Trial)
     public void setup() throws IOException {
         arena = Arena.ofShared();
         tempFiles = new ArrayList<>();
         graphs = new ArrayList<>();
-        latencySamples = Collections.synchronizedList(new ArrayList<>());
+        latencySamples = new LatencySamples();
 
         // Use Cosine similarity
         distanceFunction = CosineSimilarity.getInstance();
@@ -145,8 +147,7 @@ public class EndToEndQueryBenchmark {
                 for (int d = 0; d < dimension; d++) {
                     vector[d] = (float) random.nextGaussian();
                 }
-                normalizeVector(vector);
-                graph.insert(vector);
+                graph.insert(Vectors.normalized(vector));
             }
 
             System.out.println("  Segment " + s + ": " + graph.nodeCount() + " graph nodes");
@@ -159,8 +160,7 @@ public class EndToEndQueryBenchmark {
             for (int d = 0; d < dimension; d++) {
                 vector[d] = (float) random.nextGaussian();
             }
-            normalizeVector(vector);
-            queryVectors[i] = vector;
+            queryVectors[i] = Vectors.normalized(vector);
         }
 
         queryIndex = 0;
@@ -306,7 +306,7 @@ public class EndToEndQueryBenchmark {
         double latencyMs = (endTime - startTime) / 1_000_000.0;
 
         // Collect sample for percentile calculation
-        latencySamples.add(latencyMs);
+        latencySamples.record(latencyMs);
 
         bh.consume(response);
         return (long) latencyMs;
@@ -449,7 +449,7 @@ public class EndToEndQueryBenchmark {
      * @return sample count
      */
     public int getSampleCount() {
-        return latencySamples.size();
+        return latencySamples.count();
     }
 
     /**
@@ -465,7 +465,7 @@ public class EndToEndQueryBenchmark {
      * @return validation result indicating success or failure with details
      */
     public LatencyPercentileValidator.ValidationResult validateLatencyPercentiles() {
-        return LatencyPercentileValidator.validate(getP50Latency(), getP99Latency(), latencySamples.size());
+        return LatencyPercentileValidator.validate(getP50Latency(), getP99Latency(), latencySamples.count());
     }
 
     /**
@@ -484,37 +484,10 @@ public class EndToEndQueryBenchmark {
      * @return the latency value in milliseconds, or 0.0 if no samples
      */
     private double calculatePercentile(int percentile) {
-        if (latencySamples.isEmpty()) {
-            return 0.0;
-        }
-
-        List<Double> sorted = latencySamples.stream()
-            .sorted()
-            .toList();
-
-        int index = (int) Math.ceil(percentile / 100.0 * sorted.size()) - 1;
-        index = Math.max(0, Math.min(index, sorted.size() - 1));
-
-        return sorted.get(index);
+        return latencySamples.percentile(percentile);
     }
 
     // ==================== Helper Methods ====================
-
-    /**
-     * Normalizes a vector to unit length.
-     */
-    private void normalizeVector(float[] vector) {
-        float norm = 0.0f;
-        for (float v : vector) {
-            norm += v * v;
-        }
-        norm = (float) Math.sqrt(norm);
-        if (norm > 0) {
-            for (int i = 0; i < vector.length; i++) {
-                vector[i] /= norm;
-            }
-        }
-    }
 
     // ==================== Mock Infrastructure for QueryPipeline ====================
 

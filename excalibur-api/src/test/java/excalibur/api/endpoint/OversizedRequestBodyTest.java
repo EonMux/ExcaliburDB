@@ -87,6 +87,9 @@ class OversizedRequestBodyTest {
         exchange = mock(HttpExchange.class);
         when(exchange.getRequestMethod()).thenReturn(method);
         when(exchange.getRequestURI()).thenReturn(URI.create(path));
+        // A real exchange always has a request header map, and the ingest route reads one of
+        // them - the namespace a registration belongs to - before it reads the body.
+        when(exchange.getRequestHeaders()).thenReturn(new Headers());
         when(exchange.getResponseHeaders()).thenReturn(new Headers());
         when(exchange.getRequestBody()).thenReturn(
             new ByteArrayInputStream(TOO_LARGE.getBytes(StandardCharsets.UTF_8)));

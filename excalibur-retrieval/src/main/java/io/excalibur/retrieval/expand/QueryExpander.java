@@ -25,6 +25,22 @@ public interface QueryExpander {
      */
     List<SearchFormulation> expand(String query);
 
+    /**
+     * The longest query this expander will widen, beyond which it returns the query as typed.
+     *
+     * <p>Read by the query route so a response can say that a query was searched without the
+     * expansion this node would normally apply. A caller cannot see the difference in the
+     * results - a longer question answered by a narrower search looks exactly like a question
+     * the corpus had less to say about - so the length at which the strategy changes has to be
+     * something the answer can report rather than something only the expander knows.</p>
+     *
+     * @return The bound in characters, or {@link Integer#MAX_VALUE} when length is never the
+     *         reason a query goes unexpanded
+     */
+    default int maxExpandableChars() {
+        return Integer.MAX_VALUE;
+    }
+
     /** An expander that adds nothing, for deployments with no model to call. */
     static QueryExpander identity() {
         return query -> List.of(SearchFormulation.original(query));

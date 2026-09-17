@@ -3,6 +3,7 @@ package excalibur.query.scorer;
 import excalibur.query.QueryResultItem;
 import excalibur.query.pipeline.QueryPipeline.LlmScorer;
 import io.excalibur.llm.RelevancyScore;
+import io.excalibur.llm.client.CircuitBreaker;
 import io.excalibur.llm.client.LLMHttpClient;
 import io.excalibur.llm.LLMException;
 import org.slf4j.Logger;
@@ -59,6 +60,19 @@ public final class LlmRelevancyScorer implements LlmScorer {
      */
     public LlmRelevancyScorer(LLMHttpClient llmClient) {
         this.llmClient = Objects.requireNonNull(llmClient, "LLMHttpClient cannot be null");
+    }
+
+    /**
+     * The circuit breaker this scorer's calls are made through.
+     *
+     * <p>Exposed so the node can report it. When it opens, stage 5 is bypassed, the pipeline
+     * keeps the ranking it already had and the node goes on answering 200 - so without this
+     * the only evidence that every ranking changed is a log line.</p>
+     *
+     * @return The breaker guarding relevancy scoring
+     */
+    public CircuitBreaker getCircuitBreaker() {
+        return llmClient.getCircuitBreaker();
     }
 
     /**

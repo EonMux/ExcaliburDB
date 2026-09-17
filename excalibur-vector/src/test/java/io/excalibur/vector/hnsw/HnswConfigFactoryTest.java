@@ -1,6 +1,7 @@
 package io.excalibur.vector.hnsw;
 
 import io.excalibur.config.Config;
+import io.excalibur.config.ShardConfig;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
@@ -11,7 +12,7 @@ import static org.assertj.core.api.Assertions.*;
 /**
  * Unit tests for {@link HnswConfigFactory}.
  *
- * <p>Tests verify that the factory correctly wires Config.Shard settings
+ * <p>Tests verify that the factory correctly wires ShardConfig settings
  * to HnswConfig instances, ensuring property file values for efConstruction
  * and efSearch are applied to HNSW graphs.</p>
  */
@@ -21,8 +22,8 @@ class HnswConfigFactoryTest {
     void shouldCreateFactoryWithDefaults() {
         HnswConfigFactory factory = HnswConfigFactory.withDefaults();
 
-        assertThat(factory.getEfConstruction()).isEqualTo(Config.Shard.DEFAULT_EF_CONSTRUCTION);
-        assertThat(factory.getEfSearch()).isEqualTo(Config.Shard.DEFAULT_EF_SEARCH);
+        assertThat(factory.getEfConstruction()).isEqualTo(ShardConfig.DEFAULT_EF_CONSTRUCTION);
+        assertThat(factory.getEfSearch()).isEqualTo(ShardConfig.DEFAULT_EF_SEARCH);
     }
 
     @Test
@@ -129,9 +130,9 @@ class HnswConfigFactoryTest {
         Config config = new Config("test", Map.of(), new HashMap<>());
         HnswConfigFactory factory = HnswConfigFactory.fromShardConfig(config.shard());
 
-        // Config.Shard defaults: efConstruction=128, efSearch=64
-        assertThat(factory.getEfConstruction()).isEqualTo(Config.Shard.DEFAULT_EF_CONSTRUCTION);
-        assertThat(factory.getEfSearch()).isEqualTo(Config.Shard.DEFAULT_EF_SEARCH);
+        // ShardConfig defaults: efConstruction=128, efSearch=64
+        assertThat(factory.getEfConstruction()).isEqualTo(ShardConfig.DEFAULT_EF_CONSTRUCTION);
+        assertThat(factory.getEfSearch()).isEqualTo(ShardConfig.DEFAULT_EF_SEARCH);
     }
 
     @Test

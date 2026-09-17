@@ -2,14 +2,13 @@ package excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 
+import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.RequestBody;
 import excalibur.api.protocol.ResponseBody;
-import excalibur.api.retrieval.ChunkTextResolver;
 import excalibur.api.retrieval.LexicalCoverage;
 import excalibur.api.retrieval.LexicalQueryService;
 import excalibur.api.retrieval.LexicalSearchPermits;
 import excalibur.api.retrieval.LexicalSignal;
-import excalibur.api.retrieval.ResultText;
 import excalibur.query.IndexCoverage;
 import excalibur.query.executor.CancellationToken;
 import excalibur.query.executor.QueryRegistry;
@@ -18,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
@@ -53,7 +53,7 @@ final class LexicalAnswer {
     private final QueryRequestParser parser;
     private final ExecutorService executorService;
     private final QueryRegistry queryRegistry;
-    private final ResultText resultText;
+    private final QueryContexts contexts;
 
     /**
      * Creates the answer path.
@@ -61,16 +61,17 @@ final class LexicalAnswer {
      * @param parser          Validates a request body
      * @param executorService Runs the search off the handler thread, so its budget is enforced
      * @param queryRegistry   Makes a running query cancellable, or null when none is kept
-     * @param resultText      Reads each result's text, when the request asks for it
-     * @throws NullPointerException if parser, executorService or resultText is null
+     * @param contexts        Resolves what a request asked for beyond the search - the page,
+     *                        the text, the explanation - the same way the fused path does
+     * @throws NullPointerException if parser, executorService or contexts is null
      */
     LexicalAnswer(QueryRequestParser parser, ExecutorService executorService,
-                  QueryRegistry queryRegistry, ResultText resultText) {
+                  QueryRegistry queryRegistry, QueryContexts contexts) {
         this.parser = Objects.requireNonNull(parser, "parser cannot be null");
         this.executorService =
             Objects.requireNonNull(executorService, "executorService cannot be null");
         this.queryRegistry = queryRegistry;
-        this.resultText = Objects.requireNonNull(resultText, "resultText cannot be null");
+        this.contexts = Objects.requireNonNull(contexts, "contexts cannot be null");
     }
 
     /**
@@ -81,23 +82,28 @@ final class LexicalAnswer {
      * is the common case: BM25 has already finished, the node is holding a complete answer, and
      * returning nothing reports the corpus as empty of what it actually contains.</p>
      *
-     * <p>{@code timed_out} stays true. The request did miss its deadline, and the answer did
-     * come from fewer signals than this node has, so both are said rather than the weaker one
-     * being dressed up as a whole answer.</p>
+     * <p>It is not only a deadline that reaches here. An embedding endpoint with a rejected
+     * key, an open circuit breaker or a 5xx fails in microseconds, and the documented effect of
+     * a missing embedding endpoint is no dense signal - not a failed query. Either way the
+     * answer says what it is: coverage is degraded because it came from fewer signals than this
+     * node has, and {@code timed_out} reports whether a deadline is what ended the other half
+     * rather than being set because the answer is degraded.</p>
      *
      * @param exchange      The request to answer
      * @param lexicalSignal The BM25 search, or null when none was started
      * @param queryId       The identifier this query was registered under
      * @param requestBody   The raw request, for the fields this path cannot honour
-     * @param topK          Most results the caller asked for
+     * @param parsed        The validated request
      * @param durationMs    How long the request has taken
-     * @param text          Reads each result's text, or null when none was asked for
+     * @param context       What this request asked for beyond the search
+     * @param timedOut      Whether the vector half ran out of time rather than failing
      * @return true when an answer was sent, false when this signal had none to give
      */
     boolean fallback(HttpExchange exchange,
                      LexicalSignal lexicalSignal,
-                     String queryId, String requestBody, int topK, long durationMs,
-                     ChunkTextResolver text)
+                     String queryId, String requestBody,
+                     QueryRequestParser.ParsedQuery parsed, long durationMs,
+                     QueryContext context, boolean timedOut)
             throws IOException {
         List<LexicalQueryService.Hit> hits =
             lexicalSignal == null ? null : lexicalSignal.ready();
@@ -107,12 +113,6 @@ final class LexicalAnswer {
         // everywhere else on this route, and it has to mean that here too.
         if (hits == null) {
             return false;
-        }
-        // top_k is a validated bound and is enforced here rather than assumed of the search:
-        // what this signal was asked for is a detail of how the two are fused, and no detail
-        // of that is allowed to hand the caller more than it asked for.
-        if (hits.size() > topK) {
-            hits = hits.subList(0, topK);
         }
         IndexCoverage coverage;
         try {
@@ -124,9 +124,37 @@ final class LexicalAnswer {
             LOGGER.warn("The lexical index could not report its coverage: {}", e.getMessage());
             return false;
         }
-        ResponseBody.sendJson(exchange, 200, QueryResponseJson.lexical(queryId, hits, coverage, requestBody,
-            UNHONOURED_FIELDS, true, false, durationMs, text));
+        // The page is what bounds the hits handed back. top_k is a validated bound and what
+        // this signal was asked for is a detail of how the two are fused, so no detail of
+        // that is allowed to hand the caller more, or less, than the page it asked for.
+        List<LexicalQueryService.Hit> page = context.page(hits.size()).slice(hits);
+        ResponseBody.sendJson(exchange, 200, QueryResponseJson.lexical(queryId, page, coverage,
+            ignoredFor(requestBody, lexicalSignal.service(), parsed.query()), timedOut, false,
+            durationMs, answerFor(context, hits.size(), page, coverage, timedOut, false)));
         return true;
+    }
+
+    /**
+     * Everything a BM25 answer says beyond its ranking.
+     *
+     * @param context   What this request asked for beyond the search
+     * @param produced  How many hits the search ranked, before the page was cut
+     * @param page      The hits this answer returns
+     * @param coverage  What the index says it searched
+     * @param timedOut  Whether the request's budget ran out
+     * @param cancelled Whether the caller withdrew the request
+     * @return The answer
+     */
+    private static QueryAnswer answerFor(QueryContext context, int produced,
+                                         List<LexicalQueryService.Hit> page,
+                                         IndexCoverage coverage, boolean timedOut,
+                                         boolean cancelled) {
+        QueryExplanation explanation = context.explaining()
+            ? QueryExplainer.lexical(page, context.offset(), context.passages(),
+                context.expansion(true))
+            : null;
+        return context.answer(produced,
+            ResultTotal.searchWasComplete(coverage, timedOut, cancelled), explanation);
     }
 
     /**
@@ -141,6 +169,47 @@ final class LexicalAnswer {
     private static final List<String> UNHONOURED_FIELDS = List.of(
         "threshold", "include_partial_segments", "enable_llm_scoring", "llm_threshold",
         "oversampling_factor");
+
+    /**
+     * Named when a query was searched as typed, without the expansion this node applies to
+     * shorter ones.
+     *
+     * <p>Not a request field, and the only entry here that is not: it is a stage of retrieval
+     * the caller's own input turned off. It belongs in the same list because the failure it
+     * prevents is the same one - a request that was accepted in full and answered by less than
+     * it asked for, with nothing in the answer saying which part was left out. A query past the
+     * bound is answered by plain BM25, and a caller comparing it against a shorter query is
+     * comparing two retrieval strategies without being told.</p>
+     */
+    private static final String QUERY_EXPANSION = "query_expansion";
+
+    /**
+     * What one answer accepted and did not act on.
+     *
+     * <p>Decided here rather than in the renderer: whether a field was honoured depends on what
+     * the caller sent and on what this node's retrieval stages could do with it, and neither is
+     * a question about how to write JSON.</p>
+     *
+     * @param requestBody The raw request, read for which fields the caller actually sent
+     * @param lexical     The index that answered, asked what it does to a query this long
+     * @param query       The query text, as validated
+     * @return The entries for {@code ignored_fields}, in a stable order
+     */
+    private static List<String> ignoredFor(String requestBody, LexicalQueryService lexical,
+                                           String query) {
+        List<String> ignored = new ArrayList<>(UNHONOURED_FIELDS.size() + 1);
+        for (String field : UNHONOURED_FIELDS) {
+            if (JsonText.has(requestBody, field)) {
+                ignored.add(field);
+            }
+        }
+        // Trimmed, because that is the length the expander measures: reporting a stage as
+        // skipped when it ran is the same kind of untruth as not reporting one that did not.
+        if (query.trim().length() > lexical.maxExpandableQueryChars()) {
+            ignored.add(QUERY_EXPANSION);
+        }
+        return ignored;
+    }
 
     /**
      * Answers a query from the lexical index alone.
@@ -170,26 +239,31 @@ final class LexicalAnswer {
             return;
         }
 
-        // Resolved before the search, not at render time, so a request asking for text this
-        // node cannot serve is refused without a full BM25 pass having run for an answer that
-        // is going to be thrown away.
-        ChunkTextResolver text;
+        // Resolved before the search, not at render time, so a request asking for text, a
+        // page or an explanation this node cannot serve is refused without a full BM25 pass
+        // having run for an answer that is going to be thrown away.
+        QueryContext context;
         try {
-            text = resultText.resolverFor(parsed.includeText());
+            context = contexts.of(requestBody, parsed);
         } catch (IllegalArgumentException e) {
             ResponseBody.sendError(exchange, 400, "Bad Request: " + e.getMessage());
             return;
         }
 
-        Outcome outcome = search(exchange, lexical, parsed, queryId, correlationId, startTime);
+        Outcome outcome = search(exchange, lexical, parsed, context, queryId, correlationId,
+            startTime);
         if (outcome == null) {
             return;
         }
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+        IndexCoverage coverage = coverageFor(lexical, outcome.timedOut(), outcome.cancelled());
+        List<LexicalQueryService.Hit> page = context.page(outcome.hits().size())
+            .slice(outcome.hits());
 
-        ResponseBody.sendJson(exchange, 200, QueryResponseJson.lexical(queryId, outcome.hits(),
-            coverageFor(lexical, outcome.timedOut(), outcome.cancelled()), requestBody,
-            UNHONOURED_FIELDS, outcome.timedOut(), outcome.cancelled(), durationMs, text));
+        ResponseBody.sendJson(exchange, 200, QueryResponseJson.lexical(queryId, page, coverage,
+            ignoredFor(requestBody, lexical, parsed.query()), outcome.timedOut(),
+            outcome.cancelled(), durationMs, answerFor(context, outcome.hits().size(), page,
+                coverage, outcome.timedOut(), outcome.cancelled())));
     }
 
     /**
@@ -213,6 +287,7 @@ final class LexicalAnswer {
      * @param exchange      The request, answered here when the search cannot be started
      * @param lexical       The index to search
      * @param parsed        The validated request
+     * @param context       What this request asked for beyond the search, for its depth
      * @param queryId       The identifier to register the running query under
      * @param correlationId Correlation ID for the registration
      * @param token         Cancels the search when the caller withdraws the request
@@ -222,6 +297,7 @@ final class LexicalAnswer {
     private Future<List<LexicalQueryService.Hit>> start(HttpExchange exchange,
                                                         LexicalQueryService lexical,
                                                         QueryRequestParser.ParsedQuery parsed,
+                                                        QueryContext context,
                                                         String queryId, String correlationId,
                                                         CancellationToken token)
             throws IOException {
@@ -239,7 +315,7 @@ final class LexicalAnswer {
         try {
             return executorService.submit(() -> {
                 try {
-                    return lexical.search(parsed.query(), parsed.topK());
+                    return lexical.search(parsed.query(), context.depth());
                 } finally {
                     // Released when the search stops, not when the request stops waiting for
                     // it. Releasing at the call site would let abandoned searches pile up
@@ -280,6 +356,7 @@ final class LexicalAnswer {
      * @param exchange      The request, answered here when the search could not produce one
      * @param lexical       The index to search
      * @param parsed        The validated request
+     * @param context       What this request asked for beyond the search, for its depth
      * @param queryId       The identifier to register the running query under
      * @param correlationId Correlation ID for the registration
      * @param startTime     {@link System#nanoTime()} value the request's budget runs from
@@ -287,15 +364,16 @@ final class LexicalAnswer {
      * @throws IOException if a refusal cannot be written
      */
     private Outcome search(HttpExchange exchange, LexicalQueryService lexical,
-                           QueryRequestParser.ParsedQuery parsed, String queryId,
-                           String correlationId, long startTime) throws IOException {
+                           QueryRequestParser.ParsedQuery parsed, QueryContext context,
+                           String queryId, String correlationId, long startTime)
+            throws IOException {
         long deadlineNanos = startTime + TimeUnit.MILLISECONDS.toNanos(parsed.timeoutMs());
         List<LexicalQueryService.Hit> hits;
         boolean timedOut = false;
         boolean cancelled = false;
         CancellationToken token = new CancellationToken();
         Future<List<LexicalQueryService.Hit>> pending =
-            start(exchange, lexical, parsed, queryId, correlationId, token);
+            start(exchange, lexical, parsed, context, queryId, correlationId, token);
         if (pending == null) {
             return null;
         }

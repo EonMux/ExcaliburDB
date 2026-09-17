@@ -81,6 +81,12 @@ final class ScheduledReindexRunner implements ReindexOperationHandler {
             return false;
         } finally {
             lease.release();
+            // Cleared before this thread goes back to the scheduler's pool. A cancelled
+            // reindex restores the interrupt flag on its way out so its caller can tell a
+            // cancellation from a failure - but that signal was addressed to the run that has
+            // just ended. Carried away, it fails the next task scheduled onto this thread at
+            // its first interruptible channel operation, which closes that channel for good.
+            Thread.interrupted();
         }
     }
 

@@ -1,5 +1,7 @@
 package excalibur.bench.benchmark;
 
+import excalibur.bench.kernel.RecallComputation;
+import excalibur.bench.kernel.Vectors;
 import excalibur.bench.metric.RecallValidator;
 import io.excalibur.vector.distance.DistanceFunction;
 import io.excalibur.vector.distance.L2Distance;
@@ -135,7 +137,7 @@ public class HnswRecallBenchmark {
                 dataset[i][d] = (float) random.nextGaussian();
             }
             // Normalize vectors for more meaningful distances
-            normalize(dataset[i]);
+            dataset[i] = Vectors.normalized(dataset[i]);
         }
 
         // Insert vectors into graph
@@ -153,7 +155,7 @@ public class HnswRecallBenchmark {
             for (int d = 0; d < dimension; d++) {
                 queries[i][d] = (float) random.nextGaussian();
             }
-            normalize(queries[i]);
+            queries[i] = Vectors.normalized(queries[i]);
         }
 
         // Compute ground truth via brute force
@@ -161,7 +163,7 @@ public class HnswRecallBenchmark {
         groundTruth = new ArrayList<>();
         groundTruthMap = new HashMap<>();
         for (int q = 0; q < queryCount; q++) {
-            List<Long> truth = computeTrueTopK(queries[q], K);
+            List<Long> truth = RecallComputation.trueTopK(queries[q], dataset, K, distanceFunction);
             groundTruth.add(truth);
             groundTruthMap.put(q, truth);
         }
@@ -221,28 +223,29 @@ public class HnswRecallBenchmark {
      * <p>Domain correctness: Returns value in range [0.0, 1.0]</p>
      */
     private double measureRecallInternal() {
-        int totalFound = 0;
-        int totalExpected = queryCount * K;
-
+        RecallComputation.Tally tally = new RecallComputation.Tally();
         for (int q = 0; q < queryCount; q++) {
-            List<HnswSearchResult> results = graph.search(queries[q], K);
-            Set<Long> resultIds = new HashSet<>();
-            for (HnswSearchResult r : results) {
-                resultIds.add(r.nodeId());
-            }
-
-            // Count how many true top-k are in the results
-            for (Long trueId : groundTruth.get(q)) {
-                if (resultIds.contains(trueId)) {
-                    totalFound++;
-                }
-            }
+            tally.record(searchIds(queries[q]), groundTruth.get(q));
         }
+        return clampRecall(tally.recall());
+    }
 
-        double recall = (double) totalFound / totalExpected;
+    /**
+     * The node ids the graph returns for one query.
+     */
+    private Set<Long> searchIds(float[] query) {
+        return nodeIds(graph.search(query, K));
+    }
 
-        // Clamp to valid range [0.0, 1.0] for domain correctness
-        return clampRecall(recall);
+    /**
+     * The node ids of a search result list.
+     */
+    private static Set<Long> nodeIds(List<HnswSearchResult> results) {
+        Set<Long> ids = new HashSet<>(results.size() * 2);
+        for (HnswSearchResult result : results) {
+            ids.add(result.nodeId());
+        }
+        return ids;
     }
 
     /**
@@ -288,30 +291,7 @@ public class HnswRecallBenchmark {
      */
     @Benchmark
     public double measureRecall(Blackhole bh) {
-        int totalFound = 0;
-        int totalExpected = queryCount * K;
-
-        for (int q = 0; q < queryCount; q++) {
-            List<HnswSearchResult> results = graph.search(queries[q], K);
-            Set<Long> resultIds = new HashSet<>();
-            for (HnswSearchResult r : results) {
-                resultIds.add(r.nodeId());
-            }
-
-            // Count how many true top-k are in the results
-            for (Long trueId : groundTruth.get(q)) {
-                if (resultIds.contains(trueId)) {
-                    totalFound++;
-                }
-            }
-        }
-
-        double recall = (double) totalFound / totalExpected;
-
-        // Clamp recall to valid range [0.0, 1.0] for domain correctness
-        // This ensures the value is always a valid percentage between 0% and 100%
-        recall = Math.max(0.0, Math.min(1.0, recall));
-
+        double recall = measureRecallInternal();
         bh.consume(recall);
         return recall;
     }
@@ -359,34 +339,17 @@ public class HnswRecallBenchmark {
     @Benchmark
     @OperationsPerInvocation(100)
     public RecallQpsResult recallAndThroughput(Blackhole bh) {
-        int totalFound = 0;
-        int totalExpected = 100 * K;
+        RecallComputation.Tally tally = new RecallComputation.Tally();
         int resultCount = 0;
 
         for (int q = 0; q < 100; q++) {
             int queryIdx = q % queryCount;
             List<HnswSearchResult> results = graph.search(queries[queryIdx], K);
             resultCount += results.size();
-
-            Set<Long> resultIds = new HashSet<>();
-            for (HnswSearchResult r : results) {
-                resultIds.add(r.nodeId());
-            }
-
-            // Count how many true top-k are in the results
-            for (Long trueId : groundTruth.get(queryIdx)) {
-                if (resultIds.contains(trueId)) {
-                    totalFound++;
-                }
-            }
+            tally.record(nodeIds(results), groundTruth.get(queryIdx));
         }
 
-        double recall = (double) totalFound / totalExpected;
-
-        // Clamp recall to valid range [0.0, 1.0] for domain correctness
-        recall = Math.max(0.0, Math.min(1.0, recall));
-
-        RecallQpsResult result = new RecallQpsResult(recall, resultCount);
+        RecallQpsResult result = new RecallQpsResult(clampRecall(tally.recall()), resultCount);
         bh.consume(result);
         return result;
     }
@@ -414,53 +377,6 @@ public class HnswRecallBenchmark {
     }
 
     // ==================== Helper Methods ====================
-
-    /**
-     * Computes the true top-k nearest neighbors via brute force.
-     */
-    private List<Long> computeTrueTopK(float[] query, int k) {
-        PriorityQueue<NodeDistance> heap = new PriorityQueue<>(
-            Comparator.comparingDouble(NodeDistance::distance).reversed()
-        );
-
-        for (long i = 0; i < datasetSize; i++) {
-            float dist = distanceFunction.compute(query, dataset[(int) i]);
-            if (heap.size() < k) {
-                heap.offer(new NodeDistance(i, dist));
-            } else if (dist < heap.peek().distance()) {
-                heap.poll();
-                heap.offer(new NodeDistance(i, dist));
-            }
-        }
-
-        List<Long> topK = new ArrayList<>();
-        while (!heap.isEmpty()) {
-            topK.add(heap.poll().nodeId());
-        }
-        Collections.reverse(topK);
-        return topK;
-    }
-
-    /**
-     * Normalizes a vector to unit length.
-     */
-    private void normalize(float[] vector) {
-        float norm = 0.0f;
-        for (float v : vector) {
-            norm += v * v;
-        }
-        norm = (float) Math.sqrt(norm);
-        if (norm > 0) {
-            for (int i = 0; i < vector.length; i++) {
-                vector[i] /= norm;
-            }
-        }
-    }
-
-    /**
-     * Record for node-distance pairs in brute force search.
-     */
-    private record NodeDistance(long nodeId, float distance) {}
 
     // ==================== Additional Validation Methods ====================
 

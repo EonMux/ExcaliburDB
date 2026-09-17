@@ -46,6 +46,15 @@ public final class LexicalQueryService {
     private final int rrfK;
 
     /**
+     * The expander every query goes through, kept so an answer can describe what it did.
+     *
+     * <p>Held rather than only handed to the ranker because the length at which expansion
+     * stops applying is not visible in the results: a long question answered by a narrower
+     * search looks exactly like a question the corpus had less to say about.</p>
+     */
+    private final QueryExpander expander;
+
+    /**
      * Creates the service.
      *
      * @param chunks   The lexical index over ingested chunks
@@ -73,11 +82,12 @@ public final class LexicalQueryService {
                                List<Ranker> extra, int rrfK, int perSignalOverFetch) {
         this.chunks = Objects.requireNonNull(chunks, "chunks must not be null");
         this.rrfK = rrfK;
+        this.expander = expander == null ? QueryExpander.identity() : expander;
         List<Ranker> rankers = new ArrayList<>();
         // The index supplies its own signal: the two engines search differently enough that
         // asking either to expose the other's query type would mean writing a translation layer
         // whose only job is to be wrong somewhere.
-        rankers.add(chunks.ranker(expander == null ? QueryExpander.identity() : expander));
+        rankers.add(chunks.ranker(this.expander));
         if (extra != null) {
             rankers.addAll(extra);
         }
@@ -101,6 +111,21 @@ public final class LexicalQueryService {
      */
     public int rrfK() {
         return rrfK;
+    }
+
+    /**
+     * The longest query this node will widen before searching it.
+     *
+     * <p>A query past it is still answered, and answered well - it is long enough to be
+     * specific - but by plain BM25 rather than by the expanded search every shorter query
+     * gets. Two retrieval strategies behind one endpoint is only honest if the answer says
+     * which one ran, and nothing in a result list shows it.</p>
+     *
+     * @return The bound in characters, or {@link Integer#MAX_VALUE} when length never stops
+     *         expansion on this node
+     */
+    public int maxExpandableQueryChars() {
+        return expander.maxExpandableChars();
     }
 
     /**

@@ -20,11 +20,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * happens while the node is reading its configuration, not on the first document of a crawl
  * that had already been accepted.</p>
  */
-@DisplayName("Config.Ingest chunking")
+@DisplayName("IngestConfig chunking")
 class ConfigIngestChunkingTest {
 
-    private static Config.Ingest ingest(Map<String, String> props) {
-        return new Config.Ingest(new HashMap<>(props));
+    private static IngestConfig ingest(Map<String, String> props) {
+        return new IngestConfig(new HashMap<>(props));
     }
 
     @Nested
@@ -34,7 +34,7 @@ class ConfigIngestChunkingTest {
         @Test
         @DisplayName("an empty configuration chunks at 512 tokens overlapping by 64")
         void documentedDefaults() {
-            Config.Ingest settings = ingest(Map.of());
+            IngestConfig settings = ingest(Map.of());
 
             assertThat(settings.getChunkTargetTokens()).isEqualTo(512);
             assertThat(settings.getChunkOverlapTokens()).isEqualTo(64);
@@ -78,7 +78,7 @@ class ConfigIngestChunkingTest {
         @Test
         @DisplayName("a smaller chunk with a proportionate overlap is taken as given")
         void acceptsATunedPair() {
-            Config.Ingest settings = ingest(Map.of(
+            IngestConfig settings = ingest(Map.of(
                 "excalibur.ingest.chunk-target-tokens", "256",
                 "excalibur.ingest.chunk-overlap-tokens", "32"));
 

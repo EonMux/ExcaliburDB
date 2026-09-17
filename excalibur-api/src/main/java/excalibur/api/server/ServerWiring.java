@@ -14,6 +14,7 @@ import excalibur.ingest.lsh.LshIngestionService;
 import excalibur.ingest.pipeline.DocumentReindexer;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
 import excalibur.ingest.processor.TextChunker;
+import excalibur.ingest.registry.DocumentRegistry;
 import excalibur.ingest.registry.SourceCatalog;
 import excalibur.ingest.source.SourceResolver;
 import excalibur.ingest.visibility.DocumentVisibilityTracker;
@@ -137,6 +138,12 @@ final class ServerWiring {
      */
     private volatile DocumentErasureService documentErasure;
 
+    /** What this node has ingested, or null on a node that keeps no record of it. */
+    private volatile DocumentRegistry documentRegistry;
+
+    /** The expander the lexical half widens queries with, or null on a node with none. */
+    private volatile io.excalibur.retrieval.expand.QueryExpander queryExpander;
+
     /**
      * Where registered ingest sources are written down, so they outlive the process.
      *
@@ -254,8 +261,12 @@ final class ServerWiring {
      * @return One line per route this node serves
      */
     List<String> bannerLines() {
-        return EndpointBanner.lines(documentErasure != null, graphTenants != null,
-            graphTenants == null && graphPipeline != null, ingestionOrchestrator != null);
+        return EndpointBanner.lines(new EndpointBanner.Routes(
+            documentErasure != null,
+            graphTenants != null,
+            graphTenants == null && graphPipeline != null,
+            ingestionOrchestrator != null,
+            documentRegistry != null));
     }
 
     // ==================== Attachment ====================
@@ -285,9 +296,19 @@ final class ServerWiring {
         this.lexicalQueryService = service;
     }
 
+    /** @param expander The expander the lexical half widens queries with, or null for none */
+    void withQueryExpander(io.excalibur.retrieval.expand.QueryExpander expander) {
+        this.queryExpander = expander;
+    }
+
     /** @param service The service behind {@code POST /v1/erasure}, or null to omit the route */
     void withDocumentErasure(DocumentErasureService service) {
         this.documentErasure = service;
+    }
+
+    /** @param registry What this node holds, or null to omit {@code GET /v1/documents/list} */
+    void withDocumentRegistry(DocumentRegistry registry) {
+        this.documentRegistry = registry;
     }
 
     /** @param catalog Where source registrations are recorded across restarts, or null */
@@ -466,9 +487,10 @@ final class ServerWiring {
         SourceResolver resolver = sourceResolver != null ? sourceResolver : createSourceResolver();
         return new EndpointRegistrar.Inputs(
             security, config, indexOrchestrator, storageEngine, volumeManager,
-            queryPipeline, queryRegistry, embeddingClient, lexicalQueryService, chunkIndex,
+            queryPipeline, queryRegistry, embeddingClient, lexicalQueryService, queryExpander,
+            chunkIndex,
             ingestSourceRegistry, sourceCatalog, ingestionStatusRegistry, ingestionOrchestrator,
             reindexStatusRegistry, documentReindexer, resolver, reindexCoordinator,
-            documentErasure, graphTenants, graphPipeline);
+            documentErasure, graphTenants, graphPipeline, documentRegistry);
     }
 }

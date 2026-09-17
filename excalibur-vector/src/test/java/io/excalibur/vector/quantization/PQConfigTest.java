@@ -100,10 +100,11 @@ class PQConfigTest {
     void testValidateDimensionValid() {
         PQConfig config = new PQConfig(8, 256);
 
-        // Should not throw
-        config.validateDimension(128);  // 128 / 8 = 16
-        config.validateDimension(256);  // 256 / 8 = 32
-        config.validateDimension(768);  // 768 / 8 = 96
+        assertThatCode(() -> {
+            config.validateDimension(128);  // 128 / 8 = 16
+            config.validateDimension(256);  // 256 / 8 = 32
+            config.validateDimension(768);  // 768 / 8 = 96
+        }).doesNotThrowAnyException();
     }
 
     @Test

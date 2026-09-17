@@ -12,7 +12,10 @@
     - Use StructuredLoggingHelper for safe MDC management
 
     Environment Variables:
-    - EXCALIBUR_LOG_LEVEL: Root log level (default: INFO)
+    - EXCALIBUR_LOG_LEVEL: Root log level (default: INFO), read once at startup.
+
+    To change the level on a running node, use the logback JMX MBean registered below rather than
+    editing this file: it ships inside the fat JAR and cannot be edited in place.
 
     Output is JSON. A human-readable switch used to be documented here and wired to nothing:
     logback selects an appender conditionally only with Janino, which this build does not carry,
@@ -49,6 +52,20 @@
         with the JDK's own on every reconfiguration.
     -->
     <contextListener class="ch.qos.logback.classic.jul.LevelChangePropagator"/>
+
+    <!--
+        Let the level be changed on a running node.
+
+        scan="true" above cannot do it here: logback only watches file: and http: URLs, and this
+        file ships inside the fat JAR, so its scan never fires and the level it would re-read is
+        resolved from EXCALIBUR_LOG_LEVEL at configuration time anyway. Without this, raising the
+        level to debug an incident costs a restart - which destroys the state being debugged.
+
+        jmxConfigurator registers a ch.qos.logback.classic:Name=default,Type=... MBean whose
+        setLoggerLevel takes effect immediately, and the LevelChangePropagator above carries the
+        change onto the JDK loggers the storage engine uses, so the two do not drift apart.
+    -->
+    <jmxConfigurator/>
 
     <!-- Read log level from environment variable, default to INFO -->
     <property name="LOG_LEVEL" value="${EXCALIBUR_LOG_LEVEL:-INFO}" />

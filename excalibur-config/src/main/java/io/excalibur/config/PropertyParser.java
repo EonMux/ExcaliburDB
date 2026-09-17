@@ -85,6 +85,12 @@ final class PropertyParser {
      * literals {@code NaN} and {@code Infinity}, and NaN in particular survives every
      * ordered range check downstream while making each comparison against it false.</p>
      *
+     * <p>This is the only place finiteness is enforced. Every decimal setting in every
+     * section is read through here, so no section and no validator carries a NaN guard of
+     * its own: a guard that cannot fire reads like a check and performs none, and copies of
+     * one invariant drift apart. Removing this check therefore breaks every section at once,
+     * which is what {@code ConfigFinitenessTest} pins.</p>
+     *
      * @param props The properties map
      * @param key The property key
      * @param defaultValue Value to use when the key is absent or blank

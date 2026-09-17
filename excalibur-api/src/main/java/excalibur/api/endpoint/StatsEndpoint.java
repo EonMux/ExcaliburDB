@@ -4,21 +4,18 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.ResponseBody;
+import excalibur.ingest.lexical.ChunkIndexStats;
 import excalibur.shard.IndexOrchestrator;
 import excalibur.shard.VisibilityTracker;
 import excalibur.shard.allocator.VolumeManager;
-import io.excalibur.metrics.FixedBucketHistogram;
 import io.excalibur.store.SegmentCatalog;
 import io.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.Map;
-import java.util.Objects;
+import java.util.function.Supplier;
 
 /**
  * HTTP endpoint for the /v1/stats API.
@@ -38,13 +35,12 @@ import java.util.Objects;
  *     "tombstoned": 0,
  *     "purged": 0
  *   },
- *   "entries": {
- *     "total": 15000000
- *   },
+ *   "entries": { "total": 15000000 },
  *   "volumes": {
  *     "count": 3,
  *     "totalBytes": 5368709120,
- *     "usedBytes": 3221225472
+ *     "usedBytes": 3221225472,
+ *     "availableBytes": 2147483648
  *   },
  *   "hnsw": {
  *     "queueDepth": 50000,
@@ -65,6 +61,9 @@ import java.util.Objects;
  *     "visibleSegments": 1024
  *   },
  *   "coverage": 1.0000,
+ *   "workers": { "indexOrchestratorRunning": true },
+ *   "vectorIndex": { "segmentsWithoutIndex": 0 },
+ *   "breakers": { "embedding": "CLOSED" },
  *   "lexical": {
  *     "engine": "native",
  *     "indexed": 15000000,
@@ -75,9 +74,33 @@ import java.util.Objects;
  *     "erasureRequests": 3,
  *     "oldestErasureAgeMs": 412000,
  *     "compactionDue": false
+ *   },
+ *   "queryCache": {
+ *     "hits": 1204,
+ *     "misses": 8431,
+ *     "evictions": 0,
+ *     "invalidations": 7900,
+ *     "size": 512,
+ *     "capacity": 1024,
+ *     "hitRatio": 0.1249
  *   }
  * }
  * }</pre>
+ *
+ * <h2>The query cache, when there is one</h2>
+ * <p>Absent unless {@code excalibur.query.cache.enabled} is on, and absent is a different
+ * statement from a cache that has never been hit. {@code hitRatio} says whether it is
+ * earning its place; {@code invalidations} says why it is not, when it is not. Entries
+ * discarded because the corpus moved are not a capacity problem and raising the capacity
+ * will not help - that figure is the node ingesting faster than its queries repeat.</p>
+ *
+ * <h2>The three blocks that report a partial failure</h2>
+ * <p>{@code workers}, {@code vectorIndex} and {@code breakers} describe states this node keeps
+ * serving through, and each of them is invisible in every other field. A dead index
+ * orchestrator leaves the HNSW queue growing while coverage stays at one; a segment whose
+ * vector index would not attach answers no vector search while returning its key-value data
+ * intact; an open embedding breaker silently drops retrieval to lexical-only. In all three the
+ * node answers 200 to everything it is asked.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
@@ -97,20 +120,17 @@ public class StatsEndpoint implements HttpHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(StatsEndpoint.class);
 
-    private final VisibilityTracker visibilityTracker;
-    private final SegmentCatalog segmentCatalog;
-    private final IndexOrchestrator indexOrchestrator;
-    private final StorageEngine storageEngine;
-    private final VolumeManager volumeManager;
-
     /**
-     * The chunk lexical index, when this node keeps one.
+     * Most vector-index failures named individually in one response.
      *
-     * <p>Optional and set after construction, because whether there is an index at all depends on
-     * configuration this endpoint does not read. Absent, the response simply carries no
-     * {@code lexical} block, which is a different statement from an index reporting nothing.</p>
+     * <p>The count is always exact; only the reasons are capped. A node that lost its graphs
+     * wholesale would otherwise produce a reason per segment, and a stats response that grows
+     * with the size of the failure is one an operator cannot read during the incident it
+     * describes.</p>
      */
-    private volatile excalibur.ingest.lexical.ChunkIndex lexicalIndex;
+    private static final int MAX_REPORTED_VECTOR_FAILURES = 32;
+
+    private final NodeStatsCollector collector;
 
     /**
      * Creates a new StatsEndpoint with required dependencies.
@@ -136,15 +156,7 @@ public class StatsEndpoint implements HttpHandler {
      */
     public StatsEndpoint(IndexOrchestrator indexOrchestrator, StorageEngine storageEngine,
                          VolumeManager volumeManager) {
-        Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
-        Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
-
-        this.indexOrchestrator = indexOrchestrator;
-        this.storageEngine = storageEngine;
-        this.visibilityTracker = indexOrchestrator.getVisibilityTracker();
-        this.segmentCatalog = storageEngine.getCatalog();
-        this.volumeManager = volumeManager;
-
+        this(new NodeStatsCollector(indexOrchestrator, storageEngine, volumeManager));
         LOGGER.debug("StatsEndpoint created with VolumeManager: {}", volumeManager != null);
     }
 
@@ -185,16 +197,21 @@ public class StatsEndpoint implements HttpHandler {
                          IndexOrchestrator indexOrchestrator,
                          StorageEngine storageEngine,
                          VolumeManager volumeManager) {
-        Objects.requireNonNull(visibilityTracker, "VisibilityTracker cannot be null");
-        Objects.requireNonNull(segmentCatalog, "SegmentCatalog cannot be null");
-        Objects.requireNonNull(indexOrchestrator, "IndexOrchestrator cannot be null");
-        Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
+        this(new NodeStatsCollector(visibilityTracker, segmentCatalog, indexOrchestrator,
+            storageEngine, volumeManager));
+    }
 
-        this.visibilityTracker = visibilityTracker;
-        this.segmentCatalog = segmentCatalog;
-        this.indexOrchestrator = indexOrchestrator;
-        this.storageEngine = storageEngine;
-        this.volumeManager = volumeManager;
+    /**
+     * Creates a new StatsEndpoint over a collector somebody else assembled.
+     *
+     * <p>How {@code /metrics} and this route are given the same snapshot source: whichever of
+     * them is registered, the node is read once, the same way.</p>
+     *
+     * @param collector Reads the node's state
+     * @throws NullPointerException if collector is null
+     */
+    public StatsEndpoint(NodeStatsCollector collector) {
+        this.collector = java.util.Objects.requireNonNull(collector, "collector cannot be null");
     }
 
     /**
@@ -206,445 +223,280 @@ public class StatsEndpoint implements HttpHandler {
      * @param lexicalIndex The index, or null for a node that keeps none
      */
     public void withLexicalIndex(excalibur.ingest.lexical.ChunkIndex lexicalIndex) {
-        this.lexicalIndex = lexicalIndex;
+        collector.withLexicalIndex(lexicalIndex);
+    }
+
+    /**
+     * Reports the embedding circuit breaker's state.
+     *
+     * <p>The breaker is the node's main degradation mode and was readable only from log
+     * statements: when it opens, retrieval silently falls back to lexical-only and the node
+     * keeps answering 200, so a caller sees worse results and no signal at all.</p>
+     *
+     * @param breaker Reads the breaker's state, or null on a node with no embedding client
+     */
+    public void withEmbeddingBreaker(Supplier<String> breaker) {
+        collector.withEmbeddingBreaker(breaker);
+    }
+
+    /**
+     * Reports the LLM relevancy circuit breaker's state.
+     *
+     * <p>Stage 5's breaker. When it opens the pipeline keeps the vector ranking and the node
+     * goes on answering 200, so every ranking it returns changes with nothing in the response
+     * saying so.</p>
+     *
+     * @param breaker Reads the breaker's state, or null on a node with no LLM scorer
+     */
+    public void withLlmRelevancyBreaker(Supplier<String> breaker) {
+        collector.withLlmRelevancyBreaker(breaker);
+    }
+
+    /**
+     * Reports the query result cache alongside the rest of the node's state.
+     *
+     * <p>The one component whose failure is invisible in every other figure here. A cache
+     * that never hits is pure cost - a corpus fingerprint on every request, and memory held
+     * for answers nobody asks for twice - and a cache whose entries are invalidated as fast
+     * as they are stored is a node ingesting faster than it is being queried. Both read as
+     * ordinary latency from outside, and the hit ratio against the invalidation count is what
+     * tells the two apart.</p>
+     *
+     * @param cache The cache, or null for a node that runs without one
+     */
+    public void withQueryResultCache(excalibur.query.cache.QueryResultCache cache) {
+        collector.withQueryResultCache(cache);
     }
 
     @Override
     public void handle(HttpExchange exchange) throws IOException {
-        String method = exchange.getRequestMethod();
-
-        if (!"GET".equalsIgnoreCase(method)) {
-            sendError(exchange, 405, "Method Not Allowed");
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            ResponseBody.sendError(exchange, 405, "Method Not Allowed");
             return;
         }
 
         try {
-            SystemStats stats = computeStats();
-            sendResponse(exchange, stats);
+            ResponseBody.sendJson(exchange, 200, toJson(collector.collect()));
         } catch (Exception e) {
             LOGGER.error("Error computing stats: {}", e.getMessage(), e);
-            sendError(exchange, 500, "Internal Server Error");
+            ResponseBody.sendError(exchange, 500, "Internal Server Error");
         }
     }
 
     /**
-     * Computes the current system statistics.
-     *
-     * <p>Domain correctness guarantees:</p>
-     * <ul>
-     *   <li>All counts are non-negative</li>
-     *   <li>Coverage is clamped to [0.0, 1.0]</li>
-     *   <li>Epoch is non-negative</li>
-     * </ul>
-     *
-     * @return The current system statistics
-     */
-    private SystemStats computeStats() {
-        SegmentCatalog.CatalogMetadata catalogMeta = segmentCatalog.getCatalogMetadata();
-
-        SegmentStats segments = new SegmentStats(
-            catalogMeta.getTotalSegments(),
-            catalogMeta.getActiveSegments(),
-            catalogMeta.getIndexingSegments(),
-            catalogMeta.getWarmSegments(),
-            catalogMeta.getCompactingSegments(),
-            catalogMeta.getTombstonedSegments(),
-            catalogMeta.getPurgedSegments()
-        );
-
-        EntryStats entries = new EntryStats(catalogMeta.getTotalEntryCount());
-
-        VolumeStats volumes = computeVolumeStats();
-
-        HnswStats hnsw = new HnswStats(
-            indexOrchestrator.getHnswQueueDepth(),
-            indexOrchestrator.getHnswQueueDepthLimit(),
-            indexOrchestrator.getTotalVectorsIntegrated()
-        );
-
-        excalibur.filter.HierarchicalCuckooFilter membership =
-            indexOrchestrator.getHierarchicalCuckooFilter();
-        CuckooStats cuckoo = new CuckooStats(
-            indexOrchestrator.getPendingCuckooDeletions(),
-            indexOrchestrator.getTotalCuckooDeletions(),
-            FixedBucketHistogram.getInstance().getAverageFpRate(),
-            FixedBucketHistogram.getInstance().getMaxFpRate(),
-            membership != null && membership.isSaturated(),
-            membership == null ? 0 : membership.saturatedSegmentCount()
-        );
-
-        VisibilityTracker.VisibilityStats visStats = visibilityTracker.getStats();
-        VisibilityStats visibility = new VisibilityStats(
-            visStats.currentEpoch(),
-            visStats.totalSegments(),
-            visStats.visibleSegments()
-        );
-
-        double coverage = computeCoverage(catalogMeta);
-
-        return new SystemStats(segments, entries, volumes, hnsw, cuckoo, visibility, coverage,
-            computeLexicalStats());
-    }
-
-    /**
-     * Reads the lexical index's own account of itself, or null when there is no index.
-     *
-     * <p>A failure here is reported as an absent block rather than as a failed request: the rest
-     * of the response is what most callers came for, and losing all of it to one subsystem that
-     * could not answer is the worse outcome.</p>
-     */
-    private excalibur.ingest.lexical.ChunkIndexStats computeLexicalStats() {
-        excalibur.ingest.lexical.ChunkIndex index = this.lexicalIndex;
-        if (index == null) {
-            return null;
-        }
-        try {
-            return index.stats();
-        } catch (RuntimeException e) {
-            LOGGER.warn("Lexical index stats unavailable: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Computes volume statistics from the VolumeManager or storage engine.
-     *
-     * <p>If VolumeManager is available, uses it for accurate disk space tracking via
-     * {@link Files#getFileStore(Path)}. Otherwise, falls back to estimating from
-     * segment catalog (which may be inaccurate as it uses directory metadata size).</p>
-     *
-     * <p><strong>Domain Correctness:</strong></p>
-     * <ul>
-     *   <li>totalBytes: Actual disk capacity from FileStore.getTotalSpace()</li>
-     *   <li>usedBytes: Actual used space (totalBytes - availableBytes)</li>
-     *   <li>Values represent real disk usage, not directory metadata size</li>
-     * </ul>
-     *
-     * @return Volume statistics
-     */
-    private VolumeStats computeVolumeStats() {
-        // Use VolumeManager for accurate disk space tracking when available
-        if (volumeManager != null) {
-            VolumeManager.VolumeStats aggregatedStats = volumeManager.getAggregatedVolumeStats();
-            int volumeCount = volumeManager.getVolumeCount();
-
-            return new VolumeStats(
-                volumeCount,
-                aggregatedStats.totalBytes(),
-                aggregatedStats.usedBytes()
-            );
-        }
-
-        // Fallback: compute from segment catalog (less accurate)
-        // WARNING: This uses Files.size(volumePath) which returns directory metadata size,
-        // not actual disk usage. This is kept for backward compatibility.
-        return computeVolumeStatsFallback();
-    }
-
-    /**
-     * Fallback method for computing volume statistics from segment catalog.
-     *
-     * <p><strong>Warning:</strong> This method uses {@link Files#size(Path)} which
-     * returns directory metadata size (typically 4096 bytes), not actual disk usage.
-     * Use VolumeManager for accurate disk space tracking.</p>
-     *
-     * @return Volume statistics computed from segment catalog
-     */
-    private VolumeStats computeVolumeStatsFallback() {
-        Map<Long, SegmentCatalog.SegmentMetadata> allSegments = segmentCatalog.getAll();
-
-        int volumeCount = 0;
-        long totalBytes = 0;
-        long usedBytes = 0;
-
-        java.util.Set<Path> seenVolumes = new java.util.HashSet<>();
-
-        for (SegmentCatalog.SegmentMetadata metadata : allSegments.values()) {
-            Path volumePath = metadata.getVolumePath();
-            if (volumePath != null && !seenVolumes.contains(volumePath)) {
-                seenVolumes.add(volumePath);
-                volumeCount++;
-
-                try {
-                    if (Files.exists(volumePath)) {
-                        // WARNING: Files.size() returns directory metadata size, not disk usage
-                        // This is intentionally kept for backward compatibility but is inaccurate
-                        long size = Files.size(volumePath);
-                        totalBytes += size;
-                        usedBytes += size;
-                    }
-                } catch (IOException e) {
-                    LOGGER.trace("Could not get size for volume {}: {}", volumePath, e.getMessage());
-                }
-            }
-        }
-
-        return new VolumeStats(volumeCount, totalBytes, usedBytes);
-    }
-
-    /**
-     * Computes estimated corpus coverage from the segment catalog.
-     *
-     * <p>Coverage is computed as the ratio of queryable segments to total non-purged segments.
-     * The value is clamped to [0.0, 1.0] to ensure domain correctness.</p>
-     *
-     * @param metadata The catalog metadata
-     * @return Coverage ratio in range [0.0, 1.0]
-     * @see SegmentCatalog.CatalogMetadata#getEstimatedCoverage()
-     */
-    private double computeCoverage(SegmentCatalog.CatalogMetadata metadata) {
-        return metadata.getEstimatedCoverage();
-    }
-
-    /**
-     * Sends a JSON response with the system statistics.
-     */
-    private void sendResponse(HttpExchange exchange, SystemStats stats) throws IOException {
-        String json = toJson(stats);
-        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-
-        exchange.getResponseHeaders().set("Content-Type", "application/json");
-        ResponseBody.send(exchange, 200, bytes);
-    }
-
-    /**
-     * Sends an error response.
-     */
-    private void sendError(HttpExchange exchange, int statusCode, String message) throws IOException {
-        String json = String.format("{\"error\": \"%s\"}", JsonText.escape(message));
-        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-
-        exchange.getResponseHeaders().set("Content-Type", "application/json");
-        ResponseBody.send(exchange, statusCode, bytes);
-    }
-
-    /**
-     * Converts SystemStats to JSON.
+     * Converts a snapshot to JSON.
      *
      * <p>Hand-serialized JSON following the project's minimal dependency approach.</p>
+     *
+     * @param stats What the collector read
+     * @return The response body
      */
-    private String toJson(SystemStats stats) {
-        StringBuilder sb = new StringBuilder(512);
+    private static String toJson(NodeStats stats) {
+        StringBuilder sb = new StringBuilder(768);
         sb.append("{");
-
-        sb.append("\"segments\": {");
-        sb.append("\"total\": ").append(stats.segments().total()).append(", ");
-        sb.append("\"active\": ").append(stats.segments().active()).append(", ");
-        sb.append("\"indexing\": ").append(stats.segments().indexing()).append(", ");
-        sb.append("\"warming\": ").append(stats.segments().warming()).append(", ");
-        sb.append("\"compacting\": ").append(stats.segments().compacting()).append(", ");
-        sb.append("\"tombstoned\": ").append(stats.segments().tombstoned()).append(", ");
-        sb.append("\"purged\": ").append(stats.segments().purged());
-        sb.append("}, ");
-
-        sb.append("\"entries\": {");
-        sb.append("\"total\": ").append(stats.entries().total());
-        sb.append("}, ");
-
-        sb.append("\"volumes\": {");
-        sb.append("\"count\": ").append(stats.volumes().count()).append(", ");
-        sb.append("\"totalBytes\": ").append(stats.volumes().totalBytes()).append(", ");
-        sb.append("\"usedBytes\": ").append(stats.volumes().usedBytes());
-        sb.append("}, ");
-
-        sb.append("\"hnsw\": {");
-        sb.append("\"queueDepth\": ").append(stats.hnsw().queueDepth()).append(", ");
-        sb.append("\"queueDepthLimit\": ").append(stats.hnsw().queueDepthLimit()).append(", ");
-        sb.append("\"vectorsIntegrated\": ").append(stats.hnsw().vectorsIntegrated());
-        sb.append("}, ");
-
-        sb.append("\"cuckoo\": {");
-        sb.append("\"pendingDeletions\": ").append(stats.cuckoo().pendingDeletions()).append(", ");
-        sb.append("\"totalDeletions\": ").append(stats.cuckoo().totalDeletions()).append(", ");
-        sb.append("\"avgFpRate\": ").append(JsonText.number(stats.cuckoo().avgFpRate(), 6)).append(", ");
-        sb.append("\"maxFpRate\": ").append(JsonText.number(stats.cuckoo().maxFpRate(), 6)).append(", ");
-        sb.append("\"saturated\": ").append(stats.cuckoo().saturated()).append(", ");
-        sb.append("\"saturatedSegments\": ").append(stats.cuckoo().saturatedSegments());
-        sb.append("}, ");
-
-        sb.append("\"visibility\": {");
-        sb.append("\"epoch\": ").append(stats.visibility().epoch()).append(", ");
-        sb.append("\"registeredSegments\": ").append(stats.visibility().registeredSegments()).append(", ");
-        sb.append("\"visibleSegments\": ").append(stats.visibility().visibleSegments());
-        sb.append("}, ");
-
-        sb.append("\"coverage\": ").append(JsonText.number(stats.coverage(), 4));
-
-        if (stats.lexical() != null) {
-            excalibur.ingest.lexical.ChunkIndexStats lexical = stats.lexical();
-            sb.append(", \"lexical\": {");
-            sb.append("\"engine\": \"").append(JsonText.escape(lexical.engine())).append("\", ");
-            sb.append("\"indexed\": ").append(lexical.indexed()).append(", ");
-            sb.append("\"segments\": ").append(lexical.segments()).append(", ");
-            sb.append("\"liveChunks\": ").append(lexical.liveDocuments()).append(", ");
-            sb.append("\"erasedChunks\": ").append(lexical.erasedDocuments()).append(", ");
-            sb.append("\"erasedRatio\": ").append(JsonText.number(lexical.erasedRatio(), 4)).append(", ");
-            sb.append("\"erasureRequests\": ").append(lexical.erasureRequests()).append(", ");
-            // Milliseconds since the oldest unmet request was accepted: the number an operator
-            // compares against the configured latency bound to see whether it is being met.
-            sb.append("\"oldestErasureAgeMs\": ").append(lexical.oldestErasureRequest()
-                .map(at -> String.valueOf(Math.max(0, System.currentTimeMillis() - at.toEpochMilli())))
-                .orElse("null")).append(", ");
-            sb.append("\"compactionDue\": ").append(lexical.compactionDue());
-            sb.append("}");
-        }
-
+        appendSegments(sb, stats);
+        appendStorage(sb, stats);
+        appendIndexes(sb, stats);
+        appendVisibility(sb, stats);
+        appendDegradation(sb, stats);
+        appendLexical(sb, stats.lexical());
+        appendQueryCache(sb, stats.queryCache());
         sb.append("}");
         return sb.toString();
     }
 
+    /** The segment lifecycle and how much the corpus holds. */
+    private static void appendSegments(StringBuilder sb, NodeStats stats) {
+        NodeStats.SegmentStats segments = stats.segments();
+        sb.append("\"segments\": {")
+            .append("\"total\": ").append(segments.total()).append(", ")
+            .append("\"active\": ").append(segments.active()).append(", ")
+            .append("\"indexing\": ").append(segments.indexing()).append(", ")
+            .append("\"warming\": ").append(segments.warming()).append(", ")
+            .append("\"compacting\": ").append(segments.compacting()).append(", ")
+            .append("\"tombstoned\": ").append(segments.tombstoned()).append(", ")
+            .append("\"purged\": ").append(segments.purged())
+            .append("}, ")
+            .append("\"entries\": {\"total\": ").append(stats.entries().total()).append("}, ");
+    }
 
-    /**
-     * Immutable record representing complete system statistics.
-     */
-    public record SystemStats(
-        SegmentStats segments,
-        EntryStats entries,
-        VolumeStats volumes,
-        HnswStats hnsw,
-        CuckooStats cuckoo,
-        VisibilityStats visibility,
-        double coverage,
-        excalibur.ingest.lexical.ChunkIndexStats lexical
-    ) {
-        /**
-         * Validates domain constraints on construction.
-         */
-        public SystemStats {
-            Objects.requireNonNull(segments, "segments cannot be null");
-            Objects.requireNonNull(entries, "entries cannot be null");
-            Objects.requireNonNull(volumes, "volumes cannot be null");
-            Objects.requireNonNull(hnsw, "hnsw cannot be null");
-            Objects.requireNonNull(cuckoo, "cuckoo cannot be null");
-            Objects.requireNonNull(visibility, "visibility cannot be null");
+    /** Disk, including what is left of it. */
+    private static void appendStorage(StringBuilder sb, NodeStats stats) {
+        NodeStats.VolumeStats volumes = stats.volumes();
+        sb.append("\"volumes\": {")
+            .append("\"count\": ").append(volumes.count()).append(", ")
+            .append("\"totalBytes\": ").append(volumes.totalBytes()).append(", ")
+            .append("\"usedBytes\": ").append(volumes.usedBytes()).append(", ")
+            // Reported rather than left to be subtracted: it is the figure readiness is
+            // decided on, and a node whose volumes are full fails writes whatever its
+            // coverage says.
+            .append("\"availableBytes\": ").append(volumes.availableBytes())
+            .append("}, ");
+    }
 
-            if (Double.isNaN(coverage) || coverage < 0.0 || coverage > 1.0) {
-                throw new IllegalArgumentException("Coverage must be in range [0.0, 1.0]: " + coverage);
-            }
-        }
+    /** The vector integration queue and the membership filters. */
+    private static void appendIndexes(StringBuilder sb, NodeStats stats) {
+        NodeStats.HnswStats hnsw = stats.hnsw();
+        NodeStats.CuckooStats cuckoo = stats.cuckoo();
+        sb.append("\"hnsw\": {")
+            .append("\"queueDepth\": ").append(hnsw.queueDepth()).append(", ")
+            .append("\"queueDepthLimit\": ").append(hnsw.queueDepthLimit()).append(", ")
+            .append("\"vectorsIntegrated\": ").append(hnsw.vectorsIntegrated())
+            .append("}, ")
+            .append("\"cuckoo\": {")
+            .append("\"pendingDeletions\": ").append(cuckoo.pendingDeletions()).append(", ")
+            .append("\"totalDeletions\": ").append(cuckoo.totalDeletions()).append(", ")
+            .append("\"avgFpRate\": ").append(JsonText.number(cuckoo.avgFpRate(), 6)).append(", ")
+            .append("\"maxFpRate\": ").append(JsonText.number(cuckoo.maxFpRate(), 6)).append(", ")
+            .append("\"saturated\": ").append(cuckoo.saturated()).append(", ")
+            .append("\"saturatedSegments\": ").append(cuckoo.saturatedSegments())
+            .append("}, ");
+    }
+
+    /** The epoch, what is visible in it, and the share of the corpus that is. */
+    private static void appendVisibility(StringBuilder sb, NodeStats stats) {
+        NodeStats.VisibilityStats visibility = stats.visibility();
+        sb.append("\"visibility\": {")
+            .append("\"epoch\": ").append(visibility.epoch()).append(", ")
+            .append("\"registeredSegments\": ").append(visibility.registeredSegments()).append(", ")
+            .append("\"visibleSegments\": ").append(visibility.visibleSegments())
+            .append("}, ")
+            .append("\"coverage\": ").append(JsonText.number(stats.coverage(), 4));
     }
 
     /**
-     * Segment lifecycle statistics.
+     * The three states the node keeps serving through, each invisible in every other field.
+     *
+     * @param sb    The body being built
+     * @param stats The snapshot
      */
-    public record SegmentStats(
-        long total,
-        long active,
-        long indexing,
-        long warming,
-        long compacting,
-        long tombstoned,
-        long purged
-    ) {
-        public SegmentStats {
-            if (total < 0 || active < 0 || indexing < 0 || warming < 0 ||
-                compacting < 0 || tombstoned < 0 || purged < 0) {
-                throw new IllegalArgumentException("All segment counts must be non-negative");
-            }
-        }
+    private static void appendDegradation(StringBuilder sb, NodeStats stats) {
+        sb.append(", \"workers\": {\"indexOrchestratorRunning\": ")
+            .append(stats.indexerRunning()).append("}");
+        appendVectorIndex(sb, stats.vectorIndex());
+        appendBreakers(sb, stats);
     }
 
     /**
-     * Entry statistics.
+     * The circuit breakers this node has, each omitted where there is none.
+     *
+     * <p>Two breakers and two different degradations: an open embedding breaker drops
+     * retrieval to lexical-only, an open relevancy breaker bypasses stage-5 re-ranking. Either
+     * can be open while the other is closed, and an omitted one means there is no such
+     * component rather than a healthy one.</p>
+     *
+     * @param sb    The body being built
+     * @param stats The snapshot
      */
-    public record EntryStats(long total) {
-        public EntryStats {
-            if (total < 0) {
-                throw new IllegalArgumentException("Entry count must be non-negative: " + total);
-            }
+    private static void appendBreakers(StringBuilder sb, NodeStats stats) {
+        if (stats.embeddingBreaker() == null && stats.llmRelevancyBreaker() == null) {
+            return;
         }
+        sb.append(", \"breakers\": {");
+        String separator = "";
+        if (stats.embeddingBreaker() != null) {
+            sb.append("\"embedding\": \"")
+                .append(JsonText.escape(stats.embeddingBreaker())).append("\"");
+            separator = ", ";
+        }
+        if (stats.llmRelevancyBreaker() != null) {
+            sb.append(separator).append("\"llmRelevancy\": \"")
+                .append(JsonText.escape(stats.llmRelevancyBreaker())).append("\"");
+        }
+        sb.append("}");
     }
 
     /**
-     * Volume statistics.
+     * Which segments are serving without a vector index, and why.
+     *
+     * <p>Absent where the storage engine could not be asked, which is a different statement
+     * from a count of zero.</p>
+     *
+     * @param sb          The body being built
+     * @param vectorIndex The failures, or null
      */
-    public record VolumeStats(
-        int count,
-        long totalBytes,
-        long usedBytes
-    ) {
-        public VolumeStats {
-            if (count < 0) {
-                throw new IllegalArgumentException("Volume count must be non-negative: " + count);
-            }
-            if (totalBytes < 0) {
-                throw new IllegalArgumentException("Total bytes must be non-negative: " + totalBytes);
-            }
-            if (usedBytes < 0) {
-                throw new IllegalArgumentException("Used bytes must be non-negative: " + usedBytes);
-            }
+    private static void appendVectorIndex(StringBuilder sb, NodeStats.VectorIndexStats vectorIndex) {
+        if (vectorIndex == null) {
+            return;
         }
+        sb.append(", \"vectorIndex\": {\"segmentsWithoutIndex\": ")
+            .append(vectorIndex.segmentsWithoutIndex());
+        Map<Long, String> reasons = vectorIndex.orderedReasons();
+        if (reasons.isEmpty()) {
+            sb.append("}");
+            return;
+        }
+        sb.append(", \"reasons\": {");
+        int written = 0;
+        for (Map.Entry<Long, String> reason : reasons.entrySet()) {
+            if (written == MAX_REPORTED_VECTOR_FAILURES) {
+                sb.append(", \"truncated\": true");
+                break;
+            }
+            sb.append(written == 0 ? "" : ", ")
+                .append('"').append(reason.getKey()).append("\": \"")
+                .append(JsonText.escape(reason.getValue())).append('"');
+            written++;
+        }
+        sb.append("}}");
     }
 
     /**
-     * HNSW graph statistics.
+     * The query result cache, when this node runs one.
+     *
+     * <p>Omitted entirely on a node with no cache, which is a different statement from a
+     * cache that has never been hit: the zeros of a cache nobody has used and the zeros of a
+     * node that has none are identical, and only one of them is worth investigating.</p>
+     *
+     * <p>{@code hitRatio} is the figure that says whether the cache is earning its place, and
+     * {@code invalidations} is the one that says why it is not: entries discarded because the
+     * corpus moved cannot be fixed by raising the capacity, only by ingesting less often or
+     * by accepting that this node's corpus changes faster than its queries repeat.</p>
+     *
+     * @param sb    The body being built
+     * @param cache What the cache has done, or null
      */
-    public record HnswStats(
-        long queueDepth,
-        int queueDepthLimit,
-        long vectorsIntegrated
-    ) {
-        public HnswStats {
-            if (queueDepth < 0) {
-                throw new IllegalArgumentException("Queue depth must be non-negative: " + queueDepth);
-            }
-            if (queueDepthLimit < 0) {
-                throw new IllegalArgumentException("Queue depth limit must be non-negative: " + queueDepthLimit);
-            }
-            if (vectorsIntegrated < 0) {
-                throw new IllegalArgumentException("Vectors integrated must be non-negative: " + vectorsIntegrated);
-            }
+    private static void appendQueryCache(StringBuilder sb,
+                                         excalibur.query.cache.QueryCacheStats cache) {
+        if (cache == null) {
+            return;
         }
+        sb.append(", \"queryCache\": {")
+            .append("\"hits\": ").append(cache.hits()).append(", ")
+            .append("\"misses\": ").append(cache.misses()).append(", ")
+            .append("\"evictions\": ").append(cache.evictions()).append(", ")
+            .append("\"invalidations\": ").append(cache.invalidations()).append(", ")
+            .append("\"size\": ").append(cache.size()).append(", ")
+            .append("\"capacity\": ").append(cache.capacity()).append(", ")
+            .append("\"hitRatio\": ").append(JsonText.number(cache.hitRatio(), 4))
+            .append("}");
     }
 
     /**
-     * Cuckoo filter statistics.
+     * The chunk lexical index, when this node keeps one.
+     *
+     * @param sb      The body being built
+     * @param lexical The index's own account of itself, or null
      */
-    public record CuckooStats(
-        int pendingDeletions,
-        long totalDeletions,
-        double avgFpRate,
-        double maxFpRate,
-        boolean saturated,
-        int saturatedSegments
-    ) {
-        public CuckooStats {
-            if (pendingDeletions < 0) {
-                throw new IllegalArgumentException("Pending deletions must be non-negative: " + pendingDeletions);
-            }
-            if (totalDeletions < 0) {
-                throw new IllegalArgumentException("Total deletions must be non-negative: " + totalDeletions);
-            }
-            if (saturatedSegments < 0) {
-                throw new IllegalArgumentException("Saturated segments must be non-negative: " + saturatedSegments);
-            }
-            if (Double.isNaN(avgFpRate) || avgFpRate < 0.0 || avgFpRate > 1.0) {
-                throw new IllegalArgumentException("Average FP rate must be in range [0.0, 1.0]: " + avgFpRate);
-            }
-            if (Double.isNaN(maxFpRate) || maxFpRate < 0.0 || maxFpRate > 1.0) {
-                throw new IllegalArgumentException("Max FP rate must be in range [0.0, 1.0]: " + maxFpRate);
-            }
+    private static void appendLexical(StringBuilder sb, ChunkIndexStats lexical) {
+        if (lexical == null) {
+            return;
         }
-    }
-
-    /**
-     * Visibility tracking statistics.
-     */
-    public record VisibilityStats(
-        long epoch,
-        int registeredSegments,
-        int visibleSegments
-    ) {
-        public VisibilityStats {
-            if (epoch < 0) {
-                throw new IllegalArgumentException("Epoch must be non-negative: " + epoch);
-            }
-            if (registeredSegments < 0) {
-                throw new IllegalArgumentException("Registered segments must be non-negative: " + registeredSegments);
-            }
-            if (visibleSegments < 0) {
-                throw new IllegalArgumentException("Visible segments must be non-negative: " + visibleSegments);
-            }
-        }
+        sb.append(", \"lexical\": {")
+            .append("\"engine\": \"").append(JsonText.escape(lexical.engine())).append("\", ")
+            .append("\"indexed\": ").append(lexical.indexed()).append(", ")
+            .append("\"segments\": ").append(lexical.segments()).append(", ")
+            .append("\"liveChunks\": ").append(lexical.liveDocuments()).append(", ")
+            .append("\"erasedChunks\": ").append(lexical.erasedDocuments()).append(", ")
+            .append("\"erasedRatio\": ").append(JsonText.number(lexical.erasedRatio(), 4))
+            .append(", ")
+            .append("\"erasureRequests\": ").append(lexical.erasureRequests()).append(", ")
+            // Milliseconds since the oldest unmet request was accepted: the number an operator
+            // compares against the configured latency bound to see whether it is being met.
+            .append("\"oldestErasureAgeMs\": ").append(lexical.oldestErasureRequest()
+                .map(at -> String.valueOf(Math.max(0, System.currentTimeMillis() - at.toEpochMilli())))
+                .orElse("null")).append(", ")
+            .append("\"compactionDue\": ").append(lexical.compactionDue())
+            .append("}");
     }
 }

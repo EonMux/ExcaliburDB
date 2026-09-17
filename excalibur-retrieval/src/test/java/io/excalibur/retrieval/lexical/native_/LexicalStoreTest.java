@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -15,6 +16,7 @@ import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Growing, remembering when, and forgetting.
@@ -552,6 +554,161 @@ class LexicalStoreTest {
                 assertThat(store.search(new String[] {"shared"}, ones(1), 1000, 9)).hasSize(498);
                 assertThat(store.search(new String[] {"37"}, ones(1), 10, 9)).isEmpty();
                 assertThat(store.search(new String[] {"38"}, ones(1), 10, 9)).hasSize(1);
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("ranking around tombstones")
+    class RankingAroundTombstones {
+
+        /** One segment of documents all matching "oom", ranked by how often they repeat it. */
+        private Map<String, String> ranked(int count) {
+            Map<String, String> documents = new LinkedHashMap<>();
+            for (int i = 0; i < count; i++) {
+                documents.put("d" + i, ("oom " .repeat(count - i)).trim());
+            }
+            return documents;
+        }
+
+        @Test
+        @DisplayName("a page of live results is returned however many better ones are tombstoned")
+        void tombstonesDoNotTruncateThePage(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(ranked(30), 1);
+
+                Set<String> erased = new java.util.LinkedHashSet<>();
+                for (int i = 0; i < 20; i++) {
+                    erased.add("d" + i);
+                }
+                assertThat(store.erase(erased)).isEqualTo(20);
+
+                // The twenty best documents are gone. The next three are d20, d21 and d22, and
+                // asking for three has to return three: a caller cannot tell an exhausted corpus
+                // from a scoring shortcut that stopped looking.
+                assertThat(store.search(new String[] {"oom"}, ones(1), 3, 99))
+                    .extracting(LexicalStore.Hit::key)
+                    .containsExactly("d20", "d21", "d22");
+            }
+        }
+
+        @Test
+        @DisplayName("asking for more than survive returns all of them, not a truncated page")
+        void everySurvivorIsReturned(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(ranked(30), 1);
+
+                Set<String> erased = new java.util.LinkedHashSet<>();
+                for (int i = 0; i < 28; i++) {
+                    erased.add("d" + i);
+                }
+                assertThat(store.erase(erased)).isEqualTo(28);
+
+                assertThat(store.search(new String[] {"oom"}, ones(1), 10, 99))
+                    .extracting(LexicalStore.Hit::key)
+                    .containsExactly("d28", "d29");
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("opening on damaged files")
+    class Damaged {
+
+        private List<String> segmentDirectories(Path dir) throws Exception {
+            try (Stream<Path> listing = Files.list(dir)) {
+                return listing.filter(Files::isDirectory)
+                    .map(path -> path.getFileName().toString())
+                    .sorted()
+                    .toList();
+            }
+        }
+
+        @Test
+        @DisplayName("a manifest whose write never landed does not take the segments with it")
+        void unreadableManifestKeepsTheSegments(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha oom"), 1);
+                store.add(docs("b", "beta oom"), 2);
+            }
+            List<String> before = segmentDirectories(dir);
+            assertThat(before).hasSize(2);
+            // A rename that reached the directory while its contents were still in the page
+            // cache leaves exactly this.
+            Files.write(dir.resolve("manifest"), new byte[0]);
+
+            assertThatThrownBy(() -> LexicalStore.open(dir)).isInstanceOf(IOException.class);
+
+            assertThat(segmentDirectories(dir))
+                .as("a manifest that cannot be trusted must never authorise a deletion")
+                .isEqualTo(before);
+        }
+
+        @Test
+        @DisplayName("a manifest with no count marker still opens and is not swept from")
+        void legacyManifestOpensWithoutSweeping(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha oom"), 1);
+            }
+            // What a directory written by the build before the marker existed looks like: the
+            // older header, and records with nothing after them.
+            List<String> lines = Files.readAllLines(dir.resolve("manifest"));
+            List<String> records = lines.subList(1, lines.size() - 1);
+            Files.writeString(dir.resolve("manifest"), "excalibur-lexical-store v1\n"
+                + String.join("\n", records) + "\n");
+            Files.createDirectories(dir.resolve("seg-99"));
+
+            try (LexicalStore reopened = LexicalStore.open(dir)) {
+                assertThat(reopened.search(new String[] {"alpha"}, ones(1), 10, 9))
+                    .extracting(LexicalStore.Hit::key)
+                    .containsExactly("a");
+            }
+            assertThat(Files.exists(dir.resolve("seg-99")))
+                .as("an unverified manifest is not evidence that seg-99 is an orphan")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("a segment that cannot be opened is reported rather than wedging the store")
+        void tornSegmentDoesNotWedgeTheStore(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha oom"), 1);
+                store.add(docs("b", "beta oom"), 2);
+            }
+            Files.write(dir.resolve("seg-0").resolve("post.off"), new byte[4]);
+
+            try (LexicalStore reopened = LexicalStore.open(dir)) {
+                assertThat(reopened.unreadableSegments()).containsOnlyKeys("seg-0");
+                assertThat(reopened.search(new String[] {"oom"}, ones(1), 10, 9))
+                    .as("the healthy segment still answers")
+                    .extracting(LexicalStore.Hit::key)
+                    .containsExactly("b");
+            }
+            assertThat(Files.exists(dir.resolve("seg-0")))
+                .as("the damaged segment's bytes are kept for whoever has to recover them")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("a repaired segment answers again at the next open")
+        void repairedSegmentComesBack(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "alpha oom"), 1);
+            }
+            Path rowIndex = dir.resolve("seg-0").resolve("post.off");
+            byte[] intact = Files.readAllBytes(rowIndex);
+            Files.write(rowIndex, new byte[4]);
+            try (LexicalStore broken = LexicalStore.open(dir)) {
+                assertThat(broken.unreadableSegments()).containsOnlyKeys("seg-0");
+            }
+
+            Files.write(rowIndex, intact);
+
+            try (LexicalStore repaired = LexicalStore.open(dir)) {
+                assertThat(repaired.unreadableSegments()).isEmpty();
+                assertThat(repaired.search(new String[] {"alpha"}, ones(1), 10, 9))
+                    .extracting(LexicalStore.Hit::key)
+                    .containsExactly("a");
             }
         }
     }

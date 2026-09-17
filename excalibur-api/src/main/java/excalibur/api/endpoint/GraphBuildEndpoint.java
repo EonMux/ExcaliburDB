@@ -2,19 +2,17 @@ package excalibur.api.endpoint;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
-import excalibur.api.bootstrap.GraphBuildService;
-import excalibur.api.bootstrap.GraphTenant;
 import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.ResponseBody;
 import io.excalibur.tenancy.NamespaceId;
-import io.excalibur.tenancy.NamespaceRegistry;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Objects;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * {@code POST /v1/graph/build} - turns the facts ingestion has staged into the graph being served.
@@ -24,28 +22,65 @@ import java.util.Objects;
  * makes an append impossible. Rebuilding after every document would cost the whole graph per
  * document, so ingestion stages facts and this publishes them.</p>
  *
- * <p>Answers with what the build did, including the case where there was nothing to do. A node that
- * has staged nothing keeps serving the graph it already had - replacing it with an empty one would
- * turn every question into a refusal.</p>
+ * <h2>Why this answers before the build has happened</h2>
+ * <p>Publishing replays every staged fact, indexes the prose they came from and embeds every
+ * entity. On a real corpus that is minutes - longer than any load balancer will hold a
+ * connection open and longer than a client will wait, so a synchronous build ended as a timeout
+ * at the caller while the work carried on invisibly and the retry raced it. The build therefore
+ * happens behind this response, and {@code GET /v1/graph/build/status} is where its outcome is
+ * read. {@code DELETE /v1/graph/build} ends one started at the wrong moment.</p>
+ *
+ * <h2>Request</h2>
+ * <pre>{@code
+ * POST /v1/graph/build HTTP/1.1
+ * X-Excalibur-Namespace: acme
+ * }</pre>
+ *
+ * <p>No body. The namespace header names whose graph to build, and its absence means the shared
+ * namespace, as it does on every other graph route.</p>
+ *
+ * <h2>Response (accepted)</h2>
+ * <pre>{@code
+ * HTTP/1.1 202 Accepted
+ * Content-Type: application/json
+ *
+ * {"state": "running", "namespace": "acme", "started_at_ms": 1736899200000}
+ * }</pre>
+ *
+ * <h2>Response (a build is already running)</h2>
+ * <pre>{@code
+ * HTTP/1.1 409 Conflict
+ * Content-Type: application/json
+ *
+ * {"error": "A graph build is already in progress for namespace 'acme'"}
+ * }</pre>
+ *
+ * <p>One build at a time for the whole node, and the namespace holding it is named. Two builds
+ * would not corrupt each other - each assembles into its own scratch directory - but they would
+ * take twice as long each over the same disk and the same embedding endpoint, with neither
+ * caller told why.</p>
  *
  * <h2>Thread Safety</h2>
- * <p>Stateless; the service it calls serialises builds.</p>
+ * <p>Stateless; the runner it delegates to claims the node's single build slot atomically.</p>
  *
+ * @see GraphBuildStatusEndpoint
+ * @see GraphBuildCancelEndpoint
  * @author ExcaliburDB
  */
 public class GraphBuildEndpoint implements HttpHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GraphBuildEndpoint.class);
 
-    private final GraphTenants tenants;
+    private final GraphBuildRunner runner;
 
     /**
      * Creates the endpoint.
      *
-     * @param tenants The namespaces whose graphs can be built
+     * @param runner The runner that performs and remembers graph builds
+     * @throws NullPointerException if runner is null
      */
-    public GraphBuildEndpoint(GraphTenants tenants) {
-        this.tenants = Objects.requireNonNull(tenants, "tenants cannot be null");
+    public GraphBuildEndpoint(GraphBuildRunner runner) {
+        this.runner = Objects.requireNonNull(runner, "runner cannot be null");
     }
 
     @Override
@@ -66,37 +101,33 @@ public class GraphBuildEndpoint implements HttpHandler {
             return;
         }
 
-        try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
-            GraphBuildService.BuildOutcome outcome = lease.resource().buildService().build();
-            // The build already installed the newly published stack into this tenant's holder,
-            // which is the one every namespace-scoped request reads - so there is nothing stale
-            // left to drop. What did change is what the tenant costs: a namespace that held no
-            // graph a moment ago now holds thirteen mappings, and the budget has to be told.
-            tenants.recost(namespace);
-
-            ResponseBody.sendJson(exchange, 200,
-                "{"
-                    + "\"published\": " + outcome.published() + ", "
-                    + "\"edges\": " + outcome.edges() + ", "
-                    + "\"entities\": " + outcome.entities() + ", "
-                    + "\"relations\": " + outcome.relations() + ", "
-                    + "\"entities_with_text\": " + outcome.indexed() + ", "
-                    + "\"entities_with_vectors\": " + outcome.embedded() + ", "
-                    + "\"staged_facts\": " + outcome.staged() + ", "
-                    + "\"namespace\": \"" + JsonText.escape(namespace.value()) + "\""
-                    + "}");
-        } catch (IOException | RuntimeException e) {
-            // The build failed; whatever was being served is still being served, because the
-            // directory is only replaced by a rename after the whole thing is assembled.
-            //
-            // RuntimeException is not defensive padding: a namespace that cannot be opened
-            // arrives here as an UncheckedIOException from the registry, and catching only
-            // IOException would let it escape the handler with no response sent at all.
-            //
-            // Logged with detail, answered without it: the message names the path the node
-            // failed on, which a client has no business seeing.
-            LOGGER.error("Graph build failed", e);
-            ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
+        GraphBuildRunner.Claim claim;
+        try {
+            claim = runner.start(namespace);
+        } catch (RejectedExecutionException e) {
+            // The node is shutting down. Retryable at another node or after a restart, which is
+            // what 503 says and 500 does not.
+            LOGGER.warn("a graph build of namespace {} was asked for during shutdown", namespace);
+            ResponseBody.sendJson(exchange, 503,
+                "{\"error\": \"This node is shutting down and is not accepting builds\"}");
+            return;
         }
+
+        if (!claim.accepted()) {
+            ResponseBody.sendJson(exchange, 409,
+                "{\"error\": \"A graph build is already in progress for namespace '"
+                    + JsonText.escape(claim.blockedBy().namespace().value()) + "'\"}");
+            return;
+        }
+
+        // Rendered from the build that was just started rather than from a re-read of the
+        // runner's state. On an empty namespace the build can finish before this line, and a
+        // 202 reporting "completed" would tell a client keying on "running" not to poll.
+        ResponseBody.sendJson(exchange, 202,
+            "{"
+                + "\"state\": \"" + JsonText.escape(claim.started().state()) + "\", "
+                + "\"namespace\": \"" + JsonText.escape(namespace.value()) + "\", "
+                + "\"started_at_ms\": " + claim.started().startedAtMs()
+                + "}");
     }
 }

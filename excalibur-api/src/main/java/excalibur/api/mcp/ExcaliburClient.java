@@ -148,6 +148,30 @@ public final class ExcaliburClient {
     }
 
     /**
+     * DELETEs with a JSON body.
+     *
+     * <p>A body on a DELETE, because that is what the routes it reaches take: {@code
+     * /v1/ingest} and {@code /v1/reindex} each serve two verbs at one path and name their
+     * subject in the body, exactly as their POST halves do.</p>
+     *
+     * @param path      Path on the node, beginning with {@code /}
+     * @param body      The JSON request body
+     * @param namespace Namespace to scope the call to, or null for the configured default
+     * @return The node's answer
+     * @throws IOException          if the node cannot be reached
+     * @throws InterruptedException if the calling thread is interrupted
+     */
+    public Response delete(String path, String body, String namespace)
+            throws IOException, InterruptedException {
+        HttpRequest.Builder request = HttpRequest.newBuilder()
+            .uri(baseUri.resolve(path))
+            .timeout(timeout)
+            .header("Content-Type", "application/json")
+            .method("DELETE", HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
+        return send(request, namespace);
+    }
+
+    /**
      * GETs a path, with one optional query parameter.
      *
      * @param path       Path on the node, beginning with {@code /}
@@ -159,6 +183,22 @@ public final class ExcaliburClient {
      */
     public Response get(String path, String queryName, String queryValue)
             throws IOException, InterruptedException {
+        return get(path, queryName, queryValue, null);
+    }
+
+    /**
+     * Reads from the node inside a namespace.
+     *
+     * @param path       The route to read
+     * @param queryName  Parameter name, or null for none
+     * @param queryValue Parameter value, or null for none
+     * @param namespace  The namespace to read in, or null for the node's default
+     * @return The node's answer
+     * @throws IOException          if the node cannot be reached
+     * @throws InterruptedException if the calling thread is interrupted
+     */
+    public Response get(String path, String queryName, String queryValue, String namespace)
+            throws IOException, InterruptedException {
         String target = path;
         if (queryName != null && queryValue != null) {
             target = path + "?" + queryName + "="
@@ -167,7 +207,7 @@ public final class ExcaliburClient {
         return send(HttpRequest.newBuilder()
             .uri(baseUri.resolve(target))
             .timeout(timeout)
-            .GET(), null);
+            .GET(), namespace);
     }
 
     private Response send(HttpRequest.Builder request, String namespace)

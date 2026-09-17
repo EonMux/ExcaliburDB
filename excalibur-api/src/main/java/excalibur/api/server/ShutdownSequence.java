@@ -1,6 +1,7 @@
 package excalibur.api.server;
 
 import excalibur.api.endpoint.CompactionRunner;
+import excalibur.api.endpoint.GraphBuildRunner;
 import excalibur.api.endpoint.QueryEndpoint;
 import excalibur.api.endpoint.ReindexEndpoint;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
@@ -54,6 +55,7 @@ final class ShutdownSequence {
 
         drainEndpoints(endpoints, wiring.queryPipeline());
         drainCompaction(endpoints);
+        drainGraphBuild(endpoints);
         drainIngestion(wiring);
 
         // Stop the index orchestrator after the HTTP server stops
@@ -108,6 +110,28 @@ final class ShutdownSequence {
         if (compaction != null && !compaction.drain()) {
             LOGGER.error("A compaction was still rewriting segments when the node shut down; "
                 + "the storage engine is being closed underneath it");
+        }
+    }
+
+    /**
+     * Stops the graph build in progress and waits for it.
+     *
+     * <p>Before the graph tenants are closed: closing a tenant unmaps the files a build is
+     * writing through and closes the Lucene directories it is indexing into. The build is
+     * asked to stop rather than interrupted, because it publishes by renaming a directory over
+     * the served one, and an interrupt inside that window leaves a namespace serving
+     * nothing.</p>
+     *
+     * @param endpoints What was registered, or null
+     */
+    private static void drainGraphBuild(EndpointRegistrar.Endpoints endpoints) {
+        if (endpoints == null) {
+            return;
+        }
+        GraphBuildRunner graphBuild = endpoints.graphBuild();
+        if (graphBuild != null && !graphBuild.drain()) {
+            LOGGER.error("A graph build was still running when the node shut down; the graph "
+                + "tenants are being closed underneath it");
         }
     }
 

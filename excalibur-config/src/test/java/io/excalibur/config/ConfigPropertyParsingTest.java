@@ -87,9 +87,9 @@ class ConfigPropertyParsingTest {
 
             Config config = new Config(props);
 
-            assertThat(config.query().getDefaultTopK()).isEqualTo(Config.Query.DEFAULT_TOP_K);
+            assertThat(config.query().getDefaultTopK()).isEqualTo(QueryConfig.DEFAULT_TOP_K);
             assertThat(config.visibility().getEpochTickMs())
-                .isEqualTo(Config.Visibility.DEFAULT_EPOCH_TICK_MS);
+                .isEqualTo(VisibilityConfig.DEFAULT_EPOCH_TICK_MS);
         }
     }
 
@@ -203,7 +203,7 @@ class ConfigPropertyParsingTest {
 
             Config config = new Config("excalibur.properties", env, new HashMap<>());
 
-            assertThat(config.llm().getBaseUrl()).isEqualTo(Config.Llm.DEFAULT_BASE_URL);
+            assertThat(config.llm().getBaseUrl()).isEqualTo(LlmConfig.DEFAULT_BASE_URL);
         }
 
         @Test

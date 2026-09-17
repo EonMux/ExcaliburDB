@@ -10,12 +10,17 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -40,15 +45,37 @@ class CompactionWorkerTest {
 
     private Arena arena;
     private List<Segment> testSegments;
+    private final List<String> warnings = new ArrayList<>();
+    private Handler warningCaptor;
 
     @BeforeEach
     void setUp() {
         arena = Arena.ofShared();
         testSegments = new ArrayList<>();
+        warningCaptor = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getLevel().intValue() >= Level.WARNING.intValue()) {
+                    warnings.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        Logger.getLogger(CompactionWorker.class.getName()).addHandler(warningCaptor);
     }
 
     @AfterEach
     void tearDown() throws IOException {
+        Logger.getLogger(CompactionWorker.class.getName()).removeHandler(warningCaptor);
+        warnings.clear();
+
         // Stop all workers and close segments
         for (Segment segment : testSegments) {
             if (!segment.isClosed()) {
@@ -308,32 +335,196 @@ class CompactionWorkerTest {
         worker.stop();
     }
 
+    /**
+     * Dispatch, proven by pinning the rewrite rather than by watching a callback go past.
+     *
+     * <p>This used to count a latch down inside the listener and then tear the arena down. The
+     * listener is called from the middle of the rewrite - the swap is done but the old segment
+     * has still to be retired and the write lock released - so the latch said the rewrite had
+     * started, never that it had finished, and everything after it ran against an arena a live
+     * rewrite was still mapped out of.</p>
+     */
     @Test
     @DisplayName("requestCompaction dispatches the same work to a background thread")
     void requestCompaction_triggersCompaction() throws IOException, InterruptedException {
-        CountDownLatch compactionLatch = new CountDownLatch(1);
+        CountDownLatch insideTheRewrite = new CountDownLatch(1);
+        CountDownLatch releaseTheRewrite = new CountDownLatch(1);
+        AtomicReference<Thread> rewriteThread = new AtomicReference<>();
+        AtomicReference<Segment> replacement = new AtomicReference<>();
 
         CompactionWorker worker = new CompactionWorker(arena,
             (oldSeg, newSeg) -> {
-                compactionLatch.countDown();
+                rewriteThread.set(Thread.currentThread());
+                replacement.set(newSeg);
+                insideTheRewrite.countDown();
+                awaitRelease(releaseTheRewrite);
                 return CompactionOutcome.INSTALLED;
             });
 
-        Segment segment = createTestSegment("dispatch-segment");
-        segment.put("test-key".getBytes(), "test-value".getBytes());
-        byte[] deleteKey = "delete-key".getBytes();
-        segment.put(deleteKey, "delete-value".getBytes());
-        segment.delete(deleteKey);
+        Segment segment = compactableSegment("dispatch-segment");
 
         worker.requestCompaction(segment);
 
-        // A liveness guard, not a latency budget: this asserts only that the request reaches the
-        // compaction, which the test above already checks the outcome of.
-        assertThat(compactionLatch.await(30, TimeUnit.SECONDS))
-            .as("the requested compaction ran")
+        // Reaching here with the rewrite pinned is the dispatch: the request returned while the
+        // work it asked for was still running, on a thread that is not this one.
+        assertThat(insideTheRewrite.await(30, TimeUnit.SECONDS))
+            .as("the requested compaction reached the rewrite")
+            .isTrue();
+        assertThat(rewriteThread.get())
+            .as("the rewrite runs on a thread of its own rather than the caller's")
+            .isNotSameAs(Thread.currentThread());
+
+        releaseTheRewrite.countDown();
+
+        // Completion is what stop() waits for, and the only thing that makes the arena this
+        // test closes in teardown safe to close.
+        worker.stop();
+
+        assertThat(worker.getCompactionCount())
+            .as("the dispatched rewrite finished, and finished before stop() returned")
+            .isEqualTo(1);
+        assertThat(segment.isClosed())
+            .as("the rewrite ran to the end and retired the segment it replaced")
+            .isTrue();
+        assertThat(replacement.get().get("test-key".getBytes()))
+            .as("the replacement carries the live entry")
+            .isNotNull();
+    }
+
+    @Test
+    @DisplayName("stop() does not return while a requested compaction is still rewriting")
+    void stop_awaitsACompactionStartedByRequestCompaction() throws IOException, InterruptedException {
+        CountDownLatch insideTheRewrite = new CountDownLatch(1);
+        CountDownLatch releaseTheRewrite = new CountDownLatch(1);
+
+        CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
+            insideTheRewrite.countDown();
+            awaitRelease(releaseTheRewrite);
+            return CompactionOutcome.INSTALLED;
+        });
+
+        Segment segment = compactableSegment("stop-awaits-request");
+
+        worker.requestCompaction(segment);
+        assertThat(insideTheRewrite.await(30, TimeUnit.SECONDS))
+            .as("the requested compaction reached the rewrite")
             .isTrue();
 
+        // The rewrite is now provably in flight and pinned there by a latch this test owns, so
+        // there is no race to lose: whatever stop() does next, it does with a compaction running.
+        Thread stopper = Thread.ofVirtual().name("stop-caller").start(worker::stop);
+        boolean stopReturnedMidRewrite = stopper.join(Duration.ofSeconds(1));
+
+        releaseTheRewrite.countDown();
+        assertThat(stopper.join(Duration.ofSeconds(30)))
+            .as("stop() finished once the rewrite was released")
+            .isTrue();
+
+        assertThat(stopReturnedMidRewrite)
+            .as("stop() returned while a requested compaction was still inside the rewrite; the "
+                + "owner closes the segment's Arena next, under a live mapped-memory access")
+            .isFalse();
+        assertThat(worker.getCompactionCount())
+            .as("the requested compaction had run to completion by the time stop() returned")
+            .isEqualTo(1);
+        assertThat(segment.isClosed())
+            .as("the rewrite got as far as retiring the segment it replaced")
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("stop() gives up on a compaction that outlives its budget rather than hanging")
+    void stop_boundsTheWaitForARequestedCompaction() throws IOException, InterruptedException {
+        CountDownLatch insideTheRewrite = new CountDownLatch(1);
+        CountDownLatch releaseTheRewrite = new CountDownLatch(1);
+
+        CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
+            insideTheRewrite.countDown();
+            awaitRelease(releaseTheRewrite);
+            return CompactionOutcome.INSTALLED;
+        }).withStopTimeoutMs(200);
+
+        Segment segment = compactableSegment("stop-bounds-the-wait");
+
+        worker.requestCompaction(segment);
+        assertThat(insideTheRewrite.await(30, TimeUnit.SECONDS))
+            .as("the requested compaction reached the rewrite")
+            .isTrue();
+
+        // The rewrite is held for longer than the budget and is never going to finish inside
+        // it. A shutdown that waited without a bound would never come back from here.
+        long startNanos = System.nanoTime();
         worker.stop();
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+        releaseTheRewrite.countDown();
+
+        assertThat(elapsedMs)
+            .as("stop() returned on its own budget rather than waiting out the rewrite")
+            .isLessThan(5000);
+        assertThat(warnings)
+            .as("an expired wait is not silent: the Arena is not safe to close and the log says so")
+            .anyMatch(message -> message.contains("still running after"));
+
+        // Nothing here proved the Arena was safe to close - that is the point of the warning -
+        // so the rewrite is waited out before teardown closes it.
+        awaitCompactionCount(worker, 1);
+    }
+
+    @Test
+    @DisplayName("requestCompaction after stop() starts nothing")
+    void requestCompaction_afterStop_isRefused() throws IOException {
+        CompactionWorker worker = new CompactionWorker(arena,
+            (oldSeg, newSeg) -> CompactionOutcome.INSTALLED);
+
+        Segment segment = compactableSegment("request-after-stop");
+
+        worker.stop();
+        worker.requestCompaction(segment);
+
+        // A request accepted after shutdown is the same defect wearing a later timestamp: a
+        // detached rewrite of a segment whose Arena the owner is already closing, with nothing
+        // left that could wait for it.
+        assertThat(warnings)
+            .as("a request that arrives after shutdown is refused, and says so")
+            .anyMatch(message -> message.contains("has been stopped"));
+        assertThat(segment.isClosed())
+            .as("no rewrite may be started after stop()")
+            .isFalse();
+        assertThat(worker.getCompactionCount()).isZero();
+    }
+
+    /**
+     * A request the worker refuses must say so, because the caller records what it was told.
+     *
+     * <p>The lifecycle manager asks for a rewrite and marks the segment handled on the answer.
+     * A refusal reported as a dispatch leaves the tombstoned space unreclaimed with nothing
+     * left that will ask again.</p>
+     */
+    @Test
+    @DisplayName("requestCompaction reports whether the rewrite was dispatched")
+    void requestCompaction_reportsWhetherItWasDispatched() throws IOException, InterruptedException {
+        CompactionWorker worker = new CompactionWorker(arena,
+            (oldSeg, newSeg) -> CompactionOutcome.INSTALLED);
+
+        Segment live = compactableSegment("dispatch-reported");
+
+        assertThat(worker.requestCompaction(live))
+            .as("a live worker dispatches the rewrite and says so")
+            .isTrue();
+
+        // The dispatch must finish before the arena is torn down in teardown.
+        awaitCompactionCount(worker, 1);
+
+        worker.stop();
+        Segment afterStop = compactableSegment("refusal-reported");
+
+        assertThat(worker.requestCompaction(afterStop))
+            .as("a stopped worker refuses the rewrite and says so")
+            .isFalse();
+        assertThat(worker.getCompactionCount())
+            .as("the refused request started nothing")
+            .isEqualTo(1);
     }
 
     // ==================== Statistics Tests ====================
@@ -382,12 +573,17 @@ class CompactionWorkerTest {
         assertThat(worker.getTombstoneRatioThreshold()).isEqualTo(0.5);
     }
 
+    /**
+     * The value this used to use, 64 MiB, is a write log's entire capacity - a trigger there
+     * can never fire, so it is no longer accepted. The ceiling is what a valid value means.
+     */
     @Test
     void setWriteLogSizeThreshold_validValue_updates() {
         CompactionWorker worker = new CompactionWorker(arena, (o, n) -> CompactionOutcome.INSTALLED);
 
-        worker.setWriteLogSizeThreshold(64 * 1024 * 1024L);
-        assertThat(worker.getWriteLogSizeThreshold()).isEqualTo(64 * 1024 * 1024L);
+        worker.setWriteLogSizeThreshold(CompactionWorker.MAX_WRITE_LOG_SIZE_THRESHOLD);
+        assertThat(worker.getWriteLogSizeThreshold())
+            .isEqualTo(CompactionWorker.MAX_WRITE_LOG_SIZE_THRESHOLD);
     }
 
     @Test
@@ -441,51 +637,81 @@ class CompactionWorkerTest {
         worker.stop();
     }
 
+    /**
+     * A reader that overlaps a compaction is served the value, not an error and not a miss.
+     *
+     * <p>This used to start the reader and the compaction together and hope they overlapped,
+     * with the listener sleeping 50ms to help. The overlap was therefore never guaranteed - and
+     * whichever way the race fell, the test then tore the arena down on the strength of a latch
+     * counted down inside the listener, which is the middle of the rewrite rather than its end.
+     * Here the rewrite is pinned by a latch this test owns, so the read is issued while a
+     * compaction is demonstrably in flight every run.</p>
+     *
+     * <p>Starting the reader is not the same as the reader having issued its read. A virtual
+     * thread that has not been scheduled yet reaches {@code get} after the rewrite has retired
+     * the parent and sees a closed segment - a race in the test, not a property of the engine,
+     * and one that failed roughly one run in five. The rewrite is therefore held until the
+     * reader is observably parked, which it can only be on the segment lock the rewrite holds.</p>
+     *
+     * <p>What the reader is entitled to is the value, whether it is served before the swap or
+     * after it. It is not entitled to be served <em>during</em> the rewrite: the rewrite holds
+     * the segment's write lock from the copy through to the registry swap, deliberately, so
+     * that no write can be accepted and lost in between - so a read issued mid-rewrite waits
+     * for it and is then served out of the retired mapping. Asserting otherwise would be
+     * asserting a property this engine does not have.</p>
+     */
     @Test
-    void compaction_doesNotBlockReads() throws IOException, InterruptedException {
-        CountDownLatch readStarted = new CountDownLatch(1);
-        CountDownLatch compactionComplete = new CountDownLatch(1);
+    @DisplayName("a read issued while a compaction is in flight is still served its value")
+    void compaction_servesAReadThatOverlapsIt() throws IOException, InterruptedException {
+        CountDownLatch insideTheRewrite = new CountDownLatch(1);
+        CountDownLatch releaseTheRewrite = new CountDownLatch(1);
         AtomicBoolean readSucceeded = new AtomicBoolean(false);
+        AtomicReference<RuntimeException> readFailure = new AtomicReference<>();
 
         CompactionWorker worker = new CompactionWorker(arena, (oldSeg, newSeg) -> {
-            try {
-                // Wait for read to start before completing compaction
-                readStarted.await(5, TimeUnit.SECONDS);
-                Thread.sleep(50); // Small delay to ensure read overlaps with compaction
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            compactionComplete.countDown();
+            insideTheRewrite.countDown();
+            awaitRelease(releaseTheRewrite);
             return CompactionOutcome.INSTALLED;
         });
 
         Segment segment = createTestSegment("non-blocking-test");
         byte[] key = "test-key".getBytes();
-        byte[] value = "test-value".getBytes();
-        segment.put(key, value);
+        segment.put(key, "test-value".getBytes());
         segment.delete("deleted-key".getBytes()); // Create a tombstone
 
-        // Start read thread
-        Thread readThread = Thread.ofVirtual().start(() -> {
-            readStarted.countDown();
-            // Read should succeed even during compaction
-            var result = segment.get(key);
-            if (result != null) {
-                readSucceeded.set(true);
+        worker.requestCompaction(segment);
+        assertThat(insideTheRewrite.await(30, TimeUnit.SECONDS))
+            .as("the compaction is in flight before the read is issued")
+            .isTrue();
+
+        Thread readThread = Thread.ofVirtual().name("overlapping-reader").start(() -> {
+            try {
+                readSucceeded.set(segment.get(key) != null);
+            } catch (RuntimeException e) {
+                readFailure.set(e);
             }
         });
 
-        // Trigger compaction
-        worker.requestCompaction(segment);
+        awaitParkedOnTheSegmentLock(readThread);
+        releaseTheRewrite.countDown();
 
-        // Wait for both to complete
-        readThread.join(5000);
-        boolean compactionDone = compactionComplete.await(30, TimeUnit.SECONDS);
+        assertThat(readThread.join(Duration.ofSeconds(30)))
+            .as("the overlapping read finished")
+            .isTrue();
 
-        assertThat(readSucceeded.get()).isTrue();
-        assertThat(compactionDone).isTrue();
-
+        // Completion, not the callback: stop() is what waits for the rewrite the request
+        // dispatched, and teardown closes the arena it is mapped out of straight afterwards.
         worker.stop();
+
+        assertThat(readFailure.get())
+            .as("a compaction in flight must not turn a read into an error")
+            .isNull();
+        assertThat(readSucceeded.get())
+            .as("the overlapping read was served the value")
+            .isTrue();
+        assertThat(worker.getCompactionCount())
+            .as("the compaction completed before stop() returned")
+            .isEqualTo(1);
     }
 
     @Test
@@ -572,6 +798,85 @@ class CompactionWorkerTest {
             .isEqualTo(before);
 
         worker.stop();
+    }
+
+    /**
+     * Waits for a latch a test controls, from inside a compaction listener.
+     *
+     * @param latch The latch the test counts down when the rewrite may proceed
+     */
+    /**
+     * Waits until a thread has parked, so a read is known to be in flight and not merely started.
+     *
+     * <p>The reader's only park point is the segment lock the rewrite holds, so a parked reader
+     * is a reader that has entered {@code get} and is waiting the rewrite out. Polling the thread
+     * state is the only way to see that from outside: the read offers no hook of its own, and a
+     * latch the reader counts down before calling {@code get} would still leave it descheduled
+     * between the two.</p>
+     *
+     * @param thread The reader
+     * @throws InterruptedException if this thread is interrupted while waiting
+     */
+    private static void awaitParkedOnTheSegmentLock(Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while (System.nanoTime() < deadline) {
+            Thread.State state = thread.getState();
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING
+                || state == Thread.State.BLOCKED || state == Thread.State.TERMINATED) {
+                return;
+            }
+            Thread.sleep(1);
+        }
+        throw new AssertionError(
+            "the reader never parked, so the read was never issued against the live rewrite");
+    }
+
+    private static void awaitRelease(CountDownLatch latch) {
+        try {
+            if (!latch.await(30, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("the test never released the rewrite");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while held inside the rewrite", e);
+        }
+    }
+
+    /**
+     * Waits for a worker to have finished the given number of rewrites.
+     *
+     * <p>The count is credited after a rewrite has returned, so reaching it means no compaction
+     * is still reading or writing anything mapped out of the arena.</p>
+     *
+     * @param worker   The worker to watch
+     * @param expected How many completed compactions to wait for
+     * @throws InterruptedException if the wait is interrupted
+     */
+    private static void awaitCompactionCount(CompactionWorker worker, long expected)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (worker.getCompactionCount() < expected && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(worker.getCompactionCount())
+            .as("the rewrite finished before the arena was torn down")
+            .isEqualTo(expected);
+    }
+
+    /**
+     * Creates a segment with one live entry and one tombstone, so a rewrite has work to do.
+     *
+     * @param name Base name for the segment file
+     * @return The segment, registered for teardown
+     * @throws IOException if the segment cannot be created
+     */
+    private Segment compactableSegment(String name) throws IOException {
+        Segment segment = createTestSegment(name);
+        segment.put("test-key".getBytes(), "test-value".getBytes());
+        byte[] deleteKey = "delete-key".getBytes();
+        segment.put(deleteKey, "delete-value".getBytes());
+        segment.delete(deleteKey);
+        return segment;
     }
 
     private Segment createTestSegment(String name) throws IOException {

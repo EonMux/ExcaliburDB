@@ -154,10 +154,14 @@ public final class PostingsWriter {
     }
 
     /**
-     * Writes the index.
+     * Writes the index and makes it durable.
+     *
+     * <p>The caller may treat a normal return as meaning the index is on the device, which is
+     * what lets {@link LexicalStore} name the segment in its manifest and delete what the
+     * manifest does not name.</p>
      *
      * @param directory Where to write; created if absent
-     * @throws IOException if any file cannot be written
+     * @throws IOException if any file cannot be written or forced
      */
     public void write(Path directory) throws IOException {
         Files.createDirectories(directory);
@@ -173,7 +177,7 @@ public final class PostingsWriter {
 
         // Dictionary, and the offset of every term within it.
         long[] termOffsets = new long[termCount];
-        try (DataOutputStream dict = stream(directory.resolve("terms.dict"))) {
+        try (DataOutputStream dict = stream(directory.resolve(SegmentFiles.TERMS_DICT))) {
             long cursor = 0;
             for (int i = 0; i < termCount; i++) {
                 byte[] bytes = sorted.get(i).getBytes(StandardCharsets.UTF_8);
@@ -191,8 +195,8 @@ public final class PostingsWriter {
         // skipped without being read. See BlockLayout for the record shape and why each field
         // is there.
         long[] blockStarts = new long[termCount + 1];
-        try (DataOutputStream blocks = stream(directory.resolve("post.blk"));
-             DataOutputStream data = stream(directory.resolve("post.dat"))) {
+        try (DataOutputStream blocks = stream(directory.resolve(SegmentFiles.POST_BLK));
+             DataOutputStream data = stream(directory.resolve(SegmentFiles.POST_DAT))) {
             long blockIndex = 0;
             long dataOffset = 0;
             int[] gaps = new int[BlockLayout.BLOCK_SIZE];
@@ -245,7 +249,7 @@ public final class PostingsWriter {
             blockStarts[termCount] = blockIndex;
         }
 
-        try (DataOutputStream lengths = stream(directory.resolve("docs.len"))) {
+        try (DataOutputStream lengths = stream(directory.resolve(SegmentFiles.DOCS_LEN))) {
             for (int length : docLengths) {
                 lengths.writeInt(length);
             }
@@ -256,7 +260,7 @@ public final class PostingsWriter {
         // Block indices as int32 and dictionary offsets as int64. A corpus would need over two
         // billion postings blocks to overflow the first, which is two hundred billion postings;
         // the dictionary genuinely can exceed 2 GiB and is left wide.
-        try (DataOutputStream off = stream(directory.resolve("post.off"))) {
+        try (DataOutputStream off = stream(directory.resolve(SegmentFiles.POST_OFF))) {
             for (int t = 0; t <= termCount; t++) {
                 off.writeInt((int) blockStarts[t]);
             }
@@ -267,10 +271,13 @@ public final class PostingsWriter {
 
         int hashSlots = Integer.highestOneBit(
             Math.max(16, (int) Math.min(Integer.MAX_VALUE / 2, termCount / HASH_LOAD))) * 2;
-        writeTermHash(directory.resolve("terms.hash"), sorted, hashSlots);
+        writeTermHash(directory.resolve(SegmentFiles.TERMS_HASH), sorted, hashSlots);
 
         double averageDocLength = docCount == 0 ? 1.0 : (double) totalTokens / docCount;
-        IndexMeta.current(termCount, docCount, hashSlots, averageDocLength, bm25).write(directory);
+        // Every column on the device before the metadata that describes them is named, because
+        // the metadata is what makes this directory an index at all. See SegmentFiles.commit.
+        SegmentFiles.commit(directory,
+            IndexMeta.current(termCount, docCount, hashSlots, averageDocLength, bm25));
 
         LOGGER.info("Wrote lexical index: {} terms, {} docs, {} postings, {} hash slots",
             termCount, docCount, postingCount, hashSlots);

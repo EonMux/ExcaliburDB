@@ -12,8 +12,10 @@ import excalibur.ingest.source.SourceDescriptor;
 import excalibur.api.security.ApiSecurityConfig;
 import excalibur.api.security.IngestTargetRejectedException;
 import excalibur.api.security.IngestTargetValidator;
+import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.protocol.JsonText;
 import excalibur.api.protocol.ResponseBody;
+import io.excalibur.tenancy.NamespaceId;
 import io.excalibur.core.logging.StructuredLoggingHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +63,18 @@ import java.util.*;
  *   <li>{@code filesystem} - Local filesystem directory crawler</li>
  *   <li>{@code http} - HTTP-based document source</li>
  * </ul>
+ *
+ * <h2>Which Namespace a Source Belongs To</h2>
+ * <p>{@value excalibur.api.bootstrap.GraphTenants#NAMESPACE_HEADER} - the same header the graph
+ * routes read - names the namespace the registered source's documents belong to. Every document
+ * the crawl publishes is staged into that namespace's graph, including the documents a re-crawl
+ * publishes after a restart, because the namespace is written into the source catalog alongside
+ * everything else the registration is rebuilt from.</p>
+ * <p>Absent, it is the shared namespace, which is how a node that has never heard of
+ * multi-tenancy behaves. Present and not a legal namespace id, the registration is refused with
+ * {@code 400} rather than quietly given the shared namespace: a caller who asked for one tenant
+ * and was given another has had its documents cross a tenancy boundary, and nothing later in the
+ * pipeline could tell.</p>
  *
  * <h2>Target Allow-Lists</h2>
  * <p>Both source types point the server at something a caller names, so both are
@@ -248,14 +262,30 @@ public class IngestEndpoint implements HttpHandler {
                 .build()) {
 
             try {
+                // Before the body is read: which tenant a registration belongs to is settled
+                // from a header, and a request naming a namespace this node cannot name is
+                // refused whatever it carries.
+                NamespaceId namespace;
+                try {
+                    namespace = GraphTenants.namespaceOf(exchange.getRequestHeaders()
+                        .getFirst(GraphTenants.NAMESPACE_HEADER));
+                } catch (IllegalArgumentException e) {
+                    LOGGER.warn("Refused an ingest registration naming an illegal namespace: {}",
+                        e.getMessage());
+                    sendError(exchange, 400, "Header '" + GraphTenants.NAMESPACE_HEADER
+                        + "': " + e.getMessage());
+                    return;
+                }
+
                 // Parse request body
                 String requestBody = readRequestBody(exchange);
-                SourceDescriptor request = parseRequest(requestBody);
+                SourceDescriptor request = parseRequest(requestBody, namespace);
 
                 // Set source ID in MDC for per-source logging
                 StructuredLoggingHelper.setSourceId(request.sourceId());
 
-                LOGGER.info("Registering ingestion source: type={}", request.sourceType());
+                LOGGER.info("Registering ingestion source: type={}, namespace={}",
+                    request.sourceType(), request.namespace());
 
                 // Build the source. The target is validated against the configured
                 // allow-lists first, so an unknown root or host never reaches a crawler.
@@ -366,10 +396,16 @@ public class IngestEndpoint implements HttpHandler {
     /**
      * Parses the JSON request body into the registration it describes.
      *
-     * <p>What comes out is what gets written down: the type, the id, and the configuration as the
-     * caller supplied it. A restart replays exactly this through the same allow-lists.</p>
+     * <p>What comes out is what gets written down: the type, the id, the namespace and the
+     * configuration as the caller supplied it. A restart replays exactly this through the same
+     * allow-lists, into the same namespace.</p>
+     *
+     * @param json      The request body
+     * @param namespace The namespace the header named, already validated
+     * @return The registration
+     * @throws IllegalArgumentException if the body does not describe a source this node builds
      */
-    private static SourceDescriptor parseRequest(String json) {
+    private static SourceDescriptor parseRequest(String json, NamespaceId namespace) {
         String sourceType = JsonText.string(json, "source_type");
         if (sourceType == null || sourceType.isEmpty()) {
             throw new IllegalArgumentException("Field 'source_type' is required");
@@ -422,7 +458,7 @@ public class IngestEndpoint implements HttpHandler {
                 throw new IllegalArgumentException("Unknown source type: " + sourceType);
         }
 
-        return new SourceDescriptor(sourceType, sourceId, config);
+        return new SourceDescriptor(sourceType, sourceId, config, namespace);
     }
 
     /**

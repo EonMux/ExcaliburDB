@@ -264,6 +264,13 @@ public final class FixedBucketHistogram {
 
     /**
      * Gets the epoch this histogram was last told about (instance method).
+     *
+     * <p>This is the stamp the next {@link #recordFpRate(double)} will carry, moved by
+     * {@link #setEpoch(long)}, {@link #record(long, long)} and
+     * {@link #recordFpRate(double, long)} alike. It is not the node's published visibility
+     * epoch - {@code Metrics.getCurrentEpoch()} owns that, and is what both epoch-bearing
+     * MBeans report, so that a query recording the epoch it read at cannot move the number an
+     * operator watches.</p>
      */
     public long getCurrentEpoch() {
         return currentEpoch;
@@ -339,7 +346,13 @@ public final class FixedBucketHistogram {
     }
 
     /**
-     * Gets the singleton histogram instance for direct access.
+     * Gets the process-wide histogram every metric in this node is measured into.
+     *
+     * <p>This is the same object {@link Metrics#QueryLatency()} hands out, so the static
+     * percentile accessors above and {@code Metrics.getP50()} and friends are one number.
+     * They were not always: latencies went to a second instance while these read this one,
+     * which nothing recorded a latency into, so they published a permanent zero under the
+     * name of a real measurement.</p>
      *
      * @return The singleton histogram instance
      */

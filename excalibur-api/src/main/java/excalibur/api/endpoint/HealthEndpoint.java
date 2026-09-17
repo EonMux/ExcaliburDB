@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
+import java.util.function.BooleanSupplier;
 
 /**
  * HTTP endpoint for the /health API.
@@ -44,6 +45,13 @@ import java.util.Objects;
  *       searched, so it counts, and an empty segment counts as readily as a full one. See
  *       {@link SegmentCatalog.CatalogMetadata#getEstimatedCoverage()}</li>
  *   <li>{@code latencyMs} - Time taken to compute health status in milliseconds</li>
+ *   <li>{@code indexerRunning} - Whether the worker that drains the HNSW integration queue is
+ *       alive. Present only where the endpoint was built over an index orchestrator. Additive
+ *       and reported beside the verdict rather than folded into it: a dead worker leaves
+ *       coverage at 1.0 and this response {@code healthy}, so nothing else here would show it,
+ *       but {@code live}, {@code ready} and {@code healthy} keep the meanings they are
+ *       documented with. The verdict a probe acts on is {@code /health/ready}'s, which does
+ *       treat a dead worker as a reason to leave the rotation</li>
  * </ul>
  *
  * <h2>Domain Correctness</h2>
@@ -87,6 +95,15 @@ public class HealthEndpoint implements HttpHandler {
 
     private final VisibilityTracker visibilityTracker;
     private final SegmentCatalog segmentCatalog;
+
+    /**
+     * Whether the index orchestrator is alive, or null where one was never supplied.
+     *
+     * <p>Null rather than a constant {@code true}: an endpoint built from a visibility tracker
+     * and a catalog alone has no orchestrator to ask, and reporting one as running would be
+     * an answer it did not have.</p>
+     */
+    private final BooleanSupplier indexerRunning;
     private final double readinessThreshold;
     private final double healthyThreshold;
     private final int maxLatencyMs;
@@ -134,6 +151,7 @@ public class HealthEndpoint implements HttpHandler {
 
         this.visibilityTracker = indexOrchestrator.getVisibilityTracker();
         this.segmentCatalog = indexOrchestrator.getCatalog();
+        this.indexerRunning = indexOrchestrator::isRunning;
         this.readinessThreshold = readinessThreshold;
         this.healthyThreshold = healthyThreshold;
         this.maxLatencyMs = maxLatencyMs;
@@ -186,6 +204,7 @@ public class HealthEndpoint implements HttpHandler {
 
         this.visibilityTracker = visibilityTracker;
         this.segmentCatalog = segmentCatalog;
+        this.indexerRunning = null;
         this.readinessThreshold = readinessThreshold;
         this.healthyThreshold = healthyThreshold;
         this.maxLatencyMs = maxLatencyMs;
@@ -374,7 +393,29 @@ public class HealthEndpoint implements HttpHandler {
             + ", \"epoch\": " + status.epoch()
             + ", \"coverage\": " + JsonText.number(status.coverage(), 4)
             + ", \"latencyMs\": " + status.latencyMs()
+            + indexerField()
             + "}";
+    }
+
+    /**
+     * The index worker's state, where this endpoint has an orchestrator to ask.
+     *
+     * <p>A failure to read it drops the field rather than the response: the node's health does
+     * not depend on being able to describe one of its workers, and an absent field is a
+     * truthful "not known" where a {@code false} would be an alarm nobody should act on.</p>
+     *
+     * @return The field, with its leading separator, or an empty string
+     */
+    private String indexerField() {
+        if (indexerRunning == null) {
+            return "";
+        }
+        try {
+            return ", \"indexerRunning\": " + indexerRunning.getAsBoolean();
+        } catch (RuntimeException e) {
+            LOGGER.debug("Could not read the index orchestrator's state: {}", e.toString());
+            return "";
+        }
     }
 
     /**

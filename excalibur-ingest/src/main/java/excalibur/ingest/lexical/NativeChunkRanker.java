@@ -1,5 +1,6 @@
 package excalibur.ingest.lexical;
 
+import io.excalibur.retrieval.expand.ExpansionWeights;
 import io.excalibur.retrieval.expand.QueryExpander;
 import io.excalibur.retrieval.expand.SearchFormulation;
 import io.excalibur.retrieval.lexical.native_.LexicalStore;
@@ -29,6 +30,12 @@ import java.util.Objects;
  * which is what a boolean query of boosted clauses does with a repeated term - the alternative,
  * taking the larger, would make a term that several independent formulations agreed on count no
  * more than one that only the strongest suggested.</p>
+ *
+ * <p>Summing is bounded by {@link ExpansionWeights}, because a sum has no ceiling of its own: two
+ * formulations at 0.9 sharing a term arrive at the store carrying 1.8 against the 1.0 of a word
+ * the user typed, and the guess then wins the ranking. The bound is applied to the formulations
+ * that survive gating rather than to every one the model produced, so a dropped formulation does
+ * not quietly scale down the ones that were searched.</p>
  *
  * <h2>Gating</h2>
  * <p>A generated formulation whose terms the corpus does not contain is dropped, checked against
@@ -98,24 +105,44 @@ public final class NativeChunkRanker implements Ranker {
 
     /** Turns formulations into one weighted term set, dropping generated ones the corpus lacks. */
     private Map<String, Double> flatten(List<SearchFormulation> formulations) throws IOException {
+        List<SearchFormulation> searchable =
+            ExpansionWeights.bounded(corpusKnows(formulations), Tokens::of);
         Map<String, Double> weighted = new LinkedHashMap<>();
-        boolean first = true;
-        for (SearchFormulation formulation : formulations) {
-            List<String> tokens = Tokens.of(formulation.text());
-            if (tokens.isEmpty()) {
-                continue;
-            }
-            if (!first && !anyKnown(tokens)) {
-                LOGGER.debug("Dropping '{}': no term of it occurs in the corpus",
-                    formulation.text());
-                continue;
-            }
-            first = false;
-            for (String token : tokens) {
+        for (SearchFormulation formulation : searchable) {
+            for (String token : Tokens.of(formulation.text())) {
                 weighted.merge(token, formulation.weight(), Double::sum);
             }
         }
         return weighted;
+    }
+
+    /**
+     * The formulations worth searching: the user's own, and the guesses the corpus can match.
+     *
+     * <p>The user's query is never gated and stays first, both because it is what was asked -
+     * a query for words the corpus lacks must return nothing rather than quietly become a
+     * different query - and because the weight it carries is what every expansion is measured
+     * against.</p>
+     *
+     * @param formulations What the expander produced, the original first
+     * @return The survivors, the original still first
+     * @throws IOException if the term dictionary cannot be read
+     */
+    private List<SearchFormulation> corpusKnows(List<SearchFormulation> formulations)
+            throws IOException {
+        List<SearchFormulation> kept = new ArrayList<>(formulations.size());
+        kept.add(formulations.get(0));
+        for (int i = 1; i < formulations.size(); i++) {
+            SearchFormulation formulation = formulations.get(i);
+            List<String> tokens = Tokens.of(formulation.text());
+            if (tokens.isEmpty() || !anyKnown(tokens)) {
+                LOGGER.debug("Dropping '{}': no term of it occurs in the corpus",
+                    formulation.text());
+                continue;
+            }
+            kept.add(formulation);
+        }
+        return kept;
     }
 
     private boolean anyKnown(List<String> tokens) throws IOException {

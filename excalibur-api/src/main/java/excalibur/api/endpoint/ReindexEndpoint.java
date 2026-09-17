@@ -432,9 +432,10 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
     private void runReindex(String sourceId, ReindexCoordinator.Lease lease) {
         try {
             if (lease.isCancelled()) {
+                // Cancelled, not failed. The caller asked for this, and the readback it polls
+                // is the only place the two are distinguishable.
                 LOGGER.info("Reindex of {} was cancelled before it started", sourceId);
-                reindexStatusRegistry.failReindex(sourceId,
-                    "Reindex was cancelled before it started");
+                reindexStatusRegistry.cancelReindex(sourceId);
                 return;
             }
             Thread runner = Thread.currentThread();
@@ -538,10 +539,23 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         /** Reported for a run that stopped without finishing; {@code lastError} says why. */
         public static final String STATE_FAILED = "failed";
 
+        /**
+         * Reported for a run that stopped because someone asked it to.
+         *
+         * <p>Distinct from {@link #STATE_FAILED}, and the distinction is the point.
+         * {@code DELETE /v1/reindex} answers "poll /v1/reindex/status for when it has" and is
+         * the documented way to clear a wedged reindex, so the readback it points at is where
+         * a caller learns the stop worked. Reported as a failure, a deliberate stop is an
+         * incident an operator is expected to investigate, and the only thing separating the
+         * two was the wording of a message this endpoint deliberately does not carry.</p>
+         */
+        public static final String STATE_CANCELLED = "cancelled";
+
         private final String sourceId;
         private volatile String state;
         private volatile double progress;
         private volatile long startTimeMs;
+        private volatile long finishedAtMs;
         private volatile long entriesProcessed;
         private volatile long entriesTotal;
         private volatile String lastError;
@@ -551,6 +565,7 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             this.state = "idle";
             this.progress = 0.0;
             this.startTimeMs = 0;
+            this.finishedAtMs = 0;
             this.entriesProcessed = 0;
             this.entriesTotal = 0;
             this.lastError = null;
@@ -564,6 +579,24 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         public long entriesTotal() { return entriesTotal; }
         public String lastError() { return lastError; }
 
+        /**
+         * When this run stopped, however it stopped, or 0 while it is still going.
+         *
+         * <p>Served beside the start time because between them they are how long the run took,
+         * which is the number an operator compares against the next run. A start time on its
+         * own says only when someone asked.</p>
+         *
+         * @return Epoch milliseconds, or 0 for a run that has not ended
+         */
+        public long finishedAtMs() { return finishedAtMs; }
+
+        /**
+         * Whether this run stopped because it was asked to.
+         *
+         * @return true for a cancelled run
+         */
+        public boolean cancelled() { return STATE_CANCELLED.equals(state); }
+
         public boolean isInProgress() {
             return "crawling".equals(state) || "embedding".equals(state) || "indexing".equals(state);
         }
@@ -572,6 +605,7 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             this.state = "crawling";
             this.progress = 0.0;
             this.startTimeMs = System.currentTimeMillis();
+            this.finishedAtMs = 0;
             this.entriesProcessed = 0;
             this.entriesTotal = 0;
             this.lastError = null;
@@ -595,6 +629,20 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         public void complete() {
             this.state = "idle";
             this.progress = 1.0;
+            this.finishedAtMs = System.currentTimeMillis();
+        }
+
+        /**
+         * Records that the run stopped because {@code DELETE /v1/reindex} asked it to.
+         *
+         * <p>The counters are left as the run last published them: how far a cancelled run got
+         * before it stopped is exactly what the caller who stopped it wants to know, and it is
+         * also what says whether cancelling again is needed.</p>
+         */
+        public void cancel() {
+            this.state = STATE_CANCELLED;
+            this.finishedAtMs = System.currentTimeMillis();
+            this.lastError = null;
         }
 
         /**
@@ -610,6 +658,7 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         public void fail(String error) {
             this.state = STATE_FAILED;
             this.lastError = error;
+            this.finishedAtMs = System.currentTimeMillis();
         }
     }
 
@@ -622,6 +671,16 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         void updateProgress(String sourceId, String state, double progress, long processed, long total);
         void completeReindex(String sourceId);
         void failReindex(String sourceId, String error);
+
+        /**
+         * Records that a run stopped because it was asked to.
+         *
+         * <p>Separate from {@link #failReindex(String, String)} because a caller acts
+         * differently on the two, and the readback is the only place either is visible.</p>
+         *
+         * @param sourceId The source whose run was cancelled
+         */
+        void cancelReindex(String sourceId);
         Map<String, ReindexStatus> getAllStatuses();
 
         /**
@@ -681,6 +740,14 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
             ReindexStatus status = statuses.get(sourceId);
             if (status != null) {
                 status.fail(error);
+            }
+        }
+
+        @Override
+        public void cancelReindex(String sourceId) {
+            ReindexStatus status = statuses.get(sourceId);
+            if (status != null) {
+                status.cancel();
             }
         }
 

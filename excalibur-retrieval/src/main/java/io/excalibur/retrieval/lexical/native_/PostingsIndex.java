@@ -2,6 +2,7 @@ package io.excalibur.retrieval.lexical.native_;
 
 import excalibur.filter.CuckooFilter;
 import io.excalibur.core.hash.XxHash64;
+import io.excalibur.core.integrity.IntegrityReport;
 import io.excalibur.core.mapped.MappedFile;
 import io.excalibur.retrieval.lexical.Bm25Parameters;
 
@@ -13,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.function.IntPredicate;
 
 /**
  * A memory-mapped inverted index, in the shape the rest of this engine already uses.
@@ -143,6 +145,27 @@ public final class PostingsIndex implements AutoCloseable {
     /** Every term's impact bound, for the one mean document length it was computed against. */
     private record TermBounds(double average, float[] byTerm) { }
 
+    /**
+     * Verifies a segment on disk without mapping a column or opening the index.
+     *
+     * <p>The entry point a checking tool calls. Each column is streamed past the digest through
+     * a channel, so a segment too large to map - or too damaged to serve - can still be judged,
+     * and nothing about the call puts the segment into service. It reports rather than throws,
+     * because a survey of a node's files has to reach the end of the list.</p>
+     *
+     * <p>A segment written before this format carried checksums is reported as
+     * {@code LEGACY_UNPROTECTED} rather than as sound: it is not refused, and it is not
+     * upgraded in place either, because a checksum written over it now would vouch for bytes
+     * nothing has ever vouched for. See {@link IndexMeta} for the version decision.</p>
+     *
+     * @param directory The segment directory to verify
+     * @return What the check concluded, naming the damaged column when there is one
+     * @throws NullPointerException if the directory is null
+     */
+    public static IntegrityReport verifyIntegrity(Path directory) {
+        return LexicalSegmentIntegrity.verify(directory);
+    }
+
     /** Opens an index previously written by {@link PostingsWriter}, scored with the defaults. */
     public static PostingsIndex open(Path directory) throws IOException {
         return open(directory, Bm25Parameters.DEFAULT);
@@ -155,6 +178,9 @@ public final class PostingsIndex implements AutoCloseable {
      * @throws Bm25MismatchException if the index was built with a different pair, since every
      *                               score and therefore every ranking it can produce would differ
      *                               from the one the corpus was ingested for
+     * @throws IOException           if a file disagrees with the geometry the metadata declares,
+     *                               which is an index that was truncated or never finished; see
+     *                               {@link SegmentGeometry}
      */
     public static PostingsIndex open(Path directory, Bm25Parameters bm25) throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
@@ -163,17 +189,24 @@ public final class PostingsIndex implements AutoCloseable {
         if (!meta.bm25().equals(bm25)) {
             throw new Bm25MismatchException(directory, meta.bm25(), bm25);
         }
+        // Before anything is mapped: every offset below is arithmetic on the counts just read,
+        // and a column that stopped short decodes into an answer rather than an error. The
+        // geometry catches a column that lost bytes; the checksums catch one that kept its
+        // length and lost its contents, which nothing measurable can distinguish from a sound
+        // index once it is mapped.
+        SegmentGeometry.verify(directory, meta);
+        LexicalSegmentIntegrity.requireIntact(directory, meta);
         int termCount = meta.termCount();
         int docCount = meta.docCount();
         int hashSlots = meta.hashSlots();
         double averageDocLength = meta.averageDocLength();
 
-        MappedFile dict = MappedFile.open(directory.resolve("terms.dict"));
-        MappedFile hash = MappedFile.open(directory.resolve("terms.hash"));
-        MappedFile off = MappedFile.open(directory.resolve("post.off"));
-        MappedFile blk = MappedFile.open(directory.resolve("post.blk"));
-        MappedFile dat = MappedFile.open(directory.resolve("post.dat"));
-        MappedFile len = MappedFile.open(directory.resolve("docs.len"));
+        MappedFile dict = MappedFile.open(directory.resolve(SegmentFiles.TERMS_DICT));
+        MappedFile hash = MappedFile.open(directory.resolve(SegmentFiles.TERMS_HASH));
+        MappedFile off = MappedFile.open(directory.resolve(SegmentFiles.POST_OFF));
+        MappedFile blk = MappedFile.open(directory.resolve(SegmentFiles.POST_BLK));
+        MappedFile dat = MappedFile.open(directory.resolve(SegmentFiles.POST_DAT));
+        MappedFile len = MappedFile.open(directory.resolve(SegmentFiles.DOCS_LEN));
 
         // The term gate is rebuilt on open rather than persisted: it is derived data, it costs
         // milliseconds per million terms, and a filter that has drifted from the dictionary it
@@ -325,6 +358,29 @@ public final class PostingsIndex implements AutoCloseable {
      * @param stats Collection-wide statistics, or null to use this index's own
      */
     public Hit[] search(String[] terms, double[] weights, int limit, Stats stats) {
+        return search(terms, weights, limit, stats, null);
+    }
+
+    /**
+     * Scores only the documents a caller still considers live.
+     *
+     * <p>A segment holding tombstoned documents cannot be searched by taking the top {@code
+     * limit} and discarding the dead ones afterwards: if the dead ones are the best matches -
+     * which is the ordinary case, because a document is usually erased for being the very thing
+     * that was searched for - the page comes back short, or empty, while live documents that
+     * belong on it are never looked at. Over-fetching some multiple of {@code limit} only moves
+     * the threshold at which that happens.</p>
+     *
+     * <p>So the filter is applied where the ranking is decided rather than after it. A dead
+     * document is stepped over without entering the heap, which keeps the page exactly {@code
+     * limit} live documents long whenever the segment holds that many, and keeps the pruning
+     * threshold measured against live documents rather than against ones nobody can be shown.</p>
+     *
+     * @param live A predicate on doc id that is true for a document still searchable, or null
+     *             when every document in the segment is
+     */
+    public Hit[] search(String[] terms, double[] weights, int limit, Stats stats,
+                        IntPredicate live) {
         if (terms.length != weights.length) {
             throw new IllegalArgumentException("terms and weights differ in length");
         }
@@ -336,7 +392,7 @@ public final class PostingsIndex implements AutoCloseable {
         if (cursors.length == 0) {
             return new Hit[0];
         }
-        return maxScore(cursors, Math.min(limit, docCount), average);
+        return maxScore(cursors, Math.min(limit, docCount), average, live);
     }
 
     /**
@@ -387,7 +443,7 @@ public final class PostingsIndex implements AutoCloseable {
      * Its advantage needs queries that mix very rare terms with very common ones, which expansion
      * produces less often than it looks.</p>
      */
-    private Hit[] maxScore(Cursor[] cursors, int wanted, double average) {
+    private Hit[] maxScore(Cursor[] cursors, int wanted, double average, IntPredicate live) {
         // Strongest bound first, so the suffix sums shrink as fast as possible.
         java.util.Arrays.sort(cursors, (a, b) -> Double.compare(b.bound, a.bound));
         double[] suffix = new double[cursors.length + 1];
@@ -404,6 +460,10 @@ public final class PostingsIndex implements AutoCloseable {
             int current = nextCandidate(cursors, essential);
             if (current < 0) {
                 break;
+            }
+            if (live != null && !live.test(current)) {
+                stepOver(cursors, current);
+                continue;
             }
             double score = scoreDocument(cursors, current, average);
             if (score <= 0) {
@@ -449,6 +509,22 @@ public final class PostingsIndex implements AutoCloseable {
             }
         }
         return score;
+    }
+
+    /**
+     * Advances past a document without scoring it.
+     *
+     * <p>What {@link #scoreDocument} does to the cursors, minus the arithmetic. A document the
+     * caller has filtered out still has to be stepped over on every cursor that holds it, or the
+     * next call reads the same doc id for ever.</p>
+     */
+    private void stepOver(Cursor[] cursors, int doc) {
+        for (Cursor cursor : cursors) {
+            cursor.advanceTo(this, doc);
+            if (cursor.currentDoc() == doc) {
+                cursor.step(this);
+            }
+        }
     }
 
     /** A position in one term's postings, decoding a block only when it must. */

@@ -3,9 +3,13 @@ package excalibur.api.endpoint;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 
+import excalibur.api.bootstrap.GraphTenants;
 import excalibur.api.security.ApiSecurityConfig;
 import excalibur.api.security.IngestTargetValidator;
 import excalibur.ingest.pipeline.IngestionOrchestrator;
+import excalibur.ingest.registry.SourceCatalog;
+import excalibur.ingest.source.SourceDescriptor;
+import io.excalibur.tenancy.NamespaceId;
 import excalibur.ingest.source.Source;
 import excalibur.shard.worker.SegmentReindexScheduler;
 import io.excalibur.store.SegmentCatalog;
@@ -587,6 +591,90 @@ class IngestEndpointTest {
         }
     }
 
+    /**
+     * A source belongs to the namespace that registered it, and to no other.
+     *
+     * <p>{@code X-Excalibur-Namespace} is the same header the graph routes read, named once in
+     * {@link GraphTenants#NAMESPACE_HEADER}. Registration is where a source's namespace is
+     * settled, because it is the only moment the caller and the crawl are both present: every
+     * document the crawl later publishes is staged into the namespace named here, including the
+     * documents a re-crawl publishes after a restart.</p>
+     */
+    @Nested
+    @DisplayName("The namespace a source is registered in")
+    class Namespaces {
+
+        @Test
+        @DisplayName("refuses a namespace header that is not a namespace id, and names the rule")
+        void refusesAnIllegalNamespace(@TempDir Path root) throws IOException {
+            Response response = post(root, null, body(root, "docs"), "Not A Namespace");
+
+            assertThat(response.status())
+                .as("a caller who asked for a namespace this node cannot name must not be "
+                    + "quietly given the shared one: its documents would cross a tenancy "
+                    + "boundary and nothing in the answer would say so")
+                .isEqualTo(400);
+            assertThat(response.body()).contains("[a-z0-9]");
+            assertThat(registry.getAllSourceIds()).isEmpty();
+        }
+
+        @Test
+        @DisplayName("registers a source in the namespace its header named")
+        void registersAgainstTheNamespaceTheHeaderNamed(@TempDir Path root) throws IOException {
+            Response response = post(root, null, body(root, "docs"), "acme");
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registry.namespaceOf("docs"))
+                .as("the graph sink routes on this: without it the header is honoured by the "
+                    + "query routes and nothing can ever put a fact into the namespace")
+                .contains(NamespaceId.of("acme"));
+        }
+
+        @Test
+        @DisplayName("a registration that names no namespace belongs to the shared one")
+        void noHeaderMeansTheSharedNamespace(@TempDir Path root) throws IOException {
+            Response response = post(root, null, body(root, "docs"), null);
+
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registry.namespaceOf("docs"))
+                .as("a node that never sees the header behaves as a single-tenant node")
+                .contains(NamespaceId.SHARED);
+        }
+
+        @Test
+        @DisplayName("writes the namespace down, so a re-crawl after a restart stages where it did")
+        void recordsTheNamespaceInTheCatalog(@TempDir Path root, @TempDir Path dataDir)
+                throws IOException {
+            SourceCatalog catalog = SourceCatalog.open(dataDir);
+            registry.setSourceCatalog(catalog);
+
+            assertThat(post(root, null, body(root, "docs"), "acme").status()).isEqualTo(200);
+
+            assertThat(SourceCatalog.open(dataDir).all())
+                .extracting(SourceDescriptor::sourceId, SourceDescriptor::namespace)
+                .containsExactly(
+                    org.assertj.core.groups.Tuple.tuple("docs", NamespaceId.of("acme")));
+        }
+
+        @Test
+        @DisplayName("refuses a namespace header claiming the shared namespace by name")
+        void refusesTheSharedNamespaceByName(@TempDir Path root) throws IOException {
+            // The same answer the graph routes give it. 'shared' is what a node uses when no
+            // namespace was named; a caller naming it is claiming an index it does not own.
+            Response response = post(root, null, body(root, "docs"), "shared");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(registry.getAllSourceIds()).isEmpty();
+        }
+
+        /** A filesystem registration for {@code root} under {@code sourceId}. */
+        private String body(Path root, String sourceId) {
+            return "{\"source_type\": \"filesystem\", \"config\": {"
+                + "\"source_id\": \"" + sourceId + "\", "
+                + "\"root_path\": \"" + root + "\"}}";
+        }
+    }
+
     /** One captured HTTP response. */
     private record Response(int status, String body) {}
 
@@ -609,15 +697,28 @@ class IngestEndpointTest {
      */
     private Response post(Path root, InlineSourceIds supplied, String requestBody)
             throws IOException {
+        return post(root, supplied, requestBody, null);
+    }
+
+    /**
+     * Posts {@code requestBody} with the namespace header a caller would send, or without one
+     * when {@code namespace} is null.
+     */
+    private Response post(Path root, InlineSourceIds supplied, String requestBody,
+                          String namespace) throws IOException {
         IngestEndpoint endpoint = new IngestEndpoint(registry, null, null,
             new IngestTargetValidator(ApiSecurityConfig.builder().allowIngestRoot(root).build()),
             supplied);
 
         HttpExchange exchange = mock(HttpExchange.class);
         ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
+        Headers requestHeaders = new Headers();
+        if (namespace != null) {
+            requestHeaders.set(GraphTenants.NAMESPACE_HEADER, namespace);
+        }
         when(exchange.getRequestMethod()).thenReturn("POST");
         when(exchange.getRequestURI()).thenReturn(URI.create("/v1/ingest"));
-        when(exchange.getRequestHeaders()).thenReturn(new Headers());
+        when(exchange.getRequestHeaders()).thenReturn(requestHeaders);
         when(exchange.getResponseHeaders()).thenReturn(new Headers());
         when(exchange.getRequestBody()).thenReturn(
             new ByteArrayInputStream(requestBody.getBytes(StandardCharsets.UTF_8)));

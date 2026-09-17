@@ -97,7 +97,11 @@ public final class SourceRestoration {
         }
 
         try {
-            registry.restore(source);
+            // With the descriptor, not just the crawler: the namespace it records is what
+            // decides which tenant's graph this source's documents are staged into, and a
+            // restore that dropped it would move them into the shared namespace at the first
+            // restart after they were registered.
+            registry.restore(source, descriptor);
             return true;
         } catch (RuntimeException e) {
             closeQuietly(source, descriptor.sourceId());
