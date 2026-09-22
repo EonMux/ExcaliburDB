@@ -1,0 +1,102 @@
+# The build a clone has to pass.
+#
+# Deliberately the documented commands and nothing else. A pipeline that runs a private
+# incantation proves that the incantation works, not that the README does.
+name: build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# A second push to the same branch makes the first one's answer worthless, so it is cancelled
+# rather than left to finish. Never on the default branch, where each commit's verdict is the
+# record of whether that commit was sound.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    name: Build, test and verify coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # 21 exactly, not 21-or-later. Every module compiles with --enable-preview for the Panama
+      # FFM API, and a preview class file is refused by any JDK other than the one that produced
+      # it, so a newer runner default would fail after compiling rather than before.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # assemble + check, and check is where the per-module coverage floors are enforced. This
+      # is also the only place RepositoryCompletenessTest runs against a tree that holds exactly
+      # what git holds, which is the whole reason that test asks git rather than the filesystem.
+      - run: ./gradlew build
+
+      # The three artefacts the README tells a reader to build. They are not part of `build`:
+      # installDist is not wired into assemble, and a module whose build script went missing
+      # would still leave `build` green while these resolved to no such task.
+      - run: ./gradlew :excalibur-api:shadowJar :excalibur-fsck:installDist :excalibur-backup:installDist
+
+      # Both commands run and exit, so running one is a real check that the start scripts carry
+      # the JVM flags the formats need. --help touches no data directory.
+      - run: ./excalibur-fsck/build/install/excalibur-fsck/bin/excalibur-fsck --help
+      - run: ./excalibur-backup/build/install/excalibur-backup/bin/excalibur-backup --help
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: '**/build/reports/tests/test'
+          retention-days: 7
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The README's own command. The image builds the jar itself, from the same tree, so this
+      # is the only thing that checks the Dockerfile against what the build actually produces.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: excalibur:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # It must start on loopback with no token and no TLS, which is the only shape the server
+      # will start in without one, and report itself ready. A node that builds and will not come
+      # up is the failure an image build alone cannot see.
+      - name: Start it and wait for readiness
+        run: |
+          docker run -d --name excalibur-ci -p 8080:8080 \
+            -e EXCALIBUR_API_BIND_ADDRESS=0.0.0.0 \
+            -e EXCALIBUR_API_ALLOW_PLAINTEXT=true \
+            -e EXCALIBUR_API_AUTH_TOKEN=ci-token \
+            excalibur:ci
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/health/ready; then
+              echo "ready"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "the node never reported ready"
+          docker logs excalibur-ci
+          exit 1
+
+      - name: Stop it the way a scheduler would
+        if: always()
+        run: docker stop --time 40 excalibur-ci || true

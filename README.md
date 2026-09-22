@@ -1286,7 +1286,7 @@ rather than a silent clamp:
 | `max_response_bytes` | http | 1 – 256 MiB | Largest single response body held |
 | `timeout_seconds` | http | 1 – 600 | How long one request may take |
 | `user_agent` | http | ≤ 200 chars | What the crawl identifies itself as. Screened for header injection |
-| `max_depth` | both | 0 – 1000 | How far the crawl descends |
+| `max_depth` | both | 1 – 1000 filesystem, 0 – 1000 http | How far the crawl descends. Zero is a meaningful HTTP crawl — the one page named by `base_url` — and not a meaningful directory walk |
 
 `source_id` is bounded at 256 characters. A copy of it is kept in every document's registry record
 and printed with every log line about the source, so its length is multiplied by the size of the
@@ -2208,6 +2208,24 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 ```bash
 ./gradlew :excalibur-integration:test
 ```
+
+`RepositoryCompletenessTest` is the odd one out: it asks git rather than the filesystem. Every
+other test here runs against the working tree, which holds whatever the last edit left behind
+whether or not it was ever committed, and that makes the whole suite blind to a file the build
+reads that nobody added. It has happened twice — a `.gitignore` line that matched the Java
+package `io.excalibur.retrieval.build`, and three modules whose build scripts were never tracked.
+
+### Continuous integration
+
+`.github/workflows/build.yml` runs `./gradlew build` on a Temurin 21 runner — assemble, the whole
+test suite, and the per-module coverage floors `check` enforces — then builds the three artefacts
+the README names, because `installDist` is not part of `build` and a module with no build script
+would leave `build` green while those resolved to no such task. A second job builds the container
+image with the README's own command and waits for the node inside it to report ready.
+
+The benchmark assertions are not run there. They are wall-clock targets, and a shared runner is
+the one machine whose wall clock means nothing; `./gradlew :excalibur-bench:benchmarkTest` is
+where they belong.
 
 ## FAQ
 
