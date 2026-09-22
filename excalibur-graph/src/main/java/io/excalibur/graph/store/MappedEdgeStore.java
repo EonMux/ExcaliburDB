@@ -273,8 +273,13 @@ public final class MappedEdgeStore implements EdgeStore {
      */
     void collectNeighbors(int entity, int[] selectors, TemporalFilter asOf, RoaringBitmap sink) {
         if (selectors == null) {
+            // Both runs. No relation filter means no filter, and direction is not a relation -
+            // see the contract on EdgeStore. The sink is a bitmap, so an entity reached both ways
+            // costs nothing to deduplicate.
             collectRun(entity, EdgeColumn.OFFSETS_FWD, EdgeColumn.EDGES_FWD,
                 -1, false, asOf, sink);
+            collectRun(entity, EdgeColumn.OFFSETS_REV, EdgeColumn.EDGES_REV,
+                -1, true, asOf, sink);
             return;
         }
         for (int selector : selectors) {

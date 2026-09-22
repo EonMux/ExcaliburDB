@@ -57,8 +57,44 @@ class MappedEdgeStoreTest {
                     .add(1, KNOWS, 2))) {
 
                 assertThat(sorted(store.neighbors(0, null))).containsExactly(1, 2, 3);
-                assertThat(sorted(store.neighbors(1, null))).containsExactly(2);
-                assertThat(store.neighbors(2, null)).isEmpty();
+                assertThat(sorted(store.neighbors(1, null))).containsExactly(0, 2);
+                assertThat(sorted(store.neighbors(2, null))).containsExactly(0, 1);
+            }
+        }
+
+        @Test
+        @DisplayName("no relation filter means both directions, not forward alone")
+        void absentFilterIsNotADirection(@TempDir Path dir) throws IOException {
+            // Entity 2 asserts nothing and is asserted about twice. A store that reads an absent
+            // relation filter as "forward" calls it isolated, and every question asked from its
+            // side of an edge goes unanswered - which is the direction half of any real corpus
+            // happens to have been written in.
+            try (MappedEdgeStore store = build(dir, 4, w -> w
+                    .add(0, KNOWS, 2)
+                    .add(1, WORKS_AT, 2))) {
+
+                assertThat(sorted(store.neighbors(2, null)))
+                    .as("direction is not a relation, so omitting a relation filter cannot pick one")
+                    .containsExactly(0, 1);
+                assertThat(sorted(store.expand(new long[] { 2 }, 1, null, TemporalFilter.ALL)))
+                    .containsExactly(0, 1, 2);
+            }
+        }
+
+        @Test
+        @DisplayName("one direction is still available, by saying so")
+        void directionIsStillExpressible(@TempDir Path dir) throws IOException {
+            try (MappedEdgeStore store = build(dir, 4, w -> w
+                    .add(0, KNOWS, 2)
+                    .add(1, WORKS_AT, 2))) {
+
+                assertThat(store.neighbors(2, new int[] { RelationSelector.forward(KNOWS) }))
+                    .as("2 asserts nothing, so it has no forward neighbour on any relation")
+                    .isEmpty();
+                assertThat(store.neighbors(2, new int[] { RelationSelector.reverse(KNOWS) }))
+                    .containsExactly(0);
+                assertThat(sorted(store.neighbors(2, RelationSelector.both(KNOWS))))
+                    .containsExactly(0);
             }
         }
 

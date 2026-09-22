@@ -44,6 +44,9 @@ class ConfigGraphTest {
                 .isEqualTo(GraphConfig.DEFAULT_MIN_MEAN_CONFIDENCE);
             assertThat(settings.getMaxAmbiguousCandidates())
                 .isEqualTo(GraphConfig.DEFAULT_MAX_AMBIGUOUS_CANDIDATES);
+            assertThat(settings.getConfidenceTemperature())
+                .as("the honest default is no correction, because none has been measured")
+                .isEqualTo(GraphConfig.DEFAULT_CONFIDENCE_TEMPERATURE);
             assertThat(settings.getRamBufferMb()).isEqualTo(GraphConfig.DEFAULT_RAM_BUFFER_MB);
         }
 
@@ -71,6 +74,7 @@ class ConfigGraphTest {
                 "excalibur.graph.min-separation", "0.1",
                 "excalibur.graph.min-mean-confidence", "0.75",
                 "excalibur.graph.max-ambiguous-candidates", "3",
+                "excalibur.graph.confidence-temperature", "2.5",
                 "excalibur.graph.ram-buffer-mb", "64"));
 
             assertThat(settings.getPath()).isEqualTo("/srv/graph");
@@ -80,6 +84,7 @@ class ConfigGraphTest {
             assertThat(settings.getMinSeparation()).isEqualTo(0.1);
             assertThat(settings.getMinMeanConfidence()).isEqualTo(0.75);
             assertThat(settings.getMaxAmbiguousCandidates()).isEqualTo(3);
+            assertThat(settings.getConfidenceTemperature()).isEqualTo(2.5);
             assertThat(settings.getRamBufferMb()).isEqualTo(64.0);
         }
 
@@ -134,6 +139,25 @@ class ConfigGraphTest {
             assertThatThrownBy(() -> graph(Map.of("excalibur.graph.min-mean-confidence", "-1")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("min-mean-confidence");
+        }
+
+        @Test
+        @DisplayName("a temperature outside the range a fit can produce is refused")
+        void temperatureOutOfRange() {
+            assertThatThrownBy(
+                () -> graph(Map.of("excalibur.graph.confidence-temperature", "0")))
+                .as("dividing log-odds by zero is not a cautious node, it is a broken one")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("confidence-temperature");
+            assertThatThrownBy(
+                () -> graph(Map.of("excalibur.graph.confidence-temperature", "-1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("confidence-temperature");
+            assertThatThrownBy(
+                () -> graph(Map.of("excalibur.graph.confidence-temperature", "100")))
+                .as("no fit can produce this, so it is a typo rather than a decision")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("confidence-temperature");
         }
 
         @Test

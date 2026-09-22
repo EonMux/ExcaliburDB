@@ -247,6 +247,7 @@ class ConfigSectionEqualityTest {
             v("minSeparation", "excalibur.graph.min-separation", "0.25"),
             v("minMeanConfidence", "excalibur.graph.min-mean-confidence", "0.6"),
             v("maxAmbiguousCandidates", "excalibur.graph.max-ambiguous-candidates", "7"),
+            v("confidenceTemperature", "excalibur.graph.confidence-temperature", "2.5"),
             v("contextTokenBudget", "excalibur.graph.context-token-budget", "4000"),
             v("topK", "excalibur.graph.top-k", "25"),
             v("rerankOverFetch", "excalibur.graph.rerank-over-fetch", "8"),

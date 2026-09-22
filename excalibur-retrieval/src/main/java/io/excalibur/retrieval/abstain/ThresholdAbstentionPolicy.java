@@ -55,8 +55,12 @@ public final class ThresholdAbstentionPolicy implements AbstentionPolicy {
      * and biased sample. A system that reports 1.0 is claiming the answer cannot be wrong, and
      * downstream code that sees 1.0 will reasonably stop hedging — so the value has to be
      * unreachable rather than merely unusual.
+     *
+     * <p>Public because it is the ceiling on a reported confidence rather than on this policy's
+     * arithmetic, and {@link ConfidenceCalibration#apply} has to respect the same bound. A second
+     * copy of the number over there would be free to drift away from the reasoning above.
      */
-    private static final double MAX_REPORTED_CONFIDENCE = 0.99;
+    public static final double MAX_REPORTED_CONFIDENCE = 0.99;
 
     private final double minScore;
     private final double minSeparation;

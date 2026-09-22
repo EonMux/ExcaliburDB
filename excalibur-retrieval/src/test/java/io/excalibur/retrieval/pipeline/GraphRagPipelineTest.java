@@ -30,6 +30,7 @@ import io.excalibur.retrieval.serialize.TripleSubgraphSerializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -120,7 +121,19 @@ class GraphRagPipelineTest {
         return pipeline(new ThresholdAbstentionPolicy(0.005, 0.001, 0.3, 5));
     }
 
+    /** The same pipeline, able to resolve the relation words a question uses. */
+    private GraphRagPipeline pipelineWithRelations() {
+        Map<Integer, String> names = new java.util.LinkedHashMap<>();
+        RELATION_NAMES.forEach((id, name) -> names.put(Math.toIntExact(id), name));
+        return pipeline(new ThresholdAbstentionPolicy(0.005, 0.001, 0.3, 5),
+            RelationResolver.over(names));
+    }
+
     private GraphRagPipeline pipeline(AbstentionPolicy abstention) {
+        return pipeline(abstention, null);
+    }
+
+    private GraphRagPipeline pipeline(AbstentionPolicy abstention, RelationResolver relations) {
         EntityLinker linker = mention -> LABELS.entrySet().stream()
             .filter(entry -> entry.getValue().equalsIgnoreCase(mention)
                 || entry.getValue().toLowerCase().contains(mention.toLowerCase()))
@@ -137,7 +150,9 @@ class GraphRagPipelineTest {
                 relation -> RELATION_NAMES.getOrDefault(relation, "R" + relation)),
             abstention,
             new SerializationBudget(2000, BpeTokenCounter.defaultCounter()),
-            10);
+            10,
+            null,
+            relations);
     }
 
     @Test
@@ -330,5 +345,135 @@ class GraphRagPipelineTest {
 
         assertThat(trace.nanosIn(Stage.PLAN)).isPositive();
         assertThat(trace.elapsedNanos()).isPositive();
+    }
+
+    @Test
+    @DisplayName("answering judges exactly the evidence gathering returns")
+    void answerJudgesWhatGatherReturns() {
+        // The whole claim of the gather seam is that a harness fitting thresholds against it is
+        // fitting the retrieval a served query gets. That holds only while answer() is written in
+        // terms of gather() rather than beside it, so it is asserted rather than assumed.
+        ThresholdAbstentionPolicy policy = new ThresholdAbstentionPolicy(0.005, 0.001, 0.3, 5);
+        GraphRagPipeline pipeline = pipeline(policy);
+        String question = "Who did Ada Lovelace collaborate with?";
+
+        Evidence evidence = pipeline.gather(
+            question, new ConversationContext(), null, new QueryTrace());
+
+        assertThat(evidence).isInstanceOf(Evidence.Gathered.class);
+        Evidence.Gathered gathered = (Evidence.Gathered) evidence;
+
+        RetrievalOutcome directly = policy.decide(gathered.fused(), gathered.subgraph());
+        GraphRagResult served = pipeline.answer(question);
+
+        assertThat(served.hasAnswer())
+            .isEqualTo(directly instanceof RetrievalOutcome.Results);
+        assertThat(served.confidence())
+            .isEqualTo(((RetrievalOutcome.Results) directly).confidence());
+    }
+
+    @Test
+    @DisplayName("gathering reports a question that never reached retrieval, rather than refusing")
+    void gatherDistinguishesUnresolvedFromRefused() {
+        // A refusal is abstention's; an unresolvable mention is not, and no threshold changes it.
+        // A fit that could not tell them apart would gate against a gap in the graph.
+        Evidence evidence = pipeline().gather(
+            "Who did Zxqv Nonexistent collaborate with?", new ConversationContext(), null,
+            new QueryTrace());
+
+        assertThat(evidence).isInstanceOf(Evidence.Unresolved.class);
+        assertThat(pipeline().answer("Who did Zxqv Nonexistent collaborate with?").declined())
+            .as("serving still turns it into a refusal; only the seam keeps them apart")
+            .isPresent();
+    }
+
+    @Test
+    @DisplayName("a question asked from the other end of an edge is answered too")
+    void reverseDirectionQuestionIsAnswered() {
+        // The store holds Ada --collaboratedWith--> Babbage. Asked from Babbage's side it is the
+        // same fact, and a traversal that followed only the direction it was asserted in would
+        // refuse this while holding the answer.
+        GraphRagResult forward = pipeline().answer("Who did Ada Lovelace collaborate with?");
+        GraphRagResult reverse = pipeline().answer("Who did Charles Babbage collaborate with?");
+
+        assertThat(forward.hasAnswer()).isTrue();
+        assertThat(reverse.hasAnswer())
+            .as("the fact is in the store; which end it was written from is not the asker's problem")
+            .isTrue();
+        assertThat(reverse.contextText()).contains("Ada Lovelace");
+    }
+
+    @Nested
+    @DisplayName("relation hints")
+    class RelationHints {
+
+        @Test
+        @DisplayName("a hint the graph recognises narrows what the answer is built from")
+        void recognisedHintNarrowsTheTraversal() {
+            // Ada has four edges: collaboratedWith, authored and two livedIn. The question names
+            // only one of those relations, so only it should reach the model.
+            GraphRagResult result =
+                pipelineWithRelations().answer("Who collaborated with Ada Lovelace?");
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.contextText())
+                .contains("collaboratedWith")
+                .contains("Charles Babbage");
+            assertThat(result.contextText())
+                .as("a traversal narrowed to one relation must not describe the others")
+                .doesNotContain("authored")
+                .doesNotContain("livedIn");
+        }
+
+        @Test
+        @DisplayName("the same question without a resolver still sees every relation")
+        void withoutAResolverNothingIsNarrowed() {
+            GraphRagResult result = pipeline().answer("Who collaborated with Ada Lovelace?");
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.contextText()).contains("authored");
+        }
+
+        @Test
+        @DisplayName("a hint that resolves to the wrong relation costs nothing")
+        void wrongHintFallsBackRatherThanRefusing() {
+            // Note G is authored, never collaborated on. The hint resolves - to a relation this
+            // entity has no edge on - so a hard whitelist would answer "nothing found" while
+            // holding the fact.
+            GraphRagResult result =
+                pipelineWithRelations().answer("Who collaborated with Note G?");
+
+            assertThat(result.hasAnswer())
+                .as("a hint may sharpen an answer; it may not remove one")
+                .isTrue();
+            assertThat(result.contextText())
+                .contains("authored")
+                .contains("Ada Lovelace");
+        }
+
+        @Test
+        @DisplayName("a hint matching no relation leaves the traversal unfiltered")
+        void unresolvableHintIsIgnored() {
+            // "who did" is a phrasing cue, not a relation. It must not become a whitelist of
+            // nothing, which asks the store for nothing and answers every such question with
+            // silence.
+            GraphRagResult result =
+                pipelineWithRelations().answer("Who did Ada Lovelace collaborate with?");
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.contextText()).contains("Charles Babbage");
+        }
+
+        @Test
+        @DisplayName("a narrowed traversal still follows the relation both ways")
+        void narrowingKeepsBothDirections() {
+            // Asked from Babbage's end. The edge is Ada -> Babbage, and narrowing to the named
+            // relation must not reintroduce, per relation, the asymmetry the store no longer has.
+            GraphRagResult result =
+                pipelineWithRelations().answer("Who collaborated with Charles Babbage?");
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.contextText()).contains("Ada Lovelace");
+        }
     }
 }

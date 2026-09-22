@@ -79,8 +79,12 @@ final class ReferenceEdgeStore implements EdgeStore {
                 continue;
             }
             if (selectors == null) {
+                // Every relation, both directions: the contract on EdgeStore.
                 if (edge.subject() == entity) {
                     sink.add((long) edge.object());
+                }
+                if (edge.object() == entity) {
+                    sink.add((long) edge.subject());
                 }
                 continue;
             }

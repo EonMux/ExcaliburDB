@@ -184,4 +184,122 @@ class GraphRagFactoryTest {
             assertThat(result.declined()).isPresent();
         }
     }
+
+    @Test
+    @DisplayName("a configured confidence temperature reaches the answer a client is given")
+    void confidenceTemperatureIsApplied(@TempDir Path dataDir) throws Exception {
+        buildGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+
+        String question = "Who did Ada Lovelace collaborate with?";
+
+        double uncalibrated;
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+            GraphRagResult result = graph.pipeline().answer(question);
+            assertThat(result.hasAnswer()).isTrue();
+            uncalibrated = result.confidence();
+        }
+
+        Config softened =
+            config(Map.of("excalibur.graph.confidence-temperature", "8.0"));
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(softened, dataDir)) {
+            GraphRagResult result = graph.pipeline().answer(question);
+
+            assertThat(result.hasAnswer())
+                .as("scaling changes how strongly an answer is claimed, never whether one is given")
+                .isTrue();
+            assertThat(result.confidence())
+                .as("a temperature above one pulls the claim towards the midpoint")
+                .isLessThan(uncalibrated)
+                .isGreaterThan(0.5);
+        }
+    }
+
+    @Test
+    @DisplayName("the neutral temperature leaves the reported confidence exactly as it was")
+    void neutralTemperatureChangesNothing(@TempDir Path dataDir) throws Exception {
+        buildGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+
+        String question = "Who did Ada Lovelace collaborate with?";
+
+        double byDefault;
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+            byDefault = graph.pipeline().answer(question).confidence();
+        }
+
+        Config neutral = config(Map.of("excalibur.graph.confidence-temperature", "1.0"));
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(neutral, dataDir)) {
+            assertThat(graph.pipeline().answer(question).confidence())
+                .as("a node that has not calibrated its confidences must not report that it has")
+                .isEqualTo(byDefault);
+        }
+    }
+
+    private static final int NOTE_G = 3;
+    private static final int AUTHORED = 1;
+
+    /** The same graph, plus a second relation, so narrowing has something to narrow away. */
+    private static void buildTwoRelationGraph(Path directory) throws IOException {
+        EdgeStoreWriter edges = new EdgeStoreWriter();
+        edges.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN,
+            new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7));
+        edges.add(ADA, AUTHORED, NOTE_G, Integer.MIN_VALUE, TemporalFilter.OPEN,
+            new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7));
+        edges.build(directory, 8);
+
+        try (LexicalIndex documents = LexicalIndex.open(
+                directory.resolve(GraphRagFactory.DOCUMENT_INDEX), 16.0)) {
+            documents.put(ADA, "Ada Lovelace mathematician");
+            documents.put(BABBAGE, "Charles Babbage engineer");
+            documents.put(NOTE_G, "Note G the first published algorithm");
+            documents.refresh();
+        }
+        try (LexicalIndex labels = LexicalIndex.open(
+                directory.resolve(GraphRagFactory.LABEL_INDEX), 16.0)) {
+            LexicalEntityLinker.index(labels, ADA, "Ada Lovelace");
+            LexicalEntityLinker.index(labels, BABBAGE, "Charles Babbage");
+            LexicalEntityLinker.index(labels, NOTE_G, "Note G");
+            labels.refresh();
+        }
+
+        new LabelDictionaryWriter()
+            .put(ADA, "Ada Lovelace")
+            .put(BABBAGE, "Charles Babbage")
+            .put(NOTE_G, "Note G")
+            .write(directory, GraphRagFactory.ENTITY_DICTIONARY);
+        new LabelDictionaryWriter()
+            .put(COLLABORATED_WITH, "collaboratedWith")
+            .put(AUTHORED, "authored")
+            .write(directory, GraphRagFactory.RELATION_DICTIONARY);
+    }
+
+    @Test
+    @DisplayName("the relation dictionary on disk is what narrows a traversal")
+    void relationHintsAreWiredFromTheDictionary(@TempDir Path dataDir) throws Exception {
+        buildTwoRelationGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+            GraphRagResult narrowed =
+                graph.pipeline().answer("Who collaborated with Ada Lovelace?");
+
+            assertThat(narrowed.hasAnswer()).isTrue();
+            assertThat(narrowed.contextText()).contains("Charles Babbage");
+            assertThat(narrowed.contextText())
+                .as("the hint resolved against the names in the dictionary this node opened")
+                .doesNotContain("authored");
+        }
+    }
+
+    @Test
+    @DisplayName("a hint the graph cannot honour does not cost the answer")
+    void unhonourableHintStillAnswers(@TempDir Path dataDir) throws Exception {
+        buildTwoRelationGraph(dataDir.resolve(GraphRagFactory.DEFAULT_DIRECTORY));
+
+        try (GraphRagFactory.GraphRag graph = GraphRagFactory.open(config(Map.of()), dataDir)) {
+            // Note G was authored, never collaborated on.
+            GraphRagResult result = graph.pipeline().answer("Who collaborated with Note G?");
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.contextText()).contains("authored").contains("Ada Lovelace");
+        }
+    }
 }

@@ -16,10 +16,14 @@ import io.excalibur.retrieval.rerank.FullPrecisionReranker;
 import io.excalibur.vector.distance.DistanceFunctions;
 import excalibur.llm.embedding.EmbeddingClient;
 import io.excalibur.retrieval.HybridRetriever;
+import io.excalibur.retrieval.abstain.AbstentionPolicy;
+import io.excalibur.retrieval.abstain.CalibratedAbstentionPolicy;
 import io.excalibur.retrieval.abstain.ThresholdAbstentionPolicy;
 import io.excalibur.retrieval.lexical.LexicalIndex;
 import io.excalibur.retrieval.lexical.LuceneRanker;
+import io.excalibur.retrieval.pipeline.EntityLinker;
 import io.excalibur.retrieval.pipeline.GraphRagPipeline;
+import io.excalibur.retrieval.pipeline.RelationResolver;
 import io.excalibur.retrieval.pipeline.LexicalEntityLinker;
 import io.excalibur.retrieval.serialize.BpeTokenCounter;
 import io.excalibur.retrieval.serialize.SerializationBudget;
@@ -35,6 +39,8 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.Objects;
 
 /**
@@ -79,14 +85,21 @@ public final class GraphRagFactory {
      * The opened stack, and the handles that have to be closed with it.
      *
      * @param pipeline    The pipeline to serve requests from
+     * @param linker      The entity linker the pipeline resolves mentions with. Exposed because a
+     *                    caller holding a name rather than an id - an evaluation harness reading
+     *                    judged answers, for one - has to cross the same text-to-id boundary the
+     *                    pipeline does, and doing it against a second index opened separately
+     *                    would let the ground truth resolve differently from the questions
      * @param closeables  Everything opened, in the order it should be closed
      * @param directory   Where it was read from
      */
-    public record GraphRag(GraphRagPipeline pipeline, List<AutoCloseable> closeables,
-                           Path directory) implements AutoCloseable {
+    public record GraphRag(GraphRagPipeline pipeline, EntityLinker linker,
+                           List<AutoCloseable> closeables, Path directory)
+            implements AutoCloseable {
 
         public GraphRag {
             Objects.requireNonNull(pipeline, "pipeline cannot be null");
+            Objects.requireNonNull(linker, "linker cannot be null");
             closeables = List.copyOf(closeables);
         }
 
@@ -179,28 +192,26 @@ public final class GraphRagFactory {
                 opened.push(entityVectors);
             }
 
+            LexicalEntityLinker linker = new LexicalEntityLinker(labels);
             GraphRagPipeline pipeline = new GraphRagPipeline(
                 new QueryClassifier(),
-                new LexicalEntityLinker(labels),
+                linker,
                 edges,
                 new HybridRetriever(List.of(rankerFor(config, documents, entityVectors)),
                     new io.excalibur.retrieval.fusion.ReciprocalRankFusion(
                         config.query().getRrfK()),
                     config.query().getPerSignalOverFetch()),
                 new TripleSubgraphSerializer(entityNames, relationNames),
-                new ThresholdAbstentionPolicy(
-                    settings.getMinScore(),
-                    settings.getMinSeparation(),
-                    settings.getMinMeanConfidence(),
-                    settings.getMaxAmbiguousCandidates()),
+                abstentionFor(settings),
                 new SerializationBudget(
                     settings.getContextTokenBudget(), BpeTokenCounter.defaultCounter()),
                 settings.getTopK(),
-                embedderFor(config, entityVectors));
+                embedderFor(config, entityVectors),
+                relationResolverFor(relationNames));
 
             LOGGER.info("Graph-RAG pipeline opened from {}: {} entity names, {} relation names",
                 directory, entityNames.size(), relationNames.size());
-            return new GraphRag(pipeline, new ArrayList<>(opened), directory);
+            return new GraphRag(pipeline, linker, new ArrayList<>(opened), directory);
         } catch (IOException | RuntimeException e) {
             // Everything opened so far, released in reverse order. Leaving mappings behind on a
             // failed start is how a node that refuses to serve also refuses to shut down cleanly.
@@ -316,5 +327,50 @@ public final class GraphRagFactory {
         Objects.requireNonNull(dataDir, "dataDir cannot be null");
         String configured = config.graph().getPath();
         return configured != null && !configured.isBlank() ? Path.of(configured) : dataDir;
+    }
+
+
+    /**
+     * A resolver over the relation names this graph holds.
+     *
+     * <p>Read once at open, into a map. The dictionary is a memory-mapped file addressed by id and
+     * the question here is the other way round - a name, wanting ids - so every query would
+     * otherwise scan the whole thing. Relation vocabularies are small, in the thousands at worst,
+     * which is what makes reading them into a map at open the right trade rather than a second
+     * index on disk.
+     */
+    private static RelationResolver relationResolverFor(LabelDictionary relationNames) {
+        Map<Integer, String> names = new LinkedHashMap<>(relationNames.size());
+        relationNames.forEach((id, name) -> names.put((int) id, name));
+        return RelationResolver.over(names);
+    }
+
+    /**
+     * The abstention policy a configured node runs, thresholds first and calibration over them.
+     *
+     * <p>The two are separate keys because they are separately measured. The three
+     * {@code excalibur.graph.min-*} thresholds decide which queries get answered and are fitted by
+     * {@code AbstentionCalibrator.calibrate}; {@code excalibur.graph.confidence-temperature}
+     * decides how strongly an answer is claimed and is fitted by
+     * {@code AbstentionCalibrator.fitTemperature}. A deployment can have measured either, both or
+     * neither.
+     *
+     * <p>A neutral temperature returns the bare policy rather than a decorator that would divide
+     * every log-odds by one. Not an optimisation - it keeps a node that has not calibrated its
+     * confidences from reporting, in a log line or a {@code toString}, that it has.
+     */
+    private static AbstentionPolicy abstentionFor(GraphConfig settings) {
+        ThresholdAbstentionPolicy thresholds = new ThresholdAbstentionPolicy(
+            settings.getMinScore(),
+            settings.getMinSeparation(),
+            settings.getMinMeanConfidence(),
+            settings.getMaxAmbiguousCandidates());
+
+        double temperature = settings.getConfidenceTemperature();
+        if (temperature == CalibratedAbstentionPolicy.NEUTRAL_TEMPERATURE) {
+            return thresholds;
+        }
+        LOGGER.info("Reported confidences scaled by a fitted temperature of {}", temperature);
+        return new CalibratedAbstentionPolicy(thresholds, temperature);
     }
 }

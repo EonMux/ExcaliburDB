@@ -215,11 +215,11 @@ class AbstentionTest {
             // Correct answers score high, wrong ones score low. A threshold just above the wrong
             // ones reaches perfect precision; anything higher only gives away coverage.
             List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
-                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, true),
-                new AbstentionCalibrator.LabelledOutcome(0.09, 0.5, 0.9, true),
-                new AbstentionCalibrator.LabelledOutcome(0.08, 0.5, 0.9, true),
-                new AbstentionCalibrator.LabelledOutcome(0.02, 0.5, 0.9, false),
-                new AbstentionCalibrator.LabelledOutcome(0.01, 0.5, 0.9, false));
+                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, true, true),
+                new AbstentionCalibrator.LabelledOutcome(0.09, 0.5, 0.9, true, true),
+                new AbstentionCalibrator.LabelledOutcome(0.08, 0.5, 0.9, true, true),
+                new AbstentionCalibrator.LabelledOutcome(0.02, 0.5, 0.9, true, false),
+                new AbstentionCalibrator.LabelledOutcome(0.01, 0.5, 0.9, true, false));
 
             AbstentionCalibrator.Calibration fitted =
                 AbstentionCalibrator.calibrate(samples, 1.0);
@@ -237,11 +237,11 @@ class AbstentionTest {
         @DisplayName("a lower target precision buys more coverage")
         void lowerTargetGivesMoreCoverage() {
             List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
-                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, true),
-                new AbstentionCalibrator.LabelledOutcome(0.08, 0.5, 0.9, true),
-                new AbstentionCalibrator.LabelledOutcome(0.06, 0.5, 0.9, true),
-                new AbstentionCalibrator.LabelledOutcome(0.04, 0.5, 0.9, false),
-                new AbstentionCalibrator.LabelledOutcome(0.02, 0.5, 0.9, true));
+                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, true, true),
+                new AbstentionCalibrator.LabelledOutcome(0.08, 0.5, 0.9, true, true),
+                new AbstentionCalibrator.LabelledOutcome(0.06, 0.5, 0.9, true, true),
+                new AbstentionCalibrator.LabelledOutcome(0.04, 0.5, 0.9, true, false),
+                new AbstentionCalibrator.LabelledOutcome(0.02, 0.5, 0.9, true, true));
 
             AbstentionCalibrator.Calibration strict =
                 AbstentionCalibrator.calibrate(samples, 1.0);
@@ -257,10 +257,10 @@ class AbstentionTest {
         void unreachableTargetIsReported() {
             // Every score band contains a wrong answer, so no threshold reaches 99% precision.
             List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
-                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, false),
-                new AbstentionCalibrator.LabelledOutcome(0.08, 0.5, 0.9, true),
-                new AbstentionCalibrator.LabelledOutcome(0.06, 0.5, 0.9, false),
-                new AbstentionCalibrator.LabelledOutcome(0.04, 0.5, 0.9, true));
+                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, true, false),
+                new AbstentionCalibrator.LabelledOutcome(0.08, 0.5, 0.9, true, true),
+                new AbstentionCalibrator.LabelledOutcome(0.06, 0.5, 0.9, true, false),
+                new AbstentionCalibrator.LabelledOutcome(0.04, 0.5, 0.9, true, true));
 
             AbstentionCalibrator.Calibration fitted =
                 AbstentionCalibrator.calibrate(samples, 0.99);
@@ -275,7 +275,7 @@ class AbstentionTest {
         @DisplayName("a threshold that answers nothing is not counted as perfect precision")
         void emptyAnsweredSetIsNotPerfect() {
             List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
-                new AbstentionCalibrator.LabelledOutcome(0.05, 0.5, 0.9, false));
+                new AbstentionCalibrator.LabelledOutcome(0.05, 0.5, 0.9, true, false));
 
             AbstentionCalibrator.Calibration fitted =
                 AbstentionCalibrator.calibrate(samples, 1.0);
@@ -320,15 +320,247 @@ class AbstentionTest {
         @DisplayName("a fitted calibration becomes a usable policy")
         void calibrationBecomesPolicy() {
             List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
-                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, true),
-                new AbstentionCalibrator.LabelledOutcome(0.01, 0.5, 0.9, false));
+                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, true, true),
+                new AbstentionCalibrator.LabelledOutcome(0.01, 0.5, 0.9, true, false));
 
-            ThresholdAbstentionPolicy policy = AbstentionCalibrator.toPolicy(
-                AbstentionCalibrator.calibrate(samples, 1.0), 0.1, 0.5);
+            ThresholdAbstentionPolicy policy =
+                AbstentionCalibrator.toPolicy(AbstentionCalibrator.calibrate(samples, 1.0));
 
             assertThat(policy.minScore()).isEqualTo(0.10);
             assertThat(policy.decide(List.of(doc(1, 0.005, 1)), Subgraph.empty()))
                 .isInstanceOf(RetrievalOutcome.NoResults.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("joint calibration")
+    class Joint {
+
+        private static AbstentionCalibrator.LabelledOutcome sample(double top, double second,
+                                                                   double confidence,
+                                                                   boolean correct) {
+            return AbstentionCalibrator.observe(
+                List.of(doc(1, top, 1), doc(2, second, 1)),
+                subgraphWith(SourceType.KNOWLEDGE_BASE, (int) Math.round(confidence * 100), 2),
+                correct);
+        }
+
+        @Test
+        @DisplayName("a separation gate is fitted when separation is what separates right "
+            + "from wrong")
+        void separationIsFitted() {
+            // Score says nothing: every query scores the same. Separation says everything.
+            List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
+                sample(0.10, 0.02, 0.9, true),
+                sample(0.10, 0.02, 0.9, true),
+                sample(0.10, 0.09, 0.9, false),
+                sample(0.10, 0.09, 0.9, false));
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 1.0);
+
+            assertThat(fitted.metTarget()).isTrue();
+            assertThat(fitted.minSeparation())
+                .as("the only gate that can reach the target is the one the old fit never set")
+                .isGreaterThan(0.1);
+            assertThat(fitted.coverage()).isEqualTo(0.5);
+            assertThat(fitted.ambiguous()).isEqualTo(2);
+            assertThat(fitted.refused()).isZero();
+        }
+
+        @Test
+        @DisplayName("a provenance gate is fitted when the evidence is what separates them")
+        void provenanceIsFitted() {
+            List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
+                sample(0.10, 0.01, 0.95, true),
+                sample(0.10, 0.01, 0.95, true),
+                sample(0.10, 0.01, 0.40, false),
+                sample(0.10, 0.01, 0.40, false));
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 1.0);
+
+            assertThat(fitted.metTarget()).isTrue();
+            assertThat(fitted.minMeanConfidence()).isGreaterThan(0.40);
+            assertThat(fitted.coverage()).isEqualTo(0.5);
+            assertThat(fitted.refused())
+                .as("a weak-evidence query is declined, not handed back as ambiguous")
+                .isEqualTo(2);
+            assertThat(fitted.ambiguous()).isZero();
+        }
+
+        @Test
+        @DisplayName("a gate the sample gives no reason to raise stays at zero")
+        void unneededGatesStayDown() {
+            // Only the score gate can exclude the wrong answer: it separates more sharply than
+            // the two right ones and rests on evidence just as strong, so neither other gate can
+            // remove it without removing them too.
+            List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
+                sample(0.20, 0.01, 0.9, true),
+                sample(0.20, 0.01, 0.9, true),
+                sample(0.01, 0.0001, 0.9, false));
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 1.0);
+
+            assertThat(fitted.metTarget()).isTrue();
+            assertThat(fitted.minScore()).isEqualTo(0.20);
+            assertThat(fitted.minSeparation())
+                .as("gating on a dimension that bought nothing costs coverage on the next corpus")
+                .isZero();
+            assertThat(fitted.minMeanConfidence()).isZero();
+        }
+
+        @Test
+        @DisplayName("of two fits that answer the same queries, the one handing back ambiguities "
+            + "wins")
+        void ambiguityIsPreferredOverRefusal() {
+            // The weak query can be excluded by the score gate, which refuses it, or by the
+            // separation gate, which hands it back with its competing readings. Both answer the
+            // same two queries.
+            List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
+                sample(0.20, 0.01, 0.9, true),
+                sample(0.20, 0.01, 0.9, true),
+                sample(0.01, 0.005, 0.9, false));
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 1.0);
+
+            assertThat(fitted.metTarget()).isTrue();
+            assertThat(fitted.coverage()).isCloseTo(2 / 3.0, org.assertj.core.data.Offset.offset(1e-9));
+            assertThat(fitted.ambiguous())
+                .as("a caller can resolve an ambiguity by asking; a refusal ends the exchange")
+                .isEqualTo(1);
+            assertThat(fitted.refused()).isZero();
+            assertThat(fitted.minSeparation()).isGreaterThan(0.5);
+        }
+
+        @Test
+        @DisplayName("the provenance gate is not applied to a query that had no evidence")
+        void noEvidenceSkipsTheProvenanceGate() {
+            AbstentionCalibrator.LabelledOutcome withoutEvidence = AbstentionCalibrator.observe(
+                List.of(doc(1, 0.10, 1), doc(2, 0.01, 1)), Subgraph.empty(), true);
+
+            assertThat(withoutEvidence.hasEvidence()).isFalse();
+
+            List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
+                withoutEvidence,
+                sample(0.10, 0.01, 0.95, true),
+                sample(0.02, 0.01, 0.20, false));
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 1.0);
+
+            assertThat(fitted.metTarget()).isTrue();
+            assertThat(fitted.answered())
+                .as("the policy skips the provenance check on an empty subgraph, so a fit that "
+                    + "applied it would be fitting a check that never runs")
+                .isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("the counts reported are the counts the fitted policy produces")
+        void fitMatchesThePolicyItDescribes() {
+            record Query(double top, double second, int confidence, boolean correct) { }
+
+            List<Query> queries = new ArrayList<>();
+            for (int i = 0; i < 40; i++) {
+                double top = 0.02 + i * 0.004;
+                double second = top * (i % 5 == 0 ? 0.98 : 0.30);
+                int confidence = 30 + (i % 7) * 10;
+                queries.add(new Query(top, second, confidence, i % 3 != 0));
+            }
+
+            List<AbstentionCalibrator.LabelledOutcome> samples = new ArrayList<>();
+            for (Query query : queries) {
+                samples.add(AbstentionCalibrator.observe(
+                    List.of(doc(1, query.top(), 1), doc(2, query.second(), 1)),
+                    subgraphWith(SourceType.KNOWLEDGE_BASE, query.confidence(), 2),
+                    query.correct()));
+            }
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 0.85);
+            ThresholdAbstentionPolicy policy = AbstentionCalibrator.toPolicy(fitted);
+
+            int answered = 0;
+            int ambiguous = 0;
+            int refused = 0;
+            int correct = 0;
+            for (Query query : queries) {
+                RetrievalOutcome outcome = policy.decide(
+                    List.of(doc(1, query.top(), 1), doc(2, query.second(), 1)),
+                    subgraphWith(SourceType.KNOWLEDGE_BASE, query.confidence(), 2));
+                if (outcome instanceof RetrievalOutcome.Results) {
+                    answered++;
+                    if (query.correct()) {
+                        correct++;
+                    }
+                } else if (outcome instanceof RetrievalOutcome.Ambiguous) {
+                    ambiguous++;
+                } else {
+                    refused++;
+                }
+            }
+
+            assertThat(answered)
+                .as("a fit that simulates the policy differently from how the policy runs is "
+                    + "fitting something else")
+                .isEqualTo(fitted.answered());
+            assertThat(ambiguous).isEqualTo(fitted.ambiguous());
+            assertThat(refused).isEqualTo(fitted.refused());
+            assertThat(correct / (double) answered).isCloseTo(fitted.precision(), org.assertj.core.data.Offset.offset(1e-9));
+            assertThat(fitted.precision()).isGreaterThanOrEqualTo(0.85);
+        }
+
+        @Test
+        @DisplayName("every query is answered, handed back, or declined - never lost")
+        void everyQueryIsAccountedFor() {
+            List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
+                sample(0.20, 0.19, 0.9, false),
+                sample(0.20, 0.01, 0.9, true),
+                sample(0.01, 0.005, 0.2, false));
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 1.0);
+
+            assertThat(fitted.answered() + fitted.ambiguous() + fitted.refused())
+                .isEqualTo(fitted.sampleSize());
+            assertThat(fitted.coverage())
+                .isCloseTo(fitted.answered() / (double) fitted.sampleSize(), org.assertj.core.data.Offset.offset(1e-9));
+        }
+
+        @Test
+        @DisplayName("a sample with more distinct values than the grid still fits")
+        void largeSampleIsThinnedNotRefused() {
+            List<AbstentionCalibrator.LabelledOutcome> samples = new ArrayList<>();
+            for (int i = 0; i < 300; i++) {
+                double top = 0.001 + i * 0.001;
+                samples.add(sample(top, top * (0.05 + i * 0.003), 0.3 + i * 0.002, i >= 150));
+            }
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 0.95);
+
+            assertThat(fitted.sampleSize()).isEqualTo(300);
+            assertThat(fitted.precision()).isGreaterThanOrEqualTo(0.95);
+            assertThat(fitted.coverage()).isGreaterThan(0.0);
+        }
+
+        @Test
+        @DisplayName("an unreachable target is still reported as unreachable across all three")
+        void unreachableAcrossAllGates() {
+            // Every combination of gates leaves a wrong answer in the answered set.
+            List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
+                sample(0.20, 0.01, 0.9, false),
+                sample(0.10, 0.01, 0.9, true),
+                sample(0.05, 0.01, 0.9, false));
+
+            AbstentionCalibrator.Calibration fitted =
+                AbstentionCalibrator.calibrate(samples, 1.0);
+
+            assertThat(fitted.metTarget()).isFalse();
+            assertThat(fitted.precision()).isLessThan(1.0);
         }
     }
 }

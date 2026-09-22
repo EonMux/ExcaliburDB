@@ -55,6 +55,7 @@ public final class ConfigKeys {
         "excalibur.graph.max-ambiguous-candidates",
         "excalibur.graph.max-open-namespaces",
         "excalibur.graph.min-mean-confidence",
+        "excalibur.graph.confidence-temperature",
         "excalibur.graph.min-score",
         "excalibur.graph.min-separation",
         "excalibur.graph.path",

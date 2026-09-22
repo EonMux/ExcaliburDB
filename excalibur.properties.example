@@ -143,10 +143,27 @@ excalibur.graph.rerank-over-fetch=4
 # Abstention thresholds. Below these the endpoint declines rather than answering from evidence
 # it does not trust -- an empty "answered" reads to a client as "nothing found", which is a
 # different statement from "found something and did not believe it".
+#
+# The three min-* values below are defaults, not measurements. AbstentionCalibrator.calibrate
+# fits all three together against queries whose answers were known and reports the precision and
+# coverage they buy; Calibration.minScore/minSeparation/minMeanConfidence are what to copy here.
+# Fitting them one at a time and combining the results gives a node stricter than any of the
+# three fits measured, because the gates overlap.
 excalibur.graph.min-score=0.005
 excalibur.graph.min-separation=0.001
 excalibur.graph.min-mean-confidence=0.3
 excalibur.graph.max-ambiguous-candidates=5
+# Divisor on the log-odds of the confidence an answer reports. 1.0 leaves it untouched, which is
+# the honest default: the number a node reports is built from a fused score by arithmetic, and
+# whether it can be read as a probability is a question only labelled outcomes can answer.
+# AbstentionCalibrator.fitTemperature answers it -- above 1.0 softens overconfident claims
+# towards 0.5, below 1.0 sharpens underconfident ones -- and reports the calibration error before
+# and after, so a value copied here is one that was measured to help. Accepted range is
+# (0.0, 20.0]; the fit reports a result that reached 20.0 as not well posed, so check
+# ConfidenceCalibration.wellPosed() before copying a number anywhere near it. Scaling changes
+# only how strongly an answer is claimed: it cannot reorder results or turn an answer into a
+# refusal, because the thresholds above are what decide that.
+excalibur.graph.confidence-temperature=1.0
 # Lucene RAM buffer per index. Named for the graph, but the ingestion pipeline's chunk index is
 # sized from it too when that runs on the lucene engine, so a node with no graph still pays it -
 # once per open index, not once per node.

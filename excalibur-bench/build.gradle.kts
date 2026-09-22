@@ -51,6 +51,13 @@ dependencies {
     // Phase 8 dependency for Ingestion (DocumentVisibilityChecker)
     implementation(project(":excalibur-ingest"))
     implementation(project(":excalibur-retrieval"))
+
+    // Graph-route calibration opens a real graph directory and fits abstention against it. It goes
+    // through GraphRagFactory rather than assembling a pipeline of its own: thresholds fitted to a
+    // pipeline wired differently from the served one are thresholds for a node nobody runs, and
+    // the wiring is exactly the kind of thing that drifts silently between two copies.
+    implementation(project(":excalibur-api"))
+    implementation(project(":excalibur-config"))
 }
 
 // Enable Panama FFM preview features
@@ -327,6 +334,23 @@ tasks.register<JavaExec>("runBenchmarksWithCapture") {
 //
 // Measures the engine a node ships with unless the last argument says otherwise:
 //   -PevalArgs="<corpusDir> <indexDir> <qrels> 10 - - both"   ('-' skips a positional)
+// Fits the graph route's abstention thresholds and confidence temperature against judged
+// questions, and prints the configuration lines a node needs. Deliberately not JMH, and
+// deliberately not a server route: the labels have to come from a query set whose answers are
+// known, and a running node cannot manufacture one for itself.
+//
+//   -PcalibrationArgs="<graphDir> <judgedFile> 0.9 excalibur.properties"
+tasks.register<JavaExec>("runGraphCalibration") {
+    group = "verification"
+    description = "Fits the graph route's abstention thresholds and confidence temperature against a judged question set"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("excalibur.bench.calibration.GraphCalibrationRunner")
+    jvmArgs = listOf("--enable-preview", "--enable-native-access=ALL-UNNAMED", "-Xmx4g")
+    if (project.hasProperty("calibrationArgs")) {
+        args = (project.property("calibrationArgs") as String).split(" ")
+    }
+}
+
 tasks.register<JavaExec>("runRetrievalEvaluation") {
     group = "verification"
     description = "Indexes a corpus on the native (or lucene, or both) engine and scores the retrieval strategies over it, with the index size beside the quality"

@@ -28,6 +28,27 @@ public final class GraphConfig {
     /** How many equally-plausible candidates are reported back rather than chosen between. */
     public static final int DEFAULT_MAX_AMBIGUOUS_CANDIDATES = 5;
 
+    /**
+     * Divisor applied to the log-odds of a reported confidence. One leaves it untouched.
+     *
+     * <p>One by default because the honest default is no correction. A temperature is measured,
+     * not guessed: {@code AbstentionCalibrator.fitTemperature} fits it against queries whose
+     * answers were known, and a number invented here would make every node's confidences wrong in
+     * a way no operator asked for. Above one softens overconfident claims towards 0.5, below one
+     * sharpens underconfident ones.
+     */
+    public static final double DEFAULT_CONFIDENCE_TEMPERATURE = 1.0;
+
+    /**
+     * Widest temperature a node will accept.
+     *
+     * <p>The fit is bounded at 20 and reports a value that reached the bound as not well posed, so
+     * a configured 20 is either a coincidence or a badly posed fit copied in without reading what
+     * it said. Beyond it the value is certainly a typo - a temperature of 100 reports 0.51 for an
+     * answer the policy was sure of, which looks like a broken node rather than a cautious one.
+     */
+    public static final double MAX_CONFIDENCE_TEMPERATURE = 20.0;
+
     /** Tokens of serialised subgraph an answer may carry. */
     public static final int DEFAULT_CONTEXT_TOKEN_BUDGET = 2000;
 
@@ -94,6 +115,7 @@ public final class GraphConfig {
     private final double minSeparation;
     private final double minMeanConfidence;
     private final int maxAmbiguousCandidates;
+    private final double confidenceTemperature;
     private final int contextTokenBudget;
     private final int topK;
     private final int rerankOverFetch;
@@ -167,6 +189,8 @@ public final class GraphConfig {
         this.maxAmbiguousCandidates = ConfigBounds.atLeast(
             props, "excalibur.graph.max-ambiguous-candidates",
             DEFAULT_MAX_AMBIGUOUS_CANDIDATES, 2);
+        this.confidenceTemperature = requireTemperature(PropertyParser.parseDouble(
+            props, "excalibur.graph.confidence-temperature", DEFAULT_CONFIDENCE_TEMPERATURE));
         this.contextTokenBudget = ConfigBounds.atLeast(
             props, "excalibur.graph.context-token-budget", DEFAULT_CONTEXT_TOKEN_BUDGET, 1);
         this.topK = ConfigBounds.atLeast(
@@ -195,6 +219,15 @@ public final class GraphConfig {
      * @return The value
      * @throws IllegalArgumentException if the value is outside [0.0, 1.0]
      */
+    private static double requireTemperature(double value) {
+        if (Double.isNaN(value) || value <= 0.0 || value > MAX_CONFIDENCE_TEMPERATURE) {
+            throw new IllegalArgumentException(
+                "excalibur.graph.confidence-temperature must be in (0.0, "
+                    + MAX_CONFIDENCE_TEMPERATURE + "], got: " + value);
+        }
+        return value;
+    }
+
     private static double requireInUnitRange(double value, String name) {
         if (value < 0.0 || value > 1.0) {
             throw new IllegalArgumentException(
@@ -226,6 +259,13 @@ public final class GraphConfig {
     /** @return how many candidates are reported back when the answer is ambiguous */
     public int getMaxAmbiguousCandidates() {
         return maxAmbiguousCandidates;
+    }
+
+    /**
+     * @return the divisor applied to the log-odds of a reported confidence; 1.0 leaves it alone
+     */
+    public double getConfidenceTemperature() {
+        return confidenceTemperature;
     }
 
     /** @return tokens of serialised subgraph an answer may carry */
@@ -338,6 +378,7 @@ public final class GraphConfig {
             + ", minScore=" + minScore
             + ", minSeparation=" + minSeparation
             + ", minMeanConfidence=" + minMeanConfidence
+            + ", confidenceTemperature=" + confidenceTemperature
             + ", maxAmbiguousCandidates=" + maxAmbiguousCandidates
             + ", contextTokenBudget=" + contextTokenBudget
             + ", topK=" + topK
@@ -356,6 +397,7 @@ public final class GraphConfig {
         return Double.compare(minScore, other.minScore) == 0
             && Double.compare(minSeparation, other.minSeparation) == 0
             && Double.compare(minMeanConfidence, other.minMeanConfidence) == 0
+            && Double.compare(confidenceTemperature, other.confidenceTemperature) == 0
             && maxAmbiguousCandidates == other.maxAmbiguousCandidates
             && contextTokenBudget == other.contextTokenBudget
             && topK == other.topK
@@ -376,6 +418,7 @@ public final class GraphConfig {
     @Override
     public int hashCode() {
         return Objects.hash(path, minScore, minSeparation, minMeanConfidence,
+            confidenceTemperature,
             maxAmbiguousCandidates, contextTokenBudget, topK, rerankOverFetch, ramBufferMb,
             extractionEnabled, extractorVersion, entityVectorsEnabled, maxOpenNamespaces,
             erasureTombstoneRatio, erasureMaxLatencySeconds, singleValuedRelations,

@@ -10,6 +10,7 @@ import io.excalibur.core.trace.Stage;
 import io.excalibur.graph.provenance.Provenance;
 import io.excalibur.graph.store.EdgeStore;
 import io.excalibur.graph.store.MappedEdgeStore;
+import io.excalibur.graph.store.RelationSelector;
 import io.excalibur.graph.subgraph.Subgraph;
 import io.excalibur.graph.subgraph.SubgraphEdge;
 import io.excalibur.graph.temporal.TemporalFilter;
@@ -68,6 +69,14 @@ public final class GraphRagPipeline {
      */
     private final QueryEmbedder embedder;
 
+    /**
+     * Turns the question's relation words into relation ids, when this node has the dictionary.
+     *
+     * <p>Optional. Null is a pipeline that traverses every relation, which is what this did before
+     * there was anything to consult.
+     */
+    private final RelationResolver relations;
+
     public GraphRagPipeline(QueryClassifier classifier, EntityLinker linker, EdgeStore edgeStore,
                             HybridRetriever retriever, SubgraphSerializer serializer,
                             AbstentionPolicy abstention, SerializationBudget budget, int topK) {
@@ -91,7 +100,30 @@ public final class GraphRagPipeline {
                             HybridRetriever retriever, SubgraphSerializer serializer,
                             AbstentionPolicy abstention, SerializationBudget budget, int topK,
                             QueryEmbedder embedder) {
+        this(classifier, linker, edgeStore, retriever, serializer, abstention, budget, topK,
+            embedder, null);
+    }
+
+    /**
+     * Creates a pipeline that can also narrow a traversal to the relations a question names.
+     *
+     * @param classifier Turns the question into a plan
+     * @param linker     Resolves mentions to entities
+     * @param edgeStore  The graph to traverse
+     * @param retriever  The retrieval signals and their fusion
+     * @param serializer Renders the subgraph into the model's context
+     * @param abstention Decides whether the evidence is worth answering from
+     * @param budget     How much context an answer may carry
+     * @param topK       How many documents each signal contributes
+     * @param embedder   Embeds the question, or null when this node has no embedding endpoint
+     * @param relations  Resolves the plan's relation hints, or null to traverse every relation
+     */
+    public GraphRagPipeline(QueryClassifier classifier, EntityLinker linker, EdgeStore edgeStore,
+                            HybridRetriever retriever, SubgraphSerializer serializer,
+                            AbstentionPolicy abstention, SerializationBudget budget, int topK,
+                            QueryEmbedder embedder, RelationResolver relations) {
         this.embedder = embedder;
+        this.relations = relations;
         if (classifier == null || linker == null || edgeStore == null || retriever == null
                 || serializer == null || abstention == null || budget == null) {
             throw new IllegalArgumentException("every pipeline component is required");
@@ -142,6 +174,35 @@ public final class GraphRagPipeline {
      */
     public GraphRagResult answer(String question, ConversationContext context,
                                  TemporalFilter asOf, QueryTrace trace) {
+        return switch (gather(question, context, asOf, trace)) {
+            case Evidence.NeedsUser needsUser -> GraphRagResult.askUser(needsUser.ask(), trace);
+            case Evidence.Unresolved unresolved -> GraphRagResult.declined(
+                RetrievalOutcome.NoResults.of(RetrievalOutcome.Reason.UNRESOLVED_REFERENCE),
+                unresolved.plan(), trace);
+            case Evidence.Gathered gathered -> judge(gathered, trace);
+        };
+    }
+
+    /**
+     * Runs the pipeline up to, but not including, the decision about whether to answer.
+     *
+     * <p>Everything {@link #answer} does before abstention, and the same code path: answer is
+     * written in terms of this rather than beside it, so a harness that fits thresholds against
+     * what this returns is fitting the retrieval a served query actually gets. Two
+     * implementations would be two pipelines, and the thresholds would be measured on the one
+     * nobody runs.
+     *
+     * <p>Public for that harness. Serving has no use for it - a served request wants an answer,
+     * and the stage that decides whether there is one is the stage this stops short of.
+     *
+     * @param question the user's question
+     * @param context  what has been mentioned so far, for coreference
+     * @param asOf     the valid-time instant to answer at, or null to use the question's own
+     * @param trace    receives per-stage latency
+     * @return the evidence, or the reason the question never reached retrieval
+     */
+    public Evidence gather(String question, ConversationContext context, TemporalFilter asOf,
+                           QueryTrace trace) {
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("question must not be blank");
         }
@@ -149,37 +210,39 @@ public final class GraphRagPipeline {
             throw new IllegalArgumentException("context and trace must not be null");
         }
 
-        PlanningOutcome planning = trace.time(Stage.PLAN, () -> classifier.classify(question, context));
+        PlanningOutcome planning =
+            trace.time(Stage.PLAN, () -> classifier.classify(question, context));
         if (planning instanceof PlanningOutcome.AskUser ask) {
-            return GraphRagResult.askUser(ask, trace);
+            return new Evidence.NeedsUser(ask);
         }
         QueryPlan plan = at(((PlanningOutcome.Planned) planning).plan(), asOf);
 
         long[] seeds = trace.time(Stage.LINK, () -> linkAll(plan));
         if (seeds.length == 0) {
-            return GraphRagResult.declined(
-                RetrievalOutcome.NoResults.of(RetrievalOutcome.Reason.UNRESOLVED_REFERENCE),
-                plan, trace);
+            return new Evidence.Unresolved(plan);
         }
 
         Subgraph subgraph = trace.time(Stage.TRAVERSE, () -> traverse(plan, seeds));
-
         List<FusedDocument> fused = retriever.retrieve(
             queryFor(retrievalTextFor(question, plan)), topK, trace);
+        return new Evidence.Gathered(fused, subgraph, plan);
+    }
 
-        RetrievalOutcome outcome = abstention.decide(fused, subgraph);
+    /** Applies the abstention policy to gathered evidence, and serialises what survives it. */
+    private GraphRagResult judge(Evidence.Gathered gathered, QueryTrace trace) {
+        RetrievalOutcome outcome = abstention.decide(gathered.fused(), gathered.subgraph());
         if (!(outcome instanceof RetrievalOutcome.Results results)) {
             // Serialising evidence the system does not believe in only gives the model material to
             // be confidently wrong with.
-            return GraphRagResult.declined(outcome, plan, trace);
+            return GraphRagResult.declined(outcome, gathered.plan(), trace);
         }
 
-        SeedRelevance relevance = relevanceOf(fused);
+        SeedRelevance relevance = relevanceOf(gathered.fused());
         SerializedSubgraph serialized = trace.time(Stage.SERIALIZE,
             () -> serializer.serialize(results.subgraph(), budget, relevance));
 
         LOGGER.debug("answered in {}", trace);
-        return GraphRagResult.answered(results, serialized, plan, trace);
+        return GraphRagResult.answered(results, serialized, gathered.plan(), trace);
     }
 
     /**
@@ -249,6 +312,12 @@ public final class GraphRagPipeline {
      *
      * <p>Exhaustive over the sealed plan hierarchy, so a new plan type is a compile error here
      * rather than a silent fall-through to a default traversal.
+     *
+     * <p>In both directions, which is what the null relation filter means - see the contract on
+     * {@link EdgeStore}. A question is about an edge, not about the direction someone happened to
+     * assert it in: "who did Ada Lovelace collaborate with" and "who did Charles Babbage
+     * collaborate with" are the same edge asked from its two ends, and a forward-only walk answers
+     * the first and refuses the second with no way for the asker to tell that the fact was there.
      */
     private Subgraph traverse(QueryPlan plan, long[] seeds) {
         TemporalFilter asOf = plan instanceof QueryPlan.Temporal temporal
@@ -266,8 +335,78 @@ public final class GraphRagPipeline {
                 "a temporal plan cannot wrap another; construction already forbids it");
         };
 
-        long[] reachable = edgeStore.expand(seeds, hops, null, asOf);
-        return collect(seeds, reachable, asOf);
+        int[] wanted = relationsNamedBy(core);
+        if (wanted.length == 0) {
+            return collect(seeds, edgeStore.expand(seeds, hops, null, asOf), asOf, null);
+        }
+
+        int[] selectors = bothDirections(wanted);
+        Subgraph narrowed =
+            collect(seeds, edgeStore.expand(seeds, hops, selectors, asOf), asOf, wanted);
+        if (!narrowed.edges().isEmpty()) {
+            return narrowed;
+        }
+
+        // The field is called relationHints and this is what makes that true. The cues that
+        // produce them are a fixed English vocabulary matched against relation names an extractor
+        // chose, so a hint that resolves to the wrong relation is an ordinary outcome rather than
+        // a rare one. Letting it stand would turn a question the graph can answer into a refusal,
+        // and the asker would have no way to see that the fact was there. A hint may sharpen an
+        // answer; it may not remove one.
+        LOGGER.debug("relation hints {} matched no edge; traversing every relation",
+            java.util.Arrays.toString(wanted));
+        return collect(seeds, edgeStore.expand(seeds, hops, null, asOf), asOf, null);
+    }
+
+    /**
+     * The relation ids the plan's hints name, empty when there are none or none resolve.
+     *
+     * <p>Empty rather than an empty whitelist: an empty selector array asks the store for nothing
+     * and is a legitimate request, so handing one to {@link EdgeStore#expand} because a question
+     * happened to use no recognised relation word would answer every such question with silence.
+     */
+    private int[] relationsNamedBy(QueryPlan core) {
+        if (relations == null) {
+            return new int[0];
+        }
+        List<String> hints = switch (core) {
+            case QueryPlan.Traverse traverse -> traverse.relationHints();
+            case QueryPlan.Aggregate aggregate -> aggregate.relationHints();
+            // A lookup reads facts off the entity; there is no walk for a hint to narrow.
+            case QueryPlan.Lookup ignored -> List.of();
+            case QueryPlan.Temporal ignored -> throw new IllegalStateException(
+                "a temporal plan cannot wrap another; construction already forbids it");
+        };
+
+        List<Integer> resolved = new ArrayList<>();
+        for (String hint : hints) {
+            for (int relation : relations.resolve(hint)) {
+                if (!resolved.contains(relation)) {
+                    resolved.add(relation);
+                }
+            }
+        }
+        int[] ids = new int[resolved.size()];
+        for (int i = 0; i < ids.length; i++) {
+            ids[i] = resolved.get(i);
+        }
+        return ids;
+    }
+
+    /**
+     * Selectors following each relation both ways.
+     *
+     * <p>A hint names a relation, never a direction - "collaborated" says nothing about which end
+     * the fact was asserted from, and narrowing to one direction would reintroduce, per relation,
+     * exactly the asymmetry an unfiltered traversal no longer has.
+     */
+    private static int[] bothDirections(int[] relations) {
+        int[] selectors = new int[relations.length * 2];
+        for (int i = 0; i < relations.length; i++) {
+            selectors[2 * i] = RelationSelector.forward(relations[i]);
+            selectors[2 * i + 1] = RelationSelector.reverse(relations[i]);
+        }
+        return selectors;
     }
 
     /**
@@ -278,7 +417,8 @@ public final class GraphRagPipeline {
      * no provenance to show, so abstention will treat it as weak evidence rather than silently
      * treating it as strong.
      */
-    private Subgraph collect(long[] seeds, long[] reachable, TemporalFilter asOf) {
+    private Subgraph collect(long[] seeds, long[] reachable, TemporalFilter asOf,
+                             int[] allowedRelations) {
         Subgraph.Builder builder = new Subgraph.Builder();
         for (long seed : seeds) {
             builder.seed(seed);
@@ -307,6 +447,12 @@ public final class GraphRagPipeline {
                 if (!inScope.contains(object)) {
                     return;
                 }
+                // The whitelist narrowed which entities the walk reached; without this it would
+                // not narrow what is said about them, and a traversal restricted to one relation
+                // would hand the model a subgraph full of every other.
+                if (allowedRelations != null && !contains(allowedRelations, relation)) {
+                    return;
+                }
                 int validFrom = mapped.validFrom(index);
                 int validTo = mapped.validTo(index);
                 if (!asOf.admits(validFrom, validTo)) {
@@ -319,6 +465,15 @@ public final class GraphRagPipeline {
             });
         }
         return builder.build();
+    }
+
+    private static boolean contains(int[] values, int wanted) {
+        for (int value : values) {
+            if (value == wanted) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

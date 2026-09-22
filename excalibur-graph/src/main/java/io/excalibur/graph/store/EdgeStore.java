@@ -28,6 +28,20 @@ import io.excalibur.graph.temporal.TemporalFilter;
  * edges are being considered, never as a pass over the result: an edge outside the window must not
  * contribute its neighbours to the next hop, and a post-filter cannot undo that.
  *
+ * <h2>Direction, and what an absent filter means</h2>
+ * A null relation filter means every relation in <em>both</em> directions, not every relation
+ * forward. The parameter filters relations; direction is a separate axis, and letting the absence
+ * of a relation filter quietly decide it too is how a traversal comes to answer only those
+ * questions whose facts happen to have been asserted in the direction they are asked about. "Who
+ * did Ada Lovelace collaborate with" and "who did Charles Babbage collaborate with" are the same
+ * question about the same edge, and a store that answers one and not the other is not filtering,
+ * it is losing half the graph.
+ *
+ * <p>The reverse index is mandatory, so both runs always exist and an unfiltered hop costs two
+ * run scans rather than one. A caller that genuinely wants one direction says so with
+ * {@link RelationSelector#forward} or {@link RelationSelector#reverse}, which is the same way it
+ * would ask for one relation - stated, rather than inherited from an omission.
+ *
  * <h2>Concurrency</h2>
  * Implementations are safe for concurrent readers. None of these methods mutate.
  */
@@ -40,7 +54,8 @@ public interface EdgeStore extends AutoCloseable {
      * Order is unspecified; callers that need an order impose one.
      *
      * @param entity         the entity to expand from
-     * @param relationFilter selectors to follow, or {@code null} for every relation forward
+     * @param relationFilter selectors to follow, or {@code null} for every relation in both
+     *                       directions
      * @return neighbouring entity ids, empty if there are none
      * @throws IllegalArgumentException if {@code entity} is not a valid id for this store
      */
@@ -58,7 +73,8 @@ public interface EdgeStore extends AutoCloseable {
      *
      * @param seeds        entities to start from
      * @param hops         maximum hops to take; {@code 0} returns the seeds alone
-     * @param relWhitelist selectors to follow, or {@code null} for every relation forward
+     * @param relWhitelist selectors to follow, or {@code null} for every relation in both
+     *                     directions
      * @param asOf         valid-time window applied as edges are considered; must not be null
      * @return reachable entity ids including the seeds
      * @throws IllegalArgumentException if {@code hops} is negative or a seed is not a valid id

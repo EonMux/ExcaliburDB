@@ -46,6 +46,7 @@ class ConfigFinitenessTest {
         "excalibur.graph.min-score",
         "excalibur.graph.min-separation",
         "excalibur.graph.min-mean-confidence",
+        "excalibur.graph.confidence-temperature",
         "excalibur.graph.ram-buffer-mb",
         "excalibur.graph.erasure-tombstone-ratio");
 

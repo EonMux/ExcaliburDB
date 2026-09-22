@@ -14,11 +14,11 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 - **Epoch-based visibility tracking** for consistent query snapshots during concurrent ingestion
 - **LLM integration** for semantic relevancy scoring, with a circuit breaker on each of the chat and embedding paths and a fallback when either is open
 - **Queryability guarantee** - the system remains queryable at all times, including during initial indexing and re-indexing operations
-- **Memory-mapped CSR graph** alongside the vector index, with a mandatory reverse index, so retrieval can traverse relationships rather than only find similar text
+- **Memory-mapped CSR graph** alongside the vector index, with a mandatory reverse index, so retrieval can traverse relationships rather than only find similar text. A traversal with no relation filter follows every relation in **both** directions: a question is about an edge, not about the end someone happened to assert it from, so "who did Ada Lovelace collaborate with" and "who did Charles Babbage collaborate with" reach the same fact. A caller wanting one direction asks for it with `RelationSelector.forward` or `reverse`. When the question names a relation the graph holds — "who **collaborated** with Ada Lovelace" against a `collaborated_with` edge — the traversal narrows to it, in both directions, so the model is handed that relation rather than everything the entity touches. The match is by prefix over letters and digits, so the extractor's casing convention does not matter. It stays a hint: if narrowing finds no edge, the traversal is retried across every relation, because the cues are a fixed English vocabulary matched against names an extractor chose and a hint that lands on the wrong relation must not turn an answerable question into a refusal
 - **Bitemporal facts** - every edge carries the interval over which it held in the world, kept strictly separate from the epoch that records when the index learned it, and every traversal is filtered by it. `POST /v1/graph/query` takes an `as_of` date, instant or `all`, so a question is asked at an instant the caller states rather than one inferred from its wording. The node's own extractor does not infer dates, so facts it stages are open-ended until something supersedes them; the interval is the store's, and closing one is the graph builder's job
 - **Provenance per edge** - source, confidence and extractor version, stored columnar and serialised into the model's context so a curated claim can be told from a guess
 - **Staged reranking on the graph route** - BM25 over an embedded Lucene index, then reranked against the entities' uncompressed vectors, then reranked again in one batched call to the chat model; each stage falls back to the ordering beneath it when its endpoint is unavailable. The route runs this one lexical signal through the same fusion machinery `/v1/query` uses, so the reciprocal-rank step preserves the BM25 order rather than combining anything; it is `/v1/query` that actually fuses two signals
-- **Abstention rather than a weak answer** - a sealed result type that can answer, decline, or hand back an ambiguity, rather than returning a weak answer as though it were a strong one. The thresholds a running node applies are configuration (`excalibur.graph.min-*`). `AbstentionCalibrator` fits them instead, from labelled outcomes you supply: it is a library API rather than a server route, because the labels have to come from a query set whose answers are known, and a node cannot manufacture one for itself
+- **Abstention rather than a weak answer** - a sealed result type that can answer, decline, or hand back an ambiguity, rather than returning a weak answer as though it were a strong one. The thresholds a running node applies are configuration (`excalibur.graph.min-*`). `AbstentionCalibrator.calibrate` fits all three together instead, from labelled outcomes you supply - together rather than one at a time, because the gates overlap and combining three separate fits gives a node stricter than any of them measured. It is a library API rather than a server route, because the labels have to come from a query set whose answers are known, and a node cannot manufacture one for itself. The fit also reports where the coverage it gave up went, split between queries handed back as ambiguous and queries refused outright, and prefers the former where the two buy the same precision. The confidence attached to an answer is fitted separately and by a different method: `AbstentionCalibrator.fitTemperature` scales the reported confidence so it can be read as a probability, and `expectedCalibrationError` and `reliability` say how far off it was before and after. A fitted temperature goes into `excalibur.graph.confidence-temperature`, which is the whole of what a node needs to apply it; scaling is monotone and fixes the midpoint, so it changes how strongly an answer is claimed and never which answer is given. Which queries to answer and how strongly to claim them fail independently, so neither fit stands in for the other
 - **Erasure that removes data** - `POST /v1/graph/erasure` records an obligation durably, and a compaction rewrites the tombstoned edges out of the store and out of the staged facts it was built from, driven by the oldest outstanding request and not only by how much has accumulated. Erasing only the store would leave the next `POST /v1/graph/build` free to replay the staging log and restore exactly what was erased
 - **Per-namespace isolation** - one graph directory per tenant, selected by a request header, with mapping-count and descriptor budgets - `vm.max_map_count` and `RLIMIT_NOFILE`, read from the running process - that evict the least recently used graph before either limit is reached; a request holds a lease, so eviction never unmaps a graph out from under a reader. Ingestion routes by the same header: a source registered with it stages its facts into that tenant, one registered without it into `shared`, and the binding is written into the source catalog so a re-crawl after a restart stages where it did before
 - **A graph the node builds** - ingestion extracts facts from the documents it publishes and stages them; `POST /v1/graph/build` turns everything staged into the edge store, the dictionaries and the two Lucene indexes, and serves the result without a restart
@@ -496,10 +496,50 @@ spell them this way:
 | `excalibur.graph.min-separation` | 0.001 | Smallest gap between the top two candidates before the result is ambiguous |
 | `excalibur.graph.min-mean-confidence` | 0.3 | Smallest mean provenance confidence across the surviving evidence |
 | `excalibur.graph.max-ambiguous-candidates` | 5 | Candidates returned when the answer is ambiguous |
+| `excalibur.graph.confidence-temperature` | 1.0 | Divisor on the log-odds of the confidence an answer reports, in `(0.0, 20.0]`. The default leaves it untouched, which is honest: the reported number is arithmetic over a fused score until labelled outcomes say otherwise. `AbstentionCalibrator.fitTemperature` fits it and reports the calibration error before and after — above 1.0 softens overconfident claims, below 1.0 sharpens underconfident ones. Scaling is monotone and fixes 0.5, so it changes how strongly an answer is claimed and never which answer is given or whether one is given at all |
 | `excalibur.graph.ram-buffer-mb` | 16 | Lucene RAM buffer per index. Named for the graph, but it sizes the ingestion pipeline's chunk index too when that runs on the `lucene` engine — a node with no graph still pays it, once per open index |
 
 `max-ambiguous-candidates` is at least 2: the abstention policy calls a result ambiguous by
 comparing competing readings, so one candidate is not a value it can work with.
+
+The three `min-*` gates and `confidence-temperature` are separate keys because they are separately
+measured, and a deployment can have measured either, both or neither. The gates decide which
+queries get answered and are fitted together by `AbstentionCalibrator.calibrate`; the temperature
+decides how strongly an answer is claimed and is fitted by `AbstentionCalibrator.fitTemperature`.
+Neither fit substitutes for the other: a policy can pick exactly the right queries to answer and
+still state its confidence in them dishonestly.
+
+Both fits are run by one harness, over a graph on disk:
+
+```bash
+./gradlew :excalibur-bench:runGraphCalibration \
+    -PcalibrationArgs="data/shared/graph judged.tsv 0.9 excalibur.properties"
+```
+
+`judged.tsv` is one question per line, `question<TAB>name[,name...]`, naming the entities that
+answer it — the same shape as the document route's qrels, with entity names rather than chunk ids
+because the graph route answers with entities. Names rather than ids, because an id is an artefact
+of the build that assigned it and a judgement file written against ids goes silently stale the
+moment the graph is rebuilt.
+
+The harness retrieves for each question exactly once through the pipeline's own
+`GraphRagPipeline.gather`, which stops short of abstention. That is what makes the fit honest in
+both directions: the gates a node is currently running never touch the evidence, so a fit is not
+anchored to the last one, and the retrieval being measured is the retrieval a served query gets
+rather than a reimplementation of it. It then fits the gates, builds the policy those gates
+describe, and fits the temperature against *that* policy's confidences — not the configured
+policy's, which is about to be replaced. It prints the `excalibur.properties` lines to paste, and
+comments out any it cannot stand behind, with the reason.
+
+Pass the node's properties file. Thresholds are only valid for the retrieval that produced them,
+and `top-k`, `rerank-over-fetch` and whether an embedding endpoint is configured all change what
+retrieval returns.
+
+A correct answer is one where the expected entity is an endpoint of an edge in the subgraph the
+traversal assembled — not the top-ranked candidate, which on this route is the entity the question
+is *about* rather than its answer. So what is measured is whether the evidence needed to answer
+survived into the context, which is what abstention decides about. Whether a model then used that
+context correctly is a different question and this does not answer it.
 
 ### System properties
 
