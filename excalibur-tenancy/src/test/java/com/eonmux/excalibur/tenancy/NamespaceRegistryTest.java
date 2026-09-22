@@ -63,6 +63,46 @@ class NamespaceRegistryTest {
     }
 
     @Nested
+    @DisplayName("measuring what a namespace costs")
+    class Measuring {
+
+        @Test
+        @DisplayName("a resource whose cost cannot be measured is closed, not left open unowned")
+        void anUnmeasurableResourceIsClosed(@TempDir Path root) {
+            java.util.List<FakeIndex> loaded = new java.util.ArrayList<>();
+            try (NamespaceRegistry<FakeIndex> registry = new NamespaceRegistry<>(root,
+                     (id, dir) -> {
+                         FakeIndex index = new FakeIndex(id, dir);
+                         loaded.add(index);
+                         return index;
+                     },
+                     index -> { throw new IllegalStateException("cannot measure"); },
+                     MappingBudget.of(1000, 1.0), TieringPolicy.uniform(), 4)) {
+
+                assertThatThrownBy(() -> registry.get(NamespaceId.of("a")))
+                    .isInstanceOf(IllegalStateException.class);
+                assertThat(loaded).singleElement().satisfies(index ->
+                    assertThat(index.closed).isTrue());
+                assertThat(registry.openNamespaces()).isEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("a negative cost is refused rather than credited to the budget")
+        void aNegativeCostIsRefused(@TempDir Path root) {
+            try (NamespaceRegistry<FakeIndex> registry = new NamespaceRegistry<>(root,
+                     FakeIndex::new, index -> new long[] { -1L, 0L },
+                     MappingBudget.of(1000, 1.0), TieringPolicy.uniform(), 4)) {
+
+                assertThatThrownBy(() -> registry.get(NamespaceId.of("a")))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("non-negative");
+                assertThat(registry.openNamespaces()).isEmpty();
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("namespace identifiers")
     class Identifiers {
 
@@ -990,6 +1030,131 @@ class NamespaceRegistryTest {
             try (NamespaceRegistry<FakeIndex> registry = registry(root, 4)) {
                 assertThatThrownBy(() -> registry.borrowIfPresent(null))
                     .isInstanceOf(IllegalArgumentException.class);
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("the rest of the process")
+    class RestOfProcess {
+
+        /** A process whose size a test sets: whatever the graphs hold, plus a fixed rest. */
+        private final class GrowingProcess implements ProcessResourceUsage {
+            private final MappingBudget[] budget = new MappingBudget[1];
+            private volatile long rest;
+
+            @Override
+            public java.util.OptionalLong mappings() {
+                return java.util.OptionalLong.of(budget[0].mappings() + rest);
+            }
+
+            @Override
+            public java.util.OptionalLong descriptors() {
+                return java.util.OptionalLong.of(budget[0].descriptors());
+            }
+        }
+
+        @Test
+        @DisplayName("evicts graphs to make room for what the rest of the node has grown into")
+        void theRestOfTheNodeDrivesEviction(@TempDir Path root) {
+            // The storage segments, vector graphs and chunk index the rest of the node maps
+            // come out of the same vm.max_map_count the graphs do. Counting only the graphs let
+            // the process reach the limit with every tenant still open.
+            GrowingProcess process = new GrowingProcess();
+            MappingBudget budget = MappingBudget.of(100, 0.7, 0, process);
+            process.budget[0] = budget;
+            process.rest = 45;
+
+            try (NamespaceRegistry<FakeIndex> registry =
+                     registry(root, 10, TieringPolicy.uniform(), budget)) {
+                registry.get(NamespaceId.of("a"));
+                registry.get(NamespaceId.of("b"));
+                assertThat(registry.openNamespaces()).hasSize(2);
+
+                // Segments split and the lexical index merged: the rest of the node now holds
+                // 55, and two graphs of 10 plus another would pass the 70 the fraction allows.
+                process.rest = 55;
+                registry.get(NamespaceId.of("c"));
+
+                assertThat(registry.openNamespaces()).extracting(NamespaceId::value)
+                    .containsExactly("c");
+                assertThat(registry.evictionCount()).isEqualTo(2);
+                assertThat(budget.otherMappings()).isEqualTo(55);
+            }
+        }
+
+        @Test
+        @DisplayName("without the rest of the process counted, the same node evicts nothing")
+        void theGraphsAloneNeverFillTheBudget(@TempDir Path root) {
+            try (NamespaceRegistry<FakeIndex> registry = registry(root, 10,
+                     TieringPolicy.uniform(), MappingBudget.of(100, 0.7))) {
+                registry.get(NamespaceId.of("a"));
+                registry.get(NamespaceId.of("b"));
+                registry.get(NamespaceId.of("c"));
+
+                assertThat(registry.openNamespaces()).hasSize(3);
+                assertThat(registry.evictionCount()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("opens anyway when the rest of the node alone is over, rather than refusing")
+        void theRestAloneOverTheMarkStillOpens(@TempDir Path root) {
+            GrowingProcess process = new GrowingProcess();
+            MappingBudget budget = MappingBudget.of(100, 0.7, 0, process);
+            process.budget[0] = budget;
+            process.rest = 80;
+
+            try (NamespaceRegistry<FakeIndex> registry =
+                     registry(root, 10, TieringPolicy.sharedIsHot(), budget)) {
+                registry.get(NamespaceId.SHARED);
+                FakeIndex tenant = registry.get(NamespaceId.of("a"));
+
+                // Nothing could be evicted to make room - the shared graph is pinned and the
+                // pressure is not the graphs' - so the open goes ahead and says why.
+                assertThat(tenant.closed).isFalse();
+                assertThat(budget.isRestOfProcessOverHighWater()).isTrue();
+                assertThat(registry.openNamespaces()).contains(NamespaceId.SHARED);
+            }
+        }
+
+        @Test
+        @DisplayName("evicts nothing for a budget the graphs could not bring back under the mark")
+        void theRestAloneOverTheMarkEvictsNothing(@TempDir Path root) {
+            // Evicting cannot free what the graphs do not hold, so doing it would only empty the
+            // working set on every open and make every request pay for a reopen.
+            GrowingProcess process = new GrowingProcess();
+            MappingBudget budget = MappingBudget.of(100, 0.7, 0, process);
+            process.budget[0] = budget;
+            process.rest = 80;
+
+            try (NamespaceRegistry<FakeIndex> registry =
+                     registry(root, 10, TieringPolicy.uniform(), budget)) {
+                registry.get(NamespaceId.of("a"));
+                registry.get(NamespaceId.of("b"));
+                registry.get(NamespaceId.of("c"));
+
+                assertThat(registry.openNamespaces()).hasSize(3);
+                assertThat(registry.evictionCount()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("still holds to the open-namespace bound while the rest of the node is over")
+        void theCountBoundStillHolds(@TempDir Path root) {
+            GrowingProcess process = new GrowingProcess();
+            MappingBudget budget = MappingBudget.of(100, 0.7, 0, process);
+            process.budget[0] = budget;
+            process.rest = 80;
+
+            try (NamespaceRegistry<FakeIndex> registry =
+                     registry(root, 2, TieringPolicy.uniform(), budget)) {
+                registry.get(NamespaceId.of("a"));
+                registry.get(NamespaceId.of("b"));
+                registry.get(NamespaceId.of("c"));
+
+                assertThat(registry.openNamespaces()).hasSize(2);
+                assertThat(registry.evictionCount()).isEqualTo(1);
             }
         }
     }

@@ -81,6 +81,28 @@ class ErasureLogInspectionTest {
         }
 
         @Test
+        @DisplayName("an open log answers the same question from memory")
+        void anOpenLogReportsWhatInspectionWould(@TempDir Path dir) throws IOException {
+            Path file = logFile(dir);
+            try (ErasureLog log = ErasureLog.open(file)) {
+                assertThat(log.pending()).isEqualTo(ErasureLog.Pending.NONE);
+
+                long first = log.submit(new ErasureScope.Entity(7), WHEN);
+                log.submit(new ErasureScope.Entity(8), WHEN.plusSeconds(30));
+                assertThat(log.pending())
+                    .isEqualTo(new ErasureLog.Pending(2, java.util.Optional.of(WHEN)));
+
+                // The oldest moves on when it is discharged, which is what a deadline report
+                // has to follow.
+                log.complete(java.util.List.of(first));
+                log.flush();
+                assertThat(log.pending()).isEqualTo(
+                    new ErasureLog.Pending(1, java.util.Optional.of(WHEN.plusSeconds(30))));
+                assertThat(ErasureLog.inspect(file)).isEqualTo(log.pending());
+            }
+        }
+
+        @Test
         @DisplayName("a completed request is not still owed")
         void completedRequestsAreNotCounted(@TempDir Path dir) throws IOException {
             Path file = logFile(dir);

@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
-import com.eonmux.excalibur.shard.CompactionSettings;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.shard.allocator.VolumePlacements;
@@ -43,7 +42,7 @@ import java.util.Objects;
  * @param storageEngine      The started storage engine
  * @param volumeManager      Volume manager registered with the data directory
  * @param indexOrchestrator  Orchestrator with the hierarchical filter attached
- * @param hierarchicalFilter Corpus/cluster/segment membership filter
+ * @param hierarchicalFilter Corpus/segment membership filter
  * @author ExcaliburDB
  */
 public record CoreComponents(Arena arena,
@@ -72,8 +71,8 @@ public record CoreComponents(Arena arena,
     /** Bits kept per term when nothing says otherwise, for roughly a 0.1% false positive rate. */
     public static final int DEFAULT_FINGERPRINT_BITS = 13;
 
-    /** Fewest bits a fingerprint may be kept at. */
-    public static final int MIN_FINGERPRINT_BITS = 4;
+    /** Fewest bits a fingerprint may be kept at; the filter's slot format holds no fewer. */
+    public static final int MIN_FINGERPRINT_BITS = 8;
 
     /** Most bits a fingerprint may be kept at. */
     public static final int MAX_FINGERPRINT_BITS = 16;
@@ -99,6 +98,12 @@ public record CoreComponents(Arena arena,
         long corpusCapacity = corpusCapacity(config);
         int segmentCapacity = segmentCapacity(config);
         int fingerprintBits = fingerprintBits(config);
+        if (segmentCapacity > corpusCapacity) {
+            // The corpus level holds every segment's terms; a segment level larger than it would
+            // also break the hashing relationship that makes a delete safe between them.
+            throw new IllegalArgumentException(KEY_SEGMENT_CAPACITY + " (" + segmentCapacity
+                + ") must not exceed " + KEY_CORPUS_CAPACITY + " (" + corpusCapacity + ")");
+        }
 
         boolean panamaAvailable = MemorySegmentFactory.isPanamaAvailable();
         Arena arena = panamaAvailable ? Arena.ofShared() : null;
@@ -213,34 +218,23 @@ public record CoreComponents(Arena arena,
                 + "already carry", resumeEpoch);
         }
 
-        IndexOrchestrator orchestrator = new IndexOrchestrator(
+        // Every shard setting through the shard module's own translation, so none of them can
+        // be parsed, validated and then left out of a hand-written argument list. Volume
+        // placement is the exception, installed before the engine started.
+        IndexOrchestrator orchestrator = IndexOrchestrator.forStartedEngine(
             catalog,
             storageEngine,
             volumeManager,
-            // The shard key, the same one IndexOrchestrator.fromConfig and ExcaliburDBServer
-            // build from: two keys describing one queue meant the limit depended on which path
-            // constructed the engine.
-            config.shard().getHnswQueueLimit(),
-            IndexOrchestrator.DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,
-            IndexOrchestrator.DEFAULT_REINDEX_CHECK_INTERVAL_MS,
+            config.shard(),
             config.visibility().getEpochTickMs(),
-            resumeEpoch,
-            // Both compaction workers are built in the constructor and never reconfigured, so
-            // the configured policy has to arrive with the rest of the arguments rather than
-            // through a setter afterwards.
-            CompactionSettings.fromConfig(config.shard())
-        );
-
-        // The configured delay before compaction's first check, matching what
-        // IndexOrchestrator.fromConfig applies on the other construction path.
-        orchestrator.withCompactionStartDelayMs(config.shard().getCompactDelayMs());
+            resumeEpoch);
 
         LOGGER.info("Index orchestrator initialized");
         return orchestrator;
     }
 
     /**
-     * Creates the hierarchical Cuckoo filter for corpus → cluster → segment membership.
+     * Creates the hierarchical Cuckoo filter for corpus → segment membership.
      *
      * <p>The hierarchical filter enables efficient segment pruning during queries
      * and proper deletion propagation through all filter levels when documents
@@ -252,7 +246,6 @@ public record CoreComponents(Arena arena,
      *       {@code excalibur.filter.corpus-capacity}</li>
      *   <li>Fingerprint bits: {@value #DEFAULT_FINGERPRINT_BITS}, or
      *       {@code excalibur.filter.fingerprint-bits}</li>
-     *   <li>Cluster capacity: the corpus capacity, because every segment shares one cluster</li>
      *   <li>Segment capacity: {@value #DEFAULT_SEGMENT_CAPACITY} distinct terms, or
      *       {@code excalibur.filter.segment-capacity}</li>
      * </ul>
@@ -267,22 +260,14 @@ public record CoreComponents(Arena arena,
                                                                            int fingerprintBits) {
         LOGGER.info("Initializing hierarchical Cuckoo filter...");
 
-        // Every segment is registered into a single "default" cluster, so the cluster level does
-        // not partition anything: it holds the whole corpus's terms. Sized at a fraction of the
-        // corpus it fills first, and a level that has refused a term stops being trusted for its
-        // whole scope - which here is every segment on the node. Until clusters mean something,
-        // the cluster level is the corpus level and is sized like it.
-        int clusterCapacity = (int) Math.min(corpusCapacity, Integer.MAX_VALUE);
-
         HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(
             corpusCapacity,
             fingerprintBits,
-            clusterCapacity,
             segmentCapacity
         );
 
-        LOGGER.info("Hierarchical Cuckoo filter initialized: corpusCapacity={}, fingerprintBits={}, clusterCapacity={}, segmentCapacity={}",
-            corpusCapacity, fingerprintBits, clusterCapacity, segmentCapacity);
+        LOGGER.info("Hierarchical Cuckoo filter initialized: corpusCapacity={}, fingerprintBits={}, segmentCapacity={}",
+            corpusCapacity, fingerprintBits, segmentCapacity);
 
         return filter;
     }
@@ -317,10 +302,15 @@ public record CoreComponents(Arena arena,
      * @param config The application configuration
      * @return The configured capacity, or {@link #DEFAULT_SEGMENT_CAPACITY}
      * @throws IllegalArgumentException if a value is configured and is not a positive number
+     *                                  that fits an int
      */
     private static int segmentCapacity(Config config) {
         long parsed = positiveCapacity(config, KEY_SEGMENT_CAPACITY, DEFAULT_SEGMENT_CAPACITY);
-        return (int) Math.min(parsed, Integer.MAX_VALUE);
+        if (parsed > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(KEY_SEGMENT_CAPACITY + " must be at most "
+                + Integer.MAX_VALUE + "; got: " + parsed);
+        }
+        return (int) parsed;
     }
 
     /**

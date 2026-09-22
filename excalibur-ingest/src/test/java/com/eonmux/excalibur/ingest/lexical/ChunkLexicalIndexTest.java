@@ -128,6 +128,104 @@ class ChunkLexicalIndexTest {
                 assertThat(hits(index, "planning")).isEqualTo(1);
             }
         }
+
+        @Test
+        @DisplayName("a chunk erased and then indexed again survives a restart")
+        void reingestSurvivesRestart(@TempDir Path dir) throws Exception {
+            // The promise stays on the log until a force-merge reclaims the erased copy, which
+            // under the default policy may be an hour. Replaying it on open would delete the copy
+            // indexed since, which is not the one the erasure was about.
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "first draft");
+                index.refresh();
+                index.erase(Set.of("kb:a.txt:chunk:0"));
+                index.refresh();
+                index.add("kb:a.txt:chunk:0", "second draft");
+                index.refresh();
+            }
+
+            try (ChunkLexicalIndex reopened = open(dir)) {
+                reopened.refresh();
+                assertThat(hits(reopened, "second")).isEqualTo(1);
+                assertThat(hits(reopened, "first")).isZero();
+                assertThat(reopened.outstandingErasureRequests()).hasSize(1);
+            }
+        }
+
+        @Test
+        @DisplayName("an erasure closed before any refresh is still applied after a restart")
+        void uncommittedErasureIsCommittedOnClose(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "confidential postmortem");
+                index.refresh();
+                index.erase(Set.of("kb:a.txt:chunk:0"));
+            }
+
+            try (ChunkLexicalIndex reopened = open(dir)) {
+                reopened.refresh();
+                assertThat(hits(reopened, "postmortem")).isZero();
+            }
+        }
+    }
+
+    /**
+     * What a query result cache keys a lexical answer on. Lucene publishes at refresh, so that
+     * is the only boundary at which the version may move.
+     */
+    @Nested
+    @DisplayName("Search version")
+    class SearchVersion {
+
+        @Test
+        @DisplayName("moves when a refresh publishes an addition, and not before")
+        void movesAtRefresh(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "the TLS handshake failed");
+                index.refresh();
+                java.util.OptionalLong published = index.searchVersion();
+
+                index.add("kb:b.txt:chunk:0", "the certificate expired");
+
+                assertThat(published).isPresent();
+                assertThat(index.searchVersion())
+                    .as("buffered is not searchable, so the answer cannot have changed yet")
+                    .isEqualTo(published);
+
+                index.refresh();
+
+                assertThat(index.searchVersion()).isNotEqualTo(published);
+            }
+        }
+
+        @Test
+        @DisplayName("moves when a refresh publishes an erasure")
+        void movesOnErasure(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "confidential postmortem");
+                index.add("kb:a.txt:chunk:1", "routine planning");
+                index.refresh();
+                java.util.OptionalLong before = index.searchVersion();
+
+                index.erase(Set.of("kb:a.txt:chunk:0"));
+                index.refresh();
+
+                assertThat(index.searchVersion()).isNotEqualTo(before);
+            }
+        }
+
+        @Test
+        @DisplayName("stands still across a refresh that published nothing")
+        void stableWithoutChange(@TempDir Path dir) throws Exception {
+            try (ChunkLexicalIndex index = open(dir)) {
+                index.add("kb:a.txt:chunk:0", "the TLS handshake failed");
+                index.refresh();
+                java.util.OptionalLong before = index.searchVersion();
+
+                index.refresh();
+
+                assertThat(index.searchVersion()).isEqualTo(before);
+            }
+        }
     }
 
     @Nested

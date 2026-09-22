@@ -619,6 +619,19 @@ public final class GraphErasureCoordinator {
         return log.outstandingCount();
     }
 
+    /**
+     * How many obligations are outstanding, and how long the oldest has waited.
+     *
+     * <p>The count alone says whether erasure is keeping up; the age is what is measured against
+     * the deadline the deployment promised, and the one figure an operator can compare with
+     * {@code excalibur.graph.erasure-max-latency-seconds}.</p>
+     *
+     * @return What the log owes
+     */
+    public ErasureLog.Pending pending() {
+        return log.pending();
+    }
+
     @Override
     public String toString() {
         return "GraphErasureCoordinator[" + log.outstandingCount() + " outstanding]";

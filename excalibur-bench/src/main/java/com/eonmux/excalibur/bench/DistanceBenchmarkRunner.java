@@ -76,14 +76,11 @@ public class DistanceBenchmarkRunner {
                 .measurementTime(TimeValue.seconds(2))
                 // Fork configuration
                 .forks(1)
-                // JVM arguments for Panama FFM and Vector API
-                .jvmArgsAppend(
-                    "--enable-preview",
-                    "--enable-native-access=ALL-UNNAMED",
-                    "--add-modules=jdk.incubator.vector",
+                // The flags every fork needs, then this benchmark's own
+                .jvmArgsAppend(ForkedJvm.flags(
                     "-Xms2g",
                     "-Xmx2g"
-                )
+                ))
                 // Output format
                 .shouldDoGC(true)
                 .build();

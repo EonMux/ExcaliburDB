@@ -11,6 +11,10 @@ import java.util.Map;
  * answer with the same objection, one round trip later - and its objection is worded for an
  * operator reading an HTTP response, not for a model deciding what to try next.</p>
  *
+ * <p>An argument of the wrong type is refused, never dropped. Dropping it would run the call
+ * without a setting the model believes it made - a crawl without its exclusions, a search
+ * without its limit - and report success.</p>
+ *
  * <h2>Numbers</h2>
  * <p>JSON has one number type and a model's JSON layer decides how to write a whole number, so
  * {@code 5} and {@code 5.0} are the same value and both are accepted. A fractional one is not:
@@ -43,16 +47,21 @@ final class ToolArguments {
     }
 
     /**
-     * Reads a string argument, or null when the model did not send a usable one.
+     * Reads a string argument, or null when the model sent none.
      *
      * @param args  The call's arguments
      * @param field The field name
-     * @return The trimmed value, or null
+     * @return The trimmed value, or null when absent, null or blank
+     * @throws IllegalArgumentException if it is present and is not a string
      */
     static String optionalString(Map<String, Object> args, String field) {
         Object value = args.get(field);
-        if (!(value instanceof String text)) {
+        if (value == null) {
             return null;
+        }
+        if (!(value instanceof String text)) {
+            throw new IllegalArgumentException(
+                "Argument '" + field + "' must be a string, got: " + value);
         }
         String trimmed = text.trim();
         return trimmed.isEmpty() ? null : trimmed;
@@ -60,6 +69,9 @@ final class ToolArguments {
 
     /**
      * Reads a whole-number argument, or null when the model sent none.
+     *
+     * <p>A number written as a string is accepted, because some models' JSON layers quote
+     * every scalar; anything else that is not a whole number in {@code int} range is refused.</p>
      *
      * @param args  The call's arguments
      * @param field The field name
@@ -71,45 +83,22 @@ final class ToolArguments {
         if (value == null) {
             return null;
         }
-        if (value instanceof Number number
-                && number.doubleValue() == Math.rint(number.doubleValue())) {
-            return number.intValue();
-        }
-        if (value instanceof String text) {
+        if (value instanceof Number number) {
+            double exact = number.doubleValue();
+            if (exact == Math.rint(exact)
+                    && exact >= Integer.MIN_VALUE && exact <= Integer.MAX_VALUE) {
+                return (int) exact;
+            }
+        } else if (value instanceof String text) {
             try {
                 return Integer.valueOf(text.trim());
             } catch (NumberFormatException e) {
                 throw new IllegalArgumentException(
-                    "Field '" + field + "' must be a whole number, got: " + text, e);
+                    "Argument '" + field + "' must be a whole number, got: " + text, e);
             }
         }
         throw new IllegalArgumentException(
-            "Field '" + field + "' must be a whole number, got: " + value);
-    }
-
-    /**
-     * Reads a whole-number argument sent as a number, ignoring anything that is not one.
-     *
-     * <p>Distinct from {@link #wholeNumber(Map, String)} in what it does with a value of the
-     * wrong kind: this one omits it, which is right for a field whose absence means "use the
-     * node's default". A fractional number is still refused, because it is a count.</p>
-     *
-     * @param args  The call's arguments
-     * @param field The field name
-     * @return The value, or null when the model sent nothing numeric
-     * @throws IllegalArgumentException if it is a number but not a whole one
-     */
-    static Integer optionalInteger(Map<String, Object> args, String field) {
-        Object value = args.get(field);
-        if (!(value instanceof Number number)) {
-            return null;
-        }
-        double exact = number.doubleValue();
-        if (exact != Math.rint(exact) || exact < Integer.MIN_VALUE || exact > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException(
-                "Argument '" + field + "' must be a whole number: " + value);
-        }
-        return (int) exact;
+            "Argument '" + field + "' must be a whole number, got: " + value);
     }
 
     /**
@@ -117,19 +106,46 @@ final class ToolArguments {
      *
      * @param args  The call's arguments
      * @param field The field name
-     * @return The non-blank elements, empty when the field is absent or is not a list
+     * @return The non-blank elements, empty when the field is absent
+     * @throws IllegalArgumentException if it is present and is not a list of strings
      */
     static List<String> stringList(Map<String, Object> args, String field) {
+        List<String> values = optionalStringList(args, field);
+        return values != null ? values : List.of();
+    }
+
+    /**
+     * Reads a list-of-strings argument, telling an empty list apart from an absent one.
+     *
+     * <p>The difference matters where the node gives an empty list a meaning of its own, as
+     * with a crawl's exclusions: absent keeps the node's defaults, empty clears them.</p>
+     *
+     * @param args  The call's arguments
+     * @param field The field name
+     * @return The non-blank elements, or null when the field is absent or null
+     * @throws IllegalArgumentException if it is present and is not a list of strings
+     */
+    static List<String> optionalStringList(Map<String, Object> args, String field) {
         Object value = args.get(field);
-        List<String> out = new ArrayList<>();
-        if (value instanceof List<?> items) {
-            for (Object item : items) {
-                if (item instanceof String text && !text.isBlank()) {
-                    out.add(text.trim());
-                }
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof List<?> items)) {
+            throw new IllegalArgumentException(
+                "Argument '" + field + "' must be an array of strings, got: " + value);
+        }
+        List<String> out = new ArrayList<>(items.size());
+        for (Object item : items) {
+            if (!(item instanceof String text)) {
+                throw new IllegalArgumentException(
+                    "Argument '" + field + "' must be an array of strings, got an element: "
+                        + item);
+            }
+            if (!text.isBlank()) {
+                out.add(text.trim());
             }
         }
-        return out;
+        return List.copyOf(out);
     }
 
     /**
@@ -137,12 +153,17 @@ final class ToolArguments {
      *
      * @param args  The call's arguments
      * @param field The field name
-     * @return The elements, empty when the field is absent or is not a list
+     * @return The elements, empty when the field is absent
+     * @throws IllegalArgumentException if it is present and is not a list
      */
     static List<Object> objectList(Map<String, Object> args, String field) {
         Object value = args.get(field);
-        if (!(value instanceof List<?> list)) {
+        if (value == null) {
             return List.of();
+        }
+        if (!(value instanceof List<?> list)) {
+            throw new IllegalArgumentException(
+                "Argument '" + field + "' must be an array, got: " + value);
         }
         List<Object> items = new ArrayList<>(list.size());
         for (Object element : list) {

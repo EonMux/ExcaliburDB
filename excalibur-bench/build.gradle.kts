@@ -5,14 +5,20 @@ plugins {
 }
 
 
+// The flags every JVM in this module starts with: the runner JVMs the tasks below launch, the
+// test JVM, and the forks JMH starts from them. Without --enable-preview no class in this build
+// loads, and without --add-modules=jdk.incubator.vector any benchmark touching the Vector API
+// dies on its first call - which a pattern-selected run reaches whenever the pattern is broad
+// enough. The runners hand the same list to their forks through ForkedJvm.REQUIRED_FLAGS.
+val benchmarkJvmFlags = listOf(
+    "--enable-preview",
+    "--enable-native-access=ALL-UNNAMED",
+    "--add-modules=jdk.incubator.vector"
+)
+
 application {
     mainClass.set("com.eonmux.excalibur.bench.BenchmarkRunner")
-    applicationDefaultJvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms1g",
-        "-Xmx1g"
-    )
+    applicationDefaultJvmArgs = benchmarkJvmFlags + listOf("-Xms1g", "-Xmx1g")
 }
 
 dependencies {
@@ -73,23 +79,16 @@ tasks.test {
         events("passed", "skipped", "failed")
         showStandardStreams = true
     }
-    jvmArgs("--enable-preview")
-    jvmArgs("--enable-native-access=ALL-UNNAMED")
-    jvmArgs("--add-modules=jdk.incubator.vector")
+    jvmArgs(benchmarkJvmFlags)
 }
 
-// Task to run the JMH benchmark for Segment
+// Every benchmark in the module, or the ones one selector names (see BenchmarkSelection)
 tasks.register<JavaExec>("runBenchmark") {
     group = "benchmark"
-    description = "Runs the JMH benchmark for Segment lookups"
+    description = "Runs every JMH benchmark in the module, or those one argument selects (segment, cuckoo, cuckoo-insert)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.BenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms1g",
-        "-Xmx1g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms1g", "-Xmx1g")
 }
 
 // Task to run the JMH benchmark for Cuckoo Filter
@@ -98,12 +97,7 @@ tasks.register<JavaExec>("runCuckooFilterBenchmark") {
     description = "Runs the JMH benchmark for Cuckoo Filter lookup throughput at various load factors"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.CuckooFilterBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
 // Task to run the JMH benchmark for Cuckoo Filter memory-mapped I/O
@@ -112,12 +106,7 @@ tasks.register<JavaExec>("runCuckooFilterMemoryMappedBenchmark") {
     description = "Runs the JMH benchmark for Cuckoo Filter memory-mapped read/write throughput"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.CuckooFilterMemoryMappedBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms4g",
-        "-Xmx4g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms4g", "-Xmx4g")
 }
 
 // Task to run the JMH benchmark for Cuckoo Filter delete throughput
@@ -126,12 +115,7 @@ tasks.register<JavaExec>("runCuckooFilterDeleteBenchmark") {
     description = "Runs the JMH benchmark for Cuckoo Filter delete throughput at various load factors"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.CuckooFilterDeleteBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
 // Task to run the JMH benchmark for Cuckoo Filter false positive rate measurement
@@ -140,12 +124,7 @@ tasks.register<JavaExec>("runCuckooFilterFPRateBenchmark") {
     description = "Runs the JMH benchmark for Cuckoo Filter actual false positive rate measurement (target: <=0.1%)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.CuckooFilterFPRateBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
 // Task to run the JMH benchmark for Vector Distance functions
@@ -154,13 +133,7 @@ tasks.register<JavaExec>("runDistanceBenchmark") {
     description = "Runs the JMH benchmark for Vector Distance functions (Cosine, L2, Inner Product)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.DistanceBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "--add-modules=jdk.incubator.vector",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
 // Task to run the JMH benchmark for HNSW recall@10 validation
@@ -169,12 +142,7 @@ tasks.register<JavaExec>("runHnswRecallBenchmark") {
     description = "Runs the JMH benchmark for HNSW recall@10 validation (target: >=99%)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.HnswRecallBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms4g",
-        "-Xmx4g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms4g", "-Xmx4g")
 }
 
 // Task to run the JMH benchmark for MappedFile read/write throughput
@@ -183,12 +151,7 @@ tasks.register<JavaExec>("runMappedFileBenchmark") {
     description = "Runs the JMH benchmark for MappedFile read/write throughput (Phase 1)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.MappedFileBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
 // Task to run the JMH benchmark for Hash function speed (Phase 1 requirement)
@@ -197,12 +160,7 @@ tasks.register<JavaExec>("runHashBenchmark") {
     description = "Runs the JMH benchmark for XxHash64 hash function speed"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.HashBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms1g",
-        "-Xmx1g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms1g", "-Xmx1g")
 }
 
 // Task to run the JMH benchmark for Tail Scan throughput (Phase 6)
@@ -211,12 +169,7 @@ tasks.register<JavaExec>("runTailScanBenchmark") {
     description = "Runs the JMH benchmark for tail scan brute-force throughput at varying tail sizes"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.TailScanBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
 // Task to run the JMH benchmark for end-to-end query latency (Phase 10)
@@ -225,42 +178,16 @@ tasks.register<JavaExec>("runEndToEndQueryBenchmark") {
     description = "Runs the JMH benchmark for end-to-end query latency p50/p99"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.EndToEndQueryBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms2g",
-        "-Xmx2g"
-    )
-}
-
-// Task to run the JMH benchmark for Vector Layout (Phase 10)
-tasks.register<JavaExec>("runVectorLayoutBenchmark") {
-    group = "benchmark"
-    description = "Runs the JMH benchmark for Vector Layout operations (SoA vs AoS)"
-    classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("com.eonmux.excalibur.bench.VectorLayoutBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "--add-modules=jdk.incubator.vector",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
 // Task to run the JMH benchmark for Point Lookup throughput (Phase 10 - Feature 97)
 tasks.register<JavaExec>("runPointLookupBenchmark") {
     group = "benchmark"
-    description = "Runs the JMH benchmark for point lookup throughput (target: >=1B ops/sec)"
+    description = "Runs the JMH benchmark for point lookup throughput (target: >=10M ops/sec)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.PointLookupBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms2g",
-        "-Xmx2g",
-        "-XX:+UseTransparentHugePages"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g", "-XX:+UseTransparentHugePages")
 }
 
 // Task to run the JMH benchmark for Distance Vector API comparison (Phase 10)
@@ -269,13 +196,7 @@ tasks.register<JavaExec>("runDistanceVectorApiBenchmark") {
     description = "Runs the JMH benchmark comparing scalar vs Vector API distance computation"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.DistanceVectorApiBenchmarkRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "--add-modules=jdk.incubator.vector",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
 }
 
 // Task to run benchmarks with structured result capture (Phase 10)
@@ -284,12 +205,7 @@ tasks.register<JavaExec>("runBenchmarksWithCapture") {
     description = "Runs all benchmarks and captures results in JSON, Markdown, CSV, and text formats"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.BenchmarkResultsCaptureRunner")
-    jvmArgs = listOf(
-        "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED",
-        "-Xms2g",
-        "-Xmx2g"
-    )
+    jvmArgs = benchmarkJvmFlags + listOf("-Xms2g", "-Xmx2g")
     val baseArgs = if (project.hasProperty("benchmarkPattern")) {
         listOf("--capture", "--pattern", project.property("benchmarkPattern") as String)
     } else {
@@ -318,7 +234,7 @@ tasks.register<JavaExec>("runGraphCalibration") {
     description = "Fits the graph route's abstention thresholds and confidence temperature against a judged question set"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.calibration.GraphCalibrationRunner")
-    jvmArgs = listOf("--enable-preview", "--enable-native-access=ALL-UNNAMED", "-Xmx4g")
+    jvmArgs = benchmarkJvmFlags + listOf("-Xmx4g")
     if (project.hasProperty("calibrationArgs")) {
         args = (project.property("calibrationArgs") as String).split(" ")
     }
@@ -329,7 +245,7 @@ tasks.register<JavaExec>("runRetrievalEvaluation") {
     description = "Indexes a corpus on the native (or lucene, or both) engine and scores the retrieval strategies over it, with the index size beside the quality"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.eonmux.excalibur.bench.retrieval.CorpusEvaluationRunner")
-    jvmArgs = listOf("--enable-preview", "--enable-native-access=ALL-UNNAMED", "-Xmx6g")
+    jvmArgs = benchmarkJvmFlags + listOf("-Xmx6g")
     if (project.hasProperty("evalArgs")) {
         args = (project.property("evalArgs") as String).split(" ")
     }

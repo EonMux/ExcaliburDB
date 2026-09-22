@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.graph;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.llm.LLMException;
 import com.eonmux.excalibur.llm.client.LLMClientConfig;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
@@ -15,6 +16,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -36,6 +39,7 @@ class LlmRelationExtractorTest {
     private static final class StubClient extends LLMHttpClient {
 
         private final AtomicReference<String> reply = new AtomicReference<>();
+        private final AtomicReference<String> instruction = new AtomicReference<>();
         private final AtomicReference<LLMException> failure = new AtomicReference<>();
 
         StubClient() {
@@ -62,6 +66,7 @@ class LlmRelationExtractorTest {
         @Override
         public String completeWithCircuitBreaker(String instruction, String input,
                                                  String correlationId) {
+            this.instruction.set(instruction);
             LLMException thrown = failure.get();
             if (thrown != null) {
                 throw thrown;
@@ -283,6 +288,101 @@ class LlmRelationExtractorTest {
     }
 
     @Nested
+    @DisplayName("dates")
+    class Dates {
+
+        private static int day(int year, int month, int dayOfMonth) {
+            return Math.toIntExact(LocalDate.of(year, month, dayOfMonth).toEpochDay());
+        }
+
+        private static ExtractedTriple only(String dates) {
+            List<ExtractedTriple> triples = extract(
+                "[{\"subject\":\"Ada\",\"relation\":\"ceo_of\",\"object\":\"Acme\""
+                    + dates + "}]");
+            assertThat(triples).hasSize(1);
+            return triples.get(0);
+        }
+
+        @Test
+        @DisplayName("the model is asked for the dates the text states, and told not to guess")
+        void theModelIsAskedForStatedDates() {
+            StubClient client = new StubClient().replying("[]");
+            new LlmRelationExtractor(client, 1).extract("docs:ada", "Ada runs Acme.");
+
+            assertThat(client.instruction.get())
+                .contains("\"valid_from\"", "\"valid_to\"", "never infer a fact or a date");
+        }
+
+        @Test
+        @DisplayName("a fact whose text gives no date holds over all time, stated on no day yet")
+        void noDateMeansAlwaysValid() {
+            ExtractedTriple triple = only("");
+
+            assertThat(triple.validFrom()).isEqualTo(TemporalFilter.UNDATED);
+            assertThat(triple.validTo()).isEqualTo(TemporalFilter.OPEN);
+            assertThat(triple.isDated())
+                .as("the document's date is the ingestion side's to add")
+                .isFalse();
+        }
+
+        @Test
+        @DisplayName("a full start date begins on that day")
+        void aFullStartDate() {
+            ExtractedTriple triple = only(",\"valid_from\":\"2019-03-15\"");
+
+            assertThat(triple.validFrom()).isEqualTo(day(2019, 3, 15));
+            assertThat(triple.validTo()).isEqualTo(TemporalFilter.OPEN);
+        }
+
+        @Test
+        @DisplayName("a year or a month begins on its first day")
+        void aCoarseStartDate() {
+            assertThat(only(",\"valid_from\":\"2019\"").validFrom())
+                .isEqualTo(day(2019, 1, 1));
+            assertThat(only(",\"valid_from\":\"2019-3\"").validFrom())
+                .isEqualTo(day(2019, 3, 1));
+        }
+
+        @Test
+        @DisplayName("an end is the first day after the last period the fact held in")
+        void anEndIsExclusive() {
+            assertThat(only(",\"valid_to\":\"2021\"").validTo()).isEqualTo(day(2022, 1, 1));
+            assertThat(only(",\"valid_to\":\"2021-02\"").validTo()).isEqualTo(day(2021, 3, 1));
+            assertThat(only(",\"valid_to\":\"2021-02-28\"").validTo())
+                .isEqualTo(day(2021, 3, 1));
+
+            ExtractedTriple both = only(",\"valid_from\":\"2015\",\"valid_to\":\"2021\"");
+            assertThat(both.validFrom()).isEqualTo(day(2015, 1, 1));
+            assertThat(both.validTo()).isEqualTo(day(2022, 1, 1));
+        }
+
+        @Test
+        @DisplayName("a date that does not parse is dropped and the fact kept")
+        void anUnreadableDateIsDropped() {
+            ExtractedTriple prose = only(",\"valid_from\":\"last spring\"");
+            assertThat(prose.validFrom()).isEqualTo(TemporalFilter.UNDATED);
+
+            ExtractedTriple impossible = only(",\"valid_from\":\"2019-02-30\","
+                + "\"valid_to\":\"2019-13\"");
+            assertThat(impossible.validFrom()).isEqualTo(TemporalFilter.UNDATED);
+            assertThat(impossible.validTo()).isEqualTo(TemporalFilter.OPEN);
+
+            ExtractedTriple unknown = only(",\"valid_from\":\"\"");
+            assertThat(unknown.validFrom()).isEqualTo(TemporalFilter.UNDATED);
+        }
+
+        @Test
+        @DisplayName("an end that does not fall after its start drops both")
+        void contradictoryDatesAreDropped() {
+            ExtractedTriple backwards = only(",\"valid_from\":\"2021-06-01\","
+                + "\"valid_to\":\"2019\"");
+            assertThat(backwards.validFrom()).isEqualTo(TemporalFilter.UNDATED);
+            assertThat(backwards.validTo()).isEqualTo(TemporalFilter.OPEN);
+            assertThat(backwards.object()).as("the fact itself survives").isEqualTo("Acme");
+        }
+    }
+
+    @Nested
     @DisplayName("construction")
     class Construction {
 
@@ -371,6 +471,54 @@ class LlmRelationExtractorTest {
         @DisplayName("a sink with nothing to do reports nothing")
         void theNoneSinkDoesNothing() {
             GraphIngestSink.none().onDocumentPublished("docs:ada", "text");
+            GraphIngestSink.none().onDocumentPublished("docs:ada", "text", 1L);
+        }
+
+        @Test
+        @DisplayName("a document's facts are staged as stated on the document's own date")
+        void factsTakeTheDocumentDate(@TempDir Path tempDir) throws IOException {
+            LocalDate written = LocalDate.of(2021, 5, 4);
+            long lastModified = written.atTime(23, 59).toInstant(ZoneOffset.UTC).toEpochMilli();
+            int statedByModel = Math.toIntExact(LocalDate.of(2000, 1, 1).toEpochDay());
+
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir)) {
+                StagingGraphIngestSink sink = new StagingGraphIngestSink(staging,
+                    (documentKey, text) -> List.of(
+                        ExtractedTriple.alwaysValid("Ada", "ceo_of", "Acme",
+                            com.eonmux.excalibur.graph.provenance.Provenance.UNKNOWN),
+                        ExtractedTriple.alwaysValid("Grace", "ceo_of", "Beta",
+                            com.eonmux.excalibur.graph.provenance.Provenance.UNKNOWN)
+                            .withStatedOn(statedByModel)));
+
+                sink.onDocumentPublished("docs:ada", "Ada runs Acme.", lastModified);
+
+                List<Integer> stated = new java.util.ArrayList<>();
+                staging.forEachStaged((s, r, o, from, to, statedOn, provenance) ->
+                    stated.add(statedOn));
+                assertThat(stated)
+                    .as("the document's day in UTC; a day an extractor set is kept")
+                    .containsExactly(Math.toIntExact(written.toEpochDay()), statedByModel);
+            }
+        }
+
+        @Test
+        @DisplayName("a document with no date is staged as stated on the day it was staged")
+        void undatedDocumentTakesTheStagingDay(@TempDir Path tempDir) throws IOException {
+            LocalDate today = LocalDate.of(2025, 6, 2);
+            java.time.Clock clock = java.time.Clock.fixed(
+                today.atStartOfDay().toInstant(ZoneOffset.UTC), ZoneOffset.UTC);
+
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir, clock)) {
+                StagingGraphIngestSink sink = new StagingGraphIngestSink(staging,
+                    (documentKey, text) -> List.of(ExtractedTriple.alwaysValid(
+                        "Ada", "ceo_of", "Acme",
+                        com.eonmux.excalibur.graph.provenance.Provenance.UNKNOWN)));
+
+                sink.onDocumentPublished("docs:ada", "Ada runs Acme.", 0L);
+
+                staging.forEachStaged((s, r, o, from, to, statedOn, provenance) ->
+                    assertThat(statedOn).isEqualTo(Math.toIntExact(today.toEpochDay())));
+            }
         }
     }
 }

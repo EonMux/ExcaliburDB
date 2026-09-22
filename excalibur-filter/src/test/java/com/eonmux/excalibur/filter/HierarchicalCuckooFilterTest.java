@@ -17,17 +17,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *
  * <h2>Domain Correctness Verification</h2>
  * <ul>
- *   <li>Deletion from hierarchy removes from ALL levels (segment, cluster, corpus)</li>
+ *   <li>Deletion from hierarchy removes from both levels (segment, corpus)</li>
  *   <li>No stale false positives after deletion</li>
- *   <li>Segment registration creates cluster filters as needed</li>
+ *   <li>Segment registration creates one filter per segment, and nothing between them</li>
  *   <li>Candidate segment search prunes using hierarchy</li>
  * </ul>
  */
 class HierarchicalCuckooFilterTest {
 
     private HierarchicalCuckooFilter hierarchy;
-    private static final String CLUSTER_1 = "cluster-1";
-    private static final String CLUSTER_2 = "cluster-2";
     private static final String SEGMENT_1 = "segment-1";
     private static final String SEGMENT_2 = "segment-2";
     private static final String SEGMENT_3 = "segment-3";
@@ -42,56 +40,90 @@ class HierarchicalCuckooFilterTest {
     class SegmentRegistrationTests {
 
         @Test
-        @DisplayName("should register segment and create cluster filter")
-        void shouldRegisterSegmentAndCreateCluster() {
-            CuckooFilter segmentFilter = hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+        @DisplayName("should register a segment with a filter of its own")
+        void shouldRegisterSegment() {
+            CuckooFilter segmentFilter = hierarchy.registerSegment(SEGMENT_1);
 
             assertThat(segmentFilter).isNotNull();
             assertThat(hierarchy.getSegmentFilter(SEGMENT_1)).isSameAs(segmentFilter);
-            assertThat(hierarchy.getClusterFilter(CLUSTER_1)).isNotNull();
             assertThat(hierarchy.getSegmentCount()).isEqualTo(1);
-            assertThat(hierarchy.getClusterCount()).isEqualTo(1);
         }
 
         @Test
-        @DisplayName("should reuse cluster filter for multiple segments in same cluster")
-        void shouldReuseClusterFilter() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
-            hierarchy.registerSegment(SEGMENT_2, CLUSTER_1);
+        @DisplayName("registering a segment twice keeps the filter it already has")
+        void registeringTwiceKeepsTheFilter() {
+            CuckooFilter first = hierarchy.registerSegment(SEGMENT_1);
+            hierarchy.insert(toBytes("kept"), SEGMENT_1);
 
-            assertThat(hierarchy.getClusterFilter(CLUSTER_1)).isNotNull();
+            assertThat(hierarchy.registerSegment(SEGMENT_1)).isSameAs(first);
+            assertThat(hierarchy.mightContainInSegment(toBytes("kept"), SEGMENT_1)).isTrue();
+        }
+
+        @Test
+        @DisplayName("gives each segment its own filter")
+        void givesEachSegmentItsOwnFilter() {
+            hierarchy.registerSegment(SEGMENT_1);
+            hierarchy.registerSegment(SEGMENT_2);
+
+            assertThat(hierarchy.getSegmentFilter(SEGMENT_1))
+                .isNotSameAs(hierarchy.getSegmentFilter(SEGMENT_2));
             assertThat(hierarchy.getSegmentCount()).isEqualTo(2);
-            assertThat(hierarchy.getClusterCount()).isEqualTo(1);
         }
 
         @Test
-        @DisplayName("should create separate cluster filters for different clusters")
-        void shouldCreateSeparateClusterFilters() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
-            hierarchy.registerSegment(SEGMENT_2, CLUSTER_2);
+        @DisplayName("takes a filter built elsewhere, and trusts it afresh")
+        void registersAnExistingFilter() {
+            CuckooFilter built =
+                CuckooFilter.create(1_000, 13, hierarchy.getCorpusFilter().seed());
+            built.insert(toBytes("prebuilt"));
 
-            assertThat(hierarchy.getClusterFilter(CLUSTER_1)).isNotSameAs(hierarchy.getClusterFilter(CLUSTER_2));
-            assertThat(hierarchy.getClusterCount()).isEqualTo(2);
+            hierarchy.registerSegment(SEGMENT_1, built);
+
+            assertThat(hierarchy.getSegmentFilter(SEGMENT_1)).isSameAs(built);
+            assertThat(hierarchy.coversSegment(SEGMENT_1)).isTrue();
+        }
+
+        @Test
+        @DisplayName("refuses a filter that does not hash as the corpus level does")
+        void refusesAFilterHashedDifferently() {
+            long seed = hierarchy.getCorpusFilter().seed();
+
+            assertThatThrownBy(() -> hierarchy.registerSegment(SEGMENT_1,
+                    CuckooFilter.create(1_000, 13, seed + 1)))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> hierarchy.registerSegment(SEGMENT_1,
+                    CuckooFilter.create(1_000, 16, seed)))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> hierarchy.registerSegment(SEGMENT_1,
+                    CuckooFilter.create(100_000_000, 13, seed)))
+                .as("more buckets than the corpus level")
+                .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        @Test
+        @DisplayName("refuses an existing filter without a segment or a filter")
+        void refusesIncompleteExistingFilter() {
+            CuckooFilter built = CuckooFilter.create(1_000, 13);
+
+            assertThatThrownBy(() -> hierarchy.registerSegment(null, built))
+                .isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() -> hierarchy.registerSegment(SEGMENT_1, (CuckooFilter) null))
+                .isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() -> hierarchy.registerSegment("", built))
+                .isInstanceOf(IllegalArgumentException.class);
         }
 
         @Test
         @DisplayName("should throw on null segment ID")
         void shouldThrowOnNullSegmentId() {
-            assertThatThrownBy(() -> hierarchy.registerSegment(null, CLUSTER_1))
-                .isInstanceOf(NullPointerException.class);
-        }
-
-        @Test
-        @DisplayName("should throw on null cluster ID")
-        void shouldThrowOnNullClusterId() {
-            assertThatThrownBy(() -> hierarchy.registerSegment(SEGMENT_1, null))
+            assertThatThrownBy(() -> hierarchy.registerSegment(null))
                 .isInstanceOf(NullPointerException.class);
         }
 
         @Test
         @DisplayName("should throw on empty segment ID")
         void shouldThrowOnEmptySegmentId() {
-            assertThatThrownBy(() -> hierarchy.registerSegment("", CLUSTER_1))
+            assertThatThrownBy(() -> hierarchy.registerSegment(""))
                 .isInstanceOf(IllegalArgumentException.class);
         }
     }
@@ -103,14 +135,13 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should insert into all hierarchy levels")
         void shouldInsertIntoAllLevels() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
 
             byte[] item = toBytes("test-item-1");
             boolean inserted = hierarchy.insert(item, SEGMENT_1);
 
             assertThat(inserted).isTrue();
             assertThat(hierarchy.getCorpusFilter().contains(item)).isTrue();
-            assertThat(hierarchy.getClusterFilter(CLUSTER_1).contains(item)).isTrue();
             assertThat(hierarchy.getSegmentFilter(SEGMENT_1).contains(item)).isTrue();
         }
 
@@ -126,7 +157,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should track total entries")
         void shouldTrackTotalEntries() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
 
             hierarchy.insert(toBytes("item-1"), SEGMENT_1);
             hierarchy.insert(toBytes("item-2"), SEGMENT_1);
@@ -150,7 +181,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should check full hierarchy for segment membership")
         void shouldCheckFullHierarchyForSegment() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             byte[] item = toBytes("test-item");
             hierarchy.insert(item, SEGMENT_1);
 
@@ -161,9 +192,9 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should find candidate segments")
         void shouldFindCandidateSegments() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
-            hierarchy.registerSegment(SEGMENT_2, CLUSTER_1);
-            hierarchy.registerSegment(SEGMENT_3, CLUSTER_2);
+            hierarchy.registerSegment(SEGMENT_1);
+            hierarchy.registerSegment(SEGMENT_2);
+            hierarchy.registerSegment(SEGMENT_3);
 
             byte[] item = toBytes("test-item");
             hierarchy.insert(item, SEGMENT_1);
@@ -182,7 +213,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should delete from all hierarchy levels")
         void shouldDeleteFromAllLevels() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             byte[] item = toBytes("test-item");
             hierarchy.insert(item, SEGMENT_1);
 
@@ -190,14 +221,13 @@ class HierarchicalCuckooFilterTest {
 
             assertThat(deleted).isTrue();
             assertThat(hierarchy.getCorpusFilter().contains(item)).isFalse();
-            assertThat(hierarchy.getClusterFilter(CLUSTER_1).contains(item)).isFalse();
             assertThat(hierarchy.getSegmentFilter(SEGMENT_1).contains(item)).isFalse();
         }
 
         @Test
         @DisplayName("should return false when deleting non-existent item")
         void shouldReturnFalseWhenDeletingNonExistent() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             byte[] item = toBytes("non-existent");
 
             boolean deleted = hierarchy.deleteFromHierarchy(item, SEGMENT_1);
@@ -208,7 +238,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should decrement total entries on deletion")
         void shouldDecrementTotalEntriesOnDeletion() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             byte[] item = toBytes("test-item");
             hierarchy.insert(item, SEGMENT_1);
             long countBefore = hierarchy.getTotalEntries();
@@ -221,7 +251,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should delete from hierarchy without segment ID (searches all segments)")
         void shouldDeleteWithoutSegmentId() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             byte[] item = toBytes("test-item");
             hierarchy.insert(item, SEGMENT_1);
 
@@ -235,7 +265,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should delete multiple items in batch")
         void shouldDeleteMultipleInBatch() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             byte[] item1 = toBytes("item-1");
             byte[] item2 = toBytes("item-2");
             byte[] item3 = toBytes("item-3");
@@ -264,7 +294,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should throw on null item in delete")
         void shouldThrowOnNullItem() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
 
             assertThatThrownBy(() -> hierarchy.deleteFromHierarchy((byte[]) null, SEGMENT_1))
                 .isInstanceOf(NullPointerException.class);
@@ -278,7 +308,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should not have false positives after deletion")
         void shouldNotHaveFalsePositivesAfterDeletion() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             byte[] item = toBytes("unique-test-item-for-fp-check");
             hierarchy.insert(item, SEGMENT_1);
 
@@ -301,7 +331,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should isolate deletions to specific item")
         void shouldIsolateDeletions() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             byte[] item1 = toBytes("item-1");
             byte[] item2 = toBytes("item-2");
             hierarchy.insert(item1, SEGMENT_1);
@@ -323,7 +353,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should unregister segment")
         void shouldUnregisterSegment() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
 
             boolean removed = hierarchy.unregisterSegment(SEGMENT_1);
 
@@ -361,9 +391,9 @@ class HierarchicalCuckooFilterTest {
             // term would read the filter's silence as "not in this segment" and skip it. The
             // documents are in storage and the answer is empty, which is the one outcome a
             // pre-filter must never produce.
-            HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 100_000, 8);
-            small.registerSegment(SEGMENT_1, CLUSTER_1);
-            small.registerSegment(SEGMENT_2, CLUSTER_1);
+            HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 8);
+            small.registerSegment(SEGMENT_1);
+            small.registerSegment(SEGMENT_2);
             small.insert(toBytes("kept"), SEGMENT_2);
 
             assertThat(fillUntilRefused(small, SEGMENT_1, 4096))
@@ -381,14 +411,17 @@ class HierarchicalCuckooFilterTest {
         void aFullCorpusLevelWithdrawsEveryVerdict() {
             // The corpus filter is the first level findCandidateSegments consults, so a term it
             // has no room for is invisible everywhere - not only in the segment being written.
-            HierarchicalCuckooFilter tiny = new HierarchicalCuckooFilter(8, 13, 1_000_000, 1_000_000);
-            tiny.registerSegment(SEGMENT_1, CLUSTER_1);
-            tiny.registerSegment(SEGMENT_2, CLUSTER_2);
+            // Spread over many segments, so the one level that holds every term is the one
+            // that runs out of room first.
+            HierarchicalCuckooFilter tiny = new HierarchicalCuckooFilter(8, 13, 8);
+            tiny.registerSegment(SEGMENT_1);
+            tiny.registerSegment(SEGMENT_2);
             tiny.insert(toBytes("kept"), SEGMENT_2);
-
-            assertThat(fillUntilRefused(tiny, SEGMENT_1, 4096))
-                .as("the corpus level has to fill for this test to mean anything")
-                .isNotNegative();
+            for (int i = 0; i < 4096 && !tiny.isSaturated(); i++) {
+                String spread = "spread-" + (i % 64);
+                tiny.registerSegment(spread);
+                tiny.insert(toBytes("term-" + i), spread);
+            }
 
             assertThat(tiny.isSaturated()).isTrue();
             assertThat(tiny.coversSegment(SEGMENT_1)).isFalse();
@@ -398,7 +431,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("a populated segment that never refused anything is authoritative")
         void aPopulatedSegmentIsAuthoritative() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             hierarchy.insert(toBytes("alpha"), SEGMENT_1);
 
             assertThat(hierarchy.coversSegment(SEGMENT_1)).isTrue();
@@ -408,7 +441,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("a segment holding nothing has no verdict to give")
         void anEmptySegmentHasNoVerdict() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
 
             assertThat(hierarchy.coversSegment(SEGMENT_1)).isFalse();
             assertThat(hierarchy.coversSegment("never-registered")).isFalse();
@@ -420,13 +453,13 @@ class HierarchicalCuckooFilterTest {
             // A split replaces a segment with children, and a reindex re-registers one. The new
             // filter has refused nothing, so carrying the old mark would disable pruning for a
             // segment id forever.
-            HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 100_000, 8);
-            small.registerSegment(SEGMENT_1, CLUSTER_1);
+            HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 8);
+            small.registerSegment(SEGMENT_1);
             assertThat(fillUntilRefused(small, SEGMENT_1, 4096)).isNotNegative();
             assertThat(small.coversSegment(SEGMENT_1)).isFalse();
 
             small.unregisterSegment(SEGMENT_1);
-            small.registerSegment(SEGMENT_1, CLUSTER_1);
+            small.registerSegment(SEGMENT_1);
             small.insert(toBytes("fresh"), SEGMENT_1);
 
             assertThat(small.coversSegment(SEGMENT_1)).isTrue();
@@ -440,7 +473,7 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should insert string key")
         void shouldInsertStringKey() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
 
             boolean inserted = hierarchy.insertKey("test-key", SEGMENT_1);
 
@@ -451,13 +484,93 @@ class HierarchicalCuckooFilterTest {
         @Test
         @DisplayName("should delete string key")
         void shouldDeleteStringKey() {
-            hierarchy.registerSegment(SEGMENT_1, CLUSTER_1);
+            hierarchy.registerSegment(SEGMENT_1);
             hierarchy.insertKey("test-key", SEGMENT_1);
 
             boolean deleted = hierarchy.deleteKey("test-key", SEGMENT_1);
 
             assertThat(deleted).isTrue();
             assertThat(hierarchy.mightContainKey("test-key", SEGMENT_1)).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("Construction")
+    class ConstructionTests {
+
+        @Test
+        @DisplayName("refuses a level that could hold nothing")
+        void refusesEmptyLevels() {
+            assertThatThrownBy(() -> new HierarchicalCuckooFilter(0))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new HierarchicalCuckooFilter(1_000, 13, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new HierarchicalCuckooFilter(CuckooFilter.create(1_000, 13), 0))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new HierarchicalCuckooFilter(null, 100))
+                .isInstanceOf(NullPointerException.class);
+            assertThatThrownBy(() -> new HierarchicalCuckooFilter(8, 13, 1_000_000))
+                .as("a segment sized past the corpus")
+                .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        @Test
+        @DisplayName("every segment filter hashes with the corpus filter's seed")
+        void segmentsShareTheCorpusSeed() {
+            assertThat(hierarchy.registerSegment(SEGMENT_1).seed())
+                .isEqualTo(hierarchy.getCorpusFilter().seed());
+        }
+
+        @Test
+        @DisplayName("builds on a corpus filter it is given, at that filter's fingerprint width")
+        void buildsOnAGivenCorpusFilter() {
+            CuckooFilter corpus = CuckooFilter.create(10_000, 16);
+            HierarchicalCuckooFilter built = new HierarchicalCuckooFilter(corpus, 100);
+
+            built.registerSegment(SEGMENT_1);
+            built.insert(toBytes("term"), SEGMENT_1);
+
+            assertThat(built.getCorpusFilter()).isSameAs(corpus);
+            assertThat(corpus.contains(toBytes("term"))).isTrue();
+            assertThat(built.getSegmentFilter(SEGMENT_1).fingerprintBits()).isEqualTo(16);
+            assertThat(built.segmentCapacity()).isEqualTo(100);
+        }
+
+        @Test
+        @DisplayName("deleting a term keeps a corpus entry another segment's colliding term needs")
+        void aCollisionSurvivesTheOtherTermsDelete() {
+            // The corpus level stores a fingerprint once. Two different terms that land on the
+            // same fingerprint and buckets there share that entry, so deleting it for one would
+            // leave the other denied at the corpus level and its segment pruned.
+            HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(8, 8, 8);
+            small.registerSegment(SEGMENT_1);
+            small.registerSegment(SEGMENT_2);
+            byte[] deleted = toBytes("deleted");
+            small.insert(deleted, SEGMENT_1);
+            byte[] survivor = null;
+            for (int i = 0; survivor == null && i < 10_000_000; i++) {
+                byte[] candidate = toBytes("candidate-" + i);
+                if (small.getCorpusFilter().contains(candidate)) {
+                    survivor = candidate;
+                }
+            }
+            assertThat(survivor).as("a colliding term has to exist for this to mean anything")
+                .isNotNull();
+            small.insert(survivor, SEGMENT_2);
+
+            assertThat(small.deleteFromHierarchy(deleted, SEGMENT_1)).isTrue();
+
+            assertThat(small.getCorpusFilter().contains(survivor)).isTrue();
+            assertThat(small.findCandidateSegments(survivor)).contains(SEGMENT_2);
+        }
+
+        @Test
+        @DisplayName("describes itself by the two levels it has")
+        void describesItsLevels() {
+            hierarchy.registerSegment(SEGMENT_1);
+
+            assertThat(hierarchy.toString())
+                .startsWith("HierarchicalCuckooFilter[segments=1, entries=0,");
         }
     }
 

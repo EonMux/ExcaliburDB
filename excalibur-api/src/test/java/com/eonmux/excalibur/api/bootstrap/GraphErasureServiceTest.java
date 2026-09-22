@@ -8,6 +8,7 @@ import com.eonmux.excalibur.graph.erasure.ErasureScope;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
+import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.store.EdgeStoreWriter;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.retrieval.lexical.LexicalIndex;
@@ -40,6 +41,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("Graph erasure service")
 class GraphErasureServiceTest {
 
+    /** The pipeline being served, for identity checks; the reading is released at once. */
+    private static java.util.Optional<com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline>
+            served(GraphRagHolder holder) {
+        java.util.Optional<GraphRagHolder.Reading> reading = holder.acquire();
+        reading.ifPresent(GraphRagHolder.Reading::close);
+        return reading.map(GraphRagHolder.Reading::pipeline);
+    }
+
     private static final int ADA = 1;
     private static final int BABBAGE = 2;
     private static final int COLLABORATED_WITH = 0;
@@ -62,12 +71,12 @@ class GraphErasureServiceTest {
         @DisplayName("leaves the served graph mapped rather than closing and reopening it")
         void doesNotDisturbTheServedGraph(@TempDir Path root) throws IOException {
             GraphErasureService service = serviceOver(root);
-            GraphRagPipeline before = holder.pipeline().orElseThrow();
+            GraphRagPipeline before = served(holder).orElseThrow();
 
             GraphErasureService.ErasureOutcome outcome = service.compactIfDue();
 
             assertThat(outcome.ran()).isFalse();
-            assertThat(holder.pipeline().orElseThrow())
+            assertThat(served(holder).orElseThrow())
                 .as("a reopened stack is a different pipeline, and a query in the gap would "
                     + "have been told no graph is built")
                 .isSameAs(before);
@@ -83,11 +92,11 @@ class GraphErasureServiceTest {
         @DisplayName("an explicit compaction still goes through, since a caller asked for it")
         void forcingStillRuns(@TempDir Path root) throws IOException {
             GraphErasureService service = serviceOver(root);
-            GraphRagPipeline before = holder.pipeline().orElseThrow();
+            GraphRagPipeline before = served(holder).orElseThrow();
 
             service.compactNow();
 
-            assertThat(holder.pipeline().orElseThrow()).isNotSameAs(before);
+            assertThat(served(holder).orElseThrow()).isNotSameAs(before);
         }
     }
 
@@ -102,12 +111,12 @@ class GraphErasureServiceTest {
             // hold, so the attempt finds nothing to rewrite and the reopened stack is the one
             // this test started with. What is being checked is that the close happened at all.
             GraphErasureService service = serviceOver(root, Duration.ZERO);
-            GraphRagPipeline before = holder.pipeline().orElseThrow();
+            GraphRagPipeline before = served(holder).orElseThrow();
             service.submit(new ErasureScope.Entity(UNKNOWN_ENTITY));
 
             service.compactIfDue();
 
-            assertThat(holder.pipeline().orElseThrow()).isNotSameAs(before);
+            assertThat(served(holder).orElseThrow()).isNotSameAs(before);
         }
 
         @Test
@@ -118,6 +127,37 @@ class GraphErasureServiceTest {
             assertThat(service.outstandingCount()).isZero();
             service.submit(new ErasureScope.Entity(ADA));
             assertThat(service.outstandingCount()).isEqualTo(1);
+        }
+    }
+
+    @Nested
+    @DisplayName("After a publish was interrupted")
+    class InterruptedPublish {
+
+        @Test
+        @DisplayName("the displaced graph is restored and erased, not left beside the staging pass")
+        void erasesTheDisplacedGraph(@TempDir Path root) throws IOException {
+            // A crash between a publish's two renames leaves only graph.previous. Treating that
+            // as "no graph built" would discharge the obligation against staging alone while the
+            // displaced copy, still holding the facts, sat on disk until the next build.
+            Path graph = root.resolve("graph");
+            buildGraph(graph);
+            java.nio.file.Files.move(graph, GraphBuilder.previousFor(graph));
+            Config config = new Config(Map.of());
+            holder = new GraphRagHolder(graph, null);
+            GraphErasureService service = new GraphErasureService(
+                new GraphErasureCoordinator(ErasureLog.open(root.resolve("erasure.log")),
+                    CompactionPolicy.standard(0.2, Duration.ZERO, Integer.MAX_VALUE),
+                    Clock.systemUTC()),
+                holder, config);
+            service.submit(new ErasureScope.Entity(ADA));
+
+            GraphErasureService.ErasureOutcome outcome = service.compactNow();
+
+            assertThat(outcome.reason()).doesNotContain("no graph has been built");
+            assertThat(outcome.edgesRemoved()).isEqualTo(1);
+            assertThat(graph).isDirectory();
+            assertThat(GraphBuilder.previousFor(graph)).doesNotExist();
         }
     }
 

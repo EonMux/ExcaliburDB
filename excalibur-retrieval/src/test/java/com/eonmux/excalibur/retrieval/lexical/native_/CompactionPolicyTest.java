@@ -440,6 +440,69 @@ class CompactionPolicyTest {
                 .isFalse();
             assertThat(DocumentErasureLog.open(dir).oldestOutstanding()).isEmpty();
         }
+
+        @Test
+        @DisplayName("a confirmed promise is still owed but no longer replayed, across a reopen")
+        void confirmationSurvivesReopening(@TempDir Path dir) throws Exception {
+            DocumentErasureLog log = DocumentErasureLog.open(dir);
+            Instant at = Instant.parse("2026-01-01T00:00:00Z");
+            log.append(List.of("a", "b"), at);
+            log.confirmApplied(List.of("a"));
+
+            DocumentErasureLog reopened = DocumentErasureLog.open(dir);
+            assertThat(reopened.outstandingKeys()).containsExactly("a", "b");
+            assertThat(reopened.unappliedKeys()).containsExactly("b");
+            assertThat(reopened.oldestOutstanding()).contains(at);
+        }
+
+        @Test
+        @DisplayName("a later promise of a confirmed key is unapplied until it is confirmed too")
+        void laterPromiseIsNotConfirmedByAnEarlierOne(@TempDir Path dir) throws Exception {
+            DocumentErasureLog log = DocumentErasureLog.open(dir);
+            Instant at = Instant.parse("2026-01-01T00:00:00Z");
+            log.append(List.of("a"), at);
+            log.confirmApplied(List.of("a"));
+            log.append(List.of("a"), at.plus(Duration.ofMinutes(1)));
+
+            assertThat(DocumentErasureLog.open(dir).unappliedKeys()).containsExactly("a");
+        }
+
+        @Test
+        @DisplayName("confirmation survives the rewrite a compaction makes")
+        void retainKeepsConfirmation(@TempDir Path dir) throws Exception {
+            DocumentErasureLog log = DocumentErasureLog.open(dir);
+            Instant at = Instant.parse("2026-01-01T00:00:00Z");
+            log.append(List.of("a", "b", "c"), at);
+            log.confirmApplied(List.of("a", "b"));
+            log.retain(Set.of("a", "c"));
+
+            DocumentErasureLog reopened = DocumentErasureLog.open(dir);
+            assertThat(reopened.outstandingKeys()).containsExactly("a", "c");
+            assertThat(reopened.unappliedKeys()).containsExactly("c");
+        }
+
+        @Test
+        @DisplayName("a version 1 log is read as wholly unapplied, and upgraded before it grows")
+        void versionOneIsUpgraded(@TempDir Path dir) throws Exception {
+            // Version 1 recorded nothing about application, so replaying all of it is the only
+            // reading that cannot lose a promise.
+            Files.writeString(dir.resolve("erasure.log"),
+                "excalibur-lexical-erasure v1\n1767225600000\told\n");
+
+            DocumentErasureLog log = DocumentErasureLog.open(dir);
+            assertThat(log.unappliedKeys()).containsExactly("old");
+
+            log.append(List.of("new"), Instant.parse("2026-01-02T00:00:00Z"));
+            log.confirmApplied(List.of("old"));
+
+            assertThat(Files.readAllLines(dir.resolve("erasure.log")).get(0))
+                .isEqualTo("excalibur-lexical-erasure v2");
+            DocumentErasureLog reopened = DocumentErasureLog.open(dir);
+            assertThat(reopened.outstandingKeys()).containsExactly("old", "new");
+            assertThat(reopened.unappliedKeys()).containsExactly("new");
+            assertThat(reopened.oldestOutstanding())
+                .contains(Instant.ofEpochMilli(1767225600000L));
+        }
     }
 
     @Nested

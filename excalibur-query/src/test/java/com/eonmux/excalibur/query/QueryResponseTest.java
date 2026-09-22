@@ -211,6 +211,77 @@ class QueryResponseTest {
     }
 
     @Nested
+    @DisplayName("Relevancy scoring and caching")
+    class ScoringAndCaching {
+
+        private QueryResponse healthy() {
+            return new QueryResponse("q-1", List.of(createResult(1L, 0.9f)),
+                IndexCoverage.builder().totalSegments(1).activeSegments(1).segmentsSearched(1)
+                    .estimatedCorpusCoverage(1.0).degraded(false).build(),
+                10, false, false);
+        }
+
+        @Test
+        @DisplayName("is unscored unless Stage 5 says otherwise, and every copy keeps the flag")
+        void llmScoredSurvivesEveryCopy() {
+            QueryResponse scored = healthy().withLlmScored(true);
+
+            assertThat(healthy().llmScored()).isFalse();
+            assertThat(scored.llmScored()).isTrue();
+            assertThat(scored.withFromCache().llmScored()).isTrue();
+            assertThat(scored.withQueryTimeMs(5).llmScored()).isTrue();
+            assertThat(scored.withTimedOut(true).llmScored()).isTrue();
+            assertThat(scored.withCancelled(true).llmScored()).isTrue();
+            assertThat(scored.withQueryId("q-2").llmScored()).isTrue();
+            assertThat(scored.withResults(List.of()).llmScored()).isTrue();
+            assertThat(scored.withCoverage(createCoverage()).llmScored()).isTrue();
+        }
+
+        @Test
+        @DisplayName("the flag is part of equality, because it changes what score means")
+        void llmScoredIsPartOfEquality() {
+            assertThat(healthy().withLlmScored(true)).isNotEqualTo(healthy());
+            assertThat(healthy().withLlmScored(true).toString()).contains("llmScored=true");
+        }
+
+        @Test
+        @DisplayName("replaces the ranking or the coverage and nothing else")
+        void replacesRankingAndCoverage() {
+            QueryResponse original = healthy();
+            List<QueryResultItem> other = List.of(createResult(2L, 0.5f));
+
+            QueryResponse reranked = original.withResults(other);
+            QueryResponse degraded = original.withCoverage(
+                original.coverage().orDegraded(true));
+
+            assertThat(reranked.results()).isEqualTo(other);
+            assertThat(reranked.queryId()).isEqualTo("q-1");
+            assertThat(degraded.isDegraded()).isTrue();
+            assertThat(degraded.results()).isEqualTo(original.results());
+        }
+
+        @Test
+        @DisplayName("may be cached only when whole, in time and not withdrawn")
+        void cacheability() {
+            assertThat(healthy().cacheable()).isTrue();
+            assertThat(healthy().withTimedOut(true).cacheable()).isFalse();
+            assertThat(healthy().withCancelled(true).cacheable()).isFalse();
+            assertThat(healthy().withCoverage(createCoverage().orDegraded(true)).cacheable())
+                .isFalse();
+        }
+
+        @Test
+        @DisplayName("is stored without the query id of the request that produced it, and "
+            + "replayed saying it came from the cache")
+        void storageAndReplay() {
+            QueryResponse stored = healthy().forStorage();
+
+            assertThat(stored.queryId()).isNull();
+            assertThat(stored.servedFromCache().fromCache()).isTrue();
+        }
+    }
+
+    @Nested
     @DisplayName("Object methods")
     class ObjectMethods {
 

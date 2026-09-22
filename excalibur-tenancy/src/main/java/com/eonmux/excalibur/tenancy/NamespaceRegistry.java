@@ -409,7 +409,18 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
             if (resource == null) {
                 throw new IOException("loader returned no resource for namespace " + id);
             }
-            long[] resourceCost = cost.costOf(resource);
+            long[] resourceCost;
+            try {
+                resourceCost = measure(id, resource);
+            } catch (RuntimeException e) {
+                // Not yet in the registry, so nothing else would ever close it.
+                try {
+                    resource.close();
+                } catch (Exception closing) {
+                    e.addSuppressed(closing);
+                }
+                throw e;
+            }
             Entry<T> entry = new Entry<>(id, resource, resourceCost[0], resourceCost[1]);
             open.put(id, entry);
             budget.acquire(entry.mappings, entry.descriptors);
@@ -419,6 +430,20 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
         } catch (IOException e) {
             throw new UncheckedIOException("failed to open namespace " + id, e);
         }
+    }
+
+    /**
+     * What a resource costs, refusing an answer the budget could not account for.
+     *
+     * @throws IllegalStateException if the cost is not two non-negative counts
+     */
+    private long[] measure(NamespaceId id, T resource) {
+        long[] measured = cost.costOf(resource);
+        if (measured == null || measured.length != 2 || measured[0] < 0 || measured[1] < 0) {
+            throw new IllegalStateException("namespace " + id + " reported a cost that is not "
+                + "two non-negative counts: " + java.util.Arrays.toString(measured));
+        }
+        return measured;
     }
 
     /**
@@ -432,11 +457,30 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
      * <p>The incoming namespace's cost cannot be known before it is opened, so this reserves one
      * average namespace's worth. That estimate is why the high-water mark sits well below the real
      * limit: the headroom absorbs the times a namespace turns out larger than the average.
+     *
+     * <p>The rest of the process is measured first, once per open. The limits are the process's,
+     * and the storage segments, vector graphs and lexical index the rest of the node holds have
+     * moved since the last namespace opened; the room a new graph is given has to be the room the
+     * process has now. It is measured once rather than after every eviction, because an eviction
+     * gives back exactly what the registry accounted for it and nothing else changes in between -
+     * and because the kernel may not have unmapped a closed store by the time a second reading was
+     * taken, which would make the eviction look as though it had freed nothing.
      */
     private void evictUntilRoomFor(NamespaceId incoming) {
+        budget.refreshProcessUsage();
         long[] estimate = estimatedCostOfNextLoad();
+        boolean budgetCanHelp = !budget.isRestOfProcessOverHighWater();
+        if (!budgetCanHelp) {
+            // The rest of the node alone is past the mark, so no number of evictions could make
+            // room. Evicting for it anyway would empty the working set on every open and gain
+            // nothing; only the count bound is still worth enforcing.
+            LOGGER.warn("the rest of this process is past the mapping budget's high-water "
+                + "mark before any graph is counted, so {} is opened outside it with {} "
+                + "namespace(s) open. Raise vm.max_map_count or the open-file limit. {}",
+                incoming, open.size(), budget);
+        }
         while (open.size() >= maxOpenNamespaces
-                || budget.wouldExceedHighWater(estimate[0], estimate[1])) {
+                || (budgetCanHelp && budget.wouldExceedHighWater(estimate[0], estimate[1]))) {
             NamespaceId victim = chooseVictim(incoming);
             if (victim == null && open.isEmpty()) {
                 // Nothing is open, so nothing can be evicted: the budget has no room for even
@@ -548,19 +592,6 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
     }
 
     /**
-     * Evicts a namespace, saying whether its resource was closed or the close was deferred.
-     *
-     * <p>An open namespace leaves the registry immediately either way, so a later
-     * {@link #get(NamespaceId)} reopens it. What a lease changes is only when the old resource is
-     * closed: while one is outstanding the resource stays open and its mappings stay on the budget,
-     * because closing it would break the reader holding the lease, and releasing its accounting
-     * early would tell the budget it has headroom that is still in use.
-     *
-     * @param id the namespace to evict
-     * @return what happened - {@link Eviction#NOT_OPEN}, {@link Eviction#CLOSED} or
-     *         {@link Eviction#DEFERRED}
-     */
-    /**
      * Re-measures what an open namespace costs and corrects the budget by the difference.
      *
      * <p>A resource's cost is not fixed for its lifetime. A graph tenant that was opened before
@@ -569,8 +600,8 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
      * without this the budget would go on believing the figure taken at load and under-count the
      * process's real mappings for as long as it ran.
      *
-     * <p>Evicting it to force a reopen would also re-measure, and used to be how this happened,
-     * but eviction hands the next caller a <em>different</em> resource. For a namespace something
+     * <p>Evicting it to force a reopen would also re-measure, but eviction hands the next caller
+     * a <em>different</em> resource. For a namespace something
      * holds for the life of the process that is not a re-measurement, it is a second resource on
      * the same files.
      *
@@ -588,7 +619,7 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
             if (entry == null) {
                 return false;
             }
-            long[] measured = cost.costOf(entry.resource);
+            long[] measured = measure(id, entry.resource);
             if (measured[0] == entry.mappings && measured[1] == entry.descriptors) {
                 return false;
             }
@@ -604,6 +635,19 @@ public final class NamespaceRegistry<T extends AutoCloseable> implements AutoClo
         }
     }
 
+    /**
+     * Evicts a namespace, saying whether its resource was closed or the close was deferred.
+     *
+     * <p>An open namespace leaves the registry immediately either way, so a later
+     * {@link #get(NamespaceId)} reopens it. What a lease changes is only when the old resource is
+     * closed: while one is outstanding the resource stays open and its mappings stay on the budget,
+     * because closing it would break the reader holding the lease, and releasing its accounting
+     * early would tell the budget it has headroom that is still in use.
+     *
+     * @param id the namespace to evict
+     * @return what happened - {@link Eviction#NOT_OPEN}, {@link Eviction#CLOSED} or
+     *         {@link Eviction#DEFERRED}
+     */
     public Eviction evictOrDefer(NamespaceId id) {
         lock.lock();
         try {

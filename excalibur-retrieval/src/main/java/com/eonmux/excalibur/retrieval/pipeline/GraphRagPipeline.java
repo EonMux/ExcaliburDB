@@ -1,20 +1,22 @@
 package com.eonmux.excalibur.retrieval.pipeline;
 
-import org.roaringbitmap.RoaringBitmap;
-import java.util.Locale;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.LongFunction;
 
 import com.eonmux.excalibur.core.trace.QueryTrace;
 import com.eonmux.excalibur.core.trace.Stage;
-import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.store.EdgeStore;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
-import com.eonmux.excalibur.graph.store.RelationSelector;
 import com.eonmux.excalibur.graph.subgraph.Subgraph;
-import com.eonmux.excalibur.graph.subgraph.SubgraphEdge;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.planner.ConversationContext;
+import com.eonmux.excalibur.planner.Mention;
 import com.eonmux.excalibur.planner.PlanningOutcome;
 import com.eonmux.excalibur.planner.QueryClassifier;
 import com.eonmux.excalibur.planner.QueryPlan;
@@ -47,6 +49,11 @@ import org.slf4j.LoggerFactory;
  *       the system does not believe in only gives the model material to be confidently wrong
  *       with.</li>
  * </ul>
+ * An abstention that found several readings of one name it could not tell apart goes back to the
+ * user as a question, the same as an unbound pronoun, because one word from the user settles it.
+ * The conversation the caller sends is what that word arrives in: a name linked to several
+ * entities resolves to the ones the conversation names, and the rest are kept out of the walk and
+ * the ranking both.
  */
 public final class GraphRagPipeline {
 
@@ -54,6 +61,7 @@ public final class GraphRagPipeline {
 
     private final QueryClassifier classifier;
     private final EntityLinker linker;
+    private final GraphWalker walker;
     private final EdgeStore edgeStore;
     private final HybridRetriever retriever;
     private final SubgraphSerializer serializer;
@@ -70,12 +78,13 @@ public final class GraphRagPipeline {
     private final QueryEmbedder embedder;
 
     /**
-     * Turns the question's relation words into relation ids, when this node has the dictionary.
+     * Names entities for the people a question goes back to.
      *
-     * <p>Optional. Null is a pipeline that traverses every relation, which is what this did before
-     * there was anything to consult.
+     * <p>An ambiguity is put to someone as names, and it is a name they send back - so the same
+     * names are what the conversation is matched against. Without a dictionary an entity is
+     * called by its id, which is still a name that round-trips.</p>
      */
-    private final RelationResolver relations;
+    private final LongFunction<String> entityNames;
 
     public GraphRagPipeline(QueryClassifier classifier, EntityLinker linker, EdgeStore edgeStore,
                             HybridRetriever retriever, SubgraphSerializer serializer,
@@ -122,8 +131,32 @@ public final class GraphRagPipeline {
                             HybridRetriever retriever, SubgraphSerializer serializer,
                             AbstentionPolicy abstention, SerializationBudget budget, int topK,
                             QueryEmbedder embedder, RelationResolver relations) {
+        this(classifier, linker, edgeStore, retriever, serializer, abstention, budget, topK,
+            embedder, relations, null);
+    }
+
+    /**
+     * Creates a pipeline that can put an ambiguity to the user by name.
+     *
+     * @param classifier  Turns the question into a plan
+     * @param linker      Resolves mentions to entities
+     * @param edgeStore   The graph to traverse
+     * @param retriever   The retrieval signals and their fusion
+     * @param serializer  Renders the subgraph into the model's context
+     * @param abstention  Decides whether the evidence is worth answering from
+     * @param budget      How much context an answer may carry
+     * @param topK        How many documents each signal contributes
+     * @param embedder    Embeds the question, or null when this node has no embedding endpoint
+     * @param relations   Resolves the plan's relation hints, or null to traverse every relation
+     * @param entityNames Names entities, or null to call each by its id
+     */
+    public GraphRagPipeline(QueryClassifier classifier, EntityLinker linker, EdgeStore edgeStore,
+                            HybridRetriever retriever, SubgraphSerializer serializer,
+                            AbstentionPolicy abstention, SerializationBudget budget, int topK,
+                            QueryEmbedder embedder, RelationResolver relations,
+                            LongFunction<String> entityNames) {
         this.embedder = embedder;
-        this.relations = relations;
+        this.entityNames = entityNames != null ? entityNames : id -> "E" + id;
         if (classifier == null || linker == null || edgeStore == null || retriever == null
                 || serializer == null || abstention == null || budget == null) {
             throw new IllegalArgumentException("every pipeline component is required");
@@ -134,6 +167,7 @@ public final class GraphRagPipeline {
         this.classifier = classifier;
         this.linker = linker;
         this.edgeStore = edgeStore;
+        this.walker = new GraphWalker(edgeStore, relations);
         this.retriever = retriever;
         this.serializer = serializer;
         this.abstention = abstention;
@@ -174,7 +208,22 @@ public final class GraphRagPipeline {
      */
     public GraphRagResult answer(String question, ConversationContext context,
                                  TemporalFilter asOf, QueryTrace trace) {
-        return switch (gather(question, context, asOf, trace)) {
+        return answer(question, context, asOf, TraversalDirection.BOTH, trace);
+    }
+
+    /**
+     * Runs the whole pipeline at an instant the caller names, stepping one way if it asks to.
+     *
+     * @param question  the user's question
+     * @param context   what has been mentioned so far, for coreference and disambiguation
+     * @param asOf      the valid-time instant to answer at, or null to use the question's own
+     * @param direction which way along an edge the traversal may step
+     * @param trace     receives per-stage latency
+     */
+    public GraphRagResult answer(String question, ConversationContext context,
+                                 TemporalFilter asOf, TraversalDirection direction,
+                                 QueryTrace trace) {
+        return switch (gather(question, context, asOf, direction, trace)) {
             case Evidence.NeedsUser needsUser -> GraphRagResult.askUser(needsUser.ask(), trace);
             case Evidence.Unresolved unresolved -> GraphRagResult.declined(
                 RetrievalOutcome.NoResults.of(RetrievalOutcome.Reason.UNRESOLVED_REFERENCE),
@@ -203,11 +252,33 @@ public final class GraphRagPipeline {
      */
     public Evidence gather(String question, ConversationContext context, TemporalFilter asOf,
                            QueryTrace trace) {
+        return gather(question, context, asOf, TraversalDirection.BOTH, trace);
+    }
+
+    /**
+     * As {@link #gather(String, ConversationContext, TemporalFilter, QueryTrace)}, stepping one
+     * way along each edge if the caller asks to.
+     *
+     * @param question  the user's question
+     * @param context   what has been mentioned so far, for coreference and disambiguation
+     * @param asOf      the valid-time instant to answer at, or null to use the question's own
+     * @param direction which way along an edge the traversal may step
+     * @param trace     receives per-stage latency
+     * @return the evidence, or the reason the question never reached retrieval
+     * @throws IllegalStateException if a one-way walk is asked of a pipeline with no relation
+     *                               vocabulary to name the relations with
+     */
+    public Evidence gather(String question, ConversationContext context, TemporalFilter asOf,
+                           TraversalDirection direction, QueryTrace trace) {
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("question must not be blank");
         }
-        if (context == null || trace == null) {
-            throw new IllegalArgumentException("context and trace must not be null");
+        if (context == null || trace == null || direction == null) {
+            throw new IllegalArgumentException("context, direction and trace must not be null");
+        }
+        if (direction != TraversalDirection.BOTH && !walker.canRestrictDirection()) {
+            throw new IllegalStateException("a " + direction.wireName() + " traversal needs the "
+                + "graph's relation vocabulary, and this pipeline was built without one");
         }
 
         PlanningOutcome planning =
@@ -217,32 +288,187 @@ public final class GraphRagPipeline {
         }
         QueryPlan plan = at(((PlanningOutcome.Planned) planning).plan(), asOf);
 
-        long[] seeds = trace.time(Stage.LINK, () -> linkAll(plan));
-        if (seeds.length == 0) {
+        Linked linked = trace.time(Stage.LINK, () -> linkAll(plan, namedBy(context)));
+        if (linked.seeds().length == 0) {
             return new Evidence.Unresolved(plan);
         }
 
-        Subgraph subgraph = trace.time(Stage.TRAVERSE, () -> traverse(plan, seeds));
-        List<FusedDocument> fused = retriever.retrieve(
-            queryFor(retrievalTextFor(question, plan)), topK, trace);
-        return new Evidence.Gathered(fused, subgraph, plan);
+        Subgraph subgraph =
+            trace.time(Stage.TRAVERSE, () -> walker.walk(plan, linked.seeds(), direction));
+        List<FusedDocument> ranked = without(retriever.retrieve(
+            queryFor(retrievalTextFor(question, plan)), topK, trace), linked.ruledOut());
+        return new Evidence.Gathered(readings(ranked, linked.readings()), ranked, subgraph, plan);
+    }
+
+    /**
+     * The ranked entries abstention judges: the readings of what the question named.
+     *
+     * <p>Not the whole ranking. The answer is the walk from the linked entities, so the evidence
+     * for answering is how well <em>they</em> matched, and an ambiguity is several entities
+     * competing for one name the question used. An entity the question did not name is neither:
+     * it may tie with the named one - every entity extracted from one snippet is described by
+     * that snippet, and scores exactly alike - without the question being in any doubt about whom
+     * it asked about. Judged over the whole ranking, that tie would hand back a "which did you
+     * mean" between an entity the question named and one it never mentioned.
+     *
+     * <p>So: when a mention resolved to several entities that retrieval ranked, the question is
+     * judged on the one in most doubt - the mention whose two best readings score closest - and
+     * the gap between them is what separation measures. When no mention is in doubt, it is judged
+     * on its best-matching named entity alone, and only the score gate applies.
+     *
+     * @param ranked   every entity retrieval ranked, best first
+     * @param readings the entities each mention resolved to, one array per mention
+     * @return the entries to judge, best first; empty when retrieval ranked no named entity
+     */
+    private static List<FusedDocument> readings(List<FusedDocument> ranked,
+                                                List<long[]> readings) {
+        List<FusedDocument> contested = List.of();
+        double closest = Double.NEGATIVE_INFINITY;
+        FusedDocument best = null;
+        for (long[] mention : readings) {
+            List<FusedDocument> entries = new ArrayList<>();
+            for (FusedDocument document : ranked) {
+                if (contains(mention, document.documentId())) {
+                    entries.add(document);
+                }
+            }
+            if (!entries.isEmpty() && (best == null || entries.get(0).score() > best.score())) {
+                best = entries.get(0);
+            }
+            if (entries.size() > 1) {
+                double closeness = closeness(entries.get(0), entries.get(1));
+                if (closeness > closest) {
+                    closest = closeness;
+                    contested = entries;
+                }
+            }
+        }
+        if (!contested.isEmpty()) {
+            return contested;
+        }
+        return best == null ? List.of() : List.of(best);
+    }
+
+    /**
+     * How near the runner-up comes to the best, as a fraction of the best; higher is closer.
+     *
+     * <p>Only for choosing which mention is in most doubt. A best score of zero or less has no
+     * fraction to take, and two such readings are as close as readings get.
+     */
+    private static double closeness(FusedDocument best, FusedDocument second) {
+        return best.score() > 0 ? second.score() / best.score() : 1.0;
+    }
+
+    private static boolean contains(long[] values, long wanted) {
+        for (long value : values) {
+            if (value == wanted) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Applies the abstention policy to gathered evidence, and serialises what survives it. */
     private GraphRagResult judge(Evidence.Gathered gathered, QueryTrace trace) {
         RetrievalOutcome outcome = abstention.decide(gathered.fused(), gathered.subgraph());
-        if (!(outcome instanceof RetrievalOutcome.Results results)) {
+        return switch (outcome) {
+            case RetrievalOutcome.Ambiguous ambiguous ->
+                GraphRagResult.ambiguous(labelled(ambiguous), gathered.plan(), trace);
             // Serialising evidence the system does not believe in only gives the model material to
             // be confidently wrong with.
-            return GraphRagResult.declined(outcome, gathered.plan(), trace);
-        }
+            case RetrievalOutcome.NoResults refused ->
+                GraphRagResult.declined(refused, gathered.plan(), trace);
+            case RetrievalOutcome.Results results ->
+                answered(results, gathered.ranked(), gathered.plan(), trace);
+        };
+    }
 
-        SeedRelevance relevance = relevanceOf(gathered.fused());
+    /** Serialises the evidence abstention accepted, led by the aggregate when there is one. */
+    private GraphRagResult answered(RetrievalOutcome.Results results, List<FusedDocument> fused,
+                                    QueryPlan plan, QueryTrace trace) {
+        Aggregation aggregation = aggregationOf(plan, results.subgraph());
+        SeedRelevance relevance = relevanceOf(fused);
         SerializedSubgraph serialized = trace.time(Stage.SERIALIZE,
-            () -> serializer.serialize(results.subgraph(), budget, relevance));
+            () -> serialize(results.subgraph(), relevance, aggregation, plan));
 
         LOGGER.debug("answered in {}", trace);
-        return GraphRagResult.answered(results, serialized, gathered.plan(), trace);
+        return GraphRagResult.answered(results, serialized, plan, aggregation, trace);
+    }
+
+    /**
+     * The aggregate an aggregate plan asked for, or null for any other plan.
+     *
+     * <p>Null too for a store that cannot report its edges: the count of facts it did not
+     * report would be zero, and zero is an answer, not an absence of one.
+     */
+    private Aggregation aggregationOf(QueryPlan plan, Subgraph subgraph) {
+        if (!(plan.shape() instanceof QueryPlan.Aggregate aggregate)
+                || !(edgeStore instanceof MappedEdgeStore)) {
+            return null;
+        }
+        return Aggregation.over(aggregate.function(), subgraph, entityNames);
+    }
+
+    /**
+     * Serialises the evidence, led by the aggregate when there is one.
+     *
+     * <p>The aggregate's line is charged against the same budget as the facts, before them: it is
+     * the answer the question asked for, and the facts are the evidence for it. When the budget
+     * cannot hold even the line, the facts alone are sent and the aggregate still reaches the
+     * caller beside the context.
+     */
+    private SerializedSubgraph serialize(Subgraph subgraph, SeedRelevance relevance,
+                                         Aggregation aggregation, QueryPlan plan) {
+        if (aggregation == null) {
+            return serializer.serialize(subgraph, budget, relevance);
+        }
+        String line = "# aggregate\n" + aggregation.describe(plan.mentions()) + "\n";
+        int cost = budget.counter().count(line);
+        if (cost > budget.maxTokens()) {
+            return serializer.serialize(subgraph, budget, relevance);
+        }
+        SerializedSubgraph facts = serializer.serialize(subgraph,
+            new SerializationBudget(budget.maxTokens() - cost, budget.counter()), relevance);
+        String text = line + facts.text();
+        return new SerializedSubgraph(text, budget.counter().count(text), facts.edgesIncluded(),
+            facts.edgesDropped(), facts.format());
+    }
+
+    /** The same ambiguity, with each reading named so it can be put to a person. */
+    private RetrievalOutcome.Ambiguous labelled(RetrievalOutcome.Ambiguous ambiguous) {
+        List<RetrievalOutcome.Candidate> labelled = new ArrayList<>(ambiguous.candidates().size());
+        for (RetrievalOutcome.Candidate candidate : ambiguous.candidates()) {
+            labelled.add(new RetrievalOutcome.Candidate(candidate.entityId(),
+                entityNames.apply(candidate.entityId()), candidate.score()));
+        }
+        return new RetrievalOutcome.Ambiguous(labelled);
+    }
+
+    /** The names the conversation mentions, normalised for matching against entity names. */
+    private static Set<String> namedBy(ConversationContext context) {
+        Set<String> named = new HashSet<>();
+        for (Mention mention : context.visibleMentions()) {
+            named.add(normalized(mention.text()));
+        }
+        return named;
+    }
+
+    private static String normalized(String name) {
+        return name == null ? "" : name.trim().toLowerCase(Locale.ROOT);
+    }
+
+    /** The fused list without the given entities, order kept. */
+    private static List<FusedDocument> without(List<FusedDocument> fused, Set<Long> excluded) {
+        if (excluded.isEmpty()) {
+            return fused;
+        }
+        List<FusedDocument> kept = new ArrayList<>(fused.size());
+        for (FusedDocument document : fused) {
+            if (!excluded.contains(document.documentId())) {
+                kept.add(document);
+            }
+        }
+        return kept;
     }
 
     /**
@@ -272,21 +498,61 @@ public final class GraphRagPipeline {
      *
      * <p>All candidates from every mention. Narrowing to one per mention here would make an
      * ambiguity invisible to abstention, which is the stage equipped to notice it.
+     *
+     * <p>Unless the conversation has already narrowed it. A mention that resolves to several
+     * entities, some of which the conversation names, resolves to those: the caller has said which
+     * one it means, typically by sending back a candidate an earlier ambiguity offered, by name
+     * or, where entities share the name, by {@link InputRequest#qualifiedName}. The rest
+     * are ruled out - kept out of the walk, so their facts do not reach the model, and out of the
+     * ranking, so abstention does not find the same ambiguity a second time.
+     *
+     * @param plan  the plan whose mentions to resolve
+     * @param named the names the conversation mentions, normalised
+     * @return the seeds, and the entities the conversation ruled out
      */
-    private long[] linkAll(QueryPlan plan) {
+    private Linked linkAll(QueryPlan plan, Set<String> named) {
         List<Long> seeds = new ArrayList<>();
+        Set<Long> ruledOut = new HashSet<>();
+        List<long[]> readings = new ArrayList<>();
         for (String mention : plan.mentions()) {
-            for (long entity : linker.link(mention)) {
-                if (!seeds.contains(entity)) {
-                    seeds.add(entity);
+            long[] candidates = linker.link(mention);
+            List<Long> chosen = new ArrayList<>();
+            if (candidates.length > 1) {
+                for (long entity : candidates) {
+                    String name = entityNames.apply(entity);
+                    if (named.contains(normalized(name))
+                            || named.contains(normalized(InputRequest.qualifiedName(name, entity)))) {
+                        chosen.add(entity);
+                    }
                 }
             }
+            List<Long> kept = new ArrayList<>();
+            for (long entity : candidates) {
+                if (chosen.isEmpty() || chosen.contains(entity)) {
+                    kept.add(entity);
+                    if (!seeds.contains(entity)) {
+                        seeds.add(entity);
+                    }
+                } else {
+                    ruledOut.add(entity);
+                }
+            }
+            readings.add(kept.stream().mapToLong(Long::longValue).toArray());
         }
-        long[] result = new long[seeds.size()];
-        for (int i = 0; i < seeds.size(); i++) {
-            result[i] = seeds.get(i);
-        }
-        return result;
+        // An entity another mention resolved to on its own is wanted for that mention.
+        seeds.forEach(ruledOut::remove);
+        return new Linked(seeds.stream().mapToLong(Long::longValue).toArray(), readings,
+            ruledOut);
+    }
+
+    /**
+     * What linking produced.
+     *
+     * @param seeds    the entities to walk from
+     * @param readings the entities each mention resolved to, one array per mention
+     * @param ruledOut the entities the conversation passed over in favour of a named one
+     */
+    private record Linked(long[] seeds, List<long[]> readings, Set<Long> ruledOut) {
     }
 
     /**
@@ -305,174 +571,6 @@ public final class GraphRagPipeline {
         }
         QueryPlan core = plan instanceof QueryPlan.Temporal temporal ? temporal.inner() : plan;
         return new QueryPlan.Temporal(core, asOf);
-    }
-
-    /**
-     * Walks the graph as the plan directs, at the plan's instant.
-     *
-     * <p>Exhaustive over the sealed plan hierarchy, so a new plan type is a compile error here
-     * rather than a silent fall-through to a default traversal.
-     *
-     * <p>In both directions, which is what the null relation filter means - see the contract on
-     * {@link EdgeStore}. A question is about an edge, not about the direction someone happened to
-     * assert it in: "who did Ada Lovelace collaborate with" and "who did Charles Babbage
-     * collaborate with" are the same edge asked from its two ends, and a forward-only walk answers
-     * the first and refuses the second with no way for the asker to tell that the fact was there.
-     */
-    private Subgraph traverse(QueryPlan plan, long[] seeds) {
-        TemporalFilter asOf = plan instanceof QueryPlan.Temporal temporal
-            ? temporal.asOf()
-            : TemporalFilter.now();
-        QueryPlan core = plan instanceof QueryPlan.Temporal temporal ? temporal.inner() : plan;
-
-        int hops = switch (core) {
-            case QueryPlan.Lookup ignored -> 1;
-            case QueryPlan.Traverse traverse -> traverse.hops();
-            // An aggregate is answered from the offset array, so it needs the seeds' immediate
-            // edges and nothing beyond them.
-            case QueryPlan.Aggregate ignored -> 1;
-            case QueryPlan.Temporal ignored -> throw new IllegalStateException(
-                "a temporal plan cannot wrap another; construction already forbids it");
-        };
-
-        int[] wanted = relationsNamedBy(core);
-        if (wanted.length == 0) {
-            return collect(seeds, edgeStore.expand(seeds, hops, null, asOf), asOf, null);
-        }
-
-        int[] selectors = bothDirections(wanted);
-        Subgraph narrowed =
-            collect(seeds, edgeStore.expand(seeds, hops, selectors, asOf), asOf, wanted);
-        if (!narrowed.edges().isEmpty()) {
-            return narrowed;
-        }
-
-        // The field is called relationHints and this is what makes that true. The cues that
-        // produce them are a fixed English vocabulary matched against relation names an extractor
-        // chose, so a hint that resolves to the wrong relation is an ordinary outcome rather than
-        // a rare one. Letting it stand would turn a question the graph can answer into a refusal,
-        // and the asker would have no way to see that the fact was there. A hint may sharpen an
-        // answer; it may not remove one.
-        LOGGER.debug("relation hints {} matched no edge; traversing every relation",
-            java.util.Arrays.toString(wanted));
-        return collect(seeds, edgeStore.expand(seeds, hops, null, asOf), asOf, null);
-    }
-
-    /**
-     * The relation ids the plan's hints name, empty when there are none or none resolve.
-     *
-     * <p>Empty rather than an empty whitelist: an empty selector array asks the store for nothing
-     * and is a legitimate request, so handing one to {@link EdgeStore#expand} because a question
-     * happened to use no recognised relation word would answer every such question with silence.
-     */
-    private int[] relationsNamedBy(QueryPlan core) {
-        if (relations == null) {
-            return new int[0];
-        }
-        List<String> hints = switch (core) {
-            case QueryPlan.Traverse traverse -> traverse.relationHints();
-            case QueryPlan.Aggregate aggregate -> aggregate.relationHints();
-            // A lookup reads facts off the entity; there is no walk for a hint to narrow.
-            case QueryPlan.Lookup ignored -> List.of();
-            case QueryPlan.Temporal ignored -> throw new IllegalStateException(
-                "a temporal plan cannot wrap another; construction already forbids it");
-        };
-
-        List<Integer> resolved = new ArrayList<>();
-        for (String hint : hints) {
-            for (int relation : relations.resolve(hint)) {
-                if (!resolved.contains(relation)) {
-                    resolved.add(relation);
-                }
-            }
-        }
-        int[] ids = new int[resolved.size()];
-        for (int i = 0; i < ids.length; i++) {
-            ids[i] = resolved.get(i);
-        }
-        return ids;
-    }
-
-    /**
-     * Selectors following each relation both ways.
-     *
-     * <p>A hint names a relation, never a direction - "collaborated" says nothing about which end
-     * the fact was asserted from, and narrowing to one direction would reintroduce, per relation,
-     * exactly the asymmetry an unfiltered traversal no longer has.
-     */
-    private static int[] bothDirections(int[] relations) {
-        int[] selectors = new int[relations.length * 2];
-        for (int i = 0; i < relations.length; i++) {
-            System.arraycopy(RelationSelector.both(relations[i]), 0, selectors, 2 * i, 2);
-        }
-        return selectors;
-    }
-
-    /**
-     * Materialises the edges between the reached entities.
-     *
-     * <p>Only for a {@link MappedEdgeStore}, which is the only implementation that can report an
-     * edge's columns. Another implementation yields the entities alone — enough to answer, but with
-     * no provenance to show, so abstention will treat it as weak evidence rather than silently
-     * treating it as strong.
-     */
-    private Subgraph collect(long[] seeds, long[] reachable, TemporalFilter asOf,
-                             int[] allowedRelations) {
-        Subgraph.Builder builder = new Subgraph.Builder();
-        for (long seed : seeds) {
-            builder.seed(seed);
-        }
-        if (!(edgeStore instanceof MappedEdgeStore mapped)) {
-            return builder.build();
-        }
-
-        // Bitmaps over entity ids rather than boxed sets: the membership test runs once per edge
-        // examined, and RoaringBitmap is already what the traversal itself works in.
-        RoaringBitmap inScope = new RoaringBitmap();
-        for (long entity : reachable) {
-            inScope.add((int) entity);
-        }
-        RoaringBitmap seedSet = new RoaringBitmap();
-        for (long seed : seeds) {
-            seedSet.add((int) seed);
-        }
-
-        // Only the entities the traversal reached, rather than every entity in the store. The
-        // subgraph is a handful of entities and the store can hold tens of millions of edges,
-        // so a full scan made the cost of answering a question grow with the size of the graph
-        // instead of with the size of the answer.
-        for (long entity : reachable) {
-            mapped.forEachEdgeOf(entity, (subject, relation, object, index) -> {
-                if (!inScope.contains(object)) {
-                    return;
-                }
-                // The whitelist narrowed which entities the walk reached; without this it would
-                // not narrow what is said about them, and a traversal restricted to one relation
-                // would hand the model a subgraph full of every other.
-                if (allowedRelations != null && !contains(allowedRelations, relation)) {
-                    return;
-                }
-                int validFrom = mapped.validFrom(index);
-                int validTo = mapped.validTo(index);
-                if (!asOf.admits(validFrom, validTo)) {
-                    return;
-                }
-                Provenance provenance = mapped.provenanceOf(index);
-                int depth = seedSet.contains(subject) || seedSet.contains(object) ? 1 : 2;
-                builder.edge(new SubgraphEdge(subject, relation, object, index,
-                    validFrom, validTo, provenance, depth));
-            });
-        }
-        return builder.build();
-    }
-
-    private static boolean contains(int[] values, int wanted) {
-        for (int value : values) {
-            if (value == wanted) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
@@ -521,7 +619,7 @@ public final class GraphRagPipeline {
 
     /** Fused scores as per-entity relevance, for ranking what fits in the budget. */
     private SeedRelevance relevanceOf(List<FusedDocument> fused) {
-        java.util.Map<Long, Double> scores = new java.util.HashMap<>();
+        Map<Long, Double> scores = new HashMap<>();
         for (FusedDocument document : fused) {
             scores.merge(document.documentId(), document.score(), Math::max);
         }

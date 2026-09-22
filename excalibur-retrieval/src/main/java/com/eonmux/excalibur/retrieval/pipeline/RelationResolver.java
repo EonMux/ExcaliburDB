@@ -28,6 +28,19 @@ public interface RelationResolver {
     int[] resolve(String hint);
 
     /**
+     * Every relation id this graph holds, or null when this resolver does not know them.
+     *
+     * <p>What a one-way traversal needs when the question names no relation. The store's
+     * absent filter means every relation in <em>both</em> directions, so walking every relation
+     * forward only has to name each of them - and only the vocabulary knows what they are.
+     *
+     * @return the ids, or null for a resolver that only maps phrases
+     */
+    default int[] all() {
+        return null;
+    }
+
+    /**
      * A resolver over the relation names a graph actually holds.
      *
      * <h2>The matching rule</h2>
@@ -62,23 +75,33 @@ public interface RelationResolver {
             }
         }
 
-        return hint -> {
-            String normalized = normalize(hint);
-            if (normalized.length() < MIN_MATCH_LENGTH) {
-                return new int[0];
-            }
-            List<Integer> matched = new ArrayList<>();
-            for (Map.Entry<String, List<Integer>> candidate : byNormalized.entrySet()) {
-                String name = candidate.getKey();
-                if (name.startsWith(normalized) || normalized.startsWith(name)) {
-                    matched.addAll(candidate.getValue());
+        int[] every =
+            relationNames.keySet().stream().mapToInt(Integer::intValue).sorted().toArray();
+        return new RelationResolver() {
+            @Override
+            public int[] resolve(String hint) {
+                String normalized = normalize(hint);
+                if (normalized.length() < MIN_MATCH_LENGTH) {
+                    return new int[0];
                 }
+                List<Integer> matched = new ArrayList<>();
+                for (Map.Entry<String, List<Integer>> candidate : byNormalized.entrySet()) {
+                    String name = candidate.getKey();
+                    if (name.startsWith(normalized) || normalized.startsWith(name)) {
+                        matched.addAll(candidate.getValue());
+                    }
+                }
+                int[] ids = new int[matched.size()];
+                for (int i = 0; i < ids.length; i++) {
+                    ids[i] = matched.get(i);
+                }
+                return ids;
             }
-            int[] ids = new int[matched.size()];
-            for (int i = 0; i < ids.length; i++) {
-                ids[i] = matched.get(i);
+
+            @Override
+            public int[] all() {
+                return every.clone();
             }
-            return ids;
         };
     }
 

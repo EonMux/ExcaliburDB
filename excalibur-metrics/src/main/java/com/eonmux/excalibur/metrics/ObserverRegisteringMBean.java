@@ -2,7 +2,7 @@ package com.eonmux.excalibur.metrics;
 
 /**
  * A metrics MBean that also accepts listeners through this module's own observer interface,
- * the one {@link MBeanServerProvider} describes, alongside the JMX one.
+ * {@link MBeanNotificationObserver}, alongside the JMX one.
  *
  * <h2>Why this is separate from {@link DynamicMetricMBean}</h2>
  * <p>The observer pair predates the {@code NotificationEmitter} implementation and is how the
@@ -31,7 +31,6 @@ abstract class ObserverRegisteringMBean extends DynamicMetricMBean {
 
     /**
      * Adds a notification listener using the custom observer interface.
-     * This method provides backward compatibility with the MBeanServerProvider interface.
      *
      * @param info Notification info containing type and object name
      * @param observer The observer to receive notifications
@@ -43,7 +42,6 @@ abstract class ObserverRegisteringMBean extends DynamicMetricMBean {
 
     /**
      * Removes a notification listener using the custom observer interface.
-     * This method provides backward compatibility with the MBeanServerProvider interface.
      *
      * @param info Notification info
      * @param observer The observer to remove

@@ -18,6 +18,7 @@ import com.eonmux.excalibur.planner.ConversationContext;
 import com.eonmux.excalibur.planner.Grammar;
 import com.eonmux.excalibur.planner.QueryClassifier;
 import com.eonmux.excalibur.retrieval.HybridRetriever;
+import com.eonmux.excalibur.retrieval.fusion.ScorePassthrough;
 import com.eonmux.excalibur.retrieval.abstain.AbstentionPolicy;
 import com.eonmux.excalibur.retrieval.abstain.RetrievalOutcome;
 import com.eonmux.excalibur.retrieval.abstain.ThresholdAbstentionPolicy;
@@ -49,6 +50,8 @@ class GraphRagPipelineTest {
     private static final int NOTE_G = 4;
     private static final int LONDON = 5;
     private static final int TURIN = 6;
+    /** Shares a first name with {@link #ADA} and nothing else, for questions that name only it. */
+    private static final int ADA_KING = 7;
     private static final int ENTITY_COUNT = 16;
 
     // Relations.
@@ -63,7 +66,8 @@ class GraphRagPipelineTest {
         (long) ANALYTICAL_ENGINE, "Analytical Engine",
         (long) NOTE_G, "Note G",
         (long) LONDON, "London",
-        (long) TURIN, "Turin");
+        (long) TURIN, "Turin",
+        (long) ADA_KING, "Ada King");
 
     private static final Map<Long, String> RELATION_NAMES = Map.of(
         (long) COLLABORATED_WITH, "collaboratedWith",
@@ -104,6 +108,8 @@ class GraphRagPipelineTest {
         lexicalIndex.put(NOTE_G, "Note G the first published algorithm");
         lexicalIndex.put(LONDON, "London capital city");
         lexicalIndex.put(TURIN, "Turin city in Piedmont");
+        // As many words as Ada Lovelace's, so a question naming only "Ada" scores them alike.
+        lexicalIndex.put(ADA_KING, "Ada King countess who wrote long letters");
         lexicalIndex.refresh();
     }
 
@@ -138,21 +144,43 @@ class GraphRagPipelineTest {
             .filter(entry -> entry.getValue().equalsIgnoreCase(mention)
                 || entry.getValue().toLowerCase().contains(mention.toLowerCase()))
             .mapToLong(Map.Entry::getKey)
+            .sorted()
             .toArray();
+        return pipeline(abstention, relations, linker);
+    }
 
+    private GraphRagPipeline pipeline(AbstentionPolicy abstention, RelationResolver relations,
+                                      EntityLinker linker) {
+        return pipeline(abstention, relations, linker, id -> LABELS.getOrDefault(id, "E" + id));
+    }
+
+    private GraphRagPipeline pipeline(AbstentionPolicy abstention, RelationResolver relations,
+                                      EntityLinker linker, java.util.function.LongFunction<String> names) {
         return new GraphRagPipeline(
             new QueryClassifier(),
             linker,
             edgeStore,
-            new HybridRetriever(List.of(new LuceneRanker(lexicalIndex))),
+            new HybridRetriever(List.of(
+                new LuceneRanker(lexicalIndex, "bm25", LuceneRanker.Scale.ATTAINABLE_SHARE)),
+                new ScorePassthrough(), HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH),
             new TripleSubgraphSerializer(
-                id -> LABELS.getOrDefault(id, "E" + id),
+                names,
                 relation -> RELATION_NAMES.getOrDefault(relation, "R" + relation)),
             abstention,
             new SerializationBudget(2000, BpeTokenCounter.defaultCounter()),
             10,
             null,
-            relations);
+            relations,
+            names);
+    }
+
+    /** A conversation that has mentioned {@code names}, the way the endpoint builds one. */
+    private static ConversationContext mentioning(String... names) {
+        ConversationContext context = new ConversationContext();
+        for (String name : names) {
+            context.mention(name, Grammar.UNKNOWN);
+        }
+        return context.nextTurn();
     }
 
     @Test
@@ -283,6 +311,10 @@ class GraphRagPipelineTest {
         assertThat(result.hasAnswer()).isFalse();
         assertThat(result.askUser()).isPresent();
         assertThat(result.askUser().get().question()).contains("she");
+        assertThat(result.inputRequest()).hasValueSatisfying(request -> {
+            assertThat(request.reason()).isEqualTo(InputRequest.Reason.UNBOUND_PRONOUN);
+            assertThat(request.unresolved()).contains("she");
+        });
     }
 
     @Test
@@ -474,6 +506,337 @@ class GraphRagPipelineTest {
 
             assertThat(result.hasAnswer()).isTrue();
             assertThat(result.contextText()).contains("Ada Lovelace");
+        }
+    }
+
+    @Nested
+    @DisplayName("ambiguity goes back to the user")
+    class Ambiguity {
+
+        private static final String QUESTION = "What did Ada write?";
+
+        @Test
+        @DisplayName("a name two entities share is handed back with both as candidates, not declined")
+        void sharedNameNeedsInput() {
+            GraphRagResult result = pipeline().answer(QUESTION);
+
+            assertThat(result.hasAnswer()).isFalse();
+            assertThat(result.declined())
+                .as("the evidence was there; which entity was meant is the only thing missing")
+                .isEmpty();
+            assertThat(result.needsUserInput()).isTrue();
+            assertThat(result.ambiguity()).isPresent();
+            assertThat(result.inputRequest()).hasValueSatisfying(request -> {
+                assertThat(request.reason()).isEqualTo(InputRequest.Reason.AMBIGUOUS_ENTITY);
+                assertThat(request.candidates()).containsExactlyInAnyOrder("Ada Lovelace", "Ada King");
+                assertThat(request.unresolved()).containsExactly("Ada");
+                assertThat(request.question()).contains("\"Ada\"").contains("Ada Lovelace")
+                    .contains("Ada King");
+            });
+        }
+
+        @Test
+        @DisplayName("sending a candidate back as a conversation entity answers the question")
+        void candidateSentBackResolves() {
+            GraphRagResult asked = pipeline().answer(QUESTION);
+            String chosen = asked.inputRequest().orElseThrow().candidates().stream()
+                .filter("Ada Lovelace"::equals).findFirst().orElseThrow();
+
+            GraphRagResult answered = pipeline().answer(QUESTION, mentioning(chosen),
+                new QueryTrace());
+
+            assertThat(answered.hasAnswer()).isTrue();
+            assertThat(answered.contextText()).contains("Note G").contains("Ada Lovelace");
+        }
+
+        @Test
+        @DisplayName("entities sharing a label are offered apart, and the one sent back answers")
+        void sharedLabelsAreOfferedApart() {
+            // Both are called "Ada". Offering the label once would send back a word that names
+            // both, and the same question would come back however often it was answered.
+            java.util.function.LongFunction<String> names = id -> id == ADA || id == ADA_KING
+                ? "Ada"
+                : LABELS.getOrDefault(id, "E" + id);
+            EntityLinker linker = mention -> mention.equalsIgnoreCase("Ada")
+                ? new long[] { ADA, ADA_KING } : new long[0];
+            GraphRagPipeline pipeline = pipeline(
+                new ThresholdAbstentionPolicy(0.005, 0.001, 0.3, 5), null, linker, names);
+
+            List<String> candidates = pipeline.answer(QUESTION).inputRequest().orElseThrow()
+                .candidates();
+            assertThat(candidates).containsExactlyInAnyOrder("Ada #" + ADA, "Ada #" + ADA_KING);
+
+            GraphRagResult answered = pipeline.answer(QUESTION, mentioning("Ada #" + ADA),
+                new QueryTrace());
+
+            assertThat(answered.needsUserInput()).isFalse();
+            assertThat(answered.contextText()).contains("Note G");
+        }
+
+        @Test
+        @DisplayName("choosing the other candidate answers about that one instead")
+        void theOtherCandidateIsHonoured() {
+            // Ada King holds no facts; the answer is about her - an empty subgraph - and never
+            // borrows Ada Lovelace's.
+            GraphRagResult answered = pipeline().answer(QUESTION, mentioning("Ada King"),
+                new QueryTrace());
+
+            assertThat(answered.needsUserInput()).isFalse();
+            assertThat(answered.contextText()).doesNotContain("Note G");
+        }
+
+        @Test
+        @DisplayName("a tie with an entity the question never named is not an ambiguity")
+        void tieWithAnUnnamedEntityAnswers() {
+            // The linker is sure "Ada" is Ada Lovelace; the ranking scores Ada King exactly
+            // alike. The question named one entity and is in no doubt which: entities extracted
+            // from one snippet are described by it and tie routinely, and asking "which did you
+            // mean" between the named one and one never mentioned would be a question with no
+            // right answer.
+            EntityLinker precise = mention -> mention.equalsIgnoreCase("Ada")
+                ? new long[] { ADA } : new long[0];
+            GraphRagPipeline pipeline = pipeline(
+                new ThresholdAbstentionPolicy(0.005, 0.001, 0.3, 5), null, precise);
+
+            GraphRagResult result = pipeline.answer(QUESTION);
+
+            assertThat(result.needsUserInput()).isFalse();
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.contextText()).contains("Note G");
+        }
+
+        @Test
+        @DisplayName("abstention judges the readings of the name, not the whole ranking")
+        void gatheredReadingsAreTheNamedEntities() {
+            Evidence.Gathered ambiguous = (Evidence.Gathered) pipeline().gather(
+                QUESTION, new ConversationContext(), null, new QueryTrace());
+            Evidence.Gathered named = (Evidence.Gathered) pipeline().gather(
+                "Who did Ada Lovelace collaborate with?", new ConversationContext(), null,
+                new QueryTrace());
+
+            assertThat(ambiguous.fused()).extracting(
+                    com.eonmux.excalibur.retrieval.fusion.FusedDocument::documentId)
+                .containsExactlyInAnyOrder((long) ADA, (long) ADA_KING);
+            assertThat(named.fused()).extracting(
+                    com.eonmux.excalibur.retrieval.fusion.FusedDocument::documentId)
+                .as("one name, one entity: only the score gate has anything to read")
+                .containsExactly((long) ADA);
+            assertThat(named.ranked().size()).isGreaterThan(named.fused().size());
+        }
+
+        @Test
+        @DisplayName("a conversation naming neither candidate leaves the question with the user")
+        void unrelatedConversationSettlesNothing() {
+            GraphRagResult result = pipeline().answer(QUESTION, mentioning("Charles Babbage"),
+                new QueryTrace());
+
+            assertThat(result.inputRequest()).hasValueSatisfying(request ->
+                assertThat(request.reason()).isEqualTo(InputRequest.Reason.AMBIGUOUS_ENTITY));
+        }
+    }
+
+    @Nested
+    @DisplayName("aggregates")
+    class Aggregates {
+
+        @Test
+        @DisplayName("a count is the distinct entities related by the facts valid now")
+        void countsDistinctRelatedEntities() {
+            // Four facts, one of them superseded: the count reads the three that hold today.
+            GraphRagResult result =
+                pipeline().answer("How many things is Ada Lovelace related to?");
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.aggregation()).hasValueSatisfying(aggregate -> {
+                assertThat(aggregate.function()).isEqualTo(
+                    com.eonmux.excalibur.planner.QueryPlan.AggregateFunction.COUNT);
+                assertThat(aggregate.count()).isEqualTo(3);
+                assertThat(aggregate.factsConsidered()).isEqualTo(3);
+                assertThat(aggregate.entities())
+                    .containsExactly("Charles Babbage", "Note G", "Turin");
+                assertThat(aggregate.validFrom()).isEmpty();
+            });
+        }
+
+        @Test
+        @DisplayName("the aggregate leads the context, inside the budget")
+        void aggregateLeadsTheContext() {
+            GraphRagResult result =
+                pipeline().answer("How many things is Ada Lovelace related to?");
+
+            assertThat(result.contextText()).startsWith("# aggregate\ncount: 3 distinct entities "
+                + "related to Ada Lovelace by 3 facts\n");
+            assertThat(result.context().orElseThrow().tokens())
+                .isEqualTo(BpeTokenCounter.defaultCounter().count(result.contextText()))
+                .isLessThanOrEqualTo(2000);
+        }
+
+        @Test
+        @DisplayName("a count at a past instant counts what held then")
+        void countHonoursAsOf() {
+            GraphRagResult result = pipeline().answer(
+                "How many things is Ada Lovelace related to?", new ConversationContext(),
+                TemporalFilter.asOf(LocalDate.of(1820, 1, 1)), new QueryTrace());
+
+            assertThat(result.aggregation()).hasValueSatisfying(aggregate -> {
+                assertThat(aggregate.count()).isEqualTo(2);
+                assertThat(aggregate.entities()).containsExactly("Charles Babbage", "London");
+            });
+        }
+
+        @Test
+        @DisplayName("earliest is the dated fact that began first, even one that has since ended")
+        void earliestReadsHistory() {
+            // London was superseded in 1841, yet it is her first home. The collaboration has no
+            // recorded start and is not the earliest of anything.
+            GraphRagResult result = pipeline().answer("Where did Ada Lovelace first live?");
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.aggregation()).hasValueSatisfying(aggregate -> {
+                assertThat(aggregate.function()).isEqualTo(
+                    com.eonmux.excalibur.planner.QueryPlan.AggregateFunction.EARLIEST);
+                assertThat(aggregate.validFrom()).hasValue(day(1815, 1, 1));
+                assertThat(aggregate.entities()).containsExactly("London");
+                assertThat(aggregate.count()).isEqualTo(1);
+            });
+            assertThat(result.contextText())
+                .startsWith("# aggregate\nearliest about Ada Lovelace: began 1815-01-01, with "
+                    + "London (1 fact)\n")
+                .as("the evidence is the extreme fact, not the whole history")
+                .doesNotContain("Turin")
+                .doesNotContain("Charles Babbage");
+        }
+
+        @Test
+        @DisplayName("latest is the fact that began last")
+        void latestNow() {
+            GraphRagResult result = pipeline().answer("What did Ada Lovelace do last?");
+
+            assertThat(result.aggregation()).hasValueSatisfying(aggregate -> {
+                assertThat(aggregate.function()).isEqualTo(
+                    com.eonmux.excalibur.planner.QueryPlan.AggregateFunction.LATEST);
+                assertThat(aggregate.validFrom()).hasValue(day(1843, 1, 1));
+                assertThat(aggregate.entities()).containsExactly("Note G");
+            });
+        }
+
+        @Test
+        @DisplayName("latest at a past instant ignores what had not begun by then")
+        void latestHonoursAsOf() {
+            GraphRagResult result = pipeline().answer("What did Ada Lovelace do last?",
+                new ConversationContext(), TemporalFilter.asOf(LocalDate.of(1830, 1, 1)),
+                new QueryTrace());
+
+            assertThat(result.aggregation()).hasValueSatisfying(aggregate -> {
+                assertThat(aggregate.validFrom()).hasValue(day(1815, 1, 1));
+                assertThat(aggregate.entities()).containsExactly("London");
+            });
+            assertThat(result.contextText()).doesNotContain("Note G").doesNotContain("Turin");
+        }
+
+        @Test
+        @DisplayName("an extremum over facts none of which is dated says so, and keeps the facts")
+        void extremumWithNothingDated() {
+            // Babbage's one dated fact began in 1837. In 1830 the only fact about him is the
+            // collaboration, which has no recorded start: nothing is first, and the model still
+            // gets the fact.
+            GraphRagResult result = pipeline().answer("What did Charles Babbage do first?",
+                new ConversationContext(), TemporalFilter.asOf(LocalDate.of(1830, 1, 1)),
+                new QueryTrace());
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.aggregation()).hasValueSatisfying(aggregate -> {
+                assertThat(aggregate.count()).isZero();
+                assertThat(aggregate.factsConsidered()).isEqualTo(1);
+                assertThat(aggregate.validFrom()).isEmpty();
+                assertThat(aggregate.entities()).isEmpty();
+            });
+            assertThat(result.contextText())
+                .startsWith("# aggregate\nearliest about Charles Babbage: no fact with a "
+                    + "recorded start\n")
+                .contains("collaboratedWith")
+                .doesNotContain("designed");
+        }
+
+        @Test
+        @DisplayName("a question that is not an aggregate carries none")
+        void nonAggregateCarriesNone() {
+            GraphRagResult result = pipeline().answer("Who did Ada Lovelace collaborate with?");
+
+            assertThat(result.aggregation()).isEmpty();
+            assertThat(result.contextText()).doesNotContain("# aggregate");
+        }
+    }
+
+    @Nested
+    @DisplayName("traversal direction")
+    class Direction {
+
+        private static final String QUESTION = "Who did Charles Babbage collaborate with?";
+
+        private GraphRagResult ask(GraphRagPipeline pipeline, TraversalDirection direction) {
+            return pipeline.answer(QUESTION, new ConversationContext(), null, direction,
+                new QueryTrace());
+        }
+
+        @Test
+        @DisplayName("forward keeps only the facts the named entity asserts")
+        void forwardFollowsSubjectToObject() {
+            GraphRagResult result = ask(pipelineWithRelations(), TraversalDirection.FORWARD);
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.contextText())
+                .contains("designed").contains("Analytical Engine")
+                .as("Ada -> Babbage is asserted about him, not by him")
+                .doesNotContain("collaboratedWith");
+        }
+
+        @Test
+        @DisplayName("reverse keeps only the facts asserted about the named entity")
+        void reverseFollowsObjectToSubject() {
+            GraphRagResult result = ask(pipelineWithRelations(), TraversalDirection.REVERSE);
+
+            assertThat(result.hasAnswer()).isTrue();
+            assertThat(result.contextText())
+                .contains("collaboratedWith").contains("Ada Lovelace")
+                .doesNotContain("designed");
+        }
+
+        @Test
+        @DisplayName("both, the default, keeps each")
+        void bothKeepsEach() {
+            GraphRagResult result = ask(pipelineWithRelations(), TraversalDirection.BOTH);
+
+            assertThat(result.contextText()).contains("collaboratedWith").contains("designed");
+        }
+
+        @Test
+        @DisplayName("a relation hint narrows a one-way walk and still falls back when it finds nothing")
+        void hintNarrowsOneWayWalk() {
+            // "collaborated" names the relation; forward from Ada it is there, forward from
+            // Babbage it is not, and the fallback walks every relation forward instead.
+            GraphRagPipeline pipeline = pipelineWithRelations();
+            GraphRagResult fromAda = pipeline.answer("Who collaborated with Ada Lovelace?",
+                new ConversationContext(), null, TraversalDirection.FORWARD, new QueryTrace());
+            GraphRagResult fromBabbage = pipeline.answer("Who collaborated with Charles Babbage?",
+                new ConversationContext(), null, TraversalDirection.FORWARD, new QueryTrace());
+
+            assertThat(fromAda.contextText()).contains("collaboratedWith")
+                .doesNotContain("authored");
+            assertThat(fromBabbage.contextText()).contains("designed")
+                .doesNotContain("collaboratedWith");
+        }
+
+        @Test
+        @DisplayName("a one-way walk without a relation vocabulary is refused, not silently widened")
+        void oneWayNeedsTheVocabulary() {
+            GraphRagPipeline pipeline = pipeline();
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(
+                    () -> ask(pipeline, TraversalDirection.FORWARD))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("forward");
+            assertThat(ask(pipeline, TraversalDirection.BOTH).hasAnswer()).isTrue();
         }
     }
 }

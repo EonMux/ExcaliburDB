@@ -42,7 +42,7 @@ final class SegmentRegistry {
     private final Map<Long, SegmentIndexInfo> byId = new ConcurrentHashMap<>();
 
     /**
-     * Hierarchical Cuckoo filter for corpus -> cluster -> segment membership testing.
+     * Hierarchical Cuckoo filter for corpus -> segment membership testing.
      * Used to register segments in the hierarchy and enable efficient query pruning.
      * May be null if not configured.
      */
@@ -74,7 +74,7 @@ final class SegmentRegistry {
      *   <li>Cuckoo metrics (for FP rate monitoring, if it has a filter)</li>
      *   <li>Compaction worker (for tombstone cleanup)</li>
      *   <li>Warming phase worker (for PQ training during WARMING state)</li>
-     *   <li>Hierarchical Cuckoo filter (for corpus → cluster → segment membership)</li>
+     *   <li>Hierarchical Cuckoo filter (for corpus → segment membership)</li>
      * </ul>
      *
      * @param segmentId The segment ID
@@ -113,14 +113,11 @@ final class SegmentRegistry {
 
         workers.registerForCompaction(segment);
 
-        // Register with hierarchical Cuckoo filter for corpus → cluster → segment membership
+        // Register with hierarchical Cuckoo filter for corpus → segment membership
         // This enables efficient query pruning via Stage 1 Cuckoo filter cascade
         if (hierarchicalFilter != null) {
-            String segmentIdStr = String.valueOf(segmentId);
-            // Use "default" cluster for segments without explicit cluster assignment
-            // This allows the hierarchy to function with a single default cluster
-            hierarchicalFilter.registerSegment(segmentIdStr, "default");
-            LOGGER.debug("Registered segment {} in hierarchical Cuckoo filter with cluster 'default'", segmentId);
+            hierarchicalFilter.registerSegment(String.valueOf(segmentId));
+            LOGGER.debug("Registered segment {} in hierarchical Cuckoo filter", segmentId);
         }
 
         LOGGER.debug("Registered segment {} with index orchestrator", segmentId);
@@ -383,10 +380,7 @@ final class SegmentRegistry {
             int registeredCount = 0;
             for (Map.Entry<Long, SegmentIndexInfo> entry : byId.entrySet()) {
                 long segmentId = entry.getKey();
-                String segmentIdStr = String.valueOf(segmentId);
-                // Use "default" cluster for segments without explicit cluster assignment
-                // This allows the hierarchy to function with a single default cluster
-                filter.registerSegment(segmentIdStr, "default");
+                filter.registerSegment(String.valueOf(segmentId));
                 registeredCount++;
             }
             if (registeredCount > 0) {

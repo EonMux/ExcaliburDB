@@ -125,8 +125,9 @@ public final class BackupCli {
         }
         if (failure instanceof SnapshotRefusedException refusal) {
             return switch (refusal.reason()) {
+                case DESTINATION_NOT_EMPTY -> ExitCode.TARGET_NOT_EMPTY;
                 case SOURCE_CHANGED_UNDERNEATH -> ExitCode.NOT_QUIESCED;
-                case DESTINATION_NOT_EMPTY, COPY_DID_NOT_MATCH -> ExitCode.IO_ERROR;
+                case COPY_DID_NOT_MATCH -> ExitCode.IO_ERROR;
             };
         }
         return failure instanceof ManifestFormatException

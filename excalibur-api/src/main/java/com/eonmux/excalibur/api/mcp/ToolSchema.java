@@ -75,6 +75,23 @@ final class ToolSchema {
     }
 
     /**
+     * A string property the model may supply, restricted to a fixed set of values.
+     *
+     * <p>Listed in the schema rather than only in the description, so a client that validates
+     * arguments against the schema catches a misspelt value before the call is made.</p>
+     *
+     * @param name        The field name
+     * @param description What it is for
+     * @param values      The values accepted, in the order a model should read them
+     * @return The property
+     */
+    static Property optionalChoice(String name, String description, List<String> values) {
+        Map<String, Object> schema = propertySchema("string", description, null);
+        schema.put("enum", new ArrayList<Object>(values));
+        return new Property(name, schema, false);
+    }
+
+    /**
      * An array-of-objects property, with the shape of one element spelled out.
      *
      * <p>A model given a bare {@code array} guesses the field names of what goes in it, and the

@@ -170,6 +170,85 @@ class LexicalStoreTest {
         }
     }
 
+    /**
+     * The version a query result cache keys lexical answers on. It must move whenever a search
+     * could answer differently, including when nothing is written at all and the epoch merely
+     * crosses a publication, and must stand still otherwise or the cache never hits.
+     */
+    @Nested
+    @DisplayName("search version")
+    class SearchVersion {
+
+        @Test
+        @DisplayName("stands still while nothing a search reads changes")
+        void stableWithoutChange(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "memory"), 1);
+
+                assertThat(store.searchVersion(5)).isEqualTo(store.searchVersion(5));
+                assertThat(store.searchVersion(5))
+                    .as("a later epoch with no new publication reads the same segments")
+                    .isEqualTo(store.searchVersion(9));
+            }
+        }
+
+        @Test
+        @DisplayName("moves when the epoch crosses a publication, with no write observed then")
+        void movesWhenAPublicationBecomesVisible(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "memory"), 1);
+                store.add(docs("b", "memory"), 10);
+
+                assertThat(store.searchVersion(9)).isNotEqualTo(store.searchVersion(10));
+            }
+        }
+
+        @Test
+        @DisplayName("moves when an erasure hides a document")
+        void movesOnErasure(@TempDir Path dir) throws Exception {
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "memory", "b", "memory"), 1);
+                long before = store.searchVersion(5);
+
+                store.erase(Set.of("a"));
+
+                assertThat(store.searchVersion(5)).isNotEqualTo(before);
+            }
+        }
+
+        @Test
+        @DisplayName("moves when compaction replaces the segments")
+        void movesOnCompaction(@TempDir Path dir) throws Exception {
+            Map<String, String> all = new LinkedHashMap<>();
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                for (int i = 0; i < 3; i++) {
+                    Map<String, String> batch = docs("d" + i, "term" + i + " shared");
+                    all.putAll(batch);
+                    store.add(batch, i + 1);
+                }
+                long before = store.searchVersion(10);
+
+                store.compactNow(all::get, 10);
+
+                assertThat(store.segments()).hasSize(1);
+                assertThat(store.searchVersion(10)).isNotEqualTo(before);
+            }
+        }
+
+        @Test
+        @DisplayName("is the same for two stores holding the same published state")
+        void survivesReopen(@TempDir Path dir) throws Exception {
+            long before;
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "memory"), 1);
+                before = store.searchVersion(5);
+            }
+            try (LexicalStore reopened = LexicalStore.open(dir)) {
+                assertThat(reopened.searchVersion(5)).isEqualTo(before);
+            }
+        }
+    }
+
     @Nested
     @DisplayName("erasure")
     class Erasure {
@@ -426,6 +505,24 @@ class LexicalStoreTest {
         }
     }
 
+    /**
+     * Puts a store back in the state a crash between an erasure's promise and its application
+     * leaves: the promise on the log, and neither the tombstones nor the confirmation that they
+     * were written.
+     */
+    private static void interruptErasure(Path dir) throws Exception {
+        try (Stream<Path> files = Files.walk(dir)) {
+            for (Path file : files.filter(f -> f.getFileName().toString().endsWith(".tomb"))
+                    .toList()) {
+                Files.delete(file);
+            }
+        }
+        Path log = dir.resolve("erasure.log");
+        List<String> lines = Files.readAllLines(log, StandardCharsets.UTF_8);
+        Files.write(log, lines.stream().filter(line -> !line.startsWith("D\t")).toList(),
+            StandardCharsets.UTF_8);
+    }
+
     @Nested
     @DisplayName("erasure across a restart")
     class ErasureDurability {
@@ -433,19 +530,14 @@ class LexicalStoreTest {
         @Test
         @DisplayName("a tombstone lost to an interrupted write is restored from the log")
         void tombstonesAreRestored(@TempDir Path dir) throws Exception {
-            // The log is forced to disk before an erasure returns; the tombstone files beside it
-            // are written by atomic rename, which orders them but does not force them. Losing one
-            // to a crash must not make an erased document readable again.
+            // The log is forced to disk before the tombstones are written, and the confirmation
+            // after them. A crash between the two must not make an erased document readable
+            // again.
             try (LexicalStore store = LexicalStore.open(dir)) {
                 store.add(docs("a", "confidential", "b", "routine"), 1);
                 store.erase(Set.of("a"));
             }
-            try (Stream<Path> files = Files.walk(dir)) {
-                for (Path file : files.filter(f -> f.getFileName().toString().endsWith(".tomb"))
-                        .toList()) {
-                    Files.delete(file);
-                }
-            }
+            interruptErasure(dir);
 
             try (LexicalStore reopened = LexicalStore.open(dir)) {
                 assertThat(reopened.search(new String[] {"confidential"}, ones(1), 10, 9))
@@ -463,12 +555,7 @@ class LexicalStoreTest {
                 store.add(docs("a", "confidential", "b", "routine"), 1);
                 store.erase(Set.of("a"));
             }
-            try (Stream<Path> files = Files.walk(dir)) {
-                for (Path file : files.filter(f -> f.getFileName().toString().endsWith(".tomb"))
-                        .toList()) {
-                    Files.delete(file);
-                }
-            }
+            interruptErasure(dir);
 
             try (LexicalStore reopened = LexicalStore.open(dir)) {
                 reopened.compactNow(docs("b", "routine")::get, 9);
@@ -478,6 +565,32 @@ class LexicalStoreTest {
                 assertThat(anyFileContains(dir, "confidential"))
                     .as("the promise is kept on disk, not merely re-hidden")
                     .isFalse();
+            }
+        }
+
+        @Test
+        @DisplayName("a key erased and then written again survives a restart")
+        void reingestSurvivesRestart(@TempDir Path dir) throws Exception {
+            // The promise stays on the log until compaction removes the erased copy. Replaying
+            // it on open would tombstone the copy written since - and the compaction after that
+            // would remove it from disk for good.
+            try (LexicalStore store = LexicalStore.open(dir)) {
+                store.add(docs("a", "first draft"), 1);
+                store.erase(Set.of("a"));
+                store.add(docs("a", "second draft"), 2);
+            }
+
+            try (LexicalStore reopened = LexicalStore.open(dir)) {
+                assertThat(reopened.search(new String[] {"second"}, ones(1), 10, 9))
+                    .as("the copy written after the erasure is not the one it was about")
+                    .hasSize(1);
+                assertThat(reopened.search(new String[] {"first"}, ones(1), 10, 9)).isEmpty();
+                assertThat(reopened.outstandingErasureRequests()).hasSize(1);
+            }
+            try (LexicalStore again = LexicalStore.open(dir)) {
+                again.compactNow(docs("a", "second draft")::get, 9);
+                assertThat(again.search(new String[] {"second"}, ones(1), 10, 9)).hasSize(1);
+                assertThat(anyFileContains(dir, "first draft")).isFalse();
             }
         }
 

@@ -69,7 +69,6 @@ abstract class DynamicMetricMBean implements DynamicMBean, NotificationEmitter {
 
     /**
      * Gets all available attribute names.
-     * This method provides backward compatibility with the MBeanServerProvider interface.
      *
      * @return Set of attribute names
      */

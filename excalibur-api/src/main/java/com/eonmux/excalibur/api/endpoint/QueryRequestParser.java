@@ -69,8 +69,9 @@ public final class QueryRequestParser {
     public ParsedQuery parse(String json) {
         String query = JsonText.string(json, "query");
 
-        // Use config default for top_k if config is provided, otherwise fallback to 10
-        int defaultTopK = config != null ? config.query().getDefaultTopK() : 10;
+        int defaultTopK = config != null
+            ? config.query().getDefaultTopK()
+            : com.eonmux.excalibur.config.QueryConfig.DEFAULT_TOP_K;
         int topK = JsonText.integer(json, "top_k", defaultTopK);
 
         // Use config default for threshold if config is provided

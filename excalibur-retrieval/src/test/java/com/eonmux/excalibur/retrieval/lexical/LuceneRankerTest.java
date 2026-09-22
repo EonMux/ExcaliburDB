@@ -2,6 +2,7 @@ package com.eonmux.excalibur.retrieval.lexical;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 
 import com.eonmux.excalibur.retrieval.rank.RankedList;
 import com.eonmux.excalibur.retrieval.rank.RetrievalQuery;
@@ -191,6 +192,101 @@ class LuceneRankerTest {
                     RetrievalQuery.ofEmbedding(new float[] { 1f, 2f }), 10))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("titles");
+        }
+    }
+
+    /** Six documents sharing one common word, each with a rarer word of its own. */
+    private static LexicalIndex corpus(Path dir) throws IOException {
+        return indexOf(dir,
+            "report babbage analytical engine",
+            "report lovelace notes",
+            "report turing machine",
+            "report hopper compiler",
+            "report church lambda",
+            "report shannon information");
+    }
+
+    @Test
+    @DisplayName("the attainable share keeps BM25's order and every score within zero and one")
+    void attainableShareKeepsOrder(@TempDir Path dir) throws IOException {
+        try (LexicalIndex index = corpus(dir)) {
+            RetrievalQuery query = RetrievalQuery.ofText("report babbage engine");
+            RankedList raw = new LuceneRanker(index).rank(query, 10);
+            RankedList share = new LuceneRanker(index, "bm25", LuceneRanker.Scale.ATTAINABLE_SHARE)
+                .rank(query, 10);
+
+            assertThat(share.documents()).extracting(ScoredDocument::documentId)
+                .containsExactlyElementsOf(raw.documents().stream()
+                    .map(ScoredDocument::documentId).toList());
+            assertThat(share.documents()).allSatisfy(document ->
+                assertThat(document.score()).isBetween(0.0, 1.0));
+            // One divisor for the whole query, so the ratio between any two scores is BM25's.
+            assertThat(share.documents().get(0).score() / share.documents().get(1).score())
+                .isCloseTo(raw.documents().get(0).score() / raw.documents().get(1).score(),
+                    org.assertj.core.api.Assertions.within(1e-5));
+        }
+    }
+
+    @Test
+    @DisplayName("a match on the question's rare words scores far above one on its common word")
+    void shareReflectsWhichWordsMatched(@TempDir Path dir) throws IOException {
+        // Raw BM25 has no absolute reading: what a score of 1.3 means depends on the query. As a
+        // share, matching only the word every document has is near nothing, and matching the word
+        // that picks the document out is most of the answer.
+        try (LexicalIndex index = corpus(dir)) {
+            LuceneRanker ranker = new LuceneRanker(index, "bm25",
+                LuceneRanker.Scale.ATTAINABLE_SHARE);
+            List<ScoredDocument> results = ranker.rank(
+                RetrievalQuery.ofText("report lovelace"), 10).documents();
+
+            assertThat(results.get(0).documentId()).isEqualTo(1L);
+            // One mention in a document of average length earns 1 / (1 + k1) of its word's weight.
+            assertThat(results.get(0).score()).isGreaterThan(0.4);
+            assertThat(results.get(1).score()).isLessThan(0.05);
+        }
+    }
+
+    @Test
+    @DisplayName("a question word no document holds changes no document's share")
+    void unseenWordIsNotCounted(@TempDir Path dir) throws IOException {
+        // "who" and "did" are in none of these descriptions, as they are in none of most small
+        // indexes. Counting them would take the same share from every document, which says
+        // nothing about any of them and would make a threshold refuse whatever a small index is
+        // asked.
+        try (LexicalIndex index = corpus(dir)) {
+            LuceneRanker ranker = new LuceneRanker(index, "bm25",
+                LuceneRanker.Scale.ATTAINABLE_SHARE);
+            double bare = ranker.rank(RetrievalQuery.ofText("report babbage"), 1)
+                .documents().get(0).score();
+            double phrased = ranker.rank(RetrievalQuery.ofText("who did report babbage"), 1)
+                .documents().get(0).score();
+
+            assertThat(phrased).isEqualTo(bare);
+        }
+    }
+
+    @Test
+    @DisplayName("a question of words no document holds matches nothing, rather than dividing by zero")
+    void onlyUnseenWords(@TempDir Path dir) throws IOException {
+        try (LexicalIndex index = corpus(dir)) {
+            LuceneRanker ranker = new LuceneRanker(index, "bm25",
+                LuceneRanker.Scale.ATTAINABLE_SHARE);
+
+            assertThat(ranker.rank(RetrievalQuery.ofText("zyzzyva quux"), 5).documents())
+                .isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("raw BM25 is the default scale, and a missing scale is refused")
+    void defaultScaleIsRaw(@TempDir Path dir) throws IOException {
+        try (LexicalIndex index = corpus(dir)) {
+            assertThat(new LuceneRanker(index).scale()).isEqualTo(LuceneRanker.Scale.BM25);
+            assertThat(new LuceneRanker(index, "titles").scale())
+                .isEqualTo(LuceneRanker.Scale.BM25);
+            assertThatThrownBy(() -> new LuceneRanker(index, "bm25", null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("scale");
         }
     }
 

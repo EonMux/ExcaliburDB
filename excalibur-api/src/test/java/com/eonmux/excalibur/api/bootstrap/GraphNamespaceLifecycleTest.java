@@ -124,6 +124,30 @@ class GraphNamespaceLifecycleTest {
         }
 
         @Test
+        @DisplayName("a staging log from before stated days is counted at its own width, untouched")
+        void aLegacyLogIsCountedWithoutBeingUpgraded(@TempDir Path root) throws IOException {
+            // A namespace nobody has opened since the upgrade still holds a version 1 log.
+            // Dividing its length by the current record width would report the wrong count, and
+            // opening it to find out would rewrite the file from a status read.
+            Path graph = root.resolve("acme").resolve("graph");
+            Path log = GraphTenant.stagingDirectoryOf(graph)
+                .resolve(com.eonmux.excalibur.graph.staging.GraphStagingStore.TRIPLE_LOG);
+            Files.createDirectories(log.getParent());
+            int legacyWidth =
+                com.eonmux.excalibur.graph.staging.GraphStagingStore.LEGACY_RECORD_BYTES;
+            java.nio.ByteBuffer legacy = java.nio.ByteBuffer.allocate(16 + 9 * legacyWidth);
+            legacy.putLong(com.eonmux.excalibur.graph.staging.GraphStagingStore.MAGIC);
+            legacy.putInt(com.eonmux.excalibur.graph.staging.GraphStagingStore
+                .VERSION_WITHOUT_STATED_ON);
+            Files.write(log, legacy.array());
+
+            assertThat(GraphTenant.stagedFactsOnDisk(graph)).isEqualTo(9L);
+            assertThat(Files.readAllBytes(log)).isEqualTo(legacy.array());
+            assertThat(GraphTenant.stagedFactsOnDisk(root.resolve("absent").resolve("graph")))
+                .isZero();
+        }
+
+        @Test
         @DisplayName("summarising a closed namespace does not open its graph")
         void summarisingDoesNotOpenTheGraph(@TempDir Path root) throws IOException {
             try (GraphTenants tenants = tenants(root, 4)) {

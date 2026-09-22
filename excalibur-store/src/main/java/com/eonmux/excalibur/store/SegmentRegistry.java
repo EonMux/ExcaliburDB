@@ -28,7 +28,8 @@ import java.util.logging.Level;
  *
  * <p><strong>Thread safety:</strong> creation holds {@code StorageEngine.segmentLock} - the
  * engine's single monitor, shared with every other directory mutation - and double-checks the
- * map inside it, so two threads racing on the same empty slot produce one segment. The
+ * map inside it, so two threads racing on the same empty slot produce one segment. Reclamation
+ * holds it too, across both the routing check and the purge. The
  * lifecycle manager is published through the engine's volatile field under the engine's own
  * monitor.</p>
  */
@@ -162,23 +163,28 @@ final class SegmentRegistry {
      * @return true if the catalog row was removed
      */
     private boolean reclaim(SegmentLifecycleManager manager, long segmentIndex) {
-        if (engine.segments.get(segmentIndex) != null) {
-            if (refusedReclamations.add(segmentIndex)) {
-                StorageEngine.LOGGER.log(Level.WARNING,
-                    "Segment {0} is tombstoned but the routing directory still writes to it, so "
-                    + "it is kept tombstoned rather than purged: a purged row is recreated as a "
-                    + "live segment by the next start",
-                    segmentIndex);
+        // The check and the purge are one step under the directory's lock. Split publication
+        // registers its children's rows under the same lock, so the row this removes is the one
+        // the check was about, never one a split registered at the index in between.
+        synchronized (engine.segmentLock) {
+            if (engine.segments.get(segmentIndex) != null) {
+                if (refusedReclamations.add(segmentIndex)) {
+                    StorageEngine.LOGGER.log(Level.WARNING,
+                        "Segment {0} is tombstoned but the routing directory still writes to it, "
+                        + "so it is kept tombstoned rather than purged: a purged row is recreated "
+                        + "as a live segment by the next start",
+                        segmentIndex);
+                }
+                return false;
             }
-            return false;
-        }
 
-        try {
-            manager.purge(segmentIndex);
-        } catch (RuntimeException e) {
-            StorageEngine.LOGGER.log(Level.WARNING,
-                "Failed to purge segment " + segmentIndex + "; it stays tombstoned", e);
-            return false;
+            try {
+                manager.purge(segmentIndex);
+            } catch (RuntimeException e) {
+                StorageEngine.LOGGER.log(Level.WARNING,
+                    "Failed to purge segment " + segmentIndex + "; it stays tombstoned", e);
+                return false;
+            }
         }
 
         refusedReclamations.remove(segmentIndex);

@@ -71,10 +71,28 @@ class McpToolsTest {
 
         assertThat(names(schema.get("required"))).containsExactly("query");
         assertThat(Json.objectAt(schema, "properties"))
-            .containsKeys("query", "context_entities", "namespace");
+            .containsKeys("query", "context_entities", "namespace", "direction");
         assertThat(Json.stringAt(described, "description"))
             .as("a model must not turn an abstention into a guess")
             .contains("declined");
+        assertThat(Json.stringAt(described, "description"))
+            .as("a model has to know an ambiguity comes back as candidates to choose between, "
+                + "and that a computed count is there to be used rather than recounted")
+            .contains("needs_input").contains("candidates").contains("aggregate");
+    }
+
+    @Test
+    @DisplayName("search_graph lists the three directions, so a misspelt one fails validation")
+    void searchGraphDirectionIsEnumerated() {
+        Map<String, Object> direction = Json.objectAt(
+            Json.objectAt(Json.objectAt(tool(McpTools.SEARCH_GRAPH), "inputSchema"),
+                "properties"),
+            "direction");
+
+        assertThat(direction.get("type")).isEqualTo("string");
+        assertThat(names(direction.get("enum"))).containsExactly("forward", "reverse", "both");
+        assertThat(names(Json.objectAt(tool(McpTools.SEARCH_GRAPH), "inputSchema")
+            .get("required"))).doesNotContain("direction");
     }
 
     @Test
@@ -235,6 +253,56 @@ class McpToolsTest {
                 .call(McpTools.SEARCH_GRAPH, Map.of("query", "anything"));
 
             assertThat(Json.at(Json.parse(node.onlyRequest().body()), "as_of")).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("a direction reaches the graph endpoint as its wire name")
+    void directionIsPassedThrough() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            new McpTools(node.client(Map.of())).call(McpTools.SEARCH_GRAPH, Map.of(
+                "query", "What did Acme acquire?", "direction", " Forward "));
+
+            assertThat(Json.stringAt(Json.parse(node.onlyRequest().body()), "direction"))
+                .isEqualTo("forward");
+        }
+    }
+
+    @Test
+    @DisplayName("a query with no direction omits the field, so the node walks both ways")
+    void noDirectionIsOmitted() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            new McpTools(node.client(Map.of()))
+                .call(McpTools.SEARCH_GRAPH, Map.of("query", "anything"));
+
+            assertThat(Json.at(Json.parse(node.onlyRequest().body()), "direction")).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("a direction that is not one of the three is a tool error, and nothing is sent")
+    void unknownDirectionIsAToolError() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools.ToolResult result = new McpTools(node.client(Map.of())).call(
+                McpTools.SEARCH_GRAPH, Map.of("query", "anything", "direction", "outgoing"));
+
+            assertThat(result.isError()).isTrue();
+            assertThat(result.text()).contains("direction").contains("outgoing")
+                .contains("forward");
+            assertThat(node.requests()).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("a direction that is not a string is a tool error, and nothing is sent")
+    void nonStringDirectionIsAToolError() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools.ToolResult result = new McpTools(node.client(Map.of())).call(
+                McpTools.SEARCH_GRAPH, Map.of("query", "anything", "direction", 1));
+
+            assertThat(result.isError()).isTrue();
+            assertThat(result.text()).contains("'direction' must be a string");
+            assertThat(node.requests()).isEmpty();
         }
     }
 
@@ -506,6 +574,82 @@ class McpToolsTest {
 
             assertThat(result.isError()).isTrue();
             assertThat(result.text()).contains("documents");
+        }
+    }
+
+    @Test
+    @DisplayName("the default namespace reaches only the routes that honour one")
+    void theDefaultNamespaceStaysOffCorpusRoutes() throws IOException {
+        // The node answers 400 to a namespace on every corpus route. A client configured for a
+        // tenant must still be able to search, list status and re-crawl.
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of("EXCALIBUR_NAMESPACE", "acme")));
+
+            tools.call(McpTools.SEARCH_DOCUMENTS, Map.of("query", "q"));
+            tools.call(McpTools.INGESTION_STATUS, Map.of());
+            tools.call(McpTools.REINDEX_SOURCE, Map.of("source_id", "docs"));
+            tools.call(McpTools.ADD_DOCUMENTS, Map.of("source_id", "s",
+                "documents", List.of(Map.of("document_id", "d", "text", "t"))));
+            tools.call(McpTools.INGEST_DOCUMENTS,
+                Map.of("source_id", "docs", "root_path", "/srv/docs"));
+
+            List<StubNode.Received> requests = node.requests();
+            assertThat(requests).hasSize(5);
+            for (StubNode.Received corpus : requests.subList(0, 4)) {
+                assertThat(corpus.headers())
+                    .as(corpus.method() + " " + corpus.path())
+                    .doesNotContainKey(ExcaliburClient.NAMESPACE_HEADER);
+            }
+            assertThat(requests.get(4).headers())
+                .as("registration records the namespace a source stages its facts into")
+                .containsEntry(ExcaliburClient.NAMESPACE_HEADER, "acme");
+        }
+    }
+
+    @Test
+    @DisplayName("registering a source can name its namespace")
+    void registrationTakesANamespace() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            tools.call(McpTools.CRAWL_WEBSITE, Map.of("source_id", "site",
+                "base_url", "https://example.com", "namespace", "acme"));
+            tools.call(McpTools.INGEST_DOCUMENTS,
+                Map.of("source_id", "docs", "root_path", "/srv/docs"));
+
+            List<StubNode.Received> requests = node.requests();
+            assertThat(requests.get(0).headers())
+                .containsEntry(ExcaliburClient.NAMESPACE_HEADER, "acme");
+            assertThat(Json.objectAt(Json.parse(requests.get(0).body()), "config"))
+                .as("the namespace is a header, not a source setting the node would refuse")
+                .doesNotContainKey("namespace");
+            assertThat(requests.get(1).headers())
+                .as("with no default configured, no namespace is sent")
+                .doesNotContainKey(ExcaliburClient.NAMESPACE_HEADER);
+        }
+    }
+
+    @Test
+    @DisplayName("an argument of the wrong type is refused, not dropped")
+    void wrongTypesAreRefused() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+
+            McpTools.ToolResult topK = tools.call(McpTools.SEARCH_DOCUMENTS,
+                Map.of("query", "q", "top_k", "many"));
+            McpTools.ToolResult excluded = tools.call(McpTools.CRAWL_WEBSITE, Map.of("source_id", "s",
+                "base_url", "https://example.com", "excluded_path_patterns", "/api"));
+            McpTools.ToolResult namespace = tools.call(McpTools.BUILD_GRAPH, Map.of("namespace", 7));
+            McpTools.ToolResult element = tools.call(McpTools.INGEST_DOCUMENTS, Map.of("source_id", "d",
+                "root_path", "/srv", "included_extensions", List.of(".md", 3)));
+
+            assertThat(topK.isError()).isTrue();
+            assertThat(topK.text()).contains("top_k");
+            assertThat(excluded.isError()).isTrue();
+            assertThat(excluded.text()).contains("excluded_path_patterns");
+            assertThat(namespace.isError()).isTrue();
+            assertThat(element.isError()).isTrue();
+            assertThat(node.requests()).isEmpty();
         }
     }
 }

@@ -177,6 +177,34 @@ public final class NativeChunkIndex implements ChunkIndex {
     }
 
     @Override
+    public void addDocument(Map<String, String> chunks) throws IOException {
+        Objects.requireNonNull(chunks, "chunks must not be null");
+        int added = 0;
+        // One hold of the write lock for the whole document, which refresh() also takes: a
+        // refresh either publishes the buffer before any of these chunks arrive or after all of
+        // them have. A spill in the middle is harmless, because a staged segment is published
+        // only with the rest of what refresh() finds.
+        lock.writeLock().lock();
+        try {
+            for (Map.Entry<String, String> chunk : chunks.entrySet()) {
+                Objects.requireNonNull(chunk.getKey(), "chunkId must not be null");
+                String text = chunk.getValue();
+                if (text == null || text.isEmpty()) {
+                    continue;
+                }
+                buffer.put(chunk.getKey(), text);
+                added++;
+                if (buffer.size() >= bufferChunks) {
+                    spill();
+                }
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+        indexed.addAndGet(added);
+    }
+
+    @Override
     public void refresh() throws IOException {
         lock.writeLock().lock();
         try {
@@ -317,6 +345,22 @@ public final class NativeChunkIndex implements ChunkIndex {
         lock.readLock().lock();
         try {
             return store.search(terms, weights, limit, epochs.getAsLong());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>A digest of the segments visible at the current epoch, read under the same lock and at
+     * the same epoch a search reads them - see {@link LexicalStore#searchVersion(long)}.</p>
+     */
+    @Override
+    public java.util.OptionalLong searchVersion() {
+        lock.readLock().lock();
+        try {
+            return java.util.OptionalLong.of(store.searchVersion(epochs.getAsLong()));
         } finally {
             lock.readLock().unlock();
         }

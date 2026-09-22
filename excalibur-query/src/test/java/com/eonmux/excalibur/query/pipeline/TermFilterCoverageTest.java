@@ -24,8 +24,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TermFilterCoverageTest {
 
     private static HierarchicalCuckooFilter filterWith(long segmentId, String... terms) {
-        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(10_000L, 13, 1_000, 100);
-        filter.registerSegment(String.valueOf(segmentId), "cluster-0");
+        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(10_000L, 13, 100);
+        filter.registerSegment(String.valueOf(segmentId));
         for (String term : terms) {
             filter.insert(term.getBytes(StandardCharsets.UTF_8), String.valueOf(segmentId));
         }
@@ -36,7 +36,7 @@ class TermFilterCoverageTest {
     @DisplayName("an empty filter excludes nothing")
     void emptyFilterHasNoVerdict() {
         // The restart case. Every segment must survive, or the node answers nothing at all.
-        HierarchicalCuckooFilter empty = new HierarchicalCuckooFilter(10_000L, 13, 1_000, 100);
+        HierarchicalCuckooFilter empty = new HierarchicalCuckooFilter(10_000L, 13, 100);
 
         assertThat(TermFilterCascade.filterCovers(empty, 0L)).isFalse();
         assertThat(TermFilterCascade.survivesTermFilter(empty, 0L, Set.of())).isTrue();
@@ -91,8 +91,8 @@ class TermFilterCoverageTest {
         // filter filled, so it holds some of what the segment holds and reads as authoritative
         // - and every term it had no room for now prunes the segment that contains it. The
         // documents are in storage and the query answers with nothing.
-        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(10_000L, 13, 1_000, 8);
-        filter.registerSegment("0", "cluster-0");
+        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(10_000L, 13, 8);
+        filter.registerSegment("0");
         boolean refused = false;
         for (int i = 0; i < 4096 && !refused; i++) {
             refused = !filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), "0");
@@ -109,16 +109,18 @@ class TermFilterCoverageTest {
     void aSaturatedCorpusHasNoVerdict() {
         // The corpus filter is the first level consulted, so a term it could not record is
         // invisible in every segment - not only the one being written when it filled.
-        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(8L, 13, 1_000_000, 1_000_000);
-        filter.registerSegment("0", "cluster-0");
-        filter.registerSegment("1", "cluster-0");
+        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(8L, 13, 8);
+        filter.registerSegment("0");
+        filter.registerSegment("1");
         filter.insert("invoice".getBytes(StandardCharsets.UTF_8), "1");
-        boolean refused = false;
-        for (int i = 0; i < 4096 && !refused; i++) {
-            refused = !filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), "0");
+        // Spread over many segments, so the level holding every term fills before any segment.
+        for (int i = 0; i < 4096 && !filter.isSaturated(); i++) {
+            String spread = String.valueOf(2 + i % 64);
+            filter.registerSegment(spread);
+            filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), spread);
         }
-        assertThat(refused).as("the corpus filter has to fill for this test to mean anything")
-            .isTrue();
+        assertThat(filter.isSaturated())
+            .as("the corpus filter has to fill for this test to mean anything").isTrue();
 
         assertThat(TermFilterCascade.survivesTermFilter(filter, 0L, Set.of())).isTrue();
         assertThat(TermFilterCascade.survivesTermFilter(filter, 1L, Set.of())).isTrue();

@@ -21,8 +21,8 @@ excalibur.ingest.document-atomicity=true
 excalibur.ingest.reindex-interval-ms=3600000
 # The shortest gap a web crawl leaves between two requests to its host, in milliseconds. 200ms is
 # five a second. A crawl is a sequential walk that makes two requests per page - one to read its
-# links, one to fetch it - so before this existed a host behind a fast link was asked for pages as
-# quickly as it would answer them, up to the ten million a single registration may ask for.
+# links, one to fetch it - so without pacing a host behind a fast link is asked for pages as
+# quickly as it will answer them, up to the ten million a single registration may ask for.
 # A registration's own `crawl_delay_ms` may ask for a longer gap and never a shorter one: the rate
 # a host is asked to bear is the deployment's decision. 0 turns pacing off entirely; the maximum
 # is 60000, and a value outside that range is refused at startup rather than clamped.
@@ -67,8 +67,9 @@ excalibur.api.port=8080
 # refuses to start rather than serving the network unauthenticated or in cleartext.
 excalibur.api.bind-address=127.0.0.1
 # Never set the auth token here. Supply it as the EXCALIBUR_API_AUTH_TOKEN environment
-# variable. Setting it turns authentication on: every endpoint except GET /health then
-# requires it as a bearer token. Unset, the API is unauthenticated -- which is safe only
+# variable, which is the environment override of this key. Setting it turns authentication on:
+# every endpoint except GET /health and GET /health/ready then requires it as a bearer token (a
+# method a path does not serve is still answered 405 without one). Unset, the API is unauthenticated -- which is safe only
 # because the bind policy above will not let it listen anywhere but loopback without one.
 #excalibur.api.auth-token=
 # Per-client rate limits: separate budgets for reads and for mutating requests.
@@ -158,12 +159,20 @@ excalibur.graph.rerank-over-fetch=4
 # coverage they buy; Calibration.minScore/minSeparation/minMeanConfidence are what to copy here.
 # Fitting them one at a time and combining the results gives a node stricter than any of the
 # three fits measured, because the gates overlap.
-excalibur.graph.min-score=0.005
-excalibur.graph.min-separation=0.001
+#
+# min-score is read on a unit relevance scale, for the entity the question named: the share of the
+# question's BM25 term weight its description carries, counting only words the graph holds, or its
+# vector similarity to the question once the exact rerank has run. 0.05 declines a named entity
+# whose description carries almost none of what the question asks. min-separation is the gap
+# between the two best entities sharing the name the question used, as a fraction of the best;
+# 0.01 calls two that scored within one percent of each other ambiguous and hands them back to be
+# chosen between.
+excalibur.graph.min-score=0.05
+excalibur.graph.min-separation=0.01
 excalibur.graph.min-mean-confidence=0.3
 excalibur.graph.max-ambiguous-candidates=5
 # Divisor on the log-odds of the confidence an answer reports. 1.0 leaves it untouched, which is
-# the honest default: the number a node reports is built from a fused score by arithmetic, and
+# the honest default: the number a node reports is built from a ranking score by arithmetic, and
 # whether it can be read as a probability is a question only labelled outcomes can answer.
 # AbstentionCalibrator.fitTemperature answers it -- above 1.0 softens overconfident claims
 # towards 0.5, below 1.0 sharpens underconfident ones -- and reports the calibration error before
@@ -244,6 +253,11 @@ excalibur.ingest.lexical-max-latency-seconds=3600
 # Segments tolerated before the smallest are merged. Every segment is a set of mappings and a
 # search that must visit it, so the count is bounded rather than left to grow with the corpus.
 excalibur.ingest.lexical-max-segments=16
+# Longest a document published by a run still in progress waits to become searchable by BM25. A
+# run also refreshes when it ends or is stopped. Each refresh publishes a segment on the native
+# engine and reopens a reader on Lucene, which is why it is paced rather than per document; at
+# least 1000.
+excalibur.ingest.lexical-refresh-interval-ms=30000
 # How BM25 scores a match. k1 is where a repeated term stops earning more: higher keeps rewarding
 # repetition, 0 reduces term frequency to a yes-or-no. b is how much a match is discounted for the
 # length of the chunk it was found in: 1 normalises fully by length, 0 not at all.
@@ -368,7 +382,7 @@ excalibur.shard.default-max-connections-layer0=0
 
 # When a segment is worth rewriting, and how often the question is asked. A segment is compacted
 # once this fraction of it is tombstoned, or once its write log passes the size below - the second
-# is what keeps a segment that is appended to but never deleted from from accumulating an unbounded
+# is what keeps a segment that is appended to but never deleted from accumulating an unbounded
 # log. The concurrency bound is what stops a burst of eligible segments from spending the whole
 # machine on rewrites; it is 1 to 16, and a value outside that is refused at startup against the
 # property name rather than aborting the boot with a message naming no key.

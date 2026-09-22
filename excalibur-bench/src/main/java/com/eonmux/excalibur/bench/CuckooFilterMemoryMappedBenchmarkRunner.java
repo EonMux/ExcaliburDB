@@ -94,13 +94,11 @@ public class CuckooFilterMemoryMappedBenchmarkRunner {
                 .measurementTime(TimeValue.seconds(2))
                 // Fork configuration
                 .forks(1)
-                // JVM arguments for Panama FFM and adequate heap
-                .jvmArgsAppend(
-                    "--enable-preview",
-                    "--enable-native-access=ALL-UNNAMED",
+                // The flags every fork needs, then this benchmark's own and adequate heap
+                .jvmArgsAppend(ForkedJvm.flags(
                     "-Xms4g",
                     "-Xmx4g"
-                )
+                ))
                 // Output format
                 .shouldDoGC(true)
                 .build();

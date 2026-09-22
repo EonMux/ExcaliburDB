@@ -111,8 +111,23 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
     private final Analyzer analyzer;
     private final IndexWriter writer;
     private final Bm25Parameters bm25;
-    private final AtomicReference<DirectoryReader> reader = new AtomicReference<>();
-    private final AtomicReference<IndexSearcher> searcher = new AtomicReference<>();
+    /**
+     * The reader searches go through and the searcher over it, published together.
+     *
+     * <p>One reference rather than two so that a version read and a search run against it can
+     * never straddle a refresh: a caller reading the version from one snapshot and searching
+     * another later sees at least that version, never an older one under a newer label.</p>
+     */
+    private final AtomicReference<Snapshot> published = new AtomicReference<>();
+
+    /**
+     * A published reader, its searcher, and its version.
+     *
+     * <p>The version is read once, at publication: Lucene refuses to report it from a reader a
+     * refresh has since given up, and a caller asking which version is served should not fail
+     * because a refresh happened to finish at that moment.</p>
+     */
+    private record Snapshot(DirectoryReader reader, IndexSearcher searcher, long version) { }
 
     private LexicalIndex(Directory directory, Analyzer analyzer, IndexWriter writer,
                          Bm25Parameters bm25) {
@@ -179,6 +194,36 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
     }
 
     /**
+     * Opens an existing index for searching only, scored with the default BM25 pair.
+     *
+     * <p>For an index something else wrote and nothing here will change, such as a published
+     * graph's. No writer is opened, so no write lock is taken: a replacement can be opened at the
+     * same path while this one is still being read, and a reader draining against a directory
+     * that was renamed away keeps the files it already holds.</p>
+     *
+     * <p>An absent index is an error rather than an empty one. Opening a published artifact that
+     * is not there means the artifact is damaged, and creating an empty index in its place would
+     * serve every query from nothing without saying so.</p>
+     *
+     * @param path Where the index is
+     * @return The index, searchable at once
+     * @throws org.apache.lucene.index.IndexNotFoundException if there is no index at {@code path}
+     * @throws IOException if the index cannot be read
+     */
+    public static LexicalIndex openReadOnly(Path path) throws IOException {
+        Directory directory = FSDirectory.open(path);
+        LexicalIndex index =
+            new LexicalIndex(directory, new StandardAnalyzer(), null, Bm25Parameters.DEFAULT);
+        try {
+            index.refresh();
+        } catch (IOException | RuntimeException e) {
+            index.close();
+            throw e;
+        }
+        return index;
+    }
+
+    /**
      * The default merge policy, with the one setting that makes {@link #forceMergeDeletes()} mean
      * what it says.
      *
@@ -232,7 +277,7 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
         document.add(new StringField(FIELD_DOC_ID, Long.toString(documentId), Field.Store.NO));
         document.add(new StoredField(FIELD_DOC_ID, documentId));
         document.add(new NumericDocValuesField(FIELD_DOC_ID, documentId));
-        writer.updateDocument(new Term(FIELD_DOC_ID, Long.toString(documentId)), document);
+        writable().updateDocument(new Term(FIELD_DOC_ID, Long.toString(documentId)), document);
     }
 
     /**
@@ -243,28 +288,27 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
      * @throws IOException if the read fails
      */
     public String externalKeyOf(long documentId) throws IOException {
-        IndexSearcher current = searcher();
-        if (current == null) {
-            return null;
+        try (Lease lease = acquire()) {
+            IndexSearcher current = lease.searcher();
+            TopDocs hits = current.search(
+                new org.apache.lucene.search.TermQuery(
+                    new Term(FIELD_DOC_ID, Long.toString(documentId))), 1);
+            if (hits.scoreDocs.length == 0) {
+                return null;
+            }
+            Document stored = current.storedFields().document(hits.scoreDocs[0].doc, KEY_ONLY);
+            return stored == null ? null : stored.get(FIELD_EXTERNAL_KEY);
         }
-        TopDocs hits = current.search(
-            new org.apache.lucene.search.TermQuery(
-                new Term(FIELD_DOC_ID, Long.toString(documentId))), 1);
-        if (hits.scoreDocs.length == 0) {
-            return null;
-        }
-        Document stored = current.storedFields().document(hits.scoreDocs[0].doc, KEY_ONLY);
-        return stored == null ? null : stored.get(FIELD_EXTERNAL_KEY);
     }
 
     /** Removes a document. */
     public void delete(long documentId) throws IOException {
-        writer.deleteDocuments(new Term(FIELD_DOC_ID, Long.toString(documentId)));
+        writable().deleteDocuments(new Term(FIELD_DOC_ID, Long.toString(documentId)));
     }
 
     /** Flushes pending writes to disk without making them searchable. */
     public void commit() throws IOException {
-        writer.commit();
+        writable().commit();
     }
 
     /**
@@ -278,10 +322,11 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
      * @return How many documents were deleted before the merge, which is what it reclaimed
      */
     public int forceMergeDeletes() throws IOException {
-        DirectoryReader current = reader.get();
-        int pending = current == null ? 0 : current.numDeletedDocs();
-        writer.forceMergeDeletes(true);
-        writer.commit();
+        Snapshot current = published.get();
+        int pending = current == null ? 0 : current.reader().numDeletedDocs();
+        IndexWriter open = writable();
+        open.forceMergeDeletes(true);
+        open.commit();
         return pending;
     }
 
@@ -289,39 +334,99 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
      * Makes everything written so far searchable.
      *
      * <p>Commits first: a reader opened on uncommitted state would see documents that a crash would
-     * lose, so a search could return a result that no longer exists after a restart.
+     * lose, so a search could return a result that no longer exists after a restart. A read-only
+     * index has nothing to commit and picks up whatever was last committed.
      */
     public void refresh() throws IOException {
-        writer.commit();
-        DirectoryReader current = reader.get();
+        if (writer != null) {
+            writer.commit();
+        }
+        Snapshot current = published.get();
         DirectoryReader refreshed = current == null
             ? DirectoryReader.open(directory)
-            : DirectoryReader.openIfChanged(current);
+            : DirectoryReader.openIfChanged(current.reader());
 
         if (refreshed == null) {
             return;
         }
         IndexSearcher newSearcher = new IndexSearcher(refreshed);
         newSearcher.setSimilarity(similarityOf(bm25));
-        reader.set(refreshed);
-        searcher.set(newSearcher);
+        published.set(new Snapshot(refreshed, newSearcher, refreshed.getVersion()));
         if (current != null) {
-            current.close();
+            // Gives up the index's own reference. The reader closes once the searches leasing it
+            // have finished, not under them.
+            current.reader().decRef();
         }
     }
 
     /**
-     * A searcher over the index as of the last refresh.
+     * Holds the index as of the last refresh open for the length of one search.
      *
-     * @throws IllegalStateException if the index has never been refreshed
+     * <p>A {@link #refresh()} replaces the reader and gives up the index's own reference to the
+     * old one; a search that took a lease keeps it open until the lease is closed, so a refresh
+     * never closes files under a search that is reading them.</p>
+     *
+     * @return The lease; close it when the search is done
+     * @throws IllegalStateException if the index has never been refreshed, or is closed
      */
-    public IndexSearcher searcher() {
-        IndexSearcher current = searcher.get();
-        if (current == null) {
-            throw new IllegalStateException(
-                "lexical index has no searcher; call refresh() before searching");
+    public Lease acquire() {
+        return tryAcquire().orElseThrow(() -> new IllegalStateException(
+            "lexical index has no searcher: it is closed, or has never been refreshed"));
+    }
+
+    /**
+     * As {@link #acquire()}, for a caller with its own answer to an index that cannot be searched.
+     *
+     * @return The lease, or empty when the index has never been refreshed or is closed
+     */
+    public java.util.Optional<Lease> tryAcquire() {
+        while (true) {
+            Snapshot current = published.get();
+            if (current == null) {
+                return java.util.Optional.empty();
+            }
+            if (current.reader().tryIncRef()) {
+                return java.util.Optional.of(new Lease(current));
+            }
+            // A refresh gave the reader up between the read and the increment; its replacement
+            // is already published.
         }
-        return current;
+    }
+
+    /**
+     * One search's hold on a published reader.
+     *
+     * <p>Closing it twice releases it once.</p>
+     */
+    public static final class Lease implements AutoCloseable {
+
+        private final Snapshot snapshot;
+        private final java.util.concurrent.atomic.AtomicBoolean released =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+        private Lease(Snapshot snapshot) {
+            this.snapshot = snapshot;
+        }
+
+        /**
+         * The searcher to run the search with.
+         *
+         * @return The searcher over the leased reader
+         */
+        public IndexSearcher searcher() {
+            return snapshot.searcher();
+        }
+
+        @Override
+        public void close() {
+            if (released.compareAndSet(false, true)) {
+                try {
+                    snapshot.reader().decRef();
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException("could not release a lexical reader", e);
+                }
+            }
+        }
     }
 
     /**
@@ -341,16 +446,34 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
      * @throws IllegalStateException if the index has never been refreshed
      */
     public String textOf(long documentId) throws IOException {
-        IndexSearcher current = searcher();
-        TopDocs hits = current.search(
-            new TermQuery(new Term(FIELD_DOC_ID, Long.toString(documentId))), 1);
-        if (hits.scoreDocs.length == 0) {
-            return null;
+        try (Lease lease = acquire()) {
+            IndexSearcher current = lease.searcher();
+            TopDocs hits = current.search(
+                new TermQuery(new Term(FIELD_DOC_ID, Long.toString(documentId))), 1);
+            if (hits.scoreDocs.length == 0) {
+                return null;
+            }
+            // Only the text is loaded. The id is what the caller already had, and fetching it
+            // again would decompress a second stored field per lookup for nothing.
+            Document stored = current.storedFields().document(hits.scoreDocs[0].doc, TEXT_ONLY);
+            return stored.get(FIELD_TEXT);
         }
-        // Only the text is loaded. The id is what the caller already had, and fetching it again
-        // would decompress a second stored field per lookup for nothing.
-        Document stored = current.storedFields().document(hits.scoreDocs[0].doc, TEXT_ONLY);
-        return stored.get(FIELD_TEXT);
+    }
+
+    /**
+     * Whether this index was opened with {@link #openReadOnly}.
+     *
+     * @return true when nothing can be written through it
+     */
+    public boolean isReadOnly() {
+        return writer == null;
+    }
+
+    private IndexWriter writable() {
+        if (writer == null) {
+            throw new IllegalStateException("lexical index is open read-only: " + directory);
+        }
+        return writer;
     }
 
     /** The analyzer, so a query is analysed exactly as the documents were. */
@@ -358,10 +481,28 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
         return analyzer;
     }
 
+    /**
+     * Which published state of the index a search started now would read.
+     *
+     * <p>The version of the reader searches go through, which changes exactly when a
+     * {@link #refresh()} publishes something - an addition, a deletion or a merge - and not
+     * when a write is merely buffered or committed behind the reader's back. That is the
+     * boundary a search sees, so an answer computed against one version is the answer to the
+     * same question for as long as the version stands.</p>
+     *
+     * @return The reader's version, or empty when the index has never been refreshed and so
+     *         has no reader
+     */
+    public java.util.OptionalLong readerVersion() {
+        Snapshot current = published.get();
+        return current == null ? java.util.OptionalLong.empty()
+            : java.util.OptionalLong.of(current.version());
+    }
+
     /** How many documents are searchable as of the last refresh. */
     public int documentCount() {
-        DirectoryReader current = reader.get();
-        return current == null ? 0 : current.numDocs();
+        Snapshot current = published.get();
+        return current == null ? 0 : current.reader().numDocs();
     }
 
     /**
@@ -415,14 +556,14 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
     /**
      * {@inheritDoc}
      *
-     * <p>One for the writer's lock, which is held open for as long as this index is. A mapped
-     * directory holds no others: it maps each file and closes the channel. A directory that is not
-     * mapped reads through open files instead, so there its files are descriptors rather than
-     * mappings and are counted here.
+     * <p>One for the writer's lock, which is held open for as long as this index is, and none on
+     * a read-only index, which takes no lock. A mapped directory holds no others: it maps each
+     * file and closes the channel. A directory that is not mapped reads through open files
+     * instead, so there its files are descriptors rather than mappings and are counted here.
      */
     @Override
     public long descriptors() {
-        long lock = 1L;
+        long lock = writer == null ? 0L : 1L;
         if (directory instanceof MMapDirectory) {
             return lock;
         }
@@ -436,8 +577,8 @@ public final class LexicalIndex implements AutoCloseable, MappedFootprint {
 
     @Override
     public void close() {
-        closeQuietly("reader", reader.getAndSet(null));
-        searcher.set(null);
+        Snapshot last = published.getAndSet(null);
+        closeQuietly("reader", last == null ? null : last.reader());
         closeQuietly("writer", writer);
         closeQuietly("analyzer", analyzer);
         closeQuietly("directory", directory);

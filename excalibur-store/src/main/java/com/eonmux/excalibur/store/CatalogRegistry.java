@@ -35,8 +35,24 @@ import java.util.concurrent.atomic.AtomicLong;
  *       the segment BOOTSTRAPPING, which is invisible to queries.</li>
  * </ul>
  *
- * <p>Every id that enters the registry is fed back into the generator, so an id supplied by
- * a caller can never be handed out again by {@code create()}.</p>
+ * <h2>Two id spaces that never meet</h2>
+ * <p>The first two register <em>canonical</em> ids: routing-directory indices the storage
+ * engine chooses, including the indices a split publishes its children at. The third
+ * <em>allocates</em> ids for segments that belong to a source rather than to a directory slot.
+ * If the two could produce the same number, a split publishing its right child at an index a
+ * rolling reindex had already been given would land on that reindex's record - another
+ * source's segment, often already TOMBSTONED - and a live segment would inherit its state and
+ * drop out of every query. So they are disjoint by construction: the directory's width is an
+ * {@code int} power of two, which bounds every canonical index by {@link Integer#MAX_VALUE},
+ * and {@code create()} only ever hands out ids from {@link #FIRST_CREATED_ID} upward.</p>
+ *
+ * <p>A persisted catalog can still hold created records at ids inside the routing range,
+ * allocated when {@code create()} drew from the same counter as the routing indices. Those
+ * records keep their ids - renumbering them would orphan
+ * whatever still refers to them - and registering a canonical segment over one is refused
+ * with an exception instead of adopting it, so the collision surfaces where it happens rather
+ * than as a segment that silently stops answering queries. See
+ * {@link #checkRoutingRegistration(long)}.</p>
  *
  * <p>Each mutation is persisted through {@link CatalogPersistence} before it is reported as
  * done, in the same order the in-memory change was made.</p>
@@ -67,8 +83,22 @@ final class CatalogRegistry {
      */
     private final ConcurrentHashMap<Path, List<Long>> volumeToSegments = new ConcurrentHashMap<>();
 
-    /** Global segment ID generator. */
-    private final AtomicLong segmentIdGenerator = new AtomicLong(0);
+    /**
+     * The lowest id {@link #create(String, Path)} hands out.
+     *
+     * <p>One past the largest index an {@code int}-wide routing directory can hold, so no
+     * created id can ever equal a canonical one. The catalog file stores ids as eight-byte
+     * fields, so ids in this range persist and recover like any other.</p>
+     */
+    static final long FIRST_CREATED_ID = (long) Integer.MAX_VALUE + 1;
+
+    /**
+     * The last id {@link #create(String, Path)} handed out, or {@code FIRST_CREATED_ID - 1}
+     * when it has handed out none.
+     *
+     * <p>Canonical ids need no generator: the engine chooses them.</p>
+     */
+    private final AtomicLong createdIdGenerator = new AtomicLong(FIRST_CREATED_ID - 1);
 
     /** Where each change is made durable. */
     private final CatalogPersistence persistence;
@@ -157,16 +187,16 @@ final class CatalogRegistry {
     /**
      * Adds a segment under a caller-supplied id, moving a new record into INDEXING.
      *
-     * @param segmentId Unique segment identifier
+     * @param segmentId Unique segment identifier: a routing-directory index
      * @param volumePath Path to the segment file
      * @return The created or existing metadata
+     * @throws IllegalArgumentException if the id lies outside the routing range
+     * @throws IllegalStateException if the id is held by a segment {@link #create} made
      */
     SegmentCatalog.SegmentMetadata add(long segmentId, Path volumePath) {
+        checkRoutingRegistration(segmentId);
         SegmentCatalog.SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
             new SegmentCatalog.SegmentMetadata(segmentId));
-
-        // A caller-supplied id must never be handed out again by create().
-        reserveSegmentId(segmentId);
 
         metadata.setVolumePath(volumePath);
         metadata.setCreationTime(System.currentTimeMillis());
@@ -193,12 +223,13 @@ final class CatalogRegistry {
      * @param segmentId  The segment index whose file changed
      * @param volumePath The new segment file path
      * @return The metadata for the segment
+     * @throws IllegalArgumentException if the id lies outside the routing range
+     * @throws IllegalStateException if the id is held by a segment {@link #create} made
      */
     SegmentCatalog.SegmentMetadata registerFile(long segmentId, Path volumePath) {
+        checkRoutingRegistration(segmentId);
         SegmentCatalog.SegmentMetadata metadata = segments.computeIfAbsent(segmentId, k ->
             new SegmentCatalog.SegmentMetadata(segmentId));
-
-        reserveSegmentId(segmentId);
 
         Path previousPath = metadata.getVolumePath();
         if (previousPath != null && !previousPath.equals(volumePath)) {
@@ -219,10 +250,14 @@ final class CatalogRegistry {
     /**
      * Creates a new segment in BOOTSTRAPPING state for a specific source.
      *
+     * <p>The id is drawn from {@link #FIRST_CREATED_ID} upward, so it is never one the
+     * routing directory can publish a segment at.</p>
+     *
      * @param sourceId The source ID this segment belongs to
      * @param volumePath Path to the segment file
      * @return The created segment metadata with BOOTSTRAPPING state
      * @throws NullPointerException if sourceId or volumePath is null
+     * @throws IllegalStateException if the drawn id is somehow already registered
      */
     SegmentCatalog.SegmentMetadata create(String sourceId, Path volumePath) {
         if (sourceId == null) {
@@ -232,18 +267,16 @@ final class CatalogRegistry {
             throw new NullPointerException("volumePath cannot be null");
         }
 
-        // Generate a unique segment ID. The generator is also advanced by add() and
-        // recover(), but a concurrent add() can still take the next id, so keep
-        // drawing until an unused key is claimed rather than overwriting a live
-        // routing segment's metadata with a blind put().
-        long segmentId;
-        SegmentCatalog.SegmentMetadata metadata;
-        while (true) {
-            segmentId = segmentIdGenerator.incrementAndGet();
-            metadata = new SegmentCatalog.SegmentMetadata(segmentId);
-            if (segments.putIfAbsent(segmentId, metadata) == null) {
-                break;
-            }
+        // add() and registerFile() refuse ids in the created range, and restore() advances
+        // the generator past every one it reads back, so the drawn id is free. An id that is
+        // nonetheless taken means that invariant is broken, and a blind put() would overwrite
+        // whatever holds it, so the claim is conditional.
+        long segmentId = createdIdGenerator.incrementAndGet();
+        SegmentCatalog.SegmentMetadata metadata = new SegmentCatalog.SegmentMetadata(segmentId);
+        if (segments.putIfAbsent(segmentId, metadata) != null) {
+            throw new IllegalStateException(
+                "Created segment id " + segmentId + " is already registered; the catalog's "
+                    + "created-id generator is behind the ids it holds");
         }
 
         metadata.setVolumePath(volumePath);
@@ -297,12 +330,127 @@ final class CatalogRegistry {
     }
 
     /**
-     * Ensures the id generator can never hand out an id that is already in use.
+     * Refuses a canonical registration that would land on something other than a routing
+     * segment's record.
      *
-     * @param segmentId The id that has just been taken
+     * <p>A canonical id is a routing-directory index, so it must lie in
+     * {@code [0, FIRST_CREATED_ID)}. Within that range, the only record that can already hold
+     * the id and not be a routing segment's is one {@link #create(String, Path)} allocated
+     * there when it shared a counter with the routing indices, and which a persisted catalog
+     * still holds; such a record carries its source's id. Registering over it would re-point another source's segment -
+     * frequently already TOMBSTONED - at a live file, and leave that file invisible to queries
+     * under the other record's state, so this throws instead. Split publication calls it before
+     * it touches any file, which is what lets a refused split return its parent to service
+     * unchanged.</p>
+     *
+     * @param segmentId The routing index about to be registered
+     * @throws IllegalArgumentException if the id lies outside the routing range
+     * @throws IllegalStateException if a created segment already holds the id
      */
-    private void reserveSegmentId(long segmentId) {
-        segmentIdGenerator.accumulateAndGet(segmentId, Math::max);
+    void checkRoutingRegistration(long segmentId) {
+        if (segmentId < 0 || segmentId >= FIRST_CREATED_ID) {
+            throw new IllegalArgumentException(
+                "Segment id " + segmentId + " is not a routing index: routing indices lie in [0, "
+                    + FIRST_CREATED_ID + ")");
+        }
+        SegmentCatalog.SegmentMetadata existing = segments.get(segmentId);
+        if (existing != null && isCreated(existing)) {
+            throw new IllegalStateException(
+                "Routing index " + segmentId + " is held by a segment created for source '"
+                    + existing.getSourceId() + "' (state " + existing.getLifecycleState()
+                    + ", file " + existing.getVolumePath() + "); refusing to register a routing "
+                    + "segment over it. Purge that segment to free the index.");
+        }
+    }
+
+    /**
+     * Whether the record at a routing index belongs to a source rather than to the routing
+     * segment at that index.
+     *
+     * @param segmentIndex The routing index
+     * @return true if a record made by {@link #create(String, Path)} holds the index
+     */
+    boolean isHeldByCreatedRecord(long segmentIndex) {
+        SegmentCatalog.SegmentMetadata existing = segments.get(segmentIndex);
+        return existing != null && isCreated(existing);
+    }
+
+    /**
+     * Replaces a created record that holds a routing index with a routing segment's own row.
+     *
+     * <p>The catalog can hold, at a routing index, a record {@link #create(String, Path)}
+     * allocated for a source while it shared a counter with the routing indices, and which a
+     * split then re-pointed at the segment it published there. That record carries the
+     * source's id and the source's lifecycle state - TOMBSTONED when the rolling reindex that
+     * made it fell back - so the routing segment answers no query while it keeps accepting
+     * writes. The replacement is the row the segment would have been given had it been
+     * discovered with none: its own file, INDEXING, and ACTIVE with its entry count when it
+     * holds entries. Its write-log checkpoint, creation time and last compaction are carried
+     * over: from the moment the split re-pointed the record, those were advanced by the
+     * routing segment itself, and before it the created segment had no storage to advance
+     * them.</p>
+     *
+     * <p>The source id and the lifecycle state are exactly what is discarded, and the source id
+     * is also what selects the record, never its state alone: a routing segment can
+     * legitimately be TOMBSTONED, and its row carries no source id.</p>
+     *
+     * @param segmentIndex The routing index the routing segment occupies
+     * @param volumePath   The routing segment's file
+     * @param entryCount   The routing segment's live entry count
+     * @return The routing segment's new row
+     * @throws IllegalArgumentException if the id is not a routing index
+     * @throws IllegalStateException if the index is not held by a created record
+     */
+    SegmentCatalog.SegmentMetadata replaceWithRoutingRecord(long segmentIndex, Path volumePath,
+                                                            int entryCount) {
+        if (segmentIndex < 0 || segmentIndex >= FIRST_CREATED_ID) {
+            throw new IllegalArgumentException(
+                "Segment id " + segmentIndex + " is not a routing index");
+        }
+        SegmentCatalog.SegmentMetadata stale = segments.get(segmentIndex);
+        if (stale == null || !isCreated(stale)) {
+            throw new IllegalStateException(
+                "Routing index " + segmentIndex + " is not held by a created segment");
+        }
+
+        SegmentCatalog.SegmentMetadata routing = new SegmentCatalog.SegmentMetadata(segmentIndex);
+        routing.setVolumePath(volumePath);
+        routing.setCreationTime(stale.getCreationTime() != 0
+            ? stale.getCreationTime() : System.currentTimeMillis());
+        routing.setLastCompactionTime(stale.getLastCompactionTime());
+        routing.setLastIntegratedOffset(stale.getLastIntegratedOffset());
+        routing.transitionToIndexing();
+        if (entryCount > 0) {
+            routing.transitionToWarming();
+            routing.transitionToActive();
+            routing.setEntryCount(entryCount);
+        }
+
+        if (!segments.replace(segmentIndex, stale, routing)) {
+            throw new IllegalStateException(
+                "The record at routing index " + segmentIndex + " changed while it was replaced");
+        }
+        Path stalePath = stale.getVolumePath();
+        if (stalePath != null && !stalePath.equals(volumePath)) {
+            unindexByVolume(stalePath, segmentIndex);
+        }
+        indexByVolume(volumePath, segmentIndex);
+        persistence.persist(routing);
+        return routing;
+    }
+
+    /**
+     * Whether a record was made by {@link #create(String, Path)} rather than registered at a
+     * routing index.
+     *
+     * <p>Created records are the only ones that carry a source id; ids in the created range
+     * identify them even when that id did not survive persistence.</p>
+     *
+     * @param metadata The record
+     * @return true if it belongs to a source rather than to a directory slot
+     */
+    private static boolean isCreated(SegmentCatalog.SegmentMetadata metadata) {
+        return metadata.getSegmentId() >= FIRST_CREATED_ID || metadata.getSourceId() != null;
     }
 
     /**
@@ -362,7 +510,7 @@ final class CatalogRegistry {
     void clear() {
         segments.clear();
         volumeToSegments.clear();
-        segmentIdGenerator.set(0);
+        createdIdGenerator.set(FIRST_CREATED_ID - 1);
     }
 
     /**
@@ -372,6 +520,13 @@ final class CatalogRegistry {
      * freed, so recovering them would put a segment back in the catalog that nothing holds.
      * That is also why {@link SegmentCatalog.CatalogMetadata#getLiveSegments()} can treat
      * PURGED as a state the catalog never holds.</p>
+     *
+     * <p>The created-id generator is advanced past every created-range id read back, so
+     * {@link #create(String, Path)} never reissues one. A created record found inside the
+     * routing range is kept under its id and reported: if a routing segment is found at that
+     * index when the engine starts, {@link #replaceWithRoutingRecord} gives it a row of its
+     * own; otherwise a split publishing at that index is refused until the record is
+     * purged.</p>
      *
      * @param persisted The records read from the catalog file
      */
@@ -389,8 +544,15 @@ final class CatalogRegistry {
                 indexByVolume(segMetadata.getVolumePath(), segMetadata.getSegmentId());
             }
 
-            // Update ID generator to avoid conflicts
-            segmentIdGenerator.accumulateAndGet(segMetadata.getSegmentId(), Math::max);
+            long segmentId = segMetadata.getSegmentId();
+            if (segmentId >= FIRST_CREATED_ID) {
+                createdIdGenerator.accumulateAndGet(segmentId, Math::max);
+            } else if (isCreated(segMetadata)) {
+                SegmentCatalog.logger.warn("Segment {} was created for source {} at an id inside "
+                        + "the routing range; unless start-up finds a routing segment there to "
+                        + "take the index back, a split publishing routing index {} is refused "
+                        + "until it is purged", segmentId, segMetadata.getSourceId(), segmentId);
+            }
         }
     }
 

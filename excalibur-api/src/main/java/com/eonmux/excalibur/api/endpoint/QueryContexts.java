@@ -55,6 +55,18 @@ final class QueryContexts {
     }
 
     /**
+     * This node's chunk-text source.
+     *
+     * <p>Read by relevancy scoring as well as by the passages: a model judges a candidate on
+     * its text, and a node that keeps none has nothing to put in front of it.</p>
+     *
+     * @return Reads a chunk's text by identifier, or null when this node keeps no chunk storage
+     */
+    Function<String, String> chunkText() {
+        return chunkText;
+    }
+
+    /**
      * Gives this node the expander its searching half widens queries with.
      *
      * @param expander The expander, or null when nothing is to be reported about expansion

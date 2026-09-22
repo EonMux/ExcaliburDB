@@ -20,16 +20,6 @@ final class SegmentTermRecorder {
     private static final Logger LOGGER = LoggerFactory.getLogger(SegmentTermRecorder.class);
 
     /**
-     * Cluster every segment is filed under in the membership filter.
-     *
-     * <p>The filter's middle level partitions segments by topic; nothing in this server assigns
-     * topics, so there is one cluster and it matches what excalibur-shard registers segments
-     * under. A second name here would put ingested terms in a cluster the query side never
-     * looks in.</p>
-     */
-    private static final String MEMBERSHIP_CLUSTER = "default";
-
-    /**
      * Membership filter the query pipeline prunes segments with, or null when the node keeps
      * none.
      *
@@ -72,7 +62,7 @@ final class SegmentTermRecorder {
         }
         String segment = String.valueOf(segmentId);
         try {
-            target.registerSegment(segment, MEMBERSHIP_CLUSTER);
+            target.registerSegment(segment);
             for (String term : TermExtractor.extractUniqueTerms(text)) {
                 target.insert(term.getBytes(StandardCharsets.UTF_8), segment);
             }

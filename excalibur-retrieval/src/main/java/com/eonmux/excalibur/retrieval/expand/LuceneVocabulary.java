@@ -30,13 +30,14 @@ public final class LuceneVocabulary implements VocabularyGate {
 
     @Override
     public boolean mayContain(String term) {
-        IndexSearcher searcher = index.searcher();
-        if (searcher == null) {
+        java.util.Optional<LexicalIndex.Lease> leased = index.tryAcquire();
+        if (leased.isEmpty()) {
             // Nothing searchable yet: admit everything rather than silently emptying queries.
             return true;
         }
         BytesRef needle = new BytesRef(term);
-        try {
+        try (LexicalIndex.Lease lease = leased.get()) {
+            IndexSearcher searcher = lease.searcher();
             boolean sawVocabulary = false;
             for (LeafReaderContext leaf : searcher.getIndexReader().leaves()) {
                 Terms terms = leaf.reader().terms(LexicalIndex.FIELD_TEXT);

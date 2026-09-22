@@ -26,7 +26,13 @@ public enum ExitCode {
      */
     VERIFICATION_FAILED(3),
 
-    /** A restore target already holds something and {@code --force} was not given. */
+    /**
+     * The directory the command was to write into already holds something.
+     *
+     * <p>A restore target without {@code --force}, or a snapshot's {@code --out}, which never
+     * merges into an existing image. Either way nothing was written, and retrying the same
+     * line will be refused the same way: the fix is a different directory.</p>
+     */
     TARGET_NOT_EMPTY(4),
 
     /**

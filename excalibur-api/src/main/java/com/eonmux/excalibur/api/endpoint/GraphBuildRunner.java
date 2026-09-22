@@ -185,6 +185,17 @@ public final class GraphBuildRunner implements AutoCloseable {
     /** The build in progress, or null when the node is not building anything. */
     private Snapshot inFlight;
 
+    /**
+     * How every build since startup ended, by outcome.
+     *
+     * <p>Kept apart from the per-namespace memory, which is bounded and forgets: a node's stats
+     * report whether builds are failing, and a count that drops when the sixty-fifth namespace
+     * builds would say they had stopped.</p>
+     */
+    private long completedBuilds;
+    private long failedBuilds;
+    private long cancelledBuilds;
+
     /** The last build of each namespace, bounded and least-recently-touched first. */
     private final Map<NamespaceId, Snapshot> remembered =
         new LinkedHashMap<>(16, 0.75f, true) {
@@ -281,6 +292,43 @@ public final class GraphBuildRunner implements AutoCloseable {
             return snapshot != null
                 ? snapshot
                 : new Snapshot(STATE_IDLE, namespace, 0L, 0L, null, null);
+        }
+    }
+
+    /**
+     * Whether a build is running, and how every build since startup ended.
+     *
+     * <p>Totals across namespaces, for the node's stats: whether builds are failing is a
+     * question about the node, and a count per namespace would be one series for every name a
+     * caller ever put in the header.</p>
+     *
+     * @return The counts, read together
+     */
+    public Counts counts() {
+        synchronized (lock) {
+            return new Counts(inFlight != null, completedBuilds, failedBuilds, cancelledBuilds);
+        }
+    }
+
+    /**
+     * Graph builds on this node since startup.
+     *
+     * @param running   Whether one is in progress now
+     * @param completed How many published a graph
+     * @param failed    How many raised an error and published nothing
+     * @param cancelled How many were asked to stop and stopped before publishing
+     */
+    public record Counts(boolean running, long completed, long failed, long cancelled) {
+
+        /**
+         * Validates the counts.
+         *
+         * @throws IllegalArgumentException if any is negative
+         */
+        public Counts {
+            if (completed < 0 || failed < 0 || cancelled < 0) {
+                throw new IllegalArgumentException("build counts must not be negative");
+            }
         }
     }
 
@@ -395,6 +443,13 @@ public final class GraphBuildRunner implements AutoCloseable {
         synchronized (lock) {
             remembered.put(snapshot.namespace(), snapshot);
             inFlight = null;
+            switch (snapshot.state()) {
+                case STATE_COMPLETED -> completedBuilds++;
+                case STATE_CANCELLED -> cancelledBuilds++;
+                // The only other state a build ends in: finish() is never handed a running or
+                // idle snapshot.
+                default -> failedBuilds++;
+            }
         }
     }
 

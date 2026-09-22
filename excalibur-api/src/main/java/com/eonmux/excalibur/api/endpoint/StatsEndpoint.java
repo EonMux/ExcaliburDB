@@ -83,9 +83,34 @@ import java.util.function.Supplier;
  *     "size": 512,
  *     "capacity": 1024,
  *     "hitRatio": 0.1249
+ *   },
+ *   "graph": {
+ *     "namespaces": { "open": 3, "maxOpen": 64, "evictions": 12 },
+ *     "budget": {
+ *       "graphMappings": 81, "processMappings": 20412,
+ *       "mappingHighWater": 45871, "mappingLimit": 65530, "limitRead": true,
+ *       "graphDescriptors": 6, "processDescriptors": 311,
+ *       "descriptorHighWater": 716, "descriptorLimit": 1024
+ *     },
+ *     "builds": { "running": false, "completed": 4, "failed": 0, "cancelled": 1 },
+ *     "erasure": {
+ *       "namespacesOwing": 1, "outstanding": 3, "overdueNamespaces": 0,
+ *       "unreadableNamespaces": 0, "oldestAgeMs": 412000
+ *     },
+ *     "ingest": {
+ *       "documentsSeen": 1200, "factsStaged": 5400, "unresolvedDocuments": 0,
+ *       "extractionFailures": 2, "tenantFailures": 0
+ *     }
  *   }
  * }
  * }</pre>
+ *
+ * <h2>The graph, when this node builds one</h2>
+ * <p>Absent on a node that serves no graph of its own. Every figure is a total across
+ * namespaces, never a row per namespace. {@code budget} carries both the graphs' share of the
+ * mapping and descriptor limits and the whole process's, because the limits are the process's
+ * and eviction can only give back the graphs' share. {@code erasure} is absent when the graph
+ * root could not be listed, and {@code ingest} on a node whose ingestion stages no facts.</p>
  *
  * <h2>The query cache, when there is one</h2>
  * <p>Absent unless {@code excalibur.query.cache.enabled} is on, and absent is a different
@@ -292,7 +317,7 @@ public class StatsEndpoint implements HttpHandler {
      * @return The response body
      */
     private static String toJson(NodeStats stats) {
-        StringBuilder sb = new StringBuilder(768);
+        StringBuilder sb = new StringBuilder(1024);
         sb.append("{");
         appendSegments(sb, stats);
         appendStorage(sb, stats);
@@ -301,8 +326,105 @@ public class StatsEndpoint implements HttpHandler {
         appendDegradation(sb, stats);
         appendLexical(sb, stats.lexical());
         appendQueryCache(sb, stats.queryCache());
+        appendGraph(sb, stats.graph());
         sb.append("}");
         return sb.toString();
+    }
+
+    /**
+     * The graph tenants, when this node builds its own graph.
+     *
+     * @param sb    The body being built
+     * @param graph The graph's figures, or null
+     */
+    private static void appendGraph(StringBuilder sb, GraphStats graph) {
+        if (graph == null) {
+            return;
+        }
+        GraphStats.NamespaceStats namespaces = graph.namespaces();
+        GraphStats.BudgetStats budget = graph.budget();
+        GraphStats.BuildStats builds = graph.builds();
+        sb.append(", \"graph\": {")
+            .append("\"namespaces\": {")
+            .append("\"open\": ").append(namespaces.open()).append(", ")
+            .append("\"maxOpen\": ").append(namespaces.maxOpen()).append(", ")
+            .append("\"evictions\": ").append(namespaces.evictions())
+            .append("}, ")
+            .append("\"budget\": {")
+            .append("\"graphMappings\": ").append(budget.graphMappings()).append(", ")
+            .append("\"processMappings\": ").append(orNull(budget.processMappings()))
+            .append(", ")
+            .append("\"mappingHighWater\": ").append(budget.mappingHighWater()).append(", ")
+            .append("\"mappingLimit\": ").append(budget.mappingLimit()).append(", ")
+            .append("\"limitRead\": ").append(budget.limitRead()).append(", ")
+            .append("\"graphDescriptors\": ").append(budget.graphDescriptors()).append(", ")
+            .append("\"processDescriptors\": ").append(orNull(budget.processDescriptors()))
+            .append(", ")
+            .append("\"descriptorHighWater\": ").append(budget.descriptorHighWater())
+            .append(", ")
+            .append("\"descriptorLimit\": ").append(budget.descriptorLimit())
+            .append("}, ")
+            .append("\"builds\": {")
+            .append("\"running\": ").append(builds.running()).append(", ")
+            .append("\"completed\": ").append(builds.completed()).append(", ")
+            .append("\"failed\": ").append(builds.failed()).append(", ")
+            .append("\"cancelled\": ").append(builds.cancelled())
+            .append("}");
+        appendGraphErasure(sb, graph.erasure());
+        appendGraphIngest(sb, graph.ingest());
+        sb.append("}");
+    }
+
+    /**
+     * Erasure obligations across every namespace, omitted where the root could not be listed.
+     *
+     * @param sb      The body being built
+     * @param erasure The backlog, or null
+     */
+    private static void appendGraphErasure(StringBuilder sb, GraphStats.ErasureStats erasure) {
+        if (erasure == null) {
+            return;
+        }
+        sb.append(", \"erasure\": {")
+            .append("\"namespacesOwing\": ").append(erasure.namespacesOwing()).append(", ")
+            .append("\"outstanding\": ").append(erasure.outstanding()).append(", ")
+            .append("\"overdueNamespaces\": ").append(erasure.overdueNamespaces()).append(", ")
+            .append("\"unreadableNamespaces\": ").append(erasure.unreadableNamespaces())
+            .append(", ")
+            // Null rather than zero when nothing is owed: an age of zero is an obligation
+            // accepted this instant, which is a different state from none at all.
+            .append("\"oldestAgeMs\": ").append(orNull(erasure.oldestAgeMs()))
+            .append("}");
+    }
+
+    /**
+     * What ingestion has staged into the graph, omitted on a node whose ingestion stages none.
+     *
+     * @param sb     The body being built
+     * @param ingest The sink's counts, or null
+     */
+    private static void appendGraphIngest(StringBuilder sb, GraphStats.IngestStats ingest) {
+        if (ingest == null) {
+            return;
+        }
+        sb.append(", \"ingest\": {")
+            .append("\"documentsSeen\": ").append(ingest.documentsSeen()).append(", ")
+            .append("\"factsStaged\": ").append(ingest.factsStaged()).append(", ")
+            .append("\"unresolvedDocuments\": ").append(ingest.unresolvedDocuments())
+            .append(", ")
+            .append("\"extractionFailures\": ").append(ingest.extractionFailures()).append(", ")
+            .append("\"tenantFailures\": ").append(ingest.tenantFailures())
+            .append("}");
+    }
+
+    /**
+     * A figure that may be unknown, as a JSON number or {@code null}.
+     *
+     * @param value The figure
+     * @return Its JSON text
+     */
+    private static String orNull(java.util.OptionalLong value) {
+        return value.isPresent() ? String.valueOf(value.getAsLong()) : "null";
     }
 
     /** The segment lifecycle and how much the corpus holds. */

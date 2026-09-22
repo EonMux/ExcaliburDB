@@ -104,13 +104,10 @@ public final class BenchmarkResultsCaptureRunner {
             .measurementIterations(3)
             .measurementTime(TimeValue.seconds(1))
             .forks(1)
-            .jvmArgsAppend(
-                "--enable-preview",
-                "--enable-native-access=ALL-UNNAMED",
-                "--add-modules=jdk.incubator.vector",
+            .jvmArgsAppend(ForkedJvm.flags(
                 "-Xms1g",
                 "-Xmx1g"
-            )
+            ))
             .shouldDoGC(true)
             .build();
     }

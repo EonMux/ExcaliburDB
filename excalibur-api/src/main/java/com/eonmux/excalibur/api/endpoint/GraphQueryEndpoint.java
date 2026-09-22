@@ -14,8 +14,11 @@ import com.eonmux.excalibur.core.trace.Stage;
 import com.eonmux.excalibur.planner.ConversationContext;
 import com.eonmux.excalibur.planner.Grammar;
 import com.eonmux.excalibur.planner.QueryPlan;
+import com.eonmux.excalibur.retrieval.pipeline.Aggregation;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagResult;
+import com.eonmux.excalibur.retrieval.pipeline.InputRequest;
+import com.eonmux.excalibur.retrieval.pipeline.TraversalDirection;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,14 +37,23 @@ import java.util.Objects;
  * <p>The response distinguishes the three ways a request can end, because a client has to treat
  * them differently:
  * <ul>
- *   <li><b>{@code answered}</b> — context to put in a prompt, with a calibrated confidence.</li>
- *   <li><b>{@code needs_input}</b> — a pronoun could not be bound. The body carries the question to
- *       put to the user. Returned as 200, not an error: the request was well-formed and the system
- *       is working as intended.</li>
+ *   <li><b>{@code answered}</b> — context to put in a prompt, with a calibrated confidence. A
+ *       count, earliest or latest question also carries an {@code aggregate} object: the value
+ *       the graph computed, which the context leads with too.</li>
+ *   <li><b>{@code needs_input}</b> — the question cannot be answered until the user says which
+ *       thing it means: a pronoun could not be bound, no entity was named, or a name matched
+ *       several entities the evidence could not tell apart. The body carries the question to put
+ *       to the user and the candidates to choose between; sending the chosen one back in
+ *       {@code context_entities} with the same query answers it. Returned as 200, not an error:
+ *       the request was well-formed and the system is working as intended.</li>
  *   <li><b>{@code declined}</b> — the evidence does not support an answer, with the reason.
  *       Deliberately not an empty {@code answered}, which a client would render as "no results
  *       found" when the truth may be "found something and did not trust it".</li>
  * </ul>
+ *
+ * <p>An optional {@code direction} - {@code forward}, {@code reverse} or {@code both}, the
+ * default - restricts which way the walk may step along an edge from the entities the question
+ * names: forward reads the facts they assert, reverse the facts asserted about them.
  *
  * <p>Per-stage latency is returned with every response, including the ones that answered nothing —
  * a refusal that took two seconds is as much a performance question as an answer that did.
@@ -70,14 +82,14 @@ public class GraphQueryEndpoint implements HttpHandler {
     /** Longest single conversation entity accepted, in characters. Longer than this is not a name. */
     private static final int MAX_CONTEXT_ENTITY_LENGTH = 256;
 
-    private final java.util.function.Supplier<java.util.Optional<GraphRagPipeline>> pipelineSource;
+    /** The one pipeline to answer from, when this node is not multi-tenant; null otherwise. */
+    private final GraphRagPipeline pipeline;
 
     /** The namespaces to answer from, when this node is multi-tenant; null otherwise. */
     private final com.eonmux.excalibur.api.bootstrap.GraphTenants tenants;
 
     public GraphQueryEndpoint(GraphRagPipeline pipeline) {
-        Objects.requireNonNull(pipeline, "pipeline cannot be null");
-        this.pipelineSource = () -> java.util.Optional.of(pipeline);
+        this.pipeline = Objects.requireNonNull(pipeline, "pipeline cannot be null");
         this.tenants = null;
     }
 
@@ -91,23 +103,7 @@ public class GraphQueryEndpoint implements HttpHandler {
      */
     public GraphQueryEndpoint(com.eonmux.excalibur.api.bootstrap.GraphTenants tenants) {
         this.tenants = Objects.requireNonNull(tenants, "tenants cannot be null");
-        this.pipelineSource = null;
-    }
-
-    /**
-     * Creates the endpoint over a pipeline that may be replaced, or may not exist yet.
-     *
-     * <p>A node can be built for graph answering and have no graph: nothing ingested, or ingested
-     * and never built. Resolving per request is what lets a build make the route answer without a
-     * restart, and lets a query before the first build say so rather than 404.
-     *
-     * @param pipelineSource Supplies the pipeline currently being served
-     */
-    public GraphQueryEndpoint(
-            java.util.function.Supplier<java.util.Optional<GraphRagPipeline>> pipelineSource) {
-        this.pipelineSource = Objects.requireNonNull(
-            pipelineSource, "pipelineSource cannot be null");
-        this.tenants = null;
+        this.pipeline = null;
     }
 
     @Override
@@ -125,7 +121,21 @@ public class GraphQueryEndpoint implements HttpHandler {
             return;
         }
 
-        String question = JsonText.string(body, "query");
+        // A field of the wrong JSON type is the caller's mistake, so it is answered 400 here
+        // rather than escaping to the router, which can only call it a server fault.
+        String question;
+        String[] mentions;
+        String asOfText;
+        TraversalDirection direction;
+        try {
+            question = JsonText.string(body, "query");
+            mentions = JsonText.stringArray(body, "context_entities");
+            asOfText = JsonText.string(body, "as_of");
+            direction = directionFrom(JsonText.string(body, "direction"));
+        } catch (IllegalArgumentException e) {
+            send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
+            return;
+        }
         if (question == null || question.isBlank()) {
             send(exchange, 400, "{\"error\":\"'query' is required\"}");
             return;
@@ -136,7 +146,6 @@ public class GraphQueryEndpoint implements HttpHandler {
             return;
         }
 
-        String[] mentions = JsonText.stringArray(body, "context_entities");
         String violation = contextViolation(mentions);
         if (violation != null) {
             send(exchange, 400, "{\"error\":" + quoted(violation) + "}");
@@ -144,7 +153,6 @@ public class GraphQueryEndpoint implements HttpHandler {
         }
         ConversationContext context = contextFrom(mentions);
 
-        String asOfText = JsonText.string(body, "as_of");
         TemporalFilter asOf;
         try {
             asOf = temporalFilterFrom(asOfText);
@@ -154,24 +162,13 @@ public class GraphQueryEndpoint implements HttpHandler {
         }
 
         if (tenants != null) {
-            answerFromTenant(exchange, question, context, asOf);
-            return;
-        }
-
-        java.util.Optional<GraphRagPipeline> pipeline = pipelineSource.get();
-        if (pipeline.isEmpty()) {
-            // The node can answer graph questions and has no graph to answer from: nothing has
-            // been ingested, or facts are staged and no build has run. Saying so is the whole
-            // difference between "not configured for this" and "ask me again after a build".
-            send(exchange, 503,
-                "{\"error\":\"No graph is being served; POST /v1/graph/build to build one from "
-                    + "the facts ingestion has staged\"}");
+            answerFromTenant(exchange, question, context, asOf, direction);
             return;
         }
 
         try {
             QueryTrace trace = new QueryTrace();
-            GraphRagResult result = pipeline.get().answer(question, context, asOf, trace);
+            GraphRagResult result = pipeline.answer(question, context, asOf, direction, trace);
             send(exchange, 200, render(result, trace, asOf));
         } catch (IllegalArgumentException e) {
             send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
@@ -200,11 +197,13 @@ public class GraphQueryEndpoint implements HttpHandler {
      * @param exchange The exchange
      * @param question The question asked
      * @param context  The conversation the question is asked in
-     * @param asOf     The valid-time instant to answer at, or null for the question's own
+     * @param asOf      The valid-time instant to answer at, or null for the question's own
+     * @param direction Which way along an edge the walk may step
      * @throws IOException if the response cannot be written
      */
     private void answerFromTenant(HttpExchange exchange, String question,
-                                  ConversationContext context, TemporalFilter asOf)
+                                  ConversationContext context, TemporalFilter asOf,
+                                  TraversalDirection direction)
             throws IOException {
         com.eonmux.excalibur.tenancy.NamespaceId namespace;
         try {
@@ -236,14 +235,20 @@ public class GraphQueryEndpoint implements HttpHandler {
 
         try (com.eonmux.excalibur.tenancy.NamespaceRegistry.Lease<com.eonmux.excalibur.api.bootstrap.GraphTenant> lease
                  = borrowed.get()) {
-            java.util.Optional<GraphRagPipeline> pipeline = lease.resource().holder().pipeline();
-            if (pipeline.isEmpty()) {
+            java.util.Optional<com.eonmux.excalibur.api.bootstrap.GraphRagHolder.Reading> reading =
+                lease.resource().holder().acquire();
+            if (reading.isEmpty()) {
                 sendNoGraph(exchange);
                 return;
             }
 
             QueryTrace trace = new QueryTrace();
-            GraphRagResult result = pipeline.get().answer(question, context, asOf, trace);
+            GraphRagResult result;
+            // Released before the response is written: the stack is needed to answer, not to
+            // send, and a slow client must not keep a replaced graph open.
+            try (com.eonmux.excalibur.api.bootstrap.GraphRagHolder.Reading held = reading.get()) {
+                result = held.pipeline().answer(question, context, asOf, direction, trace);
+            }
             send(exchange, 200, render(result, trace, asOf));
         } catch (IllegalArgumentException e) {
             send(exchange, 400, "{\"error\":" + quoted(e.getMessage()) + "}");
@@ -358,6 +363,22 @@ public class GraphQueryEndpoint implements HttpHandler {
         }
     }
 
+    /**
+     * Reads the traversal direction a request named.
+     *
+     * <p>Absent is {@link TraversalDirection#BOTH}, which is what a question about an edge almost
+     * always means. Present and not one of the three is refused rather than defaulted: a caller
+     * that asked for one direction and silently got both would read facts it excluded as though
+     * they answered its question.</p>
+     *
+     * @param text The raw {@code direction} value, or null when the request carried none
+     * @return The direction to walk in
+     * @throws IllegalArgumentException if the value is present and is not a direction
+     */
+    static TraversalDirection directionFrom(String text) {
+        return text == null ? TraversalDirection.BOTH : TraversalDirection.parse(text);
+    }
+
     /** How a resolved instant is reported back. */
     private static String textOf(TemporalFilter asOf) {
         return asOf.isUnbounded()
@@ -378,8 +399,9 @@ public class GraphQueryEndpoint implements HttpHandler {
      * for is reported as {@code question} or {@code default}, never bare, so a client can tell an
      * honoured request from an inference and act on the difference.
      *
-     * <p>Absent on both fields when no plan was produced: {@code needs_input} stops before the
-     * traversal, so there is no instant to report rather than one worth defaulting.</p>
+     * <p>Absent on both fields when no plan was produced: a {@code needs_input} from planning - a
+     * pronoun or a missing name - stops before the traversal, so there is no instant to report
+     * rather than one worth defaulting. One from an ambiguous entity did walk, and says when.</p>
      *
      * @param json      the response being built
      * @param result    what the pipeline produced, carrying the plan the walk actually used
@@ -414,23 +436,19 @@ public class GraphQueryEndpoint implements HttpHandler {
                 .append(",\"facts_dropped\":").append(context.edgesDropped())
                 .append(",\"truncated\":").append(context.wasTruncated())
                 .append(",\"format\":").append(quoted(context.format())));
+            result.aggregation().ifPresent(aggregation -> appendAggregate(json, aggregation));
         } else if (result.needsUserInput()) {
-            var ask = result.askUser().orElseThrow();
+            InputRequest request = result.inputRequest().orElseThrow();
             json.append("\"status\":\"needs_input\"")
-                .append(",\"reason\":\"").append(ask.reason().name().toLowerCase(Locale.ROOT)).append('"')
-                .append(",\"question\":").append(quoted(ask.question()))
-                .append(",\"candidates\":[");
-            for (int i = 0; i < ask.candidates().size(); i++) {
-                if (i > 0) {
-                    json.append(',');
-                }
-                json.append(quoted(ask.candidates().get(i)));
-            }
-            json.append(']');
+                .append(",\"reason\":")
+                .append(quoted(request.reason().name().toLowerCase(Locale.ROOT)))
+                .append(",\"question\":").append(quoted(request.question()))
+                .append(",\"candidates\":");
+            appendStrings(json, request.candidates());
         } else {
             json.append("\"status\":\"declined\"");
-            result.declined().ifPresent(outcome -> json.append(",\"reason\":\"")
-                .append(reasonOf(outcome)).append('"'));
+            result.declined().ifPresent(outcome -> json.append(",\"reason\":")
+                .append(quoted(outcome.reason().name().toLowerCase(Locale.ROOT))));
         }
 
         json.append(",\"plan\":").append(result.plan()
@@ -457,13 +475,43 @@ public class GraphQueryEndpoint implements HttpHandler {
         return json.append('}').toString();
     }
 
-    private String reasonOf(com.eonmux.excalibur.retrieval.abstain.RetrievalOutcome outcome) {
-        return switch (outcome) {
-            case com.eonmux.excalibur.retrieval.abstain.RetrievalOutcome.NoResults none ->
-                none.reason().name().toLowerCase(Locale.ROOT);
-            case com.eonmux.excalibur.retrieval.abstain.RetrievalOutcome.Ambiguous ignored -> "ambiguous";
-            case com.eonmux.excalibur.retrieval.abstain.RetrievalOutcome.Results ignored -> "answered";
-        };
+    /**
+     * Reports the value an aggregate question asked for, beside the context that leads with it.
+     *
+     * <p>Structured as well as written into the context, because a caller that asked "how many"
+     * wants a number it can use without reading it back out of prose. {@code valid_from} is only
+     * on an earliest or latest, and null there when nothing the walk found had a recorded
+     * start.</p>
+     *
+     * @param json        the response being built
+     * @param aggregation the computed aggregate
+     */
+    private static void appendAggregate(StringBuilder json, Aggregation aggregation) {
+        json.append(",\"aggregate\":{\"function\":")
+            .append(quoted(aggregation.function().name().toLowerCase(Locale.ROOT)))
+            .append(",\"count\":").append(aggregation.count())
+            .append(",\"facts\":").append(aggregation.factsConsidered());
+        if (aggregation.function() != QueryPlan.AggregateFunction.COUNT) {
+            json.append(",\"valid_from\":").append(aggregation.validFrom().isPresent()
+                ? quoted(java.time.LocalDate.ofEpochDay(aggregation.validFrom().getAsInt())
+                    .toString())
+                : "null");
+        }
+        json.append(",\"entities\":");
+        appendStrings(json, aggregation.entities());
+        json.append('}');
+    }
+
+    /** A JSON array of strings. */
+    private static void appendStrings(StringBuilder json, java.util.List<String> values) {
+        json.append('[');
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append(quoted(values.get(i)));
+        }
+        json.append(']');
     }
 
     private void send(HttpExchange exchange, int status, String body) throws IOException {

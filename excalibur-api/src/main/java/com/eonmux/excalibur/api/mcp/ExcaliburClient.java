@@ -28,13 +28,19 @@ import java.util.Objects;
  *       <td>{@code http://127.0.0.1:8080}</td></tr>
  *   <tr><td>{@code EXCALIBUR_API_AUTH_TOKEN}</td><td>Bearer token, when the node requires one</td>
  *       <td>none</td></tr>
- *   <tr><td>{@code EXCALIBUR_NAMESPACE}</td><td>Default namespace for graph calls</td>
+ *   <tr><td>{@code EXCALIBUR_NAMESPACE}</td><td>Default namespace for the calls that take
+ *       one: the graph tools and source registration</td>
  *       <td>the shared one</td></tr>
  *   <tr><td>{@code EXCALIBUR_MCP_TIMEOUT_SECONDS}</td><td>Per-request timeout</td><td>60</td></tr>
  * </table>
  *
  * <p>The token is read from the environment and never from an argument, because a process's
  * arguments are readable by any other process on the machine and its environment is not.</p>
+ *
+ * <p>The namespace header is sent only on a call that was given a namespace - see
+ * {@link #namespaceFor(String)}. The node refuses a namespace on every route that serves the
+ * whole corpus, so stamping the default on every call would turn a tenant-scoped client into
+ * one that cannot search.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Immutable, over a thread-safe {@link HttpClient}.</p>
@@ -128,11 +134,21 @@ public final class ExcaliburClient {
     }
 
     /**
+     * The namespace a call that takes one should be scoped to.
+     *
+     * @param requested The namespace the caller named, or null
+     * @return {@code requested}, else the configured default, else null for the shared one
+     */
+    public String namespaceFor(String requested) {
+        return requested != null ? requested : defaultNamespace;
+    }
+
+    /**
      * POSTs a JSON body.
      *
      * @param path      Path on the node, beginning with {@code /}
      * @param body      The JSON request body
-     * @param namespace Namespace to scope the call to, or null for the configured default
+     * @param namespace Namespace to scope the call to, or null to send none
      * @return The node's answer
      * @throws IOException          if the node cannot be reached
      * @throws InterruptedException if the calling thread is interrupted
@@ -156,7 +172,7 @@ public final class ExcaliburClient {
      *
      * @param path      Path on the node, beginning with {@code /}
      * @param body      The JSON request body
-     * @param namespace Namespace to scope the call to, or null for the configured default
+     * @param namespace Namespace to scope the call to, or null to send none
      * @return The node's answer
      * @throws IOException          if the node cannot be reached
      * @throws InterruptedException if the calling thread is interrupted
@@ -192,7 +208,7 @@ public final class ExcaliburClient {
      * @param path       The route to read
      * @param queryName  Parameter name, or null for none
      * @param queryValue Parameter value, or null for none
-     * @param namespace  The namespace to read in, or null for the node's default
+     * @param namespace  The namespace to read in, or null to send none
      * @return The node's answer
      * @throws IOException          if the node cannot be reached
      * @throws InterruptedException if the calling thread is interrupted
@@ -215,9 +231,8 @@ public final class ExcaliburClient {
         if (authToken != null) {
             request.header("Authorization", "Bearer " + authToken);
         }
-        String scope = namespace != null ? namespace : defaultNamespace;
-        if (scope != null) {
-            request.header(NAMESPACE_HEADER, scope);
+        if (namespace != null) {
+            request.header(NAMESPACE_HEADER, namespace);
         }
         HttpResponse<String> response =
             http.send(request.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));

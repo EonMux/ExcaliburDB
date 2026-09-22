@@ -16,8 +16,9 @@ This document defines the performance targets for all ExcaliburDB benchmarks bas
 ./gradlew :excalibur-bench:runTailScanBenchmark
 ./gradlew :excalibur-bench:runEndToEndQueryBenchmark
 
-# Run with custom pattern
-./gradlew :excalibur-bench:runBenchmarksWithCapture --args="--pattern '.*PointLookup.*'"
+# Run with custom pattern (and optionally a custom output directory)
+./gradlew :excalibur-bench:runBenchmarksWithCapture -PbenchmarkPattern='.*PointLookup.*'
+./gradlew :excalibur-bench:runBenchmarksWithCapture -PbenchmarkPattern=Cuckoo -PoutputDir=build/bench
 ```
 
 Results are captured to `build/benchmark-results/` in JSON, Markdown, CSV, and text formats.

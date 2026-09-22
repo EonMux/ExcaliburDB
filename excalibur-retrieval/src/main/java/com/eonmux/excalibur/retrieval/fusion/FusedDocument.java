@@ -12,13 +12,19 @@ import java.util.List;
  * signal to fix.
  *
  * @param documentId    the candidate
- * @param score         the fused score, higher meaning better
+ * @param score         the fused score, higher meaning better; under {@link ScorePassthrough}
+ *                      it is the one signal's own score
  * @param contributions one entry per signal that returned this document, best rank first
  */
 public record FusedDocument(long documentId, double score, List<SignalContribution> contributions)
         implements Comparable<FusedDocument> {
 
     public FusedDocument {
+        if (Double.isNaN(score)) {
+            // Refused here, where every consumer reads it: the abstention policy and its
+            // calibrator would otherwise each meet a NaN on their own terms and judge it apart.
+            throw new IllegalArgumentException("score must not be NaN for document " + documentId);
+        }
         if (contributions == null) {
             throw new IllegalArgumentException("contributions must not be null");
         }

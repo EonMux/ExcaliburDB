@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.ingest.graph.GraphIngestSink;
 import com.eonmux.excalibur.ingest.graph.RelationExtractor;
 import com.eonmux.excalibur.ingest.graph.StagingGraphIngestSink;
+import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 
 import com.eonmux.excalibur.tenancy.NamespaceId;
 import com.eonmux.excalibur.tenancy.NamespaceRegistry;
@@ -10,6 +11,7 @@ import com.eonmux.excalibur.tenancy.NamespaceRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
@@ -45,8 +47,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * work is built inside the lease and discarded with it, for the same reason: it is the reference
  * to the staging store that must not outlive the borrow.</p>
  *
- * <p>The cost is one borrow and one small object per document, against one chat-model call per
- * document for extraction. It is not the expensive part.</p>
+ * <p>Extraction runs before the borrow, and a document with no facts borrows nothing. A borrow
+ * opens the namespace's graph if it is not resident and can evict another to make room, so
+ * borrowing for a document that stages nothing - every document, on a node with extraction
+ * disabled - would churn the working set the query path depends on for no write at all. And the
+ * extraction is a chat-model call: made inside the lease, it would pin the namespace against
+ * eviction for the length of a network round trip.</p>
  *
  * <h2>Why an unresolved source is not staged into the shared namespace</h2>
  * <p>A document whose source this node no longer holds - deregistered while its crawl was
@@ -96,6 +102,7 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     private final AtomicLong factsStaged = new AtomicLong();
     private final AtomicLong unresolvedDocuments = new AtomicLong();
     private final AtomicLong tenantFailures = new AtomicLong();
+    private final AtomicLong extractionFailures = new AtomicLong();
 
     /**
      * Creates a routing sink.
@@ -121,11 +128,12 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      * failure: a graph that has quietly stopped growing for an hour shows up in a count and in
      * nothing else.</p>
      *
-     * @param documentKey The source-qualified document key
-     * @param text        The document's text
+     * @param documentKey        The source-qualified document key
+     * @param text               The document's text
+     * @param lastModifiedMillis The document's own date, or 0 when its source does not say
      */
     @Override
-    public void onDocumentPublished(String documentKey, String text) {
+    public void onDocumentPublished(String documentKey, String text, long lastModifiedMillis) {
         if (documentKey == null || documentKey.isBlank() || text == null || text.isBlank()) {
             return;
         }
@@ -139,21 +147,38 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
                 + "which every tenant reads", documentKey);
             return;
         }
-        stageInto(namespace.get(), documentKey, text);
+        stageInto(namespace.get(), documentKey, text, lastModifiedMillis);
     }
 
     /**
-     * Stages one document into one namespace, for the length of a borrow.
+     * Extracts one document's facts and stages them into one namespace, for the length of a
+     * borrow.
      *
-     * @param namespace   Where the facts belong
-     * @param documentKey The document
-     * @param text        Its text
+     * @param namespace          Where the facts belong
+     * @param documentKey        The document
+     * @param text               Its text
+     * @param lastModifiedMillis The document's own date, or 0 when unknown
      */
-    private void stageInto(NamespaceId namespace, String documentKey, String text) {
+    private void stageInto(NamespaceId namespace, String documentKey, String text,
+                           long lastModifiedMillis) {
+        List<ExtractedTriple> triples;
+        try {
+            triples = extractor.extract(documentKey, text);
+        } catch (RuntimeException e) {
+            extractionFailures.incrementAndGet();
+            LOGGER.warn("Could not extract facts from {}: {}", documentKey, e.toString());
+            return;
+        }
+        if (triples == null || triples.isEmpty()) {
+            return;
+        }
+        List<ExtractedTriple> extracted = List.copyOf(triples);
         try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
-            StagingGraphIngestSink sink =
-                new StagingGraphIngestSink(lease.resource().staging(), extractor);
-            sink.onDocumentPublished(documentKey, text);
+            // Handed what was already extracted, so the staging sink stages the facts and the
+            // entity text they mention without calling the model a second time.
+            StagingGraphIngestSink sink = new StagingGraphIngestSink(
+                lease.resource().staging(), (key, body) -> extracted);
+            sink.onDocumentPublished(documentKey, text, lastModifiedMillis);
             factsStaged.addAndGet(sink.factsStaged());
         } catch (RuntimeException e) {
             // Opening a tenant can fail - a directory that will not create, a staging log that
@@ -219,6 +244,18 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      */
     public long unresolvedDocuments() {
         return unresolvedDocuments.get();
+    }
+
+    /**
+     * How many documents the extractor failed on.
+     *
+     * <p>The documents are published and searchable; only their facts are missing from the
+     * graph.</p>
+     *
+     * @return The count
+     */
+    public long extractionFailures() {
+        return extractionFailures.get();
     }
 
     /**

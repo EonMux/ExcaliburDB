@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.bootstrap;
 
+import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
@@ -7,11 +8,17 @@ import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.tenancy.MappingBudget;
 import com.eonmux.excalibur.vector.hnsw.HnswConfigFactory;
 import org.junit.jupiter.api.AfterEach;
+import org.mockito.Answers;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
@@ -41,9 +48,14 @@ class IngestionWiringTest {
     private CoreComponents core;
     private GraphTenants tenants;
     private IngestionWiring.Attachment attachment;
+    private ExcaliburDBServer serving;
 
     @AfterEach
     void tearDown() {
+        if (serving != null) {
+            serving.stop(0);
+            serving = null;
+        }
         if (attachment != null) {
             if (attachment.lexicalErasureSweep() != null) {
                 attachment.lexicalErasureSweep().close();
@@ -101,7 +113,9 @@ class IngestionWiringTest {
         tenants = new GraphTenants(dataDir.resolve("graph"), config, MappingBudget.detect(), 4);
         ExcaliburDBServer server = new ExcaliburDBServer(0, ExcaliburDBServer.DEFAULT_BACKLOG,
             core.indexOrchestrator(), core.storageEngine(), core.volumeManager(), config,
-            mock(QueryPipeline.class));
+            // Returns itself from every derivation, as a real pipeline returns a working one,
+            // so the node the ingestion half is attached to can also be started.
+            mock(QueryPipeline.class, Answers.RETURNS_SELF));
 
         attachment = new IngestionWiring(config, dataDir, core.storageEngine(),
             core.indexOrchestrator(), core.hierarchicalFilter(), tracker, tenants)
@@ -193,5 +207,53 @@ class IngestionWiringTest {
         assertThatThrownBy(() -> new IngestionWiring(config, dataDir, null, null, null, null, null))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("storageEngine");
+    }
+
+    @Test
+    @DisplayName("a node that extracts facts reports what its graph ingestion dropped")
+    void graphIngestIsReported(@TempDir Path dataDir) throws IOException {
+        // The sink counts every document whose facts never reached the graph. Wired into the
+        // orchestrator and not into the stats, those counts existed and nobody could read them.
+        JsonNode graph = statsOf(attach(config(Map.of(
+            "excalibur.llm.api-key", "test-key")), dataDir)).path("graph");
+
+        assertThat(graph.path("ingest").isObject())
+            .as("the ingest block of /v1/stats, fed by the sink ingestion stages through")
+            .isTrue();
+        assertThat(graph.path("ingest").path("documentsSeen").asLong()).isZero();
+    }
+
+    @Test
+    @DisplayName("a node with no model stages nothing, and reports no graph ingestion")
+    void noModelNoGraphIngest(@TempDir Path dataDir) throws IOException {
+        JsonNode graph = statsOf(attach(config(Map.of()), dataDir)).path("graph");
+
+        assertThat(graph.isObject()).as("the graph itself is still reported").isTrue();
+        assertThat(graph.has("ingest")).isFalse();
+    }
+
+    /**
+     * Serves the attached node and reads its stats back over the socket.
+     *
+     * @param server The server the ingestion half was attached to
+     * @return The parsed body of {@code GET /v1/stats}
+     * @throws IOException if the request fails
+     */
+    private JsonNode statsOf(ExcaliburDBServer server) throws IOException {
+        String token = "wiring-test-token";
+        server.withSecurity(ApiSecurityConfig.builder().authToken(token).build());
+        server.withGraphSupport(tenants);
+        server.start();
+        serving = server;
+        HttpURLConnection connection = (HttpURLConnection) URI
+            .create("http://127.0.0.1:" + server.getPort() + "/v1/stats")
+            .toURL().openConnection();
+        connection.setRequestProperty("Authorization", "Bearer " + token);
+        try {
+            assertThat(connection.getResponseCode()).isEqualTo(200);
+            return new ObjectMapper().readTree(connection.getInputStream());
+        } finally {
+            connection.disconnect();
+        }
     }
 }

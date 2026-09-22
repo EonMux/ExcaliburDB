@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.retrieval.lexical.native_;
 
+import com.eonmux.excalibur.core.hash.XxHash64;
 import com.eonmux.excalibur.graph.erasure.CompactionPolicy.CompactionStats;
 import com.eonmux.excalibur.retrieval.lexical.Bm25Parameters;
 
@@ -10,7 +11,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -545,6 +545,53 @@ public final class LexicalStore implements AutoCloseable {
     }
 
     /**
+     * A digest of everything a search at this epoch reads, which moves exactly when its answer
+     * can.
+     *
+     * <p>Taken over the same list {@link #search} and {@link #knowsTerm} read - the segments
+     * visible at the epoch, less any this store could not open - and over each entry's name,
+     * publication epoch, document count and tombstone count. Each of those is what one kind of
+     * change moves: a publication becoming visible adds an entry once the epoch crosses it,
+     * which is the change no write is observed making at the moment it takes effect; an
+     * erasure raises a tombstone count; a compaction replaces names. The collection statistics
+     * BM25 scores against are sums over the same entries, so they cannot change while this
+     * stands still.</p>
+     *
+     * <p>Cheap: one pass over the manifest, which compaction keeps short, with no file access.
+     * The caller holds whatever guards the manifest against a concurrent writer, as it does
+     * for a search.</p>
+     *
+     * @param epoch The epoch a search would read at
+     * @return The digest
+     */
+    public long searchVersion(long epoch) {
+        List<SegmentManifest.Entry> visible = readable(manifest.visibleAt(epoch));
+        long digest = fold(0x9E3779B97F4A7C15L, visible.size());
+        // In publication order, which the manifest keeps stable across compaction, so two
+        // equal manifests always digest the same way.
+        for (SegmentManifest.Entry entry : visible) {
+            digest = fold(digest, XxHash64.hash(entry.name()));
+            digest = fold(digest, entry.epoch());
+            digest = fold(digest, entry.docCount());
+            digest = fold(digest, entry.tombstoned());
+        }
+        return digest;
+    }
+
+    /**
+     * Mixes one value into a digest with a 64-bit avalanche step, so two manifests differing in
+     * one low bit of one count digest differently everywhere rather than in that bit.
+     */
+    private static long fold(long digest, long value) {
+        long mixed = digest * 0x100000001B3L ^ value;
+        mixed ^= mixed >>> 33;
+        mixed *= 0xFF51AFD7ED558CCDL;
+        mixed ^= mixed >>> 33;
+        mixed *= 0xC4CEB9FE1A85EC53L;
+        return mixed ^ (mixed >>> 33);
+    }
+
+    /**
      * Gathers the statistics every visible segment must be scored against.
      *
      * <p>Summed across segments rather than taken from any one of them. A term's rarity and a
@@ -597,6 +644,10 @@ public final class LexicalStore implements AutoCloseable {
         if (erased > 0) {
             manifest.write(directory);
         }
+        // Only now: the tombstones and the manifest counting them are on the device, so a reopen
+        // has nothing left to replay for these keys - and must not, because by then the key may
+        // name a document written after this erasure.
+        erasureLog.confirmApplied(documentKeys);
         LOGGER.info("Erasure recorded for {} key(s), {} document(s) tombstoned",
             documentKeys.size(), erased);
         return erased;
@@ -638,21 +689,25 @@ public final class LexicalStore implements AutoCloseable {
      * worse, the next compaction would discharge the log entry on the grounds that it names
      * nothing tombstoned, forgetting the promise while the document is still readable.</p>
      *
-     * <p>So the log is the authority on open, and anything it still owes is marked again. Free
-     * when nothing is outstanding, which is the usual case.</p>
+     * <p>So the log is the authority on open, and any promise it has no confirmation of having
+     * applied is marked again. Only those: a promise that was applied stays on the log until
+     * compaction removes the document, and marking it again would tombstone whatever has been
+     * written under the same key since. Free when nothing is unconfirmed, which is the usual
+     * case.</p>
      */
     private void reapplyErasures() throws IOException {
-        Set<String> owed = erasureLog.outstandingKeys();
-        if (owed.isEmpty()) {
+        Set<String> unapplied = erasureLog.unappliedKeys();
+        if (unapplied.isEmpty()) {
             return;
         }
-        int restored = markErased(owed);
+        int restored = markErased(unapplied);
         if (restored > 0) {
             manifest.write(directory);
             LOGGER.warn("Restored {} tombstone(s) that the erasure log still owed but the store "
                 + "had lost; an interrupted write made {} erased key(s) readable again",
-                restored, owed.size());
+                restored, unapplied.size());
         }
+        erasureLog.confirmApplied(unapplied);
     }
 
     /** Documents erased but not yet physically removed. */
@@ -1104,10 +1159,10 @@ public final class LexicalStore implements AutoCloseable {
                 bits[i >>> 3] |= (byte) (1 << (i & 7));
             }
         }
-        Path temp = directory.resolve(name + TOMBSTONE_SUFFIX + ".tmp");
-        Files.write(temp, bits);
-        Files.move(temp, directory.resolve(name + TOMBSTONE_SUFFIX),
-            StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        // Forced, not merely renamed: an erasure is confirmed as applied once its tombstones are
+        // written, and a confirmation resting on bytes still in the page cache is one a power cut
+        // turns into a document readable again with nothing left to say it was owed.
+        Durability.FILE_SYSTEM.replace(directory.resolve(name + TOMBSTONE_SUFFIX), bits);
         tombstones.put(name, marks);
     }
 

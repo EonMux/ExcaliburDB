@@ -44,12 +44,10 @@ public class QuickJmhBenchmark {
                 .measurementIterations(2)
                 .measurementTime(TimeValue.seconds(1))
                 .forks(1)
-                .jvmArgsAppend(
-                    "--enable-preview",
-                    "--enable-native-access=ALL-UNNAMED",
+                .jvmArgsAppend(ForkedJvm.flags(
                     "-Xms4g",
                     "-Xmx4g"
-                )
+                ))
                 .shouldDoGC(true)
                 .build();
 

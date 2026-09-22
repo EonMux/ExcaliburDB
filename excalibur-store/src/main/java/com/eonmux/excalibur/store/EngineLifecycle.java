@@ -207,6 +207,10 @@ final class EngineLifecycle {
 
         engine.routingTable.rebuildRoutingDirectory(maxSegmentIndex);
 
+        // After the rebuild, because only the directory says which segment each index routes
+        // to, and before anything can query or split.
+        returnRoutingIndicesHeldBySources();
+
         // Start the background split worker for automatic capacity management
         if (engine.splitWorker != null) {
             engine.splitWorker.start();
@@ -224,6 +228,42 @@ final class EngineLifecycle {
         java.util.logging.Logger.getLogger(StorageEngine.class.getName()).info(
             String.format("StorageEngine started: discovered=%d, total=%d segments, ready for operations",
                 discoveredSegments.size(), engine.segments.size()));
+    }
+
+    /**
+     * Gives every routed segment whose catalog row belongs to a source a row of its own.
+     *
+     * <p>A catalog can hold, at a routing index, a record created for a rolling reindex while
+     * such records shared a counter with the routing indices, re-pointed at a split child the
+     * directory later published at that index. The routing segment then carries the source's
+     * id and the source's lifecycle state - TOMBSTONED when the reindex fell back - so the keys
+     * it holds answer no query while writes keep landing in it, and reclamation keeps the row
+     * because the directory still routes there. Only the routing segment's own row makes it
+     * queryable again, so the stale record is replaced with the row a discovered segment would
+     * have been given; see {@code CatalogRegistry.replaceWithRoutingRecord}.</p>
+     *
+     * <p>The record is identified by the source id it carries, never by its state: a routing
+     * segment can legitimately be TOMBSTONED or COMPACTING, and those rows carry no source id,
+     * so they are left alone. The replacement is persisted, so a second start finds a clean
+     * row and does nothing.</p>
+     */
+    private void returnRoutingIndicesHeldBySources() {
+        for (Map.Entry<Long, Segment> routed : engine.routingTable.distinctSegments().entrySet()) {
+            long segmentIndex = routed.getKey();
+            if (!engine.catalog.isHeldByCreatedRecord(segmentIndex)) {
+                continue;
+            }
+            SegmentCatalog.SegmentMetadata stale = engine.catalog.get(segmentIndex);
+            Segment segment = routed.getValue();
+            SegmentCatalog.SegmentMetadata repaired = engine.catalog.replaceWithRoutingRecord(
+                segmentIndex, segment.path(), segment.entryCount());
+            StorageEngine.LOGGER.log(Level.WARNING,
+                "Routing segment {0} ({1}) was registered under a record created for source "
+                    + "''{2}'' in state {3}; replaced it with the segment''s own row in state {4} "
+                    + "so its entries are queryable again",
+                new Object[] { segmentIndex, segment.path(), stale.getSourceId(),
+                    stale.getLifecycleState(), repaired.getLifecycleState() });
+        }
     }
 
     /**

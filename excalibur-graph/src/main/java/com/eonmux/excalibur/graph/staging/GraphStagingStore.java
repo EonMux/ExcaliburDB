@@ -19,6 +19,9 @@ import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Clock;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -45,10 +48,22 @@ import java.util.zip.CRC32;
  * triples.log        [magic : int64][version : int32][reserved : int32]
  *                    repeated, little-endian, {@value #RECORD_BYTES} bytes each:
  *                      [subject : int32][relation : int32][object : int32]
- *                      [validFrom : int32][validTo : int32]
+ *                      [validFrom : int32][validTo : int32][statedOn : int32]
  *                      [sourceType : int8][confidence : int8][extractorVersion : int16]
  *                      [sourceId : int64][crc32 : int32]
  * </pre>
+ *
+ * <p>{@code statedOn} is the day the source made the statement, which is what orders two
+ * statements of a single-valued relation when neither says when its value began; see
+ * {@link ExtractedTriple}. Every record has one: a fact whose source gave no date is recorded
+ * with the day it was staged, because the order facts arrive in is the only evidence left about
+ * which statement is the later one.</p>
+ *
+ * <p>Version {@value #VERSION_WITHOUT_STATED_ON} is the same framing without {@code statedOn}, in
+ * {@value #LEGACY_RECORD_BYTES}-byte records. A log in that version is rewritten to the current
+ * one when it is opened, its facts carried across with no stated day: nothing recorded when they
+ * were made, and the day of the upgrade would be an invention. The order they were staged in
+ * survives the rewrite, and it is what orders them.</p>
  *
  * <p>Fixed-width records, so a crash mid-append leaves a file whose length is not a whole number
  * of records. That partial record is cut off when the log is opened, which is the same tolerance
@@ -73,8 +88,11 @@ public final class GraphStagingStore implements AutoCloseable {
     /** Identifies the file as an ExcaliburDB triple log: ASCII {@code EXCLBTRP}. */
     public static final long MAGIC = 0x4558434C42545250L;
 
+    /** The version written before each record carried the day its statement was made. */
+    public static final int VERSION_WITHOUT_STATED_ON = 1;
+
     /** Format version written by this build. */
-    public static final int VERSION = 1;
+    public static final int VERSION = 2;
 
     /** Bytes before the first record. */
     public static final int HEADER_BYTES = 16;
@@ -82,11 +100,20 @@ public final class GraphStagingStore implements AutoCloseable {
     /**
      * Bytes per staged triple.
      *
-     * <p>Three ids, two interval bounds, four provenance fields and a checksum: 4+4+4 + 4+4 +
-     * 1+1+2+8 + 4. Fixed width, so a torn tail is a file whose length is not a whole number of
-     * records.
+     * <p>Three ids, two interval bounds, the stated-on day, four provenance fields and a
+     * checksum: 4+4+4 + 4+4 + 4 + 1+1+2+8 + 4. Fixed width, so a torn tail is a file whose length
+     * is not a whole number of records.
      */
-    public static final int RECORD_BYTES = 36;
+    public static final int RECORD_BYTES = 40;
+
+    /** Bytes per staged triple in a {@value #VERSION_WITHOUT_STATED_ON} log. */
+    public static final int LEGACY_RECORD_BYTES = 36;
+
+    /** Bytes of a record before the stated-on day, laid out identically in both versions. */
+    private static final int INTERVAL_END = 20;
+
+    /** Bytes of provenance after the interval (and, in the current version, the stated-on day). */
+    private static final int PROVENANCE_BYTES = 12;
 
     /** Bytes of a record the checksum covers - everything but the checksum itself. */
     private static final int RECORD_PAYLOAD_BYTES = RECORD_BYTES - Integer.BYTES;
@@ -109,11 +136,15 @@ public final class GraphStagingStore implements AutoCloseable {
     /** Suffix of the partially rewritten log an erasure builds before swapping it in. */
     private static final String ERASING_SUFFIX = ".erasing";
 
+    /** Suffix of the replacement an upgrade from an earlier version builds before swapping it. */
+    private static final String REWRITE_SUFFIX = ".rewriting";
+
     private final Path directory;
     private final Path logPath;
     private final LabelInterner entities;
     private final LabelInterner relations;
     private final EntityTextLog text;
+    private final Clock clock;
     private final Object appendLock = new Object();
 
     private DataOutputStream out;
@@ -121,13 +152,14 @@ public final class GraphStagingStore implements AutoCloseable {
     private volatile boolean closed;
 
     private GraphStagingStore(Path directory, Path logPath, LabelInterner entities,
-                              LabelInterner relations, EntityTextLog text, DataOutputStream out,
-                              long staged) {
+                              LabelInterner relations, EntityTextLog text, Clock clock,
+                              DataOutputStream out, long staged) {
         this.directory = directory;
         this.logPath = logPath;
         this.entities = entities;
         this.relations = relations;
         this.text = text;
+        this.clock = clock;
         this.out = out;
         this.staged = staged;
     }
@@ -140,7 +172,21 @@ public final class GraphStagingStore implements AutoCloseable {
      * @throws IOException if the directory or its files cannot be opened
      */
     public static GraphStagingStore open(Path directory) throws IOException {
+        return open(directory, Clock.systemUTC());
+    }
+
+    /**
+     * Opens the staging store in {@code directory}, dating undated facts by {@code clock}.
+     *
+     * @param directory Where the interners and the log live
+     * @param clock     What the day a fact is staged on is read from
+     * @return The store
+     * @throws IOException if the directory or its files cannot be opened, or a log in an earlier
+     *                     version cannot be upgraded
+     */
+    public static GraphStagingStore open(Path directory, Clock clock) throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
+        Objects.requireNonNull(clock, "clock must not be null");
         Files.createDirectories(directory);
 
         LabelInterner entities = LabelInterner.open(directory.resolve(ENTITY_LABELS));
@@ -150,11 +196,15 @@ public final class GraphStagingStore implements AutoCloseable {
         try {
             relations = LabelInterner.open(directory.resolve(RELATION_LABELS));
 
+            // Upgraded first, because appending current-width records to a log of the earlier
+            // width would misframe every record after the first append.
+            Path logPath = directory.resolve(TRIPLE_LOG);
+            upgradeIfEarlierVersion(logPath);
+
             // Truncated to a whole number of records before anything is appended. A process
             // killed mid-append leaves a partial record, and appending after it would put every
             // later fact behind a record replay stops at - present on disk and invisible to every
             // build from then on.
-            Path logPath = directory.resolve(TRIPLE_LOG);
             long existing = truncateToWholeRecords(logPath);
             out = openLog(logPath);
 
@@ -162,7 +212,7 @@ public final class GraphStagingStore implements AutoCloseable {
 
             LOGGER.info("graph staging at {}: {} facts, {} entities, {} relations",
                 directory, existing, entities.size(), relations.size());
-            return new GraphStagingStore(directory, logPath, entities, relations, text,
+            return new GraphStagingStore(directory, logPath, entities, relations, text, clock,
                 out, existing);
         } catch (IOException | RuntimeException e) {
             closeQuietly(entities);
@@ -176,6 +226,13 @@ public final class GraphStagingStore implements AutoCloseable {
     /**
      * Records one extracted fact.
      *
+     * <p>A fact whose source gave no date is recorded as stated on the day it is staged, and one
+     * dated later than that is recorded as stated today. The first is the fallback that keeps a
+     * later statement ordered after an earlier one when neither document carried a date; the
+     * second is a clock that disagrees with ours - a file modified "tomorrow" - and a statement
+     * cannot have been made after the node read it. Left alone it would place a change of value
+     * in the future, where no question about the present could see it.</p>
+     *
      * @param triple The fact
      * @throws IOException if the record cannot be written
      * @throws IllegalArgumentException if the triple names a relation id outside the storable range
@@ -188,6 +245,9 @@ public final class GraphStagingStore implements AutoCloseable {
         int relation = relations.intern(triple.relation());
         RelationSelector.checkRelation(relation);
 
+        int today = Math.toIntExact(LocalDate.now(clock.withZone(ZoneOffset.UTC)).toEpochDay());
+        int statedOn = triple.isDated() ? Math.min(triple.statedOn(), today) : today;
+
         Provenance provenance = triple.provenance();
         ByteBuffer record = ByteBuffer.allocate(RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
         record.putInt(subject);
@@ -195,14 +255,12 @@ public final class GraphStagingStore implements AutoCloseable {
         record.putInt(object);
         record.putInt(triple.validFrom());
         record.putInt(triple.validTo());
+        record.putInt(statedOn);
         record.put(provenance.sourceType().toByte());
         record.put(provenance.confidenceByte());
         record.putShort(provenance.extractorVersionShort());
         record.putLong(provenance.sourceId());
-
-        CRC32 crc = new CRC32();
-        crc.update(record.array(), 0, RECORD_PAYLOAD_BYTES);
-        record.putInt((int) crc.getValue());
+        sealRecord(record.array());
 
         synchronized (appendLock) {
             requireOpen();
@@ -227,6 +285,26 @@ public final class GraphStagingStore implements AutoCloseable {
      */
     public long forEach(TripleVisitor visitor) throws IOException {
         Objects.requireNonNull(visitor, "visitor must not be null");
+        return forEachStaged((subject, relation, object, validFrom, validTo, statedOn, provenance)
+            -> visitor.visit(subject, relation, object, validFrom, validTo, provenance));
+    }
+
+    /**
+     * Replays every fact recorded so far, in the order it was staged, with the day each was
+     * stated.
+     *
+     * <p>What a build reads: supersession orders the statements of a single-valued relation by
+     * when their values began, and where a statement does not say, by the day it was made and
+     * then by the order it was staged in. The order of this replay is that last key, so a caller
+     * that needs it keeps it.
+     *
+     * @param visitor Receives each fact, with ids resolved
+     * @return How many facts were replayed
+     * @throws IOException if the log cannot be read, or holds a record whose checksum fails
+     * @see #forEach
+     */
+    public long forEachStaged(StagedFactVisitor visitor) throws IOException {
+        Objects.requireNonNull(visitor, "visitor must not be null");
         flush();
 
         if (!Files.exists(logPath) || Files.size(logPath) < HEADER_BYTES) {
@@ -241,7 +319,7 @@ public final class GraphStagingStore implements AutoCloseable {
             // assembled so far is in a scratch directory nothing is served from.
             BuildCancellation.checkpoint(cursor.read);
             visitor.visit(cursor.subject, cursor.relation, cursor.object,
-                cursor.validFrom, cursor.validTo, cursor.provenance);
+                cursor.validFrom, cursor.validTo, cursor.statedOn, cursor.provenance);
         }
         return cursor.read;
     }
@@ -296,6 +374,7 @@ public final class GraphStagingStore implements AutoCloseable {
         private int object;
         private int validFrom;
         private int validTo;
+        private int statedOn;
         private Provenance provenance = Provenance.UNKNOWN;
 
         /**
@@ -328,6 +407,7 @@ public final class GraphStagingStore implements AutoCloseable {
             object = buffer.getInt();
             validFrom = buffer.getInt();
             validTo = buffer.getInt();
+            statedOn = buffer.getInt();
             byte sourceType = buffer.get();
             byte confidence = buffer.get();
             short extractorVersion = buffer.getShort();
@@ -468,17 +548,147 @@ public final class GraphStagingStore implements AutoCloseable {
 
     private static ByteBuffer readHeader(byte[] all, Path path, String what) throws IOException {
         ByteBuffer buffer = ByteBuffer.wrap(all);
-        long magic = buffer.getLong();
-        if (magic != MAGIC) {
-            throw new IOException("not a " + what + " (magic 0x" + Long.toHexString(magic)
-                + "): " + path);
-        }
-        int version = buffer.getInt();
+        int version = versionOf(buffer, path, what);
         if (version != VERSION) {
             throw new IOException("unsupported " + what + " version " + version + ": " + path);
         }
         buffer.getInt();
         return buffer;
+    }
+
+    /**
+     * Reads the magic and the version from the start of a log, leaving the buffer after them.
+     *
+     * @param header The log's first bytes, at least {@value #HEADER_BYTES} of them
+     * @param path   The log, named in any failure
+     * @param what   What the log is, for the failure
+     * @return The version
+     * @throws IOException if the file is not a triple log, or is one of a version this build
+     *                     does not know
+     */
+    private static int versionOf(ByteBuffer header, Path path, String what) throws IOException {
+        long magic = header.getLong();
+        if (magic != MAGIC) {
+            throw new IOException("not a " + what + " (magic 0x" + Long.toHexString(magic)
+                + "): " + path);
+        }
+        int version = header.getInt();
+        if (version != VERSION && version != VERSION_WITHOUT_STATED_ON) {
+            throw new IOException("unsupported " + what + " version " + version + ": " + path);
+        }
+        return version;
+    }
+
+    /**
+     * The width of the records in a log of {@code version}.
+     *
+     * @param version A version {@link #versionOf} accepted
+     * @return Bytes per record
+     */
+    private static int recordBytes(int version) {
+        return version == VERSION ? RECORD_BYTES : LEGACY_RECORD_BYTES;
+    }
+
+    /**
+     * How many whole facts a triple log on disk holds, in whichever version it was written.
+     *
+     * <p>For a caller that has to answer without opening the store - opening one upgrades an
+     * earlier version in place, and a status read must not write. Reads the sixteen-byte header
+     * for the version, since the record width depends on it, and measures the file. A trailing
+     * partial record is not counted: it is a process killed mid-append, and the next open trims
+     * it.</p>
+     *
+     * @param log The triple log
+     * @return The whole records it holds, or zero if it does not exist or has no complete header
+     * @throws IOException if the file cannot be read, is not a triple log, or is of an unknown
+     *                     version
+     */
+    public static long factsOnDisk(Path log) throws IOException {
+        Objects.requireNonNull(log, "log must not be null");
+        if (!Files.isRegularFile(log)) {
+            return 0;
+        }
+        byte[] header = new byte[HEADER_BYTES];
+        long size;
+        try (var in = Files.newInputStream(log)) {
+            if (in.readNBytes(header, 0, HEADER_BYTES) < HEADER_BYTES) {
+                return 0;
+            }
+            size = Files.size(log);
+        }
+        int version = versionOf(ByteBuffer.wrap(header), log, "triple log");
+        return (size - HEADER_BYTES) / recordBytes(version);
+    }
+
+    /**
+     * Rewrites a log written before records carried the day they were stated, once.
+     *
+     * <p>Every whole record is carried across, in order and otherwise byte for byte, with
+     * {@link TemporalFilter#UNDATED} as its stated-on day and a checksum over the new layout. A
+     * partial record at the end is dropped, as opening trims one in any version. A record whose
+     * checksum fails refuses the upgrade and leaves the file as it was, for the reason
+     * {@link #corrupt} gives: the facts after it were written and acknowledged, and neither
+     * dropping them nor carrying damage into a freshly checksummed record is honest.</p>
+     *
+     * <p>Swapped in by a forced rename, so a crash leaves either the old log whole or the new one
+     * whole, and the next open finishes the job or finds nothing to do.</p>
+     *
+     * @param logPath The triple log
+     * @throws IOException if it cannot be read, holds a corrupt record, or cannot be rewritten
+     */
+    private static void upgradeIfEarlierVersion(Path logPath) throws IOException {
+        if (!Files.exists(logPath) || Files.size(logPath) < HEADER_BYTES) {
+            return;
+        }
+        byte[] all = Files.readAllBytes(logPath);
+        if (versionOf(ByteBuffer.wrap(all), logPath, "triple log") != VERSION_WITHOUT_STATED_ON) {
+            return;
+        }
+
+        Path temp = logPath.resolveSibling(logPath.getFileName() + REWRITE_SUFFIX);
+        Files.deleteIfExists(temp);
+        long upgraded = 0;
+        try {
+            try (DataOutputStream rewritten = openLog(temp)) {
+                byte[] record = new byte[RECORD_BYTES];
+                ByteBuffer view = ByteBuffer.wrap(record).order(ByteOrder.LITTLE_ENDIAN);
+                for (int start = HEADER_BYTES; start + LEGACY_RECORD_BYTES <= all.length;
+                     start += LEGACY_RECORD_BYTES) {
+                    CRC32 crc = new CRC32();
+                    crc.update(all, start, LEGACY_RECORD_BYTES - Integer.BYTES);
+                    int stored = ByteBuffer.wrap(all, start + LEGACY_RECORD_BYTES - Integer.BYTES,
+                        Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN).getInt();
+                    if (stored != (int) crc.getValue()) {
+                        throw corrupt(logPath, upgraded);
+                    }
+                    System.arraycopy(all, start, record, 0, INTERVAL_END);
+                    view.putInt(INTERVAL_END, TemporalFilter.UNDATED);
+                    System.arraycopy(all, start + INTERVAL_END, record,
+                        INTERVAL_END + Integer.BYTES, PROVENANCE_BYTES);
+                    sealRecord(record);
+                    rewritten.write(record);
+                    upgraded++;
+                }
+            }
+            Durability.DEVICE.replaceDurably(temp, logPath);
+        } finally {
+            Files.deleteIfExists(temp);
+        }
+        LOGGER.warn("upgraded {} to triple log version {}: {} fact(s) carried across with no "
+            + "stated day, so the order they were staged in is what orders them for supersession",
+            logPath, VERSION, upgraded);
+    }
+
+    /**
+     * Writes the checksum of a current-version record over everything before it.
+     *
+     * @param record A {@value #RECORD_BYTES}-byte record whose payload is filled in
+     */
+    private static void sealRecord(byte[] record) {
+        CRC32 crc = new CRC32();
+        crc.update(record, 0, RECORD_PAYLOAD_BYTES);
+        ByteBuffer.wrap(record).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(RECORD_PAYLOAD_BYTES, (int) crc.getValue());
     }
 
     /**
@@ -736,6 +946,24 @@ public final class GraphStagingStore implements AutoCloseable {
         } catch (Exception e) {
             LOGGER.debug("ignoring failure closing {} during a failed open", closeable, e);
         }
+    }
+
+    /** Receives each fact of a {@link #forEachStaged} replay, with its ids resolved. */
+    @FunctionalInterface
+    public interface StagedFactVisitor {
+
+        /**
+         * @param subject    subject entity id
+         * @param relation   relation id
+         * @param object     object entity id
+         * @param validFrom  first day the fact held, or {@link TemporalFilter#UNDATED}
+         * @param validTo    first day it no longer held, or {@link TemporalFilter#OPEN}
+         * @param statedOn   the day the statement was made, or {@link TemporalFilter#UNDATED}
+         *                   for a fact carried across from a log that did not record it
+         * @param provenance where the fact came from
+         */
+        void visit(int subject, int relation, int object, int validFrom, int validTo,
+                   int statedOn, Provenance provenance);
     }
 
     /** Receives each fact of a {@link #forEach} replay, with its ids resolved. */

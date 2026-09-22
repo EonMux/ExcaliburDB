@@ -31,7 +31,7 @@ import java.util.Objects;
  *   "queries": [
  *     {
  *       "query_id": "1f0c...",
- *       "correlation_id": "checkout-42",
+ *       "correlation_id": "9c41e07a",
  *       "started_at_ms": 1736899200000,
  *       "duration_ms": 91400,
  *       "cancelled": false

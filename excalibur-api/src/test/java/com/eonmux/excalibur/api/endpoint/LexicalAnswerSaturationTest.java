@@ -7,6 +7,7 @@ import com.eonmux.excalibur.api.retrieval.LexicalSearchPermits;
 import com.eonmux.excalibur.api.retrieval.ResultText;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 
+import com.eonmux.excalibur.query.pipeline.QueryPipeline;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -75,7 +76,8 @@ class LexicalAnswerSaturationTest {
             .isGreaterThan(0);
 
         LexicalQueryService lexical = mock(LexicalQueryService.class);
-        LexicalAnswer answer = new LexicalAnswer(parser(), executor, null, contexts());
+        LexicalAnswer answer = new LexicalAnswer(parser(), executor, null, contexts(),
+            mock(QueryPipeline.class), new RelevancyScoring(executor, 4096));
 
         HttpExchange exchange = mock(HttpExchange.class);
         ByteArrayOutputStream responseBody = new ByteArrayOutputStream();
@@ -87,7 +89,7 @@ class LexicalAnswerSaturationTest {
             "{\"query\": \"anything\"}".getBytes(StandardCharsets.UTF_8)));
         when(exchange.getResponseBody()).thenReturn(responseBody);
 
-        answer.answer(exchange, lexical, "q-1", "c-1", System.nanoTime());
+        answer.answer(exchange, lexical, null, "q-1", "c-1", System.nanoTime());
 
         ArgumentCaptor<Integer> status = ArgumentCaptor.forClass(Integer.class);
         verify(exchange).sendResponseHeaders(status.capture(), org.mockito.ArgumentMatchers.anyLong());
@@ -105,7 +107,8 @@ class LexicalAnswerSaturationTest {
         when(lexical.stats()).thenReturn(null);
 
         int before = LexicalSearchPermits.available();
-        LexicalAnswer answer = new LexicalAnswer(parser(), executor, null, contexts());
+        LexicalAnswer answer = new LexicalAnswer(parser(), executor, null, contexts(),
+            mock(QueryPipeline.class), new RelevancyScoring(executor, 4096));
 
         HttpExchange exchange = mock(HttpExchange.class);
         when(exchange.getRequestMethod()).thenReturn("POST");
@@ -116,7 +119,7 @@ class LexicalAnswerSaturationTest {
             "{\"query\": \"anything\"}".getBytes(StandardCharsets.UTF_8)));
         when(exchange.getResponseBody()).thenReturn(new ByteArrayOutputStream());
 
-        answer.answer(exchange, lexical, "q-2", "c-2", System.nanoTime());
+        answer.answer(exchange, lexical, null, "q-2", "c-2", System.nanoTime());
 
         assertThat(LexicalSearchPermits.available())
             .as("a permit held past the end of its search is a permanent loss of capacity")

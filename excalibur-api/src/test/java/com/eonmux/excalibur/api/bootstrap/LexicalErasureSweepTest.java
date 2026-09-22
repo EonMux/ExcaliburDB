@@ -145,6 +145,10 @@ class LexicalErasureSweepTest {
         }
 
         @Override
+        public void addDocument(java.util.Map<String, String> chunks) {
+        }
+
+        @Override
         public void refresh() {
         }
 

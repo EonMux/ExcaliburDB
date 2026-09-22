@@ -8,9 +8,11 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.offset;
 
 /**
  * The budget that decides when a namespace is evicted.
@@ -137,6 +139,202 @@ class MappingBudgetTest {
         void saysWhichLimitBound() {
             assertThat(MappingBudget.of(1_000, 0.7, 500).toString())
                 .contains("fds=0/500");
+        }
+    }
+
+    @Nested
+    @DisplayName("The rest of the process")
+    class RestOfProcess {
+
+        /** A process whose figures a test sets, standing in for {@code /proc/self}. */
+        private static final class FixedProcess implements ProcessResourceUsage {
+            private volatile OptionalLong mappings = OptionalLong.empty();
+            private volatile OptionalLong descriptors = OptionalLong.empty();
+
+            FixedProcess holding(long mappingCount, long descriptorCount) {
+                this.mappings = OptionalLong.of(mappingCount);
+                this.descriptors = OptionalLong.of(descriptorCount);
+                return this;
+            }
+
+            FixedProcess unreadable() {
+                this.mappings = OptionalLong.empty();
+                this.descriptors = OptionalLong.empty();
+                return this;
+            }
+
+            @Override
+            public OptionalLong mappings() {
+                return mappings;
+            }
+
+            @Override
+            public OptionalLong descriptors() {
+                return descriptors;
+            }
+        }
+
+        @Test
+        @DisplayName("counts everything the graphs do not account for against the limit")
+        void theRestOfTheProcessIsSpent() {
+            // The defect this closes: the budget compared the graphs alone against a limit that
+            // belongs to the whole process, so a node whose storage segments and vector graphs
+            // held most of vm.max_map_count reported room it did not have.
+            FixedProcess process = new FixedProcess().holding(650, 40);
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 100, process);
+            budget.acquire(50, 5);
+
+            assertThat(budget.refreshProcessUsage()).isTrue();
+
+            assertThat(budget.otherMappings()).isEqualTo(600);
+            assertThat(budget.otherDescriptors()).isEqualTo(35);
+            assertThat(budget.mappings()).as("the graphs' own figure is unchanged").isEqualTo(50);
+            assertThat(budget.isOverHighWater()).isFalse();
+            assertThat(budget.wouldExceedHighWater(51, 0))
+                .as("650 held plus 51 is past the 700 the fraction allows")
+                .isTrue();
+            assertThat(budget.wouldExceedHighWater(0, 31))
+                .as("40 descriptors held plus 31 is past 70")
+                .isTrue();
+            assertThat(budget.utilisation()).isCloseTo(0.65, offset(1e-9));
+        }
+
+        @Test
+        @DisplayName("an unmeasured budget is the graphs alone, as it always was")
+        void unmeasuredCountsTheGraphsAlone() {
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 100);
+            budget.acquire(50, 5);
+
+            assertThat(budget.refreshProcessUsage()).isFalse();
+            assertThat(budget.otherMappings()).isZero();
+            assertThat(budget.otherDescriptors()).isZero();
+            assertThat(budget.wouldExceedHighWater(600, 0)).isFalse();
+        }
+
+        @Test
+        @DisplayName("a failed measurement keeps the last one rather than forgetting the node")
+        void aFailedReadKeepsThePreviousFigure() {
+            FixedProcess process = new FixedProcess().holding(500, 20);
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 100, process);
+            budget.refreshProcessUsage();
+
+            process.unreadable();
+
+            assertThat(budget.refreshProcessUsage()).isFalse();
+            assertThat(budget.otherMappings()).isEqualTo(500);
+            assertThat(budget.otherDescriptors()).isEqualTo(20);
+        }
+
+        @Test
+        @DisplayName("graphs costed above what the process holds never make the rest negative")
+        void theRestIsNeverNegative() {
+            // A graph whose Lucene share shrank since it was costed is accounted at more than it
+            // holds; a negative rest of process would be headroom that does not exist.
+            FixedProcess process = new FixedProcess().holding(10, 1);
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 100, process);
+            budget.acquire(50, 5);
+
+            budget.refreshProcessUsage();
+
+            assertThat(budget.otherMappings()).isZero();
+            assertThat(budget.otherDescriptors()).isZero();
+        }
+
+        @Test
+        @DisplayName("says when the rest of the process alone is past the mark")
+        void recognisesWhatEvictionCannotFix() {
+            FixedProcess process = new FixedProcess().holding(750, 0);
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 100, process);
+            budget.refreshProcessUsage();
+
+            assertThat(budget.isRestOfProcessOverHighWater()).isTrue();
+            assertThat(budget.isOverHighWater()).isTrue();
+
+            process.holding(10, 80);
+            budget.refreshProcessUsage();
+            assertThat(budget.isRestOfProcessOverHighWater())
+                .as("80 descriptors is past the 70 the fraction allows")
+                .isTrue();
+
+            process.holding(10, 10);
+            budget.refreshProcessUsage();
+            assertThat(budget.isRestOfProcessOverHighWater()).isFalse();
+        }
+
+        @Test
+        @DisplayName("ignores descriptors when no descriptor limit is enforced")
+        void noDescriptorBoundMeansNoDescriptorPressure() {
+            FixedProcess process = new FixedProcess().holding(10, 1_000_000);
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 0, process);
+            budget.refreshProcessUsage();
+
+            assertThat(budget.isRestOfProcessOverHighWater()).isFalse();
+            assertThat(budget.isOverHighWater()).isFalse();
+        }
+
+        @Test
+        @DisplayName("reports the process measured now, and does not move the decision by doing so")
+        void usageIsAFreshReadThatChangesNothing() {
+            FixedProcess process = new FixedProcess().holding(300, 30);
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 100, process);
+            budget.acquire(40, 4);
+            budget.refreshProcessUsage();
+
+            process.holding(900, 90);
+            MappingBudget.Usage usage = budget.usage();
+
+            assertThat(usage.graphMappings()).isEqualTo(40);
+            assertThat(usage.processMappings()).hasValue(900);
+            assertThat(usage.graphDescriptors()).isEqualTo(4);
+            assertThat(usage.processDescriptors()).hasValue(90);
+            assertThat(usage.mappingHighWater()).isEqualTo(700);
+            assertThat(usage.maxMappings()).isEqualTo(1_000);
+            assertThat(usage.descriptorHighWater()).isEqualTo(70);
+            assertThat(usage.maxDescriptors()).isEqualTo(100);
+            assertThat(usage.limitWasRead()).isTrue();
+            assertThat(budget.otherMappings())
+                .as("a report is not a measurement the eviction decision acts on")
+                .isEqualTo(260);
+        }
+
+        @Test
+        @DisplayName("reports an unmeasurable process as unknown")
+        void usageOfAnUnmeasuredProcess() {
+            MappingBudget.Usage usage = MappingBudget.of(1_000, 0.7).usage();
+
+            assertThat(usage.processMappings()).isEmpty();
+            assertThat(usage.processDescriptors()).isEmpty();
+            assertThatThrownBy(() -> new MappingBudget.Usage(0, null, 0, 1, 0,
+                OptionalLong.empty(), 0, 0, true)).isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("refuses a budget with no way of asking the process")
+        void aProcessIsRequired() {
+            assertThatThrownBy(() -> MappingBudget.of(1_000, 0.7, 0, null))
+                .isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("names the rest of the process alongside the graphs")
+        void saysWhatTheRestHolds() {
+            MappingBudget budget = MappingBudget.of(1_000, 0.7, 100,
+                new FixedProcess().holding(123, 7));
+            budget.refreshProcessUsage();
+
+            assertThat(budget.toString()).contains("restOfProcess=123 mappings 7 fds");
+        }
+
+        @Test
+        @DisplayName("the detected budget has measured the process it is running in")
+        void detectionMeasures() {
+            MappingBudget budget = MappingBudget.detect();
+
+            if (java.nio.file.Files.isReadable(java.nio.file.Path.of("/proc/self/maps"))) {
+                assertThat(budget.otherMappings())
+                    .as("a JVM maps its heap and libraries before any graph opens")
+                    .isPositive();
+            }
         }
     }
 

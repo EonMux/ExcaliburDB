@@ -5,6 +5,7 @@ import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.erasure.ErasureScope;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.provenance.SourceType;
+import com.eonmux.excalibur.graph.staging.GraphBuilder;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,13 +40,12 @@ public final class GraphErasureService {
     private final GraphErasureCoordinator coordinator;
     private final GraphRagHolder holder;
     private final Config config;
-    private final ReentrantLock compactionLock = new ReentrantLock();
 
     /**
      * Creates the service.
      *
      * @param coordinator Records requests and rewrites the store
-     * @param holder      The stack being served, closed around a compaction and reopened after
+     * @param holder      The stack being served, withdrawn around a compaction and reopened after
      * @param config      Read when reopening the stack
      */
     public GraphErasureService(GraphErasureCoordinator coordinator, GraphRagHolder holder,
@@ -109,9 +109,55 @@ public final class GraphErasureService {
             0, 0, 0, 0, false, true,
             "this node serves no graph, so nothing was extracted from these documents into one");
 
-        /** What a node with a graph but nothing to withdraw reports. */
-        static DocumentGraphOutcome none(String detail) {
+        /**
+         * What a node with a graph but nothing to withdraw reports.
+         *
+         * @param detail Why there was nothing to withdraw
+         * @return An outcome that submitted nothing and owes nothing
+         */
+        public static DocumentGraphOutcome none(String detail) {
             return new DocumentGraphOutcome(0, 0, 0, 0, false, true, detail);
+        }
+
+        /**
+         * What withdrawing one set of documents did across several namespaces.
+         *
+         * <p>Counts add, a rewrite anywhere is a rewrite, and the whole is complete only where
+         * every part is: a namespace still owing an obligation is not discharged by another one
+         * that owed nothing.</p>
+         *
+         * @param parts The outcome in each namespace visited, at least one
+         * @return Their combination
+         * @throws IllegalArgumentException if {@code parts} is empty
+         */
+        public static DocumentGraphOutcome combine(List<DocumentGraphOutcome> parts) {
+            if (parts.isEmpty()) {
+                throw new IllegalArgumentException("parts must not be empty");
+            }
+            if (parts.size() == 1) {
+                return parts.get(0);
+            }
+            int submitted = 0;
+            int satisfied = 0;
+            int withheld = 0;
+            int outstanding = 0;
+            boolean compacted = false;
+            boolean complete = true;
+            StringBuilder detail = new StringBuilder();
+            for (DocumentGraphOutcome part : parts) {
+                submitted += part.submitted();
+                satisfied += part.satisfied();
+                withheld += part.withheld();
+                outstanding += part.outstanding();
+                compacted |= part.compacted();
+                complete &= part.complete();
+                if (!detail.isEmpty()) {
+                    detail.append("; ");
+                }
+                detail.append(part.detail());
+            }
+            return new DocumentGraphOutcome(submitted, satisfied, withheld, outstanding,
+                compacted, complete, detail.toString());
         }
     }
 
@@ -197,6 +243,15 @@ public final class GraphErasureService {
     }
 
     /**
+     * How many obligations are outstanding, and when the longest-waiting one arrived.
+     *
+     * @return What this namespace owes
+     */
+    public com.eonmux.excalibur.graph.erasure.ErasureLog.Pending pending() {
+        return coordinator.pending();
+    }
+
+    /**
      * Runs a compaction, closing and reopening the served stack around it.
      *
      * @param force Whether to skip the policy
@@ -204,9 +259,15 @@ public final class GraphErasureService {
      * @throws IOException if the compaction fails
      */
     private ErasureOutcome compact(boolean force) throws IOException {
+        // The build's lock too: a build publishing while this rewrites the directory, or reading
+        // staging while this erases from it, would serve what this is removing.
+        ReentrantLock compactionLock = holder.replacementLock();
         compactionLock.lock();
         try {
             java.nio.file.Path directory = holder.directory();
+            // A graph an interrupted publish displaced is still a graph holding the facts being
+            // erased, and its leftover copy beside a completed one would outlive the erasure.
+            GraphBuilder.recoverInterruptedPublish(directory);
             if (!java.nio.file.Files.isDirectory(directory)) {
                 // Nothing served, but not nothing to do. The obligation was recorded against
                 // facts that are staged, and staged facts are what the next build publishes -
@@ -230,12 +291,9 @@ public final class GraphErasureService {
                 return new ErasureOutcome(false, 0, 0, 0, "no outstanding erasure requests");
             }
 
-            boolean wasServing = holder.isPresent();
-            if (wasServing) {
-                // The compaction replaces this directory. Closing first releases the mappings and
-                // the Lucene write locks the replacement will need at the same paths.
-                holder.install(null);
-            }
+            // The compaction rewrites files the served stack maps, so the stack is withdrawn and
+            // the queries reading it are let finish before anything is touched.
+            boolean wasServing = holder.withdraw();
             try {
                 GraphErasureCoordinator.CompactionOutcome outcome = force
                     ? coordinator.compactNow(directory)

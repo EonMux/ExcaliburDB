@@ -51,6 +51,19 @@ class ConfigGraphTest {
         }
 
         @Test
+        @DisplayName("the score gates default to values that mean something on the unit relevance scale")
+        void scoreGatesDefaultOnTheUnitScale() {
+            // Retrieval reports relevance in [0, 1]: a share of the attainable BM25 score, or a
+            // vector similarity. Five percent of a question's term weight, and a one-percent gap,
+            // are gates that fire on real questions; thresholds sized for a reciprocal-rank score
+            // near 1/61 would pass everything on this scale.
+            GraphConfig settings = graph(Map.of());
+
+            assertThat(settings.getMinScore()).isEqualTo(0.05);
+            assertThat(settings.getMinSeparation()).isEqualTo(0.01);
+        }
+
+        @Test
         @DisplayName("a null path means the data directory decides, not the empty string")
         void nullPathIsDistinctFromBlank() {
             // GraphRagFactory treats null and blank alike, but the accessor must not turn an
@@ -128,6 +141,18 @@ class ConfigGraphTest {
             assertThatThrownBy(() -> graph(Map.of("excalibur.graph.min-score", "1.5")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("min-score");
+        }
+
+        @Test
+        @DisplayName("a tombstone ratio of zero is refused")
+        void zeroTombstoneRatio() {
+            // Every store is at or above a ratio of zero, so every tenant would compact on open.
+            assertThatThrownBy(
+                () -> graph(Map.of("excalibur.graph.erasure-tombstone-ratio", "0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("erasure-tombstone-ratio");
+            assertThat(graph(Map.of("excalibur.graph.erasure-tombstone-ratio", "1"))
+                .getErasureTombstoneRatio()).isEqualTo(1.0);
         }
 
         @Test
@@ -239,9 +264,10 @@ class ConfigGraphTest {
         }
 
         @Test
-        @DisplayName("toString names the directory without pretending one was configured")
+        @DisplayName("toString names the graph root without pretending one was configured")
         void toStringIsHonestAboutTheDefault() {
-            assertThat(graph(Map.of()).toString()).contains("<data dir>/graph");
+            // The key names the root the per-namespace graphs live under, not a graph directory.
+            assertThat(graph(Map.of()).toString()).contains("root=<data dir>,");
             assertThat(graph(Map.of("excalibur.graph.path", "/srv/g")).toString())
                 .contains("/srv/g");
         }

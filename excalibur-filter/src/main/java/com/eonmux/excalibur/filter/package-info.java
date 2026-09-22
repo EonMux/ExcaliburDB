@@ -1,6 +1,5 @@
-package com.eonmux.excalibur.filter;
-
 /**
- * Probabilistic structures package for ExcaliburDB.
- * Phase 3 - Bloom filters, HyperLogLog, sketches, and other probabilistic data structures.
+ * Probabilistic structures for ExcaliburDB: Cuckoo filters here, locality-sensitive hashing in
+ * {@code lsh} and the Count-Min Sketch in {@code sketch}.
  */
+package com.eonmux.excalibur.filter;

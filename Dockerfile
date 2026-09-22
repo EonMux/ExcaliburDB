@@ -23,9 +23,8 @@
 #                                    falls back to scalar arithmetic silently - a node that
 #                                    works and is several times slower at every search.
 #
-# The first two are what excalibur-api/build.gradle.kts puts in applicationDefaultJvmArgs, so
-# this image launches the jar the way the generated start scripts launch it. The third is what
-# excalibur-vector/build.gradle.kts adds for compilation and for its own JVM forks.
+# All three are in excalibur-api/build.gradle.kts's applicationDefaultJvmArgs, so this image
+# launches the jar the way the generated start scripts launch it.
 #
 # Configuration: excalibur.properties is read from the working directory, then from the
 # classpath (the packaged default in excalibur-api/src/main/resources). Any setting can be
@@ -71,7 +70,7 @@ FROM eclipse-temurin:21-jre-jammy AS runtime
 
 LABEL org.opencontainers.image.title="ExcaliburDB" \
       org.opencontainers.image.description="Disk-backed data relevancy retrieval engine for LLMs" \
-      org.opencontainers.image.source="https://github.com/aeslampanah/excaliburdb" \
+      org.opencontainers.image.source="https://github.com/EonMux/ExcaliburDB" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 # curl is the HEALTHCHECK's only dependency. The Temurin JRE already carries every module the

@@ -233,8 +233,7 @@ final class HttpRouting {
         Objects.requireNonNull(delegate, "delegate cannot be null");
         return exchange -> {
             String named = exchange.getRequestHeaders().getFirst(GraphTenants.NAMESPACE_HEADER);
-            if (named == null || named.isBlank()
-                || SHARED_NAMESPACE.equalsIgnoreCase(named.trim())) {
+            if (named == null || named.isBlank() || SHARED_NAMESPACE.equals(named.trim())) {
                 delegate.handle(exchange);
                 return;
             }

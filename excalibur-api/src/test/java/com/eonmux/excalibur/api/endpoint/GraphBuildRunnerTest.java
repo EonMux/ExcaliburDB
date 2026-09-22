@@ -337,4 +337,68 @@ class GraphBuildRunnerTest {
             assertThat(runner.snapshot(ACME).state()).isEqualTo(GraphBuildRunner.STATE_FAILED);
         }
     }
+
+    @Nested
+    @DisplayName("counting what builds did")
+    class Counting {
+
+        @Test
+        @DisplayName("counts every build by how it ended, across namespaces")
+        void countsByOutcome() {
+            Gate gate = new Gate();
+            java.util.concurrent.atomic.AtomicInteger calls =
+                new java.util.concurrent.atomic.AtomicInteger();
+            GraphBuildRunner.Build build = (namespace, cancel) -> switch (calls.getAndIncrement()) {
+                case 0 -> PUBLISHED;
+                case 1 -> throw new IOException("disk full");
+                default -> gate.build(namespace, cancel);
+            };
+            try (GraphBuildRunner runner = new GraphBuildRunner(build)) {
+                assertThat(runner.counts())
+                    .isEqualTo(new GraphBuildRunner.Counts(false, 0, 0, 0));
+
+                runner.start(ACME);
+                awaitState(runner, ACME, GraphBuildRunner.STATE_COMPLETED);
+                runner.start(OTHER);
+                awaitState(runner, OTHER, GraphBuildRunner.STATE_FAILED);
+
+                runner.start(ACME);
+                gate.awaitEntry();
+                assertThat(runner.counts().running())
+                    .as("a build in progress is reported as running")
+                    .isTrue();
+                runner.cancel(ACME);
+                gate.release();
+                awaitState(runner, ACME, GraphBuildRunner.STATE_CANCELLED);
+
+                // Totals, not the last build of each namespace: ACME's completed build is
+                // still counted after its cancelled one replaced it in the status.
+                assertThat(runner.counts())
+                    .isEqualTo(new GraphBuildRunner.Counts(false, 1, 1, 1));
+            }
+        }
+
+        @Test
+        @DisplayName("a build that could not even be scheduled is counted as failed")
+        void anUnschedulableBuildIsAFailure() {
+            GraphBuildRunner runner = new GraphBuildRunner((namespace, cancel) -> PUBLISHED);
+            runner.close();
+
+            assertThatThrownBy(() -> runner.start(ACME))
+                .isInstanceOf(java.util.concurrent.RejectedExecutionException.class);
+            assertThat(runner.counts())
+                .isEqualTo(new GraphBuildRunner.Counts(false, 0, 1, 0));
+        }
+
+        @Test
+        @DisplayName("refuses a negative count")
+        void countsAreNonNegative() {
+            assertThatThrownBy(() -> new GraphBuildRunner.Counts(false, -1, 0, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new GraphBuildRunner.Counts(false, 0, -1, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> new GraphBuildRunner.Counts(false, 0, 0, -1))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
 }

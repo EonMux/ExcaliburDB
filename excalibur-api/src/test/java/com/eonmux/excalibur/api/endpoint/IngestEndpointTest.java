@@ -659,14 +659,14 @@ class IngestEndpointTest {
         }
 
         @Test
-        @DisplayName("refuses a namespace header claiming the shared namespace by name")
-        void refusesTheSharedNamespaceByName(@TempDir Path root) throws IOException {
-            // The same answer the graph routes give it. 'shared' is what a node uses when no
-            // namespace was named; a caller naming it is claiming an index it does not own.
+        @DisplayName("naming the shared namespace registers into it, as naming none does")
+        void acceptsTheSharedNamespaceByName(@TempDir Path root) throws IOException {
+            // Leaving the header off already lands in 'shared', so refusing the explicit name
+            // would protect nothing and break a client that stamps the header on every request.
             Response response = post(root, null, body(root, "docs"), "shared");
 
-            assertThat(response.status()).isEqualTo(400);
-            assertThat(registry.getAllSourceIds()).isEmpty();
+            assertThat(response.status()).isEqualTo(200);
+            assertThat(registry.namespaceOf("docs")).contains(NamespaceId.SHARED);
         }
 
         /** A filesystem registration for {@code root} under {@code sourceId}. */

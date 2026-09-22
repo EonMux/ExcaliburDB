@@ -56,8 +56,7 @@ class DeletionLifecycleIntegrationTest {
 
             // Register segments for different document types
             for (int seg = 0; seg < 10; seg++) {
-                String cluster = (seg < 5) ? "cluster-alpha" : "cluster-beta";
-                hcf.registerSegment("documents-" + seg, cluster);
+                hcf.registerSegment("documents-" + seg);
             }
 
             // Insert documents (simulating ingestion)

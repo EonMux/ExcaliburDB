@@ -32,14 +32,12 @@ import java.util.Objects;
  * training finishes.</p>
  *
  * <h2>Why the run usually does not happen</h2>
- * <p>The segment created here is a catalog entry, and the catalog draws IDs from a counter it
- * advances past every ID it issues - the indices a split registers included - so a created entry
- * always names an index the engine holds no segment of its own at. Before the first split that
- * index is past the routing directory and resolves to nothing; after one it resolves to a buddy
- * pointer, and filling it would write this source's data into a segment routing unrelated keys
- * and then retire the source's real segments in favour of it. Neither is a target, so this is
- * detected before a single document is fetched and the run falls back to re-indexing through the
- * routing directory.</p>
+ * <p>The segment created here is a catalog entry, and the catalog allocates created IDs from
+ * {@code SegmentCatalog.FIRST_CREATED_SEGMENT_ID} upward - a range above every index the storage
+ * engine's routing directory can hold. A created entry therefore names no segment of the engine's
+ * and resolves to nothing, however far the directory has split, so it is not a write target. That
+ * is detected before a single document is fetched, and the run falls back to re-indexing through
+ * the routing directory.</p>
  *
  * <p>Asking once is the point. Discovering it one chunk at a time would cost a crawl, a chunking
  * pass and an embedding call for every chunk of every document in the source before the first

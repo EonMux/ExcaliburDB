@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -246,6 +247,7 @@ final class DocumentIngestor {
             rollbackChunks(documentKey, writtenKeys, e);
             return DocumentOutcome.DROPPED;
         }
+        lexicalSideIndex.addDocument(documentKey, lexicalChunks(documentKey, chunks));
         return DocumentOutcome.published(chunks.size());
     }
 
@@ -394,10 +396,19 @@ final class DocumentIngestor {
                 : ChunkPayloadCodec.encode(chunk.getText(), vector);
             long segmentId = storageEngine.putReportingSegment(
                 chunkId.getBytes(StandardCharsets.UTF_8), value);
-            lexicalSideIndex.add(chunkId, chunk.getText());
             termRecorder.record(segmentId, chunkId, chunk.getText());
             writtenKeys.add(chunkId);
         }
+    }
+
+    /** A published document's chunks, keyed by identifier, in chunk order. */
+    private static Map<String, String> lexicalChunks(String documentKey, List<TextChunk> chunks) {
+        Map<String, String> byId = new LinkedHashMap<>(chunks.size() * 2);
+        for (TextChunk chunk : chunks) {
+            byId.put(ChunkIdentifiers.chunkIdForDocumentKey(documentKey, chunk.getChunkIndex()),
+                chunk.getText());
+        }
+        return byId;
     }
 
     /**

@@ -16,13 +16,13 @@ import java.util.TreeMap;
  * endpoints only render.</p>
  *
  * <h2>What is optional, and what an absent block means</h2>
- * <p>Five blocks are nullable, and in each case absent is a different statement from zero.
+ * <p>Six blocks are nullable, and in each case absent is a different statement from zero.
  * A node with no lexical index is not a node whose index holds nothing; a node with no
  * embedding client has no circuit breaker rather than a closed one; a node that does no
  * relevancy scoring has no relevancy breaker rather than a healthy one; a storage engine
  * that could not be asked about its vector indexes has not reported that every segment has
- * one; and a node running without a query result cache is not one whose cache has never been
- * hit.</p>
+ * one; a node running without a query result cache is not one whose cache has never been
+ * hit; and a node that serves no graph of its own is not one whose tenants are all idle.</p>
  *
  * @param segments          Segment counts by lifecycle state
  * @param entries           How much the corpus holds
@@ -39,6 +39,8 @@ import java.util.TreeMap;
  *                          no LLM scorer on this node
  * @param queryCache        What the query result cache has done, or null where this node
  *                          runs without one
+ * @param graph             The graph tenants, their budget, builds, erasure backlog and what
+ *                          ingestion stages into them, or null where this node builds no graph
  * @author ExcaliburDB
  */
 public record NodeStats(
@@ -54,8 +56,40 @@ public record NodeStats(
     boolean indexerRunning,
     String embeddingBreaker,
     String llmRelevancyBreaker,
-    com.eonmux.excalibur.query.cache.QueryCacheStats queryCache
+    com.eonmux.excalibur.query.cache.QueryCacheStats queryCache,
+    GraphStats graph
 ) {
+
+    /**
+     * A snapshot of a node that serves no graph of its own.
+     *
+     * <p>Absent is what such a node reports, for the reason every optional block here is
+     * absent rather than zero: a node with no tenants and a node whose tenants are all idle
+     * would otherwise read the same.</p>
+     *
+     * @param segments            Segment counts by lifecycle state
+     * @param entries             How much the corpus holds
+     * @param volumes             Disk, as the volume manager or the catalog sees it
+     * @param hnsw                The vector integration queue
+     * @param cuckoo              The membership filters
+     * @param visibility          The epoch and what is visible in it
+     * @param coverage            Share of live segments a query reads, in [0, 1]
+     * @param lexical             The chunk lexical index, or null where this node keeps none
+     * @param vectorIndex         Segments serving without a vector index, or null if unreadable
+     * @param indexerRunning      Whether the worker that drains the HNSW queue is alive
+     * @param embeddingBreaker    The embedding breaker's state, or null where there is none
+     * @param llmRelevancyBreaker The relevancy breaker's state, or null where there is none
+     * @param queryCache          What the query cache has done, or null where there is none
+     */
+    public NodeStats(SegmentStats segments, EntryStats entries, VolumeStats volumes,
+                     HnswStats hnsw, CuckooStats cuckoo, VisibilityStats visibility,
+                     double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
+                     boolean indexerRunning, String embeddingBreaker,
+                     String llmRelevancyBreaker,
+                     com.eonmux.excalibur.query.cache.QueryCacheStats queryCache) {
+        this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
+            vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, queryCache, null);
+    }
 
     /**
      * A snapshot of a node that runs no query result cache.
@@ -83,7 +117,7 @@ public record NodeStats(
                      boolean indexerRunning, String embeddingBreaker,
                      String llmRelevancyBreaker) {
         this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
-            vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, null);
+            vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, null, null);
     }
 
     /**
@@ -110,7 +144,7 @@ public record NodeStats(
                      double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
                      boolean indexerRunning, String embeddingBreaker) {
         this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
-            vectorIndex, indexerRunning, embeddingBreaker, null, null);
+            vectorIndex, indexerRunning, embeddingBreaker, null, null, null);
     }
 
     /**

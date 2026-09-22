@@ -29,8 +29,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Deletion propagation through the levels of a {@link HierarchicalCuckooFilter}.
  *
- * <p>A hierarchical filter answers a membership question at three granularities —
- * corpus, cluster and segment — and a delete that only reaches some of them is worse
+ * <p>A hierarchical filter answers a membership question at two granularities —
+ * corpus and segment — and a delete that only reaches some of them is worse
  * than no delete at all: the coarse level keeps routing lookups to a segment that no
  * longer holds the key, so the work is done and the answer is still no. These tests
  * check each level independently rather than trusting the top-level {@code contains},
@@ -38,7 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * be queried first.</p>
  *
  * <p>Covers propagation on delete and on bulk segment removal, the absence of false
- * positives at corpus, cluster and segment level, that {@code findCandidateSegments}
+ * positives at corpus and segment level, that {@code findCandidateSegments}
  * returns nothing for a deleted key, a full end-to-end propagation sweep, and that the
  * same guarantees hold when the deletions run concurrently.</p>
  */
@@ -59,8 +59,8 @@ class HierarchicalDeletionPropagationIntegrationTest {
          * Test: Deletion propagates through hierarchy levels.
          *
          * <p>Domain correctness: When a key is deleted from a segment, it must
-         * be removed from all levels of the hierarchical Cuckoo filter (corpus →
-         * topic cluster → segment).</p>
+         * be removed from both levels of the hierarchical Cuckoo filter (corpus →
+         * segment).</p>
          */
         @Test
         @DisplayName("deletion propagates through hierarchy")
@@ -69,14 +69,14 @@ class HierarchicalDeletionPropagationIntegrationTest {
             HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(10000);
 
             // Register segments
-            hcf.registerSegment("segment-0", "cluster-A");
-            hcf.registerSegment("segment-1", "cluster-B");
+            hcf.registerSegment("segment-0");
+            hcf.registerSegment("segment-1");
 
             // Insert keys at different segments
             String key1 = "key-in-segment-0";
             String key2 = "key-in-segment-1";
 
-            // Insert at segment level (propagates to cluster and corpus)
+            // Insert at segment level (propagates to corpus)
             assertThat(hcf.insert(key1.getBytes(StandardCharsets.UTF_8), "segment-0")).isTrue();
             assertThat(hcf.insert(key2.getBytes(StandardCharsets.UTF_8), "segment-1")).isTrue();
 
@@ -111,7 +111,7 @@ class HierarchicalDeletionPropagationIntegrationTest {
             HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(50000);
 
             // Register segment
-            hcf.registerSegment("bulk-segment", "bulk-cluster");
+            hcf.registerSegment("bulk-segment");
 
             // Insert many keys at segment level
             Set<String> segmentKeys = new HashSet<>();
@@ -122,7 +122,7 @@ class HierarchicalDeletionPropagationIntegrationTest {
             }
 
             // Register another segment with different keys
-            hcf.registerSegment("other-segment", "bulk-cluster");
+            hcf.registerSegment("other-segment");
             for (int i = 0; i < 100; i++) {
                 String key = "other-segment-key-" + i;
                 hcf.insert(key.getBytes(StandardCharsets.UTF_8), "other-segment");
@@ -166,7 +166,6 @@ class HierarchicalDeletionPropagationIntegrationTest {
          * <p>Domain correctness criteria:</p>
          * <ul>
          *   <li>After deleteFromHierarchy(), mightContain() MUST return false (corpus level)</li>
-         *   <li>After deleteFromHierarchy(), cluster filter MUST NOT contain the key</li>
          *   <li>After deleteFromHierarchy(), segment filter MUST NOT contain the key</li>
          *   <li>findCandidateSegments() MUST NOT return segments containing deleted keys</li>
          * </ul>
@@ -177,10 +176,10 @@ class HierarchicalDeletionPropagationIntegrationTest {
             HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(50000);
 
             // Create multi-level hierarchy
-            hcf.registerSegment("seg-A1", "cluster-alpha");
-            hcf.registerSegment("seg-A2", "cluster-alpha");
-            hcf.registerSegment("seg-B1", "cluster-beta");
-            hcf.registerSegment("seg-B2", "cluster-beta");
+            hcf.registerSegment("seg-A1");
+            hcf.registerSegment("seg-A2");
+            hcf.registerSegment("seg-B1");
+            hcf.registerSegment("seg-B2");
 
             // Insert keys across all segments
             Set<String> allKeys = new HashSet<>();
@@ -251,68 +250,6 @@ class HierarchicalDeletionPropagationIntegrationTest {
         }
 
         /**
-         * Test: No false positives at cluster level after deletion.
-         */
-        @Test
-        @DisplayName("deleted keys return no false positives at cluster level")
-        void deletedKeysReturnNoFalsePositivesAtClusterLevel() {
-            HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(50000);
-
-            // Create hierarchy with two clusters
-            hcf.registerSegment("seg-A1", "cluster-alpha");
-            hcf.registerSegment("seg-A2", "cluster-alpha");
-
-            // Insert keys into cluster-alpha
-            Set<String> clusterAKeys = new HashSet<>();
-            for (int i = 0; i < 1000; i++) {
-                String key = "cluster-test-key-" + i;
-                if (hcf.insertKey(key, "seg-A1")) {
-                    clusterAKeys.add(key);
-                }
-            }
-
-            // Get cluster filter reference
-            CuckooFilter clusterFilter = hcf.getClusterFilter("cluster-alpha");
-            assertThat(clusterFilter).isNotNull();
-
-            // Verify all keys present in cluster filter before deletion
-            for (String key : clusterAKeys) {
-                assertThat(clusterFilter.contains(HierarchicalCuckooFilter.toBytes(key))).isTrue();
-            }
-
-            // Delete all keys
-            for (String key : clusterAKeys) {
-                hcf.deleteKey(key, "seg-A1");
-            }
-
-            int clusterFalsePositives = 0;
-            for (String key : clusterAKeys) {
-                if (clusterFilter.contains(HierarchicalCuckooFilter.toBytes(key))) {
-                    clusterFalsePositives++;
-                }
-            }
-
-            // The cluster level is shared, exactly as the corpus level is, and strands an entry
-            // for the same reason. Two keys whose fingerprints collide in the segment filter get
-            // one entry between them there and two here, because the levels hash independently.
-            // Deleting the first removes the shared segment entry; deleting the second finds
-            // nothing left to remove at segment level and stops before this one. The residue is
-            // bounded by how often those fingerprints collide, and it costs a candidate that
-            // turns out to hold nothing rather than a document that cannot be found.
-            assertThat(clusterFalsePositives)
-                .as("stale cluster entries after deleting everything are rare, and cost a wasted "
-                    + "candidate rather than a missing document")
-                .isLessThan(Math.max(1, clusterAKeys.size() / 100));
-
-            // Exact, and what queries depend on: no deleted key resolves to any segment.
-            for (String key : clusterAKeys) {
-                assertThat(hcf.findCandidateSegments(HierarchicalCuckooFilter.toBytes(key)))
-                    .as("deleted key %s resolves to no segment", key)
-                    .isEmpty();
-            }
-        }
-
-        /**
          * Test: No false positives at segment level after deletion.
          */
         @Test
@@ -320,7 +257,7 @@ class HierarchicalDeletionPropagationIntegrationTest {
         void deletedKeysReturnNoFalsePositivesAtSegmentLevel() {
             HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(50000);
 
-            hcf.registerSegment("seg-test", "cluster-test");
+            hcf.registerSegment("seg-test");
 
             // Insert keys
             Set<String> segmentKeys = new HashSet<>();
@@ -368,8 +305,8 @@ class HierarchicalDeletionPropagationIntegrationTest {
         void findCandidateSegmentsReturnsEmptyForDeletedKeys() {
             HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(50000);
 
-            hcf.registerSegment("seg-1", "cluster-A");
-            hcf.registerSegment("seg-2", "cluster-B");
+            hcf.registerSegment("seg-1");
+            hcf.registerSegment("seg-2");
 
             // Insert keys
             Set<String> keysToDelete = new HashSet<>();
@@ -416,12 +353,11 @@ class HierarchicalDeletionPropagationIntegrationTest {
         void completeHierarchyDeletionPropagationVerification() {
             HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(100000);
 
-            // Create 3-level hierarchy: corpus -> 3 clusters -> 9 segments
+            // Create the hierarchy: corpus -> 9 segments
             for (int c = 0; c < 3; c++) {
-                String clusterId = "cluster-" + c;
                 for (int s = 0; s < 3; s++) {
                     String segmentId = "seg-" + c + "-" + s;
-                    hcf.registerSegment(segmentId, clusterId);
+                    hcf.registerSegment(segmentId);
                 }
             }
 
@@ -439,19 +375,15 @@ class HierarchicalDeletionPropagationIntegrationTest {
                 }
             }
 
-            System.out.println("Inserted " + keyToSegment.size() + " keys across 3 clusters and 9 segments");
+            System.out.println("Inserted " + keyToSegment.size() + " keys across 9 segments");
 
             // Delete all keys and verify propagation
             int corpusFPs = 0;
-            int clusterFPs = 0;
             int segmentFPs = 0;
 
             for (Map.Entry<String, String> entry : keyToSegment.entrySet()) {
                 String key = entry.getKey();
                 String segmentId = entry.getValue();
-                String clusterId = segmentId.split("-")[0] + "-" + segmentId.split("-")[1];
-                // Extract cluster: seg-0-1 -> cluster-0
-                clusterId = "cluster-" + segmentId.charAt(4);
 
                 // Delete
                 hcf.deleteKey(key, segmentId);
@@ -459,11 +391,6 @@ class HierarchicalDeletionPropagationIntegrationTest {
                 // Check all levels
                 if (hcf.mightContainKey(key)) {
                     corpusFPs++;
-                }
-
-                CuckooFilter clusterFilter = hcf.getClusterFilter(clusterId);
-                if (clusterFilter != null && clusterFilter.contains(HierarchicalCuckooFilter.toBytes(key))) {
-                    clusterFPs++;
                 }
 
                 CuckooFilter segmentFilter = hcf.getSegmentFilter(segmentId);
@@ -478,9 +405,9 @@ class HierarchicalDeletionPropagationIntegrationTest {
                 .as("CRITICAL: Zero false positives at segment level after deletion propagation")
                 .isEqualTo(0);
 
-            // The cluster and corpus levels are not, and cannot be. They hold each item once
-            // however many segments contain it -- they have to, because findCandidateSegments
-            // gates on them, so an item missing there is invisible everywhere below. Removing
+            // The corpus level is not, and cannot be. It holds each item once however many
+            // segments contain it -- it has to, because findCandidateSegments gates on it, so
+            // an item missing there is invisible everywhere below. Removing
             // the shared entry therefore requires knowing that no other segment still holds the
             // item, and the only way to ask that is contains(), which is allowed to say yes
             // when the answer is no. When it does, the entry is kept.
@@ -494,9 +421,6 @@ class HierarchicalDeletionPropagationIntegrationTest {
                 .as("stale corpus entries are rare, and cost a wasted candidate rather than a "
                     + "missing document")
                 .isLessThan(keyToSegment.size() / 100);
-            assertThat(clusterFPs)
-                .as("stale cluster entries are rare for the same reason")
-                .isLessThan(keyToSegment.size() / 100);
 
             // What actually matters, and what is exact: no deleted key resolves to any segment.
             // findCandidateSegments confirms at the segment level, so a stale shared entry costs
@@ -508,7 +432,7 @@ class HierarchicalDeletionPropagationIntegrationTest {
             }
 
             System.out.println("Complete hierarchy verification - Corpus FPs: " + corpusFPs +
-                ", Cluster FPs: " + clusterFPs + ", Segment FPs: " + segmentFPs);
+                ", Segment FPs: " + segmentFPs);
         }
 
         /**
@@ -521,7 +445,7 @@ class HierarchicalDeletionPropagationIntegrationTest {
 
             // Create hierarchy
             for (int i = 0; i < 10; i++) {
-                hcf.registerSegment("concurrent-seg-" + i, "concurrent-cluster");
+                hcf.registerSegment("concurrent-seg-" + i);
             }
 
             // Insert keys

@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +41,9 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(StagingGraphIngestSink.class);
 
+    /** Milliseconds in a UTC day, which is the resolution a fact's dates are kept at. */
+    private static final long MILLIS_PER_DAY = 86_400_000L;
+
     private final GraphStagingStore staging;
     private final RelationExtractor extractor;
 
@@ -61,12 +65,12 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     }
 
     @Override
-    public void onDocumentPublished(String documentKey, String text) {
+    public void onDocumentPublished(String documentKey, String text, long lastModifiedMillis) {
         if (documentKey == null || documentKey.isBlank() || text == null || text.isBlank()) {
             return;
         }
         documentsSeen.incrementAndGet();
-        stageFacts(documentKey, text);
+        stageFacts(documentKey, text, lastModifiedMillis);
     }
 
     @Override
@@ -97,10 +101,11 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     /**
      * Extracts and stages the document's facts.
      *
-     * @param documentKey The document
-     * @param text        Its text
+     * @param documentKey        The document
+     * @param text               Its text
+     * @param lastModifiedMillis The document's own date, or 0 when unknown
      */
-    private void stageFacts(String documentKey, String text) {
+    private void stageFacts(String documentKey, String text, long lastModifiedMillis) {
         List<ExtractedTriple> triples;
         try {
             triples = extractor.extract(documentKey, text);
@@ -112,8 +117,31 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
         if (triples == null || triples.isEmpty()) {
             return;
         }
-        stage(triples);
+        stage(statedOn(triples, lastModifiedMillis));
         recordEntityText(triples, text);
+    }
+
+    /**
+     * Dates every fact the extractor left undated with the day its document was written.
+     *
+     * <p>An extractor reads text and cannot know the document's date; the source that fetched
+     * it can. A fact the extractor did date keeps its own. With no document date the facts stay
+     * undated, and the staging store records the day they were staged.
+     *
+     * @param triples            The extracted facts
+     * @param lastModifiedMillis The document's own date, or 0 when unknown
+     * @return The facts to stage
+     */
+    static List<ExtractedTriple> statedOn(List<ExtractedTriple> triples, long lastModifiedMillis) {
+        if (lastModifiedMillis <= 0) {
+            return triples;
+        }
+        int day = Math.toIntExact(Math.floorDiv(lastModifiedMillis, MILLIS_PER_DAY));
+        List<ExtractedTriple> dated = new ArrayList<>(triples.size());
+        for (ExtractedTriple triple : triples) {
+            dated.add(triple.isDated() ? triple : triple.withStatedOn(day));
+        }
+        return dated;
     }
 
     /**

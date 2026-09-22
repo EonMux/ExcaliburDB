@@ -182,6 +182,82 @@ class IngestionPipelineTest {
         }
     }
 
+    /**
+     * A chunk index that records what reached it and when it was refreshed.
+     *
+     * <p>{@code refreshedWith} holds, per refresh, how many documents had been added by then - so
+     * a test can tell a refresh during a run from the one at its end.</p>
+     */
+    private static class RecordingChunkIndex
+            implements com.eonmux.excalibur.ingest.lexical.ChunkIndex {
+
+        final List<Map<String, String>> documents = new CopyOnWriteArrayList<>();
+        final List<Integer> refreshedWith = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void add(String chunkId, String text) {
+            documents.add(Map.of(chunkId, text));
+        }
+
+        @Override
+        public void addDocument(Map<String, String> chunks) {
+            documents.add(Map.copyOf(chunks));
+        }
+
+        @Override
+        public void refresh() {
+            refreshedWith.add(documents.size());
+        }
+
+        @Override
+        public int erase(java.util.Set<String> chunkIds) {
+            return 0;
+        }
+
+        @Override
+        public String chunkIdOf(long id) {
+            return null;
+        }
+
+        @Override
+        public long indexedCount() {
+            return documents.size();
+        }
+
+        @Override
+        public com.eonmux.excalibur.retrieval.lexical.native_.CompactionResult compactIfDue(
+                java.util.function.Function<String, String> textOf) {
+            return com.eonmux.excalibur.retrieval.lexical.native_.CompactionResult
+                .declined("not due");
+        }
+
+        @Override
+        public com.eonmux.excalibur.retrieval.lexical.native_.CompactionResult compactNow(
+                java.util.function.Function<String, String> textOf) {
+            return compactIfDue(textOf);
+        }
+
+        @Override
+        public com.eonmux.excalibur.retrieval.rank.Ranker ranker(
+                com.eonmux.excalibur.retrieval.expand.QueryExpander expander) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public String engine() {
+            return "recording";
+        }
+
+        @Override
+        public com.eonmux.excalibur.ingest.lexical.ChunkIndexStats stats() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
     @TempDir
     Path tempDir;
 
@@ -943,6 +1019,201 @@ class IngestionPipelineTest {
                 .as("a node outlives the chunk it was built from unless it is retired too")
                 .containsExactly("docs:a.txt");
         }
+
+        @Test
+        @DisplayName("a rolled back document never reaches the lexical index")
+        void rollbackIndexesNothing() {
+            // Indexed as its chunks were written, a document another run's refresh published
+            // before it rolled back would be a lexical hit on a chunk no query can see.
+            RecordingChunkIndex lexical = new RecordingChunkIndex();
+            IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
+                embeddings, storage, index, registry, new RefusingTracker());
+            orchestrator.setLexicalIndex(lexical);
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "some text")));
+
+            assertThat(lexical.documents).isEmpty();
+        }
+    }
+
+    @Nested
+    @DisplayName("lexical visibility during a run")
+    class LexicalPacing {
+
+        @Test
+        @DisplayName("a document reaches the lexical index whole, once it is published")
+        void documentsArriveWhole() {
+            RecordingChunkIndex lexical = new RecordingChunkIndex();
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.setLexicalIndex(lexical);
+            String longText = "memory pressure caused the OOM killer to run. ".repeat(400);
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("long.txt", longText)));
+
+            assertThat(lexical.documents).hasSize(1);
+            assertThat(lexical.documents.get(0))
+                .as("precondition: the document is long enough to chunk more than once")
+                .hasSizeGreaterThan(1);
+        }
+
+        @Test
+        @DisplayName("a long run refreshes as it goes, not only when it ends")
+        void longRunsRefreshAsTheyGo() {
+            // A crawl can run for days, and a document it published at the start is stored and
+            // visible to every other signal. Refreshing only at the end kept it out of BM25 for
+            // all of that time - on a lexical-only node, out of search altogether.
+            RecordingChunkIndex lexical = new RecordingChunkIndex();
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.setLexicalIndex(lexical);
+            orchestrator.setLexicalRefreshIntervalMs(1);
+            FakeSource slow = new FakeSource("docs", Map.of(
+                "a.txt", "alpha", "b.txt", "beta", "c.txt", "gamma", "d.txt", "delta")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+
+            orchestrator.ingestNow(slow);
+
+            assertThat(lexical.refreshedWith)
+                .as("a refresh happened while documents were still to come")
+                .anyMatch(published -> published > 0 && published < 4);
+            assertThat(lexical.refreshedWith).last().isEqualTo(4);
+        }
+
+        @Test
+        @DisplayName("a run that fails partway still makes what it published searchable")
+        void failedRunsAreRefreshed() {
+            // A compaction that keeps throwing fails the run at its closing refresh. The
+            // documents already published are in storage; left unrefreshed, they would be
+            // missing from BM25 until some later run happened to refresh.
+            RecordingChunkIndex lexical = new RecordingChunkIndex() {
+                @Override
+                public com.eonmux.excalibur.retrieval.lexical.native_.CompactionResult compactIfDue(
+                        java.util.function.Function<String, String> textOf) {
+                    throw new IllegalStateException("compaction failed");
+                }
+            };
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.setLexicalIndex(lexical);
+            orchestrator.setLexicalRefreshIntervalMs(1);
+            FakeSource slow = new FakeSource("docs", Map.of("a.txt", "alpha", "b.txt", "beta")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+
+            assertThatThrownBy(() -> orchestrator.ingestNow(slow))
+                .isInstanceOf(IngestionOrchestrator.IngestionFailedException.class);
+
+            assertThat(lexical.documents).as("precondition: a document was published").isNotEmpty();
+            assertThat(lexical.refreshedWith).last().isEqualTo(lexical.documents.size());
+        }
+
+        @Test
+        @DisplayName("a paced refresh that fails is logged and the run goes on")
+        void aFailedPacedRefreshDoesNotStopTheRun() {
+            // The documents stay published and reach BM25 at the next refresh. Failing the run
+            // would abandon every document it had not reached for the sake of ones it had.
+            java.util.concurrent.atomic.AtomicBoolean failedOnce =
+                new java.util.concurrent.atomic.AtomicBoolean();
+            RecordingChunkIndex lexical = new RecordingChunkIndex() {
+                @Override
+                public com.eonmux.excalibur.retrieval.lexical.native_.CompactionResult compactIfDue(
+                        java.util.function.Function<String, String> textOf) {
+                    if (failedOnce.compareAndSet(false, true)) {
+                        throw new IllegalStateException("compaction failed");
+                    }
+                    return super.compactIfDue(textOf);
+                }
+            };
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.setLexicalIndex(lexical);
+            orchestrator.setLexicalRefreshIntervalMs(1);
+            FakeSource slow = new FakeSource("docs", Map.of("a.txt", "alpha", "b.txt", "beta")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+
+            IngestionOrchestrator.IngestionOutcome outcome = orchestrator.ingestNow(slow);
+
+            assertThat(failedOnce).as("precondition: a paced refresh failed").isTrue();
+            assertThat(outcome.stopped()).isFalse();
+            assertThat(lexical.documents).hasSize(2);
+            assertThat(lexical.refreshedWith).last().isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("an interrupt that arrives during a paced refresh still stops the run")
+        void anInterruptDuringAPacedRefreshStopsTheRun() {
+            java.util.concurrent.atomic.AtomicBoolean interruptedOnce =
+                new java.util.concurrent.atomic.AtomicBoolean();
+            RecordingChunkIndex lexical = new RecordingChunkIndex() {
+                @Override
+                public com.eonmux.excalibur.retrieval.lexical.native_.CompactionResult compactIfDue(
+                        java.util.function.Function<String, String> textOf) {
+                    if (interruptedOnce.compareAndSet(false, true)) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return super.compactIfDue(textOf);
+                }
+            };
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.setLexicalIndex(lexical);
+            orchestrator.setLexicalRefreshIntervalMs(1);
+            FakeSource slow = new FakeSource("docs",
+                    Map.of("a.txt", "alpha", "b.txt", "beta", "c.txt", "gamma")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return super.fetch(documentId);
+                }
+            };
+
+            try {
+                IngestionOrchestrator.IngestionOutcome outcome = orchestrator.ingestNow(slow);
+
+                assertThat(interruptedOnce).as("precondition: a paced refresh ran").isTrue();
+                assertThat(outcome.stopped()).isTrue();
+                assertThat(lexical.documents).hasSizeLessThan(3);
+            } finally {
+                Thread.interrupted();
+            }
+        }
+
+        @Test
+        @DisplayName("the refresh interval must be positive")
+        void intervalMustBePositive() {
+            assertThatThrownBy(() -> orchestrator().setLexicalRefreshIntervalMs(0))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
     }
 
     @Nested
@@ -1085,6 +1356,35 @@ class IngestionPipelineTest {
             assertThat(storedChunkExists("gated", "doc49", 0))
                 .as("the documents after the stop must not have been written")
                 .isFalse();
+        }
+
+        @Test
+        @DisplayName("what a stopped run published is made lexically searchable")
+        void stoppedRunIsRefreshed() throws Exception {
+            // Stopping abandons the documents a run had not reached, not the ones it finished:
+            // those are published in storage, and left unrefreshed they would be absent from BM25
+            // until some other run happened to refresh the index.
+            RecordingChunkIndex lexical = new RecordingChunkIndex();
+            IngestionOrchestrator orchestrator = orchestrator();
+            orchestrator.setLexicalIndex(lexical);
+            GatedSource source = new GatedSource(50);
+
+            orchestrator.startIngestion(source);
+            source.gate.release();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (lexical.documents.isEmpty() && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertThat(lexical.documents).as("precondition: the first document was published")
+                .isNotEmpty();
+            assertThat(orchestrator.stopIngestion("gated")).isTrue();
+            source.gate.release(49);
+            awaitIdle(orchestrator, "gated");
+
+            assertThat(lexical.refreshedWith)
+                .as("the stopped run refreshed after the documents it published")
+                .isNotEmpty()
+                .last().isEqualTo(lexical.documents.size());
         }
 
         @Test

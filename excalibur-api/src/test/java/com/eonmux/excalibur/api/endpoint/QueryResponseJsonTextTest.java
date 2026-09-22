@@ -43,6 +43,20 @@ class QueryResponseJsonTextTest {
         return new QueryAnswer(null, ResultPage.of(0, 10, 1), ResultTotal.of(1, 10, true), null);
     }
 
+    /** Renders one fused result over a vector answer. */
+    private static String hybrid(QueryResponse vector, HybridFusion.Result result,
+                                 QueryAnswer answer) {
+        return QueryResponseJson.hybrid(
+            HybridResponse.unscored(vector, List.of(), List.of(result), 10), List.of(result),
+            answer);
+    }
+
+    /** Renders one BM25 hit. */
+    private static String lexical(LexicalQueryService.Hit hit, QueryAnswer answer) {
+        return QueryResponseJson.lexical(new LexicalResponse("q", List.of(hit), true, COVERAGE,
+            false, false, false, false, 1L, false), List.of(hit), answer);
+    }
+
     private static QueryResponse response() {
         return new QueryResponse(
             List.of(new QueryResultItem("a", 0.9f, null, 3L, 7L)), COVERAGE, 1L, false, false);
@@ -60,8 +74,8 @@ class QueryResponseJsonTextTest {
     @Test
     @DisplayName("the fused renderer carries text, after the signals that produced the result")
     void hybridCarriesText() {
-        String json = QueryResponseJson.hybrid(response(),
-            List.of(new HybridFusion.Result("b", 0.03, 3L, List.of("vector", "lexical"))),
+        String json = hybrid(response(),
+            new HybridFusion.Result("b", 0.03, 3L, List.of("vector", "lexical")),
             withText(CORPUS));
 
         assertThat(json).contains("\"text\": \"beta\"");
@@ -73,8 +87,7 @@ class QueryResponseJsonTextTest {
     @Test
     @DisplayName("the lexical renderer carries text")
     void lexicalCarriesText() {
-        assertThat(QueryResponseJson.lexical("q", List.of(new LexicalQueryService.Hit("a", 1.5)),
-                COVERAGE, List.of(), false, false, 1L, withText(CORPUS)))
+        assertThat(lexical(new LexicalQueryService.Hit("a", 1.5), withText(CORPUS)))
             .contains("\"text\": \"alpha\"");
     }
 
@@ -86,12 +99,11 @@ class QueryResponseJsonTextTest {
 
         assertThat(QueryResponseJson.vector(missing, missing.results(), withText(CORPUS)))
             .contains("\"text\": null");
-        assertThat(QueryResponseJson.hybrid(missing,
-            List.of(new HybridFusion.Result("gone", 0.03, null, List.of("lexical"))),
+        assertThat(hybrid(missing, new HybridFusion.Result("gone", 0.03, null, List.of("lexical")),
             withText(CORPUS)))
             .contains("\"text\": null");
-        assertThat(QueryResponseJson.lexical("q", List.of(new LexicalQueryService.Hit("gone", 1.5)),
-            COVERAGE, List.of(), false, false, 1L, withText(CORPUS))).contains("\"text\": null");
+        assertThat(lexical(new LexicalQueryService.Hit("gone", 1.5), withText(CORPUS)))
+            .contains("\"text\": null");
     }
 
     @Test
@@ -100,11 +112,11 @@ class QueryResponseJsonTextTest {
         QueryResponse response = response();
         assertThat(QueryResponseJson.vector(response, response.results(), withoutText()))
             .doesNotContain("\"text\"");
-        assertThat(QueryResponseJson.hybrid(response,
-            List.of(new HybridFusion.Result("a", 0.03, 3L, List.of("vector"))), withoutText()))
+        assertThat(hybrid(response, new HybridFusion.Result("a", 0.03, 3L, List.of("vector")),
+                withoutText()))
             .doesNotContain("\"text\"");
-        assertThat(QueryResponseJson.lexical("q", List.of(new LexicalQueryService.Hit("a", 1.5)),
-            COVERAGE, List.of(), false, false, 1L, withoutText())).doesNotContain("\"text\"");
+        assertThat(lexical(new LexicalQueryService.Hit("a", 1.5), withoutText()))
+            .doesNotContain("\"text\"");
     }
 
     /**
@@ -134,11 +146,10 @@ class QueryResponseJsonTextTest {
 
         assertThat(QueryResponseJson.vector(response, response.results(), withoutText()))
             .contains("\"page\": {").contains("\"result_total\": {");
-        assertThat(QueryResponseJson.hybrid(response,
-            List.of(new HybridFusion.Result("a", 0.03, 3L, List.of("vector"))), withoutText()))
+        assertThat(hybrid(response, new HybridFusion.Result("a", 0.03, 3L, List.of("vector")),
+                withoutText()))
             .contains("\"page\": {").contains("\"result_total\": {");
-        assertThat(QueryResponseJson.lexical("q", List.of(new LexicalQueryService.Hit("a", 1.5)),
-            COVERAGE, List.of(), false, false, 1L, withoutText()))
+        assertThat(lexical(new LexicalQueryService.Hit("a", 1.5), withoutText()))
             .contains("\"page\": {").contains("\"result_total\": {");
     }
 }

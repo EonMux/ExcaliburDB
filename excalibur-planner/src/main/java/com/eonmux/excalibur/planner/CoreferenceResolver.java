@@ -64,38 +64,112 @@ public final class CoreferenceResolver {
         return Set.copyOf(all);
     }
 
-    /** Whether {@code word} is a pronoun needing an antecedent. */
+    /**
+     * Whether {@code word} is spelled like a pronoun this resolver binds.
+     *
+     * <p>Spelling only. Whether a particular occurrence refers to anything depends on the words
+     * around it - "that" in "the company that Ada founded" does not - which is what
+     * {@link #resolve} decides.
+     */
     public static boolean isPronoun(String word) {
         return word != null && pronouns().contains(word.toLowerCase(Locale.ROOT));
     }
 
     /**
-     * Resolves every pronoun in {@code text} against {@code context}.
+     * Resolves every referring pronoun in {@code text} against {@code context}.
      *
      * @return the mentions the pronouns bound to, or an {@link PlanningOutcome.AskUser} describing
      *         the first one that could not be bound
      */
     public Resolution resolve(String text, ConversationContext context) {
+        return resolve(text, context, List.of());
+    }
+
+    /**
+     * Resolves every referring pronoun in {@code text}, against the question's own names first.
+     *
+     * <h2>Only pronouns that refer</h2>
+     * A word spelled like a pronoun is often doing another job - a relative "that", a complement
+     * "that", the placeholder "it" of "is it true that" - and asking the user what such a word
+     * refers to is asking a question with no answer. {@link PronounUses} decides which occurrences
+     * point at something, and only those are bound.
+     *
+     * <h2>The question is the most recent turn</h2>
+     * "What did Ada publish in her lifetime" names its own antecedent. Binding "her" through the
+     * conversation instead would ask about - or, with one candidate there, silently bind to -
+     * someone the question had already moved on from. So a name the question gives before the
+     * pronoun is its antecedent, under the same most-recent-turn rule {@link #bind} applies to the
+     * conversation: one such name binds, several are ambiguous and asked about. Demonstratives are
+     * the exception, as everywhere here: "that" rarely points back at a name in its own sentence,
+     * so they bind through the conversation only.
+     *
+     * @param text            the question
+     * @param context         the conversation it is asked in
+     * @param namedInQuestion the entity mentions the question itself names, as planning read them
+     * @return the mentions the pronouns bound to, or the first one that could not be bound
+     */
+    public Resolution resolve(String text, ConversationContext context,
+                              List<String> namedInQuestion) {
         if (text == null) {
             throw new IllegalArgumentException("text must not be null");
         }
         if (context == null) {
             throw new IllegalArgumentException("context must not be null");
         }
+        if (namedInQuestion == null) {
+            throw new IllegalArgumentException("namedInQuestion must not be null");
+        }
 
         List<String> bound = new ArrayList<>();
-        for (String word : text.split("[^A-Za-z']+")) {
-            String lower = word.toLowerCase(Locale.ROOT);
-            if (!isPronoun(lower)) {
+        List<PronounUses.Token> tokens = PronounUses.tokenize(text);
+        for (int i = 0; i < tokens.size(); i++) {
+            PronounUses.Token token = tokens.get(i);
+            if (!token.is(PronounUses.Kind.WORD) || !isPronoun(token.text())
+                    || !PronounUses.refers(tokens, i)) {
                 continue;
             }
-            Binding binding = bind(lower, context);
+            String pronoun = token.lower();
+            Binding binding = DEMONSTRATIVES.contains(pronoun)
+                ? bind(pronoun, context)
+                : bindWithin(pronoun, text, token.offset(), namedInQuestion, context);
             if (binding.ask != null) {
                 return new Resolution(List.of(), binding.ask);
             }
             bound.add(binding.mention.text());
         }
         return new Resolution(List.copyOf(bound), null);
+    }
+
+    /**
+     * Binds to a name the question gave before the pronoun, or through the conversation if none.
+     *
+     * @param pronoun         the pronoun, lower-cased
+     * @param text            the question
+     * @param offset          where the pronoun starts in it
+     * @param namedInQuestion the names the question gives
+     * @param context         the conversation, for a pronoun the question does not bind
+     */
+    private Binding bindWithin(String pronoun, String text, int offset,
+                               List<String> namedInQuestion, ConversationContext context) {
+        List<String> preceding = new ArrayList<>();
+        for (String name : namedInQuestion) {
+            int at = text.indexOf(name);
+            if (at >= 0 && at < offset) {
+                preceding.add(name);
+            }
+        }
+        if (preceding.isEmpty()) {
+            return bind(pronoun, context);
+        }
+        if (preceding.size() > 1) {
+            return Binding.ask(new PlanningOutcome.AskUser(
+                PlanningOutcome.Reason.AMBIGUOUS_PRONOUN,
+                "Does \"" + pronoun + "\" refer to " + String.join(" or ", preceding) + "?",
+                List.of(pronoun), preceding));
+        }
+        // Shape unknown: planning reads a name, not its grammar, and refusing the binding would
+        // ask about something the question has just said.
+        return Binding.bound(new Mention(preceding.get(0), Grammar.UNKNOWN, context.currentTurn()));
     }
 
     private Binding bind(String pronoun, ConversationContext context) {

@@ -31,6 +31,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("Graph build service")
 class GraphBuildServiceTest {
 
+    /** The pipeline being served, for identity checks; the reading is released at once. */
+    private static java.util.Optional<com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline>
+            served(GraphRagHolder holder) {
+        java.util.Optional<GraphRagHolder.Reading> reading = holder.acquire();
+        reading.ifPresent(GraphRagHolder.Reading::close);
+        return reading.map(GraphRagHolder.Reading::pipeline);
+    }
+
     private static Config configFor(Path graphDirectory) {
         return new Config(new java.util.HashMap<>(Map.of(
             "excalibur.graph.path", graphDirectory.toString(),
@@ -62,7 +70,7 @@ class GraphBuildServiceTest {
             GraphBuildService service = new GraphBuildService(staging, holder, config, List.of());
 
             assertThat(holder.isPresent()).isFalse();
-            assertThat(holder.pipeline()).isEmpty();
+            assertThat(served(holder)).isEmpty();
 
             GraphBuildService.BuildOutcome outcome = service.build();
 
@@ -100,7 +108,7 @@ class GraphBuildServiceTest {
 
             // The node is now answering from a graph it built itself, with no restart.
             assertThat(holder.isPresent()).isTrue();
-            assertThat(holder.pipeline()).isPresent();
+            assertThat(served(holder)).isPresent();
         }
     }
 
@@ -118,7 +126,7 @@ class GraphBuildServiceTest {
 
             sink.onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
             service.build();
-            Object first = holder.pipeline().orElseThrow();
+            Object first = served(holder).orElseThrow();
 
             staging.append(ExtractedTriple.alwaysValid(
                 "Ada Lovelace", "wrote", "Note G", from(2)));
@@ -126,7 +134,7 @@ class GraphBuildServiceTest {
 
             assertThat(second.edges()).isEqualTo(3);
             // A new stack, not the old one still mapping a directory the rebuild replaced.
-            assertThat(holder.pipeline().orElseThrow()).isNotSameAs(first);
+            assertThat(served(holder).orElseThrow()).isNotSameAs(first);
         }
     }
 
@@ -167,6 +175,133 @@ class GraphBuildServiceTest {
         // wholesale, and the record the next build reads has to survive that.
         try (GraphStagingStore reopened = GraphStagingStore.open(stagingDirectory)) {
             assertThat(reopened.stagedCount()).isEqualTo(2);
+        }
+    }
+
+    @org.junit.jupiter.api.Nested
+    @DisplayName("Serving while the graph is replaced")
+    class ServingWhileReplaced {
+
+        private static final String QUESTION = "Who did Ada Lovelace work with?";
+
+        /** A holder serving a graph built from the fixed facts. */
+        private GraphBuildService built(Path tempDir, GraphStagingStore staging,
+                                        GraphRagHolder holder) throws IOException {
+            GraphBuildService service = new GraphBuildService(
+                staging, holder, configFor(holder.directory()), List.of());
+            new StagingGraphIngestSink(staging, fixedFacts())
+                .onDocumentPublished("docs:ada", "Ada Lovelace and Charles Babbage.");
+            assertThat(service.build().published()).isTrue();
+            return service;
+        }
+
+        @Test
+        @DisplayName("a query holding the graph finishes against it after a rebuild")
+        void aReaderOutlivesARebuild(@TempDir Path tempDir) throws IOException {
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+                 GraphRagHolder holder = new GraphRagHolder(tempDir.resolve("graph"), null)) {
+                GraphBuildService service = built(tempDir, staging, holder);
+
+                try (GraphRagHolder.Reading reading = holder.acquire().orElseThrow()) {
+                    staging.append(ExtractedTriple.alwaysValid(
+                        "Ada Lovelace", "wrote", "Note G", from(2)));
+                    assertThat(service.build().published()).isTrue();
+
+                    // The replaced stack is still open for the reader that took it: before, the
+                    // build closed it here and this query failed on a closed Lucene reader.
+                    assertThat(reading.pipeline().answer(QUESTION).hasAnswer()).isTrue();
+                    assertThat(served(holder).orElseThrow())
+                        .as("new queries are answered by the rebuilt graph")
+                        .isNotSameAs(reading.pipeline());
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("a build never leaves a moment in which no graph is served")
+        void aBuildHasNoGap(@TempDir Path tempDir) throws Exception {
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+                 GraphRagHolder holder = new GraphRagHolder(tempDir.resolve("graph"), null)) {
+                GraphBuildService service = built(tempDir, staging, holder);
+
+                java.util.concurrent.atomic.AtomicBoolean building =
+                    new java.util.concurrent.atomic.AtomicBoolean(true);
+                java.util.concurrent.atomic.AtomicInteger absent =
+                    new java.util.concurrent.atomic.AtomicInteger();
+                Thread watcher = Thread.ofPlatform().start(() -> {
+                    while (building.get()) {
+                        if (!holder.isPresent()) {
+                            absent.incrementAndGet();
+                        }
+                    }
+                });
+                try {
+                    for (int i = 0; i < 3; i++) {
+                        staging.append(ExtractedTriple.alwaysValid(
+                            "Ada Lovelace", "wrote", "Note " + i, from(10 + i)));
+                        service.build();
+                    }
+                } finally {
+                    building.set(false);
+                    watcher.join();
+                }
+
+                assertThat(absent.get()).isZero();
+            }
+        }
+
+        @Test
+        @DisplayName("a withdrawal waits for the queries reading the graph")
+        void withdrawalWaitsForReaders(@TempDir Path tempDir) throws Exception {
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+                 GraphRagHolder holder = new GraphRagHolder(tempDir.resolve("graph"), null)) {
+                built(tempDir, staging, holder);
+                GraphRagHolder.Reading reading = holder.acquire().orElseThrow();
+
+                java.util.concurrent.CompletableFuture<Boolean> withdrawn =
+                    java.util.concurrent.CompletableFuture.supplyAsync(holder::withdraw);
+
+                // Withdrawn at once for new queries, and held open for this one.
+                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+                while (holder.isPresent() && System.nanoTime() < deadline) {
+                    Thread.onSpinWait();
+                }
+                assertThat(holder.isPresent()).isFalse();
+                assertThat(holder.acquire()).isEmpty();
+                assertThat(reading.pipeline().answer(QUESTION).hasAnswer()).isTrue();
+                assertThat(withdrawn).isNotDone();
+
+                reading.close();
+                assertThat(withdrawn.get(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("a build waits for a compaction that holds the directory")
+        void buildsAndCompactionsDoNotOverlap(@TempDir Path tempDir) throws Exception {
+            try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"));
+                 GraphRagHolder holder = new GraphRagHolder(tempDir.resolve("graph"), null)) {
+                GraphBuildService service = built(tempDir, staging, holder);
+
+                // What GraphErasureService.compact holds for the length of a compaction.
+                holder.replacementLock().lock();
+                java.util.concurrent.CompletableFuture<GraphBuildService.BuildOutcome> build;
+                try {
+                    build = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                        try {
+                            return service.build();
+                        } catch (IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    });
+                    Thread.sleep(200);
+                    assertThat(build).as("the build is blocked behind the compaction").isNotDone();
+                } finally {
+                    holder.replacementLock().unlock();
+                }
+                assertThat(build.get(30, java.util.concurrent.TimeUnit.SECONDS).published())
+                    .isTrue();
+            }
         }
     }
 }

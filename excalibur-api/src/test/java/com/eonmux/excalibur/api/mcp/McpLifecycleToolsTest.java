@@ -145,6 +145,24 @@ class McpLifecycleToolsTest {
     }
 
     @Test
+    @DisplayName("an empty exclusion list is sent, because it clears the node's defaults")
+    void emptyExclusionsAreSent() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            new McpTools(node.client(Map.of())).call(McpTools.CRAWL_WEBSITE, Map.of(
+                "source_id", "docs-site",
+                "base_url", "https://example.com/docs",
+                "excluded_path_patterns", List.of()));
+
+            Map<String, Object> config =
+                Json.objectAt(Json.parse(node.onlyRequest().body()), "config");
+            assertThat(config).containsEntry("excluded_path_patterns", List.of());
+            assertThat(config)
+                .as("a setting the model did not send stays absent")
+                .doesNotContainKey("included_path_patterns");
+        }
+    }
+
+    @Test
     @DisplayName("crawl_website carries no setting a filesystem walk owns")
     void crawlSendsNoFilesystemSettings() {
         Map<String, Object> properties = Json.objectAt(

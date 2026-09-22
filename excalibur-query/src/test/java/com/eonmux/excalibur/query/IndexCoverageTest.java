@@ -514,4 +514,40 @@ class IndexCoverageTest {
                 .hasMessageContaining("negative");
         }
     }
+
+    @Nested
+    @DisplayName("orDegraded")
+    class OrDegraded {
+
+        private final IndexCoverage whole = IndexCoverage.builder()
+            .totalSegments(4).activeSegments(3).indexingSegments(1).segmentsSearched(3)
+            .segmentsExcluded(1).tailScanEntries(12).estimatedCorpusCoverage(0.75)
+            .degraded(false).build();
+
+        @Test
+        @DisplayName("marks the answer degraded and keeps every count the search reported")
+        void keepsTheCounts() {
+            IndexCoverage marked = whole.orDegraded(true);
+
+            assertThat(marked.degraded()).isTrue();
+            assertThat(marked.totalSegments()).isEqualTo(4);
+            assertThat(marked.activeSegments()).isEqualTo(3);
+            assertThat(marked.indexingSegments()).isEqualTo(1);
+            assertThat(marked.segmentsSearched()).isEqualTo(3);
+            assertThat(marked.segmentsExcluded()).isEqualTo(1);
+            assertThat(marked.tailScanEntries()).isEqualTo(12);
+            assertThat(marked.estimatedCorpusCoverage()).isEqualTo(0.75);
+        }
+
+        @Test
+        @DisplayName("returns the same coverage when there is no further reason, or it is "
+            + "already degraded")
+        void noChangeIsNoCopy() {
+            IndexCoverage degraded = whole.orDegraded(true);
+
+            assertThat(whole.orDegraded(false)).isSameAs(whole);
+            assertThat(degraded.orDegraded(true)).isSameAs(degraded);
+            assertThat(degraded.orDegraded(false)).isSameAs(degraded);
+        }
+    }
 }

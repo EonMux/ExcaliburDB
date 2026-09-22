@@ -120,7 +120,14 @@ public class IngestCancelEndpoint implements HttpHandler {
             return null;
         }
 
-        String sourceId = JsonText.string(body, "source_id");
+        String sourceId;
+        try {
+            sourceId = JsonText.string(body, "source_id");
+        } catch (IllegalArgumentException e) {
+            ResponseBody.sendJson(exchange, 400,
+                "{\"error\": \"" + JsonText.escape(e.getMessage()) + "\"}");
+            return null;
+        }
         if (sourceId == null || sourceId.isBlank()) {
             ResponseBody.sendJson(exchange, 400, "{\"error\": \"'source_id' is required\"}");
             return null;

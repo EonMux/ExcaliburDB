@@ -28,14 +28,33 @@ public interface GraphIngestSink {
      * counted, so a failure here cannot be signalled by failing the document - it would report
      * a document lost that is in fact fully searchable. An implementation logs and returns.</p>
      *
+     * <p>The document's own date is what its facts are recorded as stated on: a filesystem
+     * source's modification time, an HTTP source's {@code Last-Modified}. It is what orders two
+     * documents' conflicting values of a single-valued relation, so a re-crawl that finds a
+     * page changed supersedes what the page used to say, and a batch ingested on one day is
+     * ordered by when its documents were written rather than by the order it was crawled in.</p>
+     *
+     * @param documentKey        The source-qualified document key
+     * @param text               The document's text
+     * @param lastModifiedMillis When the document was last modified, in epoch milliseconds, or
+     *                           0 when its source does not say; its facts are then recorded as
+     *                           stated on the day they are staged
+     */
+    void onDocumentPublished(String documentKey, String text, long lastModifiedMillis);
+
+    /**
+     * Records a published document whose date is unknown.
+     *
      * @param documentKey The source-qualified document key
      * @param text        The document's text
      */
-    void onDocumentPublished(String documentKey, String text);
+    default void onDocumentPublished(String documentKey, String text) {
+        onDocumentPublished(documentKey, text, 0L);
+    }
 
     /** A sink for a deployment that indexes text and does not build a graph. */
     static GraphIngestSink none() {
-        return (documentKey, text) -> { };
+        return (documentKey, text, lastModifiedMillis) -> { };
     }
 
     /**

@@ -20,11 +20,17 @@ import java.util.List;
  * only on some answers is a field nobody reads.</p>
  *
  * <h2>What {@code score} means</h2>
- * <p>Its scale follows {@code retrieval}, because there is no scale all three share. On
- * {@code "vector"} it is the similarity the index reported, on {@code "lexical"} the BM25 score,
- * and on {@code "hybrid"} a sum of reciprocal ranks - a small number near zero that orders results
- * and means nothing in absolute terms. A threshold tuned against cosine scores does not transfer
- * to a fused one, which is why the field that says so is not optional.</p>
+ * <p>Its scale follows {@code retrieval} and {@code llm_scored}, because there is no scale every
+ * answer shares. On {@code "vector"} it is the similarity the index reported. On
+ * {@code "lexical"} and {@code "hybrid"} it is a sum of reciprocal ranks - the lexical index
+ * fuses its own signals by rank too - a small number near zero that orders results and means
+ * nothing in absolute terms. A threshold tuned against cosine scores does not transfer to either,
+ * which is why the field that says so is not optional.</p>
+ *
+ * <p>{@code llm_scored} true replaces all three: a relevancy model read each candidate against
+ * the question, and a result it judged carries that judgement, in {@code [0, 1]}, as its score.
+ * A result it could not judge keeps its retrieval score and is ordered among the others by it.
+ * The flag is on every answer, false included, for the same reason {@code retrieval} is.</p>
  *
  * <h2>How much there is, and how to get the rest</h2>
  * <p>{@code page} and {@code result_total} are on every answer, including the empty one a
@@ -39,6 +45,10 @@ import java.util.List;
  * results of one answer and not others cannot be read without checking for it each time, so the
  * request decides whether it is there and nothing else does. A request that also asked for a
  * snippet gets {@code text_offset} and {@code highlights} beside it, on the same terms.</p>
+ *
+ * <h2>What the answer did not act on</h2>
+ * <p>{@code ignored_fields} is on every answer, empty list included; which fields belong in it
+ * is decided by {@link IgnoredFields}, and only rendered here.</p>
  *
  * <h2>Why a result was returned</h2>
  * <p>{@code explain} on a result, and {@code query_expansion} on the answer, both only when
@@ -89,8 +99,9 @@ public final class QueryResponseJson {
             sb.append("}");
         }
         sb.append("], ");
-        sb.append("\"retrieval\": \"").append(VECTOR).append("\", ");
+        appendRetrieval(sb, VECTOR, response.llmScored());
         appendCoverage(sb, response.coverage());
+        appendIgnoredFields(sb, answer.ignored());
         appendAnswer(sb, answer);
         appendTail(sb, response.timedOut(), response.cancelled(), response.queryTimeMs(),
             response.fromCache());
@@ -100,19 +111,22 @@ public final class QueryResponseJson {
     /**
      * Renders an answer both signals contributed to.
      *
-     * <p>Coverage is the vector pipeline's, unchanged: it measures how much of the segment
-     * catalog the query reached, which is a question about the vector index and is not made
-     * truer or falser by a second signal having also run.</p>
+     * <p>Coverage is the vector pipeline's: it measures how much of the segment catalog the
+     * query reached, which is a question about the vector index and is not made truer or falser
+     * by a second signal having also run. The one thing added to it is relevancy scoring after
+     * fusion - a scorer that was planned and did not finish degrades the answer it was meant to
+     * order.</p>
      *
-     * @param response What the query pipeline produced, for its coverage and timings
+     * @param response What the fused search produced, for its coverage and timings
      * @param fused    The fused ranking, best first, sliced to the page being returned
      * @param answer   What this response says beyond the ranking
      * @return The response body
      */
-    public static String hybrid(QueryResponse response, List<HybridFusion.Result> fused,
+    public static String hybrid(HybridResponse response, List<HybridFusion.Result> fused,
                                 QueryAnswer answer) {
+        QueryResponse vector = response.vector();
         StringBuilder sb = new StringBuilder(256);
-        appendQueryId(sb, response.queryId());
+        appendQueryId(sb, vector.queryId());
 
         sb.append("\"results\": [");
         for (int i = 0; i < fused.size(); i++) {
@@ -122,11 +136,12 @@ public final class QueryResponseJson {
             appendFused(sb, fused.get(i), answer, i);
         }
         sb.append("], ");
-        sb.append("\"retrieval\": \"").append(HYBRID).append("\", ");
+        appendRetrieval(sb, HYBRID, response.llmScored());
         appendCoverage(sb, response.coverage());
+        appendIgnoredFields(sb, answer.ignored());
         appendAnswer(sb, answer);
-        appendTail(sb, response.timedOut(), response.cancelled(), response.queryTimeMs(),
-            response.fromCache());
+        appendTail(sb, response.timedOut(), vector.cancelled(), vector.queryTimeMs(),
+            vector.fromCache());
         return sb.toString();
     }
 
@@ -163,22 +178,15 @@ public final class QueryResponseJson {
     /**
      * Renders an answer from the lexical index alone.
      *
-     * @param queryId     The identifier this query was registered under
-     * @param hits        What BM25 returned, best first, sliced to the page being returned
-     * @param coverage    What the index says it searched
-     * @param ignored     What this answer did not act on, already decided by the caller
-     * @param timedOut    Whether the request's budget ran out
-     * @param cancelled   Whether the caller withdrew the request
-     * @param durationMs  How long the request took
-     * @param answer      What this response says beyond the ranking
+     * @param response What the BM25 search produced, for its coverage and timings
+     * @param hits     The ranking, best first, sliced to the page being returned
+     * @param answer   What this response says beyond the ranking
      * @return The response body
      */
-    public static String lexical(String queryId, List<LexicalQueryService.Hit> hits,
-                                 IndexCoverage coverage,
-                                 List<String> ignored, boolean timedOut, boolean cancelled,
-                                 long durationMs, QueryAnswer answer) {
+    public static String lexical(LexicalResponse response, List<LexicalQueryService.Hit> hits,
+                                 QueryAnswer answer) {
         StringBuilder sb = new StringBuilder(256);
-        appendQueryId(sb, queryId);
+        appendQueryId(sb, response.queryId());
 
         sb.append("\"results\": [");
         for (int i = 0; i < hits.size(); i++) {
@@ -193,16 +201,28 @@ public final class QueryResponseJson {
             sb.append("}");
         }
         sb.append("], ");
-        sb.append("\"retrieval\": \"").append(LEXICAL).append("\", ");
-        appendCoverage(sb, coverage);
-        appendIgnoredFields(sb, ignored);
+        appendRetrieval(sb, LEXICAL, response.llmScored());
+        appendCoverage(sb, response.coverage());
+        appendIgnoredFields(sb, answer.ignored());
         appendAnswer(sb, answer);
-        // Always false here. The lexical path answers from the BM25 index on every request:
-        // a lexical answer can change with no mutation to observe, purely because the query
-        // epoch later crosses a manifest entry, so there is nothing to fingerprint and
-        // nothing is cached.
-        appendTail(sb, timedOut, cancelled, durationMs, false);
+        appendTail(sb, response.timedOut(), response.cancelled(), response.queryTimeMs(),
+            response.fromCache());
         return sb.toString();
+    }
+
+    /**
+     * Says which signals produced the ranking, and whether a relevancy model then ordered it.
+     *
+     * <p>Side by side because together they are what {@code score} means; either one alone
+     * leaves a caller unable to read the number.</p>
+     *
+     * @param sb        The response under construction
+     * @param retrieval Which signals ran
+     * @param llmScored Whether the scores are a relevancy model's judgement
+     */
+    private static void appendRetrieval(StringBuilder sb, String retrieval, boolean llmScored) {
+        sb.append("\"retrieval\": \"").append(retrieval).append("\", ");
+        sb.append("\"llm_scored\": ").append(llmScored).append(", ");
     }
 
     /**

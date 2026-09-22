@@ -235,8 +235,7 @@ class IndexOrchestratorSwapTest {
     @Test
     @DisplayName("Re-registering a segment ID keeps its place in the filter hierarchy")
     void reRegisteringASegmentIdKeepsItsHierarchyEntry() {
-        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(
-            100_000L, 13, 10_000, 1_000);
+        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(100_000L, 13, 1_000);
         orchestrator.setHierarchicalCuckooFilter(filter);
 
         // Register index 0 against a stale instance, the state the orchestrator is in

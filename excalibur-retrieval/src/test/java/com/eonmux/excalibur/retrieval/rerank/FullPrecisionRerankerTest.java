@@ -9,6 +9,7 @@ import com.eonmux.excalibur.retrieval.rank.RankedList;
 import com.eonmux.excalibur.retrieval.rank.Ranker;
 import com.eonmux.excalibur.retrieval.rank.RetrievalQuery;
 import com.eonmux.excalibur.retrieval.rank.ScoredDocument;
+import com.eonmux.excalibur.vector.distance.CosineSimilarity;
 import com.eonmux.excalibur.vector.distance.L2Distance;
 
 import org.junit.jupiter.api.DisplayName;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 
 class FullPrecisionRerankerTest {
 
@@ -98,7 +100,7 @@ class FullPrecisionRerankerTest {
     }
 
     @Test
-    @DisplayName("a candidate with no stored vector keeps its approximate score instead of vanishing")
+    @DisplayName("a candidate with no stored vector is kept instead of vanishing")
     void candidateWithoutVectorSurvives() {
         // A document reached by a lexical or graph signal has no vector. Dropping it would quietly
         // turn a hybrid reranker into a vector-only one.
@@ -114,6 +116,114 @@ class FullPrecisionRerankerTest {
         assertThat(results.documents())
             .extracting(ScoredDocument::documentId)
             .containsExactlyInAnyOrder(1L, 2L);
+    }
+
+    /** A stand-in for a lexical signal: fixed ids at fixed scores, on its own scale. */
+    private record ScoredRanker(String name, List<ScoredDocument> documents) implements Ranker {
+        @Override
+        public RankedList rank(RetrievalQuery query, int limit) {
+            return RankedList.of(name, documents, limit);
+        }
+    }
+
+    @Test
+    @DisplayName("an L2 distance is scored as 1 / (1 + d): one for an exact match, falling with distance")
+    void distanceBecomesSimilarity() {
+        Map<Long, float[]> stored = new HashMap<>();
+        stored.put(1L, new float[] { 0f, 0f });
+        stored.put(2L, new float[] { 3f, 0f });
+
+        FullPrecisionReranker reranker = new FullPrecisionReranker(
+            new ApproximateRanker("pq", List.of(2L, 1L), null),
+            vectors(stored), L2Distance.getInstance());
+
+        List<ScoredDocument> results = reranker.rank(
+            RetrievalQuery.ofEmbedding(new float[] { 0f, 0f }), 2).documents();
+
+        assertThat(results).extracting(ScoredDocument::documentId).containsExactly(1L, 2L);
+        assertThat(results.get(0).score()).isEqualTo(1.0);
+        assertThat(results.get(1).score()).isCloseTo(0.25, within(1e-9));
+    }
+
+    @Test
+    @DisplayName("a similarity metric's own value is the score, not its negation")
+    void similarityIsItsOwnScore() {
+        Map<Long, float[]> stored = new HashMap<>();
+        stored.put(1L, new float[] { 1f, 0f });
+        stored.put(2L, new float[] { 0f, 1f });
+
+        FullPrecisionReranker reranker = new FullPrecisionReranker(
+            new ApproximateRanker("pq", List.of(2L, 1L), null),
+            vectors(stored), CosineSimilarity.getInstance());
+
+        List<ScoredDocument> results = reranker.rank(
+            RetrievalQuery.ofEmbedding(new float[] { 1f, 0f }), 2).documents();
+
+        assertThat(results).extracting(ScoredDocument::documentId).containsExactly(1L, 2L);
+        assertThat(results.get(0).score()).isCloseTo(1.0, within(1e-6));
+        assertThat(results.get(1).score()).isCloseTo(0.0, within(1e-6));
+    }
+
+    @Test
+    @DisplayName("a vector-less candidate ranks beneath every measured one, however large its lexical score")
+    void unmeasuredRanksBeneathMeasured() {
+        // Document 9's BM25 score of 40 is not a similarity; compared as one it would outrank every
+        // cosine there is. Documents 7 and 9 keep the order the lexical signal gave them.
+        Map<Long, float[]> stored = new HashMap<>();
+        stored.put(1L, new float[] { 1f, 0f });
+        stored.put(2L, new float[] { 1f, 1f });
+
+        FullPrecisionReranker reranker = new FullPrecisionReranker(
+            new ScoredRanker("bm25", List.of(
+                new ScoredDocument(9L, 40.0), new ScoredDocument(1L, 3.0),
+                new ScoredDocument(7L, 2.5), new ScoredDocument(2L, 1.0))),
+            vectors(stored), CosineSimilarity.getInstance());
+
+        List<ScoredDocument> results = reranker.rank(
+            RetrievalQuery.ofEmbedding(new float[] { 1f, 0f }), 4).documents();
+
+        assertThat(results).extracting(ScoredDocument::documentId).containsExactly(1L, 2L, 9L, 7L);
+        double lowestMeasured = results.get(1).score();
+        assertThat(results.get(2).score()).isLessThan(lowestMeasured);
+        assertThat(results.get(3).score()).isLessThan(results.get(2).score());
+        assertThat(results.get(3).score())
+            .as("evidence the lexical signal found is weak, not none - a threshold must see it")
+            .isPositive();
+    }
+
+    @Test
+    @DisplayName("a vector-less candidate keeps a score below the lowest measured one on the unit scale")
+    void unmeasuredKeepsItsOwnScoreBeneath() {
+        Map<Long, float[]> stored = new HashMap<>();
+        stored.put(1L, new float[] { 1f, 0f });
+
+        FullPrecisionReranker reranker = new FullPrecisionReranker(
+            new ScoredRanker("bm25", List.of(
+                new ScoredDocument(1L, 0.9), new ScoredDocument(5L, 0.4),
+                new ScoredDocument(6L, 0.0))),
+            vectors(stored), CosineSimilarity.getInstance());
+
+        List<ScoredDocument> results = reranker.rank(
+            RetrievalQuery.ofEmbedding(new float[] { 1f, 0f }), 3).documents();
+
+        assertThat(results).extracting(ScoredDocument::documentId).containsExactly(1L, 5L, 6L);
+        assertThat(results.get(1).score()).isCloseTo(0.4, within(1e-5));
+        assertThat(results.get(2).score()).as("nothing found stays nothing").isZero();
+    }
+
+    @Test
+    @DisplayName("with no candidate measured, the delegate's list stands as it was, on its own scale")
+    void nothingMeasuredKeepsTheDelegate() {
+        FullPrecisionReranker reranker = new FullPrecisionReranker(
+            new ScoredRanker("bm25", List.of(
+                new ScoredDocument(4L, 0.8), new ScoredDocument(5L, 0.3))),
+            vectors(Map.of()), CosineSimilarity.getInstance());
+
+        RankedList results = reranker.rank(RetrievalQuery.ofEmbedding(new float[] { 1f }), 5);
+
+        assertThat(results.rankerName()).isEqualTo("bm25+exact");
+        assertThat(results.documents()).containsExactly(
+            new ScoredDocument(4L, 0.8), new ScoredDocument(5L, 0.3));
     }
 
     @Test

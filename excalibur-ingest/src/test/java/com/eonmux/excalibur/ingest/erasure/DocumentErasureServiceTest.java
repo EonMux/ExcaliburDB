@@ -837,6 +837,11 @@ class DocumentErasureServiceTest {
         }
 
         @Override
+        public void addDocument(java.util.Map<String, String> chunks) throws IOException {
+            delegate.addDocument(chunks);
+        }
+
+        @Override
         public void refresh() throws IOException {
             delegate.refresh();
         }

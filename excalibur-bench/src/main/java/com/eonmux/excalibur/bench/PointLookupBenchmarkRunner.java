@@ -94,13 +94,11 @@ public class PointLookupBenchmarkRunner {
                 .measurementIterations(5)
                 .measurementTime(TimeValue.seconds(3))
                 .forks(1)
-                .jvmArgsAppend(
-                    "--enable-preview",
-                    "--enable-native-access=ALL-UNNAMED",
+                .jvmArgsAppend(ForkedJvm.flags(
                     "-Xms2g",
                     "-Xmx2g",
                     "-XX:+UseTransparentHugePages"
-                )
+                ))
                 .shouldDoGC(true)
                 .build();
 

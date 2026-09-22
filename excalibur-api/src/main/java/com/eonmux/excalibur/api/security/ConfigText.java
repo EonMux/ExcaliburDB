@@ -109,6 +109,29 @@ final class ConfigText {
     }
 
     /**
+     * Reads a positive whole number that has to fit an {@code int}.
+     *
+     * <p>Refused rather than narrowed: a limit of three billion cast to an {@code int} becomes a
+     * negative number, and a negative ceiling is a limit that refuses everything - or, compared
+     * the other way, one that admits everything - with nothing in the log to say why.</p>
+     *
+     * @param properties   The properties
+     * @param key          The key
+     * @param defaultValue The value when the key is absent
+     * @return The value
+     * @throws IllegalArgumentException if it is present and is not a positive whole number no
+     *                                  larger than {@link Integer#MAX_VALUE}
+     */
+    static int positiveInt(Map<String, String> properties, String key, int defaultValue) {
+        long parsed = positiveLong(properties, key, defaultValue);
+        if (parsed > Integer.MAX_VALUE) {
+            throw refuse(key, value(properties, key),
+                "a positive whole number no larger than " + Integer.MAX_VALUE, null);
+        }
+        return (int) parsed;
+    }
+
+    /**
      * The refusal every reader here raises, worded the same way.
      *
      * <p>The message quotes the value back. That is safe only because every key routed through

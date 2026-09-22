@@ -81,7 +81,7 @@ public final class ForeignMemoryBootstrap {
      * <p>The paths do not share an initialization path, so each is exercised rather than
      * assuming one covers the rest: a heap segment, the three arena flavours, a mapped segment
      * (the database's primary path), a {@code VarHandle} over a layout (how
-     * {@code com.eonmux.excalibur.core.atomic.AtomicOps} initializes its own static fields), and the
+     * {@link com.eonmux.excalibur.core.util.SegmentVarHandle} initializes its own static fields), and the
      * native linker (how {@code com.eonmux.excalibur.graph.store.MemoryAdvice} initializes its
      * {@code madvise} handle). The last two are reached from static initializers elsewhere,
      * which is precisely where a first touch is least visible.</p>

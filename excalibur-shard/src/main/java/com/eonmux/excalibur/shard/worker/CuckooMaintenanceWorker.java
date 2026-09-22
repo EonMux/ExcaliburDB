@@ -147,7 +147,7 @@ public class CuckooMaintenanceWorker {
     private final Set<Long> unreachableTombstonedSegments = ConcurrentHashMap.newKeySet();
 
     /**
-     * Hierarchical Cuckoo filter for corpus → cluster → segment deletion propagation.
+     * Hierarchical Cuckoo filter for corpus → segment deletion propagation.
      * May be null if hierarchy is not configured.
      */
     private volatile HierarchicalCuckooFilter hierarchicalFilter;
@@ -241,7 +241,7 @@ public class CuckooMaintenanceWorker {
      * Sets the hierarchical Cuckoo filter for deletion propagation.
      *
      * <p>When set, deletions will be propagated through the hierarchy:
-     * segment → cluster → corpus. This ensures no stale false positives
+     * segment → corpus. This ensures no stale false positives
      * from tombstoned entries.</p>
      *
      * @param filter The hierarchical Cuckoo filter (may be null)
@@ -578,10 +578,10 @@ public class CuckooMaintenanceWorker {
             }
 
             if (hierarchicalFilter != null) {
-                // deleteFromHierarchy removes a term from the cluster and corpus filters
-                // only when this segment's own filter held it, and returns the count of
-                // such terms. A term still held by another segment's filter stays in the
-                // shared levels, which is what keeps live segments queryable.
+                // deleteFromHierarchy removes a term from the corpus filter only when this
+                // segment's own filter held it, and returns the count of such terms. A term
+                // still held by another segment's filter stays in the corpus level, which is
+                // what keeps live segments queryable.
                 int deleted = hierarchicalFilter.deleteFromHierarchy(
                     termsToDelete, String.valueOf(segmentId));
                 LOGGER.debug("Deleted {} of {} terms from hierarchical filter for segment {}",
@@ -722,7 +722,7 @@ public class CuckooMaintenanceWorker {
      * Propagates deletions up the filter hierarchy.
      *
      * <p>This method processes pending deletions through the hierarchical Cuckoo filter,
-     * propagating from segment level to cluster level to corpus level.</p>
+     * propagating from segment level to corpus level.</p>
      *
      * <p>If no hierarchical filter is configured, this method does nothing.</p>
      */

@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.query.cache;
 
-import com.eonmux.excalibur.query.QueryResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -10,6 +9,11 @@ import java.util.Objects;
 
 /**
  * A bounded cache of query answers, valid only while the corpus has not moved.
+ *
+ * <p>An answer is any {@link CachedAnswer}: the vector pipeline's response, a BM25 ranking, or
+ * a fused one. They share one capacity and one generation, because what they are answers about
+ * is one corpus - a node whose routes kept separate generations could discard one route's
+ * entries on a change and keep serving another's across it.</p>
  *
  * <h2>The invariant</h2>
  * <p><strong>Every entry in this cache was computed against exactly one corpus fingerprint,
@@ -27,16 +31,17 @@ import java.util.Objects;
  * that nothing did.</p>
  *
  * <h2>What is refused</h2>
- * <p>{@link #cacheable(QueryResponse)} is the rule, applied by {@link #put} so that no caller
- * can forget it. A degraded, timed-out or cancelled answer is never stored. Such an answer is
+ * <p>{@link #cacheable(CachedAnswer)} is the rule, applied by {@link #put} so that no caller
+ * can forget it, and each answer type says what it means for itself. A degraded, timed-out or
+ * cancelled answer is never stored. Such an answer is
  * a report about one moment's trouble - a segment that errored, a tail scan that stopped
  * short, an LLM scorer that fell back - and replaying it to later callers turns a transient
  * fault into a persistent one that outlives its cause.</p>
  *
  * <h2>Bounded memory</h2>
  * <p>Strictly at most {@code capacity} entries, least-recently-used first out. An entry holds
- * one {@link QueryResponse}, whose result list is bounded by the request's own depth and thus
- * by {@code excalibur.api.max-top-k}; the cache's worst case is therefore
+ * one answer, whose rankings are bounded by the request's own depth and thus by
+ * {@code excalibur.api.max-top-k}; the cache's worst case is therefore a small multiple of
  * {@code capacity x max-top-k} result items, and it is reached rather than approached, since
  * eviction happens on insert rather than on a timer. A cache that grows with the number of
  * distinct queries is an out-of-memory error with a delay, which is why there is no unbounded
@@ -64,7 +69,7 @@ public final class QueryResultCache {
 
     private final int capacity;
     private final Object lock = new Object();
-    private final Map<QueryCacheKey, QueryResponse> entries;
+    private final Map<QueryCacheKey, CachedAnswer> entries;
 
     /** The one corpus every entry currently held was computed against. */
     private CorpusVersion generation = CorpusVersion.UNREADABLE;
@@ -91,7 +96,7 @@ public final class QueryResultCache {
         this.capacity = capacity;
         this.entries = new LinkedHashMap<>(Math.min(capacity, 1024), 0.75f, true) {
             @Override
-            protected boolean removeEldestEntry(Map.Entry<QueryCacheKey, QueryResponse> eldest) {
+            protected boolean removeEldestEntry(Map.Entry<QueryCacheKey, CachedAnswer> eldest) {
                 if (size() <= QueryResultCache.this.capacity) {
                     return false;
                 }
@@ -109,15 +114,23 @@ public final class QueryResultCache {
      * entry was stored with: the whole point is to compare them. When they differ every entry
      * is discarded before this returns.</p>
      *
+     * <p>{@code type} is the answer type the caller's route produces. The key names the route,
+     * so an entry of another type can only be there if two routes built the same key, and that
+     * is answered as a miss rather than as a cast failure in the caller.</p>
+     *
      * @param key     The request, naming every input that can change the answer
      * @param version The corpus fingerprint read immediately before this lookup
-     * @return The cached answer with {@link QueryResponse#fromCache()} set, or null when there
-     *         is none or the corpus has moved
-     * @throws NullPointerException if either argument is null
+     * @param type    The answer type the caller can read
+     * @param <A>     The answer type
+     * @return The cached answer marked {@link CachedAnswer#servedFromCache() from cache}, or
+     *         null when there is none or the corpus has moved
+     * @throws NullPointerException if any argument is null
      */
-    public QueryResponse get(QueryCacheKey key, CorpusVersion version) {
+    public <A extends CachedAnswer> A get(QueryCacheKey key, CorpusVersion version,
+                                          Class<A> type) {
         Objects.requireNonNull(key, "key must not be null");
         Objects.requireNonNull(version, "version must not be null");
+        Objects.requireNonNull(type, "type must not be null");
 
         synchronized (lock) {
             if (!version.readable()) {
@@ -129,13 +142,13 @@ public final class QueryResultCache {
                 misses++;
                 return null;
             }
-            QueryResponse held = entries.get(key);
-            if (held == null) {
+            CachedAnswer held = entries.get(key);
+            if (held == null || !type.isInstance(held)) {
                 misses++;
                 return null;
             }
             hits++;
-            return held.withFromCache();
+            return type.cast(held.servedFromCache());
         }
     }
 
@@ -143,7 +156,7 @@ public final class QueryResultCache {
      * Stores an answer against the corpus it was computed from.
      *
      * <p>Ignored silently in exactly three cases, each of them a refusal rather than a
-     * failure: the answer is not {@link #cacheable(QueryResponse)}, the fingerprint could not
+     * failure: the answer is not {@link #cacheable(CachedAnswer)}, the fingerprint could not
      * be read, or the corpus moved while the query ran.</p>
      *
      * <p>That third case is the subtle one. A slow query fingerprints the corpus, takes a
@@ -155,16 +168,17 @@ public final class QueryResultCache {
      * entries that are still answers, and on a node with any write traffic the cache would
      * spend its life being rolled backwards by whichever query happened to be slowest.</p>
      *
-     * <p>The query id is stripped on the way in. It identifies the request that produced the
-     * answer, and handing a later caller an id belonging to somebody else's query is a
-     * cancellation handle for a query they do not own.</p>
+     * <p>The answer is stored as {@link CachedAnswer#forStorage()} gives it back. The query id
+     * identifies the request that produced the answer, and handing a later caller an id
+     * belonging to somebody else's query is a cancellation handle for a query they do not
+     * own.</p>
      *
      * @param key      The request, naming every input that can change the answer
      * @param version  The corpus fingerprint read before the query ran
      * @param response The answer
      * @throws NullPointerException if the key or version is null
      */
-    public void put(QueryCacheKey key, CorpusVersion version, QueryResponse response) {
+    public void put(QueryCacheKey key, CorpusVersion version, CachedAnswer response) {
         Objects.requireNonNull(key, "key must not be null");
         Objects.requireNonNull(version, "version must not be null");
 
@@ -184,7 +198,7 @@ public final class QueryResultCache {
                 // the first one it is offered.
                 generation = version;
             }
-            entries.put(key, response.withQueryId(null));
+            entries.put(key, response.forStorage());
         }
     }
 
@@ -193,16 +207,15 @@ public final class QueryResultCache {
      *
      * <p>The rule, in one place, so that the cache and anything reasoning about it cannot
      * disagree: only an answer from a search that reached the whole corpus it meant to, within
-     * its deadline, and was not withdrawn.</p>
+     * its deadline, and was not withdrawn - which each answer type states for itself in
+     * {@link CachedAnswer#cacheable()}, since what "reached the whole corpus" means differs
+     * between a segment fan-out and a BM25 pass.</p>
      *
      * @param response The answer, which may be null
      * @return true when it may be stored
      */
-    public static boolean cacheable(QueryResponse response) {
-        return response != null
-            && !response.isDegraded()
-            && !response.timedOut()
-            && !response.cancelled();
+    public static boolean cacheable(CachedAnswer response) {
+        return response != null && response.cacheable();
     }
 
     /**

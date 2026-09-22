@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * {@code POST /v1/erasure} - removes named documents from the corpus.
@@ -129,10 +130,11 @@ public class DocumentErasureEndpoint implements HttpHandler {
     /**
      * The namespaces whose graphs hold what was extracted from these documents, or null.
      *
-     * <p>The shared one is the only one that can: ingestion is not namespace-aware and hands
-     * every published document to one sink, which stages into the shared tenant. Reading the
-     * namespace header here would submit the obligation against a graph that never held the
-     * facts, and report it discharged.
+     * <p>Which one is decided by the source, never by the request: ingestion stages a document's
+     * facts into the namespace its source was registered in, and supplied documents into the
+     * shared one - see {@link SourceNamespaceLookup}. Reading the namespace header here would
+     * submit the obligation against a graph that may never have held the facts, and report it
+     * discharged.
      */
     private final GraphTenants graphTenants;
 
@@ -235,6 +237,11 @@ public class DocumentErasureEndpoint implements HttpHandler {
         }
 
         try {
+            // Resolved before anything is removed: a source-scoped erasure deregisters the
+            // source and releases its supplied id, and after that nothing on this node records
+            // which namespace its facts were staged into.
+            Optional<NamespaceId> namespace =
+                SourceNamespaceLookup.namespaceOf(sourceRegistry, suppliedSources, sourceId);
             boolean deregistered = false;
             DocumentErasureService.Outcome outcome;
             if (SCOPE_SOURCE.equals(scope)) {
@@ -257,7 +264,7 @@ public class DocumentErasureEndpoint implements HttpHandler {
             }
 
             sendOutcome(exchange, sourceId, scope, deregistered, outcome,
-                eraseFromGraph(sourceId, outcome.erasedDocumentIds(), compactNow));
+                eraseFromGraph(namespace, sourceId, outcome.erasedDocumentIds(), compactNow));
         } catch (SourceCatalogException e) {
             // Nothing has been erased: the source comes off the crawl before its documents go,
             // and that is the step that failed. A 500 would be true and would not say that the
@@ -286,6 +293,14 @@ public class DocumentErasureEndpoint implements HttpHandler {
      * which is the wrong half to erase first and would leave the reply claiming a graph erasure
      * for content the corpus still holds.
      *
+     * <p>Into the namespace the source's facts were staged into. When this node can no longer
+     * say which that was - the source was deregistered before its documents were erased, or its
+     * documents were supplied before a restart - the obligation goes to every namespace on this
+     * node. That opens each of them, which costs mapping budget; submitting to one namespace on
+     * a guess would instead leave the facts wherever the guess was wrong and report the erasure
+     * complete.
+     *
+     * @param namespace   Where the source's facts were staged, or empty if unknown
      * @param sourceId    The source the documents belong to
      * @param documentIds The documents this node no longer holds any part of
      * @param compactNow  Rewrite the served graph now rather than leaving it to the policy
@@ -293,26 +308,50 @@ public class DocumentErasureEndpoint implements HttpHandler {
      * @throws IOException if an obligation cannot be recorded or the compaction fails
      */
     private GraphErasureService.DocumentGraphOutcome eraseFromGraph(
-            String sourceId, List<String> documentIds, boolean compactNow) throws IOException {
+            Optional<NamespaceId> namespace, String sourceId, List<String> documentIds,
+            boolean compactNow) throws IOException {
         if (graphTenants == null) {
             return GraphErasureService.DocumentGraphOutcome.NO_GRAPH;
+        }
+        if (documentIds.isEmpty()) {
+            return GraphErasureService.DocumentGraphOutcome.none(
+                "no document was erased, so the graph holds nothing more of one");
         }
         List<String> keys = new ArrayList<>(documentIds.size());
         for (String documentId : documentIds) {
             keys.add(ChunkIdentifiers.documentKey(sourceId, documentId));
         }
-        try (NamespaceRegistry.Lease<GraphTenant> lease =
-                 graphTenants.borrow(NamespaceId.SHARED)) {
-            GraphErasureService.DocumentGraphOutcome outcome =
-                lease.resource().erasureService().eraseDocuments(keys, compactNow);
-            if (outcome.compacted()) {
-                // The compaction reopened the rewritten store into the tenant's holder already.
-                // What is left is the accounting: the store it now maps is not the one the
-                // mapping budget was told about.
-                graphTenants.recost(NamespaceId.SHARED);
+        List<NamespaceId> targets = namespace.isPresent()
+            ? List.of(namespace.get())
+            : graphTenants.namespacesOnDisk();
+
+        List<GraphErasureService.DocumentGraphOutcome> parts = new ArrayList<>(targets.size());
+        for (NamespaceId target : targets) {
+            // Never created here. A namespace with no directory has had nothing staged into it,
+            // so it holds nothing of these documents - and borrowing one would create it.
+            Optional<NamespaceRegistry.Lease<GraphTenant>> borrowed =
+                graphTenants.borrowIfPresent(target);
+            if (borrowed.isEmpty()) {
+                continue;
             }
-            return outcome;
+            try (NamespaceRegistry.Lease<GraphTenant> lease = borrowed.get()) {
+                GraphErasureService.DocumentGraphOutcome outcome =
+                    lease.resource().erasureService().eraseDocuments(keys, compactNow);
+                if (outcome.compacted()) {
+                    // The compaction reopened the rewritten store into the tenant's holder
+                    // already. What is left is the accounting: the store it now maps is not the
+                    // one the mapping budget was told about.
+                    graphTenants.recost(target);
+                }
+                parts.add(outcome);
+            }
         }
+        if (parts.isEmpty()) {
+            return GraphErasureService.DocumentGraphOutcome.none(
+                "no namespace on this node has had anything staged into it, so none holds "
+                    + "anything extracted from these documents");
+        }
+        return GraphErasureService.DocumentGraphOutcome.combine(parts);
     }
 
     /**

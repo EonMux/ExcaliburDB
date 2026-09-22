@@ -31,6 +31,15 @@ public record TemporalFilter(int asOfDays) {
     public static final int OPEN = Integer.MAX_VALUE;
 
     /**
+     * A day nobody recorded: the {@code validFrom} of a fact whose beginning is unknown, and the
+     * stated-on day of a statement whose date is unknown.
+     *
+     * <p>{@link Integer#MIN_VALUE}, so that as a start it is admitted by the ordinary comparison
+     * at every instant, and as an ordering key it sorts before every recorded day.
+     */
+    public static final int UNDATED = Integer.MIN_VALUE;
+
+    /**
      * Admits every edge regardless of its interval, for callers that genuinely want the whole
      * history rather than a snapshot.
      *
@@ -88,18 +97,31 @@ public record TemporalFilter(int asOfDays) {
     }
 
     /**
-     * Validates an interval as a pair. Rejects a backwards or empty interval, which otherwise
-     * becomes an edge that no query can ever return and no test would notice.
+     * Validates an interval a caller states as a pair. Rejects a backwards or empty interval,
+     * which otherwise becomes an edge that no query can ever return and no test would notice.
      */
     public static void checkInterval(int validFrom, int validTo) {
-        if (validFrom > validTo) {
-            throw new IllegalArgumentException(
-                "validFrom (" + validFrom + ") must not be after validTo (" + validTo + ")");
-        }
+        checkStoredInterval(validFrom, validTo);
         if (validFrom == validTo) {
             throw new IllegalArgumentException(
                 "empty valid interval at " + validFrom
                     + "; a half-open interval of zero length is never visible to any query");
+        }
+    }
+
+    /**
+     * Validates an interval as a built store holds it, which may be empty.
+     *
+     * <p>No source states an empty interval, and {@link #checkInterval} refuses one from a
+     * caller. Supersession produces them: a statement superseded on the same day it began held
+     * for no whole day, so no snapshot admits it, and it survives only in the whole history
+     * {@link #ALL} returns - which is where a statement that was made and then contradicted
+     * belongs. A store rewritten from another store has to carry such an edge across as it is.
+     */
+    public static void checkStoredInterval(int validFrom, int validTo) {
+        if (validFrom > validTo) {
+            throw new IllegalArgumentException(
+                "validFrom (" + validFrom + ") must not be after validTo (" + validTo + ")");
         }
     }
 }

@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.endpoint;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
+import com.eonmux.excalibur.query.QueryResponse;
 import com.eonmux.excalibur.query.cache.QueryResultCache;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.VisibilityTracker;
@@ -95,7 +96,7 @@ class QueryCacheStatsReportingTest {
         QueryResultCache cache = new QueryResultCache(64);
         com.eonmux.excalibur.query.cache.CorpusVersion version =
             new com.eonmux.excalibur.query.cache.CorpusVersion(1L, 2L, 1);
-        cache.get(key(), version);
+        cache.get(key(), version, QueryResponse.class);
 
         NodeStatsCollector collector =
             new NodeStatsCollector(indexOrchestrator, storageEngine, null);

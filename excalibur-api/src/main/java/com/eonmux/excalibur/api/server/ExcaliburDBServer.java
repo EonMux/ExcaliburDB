@@ -2,8 +2,10 @@ package com.eonmux.excalibur.api.server;
 
 import com.sun.net.httpserver.HttpServer;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.endpoint.BuildInfo;
 import com.eonmux.excalibur.api.endpoint.InMemorySourceRegistry;
+import com.eonmux.excalibur.api.endpoint.SourceNamespaceLookup;
 import com.eonmux.excalibur.api.endpoint.SourceRegistry;
 import com.eonmux.excalibur.api.retrieval.LexicalQueryService;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
@@ -24,10 +26,12 @@ import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.store.StorageEngine;
+import com.eonmux.excalibur.tenancy.NamespaceId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -763,6 +767,25 @@ public class ExcaliburDBServer {
         return this;
     }
 
+    /**
+     * Reports what ingestion stages into the graph on {@code /v1/stats} and {@code /metrics}.
+     *
+     * <p>The sink is built by the ingestion wiring, which is the only thing that knows whether
+     * this node stages facts at all, and handed to the ingestion orchestrator it feeds. Its
+     * counts - documents seen, facts staged, and the three ways a document's facts fail to reach
+     * the graph - were kept and read by nothing; this is how the stats side is given the same
+     * sink rather than one of its own.</p>
+     *
+     * <p>Must be called before {@link #start()}; the stats collector is assembled there.</p>
+     *
+     * @param sink The sink ingestion stages through, or null on a node that stages nothing
+     * @throws IllegalStateException if the server is already running
+     */
+    public void withGraphIngestSink(NamespaceRoutingGraphIngestSink sink) {
+        requireNotStarted("the graph ingest sink");
+        wiring.withGraphIngestSink(sink);
+    }
+
     @Override
     public String toString() {
         HttpServer current = server;
@@ -777,5 +800,21 @@ public class ExcaliburDBServer {
      */
     public SourceRegistry getIngestSourceRegistry() {
         return wiring.ingestSourceRegistry();
+    }
+
+    /**
+     * The graph namespace the documents written under a source id belong to.
+     *
+     * <p>Answers for crawled sources from their registration and for supplied documents from
+     * the ids {@code POST /v1/documents} has taken, which a node only knows once it has
+     * started.</p>
+     *
+     * @param sourceId The source id
+     * @return Its namespace, or empty if this node holds nothing under that id
+     */
+    public Optional<NamespaceId> namespaceOfSource(String sourceId) {
+        EndpointRegistrar.Endpoints registered = endpoints;
+        return SourceNamespaceLookup.namespaceOf(wiring.ingestSourceRegistry(),
+            registered == null ? null : registered.suppliedSources(), sourceId);
     }
 }

@@ -126,13 +126,11 @@ public class EndToEndQueryBenchmarkRunner {
                 .measurementTime(TimeValue.seconds(1))
                 // Fork configuration: 1 fork with specified JVM args
                 .forks(FORKS)
-                // JVM arguments for Panama FFM preview features
-                .jvmArgsAppend(
-                    "--enable-preview",
-                    "--enable-native-access=ALL-UNNAMED",
+                // The flags every fork needs, then this benchmark's own preview features
+                .jvmArgsAppend(ForkedJvm.flags(
                     "-Xms2g",
                     "-Xmx2g"
-                )
+                ))
                 // Enable GC between iterations for consistent results
                 .shouldDoGC(true)
                 // Build the options

@@ -213,11 +213,12 @@ public final class ExpandedLexicalRanker implements Ranker {
             return RankedList.empty(name);
         }
 
-        try {
-            IndexSearcher searcher = index.searcher();
-            if (searcher == null) {
-                return RankedList.empty(name);
-            }
+        java.util.Optional<LexicalIndex.Lease> leased = index.tryAcquire();
+        if (leased.isEmpty()) {
+            return RankedList.empty(name);
+        }
+        try (LexicalIndex.Lease lease = leased.get()) {
+            IndexSearcher searcher = lease.searcher();
             TopDocs top = searcher.search(builder.build(), limit);
             StoredFields storedFields = searcher.storedFields();
             List<ScoredDocument> results = new ArrayList<>(top.scoreDocs.length);

@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.query;
 
+import com.eonmux.excalibur.query.cache.CachedAnswer;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -36,13 +38,19 @@ import java.util.Objects;
  *   <li>Coverage indicating segments that timed out</li>
  * </ul>
  *
+ * <h2>Relevancy scoring</h2>
+ * <p>{@link #llmScored()} says whether a chat model's relevancy judgement ordered the results.
+ * It is part of the answer rather than a detail of how it was produced, because it decides what
+ * {@code score} is: the relevancy the model gave a result it judged, rather than the similarity
+ * the index measured.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>This class is immutable and thread-safe.</p>
  *
  * @author ExcaliburDB
  * @since 1.0
  */
-public final class QueryResponse {
+public final class QueryResponse implements CachedAnswer {
 
     private final String queryId;
     private final List<QueryResultItem> results;
@@ -51,6 +59,7 @@ public final class QueryResponse {
     private final boolean fromCache;
     private final boolean timedOut;
     private final boolean cancelled;
+    private final boolean llmScored;
 
     /**
      * Creates a new QueryResponse with all fields.
@@ -83,6 +92,25 @@ public final class QueryResponse {
     public QueryResponse(String queryId, List<QueryResultItem> results, IndexCoverage coverage,
                          long queryTimeMs, boolean fromCache, boolean timedOut,
                          boolean cancelled) {
+        this(queryId, results, coverage, queryTimeMs, fromCache, timedOut, cancelled, false);
+    }
+
+    /**
+     * Creates a new QueryResponse carrying every field, relevancy scoring included.
+     *
+     * @param queryId The unique query identifier for cancellation support
+     * @param results The query results (will be copied)
+     * @param coverage The index coverage metadata
+     * @param queryTimeMs The query execution time in milliseconds
+     * @param fromCache Whether results came from cache
+     * @param timedOut Whether the query timed out
+     * @param cancelled Whether the caller cancelled the query
+     * @param llmScored Whether relevancy scoring ordered the results
+     * @throws NullPointerException if results or coverage is null
+     */
+    private QueryResponse(String queryId, List<QueryResultItem> results, IndexCoverage coverage,
+                          long queryTimeMs, boolean fromCache, boolean timedOut,
+                          boolean cancelled, boolean llmScored) {
         this.queryId = queryId;
         this.results = Collections.unmodifiableList(new ArrayList<>(
             Objects.requireNonNull(results, "Results cannot be null")));
@@ -91,6 +119,7 @@ public final class QueryResponse {
         this.fromCache = fromCache;
         this.timedOut = timedOut;
         this.cancelled = cancelled;
+        this.llmScored = llmScored;
     }
 
     /**
@@ -263,6 +292,19 @@ public final class QueryResponse {
     }
 
     /**
+     * Returns whether a chat model's relevancy judgement ordered these results.
+     *
+     * <p>When true, a result the model judged carries the relevancy it was given, in
+     * {@code [0.0, 1.0]}, as its score; a result it could not judge keeps the score retrieval
+     * gave it. When false, every score is retrieval's.</p>
+     *
+     * @return true when relevancy scoring ran over this answer
+     */
+    public boolean llmScored() {
+        return llmScored;
+    }
+
+    /**
      * Returns the top result, or null if no results.
      *
      * @return The first result, or null
@@ -278,7 +320,7 @@ public final class QueryResponse {
      */
     public QueryResponse withFromCache() {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, true, timedOut,
-            cancelled);
+            cancelled, llmScored);
     }
 
     /**
@@ -289,7 +331,7 @@ public final class QueryResponse {
      */
     public QueryResponse withQueryTimeMs(long newQueryTimeMs) {
         return new QueryResponse(queryId, results, coverage, newQueryTimeMs, fromCache, timedOut,
-            cancelled);
+            cancelled, llmScored);
     }
 
     /**
@@ -300,7 +342,7 @@ public final class QueryResponse {
      */
     public QueryResponse withTimedOut(boolean timedOut) {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled);
+            cancelled, llmScored);
     }
 
     /**
@@ -311,7 +353,7 @@ public final class QueryResponse {
      */
     public QueryResponse withCancelled(boolean cancelled) {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled);
+            cancelled, llmScored);
     }
 
     /**
@@ -322,7 +364,68 @@ public final class QueryResponse {
      */
     public QueryResponse withQueryId(String queryId) {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled);
+            cancelled, llmScored);
+    }
+
+    /**
+     * Creates a new QueryResponse saying whether relevancy scoring ordered it.
+     *
+     * @param llmScored Whether relevancy scoring ran over the results
+     * @return A new QueryResponse with the flag
+     */
+    public QueryResponse withLlmScored(boolean llmScored) {
+        return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
+            cancelled, llmScored);
+    }
+
+    /**
+     * Creates a new QueryResponse over a different ranking of the same search.
+     *
+     * <p>For a stage that reorders or narrows what the search returned after the fact - a
+     * relevancy pass run outside the pipeline - and has to keep the coverage and timings the
+     * search itself reported.</p>
+     *
+     * @param newResults The results, best first
+     * @return A new QueryResponse with the results
+     * @throws NullPointerException if newResults is null
+     */
+    public QueryResponse withResults(List<QueryResultItem> newResults) {
+        return new QueryResponse(queryId, newResults, coverage, queryTimeMs, fromCache, timedOut,
+            cancelled, llmScored);
+    }
+
+    /**
+     * Creates a new QueryResponse reporting different coverage.
+     *
+     * @param newCoverage The coverage
+     * @return A new QueryResponse with the coverage
+     * @throws NullPointerException if newCoverage is null
+     */
+    public QueryResponse withCoverage(IndexCoverage newCoverage) {
+        return new QueryResponse(queryId, results, newCoverage, queryTimeMs, fromCache, timedOut,
+            cancelled, llmScored);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Not degraded, not timed out and not cancelled: an answer from a search that reached
+     * the whole corpus it meant to, inside its deadline, with a relevancy pass that did not
+     * fall back - the pipeline marks that fallback as degraded coverage.</p>
+     */
+    @Override
+    public boolean cacheable() {
+        return !isDegraded() && !timedOut && !cancelled;
+    }
+
+    @Override
+    public QueryResponse forStorage() {
+        return withQueryId(null);
+    }
+
+    @Override
+    public QueryResponse servedFromCache() {
+        return withFromCache();
     }
 
     @Override
@@ -334,6 +437,7 @@ public final class QueryResponse {
             fromCache == that.fromCache &&
             timedOut == that.timedOut &&
             cancelled == that.cancelled &&
+            llmScored == that.llmScored &&
             Objects.equals(queryId, that.queryId) &&
             results.equals(that.results) &&
             coverage.equals(that.coverage);
@@ -342,16 +446,16 @@ public final class QueryResponse {
     @Override
     public int hashCode() {
         return Objects.hash(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled);
+            cancelled, llmScored);
     }
 
     @Override
     public String toString() {
         return String.format(
             "QueryResponse{queryId=%s, results=%d, coverage=%.1f%%, degraded=%s, time=%dms, "
-                + "cached=%s, timedOut=%s, cancelled=%s}",
+                + "cached=%s, timedOut=%s, cancelled=%s, llmScored=%s}",
             queryId != null ? queryId.substring(0, Math.min(8, queryId.length())) : "null",
             results.size(), coverage.estimatedCorpusCoverage() * 100,
-            isDegraded(), queryTimeMs, fromCache, timedOut, cancelled);
+            isDegraded(), queryTimeMs, fromCache, timedOut, cancelled, llmScored);
     }
 }

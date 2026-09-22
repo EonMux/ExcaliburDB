@@ -27,8 +27,8 @@ class RepeatedTermInsertionTest {
 
     private static HierarchicalCuckooFilter hierarchy() {
         HierarchicalCuckooFilter filter =
-            new HierarchicalCuckooFilter(100_000L, 13, 10_000, 1_000);
-        filter.registerSegment(SEGMENT, "cluster-0");
+            new HierarchicalCuckooFilter(100_000L, 13, 1_000);
+        filter.registerSegment(SEGMENT);
         return filter;
     }
 

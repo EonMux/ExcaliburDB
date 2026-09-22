@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.server;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.bootstrap.SourceRestoration;
 import com.eonmux.excalibur.api.endpoint.CompactionCancelEndpoint;
 import com.eonmux.excalibur.api.endpoint.CompactionEndpoint;
@@ -21,6 +22,7 @@ import com.eonmux.excalibur.api.endpoint.GraphErasureEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespaceDeleteEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphNamespacesEndpoint;
 import com.eonmux.excalibur.api.endpoint.GraphQueryEndpoint;
+import com.eonmux.excalibur.api.endpoint.GraphStatsReader;
 import com.eonmux.excalibur.api.endpoint.HealthEndpoint;
 import com.eonmux.excalibur.api.endpoint.InMemorySourceRegistry;
 import com.eonmux.excalibur.api.endpoint.IngestEndpoint;
@@ -162,6 +164,7 @@ final class EndpointRegistrar {
      * @param reindexCoordinator   The claim shared with the scheduled reindex handler
      * @param documentErasure      The service behind {@code POST /v1/erasure}, or null
      * @param graphTenants         Every namespace's graph, or null
+     * @param graphIngestSink      What ingestion stages facts through, or null
      * @param graphPipeline        A graph pipeline somebody else owns, or null
      * @param documentRegistry     What this node has ingested, or null
      */
@@ -186,6 +189,7 @@ final class EndpointRegistrar {
                   ReindexCoordinator reindexCoordinator,
                   DocumentErasureService documentErasure,
                   GraphTenants graphTenants,
+                  NamespaceRoutingGraphIngestSink graphIngestSink,
                   GraphRagPipeline graphPipeline,
                   DocumentRegistry documentRegistry) {
     }
@@ -198,9 +202,11 @@ final class EndpointRegistrar {
      * @param compaction Runs what {@code POST /v1/compact} asked for, behind the response
      * @param graphBuild Runs what {@code POST /v1/graph/build} asked for, behind the response,
      *                   or null on a node that serves no graph of its own
+     * @param suppliedSources The ids documents have been supplied under, which the graph sink
+     *                   reads to find the namespace a supplied document's facts belong to
      */
     record Endpoints(QueryEndpoint query, ReindexEndpoint reindex, CompactionRunner compaction,
-                     GraphBuildRunner graphBuild) {
+                     GraphBuildRunner graphBuild, InlineSourceIds suppliedSources) {
     }
 
     /**
@@ -224,6 +230,18 @@ final class EndpointRegistrar {
         // is by each gathering its own.
         NodeStatsCollector collector = newStatsCollector();
         StatsEndpoint statsEndpoint = new StatsEndpoint(collector);
+
+        // Only where there are namespaces to build. A node serving somebody else's pipeline
+        // has no staged facts of its own, and a runner with no work is a thread to drain.
+        // Created before the routes because the stats read the same runner the routes drive:
+        // a second one would report builds nothing ever started.
+        GraphBuildRunner graphBuildRunner = in.graphTenants() != null
+            ? new GraphBuildRunner(in.graphTenants())
+            : null;
+        if (graphBuildRunner != null) {
+            collector.withGraph(new GraphStatsReader(
+                in.graphTenants(), graphBuildRunner, in.graphIngestSink()));
+        }
 
         // Where a result's text is read back from when a request asks for it. The indexes hold
         // postings and vectors and no text, so without this a search answers with identifiers a
@@ -259,15 +277,11 @@ final class EndpointRegistrar {
         CompactionRunner compactionRunner = new CompactionRunner(
             in.indexOrchestrator()::compactNow);
         registerCompaction(target, notFound, compactionRunner);
-        // Only where there are namespaces to build. A node serving somebody else's pipeline
-        // has no staged facts of its own, and a runner with no work is a thread to drain.
-        GraphBuildRunner graphBuildRunner = in.graphTenants() != null
-            ? new GraphBuildRunner(in.graphTenants())
-            : null;
         registerGraph(target, notFound, graphBuildRunner);
         target.createContext("/", wrapHandler(notFound));
 
-        return new Endpoints(queryHandler, reindexHandler, compactionRunner, graphBuildRunner);
+        return new Endpoints(queryHandler, reindexHandler, compactionRunner, graphBuildRunner,
+            suppliedSources);
     }
 
     // ==================== Endpoint construction ====================
@@ -524,6 +538,25 @@ final class EndpointRegistrar {
         return guard.protect(access, refusingNamespace(handler));
     }
 
+    /**
+     * Routes a path that serves one method.
+     *
+     * <p>Every other method is answered 405 by a handler of its own, behind the public guard,
+     * as the multi-method routes do. Left to the route's handler, the 405 would be served beneath
+     * the route's guard instead: an anonymous caller would be answered 401 for a method the path
+     * does not serve at all, and a wrong method on a mutating route would be charged to the much
+     * smaller mutate budget.</p>
+     *
+     * @param method  The one method the path serves
+     * @param guarded The path's handler, already guarded
+     * @return A handler dispatching {@code method} to the route and refusing the rest
+     */
+    private HttpHandler onlyMethod(String method, HttpHandler guarded) {
+        return createMethodRouter(Map.of(method, guarded),
+            guard.protect(RequestGuard.Access.PUBLIC, methodNotAllowed(
+                "Method Not Allowed - Use " + method)));
+    }
+
     private void registerCore(HttpServer target, HttpHandler notFound,
                               HealthEndpoint healthEndpoint, StatsEndpoint statsEndpoint) {
         target.createContext("/health",
@@ -531,7 +564,7 @@ final class EndpointRegistrar {
                 guard.protect(RequestGuard.Access.PUBLIC, healthEndpoint), notFound)));
         target.createContext("/v1/stats",
             wrapHandler(exactPath("/v1/stats",
-                corpusRoute(RequestGuard.Access.READ, statsEndpoint), notFound)));
+                onlyMethod("GET", corpusRoute(RequestGuard.Access.READ, statsEndpoint)), notFound)));
     }
 
     /**
@@ -564,14 +597,16 @@ final class EndpointRegistrar {
             wrapHandler(exactPath("/health/ready", guard.protect(RequestGuard.Access.PUBLIC,
                 newReadinessEndpoint(readiness)), notFound)));
         target.createContext("/metrics",
-            wrapHandler(exactPath("/metrics", guard.protect(RequestGuard.Access.READ,
-                new MetricsEndpoint(collector, in.queryRegistry(), readiness)), notFound)));
+            wrapHandler(exactPath("/metrics", onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
+                new MetricsEndpoint(collector, in.queryRegistry(), readiness))), notFound)));
         target.createContext("/v1/version",
-            wrapHandler(exactPath("/v1/version", guard.protect(RequestGuard.Access.READ,
-                new VersionEndpoint()), notFound)));
+            wrapHandler(exactPath("/v1/version", onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
+                new VersionEndpoint())), notFound)));
         target.createContext("/v1/query/status",
-            wrapHandler(exactPath("/v1/query/status", guard.protect(RequestGuard.Access.READ,
-                new QueryStatusEndpoint(in.queryRegistry())), notFound)));
+            // A corpus route, like the /v1/query whose calls it lists: a caller naming a tenant
+            // would otherwise be shown every query on the node as though they were its own.
+            wrapHandler(exactPath("/v1/query/status", onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
+                new QueryStatusEndpoint(in.queryRegistry()))), notFound)));
 
         // Two verbs on one noun, the shape /v1/ingest and /v1/reindex already use: beginning
         // a drain and ending one are one resource. Each branch carries its own guard, so the
@@ -689,11 +724,11 @@ final class EndpointRegistrar {
                 "Method Not Allowed - Use GET to read the registrations, POST to register a "
                     + "source or DELETE to stop crawling one"))), notFound)));
         target.createContext("/v1/ingest/run",
-            wrapHandler(exactPath("/v1/ingest/run", corpusRoute(RequestGuard.Access.MUTATE,
-                new IngestCancelEndpoint(in.ingestSourceRegistry())), notFound)));
+            wrapHandler(exactPath("/v1/ingest/run", onlyMethod("DELETE", corpusRoute(RequestGuard.Access.MUTATE,
+                new IngestCancelEndpoint(in.ingestSourceRegistry()))), notFound)));
         target.createContext("/v1/ingest/status",
-            wrapHandler(exactPath("/v1/ingest/status", corpusRoute(RequestGuard.Access.READ,
-                new IngestStatusEndpoint(in.ingestionStatus())), notFound)));
+            wrapHandler(exactPath("/v1/ingest/status", onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
+                new IngestStatusEndpoint(in.ingestionStatus()))), notFound)));
     }
 
     /**
@@ -737,8 +772,8 @@ final class EndpointRegistrar {
         if (in.documentRegistry() != null) {
             target.createContext("/v1/documents/list",
                 wrapHandler(exactPath("/v1/documents/list",
-                    corpusRoute(RequestGuard.Access.READ,
-                        new DocumentListEndpoint(in.documentRegistry())), notFound)));
+                    onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
+                        new DocumentListEndpoint(in.documentRegistry()))), notFound)));
         }
     }
 
@@ -793,8 +828,8 @@ final class EndpointRegistrar {
         // /v1/reindex, so the server's longest-prefix matching routes it here rather than to
         // the reindex handler, which answers 405 to a GET.
         target.createContext("/v1/reindex/status",
-            wrapHandler(exactPath("/v1/reindex/status", corpusRoute(RequestGuard.Access.READ,
-                new ReindexStatusEndpoint(in.reindexStatus())), notFound)));
+            wrapHandler(exactPath("/v1/reindex/status", onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
+                new ReindexStatusEndpoint(in.reindexStatus()))), notFound)));
     }
 
     /** A mutation, and the most consequential one: it removes content rather than adding it. */
@@ -804,9 +839,9 @@ final class EndpointRegistrar {
             return;
         }
         target.createContext("/v1/erasure", wrapHandler(exactPath("/v1/erasure",
-            corpusRoute(RequestGuard.Access.MUTATE,
+            onlyMethod("POST", corpusRoute(RequestGuard.Access.MUTATE,
                 new DocumentErasureEndpoint(in.documentErasure(), in.ingestSourceRegistry(),
-                    suppliedSources, in.graphTenants())), notFound)));
+                    suppliedSources, in.graphTenants()))), notFound)));
     }
 
     /**
@@ -835,8 +870,8 @@ final class EndpointRegistrar {
         // A longer path than /v1/compact, so the server's longest-prefix matching routes it
         // here rather than to the handler above, which answers 405 to a GET.
         target.createContext("/v1/compact/status",
-            wrapHandler(exactPath("/v1/compact/status", corpusRoute(RequestGuard.Access.READ,
-                new CompactionStatusEndpoint(runner)), notFound)));
+            wrapHandler(exactPath("/v1/compact/status", onlyMethod("GET", corpusRoute(RequestGuard.Access.READ,
+                new CompactionStatusEndpoint(runner))), notFound)));
     }
 
     /**
@@ -849,8 +884,8 @@ final class EndpointRegistrar {
                                GraphBuildRunner graphBuildRunner) {
         if (in.graphTenants() != null) {
             target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
-                guard.protect(RequestGuard.Access.READ,
-                    new GraphQueryEndpoint(in.graphTenants())), notFound)));
+                onlyMethod("POST", guard.protect(RequestGuard.Access.READ,
+                    new GraphQueryEndpoint(in.graphTenants()))), notFound)));
             // Both mutations: they rewrite the served graph. The build answers 202 and runs
             // behind the response, so the DELETE beside it is how one started at the wrong
             // moment is ended - a mutation too, since an anonymous caller able to stop every
@@ -870,11 +905,11 @@ final class EndpointRegistrar {
             // read, like every other /status route: polling for the verdict of a build that
             // takes minutes must not be rationed against the smaller mutate budget.
             target.createContext("/v1/graph/build/status", wrapHandler(
-                exactPath("/v1/graph/build/status", guard.protect(RequestGuard.Access.READ,
-                    new GraphBuildStatusEndpoint(graphBuildRunner)), notFound)));
+                exactPath("/v1/graph/build/status", onlyMethod("GET", guard.protect(RequestGuard.Access.READ,
+                    new GraphBuildStatusEndpoint(graphBuildRunner))), notFound)));
             target.createContext("/v1/graph/erasure", wrapHandler(exactPath("/v1/graph/erasure",
-                guard.protect(RequestGuard.Access.MUTATE,
-                    new GraphErasureEndpoint(in.graphTenants())), notFound)));
+                onlyMethod("POST", guard.protect(RequestGuard.Access.MUTATE,
+                    new GraphErasureEndpoint(in.graphTenants()))), notFound)));
             // The namespace inventory and the drop. One context with pathOrChild, because the
             // collection is a GET and its members carry the namespace in the path. Registered
             // only where graphTenants is: a node serving somebody else's pipeline has no
@@ -894,8 +929,8 @@ final class EndpointRegistrar {
                 notFound)));
         } else if (in.graphPipeline() != null) {
             target.createContext("/v1/graph/query", wrapHandler(exactPath("/v1/graph/query",
-                guard.protect(RequestGuard.Access.READ,
-                    new GraphQueryEndpoint(in.graphPipeline())), notFound)));
+                onlyMethod("POST", guard.protect(RequestGuard.Access.READ,
+                    new GraphQueryEndpoint(in.graphPipeline()))), notFound)));
         }
     }
 }

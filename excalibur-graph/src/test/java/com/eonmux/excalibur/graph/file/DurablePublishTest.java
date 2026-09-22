@@ -104,5 +104,83 @@ class DurablePublishTest {
                 .isEqualTo(durability.directories.size() - 1);
             assertThat(target.resolve("documents").resolve("segments_1")).hasContent("segment");
         }
+    
+        @Test
+        @DisplayName("a published graph that will not open is rolled back, and the previous one kept")
+        void anUnopenableGraphIsRolledBack(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Files.createDirectories(target);
+            Files.writeString(target.resolve("marker"), "previous");
+            Path scratch = GraphBuilder.scratchFor(target);
+            Files.createDirectories(scratch);
+            Files.writeString(scratch.resolve("marker"), "new");
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    GraphBuilder.publish(scratch, target, new RecordingDurability(), published -> {
+                        assertThat(published.resolve("marker")).hasContent("new");
+                        throw new IOException("does not open");
+                    }))
+                .isInstanceOf(IOException.class)
+                .hasMessage("does not open");
+
+            assertThat(target.resolve("marker"))
+                .as("the graph that was being served is served again")
+                .hasContent("previous");
+            assertThat(scratch.resolve("marker"))
+                .as("the build is kept where it was assembled, for a look at why")
+                .hasContent("new");
+            assertThat(parent.resolve("graph" + GraphBuilder.PREVIOUS_SUFFIX)).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("the previous graph is deleted only once the new one has opened")
+        void thePreviousGraphOutlivesTheOpen(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Path previous = parent.resolve("graph" + GraphBuilder.PREVIOUS_SUFFIX);
+            Files.createDirectories(target);
+            Path scratch = GraphBuilder.scratchFor(target);
+            Files.createDirectories(scratch);
+
+            String opened = GraphBuilder.publish(scratch, target, new RecordingDurability(),
+                published -> {
+                    assertThat(previous).as("still there while the open runs").isDirectory();
+                    return "opened";
+                });
+
+            assertThat(opened).isEqualTo("opened");
+            assertThat(previous).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("a graph displaced by a publish that crashed between its renames is restored")
+        void aDisplacedGraphIsRestored(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Path previous = parent.resolve("graph" + GraphBuilder.PREVIOUS_SUFFIX);
+            Files.createDirectories(previous);
+            Files.writeString(previous.resolve("marker"), "previous");
+
+            assertThat(GraphBuilder.recoverInterruptedPublish(target)).isTrue();
+
+            assertThat(target.resolve("marker")).hasContent("previous");
+            assertThat(previous).doesNotExist();
+        }
+
+        @Test
+        @DisplayName("a publish that got as far as the new graph is left as it is")
+        void aCompletedRenameStands(@TempDir Path parent) throws IOException {
+            Path target = parent.resolve("graph");
+            Path previous = parent.resolve("graph" + GraphBuilder.PREVIOUS_SUFFIX);
+            Files.createDirectories(target);
+            Files.writeString(target.resolve("marker"), "new");
+            Files.createDirectories(previous);
+
+            assertThat(GraphBuilder.recoverInterruptedPublish(target)).isFalse();
+            assertThat(GraphBuilder.recoverInterruptedPublish(parent.resolve("absent"))).isFalse();
+
+            assertThat(target.resolve("marker")).hasContent("new");
+            assertThat(previous)
+                .as("the displaced graph may hold erased facts and nothing reads it")
+                .doesNotExist();
+        }
     }
 }

@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <h2>Test Categories</h2>
  * <ul>
- *   <li>Hierarchical deletion from segment to cluster to corpus filters, driven directly</li>
+ *   <li>Hierarchical deletion from segment to corpus filters, driven directly</li>
  *   <li>UpsertHandler segment-aware processing</li>
  *   <li>Error handling during tombstoning</li>
  * </ul>
@@ -34,7 +34,6 @@ import static org.junit.jupiter.api.Assertions.*;
 class HierarchicalDeletionTest {
 
     private static final String SEGMENT_ID = "segment-1";
-    private static final String CLUSTER_ID = "cluster-a";
     private static final String SOURCE_ID = "test-source";
 
     private HierarchicalCuckooFilter hierarchicalFilter;
@@ -44,7 +43,7 @@ class HierarchicalDeletionTest {
     @BeforeEach
     void setUp() {
         hierarchicalFilter = new HierarchicalCuckooFilter(10000);
-        hierarchicalFilter.registerSegment(SEGMENT_ID, CLUSTER_ID);
+        hierarchicalFilter.registerSegment(SEGMENT_ID);
         registry = new DocumentRegistry();
         tombstonedChunks = new ArrayList<>();
     }
@@ -192,10 +191,8 @@ class HierarchicalDeletionTest {
         CuckooFilter segmentFilter = hierarchicalFilter.getSegmentFilter(SEGMENT_ID);
         assertNotNull(segmentFilter);
         assertFalse(segmentFilter.contains(chunkBytes));
-        
-        CuckooFilter clusterFilter = hierarchicalFilter.getClusterFilter(CLUSTER_ID);
-        assertNotNull(clusterFilter);
-        assertFalse(clusterFilter.contains(chunkBytes));
+
+        assertFalse(hierarchicalFilter.getCorpusFilter().contains(chunkBytes));
     }
 
     @Test
@@ -359,9 +356,9 @@ class HierarchicalDeletionTest {
     }
 
     @Test
-    void testSegmentToClusterMappingPreserved() {
+    void testOtherSegmentsEntriesPreserved() {
         String segment2 = "segment-2";
-        hierarchicalFilter.registerSegment(segment2, CLUSTER_ID);
+        hierarchicalFilter.registerSegment(segment2);
         
         hierarchicalFilter.insert(toBytes("chunk-s1"), SEGMENT_ID);
         hierarchicalFilter.insert(toBytes("chunk-s2"), segment2);
@@ -374,8 +371,7 @@ class HierarchicalDeletionTest {
     @Test
     void testMultipleSegmentsIndependentDeletion() {
         String segment2 = "segment-2";
-        String cluster2 = "cluster-b";
-        hierarchicalFilter.registerSegment(segment2, cluster2);
+        hierarchicalFilter.registerSegment(segment2);
         
         hierarchicalFilter.insert(toBytes("multi-chunk1"), SEGMENT_ID);
         hierarchicalFilter.insert(toBytes("multi-chunk2"), segment2);

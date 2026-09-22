@@ -29,10 +29,10 @@ import java.util.function.Supplier;
  * moves moves in both at once.</p>
  *
  * <h2>A subsystem that cannot answer is absent, not zero</h2>
- * <p>Five of these blocks come from components that can fail independently of the node's
+ * <p>Six of these blocks come from components that can fail independently of the node's
  * ability to serve a request - a lexical index, a storage engine's record of its vector
- * indexes, a query result cache, and the two circuit breakers, each behind a client that may
- * not exist. Each is
+ * indexes, a query result cache, the graph tenants, and the two circuit breakers, each behind a
+ * client that may not exist. Each is
  * caught here and reported as absent. Letting one of them fail the whole response would lose
  * the segment counts and the queue depths an operator came for, and reporting a zero the
  * collector did not measure would be worse still: "no segment is missing its vector index"
@@ -82,6 +82,14 @@ public final class NodeStatsCollector {
      * read.</p>
      */
     private volatile com.eonmux.excalibur.query.cache.QueryResultCache queryResultCache;
+
+    /**
+     * Reads the graph tenants, when this node builds its own graph.
+     *
+     * <p>Volatile and set after construction: whether there is a graph at all is decided by
+     * the composition root, not by anything this collector reads.</p>
+     */
+    private volatile GraphStatsReader graphReader;
 
     /**
      * Creates a collector over the components a node always has.
@@ -174,6 +182,20 @@ public final class NodeStatsCollector {
     }
 
     /**
+     * Reports the graph half of the node alongside the rest of its state.
+     *
+     * <p>The tenants, their mapping budget, the builds, the erasure backlog and what ingestion
+     * stages into the graph. Each was counted and none was reported, so a graph that had
+     * stopped growing, tenants evicted on every request and an erasure deadline going unmet all
+     * looked like a healthy node from outside.</p>
+     *
+     * @param reader Reads the graph, or null on a node that builds none
+     */
+    public void withGraph(GraphStatsReader reader) {
+        this.graphReader = reader;
+    }
+
+    /**
      * Reads everything, now.
      *
      * @return One consistent-enough snapshot; each figure is read once
@@ -206,7 +228,26 @@ public final class NodeStatsCollector {
             indexOrchestrator.isRunning(),
             breakerState(this.embeddingBreaker, "Embedding"),
             breakerState(this.llmRelevancyBreaker, "LLM relevancy"),
-            queryCacheStats());
+            queryCacheStats(),
+            graphStats());
+    }
+
+    /**
+     * The graph half of the node, or null when there is none or it could not be read.
+     *
+     * @return The graph's stats, or null
+     */
+    private GraphStats graphStats() {
+        GraphStatsReader reader = this.graphReader;
+        if (reader == null) {
+            return null;
+        }
+        try {
+            return reader.read();
+        } catch (RuntimeException e) {
+            LOGGER.warn("Graph stats unavailable: {}", e.getMessage());
+            return null;
+        }
     }
 
     /**

@@ -150,6 +150,20 @@ public class IngestionOrchestrator {
      */
     private final int documentTimeoutMs;
 
+    /** What a run waits between lexical refreshes when nobody has configured it. */
+    public static final long DEFAULT_LEXICAL_REFRESH_INTERVAL_MS = 30_000L;
+
+    /**
+     * Longest a document published by a run in progress waits to become lexically searchable.
+     *
+     * <p>A refresh publishes a segment on the native engine and reopens a reader on Lucene, so a
+     * run paces them rather than refreshing per document; it also refreshes when it ends or is
+     * stopped. Without the pacing a run's documents were stored and visible to every other signal
+     * and absent from BM25 until the whole run finished - on a lexical-only node, for the length
+     * of a crawl that can run for days, the documents were not searchable at all.</p>
+     */
+    private volatile long lexicalRefreshIntervalMs = DEFAULT_LEXICAL_REFRESH_INTERVAL_MS;
+
     private final Set<String> activeIngestions;
     private final Map<String, Thread> ingestionThreads;
 
@@ -276,6 +290,21 @@ public class IngestionOrchestrator {
      */
     public void setLexicalIndex(com.eonmux.excalibur.ingest.lexical.ChunkIndex lexicalIndex) {
         this.lexicalSideIndex.setIndex(lexicalIndex);
+    }
+
+    /**
+     * Sets how long a document published by a run in progress may wait to become lexically
+     * searchable.
+     *
+     * @param intervalMs The interval in milliseconds
+     * @throws IllegalArgumentException if the interval is not positive
+     */
+    public void setLexicalRefreshIntervalMs(long intervalMs) {
+        if (intervalMs <= 0) {
+            throw new IllegalArgumentException(
+                "lexical refresh interval must be positive: " + intervalMs);
+        }
+        this.lexicalRefreshIntervalMs = intervalMs;
     }
 
     /**
@@ -533,13 +562,29 @@ public class IngestionOrchestrator {
         StructuredLoggingHelper.setStage("embedding");
         status.update("embedding", 0.0, 0, totalPending);
 
+        // Zeroed at the start of the run rather than carried: a re-crawl that skips nothing must
+        // not go on reporting what the crawl before it skipped.
+        status.setSkipped(0);
+
+        try {
+            return ingestDocuments(source, sourceId, status, documentIds);
+        } catch (RuntimeException e) {
+            finishFailedRun();
+            throw e;
+        }
+    }
+
+    /**
+     * Ingests the documents a crawl listed, refreshing the lexical index as it goes.
+     */
+    private IngestionOutcome ingestDocuments(Source source, String sourceId,
+                                             IngestionStatus status, List<String> documentIds) {
+        long totalPending = documentIds.size();
+        long lastLexicalRefresh = System.nanoTime();
         long totalIngested = 0;
         int processedDocs = 0;
         int failedDocs = 0;
         int skippedDocs = 0;
-        // Zeroed at the start of the run rather than carried: a re-crawl that skips nothing must
-        // not go on reporting what the crawl before it skipped.
-        status.setSkipped(0);
 
         for (String documentId : documentIds) {
             if (shutdown.get() || Thread.currentThread().isInterrupted()) {
@@ -548,10 +593,17 @@ public class IngestionOrchestrator {
                 // abandoning one halfway is the state the rollback exists to avoid.
                 LOGGER.info("Ingestion of {} stopped after {} of {} documents",
                     sourceId, processedDocs, totalPending);
+                finishStoppedRun();
                 status.setSkipped(skippedDocs);
                 status.setError("Ingestion stopped");
                 return new IngestionOutcome(processedDocs - failedDocs - skippedDocs,
                     totalIngested, failedDocs, skippedDocs, true);
+            }
+
+            if (System.nanoTime() - lastLexicalRefresh
+                    >= lexicalRefreshIntervalMs * 1_000_000L) {
+                refreshLexicalIndexMidRun(sourceId);
+                lastLexicalRefresh = System.nanoTime();
             }
 
             awaitBackpressureRelease();
@@ -596,11 +648,9 @@ public class IngestionOrchestrator {
         awaitBackpressureRelease();
 
         StructuredLoggingHelper.setStage("idle");
-        // Lucene writes are invisible to search until a reader is reopened. Doing it once per
-        // run rather than per document keeps the cost off the write path, at the price of a
-        // source's chunks becoming searchable together at the end of its run.
-        lexicalSideIndex.refresh();
-        lexicalSideIndex.compactIfDue();
+        // The documents published since the last paced refresh become searchable here, rather
+        // than waiting out the rest of the interval with nothing left to publish after them.
+        refreshLexicalIndex();
         persistRegistry();
 
         status.update("idle", 1.0, totalIngested, 0);
@@ -656,6 +706,92 @@ public class IngestionOrchestrator {
         }
         LOGGER.info("Ingestion of {} skipped {} of {} documents as not text",
             sourceId, skippedDocs, totalPending);
+    }
+
+    /**
+     * Publishes the lexical writes so far and merges segments if that is now due.
+     *
+     * <p>Compaction is asked each time rather than only at a run's end, because every refresh
+     * on the native engine adds a segment and a long run would otherwise leave queries visiting
+     * one per interval until it finished. The usual answer is that nothing is due.</p>
+     */
+    private void refreshLexicalIndex() {
+        lexicalSideIndex.refresh();
+        lexicalSideIndex.compactIfDue();
+    }
+
+    /**
+     * Publishes the lexical writes so far without letting a stop or a failure spoil the run.
+     *
+     * <p>A stop that lands during the refresh is set aside until it is done, for the reason
+     * {@link #finishStoppedRun()} gives, and is seen by the loop's check before the next document.
+     * A refresh that fails is logged and the run goes on: the documents stay published and become
+     * searchable at the next refresh, which is a delay, whereas failing the run would abandon the
+     * documents it had not reached for the sake of ones it already had.</p>
+     */
+    private void refreshLexicalIndexMidRun(String sourceId) {
+        boolean interrupted = Thread.interrupted();
+        try {
+            refreshLexicalIndex();
+        } catch (RuntimeException e) {
+            LOGGER.warn("Lexical index not refreshed partway through ingesting {}; the documents "
+                + "published so far become searchable by BM25 at the next refresh: {}",
+                sourceId, e.getMessage());
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Makes what a failed run published searchable, and records it, before the failure goes on.
+     *
+     * <p>A run that fails partway has still published every document it finished, and those are
+     * visible to every signal but BM25 until a refresh. Best effort: the run is already failing,
+     * and a refresh that fails as well must not replace the error the caller is owed.</p>
+     */
+    private void finishFailedRun() {
+        boolean interrupted = Thread.interrupted();
+        try {
+            lexicalSideIndex.refresh();
+        } catch (RuntimeException e) {
+            LOGGER.warn("Lexical index not refreshed after a failed run; the documents it "
+                + "published become searchable by BM25 at the next refresh: {}", e.getMessage());
+        } finally {
+            try {
+                persistRegistry();
+            } catch (RuntimeException e) {
+                LOGGER.warn("Document registry not persisted after a failed run: {}",
+                    e.getMessage());
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Makes what a stopped run published searchable, and records it.
+     *
+     * <p>A stopped run's documents are published in storage: stopping abandons the documents it
+     * had not reached, not the ones it had finished. Left unrefreshed they are visible to every
+     * signal but BM25, and unrecorded they look new to the next re-crawl after a restart.</p>
+     *
+     * <p>The interrupt that stopped the run is set aside for the length of the writes. A channel
+     * written by an interrupted thread is closed by the JDK rather than written, and the index
+     * files are channels the whole node shares.</p>
+     */
+    private void finishStoppedRun() {
+        boolean interrupted = Thread.interrupted();
+        try {
+            lexicalSideIndex.refresh();
+            persistRegistry();
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**

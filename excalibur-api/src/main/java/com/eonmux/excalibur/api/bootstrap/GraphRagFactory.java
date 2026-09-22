@@ -17,6 +17,7 @@ import com.eonmux.excalibur.retrieval.rerank.FullPrecisionReranker;
 import com.eonmux.excalibur.vector.distance.DistanceFunctions;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.retrieval.HybridRetriever;
+import com.eonmux.excalibur.retrieval.fusion.ScorePassthrough;
 import com.eonmux.excalibur.retrieval.abstain.AbstentionPolicy;
 import com.eonmux.excalibur.retrieval.abstain.CalibratedAbstentionPolicy;
 import com.eonmux.excalibur.retrieval.abstain.ThresholdAbstentionPolicy;
@@ -114,10 +115,10 @@ public final class GraphRagFactory {
          * that can account for itself does; anything that cannot contributes nothing, which is
          * the honest answer rather than a guess.
          *
-         * <p>Charging only the edge store - which is what this used to do - reported thirteen
-         * mappings and no descriptors for a tenant holding rather more of both, so the descriptor
-         * limit could never be reached however many tenants were open and the mapping limit was
-         * approached faster than the budget believed.
+         * <p>Charging only the edge store would report thirteen mappings and no descriptors for a
+         * tenant holding rather more of both, so the descriptor limit could never be reached
+         * however many tenants were open and the mapping limit would be approached faster than
+         * the budget believed.
          *
          * @return The mappings and descriptors held, in that order
          */
@@ -185,6 +186,7 @@ public final class GraphRagFactory {
         Objects.requireNonNull(config, "config cannot be null");
         Objects.requireNonNull(directory, "directory cannot be null");
 
+        com.eonmux.excalibur.graph.staging.GraphBuilder.recoverInterruptedPublish(directory);
         if (!Files.isDirectory(directory)) {
             LOGGER.info("No graph store at {}; graph queries will report that none is built",
                 directory);
@@ -197,12 +199,14 @@ public final class GraphRagFactory {
             MappedEdgeStore edges = MappedEdgeStore.open(directory);
             opened.push(edges);
 
-            LexicalIndex documents = LexicalIndex.open(
-                directory.resolve(DOCUMENT_INDEX), settings.getRamBufferMb());
+            // Read-only: a published graph is never written through the stack that serves it.
+            // Without a writer no write lock is held, so a build can open its replacement at
+            // this path while queries finish against this one - and an index missing from the
+            // directory fails the open instead of being created empty and served as the graph.
+            LexicalIndex documents = LexicalIndex.openReadOnly(directory.resolve(DOCUMENT_INDEX));
             opened.push(documents);
 
-            LexicalIndex labels = LexicalIndex.open(
-                directory.resolve(LABEL_INDEX), settings.getRamBufferMb());
+            LexicalIndex labels = LexicalIndex.openReadOnly(directory.resolve(LABEL_INDEX));
             opened.push(labels);
 
             LabelDictionary entityNames =
@@ -227,17 +231,19 @@ public final class GraphRagFactory {
                 new QueryClassifier(),
                 linker,
                 edges,
+                // One signal, whose scores are handed through rather than fused: abstention
+                // reads them, and on the unit scale every stage below reports they measure the
+                // evidence. Reciprocal rank fusion would replace each with a function of its rank.
                 new HybridRetriever(List.of(rankerFor(config, documents, entityVectors)),
-                    new com.eonmux.excalibur.retrieval.fusion.ReciprocalRankFusion(
-                        config.query().getRrfK()),
-                    config.query().getPerSignalOverFetch()),
+                    new ScorePassthrough(), config.query().getPerSignalOverFetch()),
                 new TripleSubgraphSerializer(entityNames, relationNames),
                 abstentionFor(settings),
                 new SerializationBudget(
                     settings.getContextTokenBudget(), BpeTokenCounter.defaultCounter()),
                 settings.getTopK(),
                 embedderFor(config, entityVectors),
-                relationResolverFor(relationNames));
+                relationResolverFor(relationNames),
+                entityNames);
 
             LOGGER.info("Graph-RAG pipeline opened from {}: {} entity names, {} relation names",
                 directory, entityNames.size(), relationNames.size());
@@ -257,13 +263,6 @@ public final class GraphRagFactory {
     }
 
     /**
-     * The directory the graph is read from.
-     *
-     * @param config  Application configuration
-     * @param dataDir The node's data directory
-     * @return The configured path, or {@code <dataDir>/graph}
-     */
-    /**
      * The lexical signal, reranked by the chat model when there is one to ask.
      *
      * <p>BM25 ranks by term overlap, which is what makes it a good first pass and a poor last one:
@@ -275,13 +274,21 @@ public final class GraphRagFactory {
      * <p>Without an API key there is no model to ask, and the BM25 ranking is returned as it is.
      * That is a weaker answer, not a broken one.</p>
      *
+     * <p>Whichever stage has the last word, the top of the list is scored on one unit relevance
+     * scale, which is what {@code excalibur.graph.min-score} and {@code min-separation} are set
+     * against: BM25 as a share of what the question could score, the exact rerank as a vector
+     * similarity, and the model as the relevance it judged. A stage that falls back hands on the
+     * scale of the stage before it, which is the same scale.</p>
+     *
      * @param config    Configuration, read for the LLM settings and the context budget
      * @param documents The index over each entity's text
      * @return The ranker the retriever should use
      */
     private static Ranker rankerFor(Config config, LexicalIndex documents,
                                     com.eonmux.excalibur.graph.vector.EntityVectors vectors) {
-        Ranker ranked = new LuceneRanker(documents);
+        // As a share of the attainable score rather than raw BM25, so that min-score reads the
+        // same for a question naming a rare entity as for one naming a common one.
+        Ranker ranked = new LuceneRanker(documents, "bm25", LuceneRanker.Scale.ATTAINABLE_SHARE);
 
         // Cheapest correction first. BM25 ranks by term overlap, which is why it is a good first
         // pass and a poor last one; re-scoring its top candidates against the entities' real
@@ -344,9 +351,9 @@ public final class GraphRagFactory {
      * {@code <root>/n/graph-staging}; a node that never sees the namespace header uses exactly
      * one, {@code shared}.</p>
      *
-     * <p>The configured value is the root itself. Taking its parent - which an earlier version
-     * did - discarded the last segment, so {@code /mnt/graphs/alpha} and {@code /mnt/graphs/beta}
-     * named one deployment, and a relative single-segment value named none.</p>
+     * <p>The configured value is the root itself, not its parent: taking the parent would discard
+     * the last segment, so {@code /mnt/graphs/alpha} and {@code /mnt/graphs/beta} would name one
+     * deployment, and a relative single-segment value would name none.</p>
      *
      * @param config  Application configuration
      * @param dataDir The node's data directory, used when the key is unset or blank

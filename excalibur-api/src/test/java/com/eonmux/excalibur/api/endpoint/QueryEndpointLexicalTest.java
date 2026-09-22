@@ -107,11 +107,6 @@ class QueryEndpointLexicalTest extends QueryEndpointTestBase {
         // have.
 
         private QueryEndpoint withLexical(java.nio.file.Path dir) throws Exception {
-            return withLexical(dir, null);
-        }
-
-        private QueryEndpoint withLexical(java.nio.file.Path dir,
-                com.eonmux.excalibur.retrieval.expand.QueryExpander expander) throws Exception {
             com.eonmux.excalibur.ingest.lexical.ChunkLexicalIndex index =
                 com.eonmux.excalibur.ingest.lexical.ChunkLexicalIndex.open(dir, 8.0);
             index.add("kb:oom.txt:chunk:0",
@@ -119,25 +114,8 @@ class QueryEndpointLexicalTest extends QueryEndpointTestBase {
             index.refresh();
             QueryEndpoint endpoint = new QueryEndpoint(queryPipeline, null, null, null, null);
             endpoint.setLexicalQueryService(new com.eonmux.excalibur.api.retrieval.LexicalQueryService(
-                index, expander, java.util.List.of()));
+                index, null, java.util.List.of()));
             return endpoint;
-        }
-
-        /** An expander that widens short queries and hands longer ones through as typed. */
-        private com.eonmux.excalibur.retrieval.expand.QueryExpander cappedAt(int chars) {
-            return new com.eonmux.excalibur.retrieval.expand.QueryExpander() {
-                @Override
-                public java.util.List<com.eonmux.excalibur.retrieval.expand.SearchFormulation> expand(
-                        String query) {
-                    return java.util.List.of(
-                        com.eonmux.excalibur.retrieval.expand.SearchFormulation.original(query));
-                }
-
-                @Override
-                public int maxExpandableChars() {
-                    return chars;
-                }
-            };
         }
 
         @Test
@@ -332,38 +310,6 @@ class QueryEndpointLexicalTest extends QueryEndpointTestBase {
 
             assertThat(body.toString(StandardCharsets.UTF_8))
                 .as("top_k is honoured, so an empty list is the honest answer")
-                .contains("\"ignored_fields\": []");
-        }
-
-        @Test
-        @DisplayName("says so when a query was too long for the expansion this node applies")
-        void namesExpansionWhenTheQueryIsTooLongForIt(
-                @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
-            // A query past the expander's bound is answered by plain BM25 while every shorter
-            // query is answered by an expanded search. Nothing in a result list shows that, so
-            // a caller comparing the two is comparing retrieval strategies unknowingly.
-            ByteArrayOutputStream body = new ByteArrayOutputStream();
-            HttpExchange exchange = createMockExchangeWithBody("POST",
-                "{\"query\": \"the kernel OOM killer sent SIGKILL after the cgroup memory "
-                    + "limit was exceeded\"}", body);
-
-            withLexical(dir, cappedAt(32)).handle(exchange);
-
-            assertThat(body.toString(StandardCharsets.UTF_8))
-                .contains("\"ignored_fields\": [\"query_expansion\"]");
-        }
-
-        @Test
-        @DisplayName("says nothing about expansion when the query was short enough for it")
-        void saysNothingWhenExpansionRan(
-                @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
-            ByteArrayOutputStream body = new ByteArrayOutputStream();
-            HttpExchange exchange = createMockExchangeWithBody(
-                "POST", "{\"query\": \"memory limit\"}", body);
-
-            withLexical(dir, cappedAt(32)).handle(exchange);
-
-            assertThat(body.toString(StandardCharsets.UTF_8))
                 .contains("\"ignored_fields\": []");
         }
 

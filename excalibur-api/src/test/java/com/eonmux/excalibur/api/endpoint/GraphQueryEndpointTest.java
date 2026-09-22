@@ -11,11 +11,14 @@ import com.eonmux.excalibur.graph.store.MappedEdgeStore;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.planner.QueryClassifier;
 import com.eonmux.excalibur.retrieval.HybridRetriever;
+import com.eonmux.excalibur.retrieval.fusion.ScorePassthrough;
 import com.eonmux.excalibur.retrieval.abstain.ThresholdAbstentionPolicy;
 import com.eonmux.excalibur.retrieval.lexical.LexicalIndex;
 import com.eonmux.excalibur.retrieval.lexical.LuceneRanker;
+import com.eonmux.excalibur.retrieval.pipeline.EntityLinker;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
 import com.eonmux.excalibur.retrieval.pipeline.LexicalEntityLinker;
+import com.eonmux.excalibur.retrieval.pipeline.RelationResolver;
 import com.eonmux.excalibur.retrieval.serialize.BpeTokenCounter;
 import com.eonmux.excalibur.retrieval.serialize.SerializationBudget;
 import com.eonmux.excalibur.retrieval.serialize.TripleSubgraphSerializer;
@@ -75,7 +78,8 @@ class GraphQueryEndpointTest {
             new QueryClassifier(),
             new LexicalEntityLinker(labelIndex),
             edgeStore,
-            new HybridRetriever(List.of(new LuceneRanker(documentIndex))),
+            new HybridRetriever(List.of(new LuceneRanker(documentIndex)), new ScorePassthrough(),
+                HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH),
             new TripleSubgraphSerializer(
                 id -> LABELS.getOrDefault(id, "E" + id), relation -> "collaboratedWith"),
             new ThresholdAbstentionPolicy(0.005, 0.001, 0.3, 5),
@@ -98,6 +102,12 @@ class GraphQueryEndpointTest {
 
     /** Drives the handler and returns {@code [status, body]}. */
     private Response call(String method, String body) throws IOException {
+        return call(endpoint, method, body);
+    }
+
+    /** Drives {@code handler} and returns {@code [status, body]}. */
+    private static Response call(GraphQueryEndpoint handler, String method, String body)
+            throws IOException {
         HttpExchange exchange = Mockito.mock(HttpExchange.class);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         int[] status = new int[1];
@@ -113,7 +123,7 @@ class GraphQueryEndpointTest {
             return null;
         }).when(exchange).sendResponseHeaders(Mockito.anyInt(), Mockito.anyLong());
 
-        endpoint.handle(exchange);
+        handler.handle(exchange);
         return new Response(status[0], out.toString(StandardCharsets.UTF_8));
     }
 
@@ -420,6 +430,204 @@ class GraphQueryEndpointTest {
         assertThat(call("GET", "").status()).isEqualTo(405);
     }
 
+    @Test
+    @DisplayName("a direction that is not one of the three, or not a string, is a 400")
+    void badDirectionIsRefused() throws IOException {
+        for (String bad : new String[] {"\"outgoing\"", "\"\"", "1", "true", "[\"forward\"]"}) {
+            Response response = call("POST",
+                "{\"query\": \"Who did Ada Lovelace collaborate with?\", \"direction\": "
+                    + bad + "}");
+
+            assertThat(response.status()).as("direction: %s", bad).isEqualTo(400);
+            assertThat(parse(response).get("error").asText()).contains("direction");
+        }
+    }
+
+    /**
+     * The parts of an answer that need a graph with more in it than one collaboration: names two
+     * entities share, facts with dates, and relations worth walking one way.
+     */
+    @Nested
+    @DisplayName("Ambiguity, aggregates and direction")
+    class RicherGraph {
+
+        private static final int ADA_KING = 3;
+        private static final int NOTE_G = 4;
+        private static final int LONDON = 5;
+        private static final int TURIN = 6;
+        private static final int ANALYTICAL_ENGINE = 7;
+        private static final int AUTHORED = 1;
+        private static final int LIVED_IN = 2;
+        private static final int DESIGNED = 3;
+
+        private final Map<Long, String> labels = Map.of(
+            (long) ADA, "Ada Lovelace", (long) BABBAGE, "Charles Babbage",
+            (long) ADA_KING, "Ada King", (long) NOTE_G, "Note G", (long) LONDON, "London",
+            (long) TURIN, "Turin", (long) ANALYTICAL_ENGINE, "Analytical Engine");
+        private final Map<Integer, String> relations = Map.of(
+            COLLABORATED_WITH, "collaboratedWith", AUTHORED, "authored", LIVED_IN, "livedIn",
+            DESIGNED, "designed");
+
+        private MappedEdgeStore store;
+        private LexicalIndex documents;
+        private GraphQueryEndpoint richer;
+
+        private static int day(int year) {
+            return Math.toIntExact(java.time.LocalDate.of(year, 1, 1).toEpochDay());
+        }
+
+        @BeforeEach
+        void build(@TempDir Path root) throws IOException {
+            Provenance curated = new Provenance(SourceType.KNOWLEDGE_BASE, 1, 96, 7);
+            EdgeStoreWriter writer = new EdgeStoreWriter().supersessionPolicy(
+                com.eonmux.excalibur.graph.temporal.SupersessionPolicy.forRelations(LIVED_IN));
+            writer.add(ADA, COLLABORATED_WITH, BABBAGE, Integer.MIN_VALUE, TemporalFilter.OPEN,
+                curated);
+            writer.add(ADA, AUTHORED, NOTE_G, day(1843), TemporalFilter.OPEN, curated);
+            writer.add(ADA, LIVED_IN, LONDON, day(1815), TemporalFilter.OPEN, curated);
+            writer.add(ADA, LIVED_IN, TURIN, day(1841), TemporalFilter.OPEN, curated);
+            writer.add(BABBAGE, DESIGNED, ANALYTICAL_ENGINE, day(1837), TemporalFilter.OPEN,
+                curated);
+            writer.build(root.resolve("graph"), 16);
+            store = MappedEdgeStore.open(root.resolve("graph"));
+
+            documents = LexicalIndex.open(root.resolve("docs"), 16.0);
+            documents.put(ADA, "Ada Lovelace mathematician who wrote Note G");
+            documents.put(ADA_KING, "Ada King countess who wrote long letters");
+            documents.put(BABBAGE, "Charles Babbage designed the Analytical Engine");
+            documents.put(NOTE_G, "Note G the first published algorithm");
+            documents.put(LONDON, "London capital city");
+            documents.put(TURIN, "Turin city in Piedmont");
+            documents.put(ANALYTICAL_ENGINE, "Analytical Engine mechanical computer");
+            documents.refresh();
+
+            EntityLinker linker = mention -> labels.entrySet().stream()
+                .filter(entry -> entry.getValue().toLowerCase(java.util.Locale.ROOT)
+                    .contains(mention.toLowerCase(java.util.Locale.ROOT)))
+                .mapToLong(Map.Entry::getKey)
+                .sorted()
+                .toArray();
+            richer = new GraphQueryEndpoint(new GraphRagPipeline(
+                new QueryClassifier(),
+                linker,
+                store,
+                new HybridRetriever(List.of(new LuceneRanker(documents, "bm25",
+                    LuceneRanker.Scale.ATTAINABLE_SHARE)), new ScorePassthrough(),
+                    HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH),
+                new TripleSubgraphSerializer(id -> labels.getOrDefault(id, "E" + id),
+                    relation -> relations.getOrDefault(Math.toIntExact(relation), "R" + relation)),
+                new ThresholdAbstentionPolicy(0.005, 0.001, 0.3, 5),
+                new SerializationBudget(2000, BpeTokenCounter.defaultCounter()),
+                10,
+                null,
+                RelationResolver.over(relations),
+                id -> labels.getOrDefault(id, "E" + id)));
+        }
+
+        @AfterEach
+        void close() {
+            if (store != null) {
+                store.close();
+            }
+            if (documents != null) {
+                documents.close();
+            }
+        }
+
+        private com.fasterxml.jackson.databind.JsonNode ask(String body) throws IOException {
+            Response response = call(richer, "POST", body);
+            assertThat(response.status()).as(response.body()).isEqualTo(200);
+            return parse(response);
+        }
+
+        @Test
+        @DisplayName("a name two entities share comes back as needs_input with both candidates")
+        void ambiguityNeedsInput() throws IOException {
+            var node = ask("{\"query\": \"What did Ada write?\"}");
+
+            assertThat(node.get("status").asText())
+                .as("the evidence was there; declining would tell the caller it was not")
+                .isEqualTo("needs_input");
+            assertThat(node.get("reason").asText()).isEqualTo("ambiguous_entity");
+            assertThat(node.get("question").asText()).contains("Ada Lovelace").contains("Ada King");
+            assertThat(node.get("candidates"))
+                .extracting(com.fasterxml.jackson.databind.JsonNode::asText)
+                .containsExactlyInAnyOrder("Ada Lovelace", "Ada King");
+            assertThat(node.get("as_of_source").asText())
+                .as("an ambiguity found by walking the graph walked it at an instant")
+                .isEqualTo("default");
+        }
+
+        @Test
+        @DisplayName("sending a candidate back in context_entities answers the question")
+        void candidateSentBackAnswers() throws IOException {
+            var asked = ask("{\"query\": \"What did Ada write?\"}");
+            String chosen = asked.get("candidates").get(0).asText();
+
+            var answered = ask("{\"query\": \"What did Ada write?\", \"context_entities\": ["
+                + "\"" + chosen + "\"]}");
+
+            assertThat(answered.get("status").asText()).isEqualTo("answered");
+            assertThat(answered.get("context").asText()).contains(chosen);
+        }
+
+        @Test
+        @DisplayName("a count comes back as a number beside the context")
+        void countIsReported() throws IOException {
+            var node = ask("{\"query\": \"How many things is Ada Lovelace related to?\"}");
+
+            assertThat(node.get("status").asText()).isEqualTo("answered");
+            var aggregate = node.get("aggregate");
+            assertThat(aggregate.get("function").asText()).isEqualTo("count");
+            assertThat(aggregate.get("count").asInt()).isEqualTo(3);
+            assertThat(aggregate.get("facts").asInt()).isEqualTo(3);
+            assertThat(aggregate.get("entities"))
+                .extracting(com.fasterxml.jackson.databind.JsonNode::asText)
+                .containsExactly("Charles Babbage", "Note G", "Turin");
+            assertThat(aggregate.has("valid_from")).as("a count has no date").isFalse();
+            assertThat(node.get("context").asText()).startsWith("# aggregate\ncount: 3");
+        }
+
+        @Test
+        @DisplayName("an earliest honours as_of and reports the day the fact began")
+        void earliestIsReportedAtTheInstant() throws IOException {
+            var now = ask("{\"query\": \"What did Ada Lovelace do last?\"}");
+            var then = ask("{\"query\": \"What did Ada Lovelace do last?\","
+                + " \"as_of\": \"1830-01-01\"}");
+
+            assertThat(now.get("aggregate").get("function").asText()).isEqualTo("latest");
+            assertThat(now.get("aggregate").get("valid_from").asText()).isEqualTo("1843-01-01");
+            assertThat(then.get("aggregate").get("valid_from").asText()).isEqualTo("1815-01-01");
+            assertThat(then.get("aggregate").get("entities").get(0).asText()).isEqualTo("London");
+        }
+
+        @Test
+        @DisplayName("an extremum with nothing dated reports a null start rather than a made-up one")
+        void undatedExtremumIsNull() throws IOException {
+            var node = ask("{\"query\": \"What did Charles Babbage do first?\","
+                + " \"as_of\": \"1830-01-01\"}");
+
+            assertThat(node.get("aggregate").get("valid_from").isNull()).isTrue();
+            assertThat(node.get("aggregate").get("count").asInt()).isZero();
+        }
+
+        @Test
+        @DisplayName("forward and reverse read the two ends of an edge apart; both reads each")
+        void directionIsHonoured() throws IOException {
+            String query = "\"query\": \"Who did Charles Babbage collaborate with?\"";
+            var forward = ask("{" + query + ", \"direction\": \"forward\"}");
+            var reverse = ask("{" + query + ", \"direction\": \"REVERSE\"}");
+            var both = ask("{" + query + "}");
+
+            assertThat(forward.get("context").asText()).contains("designed")
+                .doesNotContain("collaboratedWith");
+            assertThat(reverse.get("context").asText()).contains("collaboratedWith")
+                .doesNotContain("designed");
+            assertThat(both.get("context").asText()).contains("collaboratedWith")
+                .contains("designed");
+        }
+    }
+
     /**
      * What a question about a namespace may and may not do to the node.
      *
@@ -501,12 +709,26 @@ class GraphQueryEndpointTest {
         }
 
         @Test
+        @DisplayName("a bad direction is refused before any namespace is touched")
+        void badDirectionIsRefusedFirst() throws IOException {
+            Response response = ask("never-built",
+                "{\"query\": \"Who did Ada Lovelace collaborate with?\", \"direction\": \"up\"}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(root.resolve("never-built")).doesNotExist();
+        }
+
+        @Test
         @DisplayName("a namespace that is not a namespace is a 400")
         void anInvalidNamespaceIsRefused() throws IOException {
             assertThat(ask("Not A Namespace").status()).isEqualTo(400);
         }
 
         private Response ask(String namespace) throws IOException {
+            return ask(namespace, "{\"query\": \"Who did Ada Lovelace collaborate with?\"}");
+        }
+
+        private Response ask(String namespace, String body) throws IOException {
             HttpExchange exchange = Mockito.mock(HttpExchange.class);
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             int[] status = new int[1];
@@ -520,8 +742,7 @@ class GraphQueryEndpointTest {
             Mockito.when(exchange.getRequestURI()).thenReturn(URI.create("/v1/graph/query"));
             Mockito.when(exchange.getRequestHeaders()).thenReturn(requestHeaders);
             Mockito.when(exchange.getRequestBody()).thenReturn(new ByteArrayInputStream(
-                "{\"query\": \"Who did Ada Lovelace collaborate with?\"}"
-                    .getBytes(StandardCharsets.UTF_8)));
+                body.getBytes(StandardCharsets.UTF_8)));
             Mockito.when(exchange.getResponseHeaders()).thenReturn(new Headers());
             Mockito.when(exchange.getResponseBody()).thenReturn(out);
             Mockito.doAnswer(invocation -> {

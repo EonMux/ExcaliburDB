@@ -237,13 +237,26 @@ public class CuckooFilter {
     /**
      * Rounds up to a power of two, which is what the bucket index depends on.
      *
-     * <p>Rounding down was the original behaviour and silently cancelled the doubling above:
-     * twice the minimum for a capacity of 1000 is 500 buckets, and the largest power of two
-     * at or below 500 is 256 - fewer slots than the doubling was there to provide.</p>
+     * <p>Rounding down would silently cancel the doubling above: twice the minimum for a
+     * capacity of 1000 is 500 buckets, and the largest power of two at or below 500 is 256 -
+     * fewer slots than the doubling is there to provide.</p>
      *
      * @param value The least acceptable number of buckets
      * @return The smallest power of two at or above it, and never below {@link #MIN_BUCKETS}
      */
+    /**
+     * How many buckets a filter created for {@code capacity} entries has.
+     *
+     * <p>Always a power of two, and never smaller for a larger capacity.</p>
+     *
+     * @param capacity The entries the filter is sized for
+     * @return The bucket count {@link #create} would give it
+     */
+    public static long bucketsFor(long capacity) {
+        long minBuckets = (capacity + FINGERPRINTS_PER_BUCKET - 1) / FINGERPRINTS_PER_BUCKET;
+        return nextPowerOfTwo(Math.max(minBuckets * 2, MIN_BUCKETS));
+    }
+
     private static long nextPowerOfTwo(long value) {
         if (value <= MIN_BUCKETS) {
             return MIN_BUCKETS;
@@ -265,8 +278,7 @@ public class CuckooFilter {
         // a filter asked to hold its documented capacity sits near 98% full and starts refusing
         // terms - and a filter that has refused a term is no longer trusted to rule a segment
         // out, so pruning switches off and every query scans everything.
-        long minBuckets = (capacity + FINGERPRINTS_PER_BUCKET - 1) / FINGERPRINTS_PER_BUCKET;
-        long numBuckets = nextPowerOfTwo(Math.max(minBuckets * 2, MIN_BUCKETS));
+        long numBuckets = bucketsFor(capacity);
 
         // Cache-line aligned bucket storage: 8 bytes per bucket
         // This ensures buckets never cross 64-byte cache line boundaries

@@ -641,4 +641,31 @@ class FlakyTestAnalyzerTest {
             Map.of()
         );
     }
+
+    @Nested
+    @DisplayName("Command line")
+    class CommandLineTests {
+
+        @Test
+        @DisplayName("refuses a run count below the minimum with the analysis-failed code")
+        void refusesTooFewRuns() {
+            assertThat(FlakyTestAnalyzer.run(new String[] {"excalibur-integration", "1"}))
+                .isEqualTo(FlakyTestAnalyzer.EXIT_ANALYSIS_FAILED);
+        }
+
+        @Test
+        @DisplayName("refuses a run count that is not a number with the analysis-failed code")
+        void refusesNonNumericRuns() {
+            assertThat(FlakyTestAnalyzer.run(new String[] {"excalibur-integration", "many"}))
+                .isEqualTo(FlakyTestAnalyzer.EXIT_ANALYSIS_FAILED);
+        }
+
+        @Test
+        @DisplayName("keeps \"could not analyse\" apart from \"found something\"")
+        void exitCodesAreDistinct() {
+            assertThat(List.of(FlakyTestAnalyzer.EXIT_ALL_PASSED,
+                FlakyTestAnalyzer.EXIT_ISSUES_FOUND, FlakyTestAnalyzer.EXIT_ANALYSIS_FAILED))
+                .doesNotHaveDuplicates();
+        }
+    }
 }

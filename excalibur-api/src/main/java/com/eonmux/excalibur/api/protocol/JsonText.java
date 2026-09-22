@@ -341,18 +341,24 @@ public final class JsonText {
     }
 
     /**
-     * Whether a field is present at all.
+     * Whether a field carries a value.
      *
      * <p>The typed accessors take a default, so an absent field and one the caller set to the
      * default value read the same. Where the answer changes what is reported back - a field
      * this path cannot honour, say - the difference matters.</p>
      *
+     * <p>An explicit {@code null} is absence here as it is in every typed accessor. Answering
+     * true for it would let a caller of this method act on a value the accessor then reads as
+     * missing: a bounded setting taking its minimum, or a field reported as ignored that the
+     * request only spelled out as unset.</p>
+     *
      * @param json  The JSON document
      * @param field The field name
-     * @return true if the document carries the field
+     * @return true if the document carries the field with a value other than {@code null}
      */
     public static boolean has(String json, String field) {
-        return valueStart(json, field) >= 0;
+        int start = valueStart(json, field);
+        return start >= 0 && !isExplicitNull(json, start);
     }
 
     /**

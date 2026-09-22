@@ -3,6 +3,7 @@ package com.eonmux.excalibur.ingest.graph;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
+import com.eonmux.excalibur.graph.temporal.TemporalFilter;
 import com.eonmux.excalibur.llm.LLMException;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 
@@ -10,6 +11,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.time.DateTimeException;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -36,6 +39,21 @@ import java.util.regex.Pattern;
  * where a relation name belongs. A reply that yields nothing readable at all is an
  * {@link ExtractionException} - the document was examined and the answer was lost, and recording
  * that it asserted nothing would leave a gap no later run would notice.</p>
+ *
+ * <h2>Dates</h2>
+ * <p>The model is asked for the dates a fact held over only where the text states them - "joined
+ * Acme in March 2019", "was chair until 2021" - and never to estimate one. A fact whose text gives
+ * no date is valid over all time as far as this extractor knows, which is the truth about what it
+ * read. When a later document gives a single-valued relation a different value, the graph
+ * builder orders the two by these dates where they exist and by the documents' own dates where
+ * they do not, which the ingestion side records; guessing here would put an invented date ahead
+ * of a real one.</p>
+ *
+ * <p>A date is taken at the precision the text gave it. A start is the first day of the period
+ * named - "2019" begins on 1 January 2019 - and an end, which the model reports as the last period
+ * the fact held in, becomes the first day after that period, which is how an interval's end is
+ * stored. A date that does not parse is dropped and the fact kept; an end that does not fall
+ * after its start drops both, because one of them is wrong and nothing says which.</p>
  *
  * <h2>Cost</h2>
  * <p>One call per document, over a bounded prefix of its text. Extraction is the most expensive
@@ -72,8 +90,12 @@ public final class LlmRelationExtractor implements RelationExtractor {
         + "Each element is {\"subject\":\"...\",\"relation\":\"...\",\"object\":\"...\","
         + "\"confidence\":0.0}. Use the shortest form of each entity's proper name as it appears "
         + "in the text. Use a short lower_snake_case verb phrase for the relation. Give confidence "
-        + "between 0 and 1 for how clearly the text states the fact. Extract only what the text "
-        + "actually asserts; never infer. Reply with [] if it asserts no relationships.";
+        + "between 0 and 1 for how clearly the text states the fact. When the text states when a "
+        + "fact began to hold, add \"valid_from\" with that date; when it states the last date the "
+        + "fact held, add \"valid_to\" with that date. Write a date as YYYY-MM-DD, or as YYYY-MM "
+        + "or YYYY when the text is only that precise, and leave both out when the text gives no "
+        + "date for the fact. Extract only what the text actually asserts; never infer a fact or "
+        + "a date. Reply with [] if it asserts no relationships.";
 
     /** One <code>{...}</code> object of the reply. */
     private static final Pattern OBJECT = Pattern.compile("\\{[^{}]*\\}");
@@ -81,6 +103,14 @@ public final class LlmRelationExtractor implements RelationExtractor {
     /** A string field of one object. */
     private static final Pattern FIELD = Pattern.compile(
         "\"(subject|relation|object)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+
+    /** A date field of one object, which the model omits when the text gives no date. */
+    private static final Pattern DATE = Pattern.compile(
+        "\"(valid_from|valid_to)\"\\s*:\\s*\"([^\"]*)\"");
+
+    /** A date at the precision a text states one: a year, a month or a day. */
+    private static final Pattern DATE_VALUE = Pattern.compile(
+        "(\\d{4})(?:-(\\d{1,2})(?:-(\\d{1,2}))?)?");
 
     /** The confidence field, which the model may omit. */
     private static final Pattern CONFIDENCE = Pattern.compile(
@@ -204,7 +234,8 @@ public final class LlmRelationExtractor implements RelationExtractor {
                 continue;
             }
 
-            triples.add(ExtractedTriple.alwaysValid(subject, relation, target,
+            int[] interval = intervalOf(object, documentKey);
+            triples.add(new ExtractedTriple(subject, relation, target, interval[0], interval[1],
                 Provenance.of(SourceType.DOCUMENT, sourceId, confidenceOf(object, documentKey),
                     extractorVersion)));
         }
@@ -215,6 +246,77 @@ public final class LlmRelationExtractor implements RelationExtractor {
                     + trimmed.substring(0, Math.min(200, trimmed.length())));
         }
         return List.copyOf(triples);
+    }
+
+    /**
+     * The interval one returned object states, as {@code [validFrom, validTo)} in epoch days.
+     *
+     * <p>{@link TemporalFilter#UNDATED} and {@link TemporalFilter#OPEN} for a bound the text did
+     * not state, or stated in a form that does not parse. Both are dropped when the end does not
+     * fall after the start: the two bounds contradict each other, and keeping either one alone
+     * would be choosing which half of the model's answer to believe.
+     *
+     * @param object      The object text
+     * @param documentKey The document, for the log line
+     * @return The two bounds
+     */
+    private static int[] intervalOf(String object, String documentKey) {
+        int validFrom = TemporalFilter.UNDATED;
+        int validTo = TemporalFilter.OPEN;
+        Matcher dates = DATE.matcher(object);
+        while (dates.find()) {
+            boolean start = "valid_from".equals(dates.group(1));
+            Integer day = dayOf(dates.group(2), start);
+            if (day == null) {
+                LOGGER.debug("unreadable {} in {}: {}", dates.group(1), documentKey,
+                    dates.group(2));
+            } else if (start) {
+                validFrom = day;
+            } else {
+                validTo = day;
+            }
+        }
+        if (validFrom >= validTo) {
+            LOGGER.debug("dropping the dates of a fact in {} whose end is not after its start: {}",
+                documentKey, object);
+            return new int[] { TemporalFilter.UNDATED, TemporalFilter.OPEN };
+        }
+        return new int[] { validFrom, validTo };
+    }
+
+    /**
+     * One bound of an interval, from a date at whatever precision the text gave.
+     *
+     * @param text  The date as the model wrote it
+     * @param start Whether it is the start - the first day of the period named - or the last
+     *              period the fact held in, whose bound is the first day after it
+     * @return The bound in epoch days, or null if the text is not a date
+     */
+    private static Integer dayOf(String text, boolean start) {
+        Matcher date = DATE_VALUE.matcher(text.strip());
+        if (!date.matches()) {
+            return null;
+        }
+        try {
+            int year = Integer.parseInt(date.group(1));
+            LocalDate first;
+            LocalDate afterLast;
+            if (date.group(3) != null) {
+                first = LocalDate.of(year, Integer.parseInt(date.group(2)),
+                    Integer.parseInt(date.group(3)));
+                afterLast = first.plusDays(1);
+            } else if (date.group(2) != null) {
+                first = LocalDate.of(year, Integer.parseInt(date.group(2)), 1);
+                afterLast = first.plusMonths(1);
+            } else {
+                first = LocalDate.of(year, 1, 1);
+                afterLast = first.plusYears(1);
+            }
+            return Math.toIntExact((start ? first : afterLast).toEpochDay());
+        } catch (DateTimeException e) {
+            // A month thirteen or a thirty-first of February: shaped like a date and not one.
+            return null;
+        }
     }
 
     /**

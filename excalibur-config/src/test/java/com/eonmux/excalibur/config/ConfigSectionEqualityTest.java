@@ -156,6 +156,7 @@ class ConfigSectionEqualityTest {
             v("documentAtomicity", "excalibur.ingest.document-atomicity", "false"),
             v("reindexIntervalMs", "excalibur.ingest.reindex-interval-ms", "7200000"),
             v("crawlDelayMs", "excalibur.ingest.crawl-delay-ms", "1000"),
+            v("lexicalRefreshIntervalMs", "excalibur.ingest.lexical-refresh-interval-ms", "5000"),
             v("lexicalEngine", "excalibur.ingest.lexical-engine", "lucene"),
             v("lexicalTombstoneRatio", "excalibur.ingest.lexical-tombstone-ratio", "0.45"),
             v("lexicalMaxLatencySeconds", "excalibur.ingest.lexical-max-latency-seconds", "7200"),

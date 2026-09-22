@@ -443,6 +443,24 @@ public final class ErasureLog implements AutoCloseable {
     }
 
     /**
+     * What this open log owes, in the shape {@link #inspect} reads from a closed one.
+     *
+     * <p>For a caller that has to report on namespaces some of which are open and some not, and
+     * wants one answer for both: an open log is asked, because it holds the obligations in
+     * memory and its file may be mid-append, and a closed one is inspected.</p>
+     *
+     * @return How many requests are outstanding, and when the longest-waiting arrived
+     */
+    public Pending pending() {
+        synchronized (appendLock) {
+            Optional<Instant> oldest = outstanding.values().stream()
+                .map(ErasureRequest::requestedAt)
+                .min(Instant::compareTo);
+            return new Pending(outstanding.size(), oldest);
+        }
+    }
+
+    /**
      * Forces everything written so far to disk.
      *
      * <p>Worth calling after {@link #complete}, which deliberately does not force: it turns a

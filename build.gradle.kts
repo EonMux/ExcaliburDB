@@ -13,7 +13,7 @@ group = "com.eonmux"
 version = "1.0.0-SNAPSHOT"
 
 /** Stated once; every published POM's url and scm entries read from here. */
-val PROJECT_URL = "https://github.com/aeslampanah/excaliburdb"
+val PROJECT_URL = "https://github.com/EonMux/ExcaliburDB"
 
 // Java 21 configuration
 java {
@@ -134,7 +134,7 @@ subprojects {
                             url.set(PROJECT_URL)
                             connection.set("scm:git:$PROJECT_URL.git")
                             developerConnection.set(
-                                "scm:git:git@github.com:aeslampanah/excaliburdb.git")
+                                "scm:git:git@github.com:EonMux/ExcaliburDB.git")
                         }
                     }
                 }
@@ -337,8 +337,8 @@ subprojects {
         // classDirectories below reads compileJava's output. `dependsOn(test)` normally implies
         // that, but `./gradlew build -x test` severs the implication and Gradle then refuses the
         // whole build for an undeclared task dependency. That command is documented in the README
-        // and in USAGE.md, and analyze-flaky-tests.sh runs it, so the dependency is declared
-        // outright rather than left to be inferred from a task that may not run.
+        // and in USAGE.md, so the dependency is declared outright rather than left to be inferred
+        // from a task that may not run.
         dependsOn(tasks.named("classes"))
 
         // Skipping the tests skips the evidence. Verifying with no execution data reports 0% for

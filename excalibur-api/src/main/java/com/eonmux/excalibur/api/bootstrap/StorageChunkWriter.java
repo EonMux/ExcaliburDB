@@ -103,16 +103,17 @@ public final class StorageChunkWriter implements OffsetAwareStorageWriter {
     /**
      * Whether the storage engine holds a segment of its own under this ID.
      *
-     * <p>Segment IDs minted by {@link com.eonmux.excalibur.store.SegmentCatalog#create} are drawn from a
-     * counter the catalog advances past every ID it has issued, splits included, so a created
-     * entry always names an index beyond the engine's canonical ones. On an engine that has never
-     * split, that index is past the routing directory too and resolves to nothing.</p>
+     * <p>Segment IDs minted by {@link com.eonmux.excalibur.store.SegmentCatalog#create} start at
+     * {@link com.eonmux.excalibur.store.SegmentCatalog#FIRST_CREATED_SEGMENT_ID}, above every index
+     * an {@code int}-wide routing directory can hold, so a created entry never names a slot of the
+     * directory, however far it has split, and is never a write target.</p>
      *
-     * <p>After a split it resolves anyway. Doubling the directory fills its upper half with buddy
-     * pointers to the segments already in the lower half, so an out-of-range ID lands on a live
-     * segment that is routing unrelated keys. Asking whether the ID resolves cannot tell the two
-     * apart; asking whether the engine holds a distinct segment <em>under that ID</em> can, and
-     * that is the question a caller wanting a segment to fill is really asking.</p>
+     * <p>An index inside the directory is not necessarily one either. Doubling the directory
+     * fills its upper half with buddy pointers to the segments already in the lower half, so an
+     * index can resolve to a live segment that is filed under a lower index and routes other
+     * keys. Asking whether the ID resolves cannot tell the two apart; asking whether the engine
+     * holds a distinct segment <em>under that ID</em> can, and that is the question a caller
+     * wanting a segment to fill is really asking.</p>
      *
      * @param segmentId The routing index writes would be targeted at
      * @return true if the engine holds a segment of its own at that index

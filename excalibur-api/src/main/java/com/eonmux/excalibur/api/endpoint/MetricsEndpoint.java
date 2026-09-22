@@ -175,6 +175,135 @@ public final class MetricsEndpoint implements HttpHandler {
         appendDegradation(text, stats);
         appendLexical(text, stats.lexical());
         appendQueryCache(text, stats.queryCache());
+        appendGraph(text, stats.graph());
+    }
+
+    /**
+     * The graph tenants, when this node builds its own graph.
+     *
+     * <p>Totals only. A label per namespace would be a series for every name a caller ever put
+     * in the namespace header, which is the one kind of cardinality a scraper cannot be
+     * configured around.</p>
+     *
+     * @param text  The scrape being built
+     * @param graph The graph's figures, or null where there is no graph
+     */
+    private static void appendGraph(PrometheusText text, GraphStats graph) {
+        if (graph == null) {
+            return;
+        }
+        GraphStats.NamespaceStats namespaces = graph.namespaces();
+        GraphStats.BuildStats builds = graph.builds();
+        String buildsHelp = "Graph builds since startup, by how they ended";
+        text.gauge("excalibur_graph_namespaces_open", "Graph namespaces open now",
+                namespaces.open())
+            .gauge("excalibur_graph_namespaces_open_limit",
+                "Most graph namespaces kept open at once", namespaces.maxOpen())
+            .counter("excalibur_graph_namespace_evictions_total",
+                "Graph namespaces closed to stay within the open bound or the mapping budget",
+                namespaces.evictions())
+            .gauge("excalibur_graph_build_running", "1 while a graph build is in progress",
+                builds.running() ? 1 : 0)
+            .counter("excalibur_graph_builds_total", buildsHelp,
+                Map.of("outcome", "completed"), builds.completed())
+            .counter("excalibur_graph_builds_total", buildsHelp,
+                Map.of("outcome", "failed"), builds.failed())
+            .counter("excalibur_graph_builds_total", buildsHelp,
+                Map.of("outcome", "cancelled"), builds.cancelled());
+        appendBudget(text, graph.budget());
+        appendGraphErasure(text, graph.erasure());
+        appendGraphIngest(text, graph.ingest());
+    }
+
+    /**
+     * Mappings and descriptors against the process limits the tenant budget defends.
+     *
+     * <p>One family per resource, split by a {@code scope} label, so the alert that matters is
+     * a single ratio - {@code excalibur_mappings{scope="process"} / excalibur_mappings_limit} -
+     * and the graphs' share sits beside it to say how much of that eviction could give back.
+     * The process series is omitted where the platform cannot be asked, and the descriptor
+     * limit and high-water mark where no limit is enforced, rather than exported as zeros an
+     * alert would read as "nothing in use" or "no room at all".</p>
+     *
+     * @param text   The scrape being built
+     * @param budget The budget's figures
+     */
+    private static void appendBudget(PrometheusText text, GraphStats.BudgetStats budget) {
+        String mappings = "Memory mappings, the graphs' accounted share and the whole process";
+        String descriptors = "File descriptors, the graphs' accounted share and the whole process";
+        text.gauge("excalibur_mappings", mappings, Map.of("scope", "graphs"),
+                budget.graphMappings())
+            .gauge("excalibur_mappings_high_water",
+                "Mappings above which graph namespaces are evicted", budget.mappingHighWater())
+            .gauge("excalibur_mappings_limit",
+                "vm.max_map_count, or the assumed default where it could not be read",
+                budget.mappingLimit());
+        budget.processMappings().ifPresent(count ->
+            text.gauge("excalibur_mappings", mappings, Map.of("scope", "process"), count));
+        text.gauge("excalibur_descriptors", descriptors, Map.of("scope", "graphs"),
+            budget.graphDescriptors());
+        budget.processDescriptors().ifPresent(count ->
+            text.gauge("excalibur_descriptors", descriptors, Map.of("scope", "process"), count));
+        if (budget.descriptorLimit() > 0) {
+            text.gauge("excalibur_descriptors_high_water",
+                    "Descriptors above which graph namespaces are evicted",
+                    budget.descriptorHighWater())
+                .gauge("excalibur_descriptors_limit", "The soft RLIMIT_NOFILE",
+                    budget.descriptorLimit());
+        }
+    }
+
+    /**
+     * Erasure obligations across every namespace, omitted where the root could not be listed.
+     *
+     * @param text    The scrape being built
+     * @param erasure The backlog, or null
+     */
+    private static void appendGraphErasure(PrometheusText text, GraphStats.ErasureStats erasure) {
+        if (erasure == null) {
+            return;
+        }
+        String namespaces = "Graph namespaces by the state of their erasure obligations";
+        text.gauge("excalibur_graph_erasure_obligations",
+                "Graph erasure obligations accepted and not yet discharged",
+                erasure.outstanding())
+            .gauge("excalibur_graph_erasure_namespaces", namespaces, Map.of("state", "owing"),
+                erasure.namespacesOwing())
+            .gauge("excalibur_graph_erasure_namespaces", namespaces, Map.of("state", "overdue"),
+                erasure.overdueNamespaces())
+            .gauge("excalibur_graph_erasure_namespaces", namespaces,
+                Map.of("state", "unreadable"), erasure.unreadableNamespaces())
+            .gauge("excalibur_graph_erasure_oldest_age_seconds",
+                "Age of the oldest graph erasure obligation, the figure "
+                    + "excalibur.graph.erasure-max-latency-seconds is measured against",
+                erasure.oldestAgeMs().isPresent() ? erasure.oldestAgeMs().getAsLong() / 1000.0
+                    : 0.0);
+    }
+
+    /**
+     * What ingestion has staged into the graph, omitted on a node whose ingestion stages none.
+     *
+     * <p>The failures are one family split by {@code reason}, so an alert on any of them is
+     * one expression and a new reason does not need a new alert.</p>
+     *
+     * @param text   The scrape being built
+     * @param ingest The sink's counts, or null
+     */
+    private static void appendGraphIngest(PrometheusText text, GraphStats.IngestStats ingest) {
+        if (ingest == null) {
+            return;
+        }
+        String failures = "Published documents whose facts did not reach the graph, by reason";
+        text.counter("excalibur_graph_ingest_documents_total",
+                "Published documents offered to the graph", ingest.documentsSeen())
+            .counter("excalibur_graph_ingest_facts_staged_total",
+                "Facts staged into the graph across every namespace", ingest.factsStaged())
+            .counter("excalibur_graph_ingest_failures_total", failures,
+                Map.of("reason", "unresolved_source"), ingest.unresolvedDocuments())
+            .counter("excalibur_graph_ingest_failures_total", failures,
+                Map.of("reason", "extraction"), ingest.extractionFailures())
+            .counter("excalibur_graph_ingest_failures_total", failures,
+                Map.of("reason", "namespace_unavailable"), ingest.tenantFailures());
     }
 
     /**

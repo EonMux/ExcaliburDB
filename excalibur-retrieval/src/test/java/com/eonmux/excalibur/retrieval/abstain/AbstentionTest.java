@@ -1,19 +1,30 @@
 package com.eonmux.excalibur.retrieval.abstain;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+
+import com.eonmux.excalibur.config.GraphConfig;
 
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.subgraph.Subgraph;
 import com.eonmux.excalibur.graph.subgraph.SubgraphEdge;
 import com.eonmux.excalibur.graph.temporal.TemporalFilter;
+import com.eonmux.excalibur.retrieval.HybridRetriever;
+import com.eonmux.excalibur.retrieval.fusion.ScorePassthrough;
 import com.eonmux.excalibur.retrieval.fusion.FusedDocument;
+import com.eonmux.excalibur.retrieval.fusion.ReciprocalRankFusion;
 import com.eonmux.excalibur.retrieval.fusion.SignalContribution;
+import com.eonmux.excalibur.retrieval.lexical.LexicalIndex;
+import com.eonmux.excalibur.retrieval.lexical.LuceneRanker;
+import com.eonmux.excalibur.retrieval.rank.RetrievalQuery;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -148,6 +159,45 @@ class AbstentionTest {
 
             double confidence = ((RetrievalOutcome.Results) outcome).confidence();
             assertThat(confidence).isBetween(0.0, 1.0).isLessThan(1.0);
+        }
+
+        @Test
+        @DisplayName("separation is a fraction of the best, capped at one when the runner-up is below zero")
+        void separationIsBounded() {
+            assertThat(ThresholdAbstentionPolicy.separation(0.8, 0.6))
+                .isCloseTo(0.25, org.assertj.core.data.Offset.offset(1e-12));
+            assertThat(ThresholdAbstentionPolicy.separation(0.4, -0.6)).isEqualTo(1.0);
+            assertThat(ThresholdAbstentionPolicy.separation(0.4, 0.4)).isZero();
+            assertThat(ThresholdAbstentionPolicy.separation(0.0, -1.0)).isEqualTo(1.0);
+            assertThat(ThresholdAbstentionPolicy.separation(0.0, 0.0)).isZero();
+        }
+
+        @Test
+        @DisplayName("a runner-up placed below zero leaves the best clearly separated, not over-separated")
+        void negativeRunnerUpAnswers() {
+            // A reranker places a candidate it could not measure beneath every one it could, below
+            // zero. That is a decisive gap, and the policy must read it as one without the
+            // separation running past the whole of the best score.
+            RetrievalOutcome outcome = policy.decide(
+                List.of(doc(1, 0.30, 1), doc(2, -0.70, 1)),
+                subgraphWith(SourceType.KNOWLEDGE_BASE, 95, 2));
+
+            assertThat(outcome).isInstanceOf(RetrievalOutcome.Results.class);
+        }
+
+        @Test
+        @DisplayName("a best score of zero or less is refused even with the score gate at zero")
+        void nothingMatchedIsRefusedAtZeroThreshold() {
+            ThresholdAbstentionPolicy permissive = new ThresholdAbstentionPolicy(0.0, 0.0, 0.0, 5);
+
+            RetrievalOutcome zero = permissive.decide(List.of(doc(1, 0.0, 1)), Subgraph.empty());
+            RetrievalOutcome negative = permissive.decide(
+                List.of(doc(1, -0.2, 1)), Subgraph.empty());
+
+            assertThat(zero).isInstanceOf(RetrievalOutcome.NoResults.class);
+            assertThat(negative).isInstanceOf(RetrievalOutcome.NoResults.class);
+            assertThat(permissive.decide(List.of(doc(1, 0.001, 1)), Subgraph.empty()))
+                .isInstanceOf(RetrievalOutcome.Results.class);
         }
 
         @Test
@@ -306,6 +356,36 @@ class AbstentionTest {
                 List.of(doc(1, 0.10, 1)), Subgraph.empty(), true);
 
             assertThat(observed.separation()).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("observe records what the policy reads when the scores run below zero")
+        void observeBoundsNativeScores() {
+            // A similarity can be negative and a runner-up the reranker could not measure sits
+            // below zero. The outcome records a refused-anyway best as zero and caps separation at
+            // one, which is exactly how the policy judges the same list.
+            AbstentionCalibrator.LabelledOutcome belowZero = AbstentionCalibrator.observe(
+                List.of(doc(1, -0.3, 1), doc(2, -0.9, 1)), Subgraph.empty(), false);
+            AbstentionCalibrator.LabelledOutcome farRunnerUp = AbstentionCalibrator.observe(
+                List.of(doc(1, 0.4, 1), doc(2, -0.6, 1)), Subgraph.empty(), true);
+
+            assertThat(belowZero.topScore()).isZero();
+            assertThat(farRunnerUp.separation()).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("an outcome with nothing matched is refused at every score threshold, as the policy refuses it")
+        void nothingMatchedIsRefusedWhenFitted() {
+            // The empty-list outcome scores zero. A fit that tried zero as the score gate and
+            // counted it answered would be fitting a query the policy never answers.
+            List<AbstentionCalibrator.LabelledOutcome> samples = List.of(
+                AbstentionCalibrator.observe(List.of(), Subgraph.empty(), true),
+                new AbstentionCalibrator.LabelledOutcome(0.10, 0.5, 0.9, true, true));
+
+            AbstentionCalibrator.Calibration fitted = AbstentionCalibrator.calibrate(samples, 0.5);
+
+            assertThat(fitted.answered()).isEqualTo(1);
+            assertThat(fitted.refused()).isEqualTo(1);
         }
 
         @Test
@@ -561,6 +641,120 @@ class AbstentionTest {
 
             assertThat(fitted.metTarget()).isFalse();
             assertThat(fitted.precision()).isLessThan(1.0);
+        }
+    }
+
+    @Nested
+    @DisplayName("gates on the retriever's own scale")
+    class NativeScale {
+
+        /** One retriever as the graph route builds it: one signal, on the unit relevance scale. */
+        private static HybridRetriever retrieverOver(LexicalIndex index) {
+            return new HybridRetriever(
+                List.of(new LuceneRanker(index, "bm25", LuceneRanker.Scale.ATTAINABLE_SHARE)),
+                new ScorePassthrough(), HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH);
+        }
+
+        /** The shipped thresholds, so the tests show the defaults doing what they say. */
+        private static ThresholdAbstentionPolicy shipped() {
+            return new ThresholdAbstentionPolicy(GraphConfig.DEFAULT_MIN_SCORE,
+                GraphConfig.DEFAULT_MIN_SEPARATION, 0.0,
+                GraphConfig.DEFAULT_MAX_AMBIGUOUS_CANDIDATES);
+        }
+
+        /** People sharing the word every description has, two of them sharing a first name. */
+        private static LexicalIndex people(Path dir) throws IOException {
+            LexicalIndex index = LexicalIndex.open(dir, 16.0);
+            index.put(1, "person ada lovelace mathematician");
+            index.put(2, "person ada king countess");
+            index.put(3, "person charles babbage engineer");
+            index.put(4, "person alan turing logician");
+            index.put(5, "person grace hopper admiral");
+            index.put(6, "person claude shannon engineer");
+            index.put(7, "person john neumann physicist");
+            index.put(8, "person kurt goedel logician");
+            index.put(9, "person marie curie chemist");
+            index.put(10, "person niels bohr physicist");
+            index.put(11, "person emmy noether algebraist");
+            index.put(12, "person srinivasa ramanujan prodigy");
+            index.refresh();
+            return index;
+        }
+
+        private static RetrievalOutcome decide(LexicalIndex index, String question) {
+            return shipped().decide(retrieverOver(index).retrieve(RetrievalQuery.ofText(question),
+                10), Subgraph.empty());
+        }
+
+        @Test
+        @DisplayName("min-score fires when no entity carries a twentieth of what the question asks")
+        void minScoreFires(@TempDir Path dir) throws IOException {
+            // Every word here is one the index holds, spread across all twelve people: whichever
+            // matches best carries a sliver of it, and answering from that one would answer a
+            // question nobody asked.
+            try (LexicalIndex index = people(dir)) {
+                RetrievalOutcome outcome = decide(index, "ada lovelace charles babbage alan "
+                    + "turing grace hopper claude shannon john neumann kurt goedel king countess "
+                    + "mathematician engineer logician admiral physicist marie curie chemist "
+                    + "niels bohr emmy noether algebraist srinivasa ramanujan prodigy");
+
+                assertThat(outcome).isInstanceOf(RetrievalOutcome.NoResults.class);
+                assertThat(((RetrievalOutcome.NoResults) outcome).reason())
+                    .isEqualTo(RetrievalOutcome.Reason.BELOW_CONFIDENCE_THRESHOLD);
+            }
+        }
+
+        @Test
+        @DisplayName("min-score does not fire on a question naming someone the graph knows")
+        void minScoreHolds(@TempDir Path dir) throws IOException {
+            try (LexicalIndex index = people(dir)) {
+                RetrievalOutcome outcome = decide(index, "which person was grace hopper");
+
+                assertThat(outcome).isInstanceOf(RetrievalOutcome.Results.class);
+            }
+        }
+
+        @Test
+        @DisplayName("min-separation fires when the question's one name fits two entities equally")
+        void minSeparationFires(@TempDir Path dir) throws IOException {
+            try (LexicalIndex index = people(dir)) {
+                RetrievalOutcome outcome = decide(index, "what did ada write");
+
+                assertThat(outcome).isInstanceOf(RetrievalOutcome.Ambiguous.class);
+                assertThat(((RetrievalOutcome.Ambiguous) outcome).candidates())
+                    .extracting(RetrievalOutcome.Candidate::entityId)
+                    .startsWith(1L, 2L);
+            }
+        }
+
+        @Test
+        @DisplayName("min-separation does not fire once the question tells the two apart")
+        void minSeparationHolds(@TempDir Path dir) throws IOException {
+            try (LexicalIndex index = people(dir)) {
+                RetrievalOutcome outcome = decide(index, "what did ada lovelace write");
+
+                assertThat(outcome).isInstanceOf(RetrievalOutcome.Results.class);
+            }
+        }
+
+        @Test
+        @DisplayName("fused alone, the same two questions would score identically and neither gate could tell")
+        void singleListFusionWouldBeInert(@TempDir Path dir) throws IOException {
+            // What the passthrough fixes: reciprocal rank over one list scores the top 1/(k+1)
+            // whether the question named a known person or only the word every entry shares.
+            try (LexicalIndex index = people(dir)) {
+                LuceneRanker ranker =
+                    new LuceneRanker(index, "bm25", LuceneRanker.Scale.ATTAINABLE_SHARE);
+                ReciprocalRankFusion fusion = new ReciprocalRankFusion();
+                double unknown = fusion.fuse(List.of(ranker.rank(
+                    RetrievalQuery.ofText("which person invented the telescope"), 10)), 10)
+                    .get(0).score();
+                double known = fusion.fuse(List.of(ranker.rank(
+                    RetrievalQuery.ofText("which person was grace hopper"), 10)), 10)
+                    .get(0).score();
+
+                assertThat(unknown).isEqualTo(known);
+            }
         }
     }
 }

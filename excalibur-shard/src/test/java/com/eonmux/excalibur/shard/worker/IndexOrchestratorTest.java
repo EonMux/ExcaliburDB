@@ -1080,7 +1080,6 @@ class IndexOrchestratorTest {
         HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(
             1_000_000L,  // corpus capacity
             13,          // fingerprint bits
-            100_000,     // cluster capacity
             10_000       // segment capacity
         );
         orchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
@@ -1183,13 +1182,12 @@ class IndexOrchestratorTest {
         CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
 
         // Create and wire hierarchical filter
-        HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(10_000L, 13, 1_000, 100);
+        HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(10_000L, 13, 100);
         worker.setHierarchicalFilter(hierarchicalFilter);
 
         // Register a segment in the hierarchy
         String segmentId = "test-segment-1";
-        String clusterId = "test-cluster-1";
-        hierarchicalFilter.registerSegment(segmentId, clusterId);
+        hierarchicalFilter.registerSegment(segmentId);
 
         // Insert a test item
         byte[] testKey = "test-key".getBytes();
@@ -1235,7 +1233,6 @@ class IndexOrchestratorTest {
         HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(
             100_000L,  // corpus capacity
             13,        // fingerprint bits
-            10_000,    // cluster capacity
             1_000      // segment capacity
         );
 
@@ -1252,14 +1249,12 @@ class IndexOrchestratorTest {
             "Filter should have no segments since none were registered");
 
         // Create a hierarchical filter and pre-register some segments in it
-        HierarchicalCuckooFilter filter2 = new HierarchicalCuckooFilter(
-            100_000L, 13, 10_000, 1_000
-        );
+        HierarchicalCuckooFilter filter2 = new HierarchicalCuckooFilter(100_000L, 13, 1_000);
 
         // Pre-register some segment IDs in the filter
-        filter2.registerSegment("100", "default");
-        filter2.registerSegment("200", "default");
-        filter2.registerSegment("300", "default");
+        filter2.registerSegment("100");
+        filter2.registerSegment("200");
+        filter2.registerSegment("300");
 
         assertEquals(3, filter2.getSegmentCount(),
             "Filter should have 3 segments pre-registered");

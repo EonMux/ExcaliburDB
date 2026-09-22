@@ -16,32 +16,45 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A hierarchical Cuckoo filter structure for efficient segment-level membership testing.
+ * A two-level Cuckoo filter structure for efficient segment-level membership testing.
  *
  * <h2>Structure</h2>
- * <p>The hierarchy consists of three levels:
+ * <p>The hierarchy consists of two levels:
  * <ul>
- *   <li><strong>Corpus (root):</strong> Top-level filter for the entire corpus</li>
- *   <li><strong>Topic Cluster (intermediate):</strong> Filters for topic/cluster groups</li>
- *   <li><strong>Segment (leaf):</strong> Per-segment filters</li>
+ *   <li><strong>Corpus (root):</strong> One filter holding every term on the node</li>
+ *   <li><strong>Segment (leaf):</strong> One filter per segment, holding that segment's terms</li>
  * </ul>
+ *
+ * <h2>Why there is no level between them</h2>
+ * <p>An intermediate level earns its memory only when it partitions the terms: a group of
+ * segments whose filter rejects a term lets a lookup skip the whole group without asking each
+ * segment. Storage places documents by the hash of their key, so every segment holds a uniform
+ * sample of the vocabulary and any group of segments holds nearly all of it - a group filter
+ * would answer "maybe" for almost every term that the corpus filter already let through, prune
+ * nothing, and cost a second corpus-sized filter to do it. It would also widen what one refused
+ * insert disables, from one segment to the whole group. A grouping level becomes worth having
+ * only when placement groups related documents, and then it belongs here with the placement
+ * that justifies it.</p>
  *
  * <h2>Query Flow</h2>
  * <p>Queries check the coarsest filter first, drilling down on positives:
  * <ol>
- *   <li>Check corpus filter - if negative, entry definitely not in corpus</li>
- *   <li>Check relevant cluster filters - skip segments in negative clusters</li>
+ *   <li>Check the corpus filter - if negative, the term is definitely not on the node</li>
  *   <li>Check segment filters - identify candidate segments</li>
  * </ol>
  *
  * <h2>Deletion with Propagation</h2>
- * <p>When a document is deleted, its fingerprint is removed from all levels:
+ * <p>When a document is deleted, its fingerprint is removed from both levels:
  * <ol>
- *   <li>Delete from segment filter (leaf level)</li>
- *   <li>Delete from cluster filter (intermediate level)</li>
- *   <li>Delete from corpus filter (root level)</li>
+ *   <li>Delete from the segment filter (leaf level)</li>
+ *   <li>Delete from the corpus filter (root level), once no other segment still reports it</li>
  * </ol>
- * <p>This ensures no stale false positives from tombstoned entries.</p>
+ * <p>The corpus level stores each fingerprint once, so two different terms that land on the same
+ * fingerprint and buckets there share one entry, and deleting it for one would deny the other.
+ * Every level therefore hashes with one seed, and no segment filter has more buckets than the
+ * corpus filter. Bucket counts are powers of two and bucket indexes are taken by mask, so two
+ * terms that collide at the corpus level collide in every segment filter too: the segment that
+ * holds the survivor reports the deleted term as present, and the shared entry is kept.</p>
  *
  * <h2>Thread Safety</h2>
  * <p><strong>This class is fully thread-safe.</strong></p>
@@ -63,8 +76,6 @@ import org.slf4j.LoggerFactory;
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Segment IDs are non-null, non-empty strings</li>
- *   <li>Cluster IDs are non-null strings</li>
- *   <li>Each segment belongs to exactly one cluster</li>
  *   <li>Deletion from any level returns false if not found (idempotent)</li>
  *   <li>All byte[] keys are converted using UTF-8 encoding</li>
  * </ul>
@@ -78,13 +89,10 @@ public class HierarchicalCuckooFilter {
     private static final Logger LOGGER = LoggerFactory.getLogger(HierarchicalCuckooFilter.class);
 
     private static final int DEFAULT_FINGERPRINT_BITS = 13;
-    private static final int DEFAULT_CLUSTER_CAPACITY = 100_000;
     private static final int DEFAULT_SEGMENT_CAPACITY = 10_000;
 
     private final CuckooFilter corpusFilter;
-    private final Map<String, CuckooFilter> clusterFilters;
     private final Map<String, CuckooFilter> segmentFilters;
-    private final Map<String, String> segmentToCluster;
 
     // Levels that have refused a term. A cuckoo filter that cannot accept an item does not hold
     // it, and every later question about that item gets "no" from a level that was never told.
@@ -92,11 +100,9 @@ public class HierarchicalCuckooFilter {
     // level records the refusal and stops claiming to know what it holds. Sticky until the
     // filter is rebuilt: freeing space elsewhere does not record the term that was refused.
     private final Set<String> saturatedSegments;
-    private final Set<String> saturatedClusters;
     private volatile boolean corpusSaturated;
 
     private final int fingerprintBits;
-    private final int clusterCapacity;
     private final int segmentCapacity;
 
     private final ReentrantReadWriteLock hierarchyLock;
@@ -109,8 +115,7 @@ public class HierarchicalCuckooFilter {
      * @throws IllegalArgumentException if corpusCapacity is not positive
      */
     public HierarchicalCuckooFilter(long corpusCapacity) {
-        this(corpusCapacity, DEFAULT_FINGERPRINT_BITS, 
-             DEFAULT_CLUSTER_CAPACITY, DEFAULT_SEGMENT_CAPACITY);
+        this(corpusCapacity, DEFAULT_FINGERPRINT_BITS, DEFAULT_SEGMENT_CAPACITY);
     }
 
     /**
@@ -118,91 +123,76 @@ public class HierarchicalCuckooFilter {
      *
      * @param corpusCapacity Expected number of entries in the corpus
      * @param fingerprintBits Number of bits per fingerprint (8-16)
-     * @param clusterCapacity Expected entries per cluster
      * @param segmentCapacity Expected entries per segment
-     * @throws IllegalArgumentException if any capacity is not positive
+     * @throws IllegalArgumentException if either capacity is not positive
      */
     public HierarchicalCuckooFilter(long corpusCapacity, int fingerprintBits,
-                                     int clusterCapacity, int segmentCapacity) {
-        if (corpusCapacity <= 0) {
-            throw new IllegalArgumentException("corpusCapacity must be positive: " + corpusCapacity);
-        }
-        if (clusterCapacity <= 0) {
-            throw new IllegalArgumentException("clusterCapacity must be positive: " + clusterCapacity);
-        }
-        if (segmentCapacity <= 0) {
-            throw new IllegalArgumentException("segmentCapacity must be positive: " + segmentCapacity);
-        }
-
-        this.fingerprintBits = fingerprintBits;
-        this.clusterCapacity = clusterCapacity;
-        this.segmentCapacity = segmentCapacity;
-        this.corpusFilter = CuckooFilter.create(corpusCapacity, fingerprintBits);
-        this.clusterFilters = new ConcurrentHashMap<>();
-        this.segmentFilters = new ConcurrentHashMap<>();
-        this.segmentToCluster = new ConcurrentHashMap<>();
-        this.hierarchyLock = new ReentrantReadWriteLock();
-        this.totalEntries = new AtomicLong(0);
-        this.saturatedSegments = ConcurrentHashMap.newKeySet();
-        this.saturatedClusters = ConcurrentHashMap.newKeySet();
+                                     int segmentCapacity) {
+        this(createCorpusFilter(corpusCapacity, fingerprintBits), segmentCapacity);
     }
 
     /**
      * Creates a HierarchicalCuckooFilter from an existing corpus filter.
      *
+     * <p>Segment filters are created with the corpus filter's fingerprint width.</p>
+     *
      * @param corpusFilter The corpus-level Cuckoo filter
-     * @param clusterCapacity Expected entries per cluster
      * @param segmentCapacity Expected entries per segment
      * @throws NullPointerException if corpusFilter is null
+     * @throws IllegalArgumentException if segmentCapacity is not positive
      */
-    public HierarchicalCuckooFilter(CuckooFilter corpusFilter, 
-                                     int clusterCapacity, int segmentCapacity) {
+    public HierarchicalCuckooFilter(CuckooFilter corpusFilter, int segmentCapacity) {
         Objects.requireNonNull(corpusFilter, "corpusFilter must not be null");
-        if (clusterCapacity <= 0) {
-            throw new IllegalArgumentException("clusterCapacity must be positive");
-        }
         if (segmentCapacity <= 0) {
-            throw new IllegalArgumentException("segmentCapacity must be positive");
+            throw new IllegalArgumentException("segmentCapacity must be positive: " + segmentCapacity);
+        }
+
+        if (CuckooFilter.bucketsFor(segmentCapacity) > corpusFilter.numBuckets()) {
+            throw new IllegalArgumentException("segmentCapacity " + segmentCapacity
+                + " gives a segment filter more buckets than the corpus filter's "
+                + corpusFilter.numBuckets() + "; a segment cannot be sized past the corpus");
         }
 
         this.corpusFilter = corpusFilter;
         this.fingerprintBits = corpusFilter.fingerprintBits();
-        this.clusterCapacity = clusterCapacity;
         this.segmentCapacity = segmentCapacity;
-        this.clusterFilters = new ConcurrentHashMap<>();
         this.segmentFilters = new ConcurrentHashMap<>();
-        this.segmentToCluster = new ConcurrentHashMap<>();
         this.hierarchyLock = new ReentrantReadWriteLock();
         this.totalEntries = new AtomicLong(0);
         this.saturatedSegments = ConcurrentHashMap.newKeySet();
-        this.saturatedClusters = ConcurrentHashMap.newKeySet();
+    }
+
+    /**
+     * Creates the corpus level, refusing a capacity that could hold nothing.
+     *
+     * @param corpusCapacity Expected number of entries in the corpus
+     * @param fingerprintBits Number of bits per fingerprint
+     * @return The corpus filter
+     * @throws IllegalArgumentException if corpusCapacity is not positive
+     */
+    private static CuckooFilter createCorpusFilter(long corpusCapacity, int fingerprintBits) {
+        if (corpusCapacity <= 0) {
+            throw new IllegalArgumentException("corpusCapacity must be positive: " + corpusCapacity);
+        }
+        return CuckooFilter.create(corpusCapacity, fingerprintBits);
     }
 
     /**
      * Registers a new segment filter in the hierarchy.
      *
-     * <p>If the cluster doesn't exist, it will be created automatically.</p>
-     *
      * @param segmentId Unique segment identifier
-     * @param clusterId Cluster this segment belongs to
      * @return The created or existing segment filter
-     * @throws NullPointerException if segmentId or clusterId is null
+     * @throws NullPointerException if segmentId is null
      * @throws IllegalArgumentException if segmentId is empty
      */
-    public CuckooFilter registerSegment(String segmentId, String clusterId) {
+    public CuckooFilter registerSegment(String segmentId) {
         Objects.requireNonNull(segmentId, "segmentId must not be null");
-        Objects.requireNonNull(clusterId, "clusterId must not be null");
         if (segmentId.isEmpty()) {
             throw new IllegalArgumentException("segmentId must not be empty");
         }
 
         hierarchyLock.writeLock().lock();
         try {
-            segmentToCluster.put(segmentId, clusterId);
-
-            clusterFilters.computeIfAbsent(clusterId, k -> 
-                CuckooFilter.create(clusterCapacity, fingerprintBits));
-
             CuckooFilter existing = segmentFilters.get(segmentId);
             if (existing != null) {
                 return existing;
@@ -210,7 +200,8 @@ public class HierarchicalCuckooFilter {
             // A segment id can come back after a split or a reindex, holding a filter that has
             // refused nothing. Carrying the old mark would disable pruning for that id forever.
             saturatedSegments.remove(segmentId);
-            CuckooFilter created = CuckooFilter.create(segmentCapacity, fingerprintBits);
+            CuckooFilter created =
+                CuckooFilter.create(segmentCapacity, fingerprintBits, corpusFilter.seed());
             segmentFilters.put(segmentId, created);
             return created;
         } finally {
@@ -221,25 +212,31 @@ public class HierarchicalCuckooFilter {
     /**
      * Registers an existing Cuckoo filter for a segment.
      *
+     * <p>The filter must hash as the corpus level does - the same seed and fingerprint width -
+     * and have no more buckets than it, or a delete could strip a corpus entry another segment's
+     * term still depends on. See the class documentation.</p>
+     *
      * @param segmentId Unique segment identifier
-     * @param clusterId Cluster this segment belongs to
      * @param filter The Cuckoo filter for this segment
      * @throws NullPointerException if any argument is null
-     * @throws IllegalArgumentException if segmentId is empty
+     * @throws IllegalArgumentException if segmentId is empty, or the filter does not hash as the
+     *                                  corpus level does
      */
-    public void registerSegment(String segmentId, String clusterId, CuckooFilter filter) {
+    public void registerSegment(String segmentId, CuckooFilter filter) {
         Objects.requireNonNull(segmentId, "segmentId must not be null");
-        Objects.requireNonNull(clusterId, "clusterId must not be null");
         Objects.requireNonNull(filter, "filter must not be null");
         if (segmentId.isEmpty()) {
             throw new IllegalArgumentException("segmentId must not be empty");
         }
+        if (filter.seed() != corpusFilter.seed()
+                || filter.fingerprintBits() != corpusFilter.fingerprintBits()
+                || filter.numBuckets() > corpusFilter.numBuckets()) {
+            throw new IllegalArgumentException("segment " + segmentId + "'s filter must share "
+                + "the corpus filter's seed and fingerprint width and have no more buckets");
+        }
 
         hierarchyLock.writeLock().lock();
         try {
-            segmentToCluster.put(segmentId, clusterId);
-            clusterFilters.computeIfAbsent(clusterId, k -> 
-                CuckooFilter.create(clusterCapacity, fingerprintBits));
             saturatedSegments.remove(segmentId);
             segmentFilters.put(segmentId, filter);
         } finally {
@@ -251,7 +248,7 @@ public class HierarchicalCuckooFilter {
      * Unregisters a segment from the hierarchy.
      *
      * <p>This removes the segment filter but does NOT delete entries from
-     * cluster or corpus filters. Use {@link #deleteFromHierarchy(byte[])}
+     * the corpus filter. Use {@link #deleteFromHierarchy(byte[])}
      * for proper cleanup of deleted entries.</p>
      *
      * @param segmentId The segment ID to unregister
@@ -263,7 +260,6 @@ public class HierarchicalCuckooFilter {
         hierarchyLock.writeLock().lock();
         try {
             CuckooFilter removed = segmentFilters.remove(segmentId);
-            segmentToCluster.remove(segmentId);
             saturatedSegments.remove(segmentId);
             return removed != null;
         } finally {
@@ -274,16 +270,11 @@ public class HierarchicalCuckooFilter {
     /**
      * Inserts an item into all levels of the hierarchy.
      *
-     * <p>The item is inserted into:
-     * <ol>
-     *   <li>The segment filter</li>
-     *   <li>The cluster filter</li>
-     *   <li>The corpus filter</li>
-     * </ol>
+     * <p>The item is inserted into the segment filter and then the corpus filter.</p>
      *
      * @param item The item to insert
      * @param segmentId The segment ID
-     * @return true if insertion succeeded at all levels
+     * @return true if insertion succeeded at both levels
      * @throws NullPointerException if item or segmentId is null
      * @throws IllegalStateException if segment is not registered
      */
@@ -293,19 +284,12 @@ public class HierarchicalCuckooFilter {
 
         hierarchyLock.readLock().lock();
         try {
-            String clusterId = segmentToCluster.get(segmentId);
-            if (clusterId == null) {
+            CuckooFilter segmentFilter = segmentFilters.get(segmentId);
+            if (segmentFilter == null) {
                 throw new IllegalStateException("Segment not registered: " + segmentId);
             }
 
-            CuckooFilter segmentFilter = segmentFilters.get(segmentId);
-            CuckooFilter clusterFilter = clusterFilters.get(clusterId);
-
-            if (segmentFilter == null || clusterFilter == null) {
-                throw new IllegalStateException("Filter missing for segment: " + segmentId);
-            }
-
-            // Set semantics at every level: one entry per item per filter, not one per
+            // Set semantics at both levels: one entry per item per filter, not one per
             // insertion. A cuckoo filter stores a fingerprint in one of two buckets, each
             // holding a fixed handful of entries, so the same item inserted repeatedly
             // exhausts them and then fails for good - and deletion removes one slot per
@@ -328,23 +312,12 @@ public class HierarchicalCuckooFilter {
                 return false;
             }
 
-            // Roll back only the levels this call actually added to. Deleting an entry an
+            // Roll back only if this call added the segment entry. Deleting an entry an
             // earlier insertion put there would strip the item from a segment that still
             // holds it.
-            LevelInsert clusterResult = insertIfAbsent(clusterFilter, item);
-            if (clusterResult == LevelInsert.FULL) {
-                rollBack(segmentFilter, item, segmentResult);
-                if (saturatedClusters.add(clusterId)) {
-                    LOGGER.warn("Cluster {} filter is full at {} entries; no segment in it can "
-                        + "be ruled out any more", clusterId, clusterFilter.count());
-                }
-                return false;
-            }
-
             LevelInsert corpusResult = insertIfAbsent(corpusFilter, item);
             if (corpusResult == LevelInsert.FULL) {
                 rollBack(segmentFilter, item, segmentResult);
-                rollBack(clusterFilter, item, clusterResult);
                 if (!corpusSaturated) {
                     corpusSaturated = true;
                     LOGGER.warn("Corpus filter is full at {} entries; segment pruning is off and "
@@ -443,7 +416,7 @@ public class HierarchicalCuckooFilter {
     /**
      * Checks if an item might be present in a specific segment.
      *
-     * <p>This checks the full hierarchy: corpus → cluster → segment.</p>
+     * <p>This checks the full hierarchy: corpus, then segment.</p>
      *
      * @param item The item to check
      * @param segmentId The segment ID
@@ -460,16 +433,6 @@ public class HierarchicalCuckooFilter {
 
         hierarchyLock.readLock().lock();
         try {
-            String clusterId = segmentToCluster.get(segmentId);
-            if (clusterId == null) {
-                return false;
-            }
-
-            CuckooFilter clusterFilter = clusterFilters.get(clusterId);
-            if (clusterFilter != null && !clusterFilter.contains(item)) {
-                return false;
-            }
-
             CuckooFilter segmentFilter = segmentFilters.get(segmentId);
             if (segmentFilter == null) {
                 return false;
@@ -484,12 +447,8 @@ public class HierarchicalCuckooFilter {
     /**
      * Finds all segments that might contain the item.
      *
-     * <p>This method efficiently prunes the search space by:
-     * <ol>
-     *   <li>Checking corpus filter first (early exit if negative)</li>
-     *   <li>Checking cluster filters to narrow candidates</li>
-     *   <li>Checking segment filters for final candidates</li>
-     * </ol>
+     * <p>The corpus filter is checked first, and a term it rejects returns no candidates
+     * without asking any segment. Otherwise every segment filter is asked once.</p>
      *
      * @param item The item to search for
      * @return List of segment IDs that might contain the item
@@ -506,18 +465,9 @@ public class HierarchicalCuckooFilter {
 
         hierarchyLock.readLock().lock();
         try {
-            for (Map.Entry<String, CuckooFilter> clusterEntry : clusterFilters.entrySet()) {
-                if (clusterEntry.getValue().contains(item)) {
-                    String clusterId = clusterEntry.getKey();
-                    for (Map.Entry<String, String> segmentEntry : segmentToCluster.entrySet()) {
-                        if (segmentEntry.getValue().equals(clusterId)) {
-                            String segmentId = segmentEntry.getKey();
-                            CuckooFilter segmentFilter = segmentFilters.get(segmentId);
-                            if (segmentFilter != null && segmentFilter.contains(item)) {
-                                candidates.add(segmentId);
-                            }
-                        }
-                    }
+            for (Map.Entry<String, CuckooFilter> segmentEntry : segmentFilters.entrySet()) {
+                if (segmentEntry.getValue().contains(item)) {
+                    candidates.add(segmentEntry.getKey());
                 }
             }
         } finally {
@@ -531,27 +481,23 @@ public class HierarchicalCuckooFilter {
      * Deletes an item from all levels of the hierarchy immediately.
      *
      * <p><strong>CRITICAL:</strong> This method is called when a document is deleted.
-     * It removes the entry from:
-     * <ol>
-     *   <li>The segment filter</li>
-     *   <li>The cluster filter</li>
-     *   <li>The corpus filter</li>
-     * </ol>
+     * It removes the entry from the segment filter, and from the corpus filter once no other
+     * segment still reports it.</p>
      *
      * <p>This ensures queries issued after deletion will not consider the entry
      * as a candidate, preventing stale false positives.</p>
      *
-     * <p>The cluster and corpus levels are only touched when the segment filter actually
+     * <p>The corpus level is only touched when the segment filter actually
      * held the item. A Cuckoo delete removes the first slot whose fingerprint matches, so
      * deleting an item that was never inserted evicts some other item that happens to share
      * a fingerprint - and at the corpus level that other item can belong to any segment.
      * A miss at the leaf proves the item was never inserted for this segment.</p>
      *
-     * <p>That guard has a cost, and it is the reason a shared level can hold an entry no
+     * <p>That guard has a cost, and it is the reason the corpus level can hold an entry no
      * segment needs. Every level hashes independently, so two items whose fingerprints
-     * collide in the segment filter share one entry there and hold two here. Deleting the
-     * first removes the shared segment entry; deleting the second finds nothing at the leaf
-     * and stops, leaving its cluster and corpus entries behind for good. The rate is the
+     * collide in the segment filter share one entry there and hold two in the corpus. Deleting
+     * the first removes the shared segment entry; deleting the second finds nothing at the leaf
+     * and stops, leaving its corpus entry behind for good. The rate is the
      * fingerprint collision rate, and the error is the harmless one: a candidate segment
      * that turns out to hold nothing, never a document that cannot be found.</p>
      *
@@ -571,7 +517,7 @@ public class HierarchicalCuckooFilter {
                 return false;
             }
 
-            propagateDelete(item, segmentToCluster.get(segmentId), segmentId);
+            propagateDelete(item, segmentId);
             totalEntries.decrementAndGet();
             return true;
         } finally {
@@ -580,11 +526,11 @@ public class HierarchicalCuckooFilter {
     }
 
     /**
-     * Removes an item from the cluster and corpus filters, if no one else still needs it there.
+     * Removes an item from the corpus filter, if no other segment still needs it there.
      *
-     * <p>Those levels hold each item once however many segments contain it, so removing one
+     * <p>The corpus level holds each item once however many segments contain it, so removing one
      * segment's copy must not remove the shared entry while another segment still has the item
-     * - that would make the shared filter answer "absent" for something present, and the query
+     * - that would make the corpus filter answer "absent" for something present, and the query
      * path prunes on exactly that answer.
      *
      * <p>The checks are deliberately conservative. {@code mightContain} can be a false positive,
@@ -594,50 +540,19 @@ public class HierarchicalCuckooFilter {
      *
      * <p>The caller must hold {@code hierarchyLock}.
      *
+     * <p>Asking every other segment makes a delete proportional to the number of segments,
+     * which is the cost a lookup already pays on every corpus hit; deletes are far rarer.</p>
+     *
      * @param item        The item to remove
-     * @param clusterId   Cluster owning the segment, or null when unknown
      * @param fromSegment The segment it was just removed from, which is not consulted
      */
-    private void propagateDelete(byte[] item, String clusterId, String fromSegment) {
-        if (clusterId == null) {
-            return;
-        }
-        CuckooFilter clusterFilter = clusterFilters.get(clusterId);
-        if (clusterFilter == null || stillInCluster(item, clusterId, fromSegment)) {
-            return;
-        }
-        clusterFilter.delete(item);
-
-        // Only once no cluster claims it. Scanning cluster filters rather than every segment
-        // keeps this proportional to the number of clusters, and a delete is far rarer than a
-        // lookup.
-        for (CuckooFilter other : clusterFilters.values()) {
-            if (other != clusterFilter && other.contains(item)) {
+    private void propagateDelete(byte[] item, String fromSegment) {
+        for (Map.Entry<String, CuckooFilter> entry : segmentFilters.entrySet()) {
+            if (!entry.getKey().equals(fromSegment) && entry.getValue().contains(item)) {
                 return;
             }
         }
         corpusFilter.delete(item);
-    }
-
-    /**
-     * Whether any segment of a cluster other than {@code excluded} still holds the item.
-     *
-     * @param item      The item
-     * @param clusterId The cluster
-     * @param excluded  The segment it was just removed from
-     * @return true when the cluster's entry is still needed
-     */
-    private boolean stillInCluster(byte[] item, String clusterId, String excluded) {
-        for (Map.Entry<String, String> entry : segmentToCluster.entrySet()) {
-            if (!clusterId.equals(entry.getValue()) || entry.getKey().equals(excluded)) {
-                continue;
-            }
-            CuckooFilter sibling = segmentFilters.get(entry.getKey());
-            if (sibling != null && sibling.contains(item)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
@@ -661,8 +576,7 @@ public class HierarchicalCuckooFilter {
             for (Map.Entry<String, CuckooFilter> segmentEntry : segmentFilters.entrySet()) {
                 if (segmentEntry.getValue().delete(item)) {
                     deleted = true;
-                    propagateDelete(item, segmentToCluster.get(segmentEntry.getKey()),
-                        segmentEntry.getKey());
+                    propagateDelete(item, segmentEntry.getKey());
                     break;
                 }
             }
@@ -684,7 +598,7 @@ public class HierarchicalCuckooFilter {
      * multiple times when deleting many items from the same segment.</p>
      *
      * <p>As in {@link #deleteFromHierarchy(byte[], String)}, an item is removed from the
-     * cluster and corpus filters only when the segment filter held it. Deleting an item that
+     * corpus filter only when the segment filter held it. Deleting an item that
      * was never inserted would evict a fingerprint-colliding item belonging to another
      * segment from the shared corpus filter, which the query path then hard-prunes.</p>
      *
@@ -701,7 +615,6 @@ public class HierarchicalCuckooFilter {
 
         hierarchyLock.writeLock().lock();
         try {
-            String clusterId = segmentToCluster.get(segmentId);
             CuckooFilter segmentFilter = segmentFilters.get(segmentId);
 
             if (segmentFilter == null) {
@@ -713,7 +626,7 @@ public class HierarchicalCuckooFilter {
                     continue;
                 }
 
-                propagateDelete(item, clusterId, segmentId);
+                propagateDelete(item, segmentId);
                 deletedCount++;
                 totalEntries.decrementAndGet();
             }
@@ -728,8 +641,8 @@ public class HierarchicalCuckooFilter {
      * Removes all entries for a segment from the hierarchy.
      *
      * <p>This is used when a segment is tombstoned. It removes the segment
-     * filter but does NOT attempt to delete individual entries from cluster
-     * or corpus filters (they may have false positives from other segments).</p>
+     * filter but does NOT attempt to delete individual entries from the corpus
+     * filter (they may have false positives from other segments).</p>
      *
      * <p>For proper cleanup of deleted entries, use 
      * {@link #deleteFromHierarchy(byte[], String)} for each entry.</p>
@@ -760,10 +673,6 @@ public class HierarchicalCuckooFilter {
      */
     public boolean coversSegment(String segmentId) {
         if (segmentId == null || corpusSaturated || saturatedSegments.contains(segmentId)) {
-            return false;
-        }
-        String clusterId = segmentToCluster.get(segmentId);
-        if (clusterId == null || saturatedClusters.contains(clusterId)) {
             return false;
         }
         CuckooFilter segmentFilter = segmentFilters.get(segmentId);
@@ -806,16 +715,6 @@ public class HierarchicalCuckooFilter {
     }
 
     /**
-     * Returns the cluster filter for a cluster.
-     *
-     * @param clusterId The cluster ID
-     * @return The cluster filter, or null if not found
-     */
-    public CuckooFilter getClusterFilter(String clusterId) {
-        return clusterFilters.get(clusterId);
-    }
-
-    /**
      * Returns the corpus filter.
      *
      * @return The corpus-level Cuckoo filter
@@ -831,15 +730,6 @@ public class HierarchicalCuckooFilter {
      */
     public int getSegmentCount() {
         return segmentFilters.size();
-    }
-
-    /**
-     * Returns the total number of clusters.
-     *
-     * @return Cluster count
-     */
-    public int getClusterCount() {
-        return clusterFilters.size();
     }
 
     /**
@@ -916,7 +806,7 @@ public class HierarchicalCuckooFilter {
     @Override
     public String toString() {
         return String.format(
-            "HierarchicalCuckooFilter[segments=%d, clusters=%d, entries=%d, corpusLoadFactor=%.4f]",
-            getSegmentCount(), getClusterCount(), getTotalEntries(), getCorpusLoadFactor());
+            "HierarchicalCuckooFilter[segments=%d, entries=%d, corpusLoadFactor=%.4f]",
+            getSegmentCount(), getTotalEntries(), getCorpusLoadFactor());
     }
 }

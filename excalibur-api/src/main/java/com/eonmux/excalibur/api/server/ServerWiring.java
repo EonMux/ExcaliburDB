@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.server;
 
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
+import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.endpoint.InMemorySourceRegistry;
 import com.eonmux.excalibur.api.endpoint.IngestStatusEndpoint;
 import com.eonmux.excalibur.api.endpoint.ReindexEndpoint;
@@ -166,6 +167,9 @@ final class ServerWiring {
     /** Every namespace's graph, when this node builds its own. */
     private GraphTenants graphTenants;
 
+    /** What ingestion stages facts through, for the stats side to report, or null. */
+    private NamespaceRoutingGraphIngestSink graphIngestSink;
+
     /**
      * Assembles the collaborators every node has, and the registries derived from them.
      *
@@ -222,7 +226,7 @@ final class ServerWiring {
         if (config == null) {
             return ApiSecurityConfig.defaults();
         }
-        return ApiSecurityConfig.fromProperties(config.getEffectiveProperties());
+        return ApiSecurityConfig.fromConfig(config);
     }
 
     // ==================== What the lifecycle reads ====================
@@ -338,6 +342,11 @@ final class ServerWiring {
      */
     void withGraphSupport(GraphTenants tenants) {
         this.graphTenants = Objects.requireNonNull(tenants, "tenants cannot be null");
+    }
+
+    /** @param sink What ingestion stages facts through, or null on a node that stages none */
+    void withGraphIngestSink(NamespaceRoutingGraphIngestSink sink) {
+        this.graphIngestSink = sink;
     }
 
     // ==================== Reindexing ====================
@@ -494,6 +503,6 @@ final class ServerWiring {
             chunkIndex,
             ingestSourceRegistry, sourceCatalog, ingestionStatusRegistry, ingestionOrchestrator,
             reindexStatusRegistry, documentReindexer, resolver, reindexCoordinator,
-            documentErasure, graphTenants, graphPipeline, documentRegistry);
+            documentErasure, graphTenants, graphIngestSink, graphPipeline, documentRegistry);
     }
 }

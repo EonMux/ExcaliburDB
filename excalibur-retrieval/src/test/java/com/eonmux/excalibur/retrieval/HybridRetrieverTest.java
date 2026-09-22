@@ -6,6 +6,7 @@ import com.eonmux.excalibur.core.trace.QueryTrace;
 import com.eonmux.excalibur.core.trace.Stage;
 import com.eonmux.excalibur.retrieval.fusion.FusedDocument;
 import com.eonmux.excalibur.retrieval.fusion.ReciprocalRankFusion;
+import com.eonmux.excalibur.retrieval.fusion.ScorePassthrough;
 import com.eonmux.excalibur.retrieval.rank.RankedList;
 import com.eonmux.excalibur.retrieval.rank.Ranker;
 import com.eonmux.excalibur.retrieval.rank.RetrievalQuery;
@@ -152,12 +153,49 @@ class HybridRetrieverTest {
     void configuredFusionIsUsed() {
         // The convenience constructor builds fusion at its default k. A deployment that set k
         // has to be able to hand one in instead, or the setting would stop at this boundary.
-        HybridRetriever retriever = new HybridRetriever(List.of(new FixedRanker("dense", 1)),
+        HybridRetriever retriever = new HybridRetriever(
+            List.of(new FixedRanker("dense", 1), new FixedRanker("bm25", 1)),
             new ReciprocalRankFusion(17), HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH);
 
         assertThat(retriever.fusion().name()).isEqualTo("rrf(k=17)");
         assertThat(retriever.retrieve(QUERY, 1).get(0).score())
+            .isCloseTo(2.0 / 18, org.assertj.core.data.Offset.offset(1e-12));
+    }
+
+    @Test
+    @DisplayName("a single signal is fused like several, so the scale never depends on the count")
+    void singleSignalIsFused() {
+        // A caller that ranks by the returned score must read one scale whatever the node's
+        // signal count. Handing one signal's scores through is a fusion choice made explicitly.
+        HybridRetriever retriever = new HybridRetriever(List.of(new FixedRanker("bm25", 1)),
+            new ReciprocalRankFusion(17), HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH);
+
+        assertThat(retriever.retrieve(QUERY, 1).get(0).score())
             .isCloseTo(1.0 / 18, org.assertj.core.data.Offset.offset(1e-12));
+    }
+
+    @Test
+    @DisplayName("with a passthrough, a single signal's own scores come through")
+    void passthroughKeepsTheSignalsScores() {
+        Ranker strong = new Ranker() {
+            @Override
+            public String name() {
+                return "bm25";
+            }
+
+            @Override
+            public RankedList rank(RetrievalQuery query, int limit) {
+                return RankedList.of("bm25", List.of(
+                    new ScoredDocument(4, 0.82), new ScoredDocument(9, 0.10)), limit);
+            }
+        };
+        HybridRetriever retriever = new HybridRetriever(List.of(strong),
+            new ScorePassthrough(), HybridRetriever.DEFAULT_PER_SIGNAL_OVER_FETCH);
+
+        List<FusedDocument> results = retriever.retrieve(QUERY, 10);
+
+        assertThat(results).extracting(FusedDocument::documentId).containsExactly(4L, 9L);
+        assertThat(results).extracting(FusedDocument::score).containsExactly(0.82, 0.10);
     }
 
     @Test

@@ -124,6 +124,11 @@ class StatsEndpointTest {
         }
 
         @Override
+        public void addDocument(java.util.Map<String, String> chunks) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
         public void refresh() {
             throw new UnsupportedOperationException();
         }
@@ -377,10 +382,12 @@ class StatsEndpointTest {
             // invisible in the results: the node just gets slower. Nothing else in this
             // response would tell an operator that the corpus capacity is now too small.
             com.eonmux.excalibur.filter.HierarchicalCuckooFilter filter =
-                new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(8L, 13, 1_000_000, 1_000_000);
-            filter.registerSegment("0", "default");
+                new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(8L, 13, 8);
+            // Spread over many segments, so the level holding every term fills before any one.
             for (int i = 0; i < 4096 && !filter.isSaturated(); i++) {
-                filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), "0");
+                String spread = String.valueOf(i % 64);
+                filter.registerSegment(spread);
+                filter.insert(("term-" + i).getBytes(StandardCharsets.UTF_8), spread);
             }
             assertThat(filter.isSaturated())
                 .as("the corpus filter has to fill for this test to mean anything").isTrue();

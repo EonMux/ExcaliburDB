@@ -140,6 +140,21 @@ class GraphErasureCoordinatorTest {
     class Deciding {
 
         @Test
+        @DisplayName("reports what is owed and when the oldest obligation arrived")
+        void reportsWhatIsPending(@TempDir Path dir) throws IOException {
+            try (ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, CompactionPolicy.never(), CLOCK);
+                assertThat(coordinator.pending().count()).isZero();
+
+                coordinator.submit(new ErasureScope.Entity(1));
+
+                assertThat(coordinator.pending())
+                    .isEqualTo(new ErasureLog.Pending(1, java.util.Optional.of(NOW)));
+            }
+        }
+
+        @Test
         @DisplayName("a declining policy leaves the store and the request alone")
         void policyDeclines(@TempDir Path dir) throws IOException {
             Path graph = dir.resolve("graph");

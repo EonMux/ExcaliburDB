@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.OptionalLong;
 
 /**
  * Retrieval over the document corpus that needs no embedding of it.
@@ -45,14 +46,6 @@ public final class LexicalQueryService {
     private final HybridRetriever retriever;
     private final int rrfK;
 
-    /**
-     * The expander every query goes through, kept so an answer can describe what it did.
-     *
-     * <p>Held rather than only handed to the ranker because the length at which expansion
-     * stops applying is not visible in the results: a long question answered by a narrower
-     * search looks exactly like a question the corpus had less to say about.</p>
-     */
-    private final QueryExpander expander;
 
     /**
      * Creates the service.
@@ -82,12 +75,12 @@ public final class LexicalQueryService {
                                List<Ranker> extra, int rrfK, int perSignalOverFetch) {
         this.chunks = Objects.requireNonNull(chunks, "chunks must not be null");
         this.rrfK = rrfK;
-        this.expander = expander == null ? QueryExpander.identity() : expander;
+        QueryExpander widening = expander == null ? QueryExpander.identity() : expander;
         List<Ranker> rankers = new ArrayList<>();
         // The index supplies its own signal: the two engines search differently enough that
         // asking either to expose the other's query type would mean writing a translation layer
         // whose only job is to be wrong somewhere.
-        rankers.add(chunks.ranker(this.expander));
+        rankers.add(chunks.ranker(widening));
         if (extra != null) {
             rankers.addAll(extra);
         }
@@ -114,18 +107,19 @@ public final class LexicalQueryService {
     }
 
     /**
-     * The longest query this node will widen before searching it.
+     * Which state of the index a search started now would read.
      *
-     * <p>A query past it is still answered, and answered well - it is long enough to be
-     * specific - but by plain BM25 rather than by the expanded search every shorter query
-     * gets. Two retrieval strategies behind one endpoint is only honest if the answer says
-     * which one ran, and nothing in a result list shows it.</p>
+     * <p>What lets a lexical answer be cached at all. The index publishes new chunks, applies
+     * erasures and swaps compacted segments without a write this service sees, so there is no
+     * mutation to invalidate on; what there is instead is the index's own account of what a
+     * search would read. Two equal values mean a search would read the same postings, and an
+     * answer computed at one is an answer at the other.</p>
      *
-     * @return The bound in characters, or {@link Integer#MAX_VALUE} when length never stops
-     *         expansion on this node
+     * @return The version, or empty when this index cannot say - in which case nothing that
+     *         read it may be cached
      */
-    public int maxExpandableQueryChars() {
-        return expander.maxExpandableChars();
+    public OptionalLong searchVersion() {
+        return chunks.searchVersion();
     }
 
     /**

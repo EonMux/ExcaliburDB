@@ -21,7 +21,8 @@ import org.openjdk.jmh.runner.options.TimeValue;
  *
  * <h2>Targets</h2>
  * <ul>
- *   <li>Segment lookups: >=1B ops/sec (page cache hot)</li>
+ *   <li>Segment lookups: >=10M ops/sec single-threaded, page cache hot (see
+ *       {@link com.eonmux.excalibur.bench.metric.BenchmarkTargetRegistry})</li>
  *   <li>Cuckoo Filter lookups: High throughput, O(1) average case</li>
  *   <li>Cuckoo Filter inserts: Graceful degradation at high load factors</li>
  * </ul>
@@ -84,13 +85,11 @@ public class BenchmarkRunner {
                 .measurementTime(TimeValue.seconds(1))
                 // Fork configuration
                 .forks(1)
-                // JVM arguments for Panama FFM
-                .jvmArgsAppend(
-                    "--enable-preview",
-                    "--enable-native-access=ALL-UNNAMED",
+                // The flags every fork needs, then this benchmark's own
+                .jvmArgsAppend(ForkedJvm.flags(
                     "-Xms1g",
                     "-Xmx1g"
-                )
+                ))
                 // Output format
                 .shouldDoGC(true)
                 .build();

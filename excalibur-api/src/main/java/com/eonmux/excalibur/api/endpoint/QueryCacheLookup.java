@@ -2,7 +2,9 @@ package com.eonmux.excalibur.api.endpoint;
 
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
+import com.eonmux.excalibur.api.retrieval.LexicalQueryService;
 import com.eonmux.excalibur.query.QueryResponse;
+import com.eonmux.excalibur.query.cache.CachedAnswer;
 import com.eonmux.excalibur.query.cache.CorpusVersion;
 import com.eonmux.excalibur.query.cache.QueryCacheKey;
 import com.eonmux.excalibur.query.cache.QueryResultCache;
@@ -15,6 +17,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.OptionalLong;
 
 /**
  * One request's dealings with the query result cache: what was asked, what the corpus looked
@@ -28,23 +31,38 @@ import java.util.List;
  * {@link QueryResultCache#put} therefore receives the fingerprint from before, and refuses
  * the answer outright when the corpus has moved past it.</p>
  *
+ * <h2>What the fingerprint covers</h2>
+ * <p>Everything the route this node answers by reads. For vector search that is the segment
+ * catalog, {@code QueryPipeline.corpusVersion()}. For BM25 and for the two fused it is that and
+ * the lexical index as a search started now would see it - {@link LexicalQueryService#searchVersion()},
+ * which moves when the query epoch makes a new manifest entry visible, when an erasure
+ * tombstones a chunk and when compaction swaps a segment, with no write this process sees.
+ * Either index moving therefore moves the fingerprint, and the cache, which keeps one
+ * generation, drops every answer computed before it. An index that cannot say what it would
+ * read makes the fingerprint unreadable, and an unreadable fingerprint is neither served from
+ * nor stored to.</p>
+ *
+ * <p>The route is decided by what the node holds, not per request, so every lookup on one node
+ * presents a fingerprint of the same shape; a node that alternated between two would discard
+ * its own cache on every other query.</p>
+ *
  * <h2>What is cached, and what is not</h2>
- * <p>Only the vector pipeline's own answer. The BM25 half of a hybrid query runs fresh on
- * every request, and so does every read of result text - passages, snippets and
- * explanations. That is deliberate rather than an omission: the lexical index publishes
- * through a manifest whose entries become visible when the query epoch crosses them, so its
- * answer can change with no mutation to observe at all, and there is no cheap fingerprint of
- * it to key on. Caching the half that can be shown to be unchanged and re-running the half
- * that cannot is what keeps the answer correct.</p>
+ * <p>The ranking and what the search said about itself - one of {@link QueryResponse},
+ * {@link LexicalResponse} or {@link HybridResponse}, after relevancy scoring when it ran. Never
+ * the result text, snippets, explanations or {@code ignored_fields}: those are read and decided
+ * again for the request being answered. And only an answer from the route the fingerprint was
+ * taken for - a fused request that ended up answered by one signal is not the answer its key
+ * names, and is not stored under it.</p>
  *
  * @param cache   The cache, or null on a node that runs without one
  * @param key     The request, or null when there is no cache
  * @param version The corpus as it stood before the search, or null when there is no cache
- * @param hit     The answer already held, or null when there was none
+ * @param route   The route the key and fingerprint were taken for, or null when there is no
+ *                cache
  * @author ExcaliburDB
  */
 record QueryCacheLookup(QueryResultCache cache, QueryCacheKey key, CorpusVersion version,
-                        QueryResponse hit) {
+                        String route) {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(QueryCacheLookup.class);
 
@@ -55,40 +73,94 @@ record QueryCacheLookup(QueryResultCache cache, QueryCacheKey key, CorpusVersion
     private static final String ANONYMOUS = "anonymous";
 
     /**
-     * Looks one request up, fingerprinting the corpus first.
+     * Opens one request's lookup, fingerprinting the corpus first.
      *
      * @param cache    The cache, or null on a node that runs without one
-     * @param pipeline The pipeline the corpus fingerprint is read from
+     * @param pipeline The pipeline the segment catalog's fingerprint is read from
+     * @param lexical  The lexical index, read for its own fingerprint on the lexical and hybrid
+     *                 routes; may be null on the vector route
+     * @param route    The route this node answers by: {@link QueryResponseJson#VECTOR},
+     *                 {@link QueryResponseJson#LEXICAL} or {@link QueryResponseJson#HYBRID}
      * @param parsed   The validated search fields
      * @param context  The validated presentation fields
-     * @param hybrid   Whether a second signal was started for this request
      * @param exchange The request, for the credential it presented
-     * @return What the cache had to say, which on a node without one is {@link #NONE}
+     * @return The lookup, which on a node without a cache is {@link #NONE}
      */
     static QueryCacheLookup of(QueryResultCache cache, QueryPipeline pipeline,
+                               LexicalQueryService lexical, String route,
                                QueryRequestParser.ParsedQuery parsed, QueryContext context,
-                               boolean hybrid, HttpExchange exchange) {
+                               HttpExchange exchange) {
         if (cache == null) {
             return NONE;
         }
-        QueryCacheKey key = keyOf(parsed, context, hybrid, exchange);
-        CorpusVersion version = pipeline.corpusVersion();
-        return new QueryCacheLookup(cache, key, version, cache.get(key, version));
+        return new QueryCacheLookup(cache, keyOf(parsed, context, route, exchange),
+            versionOf(pipeline, lexical, route), route);
+    }
+
+    /**
+     * The answer already held for this request, if any.
+     *
+     * @param type The answer type this route produces
+     * @param <A>  The answer type
+     * @return The held answer, marked as served from the cache, or null
+     */
+    <A extends CachedAnswer> A hit(Class<A> type) {
+        if (cache == null) {
+            return null;
+        }
+        return cache.get(key, version, type);
     }
 
     /**
      * Stores an answer against the corpus it was computed from.
      *
-     * <p>A no-op on a node with no cache, and on an answer the cache refuses - a degraded,
-     * timed-out or cancelled one, or one computed against a corpus that has since moved.</p>
+     * <p>A no-op on a node with no cache, on an answer from a route other than the one this
+     * lookup was taken for, and on an answer the cache refuses - one that is degraded, timed
+     * out or cancelled, or computed against a corpus that has since moved.</p>
      *
-     * @param response The answer the pipeline produced
+     * @param answeredBy The route that actually produced the answer
+     * @param response   The answer
      */
-    void keep(QueryResponse response) {
-        if (cache == null) {
+    void keep(String answeredBy, CachedAnswer response) {
+        if (cache == null || !route.equals(answeredBy)) {
             return;
         }
         cache.put(key, version, response);
+    }
+
+    /**
+     * The fingerprint of everything the route reads.
+     *
+     * @param pipeline The pipeline, for the segment catalog
+     * @param lexical  The lexical index, for its own version
+     * @param route    The route being fingerprinted
+     * @return The fingerprint; {@link CorpusVersion#UNREADABLE} when any part cannot be read
+     */
+    private static CorpusVersion versionOf(QueryPipeline pipeline, LexicalQueryService lexical,
+                                           String route) {
+        CorpusVersion segments = pipeline.corpusVersion();
+        if (segments == null) {
+            return CorpusVersion.UNREADABLE;
+        }
+        if (QueryResponseJson.VECTOR.equals(route)) {
+            return segments;
+        }
+        if (lexical == null) {
+            return CorpusVersion.UNREADABLE;
+        }
+        OptionalLong lexicalVersion;
+        try {
+            lexicalVersion = lexical.searchVersion();
+        } catch (RuntimeException e) {
+            // Not a reason to fail the query, which can still search. It is a reason not to
+            // cache: an index that cannot say what it would read cannot be shown unchanged.
+            LOGGER.warn("The lexical index could not report its version; this answer will not "
+                + "be cached: {}", e.getMessage());
+            return CorpusVersion.UNREADABLE;
+        }
+        return lexicalVersion.isPresent()
+            ? segments.alongside(lexicalVersion.getAsLong())
+            : CorpusVersion.UNREADABLE;
     }
 
     /**
@@ -109,18 +181,18 @@ record QueryCacheLookup(QueryResultCache cache, QueryCacheKey key, CorpusVersion
      *
      * @param parsed   The validated search fields
      * @param context  The validated presentation fields
-     * @param hybrid   Whether a second signal was started for this request
+     * @param route    The route the answer will come from
      * @param exchange The request, for the credential it presented
      * @return The key
      */
     private static QueryCacheKey keyOf(QueryRequestParser.ParsedQuery parsed,
-                                       QueryContext context, boolean hybrid,
+                                       QueryContext context, String route,
                                        HttpExchange exchange) {
         QuerySearchOptions options = context.options();
         return QueryCacheKey.builder()
             .namespace("")
             .securityContext(securityContext(exchange))
-            .retrievalMode(hybrid ? "hybrid" : "vector")
+            .retrievalMode(route)
             .queryText(parsed.query())
             .topK(parsed.topK())
             .offset(options.offset())

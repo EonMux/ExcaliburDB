@@ -156,6 +156,24 @@ class BackupCliTest {
     }
 
     @Test
+    @DisplayName("snapshotting into a non-empty directory exits with the not-empty code")
+    void nonEmptySnapshotDestinationHasTheNotEmptyCode() throws IOException {
+        Path dataDir = DataDirectoryFixture.syntheticDirectory(tempDir.resolve("data"));
+        Path snapshotDir = Files.createDirectories(tempDir.resolve("snap"));
+        Path occupant = snapshotDir.resolve("already-here");
+        DataDirectoryFixture.writeRandom(occupant, 64, 9L);
+
+        Run refused = run("snapshot", "--data-dir", dataDir.toString(),
+            "--out", snapshotDir.toString());
+
+        assertThat(refused.code()).isEqualTo(ExitCode.TARGET_NOT_EMPTY.code());
+        assertThat(refused.err()).contains(snapshotDir.toString());
+        try (var entries = Files.list(snapshotDir)) {
+            assertThat(entries).containsExactly(occupant);
+        }
+    }
+
+    @Test
     @DisplayName("snapshotting a directory that is not there exits with the I/O code")
     void missingDataDirectoryIsAnIoError() {
         Run run = run("snapshot", "--data-dir", tempDir.resolve("nope").toString(),

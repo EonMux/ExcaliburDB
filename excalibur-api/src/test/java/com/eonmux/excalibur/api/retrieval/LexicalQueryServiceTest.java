@@ -83,6 +83,22 @@ class LexicalQueryServiceTest {
         }
 
         @Test
+        @DisplayName("scores are reciprocal-rank sums even with one signal, so the scale is fixed")
+        void oneSignalIsStillRankFused(@TempDir Path dir) throws Exception {
+            // A caller of /v1/query ranks by score and must read one scale whether or not this
+            // node expands queries or adds signals. The top hit is 1/(k+1), not its BM25 score.
+            java.util.concurrent.atomic.AtomicLong epoch =
+                new java.util.concurrent.atomic.AtomicLong(1);
+            try (com.eonmux.excalibur.ingest.lexical.NativeChunkIndex index = nativeIndexed(dir, epoch)) {
+                LexicalQueryService service = new LexicalQueryService(index, null, List.of());
+
+                assertThat(service.search("certificate chain verified", 3).get(0).score())
+                    .isCloseTo(1.0 / (service.rrfK() + 1),
+                        org.assertj.core.data.Offset.offset(1e-9));
+            }
+        }
+
+        @Test
         @DisplayName("a query for words the corpus lacks returns nothing, not something")
         void absentWordsFindNothing(@TempDir Path dir) throws Exception {
             java.util.concurrent.atomic.AtomicLong epoch =

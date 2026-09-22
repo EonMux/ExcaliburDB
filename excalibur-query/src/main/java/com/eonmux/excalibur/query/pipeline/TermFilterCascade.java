@@ -186,7 +186,7 @@ final class TermFilterCascade {
      *
      * <p>Only a segment the filter has actually been populated for can be excluded by it, and
      * only while the filter has had room for every term of it. A segment with no registered
-     * filter, one holding nothing, or one whose segment, cluster or corpus level has refused a
+     * filter, one holding nothing, or one whose segment or corpus level has refused a
      * term for want of room is a segment the filter has no opinion about — which is not the
      * same as one it has looked at and rejected.
      *

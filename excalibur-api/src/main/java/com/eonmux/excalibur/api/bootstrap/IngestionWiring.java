@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.api.bootstrap;
 
-import com.eonmux.excalibur.api.endpoint.SourceRegistry;
 import com.eonmux.excalibur.api.retrieval.LexicalQueryService;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
 import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
@@ -332,6 +331,8 @@ public record IngestionWiring(Config config,
         IngestionOrchestrator orchestrator = server.getIngestionOrchestrator();
         if (orchestrator != null) {
             orchestrator.setLexicalIndex(chunkIndex);
+            orchestrator.setLexicalRefreshIntervalMs(
+                config.ingest().getLexicalRefreshIntervalMs());
         }
         // Remembered, and shared with the query route: the ranker expands to search and the
         // response expands to report, and a second generation is a second bill and possibly
@@ -418,10 +419,10 @@ public record IngestionWiring(Config config,
     /**
      * Points ingestion at the graph, so published documents become facts.
      *
-     * <p>The lexical half is always wired: an entity's text is what the BM25 signal ranks it by,
-     * and it costs one staged record per mention. Extraction is wired only when it is asked for -
-     * it is a chat-model call per document, which is the most expensive thing ingestion can do,
-     * and a node doing vector search should not start paying for a graph nobody asked for.</p>
+     * <p>Extraction is wired only when it is asked for - it is a chat-model call per document,
+     * which is the most expensive thing ingestion can do, and a node doing vector search should
+     * not start paying for a graph nobody asked for. With it off the sink finds no facts, so it
+     * stages nothing and opens no namespace's graph.</p>
      *
      * <p>The sink routes rather than pointing at one tenant. A source belongs to the namespace
      * that registered it, and the sink stages each published document into that namespace's
@@ -446,28 +447,31 @@ public record IngestionWiring(Config config,
                 config.graph().getExtractorVersion());
         }
 
-        orchestrator.setGraphSink(new NamespaceRoutingGraphIngestSink(
-            graphTenants, sourceId -> namespaceOf(server, sourceId), extractor));
+        NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+            graphTenants, sourceId -> namespaceOf(server, sourceId), extractor);
+        orchestrator.setGraphSink(sink);
+        // The same sink, so the documents it drops are counted where an operator looks.
+        server.withGraphIngestSink(sink);
         LOGGER.info("Graph ingest wired: extraction {} (extractor version {}), staged into the "
             + "namespace each source was registered in", extractionEnabled ? "enabled"
             : "disabled", config.graph().getExtractorVersion());
     }
 
     /**
-     * Asks the server's source registry which namespace a source belongs to.
+     * Asks the server which namespace a source's documents belong to.
      *
      * <p>Read through the server on every call rather than captured once, because the registry
      * is replaced when the security policy is applied and a sink holding the one that existed at
-     * attachment time would answer from a registry nothing registers into. An absent registry
-     * answers empty, which the sink reads as "no namespace to stage into" rather than as the
-     * shared one.</p>
+     * attachment time would answer from a registry nothing registers into. Supplied documents
+     * resolve too, to the shared namespace, which is what lets facts extracted from them be
+     * staged at all. Anything else answers empty, which the sink reads as "no namespace to stage
+     * into" rather than as the shared one.</p>
      *
      * @param server   The server holding the registry
      * @param sourceId The source id
-     * @return Its namespace, or empty if nothing is registered under that id
+     * @return Its namespace, or empty if this node holds nothing under that id
      */
     private static Optional<NamespaceId> namespaceOf(ExcaliburDBServer server, String sourceId) {
-        SourceRegistry registry = server.getIngestSourceRegistry();
-        return registry == null ? Optional.empty() : registry.namespaceOf(sourceId);
+        return server.namespaceOfSource(sourceId);
     }
 }

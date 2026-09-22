@@ -13,8 +13,6 @@ repositories {
 dependencies {
     // SLF4J for logging
     implementation("org.slf4j:slf4j-api:2.0.16")
-    implementation(project(":excalibur-metrics"))
-    implementation(project(":excalibur-config"))
     
     // Test dependencies
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
@@ -54,7 +52,7 @@ tasks.jar {
         attributes(
             "Implementation-Title" to "ExcaliburDB Core",
             "Implementation-Version" to project.version,
-            "Implementation-URL" to "https://github.com/aeslampanah/excaliburdb"
+            "Implementation-URL" to "https://github.com/EonMux/ExcaliburDB"
         )
     }
 }

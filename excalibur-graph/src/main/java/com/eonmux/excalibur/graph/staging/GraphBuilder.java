@@ -152,8 +152,12 @@ public final class GraphBuilder {
         // deletes a true fact - "authored" closing the previous book when someone writes another.
         EdgeStoreWriter writer = new EdgeStoreWriter().supersessionPolicy(supersession);
 
-        long written = staging.forEach((subject, relation, object, validFrom, validTo, provenance) ->
-            writer.add(subject, relation, object, validFrom, validTo, provenance));
+        // In the order the facts were staged, which is supersession's last tie-break: of two
+        // statements from different sources that nothing else orders, the one staged later is
+        // the one that superseded the other.
+        long written = staging.forEachStaged(
+            (subject, relation, object, validFrom, validTo, statedOn, provenance) ->
+                writer.add(subject, relation, object, validFrom, validTo, statedOn, provenance));
 
         writer.build(scratch, entityCount);
         writeDictionary(scratch, ENTITY_DICTIONARY, staging.entityLabels());
@@ -254,11 +258,55 @@ public final class GraphBuilder {
      */
     public static void publish(Path scratch, Path target, Durability durability)
             throws IOException {
+        publish(scratch, target, durability, published -> null);
+    }
+
+    /**
+     * Opens what a publish put in place, before the graph it replaced is discarded.
+     *
+     * @param <T> What opening it produces
+     */
+    @FunctionalInterface
+    public interface Opener<T> {
+
+        /**
+         * Opens the graph just published.
+         *
+         * @param published The target directory, now holding the new graph
+         * @return Whatever the caller serves it through
+         * @throws IOException if the graph cannot be opened
+         */
+        T open(Path published) throws IOException;
+    }
+
+    /**
+     * Moves a completed build into place and opens it, keeping the previous graph until it has.
+     *
+     * <p>As {@link #publish(Path, Path, Durability)}, except that the previous graph is deleted
+     * only after {@code opener} has opened the new one. A graph that was forced to the device and
+     * renamed into place can still fail to open - an artifact written by one version and read by
+     * another, a file the opener expects and the build did not write - and deleting the fallback
+     * before finding that out leaves a node with nothing it can serve. If the opener fails, the
+     * new graph goes back to {@code scratch} and the previous one back to {@code target}, and
+     * the opener's exception propagates.</p>
+     *
+     * @param <T>        What opening the graph produces
+     * @param scratch    Where the build was assembled
+     * @param target     Where it is to be served from
+     * @param durability How the assembled build and the published name are forced
+     * @param opener     Opens the published graph
+     * @return What {@code opener} returned
+     * @throws IOException if the build cannot be forced, a move fails, or the opener fails
+     * @throws NullPointerException if any argument is null
+     */
+    public static <T> T publish(Path scratch, Path target, Durability durability,
+                                Opener<T> opener) throws IOException {
         Objects.requireNonNull(scratch, "scratch must not be null");
         Objects.requireNonNull(target, "target must not be null");
         Objects.requireNonNull(durability, "durability must not be null");
+        Objects.requireNonNull(opener, "opener must not be null");
 
-        Path previous = target.resolveSibling(target.getFileName() + PREVIOUS_SUFFIX);
+        Path previous = previousFor(target);
         deleteRecursively(previous);
 
         // Before either rename, and therefore while the previous graph is still the one being
@@ -286,7 +334,69 @@ public final class GraphBuilder {
         if (parent != null) {
             durability.fsyncDirectory(parent);
         }
+
+        T opened;
+        try {
+            opened = opener.open(target);
+        } catch (IOException | RuntimeException e) {
+            try {
+                Files.move(target, scratch, StandardCopyOption.ATOMIC_MOVE);
+                if (hadPrevious) {
+                    Files.move(previous, target, StandardCopyOption.ATOMIC_MOVE);
+                }
+                if (parent != null) {
+                    durability.fsyncDirectory(parent);
+                }
+            } catch (IOException rollback) {
+                e.addSuppressed(rollback);
+            }
+            throw e;
+        }
         deleteRecursively(previous);
+        return opened;
+    }
+
+    /**
+     * Puts back a graph that a publish interrupted by a crash left displaced.
+     *
+     * <p>A publish renames the served graph aside and then renames the new one into its place.
+     * A crash between the two leaves no graph at {@code target} and the whole previous one beside
+     * it, and a node that opened {@code target} as it found it would serve nothing, and a later
+     * build would delete the only copy. Restoring it here makes that crash cost the build and
+     * nothing else. When both are present the publish got as far as the new graph, which was
+     * forced before it was renamed, so it stands and the previous one is deleted: it may hold
+     * facts an erasure has since removed from the served graph, and nothing will read it.</p>
+     *
+     * @param target Where the graph is served from
+     * @return Whether a displaced graph was restored
+     * @throws IOException if the restoring rename or the removal fails
+     */
+    public static boolean recoverInterruptedPublish(Path target) throws IOException {
+        Objects.requireNonNull(target, "target must not be null");
+        Path previous = previousFor(target);
+        if (!Files.isDirectory(previous)) {
+            return false;
+        }
+        if (Files.exists(target)) {
+            deleteRecursively(previous);
+            LOGGER.info("removed {}, which a publish that completed its rename left behind",
+                previous);
+            return false;
+        }
+        Files.move(previous, target, StandardCopyOption.ATOMIC_MOVE);
+        LOGGER.warn("restored the graph at {} from {}, which an interrupted publish left in its "
+            + "place", target, previous);
+        return true;
+    }
+
+    /**
+     * Where a publish moves the served graph aside while it renames the new one into place.
+     *
+     * @param target Where the graph is served from
+     * @return The sibling that holds the displaced graph during a publish
+     */
+    public static Path previousFor(Path target) {
+        return target.resolveSibling(target.getFileName() + PREVIOUS_SUFFIX);
     }
 
     /**

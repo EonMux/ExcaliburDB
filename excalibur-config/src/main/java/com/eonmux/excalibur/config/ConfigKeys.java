@@ -82,6 +82,7 @@ public final class ConfigKeys {
         "excalibur.ingest.lexical-engine",
         "excalibur.ingest.lexical-max-latency-seconds",
         "excalibur.ingest.lexical-max-segments",
+        "excalibur.ingest.lexical-refresh-interval-ms",
         "excalibur.ingest.lexical-tombstone-ratio",
         "excalibur.ingest.reindex-interval-ms",
         "excalibur.llm.api-key",

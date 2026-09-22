@@ -6,6 +6,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
+import com.eonmux.excalibur.retrieval.pipeline.TraversalDirection;
+
 /**
  * What a model can do with an ExcaliburDB node, and how each of those maps onto its HTTP API.
  *
@@ -131,24 +133,31 @@ public final class McpTools {
             + "indexing or the deadline cut the search short, so the result may be incomplete. "
             + "'timed_out' and 'cancelled' say which. Use the order of the results, not the "
             + "'score' on them: 'retrieval' says which signals answered - 'vector' scores are "
-            + "similarities, 'lexical' are BM25 scores, 'hybrid' are fused rank sums near zero - "
-            + "and the three share no scale, so a score is comparable only with others from the "
-            + "same reply.",
+            + "similarities, 'lexical' and 'hybrid' scores are reciprocal-rank sums near zero - "
+            + "and when 'llm_scored' is true a relevancy model has reordered the results, and a "
+            + "score is its judgement between 0 and 1 for each result it judged. These share no "
+            + "scale, so a score is comparable only with others from the same reply.",
             ToolSchema.object(
                 ToolSchema.required("query", "string",
-                    "What to search for, in natural language. The server embeds it with the same "
-                    + "model it indexed with."),
+                    "What to search for, in natural language. The node matches it by meaning "
+                    + "when it has an embedding model, by keyword (BM25) when it has a lexical "
+                    + "index, and fuses the two when it has both; 'retrieval' in the reply says "
+                    + "which answered."),
                 ToolSchema.optional("top_k", "integer",
                     "How many passages to return. Omit for the server's default.", null))));
 
         tools.add(ToolSchema.tool(SEARCH_GRAPH,
             "Answer a question from the knowledge graph built out of the ingested documents. "
             + "Returns entities and facts to ground an answer on, not prose. Read the 'status' "
-            + "field: 'answered' carries the evidence in 'context' along with a confidence score; "
-            + "'needs_input' means an entity in the question was ambiguous and lists the candidates "
-            + "to pass back as context_entities; 'declined' means the graph does not hold enough to "
-            + "answer, which is a result and not an error - report that rather than guessing. "
-            + "Requires build_graph to have been run at least once.",
+            + "field: 'answered' carries the evidence in 'context' along with a confidence score, "
+            + "and for a 'how many', 'first' or 'latest' question an 'aggregate' object with the "
+            + "value the graph computed - use that number rather than counting the facts "
+            + "yourself; 'needs_input' means the question did not say which entity it meant - a "
+            + "pronoun with nothing to refer to, or a name several entities share - and carries "
+            + "a 'question' to put to the user and the 'candidates' to pass back as "
+            + "context_entities with the same query; 'declined' means the graph does not hold "
+            + "enough to answer, which is a result and not an error - report that rather than "
+            + "guessing. Requires build_graph to have been run at least once.",
             ToolSchema.object(
                 ToolSchema.required("query", "string",
                     "The question, in natural language."),
@@ -161,8 +170,16 @@ public final class McpTools {
                     + "for the whole history including facts that have since been superseded. "
                     + "Omit to answer from what holds now, or from a date mentioned in the "
                     + "question itself.", null),
+                ToolSchema.optionalChoice("direction",
+                    "Which way along a fact to read from the entities the question names: "
+                    + "'forward' for the facts they are the subject of (what a company "
+                    + "acquired), 'reverse' for the facts they are the object of (who acquired "
+                    + "it), 'both' for either. Omit for both, which is right unless the "
+                    + "direction of the relation is the point of the question.",
+                    directionNames()),
                 ToolSchema.optional("namespace", "string",
-                    "Namespace to query. Omit for the shared one.", null))));
+                    "Namespace to query. Omit for the configured default, or the shared one.",
+                    null))));
 
         tools.add(ToolSchema.tool(BUILD_GRAPH,
             "Turn the facts ingestion has extracted into the graph that search_graph reads. Run it "
@@ -174,9 +191,9 @@ public final class McpTools {
             + "in progress is refused.",
             ToolSchema.object(
                 ToolSchema.optional("namespace", "string",
-                    "Namespace to build. Omit for the shared one, which is what you want: "
-                    + "ingestion stages every fact it extracts under the shared namespace, so "
-                    + "building a named one finds nothing staged and publishes nothing.", null))));
+                    "Namespace to build. Omit for the configured default, or the shared one. "
+                    + "A namespace holds the facts extracted from the sources registered in "
+                    + "it, so build the one you ingested into.", null))));
 
         tools.add(ToolSchema.tool(GRAPH_BUILD_STATUS,
             "What the graph build is doing, and what the last one did. 'state' is 'idle', "
@@ -187,7 +204,8 @@ public final class McpTools {
             + "namespace is still serving the graph it had.",
             ToolSchema.object(
                 ToolSchema.optional("namespace", "string",
-                    "Namespace whose build to report on. Omit for the shared one.", null))));
+                    "Namespace whose build to report on. Omit for the configured default, or "
+                    + "the shared one.", null))));
 
         tools.add(ToolSchema.tool(INGEST_DOCUMENTS,
             "Register a local directory as a source and start indexing the documents in it. "
@@ -211,6 +229,10 @@ public final class McpTools {
                 ToolSchema.optional("excluded_directories", "array",
                     "Directory names to skip anywhere under the root, e.g. ['node_modules', "
                     + "'target']. Omit to keep the server's default skip list.", "string"),
+                ToolSchema.optional("namespace", "string",
+                    "Namespace whose graph this source's extracted facts are staged into, for "
+                    + BUILD_GRAPH + " to build from. Fixed at registration. Omit for the "
+                    + "configured default, or the shared one.", null),
                 ToolSchema.optional("max_depth", "integer",
                     "How many directory levels below the root to descend. Omit for the "
                     + "server's default.", null))));
@@ -286,6 +308,10 @@ public final class McpTools {
                     "A URL path containing one of these substrings is skipped. Supplying this "
                     + "replaces the server's default skip list rather than adding to it, and "
                     + "an empty array clears it.", "string"),
+                ToolSchema.optional("namespace", "string",
+                    "Namespace whose graph this source's extracted facts are staged into, for "
+                    + BUILD_GRAPH + " to build from. Fixed at registration. Omit for the "
+                    + "configured default, or the shared one.", null),
                 ToolSchema.optional("user_agent", "string",
                     "How the crawl identifies itself to the site. Omit for the server's "
                     + "default.", null))));
@@ -376,7 +402,7 @@ public final class McpTools {
         body.put("include_text", true);
         // Omitted rather than defaulted here: the node has a configured default, and sending one
         // of this adapter's own would quietly override whatever the operator set.
-        Integer topK = ToolArguments.optionalInteger(args, "top_k");
+        Integer topK = ToolArguments.wholeNumber(args, "top_k");
         if (topK != null) {
             body.put("top_k", topK);
         }
@@ -397,17 +423,33 @@ public final class McpTools {
         if (asOf != null) {
             body.put("as_of", asOf);
         }
-        return answer(client.post("/v1/graph/query", Json.write(body), namespace(args)));
+        // Checked here as well as by the node, so a misspelt direction is a tool error naming the
+        // three it could have been rather than a round trip; omitted when absent, for the same
+        // reason as as_of.
+        String direction = ToolArguments.optionalString(args, "direction");
+        if (direction != null) {
+            body.put("direction", TraversalDirection.parse(direction).wireName());
+        }
+        return answer(client.post("/v1/graph/query", Json.write(body), scope(args)));
+    }
+
+    /** The directions search_graph accepts, as a request spells them. */
+    private static List<String> directionNames() {
+        List<String> names = new ArrayList<>();
+        for (TraversalDirection direction : TraversalDirection.values()) {
+            names.add(direction.wireName());
+        }
+        return names;
     }
 
     private ToolResult buildGraph(Map<String, Object> args)
             throws IOException, InterruptedException {
-        return answer(client.post("/v1/graph/build", "{}", namespace(args)));
+        return answer(client.post("/v1/graph/build", "{}", scope(args)));
     }
 
     private ToolResult graphBuildStatus(Map<String, Object> args)
             throws IOException, InterruptedException {
-        return answer(client.get("/v1/graph/build/status", null, null, namespace(args)));
+        return answer(client.get("/v1/graph/build/status", null, null, scope(args)));
     }
 
     private ToolResult ingestDocuments(Map<String, Object> args)
@@ -431,7 +473,7 @@ public final class McpTools {
         Map<String, Object> body = Json.object();
         body.put("source_type", "filesystem");
         body.put("config", sourceConfig);
-        return answer(client.post("/v1/ingest", Json.write(body), null));
+        return answer(client.post("/v1/ingest", Json.write(body), scope(args)));
     }
 
     private ToolResult addDocuments(Map<String, Object> args)
@@ -483,7 +525,7 @@ public final class McpTools {
         Map<String, Object> body = Json.object();
         body.put("source_type", "http");
         body.put("config", sourceConfig);
-        return answer(client.post("/v1/ingest", Json.write(body), null));
+        return answer(client.post("/v1/ingest", Json.write(body), scope(args)));
     }
 
     private ToolResult reindexSource(Map<String, Object> args)
@@ -528,10 +570,8 @@ public final class McpTools {
     /**
      * Copies a list setting into a source configuration, absent staying absent.
      *
-     * <p>An empty list sent deliberately is not absent - it is how a caller clears the node's
-     * default exclusions - but this adapter cannot tell one the model sent from one that came
-     * out of a field it did not send, so only a non-empty list is forwarded. A model that
-     * needs the defaults cleared has the HTTP route.</p>
+     * <p>An empty list is forwarded, not dropped: the node reads it as "clear the default",
+     * which is how a caller turns off a crawl's default exclusions.</p>
      *
      * @param args   The call's arguments
      * @param config The configuration being built
@@ -539,8 +579,8 @@ public final class McpTools {
      */
     private static void putStrings(Map<String, Object> args, Map<String, Object> config,
                                    String field) {
-        List<String> values = ToolArguments.stringList(args, field);
-        if (!values.isEmpty()) {
+        List<String> values = ToolArguments.optionalStringList(args, field);
+        if (values != null) {
             config.put(field, values);
         }
     }
@@ -563,8 +603,13 @@ public final class McpTools {
             + response.body());
     }
 
-    private static String namespace(Map<String, Object> args) {
-        return ToolArguments.optionalString(args, "namespace");
+    /**
+     * The namespace a call that takes one is scoped to: the argument, else the configured
+     * default. Only the graph tools and source registration call this; every other route serves
+     * the whole corpus and refuses a namespace.
+     */
+    private String scope(Map<String, Object> args) {
+        return client.namespaceFor(ToolArguments.optionalString(args, "namespace"));
     }
 
     /**

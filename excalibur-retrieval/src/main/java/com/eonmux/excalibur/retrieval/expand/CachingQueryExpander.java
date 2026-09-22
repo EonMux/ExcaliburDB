@@ -102,9 +102,4 @@ public final class CachingQueryExpander implements QueryExpander {
         }
         return expanded;
     }
-
-    @Override
-    public int maxExpandableChars() {
-        return delegate.maxExpandableChars();
-    }
 }

@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -55,30 +56,40 @@ final class LexicalSideIndex {
     }
 
     /**
-     * Adds one chunk to the lexical index, if this node keeps one.
+     * Adds a published document's chunks to the lexical index, if this node keeps one.
      *
-     * <p>A failure here is logged and not rethrown. The chunk is already in storage and the
-     * document is still worth publishing: losing one chunk from BM25 costs recall on that chunk,
-     * while failing the document costs the document. The two are not the same size of loss.</p>
+     * <p>Once the document is published and not before. Indexed while its chunks were still
+     * being written, a document could be made searchable by a refresh from another run before
+     * storage had published it - or before it rolled back - and a lexical hit would then name a
+     * chunk no query can see. The chunks go in together, so no refresh publishes part of one.</p>
+     *
+     * <p>A failure here is logged and not rethrown. The document is already in storage and still
+     * worth having: losing it from BM25 costs recall on that document, while failing it costs the
+     * document. The two are not the same size of loss.</p>
+     *
+     * @param documentKey The document, for the log
+     * @param chunks      Chunk identifier to text
      */
-    void add(String chunkId, String text) {
+    void addDocument(String documentKey, Map<String, String> chunks) {
         ChunkIndex target = this.index;
-        if (target == null) {
+        if (target == null || chunks.isEmpty()) {
             return;
         }
         try {
-            target.add(chunkId, text);
+            target.addDocument(chunks);
         } catch (IOException e) {
-            LOGGER.warn("Chunk {} stored but not lexically indexed: {}", chunkId, e.getMessage());
+            LOGGER.warn("Document {} stored but not lexically indexed: {}",
+                documentKey, e.getMessage());
         }
     }
 
     /**
      * Takes rolled-back chunks back out of the lexical index.
      *
-     * <p>Storage no longer has them, so a search that still returned them would report hits whose
-     * text nothing can resolve - a chunk id pointing at a document that was never published. The
-     * chunks were indexed as they were written, so undoing the write has to undo that too.</p>
+     * <p>A failed document is never added here, but its chunk identifiers may already be: a
+     * re-crawl writes a changed document under the identifiers its previous version held, and
+     * the rollback deletes what storage had under them. A search that went on returning the
+     * previous version would report hits whose text nothing can resolve.</p>
      */
     void erase(List<String> chunkIds) {
         ChunkIndex target = this.index;
@@ -93,7 +104,13 @@ final class LexicalSideIndex {
         }
     }
 
-    /** Makes a run's lexical writes searchable. */
+    /**
+     * Makes the lexical writes so far searchable.
+     *
+     * <p>Every document added before the call, from any run: the index is one per node. What
+     * that publishes is always whole documents, because each arrives in one
+     * {@link ChunkIndex#addDocument} call.</p>
+     */
     void refresh() {
         ChunkIndex target = this.index;
         if (target == null) {

@@ -82,24 +82,6 @@ class CachingQueryExpanderTest {
     }
 
     @Test
-    @DisplayName("the delegate's length bound is the cache's length bound")
-    void reportsTheDelegatesBound() {
-        QueryExpander bounded = new QueryExpander() {
-            @Override
-            public List<SearchFormulation> expand(String query) {
-                return List.of(SearchFormulation.original(query));
-            }
-
-            @Override
-            public int maxExpandableChars() {
-                return 42;
-            }
-        };
-
-        assertThat(CachingQueryExpander.over(bounded).maxExpandableChars()).isEqualTo(42);
-    }
-
-    @Test
     @DisplayName("a cache of nothing is refused")
     void refusesAnEmptyCache() {
         assertThatThrownBy(() -> CachingQueryExpander.over(QueryExpander.identity(), 0))

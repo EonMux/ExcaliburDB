@@ -71,6 +71,18 @@ public final class IngestConfig {
     /** Chunk index segments tolerated before the smallest are merged. */
     public static final int DEFAULT_LEXICAL_MAX_SEGMENTS = 16;
 
+    /** Longest a published document waits, while its run goes on, to become lexically searchable. */
+    public static final long DEFAULT_LEXICAL_REFRESH_INTERVAL_MS = 30_000L;
+
+    /**
+     * Shortest refresh interval accepted.
+     *
+     * <p>Every refresh on the native engine publishes a segment, and on Lucene reopens a reader.
+     * Below a second that is a segment per handful of documents, which the merge policy then has
+     * to spend the run rewriting.</p>
+     */
+    public static final long MIN_LEXICAL_REFRESH_INTERVAL_MS = 1_000L;
+
     /** Tokens one chunk aims for. */
     public static final int DEFAULT_CHUNK_TARGET_TOKENS = 512;
 
@@ -92,6 +104,7 @@ public final class IngestConfig {
     private final double lexicalTombstoneRatio;
     private final long lexicalMaxLatencySeconds;
     private final int lexicalMaxSegments;
+    private final long lexicalRefreshIntervalMs;
     private final int chunkTargetTokens;
     private final int chunkOverlapTokens;
     private final double bm25K1;
@@ -141,6 +154,13 @@ public final class IngestConfig {
         if (lexicalMaxSegments < 1) {
             throw new IllegalArgumentException("excalibur.ingest.lexical-max-segments must be "
                 + "at least 1, got: " + lexicalMaxSegments);
+        }
+        this.lexicalRefreshIntervalMs = PropertyParser.parseLong(props,
+            "excalibur.ingest.lexical-refresh-interval-ms", DEFAULT_LEXICAL_REFRESH_INTERVAL_MS);
+        if (lexicalRefreshIntervalMs < MIN_LEXICAL_REFRESH_INTERVAL_MS) {
+            throw new IllegalArgumentException("excalibur.ingest.lexical-refresh-interval-ms must "
+                + "be at least " + MIN_LEXICAL_REFRESH_INTERVAL_MS + ", got: "
+                + lexicalRefreshIntervalMs);
         }
         this.chunkTargetTokens = PropertyParser.parseInt(props,
             "excalibur.ingest.chunk-target-tokens", DEFAULT_CHUNK_TARGET_TOKENS);
@@ -234,6 +254,16 @@ public final class IngestConfig {
     }
 
     /**
+     * How long a published document may wait, while its ingestion run goes on, before a refresh
+     * makes it lexically searchable. A run also refreshes when it ends or is stopped.
+     *
+     * @return The interval in milliseconds
+     */
+    public long getLexicalRefreshIntervalMs() {
+        return lexicalRefreshIntervalMs;
+    }
+
+    /**
      * Gets the document atomicity timeout.
      */
     public int getDocumentTimeoutMs() {
@@ -302,6 +332,7 @@ public final class IngestConfig {
             && Double.compare(lexicalTombstoneRatio, other.lexicalTombstoneRatio) == 0
             && lexicalMaxLatencySeconds == other.lexicalMaxLatencySeconds
             && lexicalMaxSegments == other.lexicalMaxSegments
+            && lexicalRefreshIntervalMs == other.lexicalRefreshIntervalMs
             && chunkTargetTokens == other.chunkTargetTokens
             && chunkOverlapTokens == other.chunkOverlapTokens
             && Double.compare(bm25K1, other.bm25K1) == 0
@@ -313,6 +344,6 @@ public final class IngestConfig {
     public int hashCode() {
         return Objects.hash(documentTimeoutMs, documentAtomicity, reindexIntervalMs, crawlDelayMs,
             lexicalEngine, lexicalTombstoneRatio, lexicalMaxLatencySeconds, lexicalMaxSegments,
-            chunkTargetTokens, chunkOverlapTokens, bm25K1, bm25B);
+            lexicalRefreshIntervalMs, chunkTargetTokens, chunkOverlapTokens, bm25K1, bm25B);
     }
 }

@@ -96,8 +96,8 @@ class SegmentReclamationTest {
     @Test
     @DisplayName("purges a catalog segment no directory slot points at")
     void purgesAnUnroutedSegment() {
-        // What a rolling reindex mints: the catalog's own counter runs past the directory's
-        // width, so the row it creates names no slot and no file of the engine's.
+        // What a rolling reindex mints: created ids lie above every routing index, so the row
+        // it creates names no slot and no file of the engine's.
         long unrouted = engine.getCatalog()
             .create("source-a", tempDir.resolve("volume-a")).getSegmentId();
         assertThat(engine.getSegment(unrouted))
@@ -112,6 +112,36 @@ class SegmentReclamationTest {
             .as("a tombstoned row nothing routes to is what reclamation is for; refusing it too "
                 + "would leave the catalog growing without bound")
             .isFalse();
+    }
+
+    @Test
+    @DisplayName("decides and purges under the directory lock, so a split cannot interleave")
+    void reclamationHoldsTheDirectoryLock() throws Exception {
+        long unrouted = engine.getCatalog()
+            .create("source-a", tempDir.resolve("volume-a")).getSegmentId();
+        engine.getCatalog().beginIndexing(unrouted);
+        engine.getCatalog().tombstone(unrouted, engine.currentEpoch());
+        SegmentLifecycleManager manager = engine.getLifecycleManager();
+
+        Thread reclaimer = Thread.ofPlatform().unstarted(
+            () -> manager.checkForReclamationCandidates(FAR_FUTURE_EPOCH));
+        synchronized (engine.segmentLock) {
+            reclaimer.start();
+            // Split publication holds this lock while it registers its children's rows, so a
+            // reclamation that could run past it could purge a row registered after its check.
+            Thread.State state = reclaimer.getState();
+            while (state != Thread.State.BLOCKED && state != Thread.State.TERMINATED) {
+                Thread.onSpinWait();
+                state = reclaimer.getState();
+            }
+            assertThat(state)
+                .as("reclamation must wait for the directory lock rather than purge without it")
+                .isEqualTo(Thread.State.BLOCKED);
+            assertThat(engine.getCatalog().contains(unrouted)).isTrue();
+        }
+        reclaimer.join();
+
+        assertThat(engine.getCatalog().contains(unrouted)).isFalse();
     }
 
     /** Reopens the data directory the way a restart does. */

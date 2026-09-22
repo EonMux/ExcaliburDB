@@ -1,7 +1,7 @@
 package com.eonmux.excalibur.query.cache;
 
 /**
- * A fingerprint of everything a vector query reads, at one instant.
+ * A fingerprint of everything a query reads, at one instant.
  *
  * <h2>What it is for</h2>
  * <p>This is the evidence a cached answer is still an answer. Two queries that observe the
@@ -65,6 +65,46 @@ public record CorpusVersion(long epoch, long contentDigest, int segmentCount) {
      */
     public boolean readable() {
         return segmentCount >= 0;
+    }
+
+    /**
+     * This fingerprint extended with a second index's own account of itself.
+     *
+     * <p>For a node whose answers read another index besides the vector segments - the
+     * lexical one BM25 searches. That index publishes on its own schedule: its segments become
+     * visible when the query epoch crosses the epoch they were published at, and erasures and
+     * merges change what it returns without touching a vector segment. So a fingerprint of the
+     * vector segments alone can stand still while a BM25 answer moves, and an entry that read
+     * both is valid only while both are unchanged. {@code otherDigest} is that index's version,
+     * read through the same state its searches read.</p>
+     *
+     * <p>Mixed rather than added or exclusive-ored, so that a change in one digest cannot be
+     * cancelled by an equal and opposite change in the other.</p>
+     *
+     * @param otherDigest The other index's version
+     * @return The combined fingerprint, or {@link #UNREADABLE} when this one is unreadable
+     */
+    public CorpusVersion alongside(long otherDigest) {
+        if (!readable()) {
+            return UNREADABLE;
+        }
+        return new CorpusVersion(epoch, mix(contentDigest, otherDigest), segmentCount);
+    }
+
+    /**
+     * Mixes a second value into a digest with a 64-bit avalanche step.
+     *
+     * @param digest The digest so far
+     * @param value  The value to mix in
+     * @return The mixed digest
+     */
+    private static long mix(long digest, long value) {
+        long mixed = digest * 0x100000001B3L ^ value;
+        mixed ^= mixed >>> 33;
+        mixed *= 0xFF51AFD7ED558CCDL;
+        mixed ^= mixed >>> 33;
+        mixed *= 0xC4CEB9FE1A85EC53L;
+        return mixed ^ (mixed >>> 33);
     }
 
     @Override

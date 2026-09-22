@@ -18,12 +18,14 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 
 /**
@@ -91,6 +93,25 @@ public final class ChunkLexicalIndex implements ChunkIndex {
 
     /** Guards the erasure log, which is a mutable file and not thread-safe on its own. */
     private final Object logLock = new Object();
+
+    /**
+     * Chunks whose deletes have been handed to Lucene and not yet committed.
+     *
+     * <p>A delete is applied, as far as a reopen is concerned, only once a commit has made it
+     * durable, so this is what the next commit confirms on the erasure log. Guarded by
+     * {@link #logLock}.</p>
+     */
+    private final Set<String> deletesAwaitingCommit = new LinkedHashSet<>();
+
+    /**
+     * Keeps a commit from landing inside a document.
+     *
+     * <p>Additions share the read half, so any number of runs index concurrently; a commit takes
+     * the write half, so it waits for every document in progress to be wholly added. Lucene's
+     * own commit captures whatever its writer holds at that instant, which for a document added
+     * chunk by chunk can be half of it.</p>
+     */
+    private final ReentrantReadWriteLock commitGate = new ReentrantReadWriteLock();
 
     /**
      * Held for the length of a force-merge.
@@ -192,24 +213,65 @@ public final class ChunkLexicalIndex implements ChunkIndex {
      * entry is forced first. A crash in that window leaves the index holding a promise it has no
      * record of having applied, and nothing afterwards would notice: the chunk is readable, the
      * index is intact, and only the answer is wrong. So the log is the authority on open, and
-     * anything outstanding is deleted again. Free when nothing is owed, which is the usual
-     * case.</p>
+     * any promise it has no confirmation of having committed is deleted again. Only those: a
+     * committed delete stays on the log until a force-merge reclaims it, and deleting again
+     * would remove whatever has been indexed under the same identifier since. Free when nothing
+     * is unconfirmed, which is the usual case.</p>
      */
     private void reapplyErasures() throws IOException {
-        Set<String> owed;
+        Set<String> unapplied;
         synchronized (logLock) {
-            owed = erasureLog.outstandingKeys();
+            unapplied = erasureLog.unappliedKeys();
         }
-        if (owed.isEmpty()) {
+        if (unapplied.isEmpty()) {
             return;
         }
         identifiersMayRepeat.set(true);
-        for (String chunkId : owed) {
+        for (String chunkId : unapplied) {
             index.delete(idOf(chunkId));
         }
         index.commit();
+        synchronized (logLock) {
+            erasureLog.confirmApplied(unapplied);
+        }
         LOGGER.warn("Re-applied {} erasure(s) the log still owed; an interrupted write may have "
-            + "made them readable again", owed.size());
+            + "made them readable again", unapplied.size());
+    }
+
+    /**
+     * Runs a Lucene commit and confirms the deletes it made durable.
+     *
+     * <p>The set is taken before the commit, so a delete issued while it runs is left for the
+     * next one to confirm. Confirming it here could record as applied a delete that missed this
+     * commit, and a crash before the next would lose it with nothing left to replay.</p>
+     *
+     * @param commit The operation that commits: a plain commit, or a refresh, which commits
+     * @throws IOException if the commit or the confirmation fails
+     */
+    private void commitAndConfirm(IoAction commit) throws IOException {
+        Set<String> issued;
+        synchronized (logLock) {
+            issued = Set.copyOf(deletesAwaitingCommit);
+        }
+        commitGate.writeLock().lock();
+        try {
+            commit.run();
+        } finally {
+            commitGate.writeLock().unlock();
+        }
+        if (issued.isEmpty()) {
+            return;
+        }
+        synchronized (logLock) {
+            erasureLog.confirmApplied(issued);
+            deletesAwaitingCommit.removeAll(issued);
+        }
+    }
+
+    /** An index operation that can fail with an I/O error. */
+    @FunctionalInterface
+    private interface IoAction {
+        void run() throws IOException;
     }
 
     /** The engine id a chunk is indexed under. */
@@ -235,8 +297,34 @@ public final class ChunkLexicalIndex implements ChunkIndex {
         // it is a query on the hot path of ingestion, run millions of times, to check for an
         // event whose probability across a hundred million chunks is under one in a thousand.
         // Collisions are detected in aggregate at refresh instead, which costs one read per run.
-        index.put(idOf(chunkId), text, chunkId);
+        commitGate.readLock().lock();
+        try {
+            index.put(idOf(chunkId), text, chunkId);
+        } finally {
+            commitGate.readLock().unlock();
+        }
         indexed.incrementAndGet();
+    }
+
+    @Override
+    public void addDocument(Map<String, String> chunks) throws IOException {
+        Objects.requireNonNull(chunks, "chunks must not be null");
+        int added = 0;
+        commitGate.readLock().lock();
+        try {
+            for (Map.Entry<String, String> chunk : chunks.entrySet()) {
+                Objects.requireNonNull(chunk.getKey(), "chunkId must not be null");
+                String text = chunk.getValue();
+                if (text == null || text.isEmpty()) {
+                    continue;
+                }
+                index.put(idOf(chunk.getKey()), text, chunk.getKey());
+                added++;
+            }
+        } finally {
+            commitGate.readLock().unlock();
+        }
+        indexed.addAndGet(added);
     }
 
     /**
@@ -250,7 +338,7 @@ public final class ChunkLexicalIndex implements ChunkIndex {
      */
     @Override
     public void refresh() throws IOException {
-        index.refresh();
+        commitAndConfirm(index::refresh);
         countChunksLostToCollisions();
     }
 
@@ -287,7 +375,7 @@ public final class ChunkLexicalIndex implements ChunkIndex {
 
     /** Flushes to disk without making writes searchable. */
     public void commit() throws IOException {
-        index.commit();
+        commitAndConfirm(index::commit);
     }
 
     /** The chunk identifier behind an engine id, or null. */
@@ -321,6 +409,9 @@ public final class ChunkLexicalIndex implements ChunkIndex {
         identifiersMayRepeat.set(true);
         for (String chunkId : chunkIds) {
             index.delete(idOf(chunkId));
+        }
+        synchronized (logLock) {
+            deletesAwaitingCommit.addAll(chunkIds);
         }
         // Lucene reports no count for a delete by term, and reading one back would cost a search
         // per chunk on a path that runs while a document is being rolled back.
@@ -390,7 +481,7 @@ public final class ChunkLexicalIndex implements ChunkIndex {
                 owed = erasureLog.outstandingKeys();
             }
             int reclaimed = index.forceMergeDeletes();
-            index.refresh();
+            commitAndConfirm(index::refresh);
             synchronized (logLock) {
                 Set<String> keep = new LinkedHashSet<>(erasureLog.outstandingKeys());
                 keep.removeAll(owed);
@@ -448,11 +539,14 @@ public final class ChunkLexicalIndex implements ChunkIndex {
     public ChunkIndexStats stats() {
         int segments = 0;
         int deleted = 0;
-        try {
-            org.apache.lucene.index.IndexReader reader = index.searcher().getIndexReader();
-            segments = reader.leaves().size();
-            deleted = reader.numDeletedDocs();
-        } catch (IllegalStateException e) {
+        Optional<LexicalIndex.Lease> leased = index.tryAcquire();
+        if (leased.isPresent()) {
+            try (LexicalIndex.Lease lease = leased.get()) {
+                org.apache.lucene.index.IndexReader reader = lease.searcher().getIndexReader();
+                segments = reader.leaves().size();
+                deleted = reader.numDeletedDocs();
+            }
+        } else {
             // Nothing has been refreshed yet, so there is no reader to count leaves in. An index
             // with no searcher has no segments and no deletions, which is what is reported.
             LOGGER.debug("Lexical stats requested before the first refresh");
@@ -468,6 +562,18 @@ public final class ChunkLexicalIndex implements ChunkIndex {
             new CompactionStats(live + deleted, deleted, oldest, segments), clock.instant());
         return new ChunkIndexStats(engine(), indexed.get(), segments, live, deleted, outstanding,
             oldest, due);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The version of the reader searches go through, which moves only when
+     * {@link #refresh()} publishes; an erasure hides a chunk at that same boundary, not
+     * before it.</p>
+     */
+    @Override
+    public java.util.OptionalLong searchVersion() {
+        return index.readerVersion();
     }
 
     /** Erasure promises still on the log, whether or not they matched a chunk. */
@@ -500,6 +606,15 @@ public final class ChunkLexicalIndex implements ChunkIndex {
 
     @Override
     public void close() {
+        // Committed here rather than left to the writer's own commit on close, which would make
+        // the deletes durable without confirming them - so the next open would replay them over
+        // anything indexed under the same identifiers since.
+        try {
+            commitAndConfirm(index::commit);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.warn("Could not commit the lexical index before closing it; erasures issued "
+                + "since the last commit will be replayed when it next opens", e);
+        }
         index.close();
     }
 }

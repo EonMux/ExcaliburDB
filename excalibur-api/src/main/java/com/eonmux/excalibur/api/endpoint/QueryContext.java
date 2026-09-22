@@ -105,8 +105,24 @@ public record QueryContext(QuerySearchOptions options, ResultPassages passages,
      * @return The answer
      */
     public QueryAnswer answer(int produced, boolean complete, QueryExplanation explanation) {
-        return new QueryAnswer(passages, page(produced),
-            ResultTotal.of(produced, depth(), complete), explanation);
+        return answer(produced, ResultTotal.of(produced, depth(), complete), explanation);
+    }
+
+    /**
+     * Everything this answer says beyond the ranking, over a total the answer worked out
+     * itself.
+     *
+     * <p>For an answer that knows more about its own depth than how many results it ended up
+     * with - one a relevancy threshold shortened, where a short list is exact only if retrieval
+     * had also run out.</p>
+     *
+     * @param produced    How many results the answer ranked, before the page was cut
+     * @param total       How many results there are, and how much that number is worth
+     * @param explanation Why the results are what they are, or null when none was asked for
+     * @return The answer
+     */
+    public QueryAnswer answer(int produced, ResultTotal total, QueryExplanation explanation) {
+        return new QueryAnswer(passages, page(produced), total, explanation);
     }
 
     /**

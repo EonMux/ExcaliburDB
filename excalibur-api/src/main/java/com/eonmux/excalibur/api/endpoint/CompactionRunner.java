@@ -202,9 +202,9 @@ public final class CompactionRunner implements AutoCloseable {
      * run loses is its own work and never data.</p>
      *
      * <p>Why it exists: a forced compaction rewrites every live segment and rebuilds every
-     * graph, which on a large corpus is minutes of saturated I/O. Until this, the only way to
-     * end one started at the wrong time was to stop the process - which is the more dangerous
-     * act of the two, since shutdown closes the arena the segments are mapped out of.</p>
+     * graph, which on a large corpus is minutes of saturated I/O. Without it, the only way to
+     * end one started at the wrong time would be to stop the process - the more dangerous act
+     * of the two, since shutdown closes the arena the segments are mapped out of.</p>
      *
      * @return true if a run was in progress and has been asked to stop
      */

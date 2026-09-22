@@ -83,13 +83,11 @@ public class HashBenchmarkRunner {
                 .measurementTime(TimeValue.seconds(3))
                 // Fork configuration
                 .forks(1)
-                // JVM arguments for Panama FFM
-                .jvmArgsAppend(
-                    "--enable-preview",
-                    "--enable-native-access=ALL-UNNAMED",
+                // The flags every fork needs, then this benchmark's own
+                .jvmArgsAppend(ForkedJvm.flags(
                     "-Xms1g",
                     "-Xmx1g"
-                )
+                ))
                 // Output format
                 .shouldDoGC(true)
                 .build();

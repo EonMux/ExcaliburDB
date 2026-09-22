@@ -547,6 +547,72 @@ class NativeChunkIndexTest {
         }
     }
 
+    /**
+     * What a query result cache keys a lexical answer on. A native publication becomes visible
+     * when the query epoch crosses it, with no call into the index at that moment, so the
+     * version is read through the epoch rather than through any write.
+     */
+    @Nested
+    @DisplayName("Search version")
+    class SearchVersion {
+
+        @Test
+        @DisplayName("moves when the epoch crosses a publication, and not at the refresh")
+        void movesWhenThePublicationBecomesVisible(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(5);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 4, standard())) {
+                java.util.OptionalLong empty = index.searchVersion();
+                index.add("kb:a.txt:chunk:0", "the certificate chain could not be verified");
+                index.refresh();
+
+                assertThat(empty).isPresent();
+                assertThat(index.searchVersion())
+                    .as("published at the next epoch, so a search now still reads nothing")
+                    .isEqualTo(empty);
+
+                epoch.incrementAndGet();
+
+                assertThat(index.searchVersion()).isNotEqualTo(empty);
+            }
+        }
+
+        @Test
+        @DisplayName("moves when an erasure hides a published chunk")
+        void movesOnErasure(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(1);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 4, standard())) {
+                index.add("kb:a.txt:chunk:0", "confidential postmortem");
+                index.add("kb:a.txt:chunk:1", "routine planning");
+                index.refresh();
+                epoch.incrementAndGet();
+                java.util.OptionalLong before = index.searchVersion();
+
+                assertThat(index.erase(Set.of("kb:a.txt:chunk:0"))).isEqualTo(1);
+
+                assertThat(index.searchVersion()).isNotEqualTo(before);
+            }
+        }
+
+        @Test
+        @DisplayName("stands still while the epoch moves over nothing new")
+        void stableWithoutChange(@TempDir Path dir) throws Exception {
+            AtomicLong epoch = new AtomicLong(1);
+            try (NativeChunkIndex index =
+                     NativeChunkIndex.open(dir, epoch::get, 4, standard())) {
+                index.add("kb:a.txt:chunk:0", "routine planning");
+                index.refresh();
+                epoch.incrementAndGet();
+                java.util.OptionalLong before = index.searchVersion();
+
+                epoch.addAndGet(10);
+
+                assertThat(index.searchVersion()).isEqualTo(before);
+            }
+        }
+    }
+
     @Nested
     @DisplayName("Reporting")
     class Reporting {

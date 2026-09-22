@@ -27,18 +27,27 @@ public sealed interface Evidence {
     /**
      * Retrieval ran, and this is what it found.
      *
-     * @param fused    the fused candidates, best first; may be empty
+     * <p>Two lists, because they answer two questions. {@code fused} is what abstention judges:
+     * the readings of what the question named, ranked - see
+     * {@link GraphRagPipeline#gather(String, com.eonmux.excalibur.planner.ConversationContext,
+     * com.eonmux.excalibur.graph.temporal.TemporalFilter, TraversalDirection,
+     * com.eonmux.excalibur.core.trace.QueryTrace)}. {@code ranked} is every entity retrieval
+     * ranked, which serialisation reads to order the facts by how well each end matched.
+     *
+     * @param fused    the readings abstention judges, best first; may be empty
+     * @param ranked   every entity retrieval ranked, best first; may be empty
      * @param subgraph the evidence the traversal assembled
      * @param plan     the plan this was retrieved for
      */
-    record Gathered(List<FusedDocument> fused, Subgraph subgraph, QueryPlan plan)
-            implements Evidence {
+    record Gathered(List<FusedDocument> fused, List<FusedDocument> ranked, Subgraph subgraph,
+                    QueryPlan plan) implements Evidence {
 
         public Gathered {
             if (subgraph == null || plan == null) {
                 throw new IllegalArgumentException("subgraph and plan are required");
             }
             fused = List.copyOf(fused);
+            ranked = List.copyOf(ranked);
         }
     }
 

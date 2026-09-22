@@ -283,17 +283,19 @@ public final class CorpusEvaluationRunner {
             com.eonmux.excalibur.retrieval.lexical.LexicalIndex index) throws IOException {
         long start = System.nanoTime();
         java.util.Set<String> vocabulary = new java.util.HashSet<>();
-        org.apache.lucene.search.IndexSearcher searcher = index.searcher();
-        for (org.apache.lucene.index.LeafReaderContext leaf
-                : searcher.getIndexReader().leaves()) {
-            org.apache.lucene.index.Terms terms =
-                leaf.reader().terms(com.eonmux.excalibur.retrieval.lexical.LexicalIndex.FIELD_TEXT);
-            if (terms == null) {
-                continue;
-            }
-            org.apache.lucene.index.TermsEnum cursor = terms.iterator();
-            for (org.apache.lucene.util.BytesRef t = cursor.next(); t != null; t = cursor.next()) {
-                vocabulary.add(t.utf8ToString());
+        try (com.eonmux.excalibur.retrieval.lexical.LexicalIndex.Lease lease = index.acquire()) {
+            for (org.apache.lucene.index.LeafReaderContext leaf
+                    : lease.searcher().getIndexReader().leaves()) {
+                org.apache.lucene.index.Terms terms = leaf.reader()
+                    .terms(com.eonmux.excalibur.retrieval.lexical.LexicalIndex.FIELD_TEXT);
+                if (terms == null) {
+                    continue;
+                }
+                org.apache.lucene.index.TermsEnum cursor = terms.iterator();
+                for (org.apache.lucene.util.BytesRef t = cursor.next(); t != null;
+                        t = cursor.next()) {
+                    vocabulary.add(t.utf8ToString());
+                }
             }
         }
         com.eonmux.excalibur.filter.CuckooFilter filter =

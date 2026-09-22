@@ -88,12 +88,23 @@ final class SplitPublication {
      * <p>The new upper half of the directory is filled first, then the mask is widened, and
      * only then are the parent's own slots repointed at the left child. At every instant a
      * reader - using either the old mask or the new one - reaches a segment that holds its
-     * key. If publication fails the directory is left untouched and the exception propagates,
-     * which makes the worker discard the children and return the parent to service.</p>
+     * key. Both children's catalog rows are written before the upper half is filled, so a
+     * reader that reaches a child also finds its row. If publication fails the directory is
+     * left untouched and the exception propagates, which makes the worker discard the children
+     * and return the parent to service.</p>
+     *
+     * <h3>Refused publication</h3>
+     * <p>A child's index held in the catalog by a segment created for a source, rather than by
+     * a routing segment, is refused with an {@link IllegalStateException} before any file is
+     * moved; see {@link SegmentCatalog#checkRoutingRegistration(long)}. Adopting that record
+     * would give the live child another source's lifecycle state - often TOMBSTONED, which
+     * hides it from every query.</p>
      *
      * @param parent     The parent segment that was split
      * @param leftChild  The left child (entries whose split bit is 0)
      * @param rightChild The right child (entries whose split bit is 1)
+     * @throws IllegalStateException if a child's index is held by a created segment, or if a
+     *         child cannot be moved into place
      */
     void handleSplitComplete(Segment parent, Segment leftChild, Segment rightChild) {
         synchronized (engine.segmentLock) {
@@ -108,6 +119,13 @@ final class SplitPublication {
 
             long leftIndex = parentSlots.get(0);
             long rightIndex = leftIndex + oldRouting;
+
+            // Before anything is moved: the catalog must be able to take both children at
+            // their indices. The only thing that can stop it is a segment created for a source
+            // under an older catalog at one of those ids, and once the renames below have run
+            // there is no way back - so the refusal has to come while the parent is untouched.
+            engine.catalog.checkRoutingRegistration(leftIndex);
+            engine.catalog.checkRoutingRegistration(rightIndex);
 
             // Step 1: give the children discoverable identities before publishing them.
             // The right child goes first: its target name is unused, so a failure there
@@ -133,6 +151,14 @@ final class SplitPublication {
             }
 
             prepareSplitChild(leftChild, leftIndex);
+
+            // Catalog rows go in before either child becomes reachable, so every reader that
+            // routes to a child also finds its row; a segment routed to without one is skipped
+            // by the queryable-segment scans. The left child inherits the parent's entry (same
+            // index), which may be in any lifecycle state, so it is re-pointed rather than
+            // re-added.
+            engine.catalog.registerFile(leftIndex, leftChild.path()).setEntryCount(leftChild.entryCount());
+            engine.catalog.add(rightIndex, rightChild.path()).setEntryCount(rightChild.entryCount());
 
             // Step 2: fill the new upper half. These indices are unreachable under the
             // old mask, so this is invisible to concurrent readers.
@@ -160,11 +186,6 @@ final class SplitPublication {
             if (engine.splitWorker != null) {
                 engine.splitWorker.unregisterSegment(parent);
             }
-
-            // The left child inherits the parent's catalog entry (same index), which may
-            // be in any lifecycle state, so it is re-pointed rather than re-added.
-            engine.catalog.registerFile(leftIndex, leftChild.path()).setEntryCount(leftChild.entryCount());
-            engine.catalog.add(rightIndex, rightChild.path()).setEntryCount(rightChild.entryCount());
 
             if (engine.splitWorker != null && engine.splitWorker.isRunning()) {
                 engine.splitWorker.registerSegment(leftChild);

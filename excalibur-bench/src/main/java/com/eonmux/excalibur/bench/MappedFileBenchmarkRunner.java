@@ -82,13 +82,11 @@ public class MappedFileBenchmarkRunner {
                 .measurementTime(TimeValue.seconds(2))
                 // Fork configuration
                 .forks(1)
-                // JVM arguments for Panama FFM
-                .jvmArgsAppend(
-                    "--enable-preview",
-                    "--enable-native-access=ALL-UNNAMED",
+                // The flags every fork needs, then this benchmark's own
+                .jvmArgsAppend(ForkedJvm.flags(
                     "-Xms2g",
                     "-Xmx2g"
-                )
+                ))
                 // Output format
                 .shouldDoGC(true)
                 .build();

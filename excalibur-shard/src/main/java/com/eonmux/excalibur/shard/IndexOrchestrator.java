@@ -459,20 +459,69 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         Objects.requireNonNull(shard, "shard config cannot be null");
 
         ShardIndexSettings settings = ShardIndexSettings.fromConfig(shard);
+        IndexOrchestrator orchestrator = fromSettings(catalog, storageEngine, volumeManager,
+            settings, DEFAULT_EPOCH_TICK_INTERVAL_MS, initialEpoch);
+        orchestrator.withVolumePlacement(settings.volumes());
+        return orchestrator;
+    }
 
+    /**
+     * Creates an IndexOrchestrator from shard configuration over an engine that has started.
+     *
+     * <p>The construction path a node takes. Volume placement has to be installed before
+     * {@link StorageEngine#start()} - see {@link #withVolumePlacement(List)} - so a node installs
+     * it itself and starts the engine before any orchestrator exists; this applies every other
+     * shard setting. Without it the node built the orchestrator from a hand-picked subset and
+     * {@code segment-sync-interval-ms} and the three {@code pq-*} keys were parsed, range-checked
+     * and delivered nowhere.</p>
+     *
+     * @param catalog             The segment catalog
+     * @param storageEngine       The storage engine, with its volume placement already installed
+     * @param volumeManager       The volume manager (optional, may be null)
+     * @param shard               The shard configuration from ShardConfig
+     * @param epochTickIntervalMs How often the visibility epoch advances
+     * @param initialEpoch        Epoch the visibility counter starts at, above every epoch the
+     *                            node's durable records carry
+     * @return A new IndexOrchestrator configured with shard settings
+     * @throws NullPointerException     if catalog, storageEngine, or shard is null
+     * @throws IllegalArgumentException if a configured value is outside the range its worker
+     *                                  accepts
+     */
+    public static IndexOrchestrator forStartedEngine(SegmentCatalog catalog,
+                                                     StorageEngine storageEngine,
+                                                     VolumeManager volumeManager,
+                                                     ShardConfig shard,
+                                                     long epochTickIntervalMs,
+                                                     long initialEpoch) {
+        Objects.requireNonNull(catalog, "catalog cannot be null");
+        Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
+        Objects.requireNonNull(shard, "shard config cannot be null");
+        return fromSettings(catalog, storageEngine, volumeManager,
+            ShardIndexSettings.fromConfig(shard), epochTickIntervalMs, initialEpoch);
+    }
+
+    /**
+     * Builds an orchestrator and delivers every setting except volume placement.
+     */
+    private static IndexOrchestrator fromSettings(SegmentCatalog catalog,
+                                                  StorageEngine storageEngine,
+                                                  VolumeManager volumeManager,
+                                                  ShardIndexSettings settings,
+                                                  long epochTickIntervalMs,
+                                                  long initialEpoch) {
         LOGGER.info("Creating IndexOrchestrator from ShardConfig: hnswQueueLimit={}, "
-                + "compactDelayMs={}, compaction={}, pqTraining={}",
+                + "compactDelayMs={}, segmentSyncIntervalMs={}, compaction={}, pqTraining={}",
             settings.hnswQueueLimit(), settings.compactionStartDelayMs(),
-            settings.compaction(), settings.pqTraining());
+            settings.segmentSyncIntervalMs(), settings.compaction(), settings.pqTraining());
 
         IndexOrchestrator orchestrator = new IndexOrchestrator(
             catalog,
             storageEngine,
             volumeManager,
-            settings.hnswQueueLimit(),               // HNSW queue depth limit from config
-            DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,  // Keep default: 5000ms
-            DEFAULT_REINDEX_CHECK_INTERVAL_MS,       // Keep default: 60000ms
-            DEFAULT_EPOCH_TICK_INTERVAL_MS,          // Keep default: 100ms
+            settings.hnswQueueLimit(),
+            DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,
+            DEFAULT_REINDEX_CHECK_INTERVAL_MS,
+            epochTickIntervalMs,
             initialEpoch,
             settings.compaction()
         );
@@ -482,7 +531,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         // it echoed back and got the same schedule as before.
         orchestrator.withCompactionStartDelayMs(settings.compactionStartDelayMs());
         orchestrator.withSegmentSyncIntervalMs(settings.segmentSyncIntervalMs());
-        orchestrator.withVolumePlacement(settings.volumes());
 
         // The warming worker reads this shape when a segment trains, not when the worker is
         // built, and nothing has started it yet - so handing it over here is as early as it
@@ -649,7 +697,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *   <li>Cuckoo metrics (for FP rate monitoring, if it has a filter)</li>
      *   <li>Compaction worker (for tombstone cleanup)</li>
      *   <li>Warming phase worker (for PQ training during WARMING state)</li>
-     *   <li>Hierarchical Cuckoo filter (for corpus → cluster → segment membership)</li>
+     *   <li>Hierarchical Cuckoo filter (for corpus → segment membership)</li>
      * </ul>
      *
      * @param segmentId The segment ID
@@ -1188,7 +1236,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * Sets the hierarchical Cuckoo filter for deletion propagation.
      *
      * <p>When set, the Cuckoo maintenance worker will propagate deletions through
-     * the hierarchy: segment → cluster → corpus. This ensures no stale false
+     * the hierarchy: segment → corpus. This ensures no stale false
      * positives from tombstoned entries.</p>
      *
      * <p>The filter is also stored locally to enable segment registration
@@ -1208,7 +1256,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
-     * Returns the hierarchical Cuckoo filter for corpus → cluster → segment membership.
+     * Returns the hierarchical Cuckoo filter for corpus → segment membership.
      *
      * <p>The hierarchical filter is used for:</p>
      * <ul>

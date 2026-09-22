@@ -462,17 +462,17 @@ class DeletionCorrectnessIntegrationTest {
          * Test: Hierarchical deletion removes entries from ALL levels.
          *
          * <p>Domain correctness: When deleting from a hierarchical filter,
-         * the entry must be removed from segment, cluster, AND corpus levels.</p>
+         * the entry must be removed from both the segment AND corpus levels.</p>
          */
         @Test
         @DisplayName("hierarchical deletion removes from all levels")
         void hierarchicalDeletionRemovesFromAllLevels() {
             HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(10000);
 
-            // Create hierarchy: corpus -> clusters -> segments
-            hcf.registerSegment("seg-A1", "cluster-A");
-            hcf.registerSegment("seg-A2", "cluster-A");
-            hcf.registerSegment("seg-B1", "cluster-B");
+            // Create hierarchy: corpus -> segments
+            hcf.registerSegment("seg-A1");
+            hcf.registerSegment("seg-A2");
+            hcf.registerSegment("seg-B1");
 
             // Insert keys into different segments
             String key1 = "hierarchy-test-key-1";
@@ -485,12 +485,9 @@ class DeletionCorrectnessIntegrationTest {
 
             // Verify presence at all levels before deletion
             CuckooFilter corpusFilter = hcf.getCorpusFilter();
-            CuckooFilter clusterA = hcf.getClusterFilter("cluster-A");
-            CuckooFilter clusterB = hcf.getClusterFilter("cluster-B");
             CuckooFilter segA1 = hcf.getSegmentFilter("seg-A1");
 
             assertThat(corpusFilter.contains(HierarchicalCuckooFilter.toBytes(key1))).isTrue();
-            assertThat(clusterA.contains(HierarchicalCuckooFilter.toBytes(key1))).isTrue();
             assertThat(segA1.contains(HierarchicalCuckooFilter.toBytes(key1))).isTrue();
 
             // Delete key1 from hierarchy
@@ -500,9 +497,6 @@ class DeletionCorrectnessIntegrationTest {
             // CRITICAL: Verify key1 is gone from ALL levels
             assertThat(segA1.contains(HierarchicalCuckooFilter.toBytes(key1)))
                 .as("Key must be removed from segment level")
-                .isFalse();
-            assertThat(clusterA.contains(HierarchicalCuckooFilter.toBytes(key1)))
-                .as("Key must be removed from cluster level")
                 .isFalse();
             assertThat(corpusFilter.contains(HierarchicalCuckooFilter.toBytes(key1)))
                 .as("Key must be removed from corpus level")

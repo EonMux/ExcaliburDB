@@ -226,6 +226,38 @@ public final class IndexCoverage {
         return activeSegments + indexingSegments + warmingSegments + compactingSegments;
     }
 
+    /**
+     * This coverage, marked degraded for a reason its counts do not record.
+     *
+     * <p>For a stage that runs after the search and can fail without the search having
+     * failed - a relevancy pass that fell back to the retrieval ranking, or ran out of time.
+     * The counts stay what the search reported, because they are still true of it; only the
+     * verdict changes. ORed rather than assigned, so no reason already found is erased.</p>
+     *
+     * @param degradedFor Whether there is a further reason to call the answer degraded
+     * @return This coverage when nothing changes, otherwise a degraded copy
+     */
+    public IndexCoverage orDegraded(boolean degradedFor) {
+        if (!degradedFor || degraded) {
+            return this;
+        }
+        return builder()
+            .totalSegments(totalSegments)
+            .activeSegments(activeSegments)
+            .indexingSegments(indexingSegments)
+            .warmingSegments(warmingSegments)
+            .compactingSegments(compactingSegments)
+            .tombstonedSegments(tombstonedSegments)
+            .estimatedCorpusCoverage(estimatedCorpusCoverage)
+            .tailScanEntries(tailScanEntries)
+            .segmentsSearched(segmentsSearched)
+            .segmentsExcluded(segmentsExcluded)
+            .segmentsWithErrors(segmentsWithErrors)
+            .segmentsTimedOut(segmentsTimedOut)
+            .degraded(true)
+            .build();
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;

@@ -271,7 +271,10 @@ public final class EdgeStoreCompactor {
             if (tombstoned.contains((int) index)) {
                 return;
             }
-            writer.add(subject, relation, object,
+            // As stored, and with no supersession policy: the intervals were closed when the
+            // store was built, and an empty one - a statement superseded the day it began - is
+            // carried across rather than refused.
+            writer.addStored(subject, relation, object,
                 store.validFrom(index), store.validTo(index), store.provenanceOf(index));
         });
         // Entity count is preserved rather than recomputed. Compaction removes edges, not the id

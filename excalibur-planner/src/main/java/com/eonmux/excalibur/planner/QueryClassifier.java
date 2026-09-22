@@ -132,12 +132,15 @@ public final class QueryClassifier {
             throw new IllegalArgumentException("context must not be null");
         }
 
-        CoreferenceResolver.Resolution resolution = coreference.resolve(question, context);
+        // The question's own names are read first so coreference can bind a pronoun to one of
+        // them: "what did Ada publish in her lifetime" has already said who "her" is.
+        List<String> named = List.copyOf(extractMentions(question));
+        CoreferenceResolver.Resolution resolution = coreference.resolve(question, context, named);
         if (!resolution.isResolved()) {
             return resolution.ask();
         }
 
-        List<String> mentions = new ArrayList<>(extractMentions(question));
+        List<String> mentions = new ArrayList<>(named);
         mentions.addAll(resolution.boundMentions());
         List<String> distinct = List.copyOf(new LinkedHashSet<>(mentions));
 
@@ -282,6 +285,11 @@ public final class QueryClassifier {
             }
             candidate = candidate.trim();
             if (quoted == null && STOP_MENTIONS.contains(candidate.toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            // A capitalised pronoun is one that starts the sentence. Taking it for a name would
+            // link "It" against the graph and let a later pronoun bind to it.
+            if (quoted == null && CoreferenceResolver.isPronoun(candidate)) {
                 continue;
             }
             mentions.add(candidate);

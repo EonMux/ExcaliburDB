@@ -89,6 +89,30 @@ class NamespaceRoutingGraphIngestSinkTest {
     }
 
     @Test
+    @DisplayName("stages a document's facts as stated on the document's own date")
+    void carriesTheDocumentDate(@TempDir Path root) throws IOException {
+        // The date is what orders two documents' values of a single-valued relation; lost on the
+        // way to the tenant, every fact would be ordered by the day it was crawled instead.
+        NamespaceId acme = NamespaceId.of("acme");
+        java.time.LocalDate written = java.time.LocalDate.of(2021, 5, 4);
+        long lastModified = written.atStartOfDay(java.time.ZoneOffset.UTC).toInstant()
+            .toEpochMilli();
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), oneFact());
+
+            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.", lastModified);
+
+            try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
+                java.util.List<Integer> stated = new java.util.ArrayList<>();
+                lease.resource().staging().forEachStaged(
+                    (s, r, o, from, to, statedOn, provenance) -> stated.add(statedOn));
+                assertThat(stated).containsExactly(Math.toIntExact(written.toEpochDay()));
+            }
+        }
+    }
+
+    @Test
     @DisplayName("stages a source registered without a namespace into the shared one")
     void stagesASourceWithNoNamespaceIntoShared(@TempDir Path root) throws IOException {
         try (GraphTenants tenants = tenants(root, 4)) {
@@ -201,6 +225,26 @@ class NamespaceRoutingGraphIngestSinkTest {
                     + "would report a loss that did not happen")
                 .doesNotThrowAnyException();
             assertThat(staged(tenants, acme)).isZero();
+            assertThat(sink.extractionFailures()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    @DisplayName("a document with no facts opens no namespace's graph")
+    void noFactsBorrowsNothing(@TempDir Path root) throws IOException {
+        // With extraction disabled every document finds nothing. Borrowing anyway opened the
+        // namespace and could evict another tenant's graph from under the query path, per
+        // document published, to stage nothing.
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), RelationExtractor.none());
+
+            sink.onDocumentPublished("docs:ada", "Ada knows Babbage.");
+
+            assertThat(tenants.openNamespaces()).doesNotContain(acme);
+            assertThat(sink.documentsSeen()).isEqualTo(1);
+            assertThat(sink.factsStaged()).isZero();
         }
     }
 

@@ -54,6 +54,15 @@ public class SegmentCatalog {
      */
     static final Logger logger = LoggerFactory.getLogger(SegmentCatalog.class);
 
+    /**
+     * The lowest segment id {@link #create(String, Path)} hands out.
+     *
+     * <p>Every id below it is a routing-directory index, which only the storage engine
+     * chooses; every id {@code create()} returns is at or above it. See
+     * {@link CatalogRegistry} for why the two ranges must not overlap.</p>
+     */
+    public static final long FIRST_CREATED_SEGMENT_ID = CatalogRegistry.FIRST_CREATED_ID;
+
     // ==================== Entry State ====================
 
     /**
@@ -225,9 +234,11 @@ public class SegmentCatalog {
      * <p>A newly created record is moved into INDEXING; one that is being re-registered in
      * a later state is left where it is. See {@link CatalogRegistry} for why.</p>
      *
-     * @param segmentId Unique segment identifier
+     * @param segmentId The routing-directory index, below {@link #FIRST_CREATED_SEGMENT_ID}
      * @param volumePath Path to the segment file
      * @return The created metadata
+     * @throws IllegalArgumentException if the id is not a routing index
+     * @throws IllegalStateException if a segment made by {@link #create} holds the id
      */
     public SegmentMetadata add(long segmentId, Path volumePath) {
         return registry.add(segmentId, volumePath);
@@ -244,6 +255,8 @@ public class SegmentCatalog {
      * @param segmentId  The segment index whose file changed
      * @param volumePath The new segment file path
      * @return The metadata for the segment
+     * @throws IllegalArgumentException if the id is not a routing index
+     * @throws IllegalStateException if a segment made by {@link #create} holds the id
      */
     public SegmentMetadata registerFile(long segmentId, Path volumePath) {
         return registry.registerFile(segmentId, volumePath);
@@ -252,7 +265,8 @@ public class SegmentCatalog {
     /**
      * Creates a new segment in BOOTSTRAPPING state for a specific source.
      *
-     * <p>For the reindexer's rolling replacement. The id is allocated atomically and the
+     * <p>For the reindexer's rolling replacement. The id is allocated atomically, at or above
+     * {@link #FIRST_CREATED_SEGMENT_ID}, so it never names a routing-directory index, and the
      * segment is invisible to queries until {@link #beginIndexing(long)} moves it on.</p>
      *
      * @param sourceId The source ID this segment belongs to
@@ -262,6 +276,48 @@ public class SegmentCatalog {
      */
     public SegmentMetadata create(String sourceId, Path volumePath) {
         return registry.create(sourceId, volumePath);
+    }
+
+    /**
+     * Checks that a routing index can be registered by {@link #add} or {@link #registerFile}
+     * without landing on a segment made by {@link #create}.
+     *
+     * <p>For callers that must know before they commit to anything - split publication,
+     * which cannot undo its file moves once made.</p>
+     *
+     * @param segmentIndex The routing index about to be registered
+     * @throws IllegalArgumentException if the id is not a routing index
+     * @throws IllegalStateException if a created segment holds the id
+     */
+    void checkRoutingRegistration(long segmentIndex) {
+        registry.checkRoutingRegistration(segmentIndex);
+    }
+
+    /**
+     * Whether a record made by {@link #create} holds a routing index.
+     *
+     * @param segmentIndex The routing index
+     * @return true if the record there belongs to a source rather than to a routing segment
+     */
+    boolean isHeldByCreatedRecord(long segmentIndex) {
+        return registry.isHeldByCreatedRecord(segmentIndex);
+    }
+
+    /**
+     * Gives a routing segment its own row in place of a created record holding its index.
+     *
+     * <p>For start-up, which is where such a row is found. See
+     * {@link CatalogRegistry#replaceWithRoutingRecord} for what is kept and what is not.</p>
+     *
+     * @param segmentIndex The routing index
+     * @param volumePath   The routing segment's file
+     * @param entryCount   The routing segment's live entry count
+     * @return The new row
+     * @throws IllegalArgumentException if the id is not a routing index
+     * @throws IllegalStateException if the index is not held by a created record
+     */
+    SegmentMetadata replaceWithRoutingRecord(long segmentIndex, Path volumePath, int entryCount) {
+        return registry.replaceWithRoutingRecord(segmentIndex, volumePath, entryCount);
     }
 
     /**

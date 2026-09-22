@@ -887,26 +887,64 @@ public final class FlakyTestAnalyzer {
         }
     }
 
+    /** Exit code when every test passed in every run. */
+    public static final int EXIT_ALL_PASSED = 0;
+
+    /** Exit code when a test was flaky or failed in every run. */
+    public static final int EXIT_ISSUES_FOUND = 1;
+
     /**
-     * Main entry point for command-line usage.
+     * Exit code when the analysis could not be carried out at all.
+     *
+     * <p>Kept apart from {@link #EXIT_ISSUES_FOUND}: "a test is flaky" and "no test ran" call for
+     * different responses, and a caller reading only the exit code cannot tell them apart if
+     * they share one.</p>
      */
-    public static void main(String[] args) throws Exception {
-        String module = args.length > 0 ? args[0] : DEFAULT_MODULE;
-        int runs = args.length > 1 ? Integer.parseInt(args[1]) : DEFAULT_RUN_COUNT;
-        boolean verbose = args.length > 2 && "-v".equals(args[2]);
+    public static final int EXIT_ANALYSIS_FAILED = 2;
 
-        FlakyTestAnalyzer analyzer = new FlakyTestAnalyzer()
-            .withModuleName(module)
-            .withRunCount(runs)
-            .withVerbose(verbose);
+    /**
+     * Main entry point for command-line usage: {@code <module> <runs> [-v]}.
+     *
+     * @param args The module, the run count and an optional {@code -v}
+     */
+    public static void main(String[] args) {
+        System.exit(run(args));
+    }
 
-        FlakyTestReport report = analyzer.analyze();
+    /**
+     * Runs the analysis the command line describes and returns the code to exit with.
+     *
+     * @param args The module, the run count and an optional {@code -v}
+     * @return {@link #EXIT_ALL_PASSED}, {@link #EXIT_ISSUES_FOUND} or {@link #EXIT_ANALYSIS_FAILED}
+     */
+    static int run(String[] args) {
+        FlakyTestAnalyzer analyzer;
+        try {
+            String module = args.length > 0 ? args[0] : DEFAULT_MODULE;
+            int runs = args.length > 1 ? Integer.parseInt(args[1]) : DEFAULT_RUN_COUNT;
+            boolean verbose = args.length > 2 && "-v".equals(args[2]);
+            analyzer = new FlakyTestAnalyzer()
+                .withModuleName(module)
+                .withRunCount(runs)
+                .withVerbose(verbose);
+        } catch (IllegalArgumentException e) {
+            System.err.println("FlakyTestAnalyzer: " + e.getMessage());
+            return EXIT_ANALYSIS_FAILED;
+        }
+
+        FlakyTestReport report;
+        try {
+            report = analyzer.analyze();
+        } catch (IOException e) {
+            System.err.println("FlakyTestAnalyzer: " + e.getMessage());
+            return EXIT_ANALYSIS_FAILED;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("FlakyTestAnalyzer: interrupted");
+            return EXIT_ANALYSIS_FAILED;
+        }
 
         System.out.println(report.getSummary());
-
-        // Exit with error code if flaky tests or consistent failures found
-        if (!report.allTestsPassed()) {
-            System.exit(1);
-        }
+        return report.allTestsPassed() ? EXIT_ALL_PASSED : EXIT_ISSUES_FOUND;
     }
 }

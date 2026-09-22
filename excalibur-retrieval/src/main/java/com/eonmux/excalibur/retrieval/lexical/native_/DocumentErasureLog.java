@@ -38,28 +38,72 @@ import java.util.Set;
  *
  * <p>The file is text, one request a line, because an operator asked to prove what a store still
  * owes should be able to read the answer.</p>
+ *
+ * <h2>Owed is not the same as unapplied</h2>
+ * <p>A promise stays on the log until compaction physically removes what it names, which may be an
+ * hour after the document was hidden. For all of that hour the promise has already been applied:
+ * the document is tombstoned, durably. Re-applying every outstanding promise when the store opens
+ * would therefore reach past the document it was made about and hide whatever has been written
+ * under the same key since - a document erased and then legitimately ingested again would vanish
+ * on the next restart, and be compacted away for good at the one after. So the log also records
+ * which promises the store has confirmed as applied, and only the rest - the ones a crash caught
+ * between the promise and its application - are replayed.</p>
+ *
+ * <h2>Format</h2>
+ * <p>Version 2, after the header line: {@code P<tab>millis<tab>key} for a promise not yet
+ * confirmed as applied, {@code A<tab>millis<tab>key} for one that has been, and
+ * {@code D<tab>key} confirming every earlier promise of that key - the line an application
+ * appends, so confirming costs an append rather than a rewrite. A version 1 log, which records
+ * {@code millis<tab>key} and nothing about application, is read with every promise unapplied,
+ * which is the only safe reading of it, and rewritten as version 2 before anything is appended to
+ * it.</p>
  */
 public final class DocumentErasureLog {
 
-    /** One outstanding promise. */
-    public record Record(Instant requestedAt, String key) {
+    /**
+     * One outstanding promise.
+     *
+     * @param requestedAt When it was made
+     * @param key         The document key it names
+     * @param applied     Whether the store has durably applied it, so a reopen must not again
+     */
+    public record Record(Instant requestedAt, String key, boolean applied) {
         public Record {
             Objects.requireNonNull(requestedAt, "requestedAt must not be null");
             DocumentKeys.require(key);
+        }
+
+        /**
+         * A promise not yet confirmed as applied.
+         *
+         * @param requestedAt When it was made
+         * @param key         The document key it names
+         */
+        public Record(Instant requestedAt, String key) {
+            this(requestedAt, key, false);
         }
     }
 
     private static final Logger LOGGER = LoggerFactory.getLogger(DocumentErasureLog.class);
 
     private static final String FILE = "erasure.log";
-    private static final String HEADER = "excalibur-lexical-erasure v1";
+    private static final String HEADER_V1 = "excalibur-lexical-erasure v1";
+    private static final String HEADER = "excalibur-lexical-erasure v2";
+
+    private static final String PROMISED = "P";
+    private static final String APPLIED = "A";
+    private static final String CONFIRMED = "D";
 
     private final Path file;
     private final List<Record> records;
 
-    private DocumentErasureLog(Path file, List<Record> records) {
+    /** Whether the file on disk is in the current format, so appending to it is safe. */
+    private boolean current;
+
+    private DocumentErasureLog(Path file, List<Record> records, boolean current) {
         this.file = file;
         this.records = records;
+        this.current = current;
     }
 
     /** Opens the log for a store directory, reading back anything already owed. */
@@ -67,32 +111,82 @@ public final class DocumentErasureLog {
         Objects.requireNonNull(directory, "directory must not be null");
         Path file = directory.resolve(FILE);
         List<Record> records = new ArrayList<>();
-        if (Files.exists(file) && Files.size(file) > 0) {
-            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-            if (!HEADER.equals(lines.get(0))) {
-                // Checked rather than assumed. If the first line is not the header it is a record,
-                // and skipping it would silently discharge a promise nobody agreed to discharge.
-                throw new IOException("Not an erasure log, first line is: " + lines.get(0));
+        if (!Files.exists(file) || Files.size(file) == 0) {
+            return new DocumentErasureLog(file, records, true);
+        }
+        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        String header = lines.get(0);
+        boolean versionOne = HEADER_V1.equals(header);
+        if (!versionOne && !HEADER.equals(header)) {
+            // Checked rather than assumed. If the first line is not a header it is a record, and
+            // skipping it would silently discharge a promise nobody agreed to discharge.
+            throw new IOException("Not an erasure log, first line is: " + header);
+        }
+        for (int i = 1; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (line.isEmpty()) {
+                continue;
             }
-            for (int i = 1; i < lines.size(); i++) {
-                String line = lines.get(i);
-                if (line.isEmpty()) {
-                    continue;
-                }
-                int tab = line.indexOf('\t');
-                if (tab < 0) {
-                    throw new IOException("Malformed erasure log line: " + line);
-                }
-                long millis;
-                try {
-                    millis = Long.parseLong(line.substring(0, tab));
-                } catch (NumberFormatException e) {
-                    throw new IOException("Malformed erasure log timestamp: " + line, e);
-                }
-                records.add(new Record(Instant.ofEpochMilli(millis), line.substring(tab + 1)));
+            if (versionOne) {
+                records.add(versionOneRecord(line));
+            } else {
+                readLine(line, records);
             }
         }
-        return new DocumentErasureLog(file, records);
+        return new DocumentErasureLog(file, records, !versionOne);
+    }
+
+    /** A version 1 line: a promise, with nothing recorded about whether it was applied. */
+    private static Record versionOneRecord(String line) throws IOException {
+        int tab = line.indexOf('\t');
+        if (tab < 0) {
+            throw new IOException("Malformed erasure log line: " + line);
+        }
+        return new Record(millisOf(line, line.substring(0, tab)), line.substring(tab + 1));
+    }
+
+    /** Applies one version 2 line to the records read so far. */
+    private static void readLine(String line, List<Record> records) throws IOException {
+        int tab = line.indexOf('\t');
+        if (tab < 0) {
+            throw new IOException("Malformed erasure log line: " + line);
+        }
+        String kind = line.substring(0, tab);
+        String rest = line.substring(tab + 1);
+        if (CONFIRMED.equals(kind)) {
+            confirm(records, Set.of(rest));
+            return;
+        }
+        if (!PROMISED.equals(kind) && !APPLIED.equals(kind)) {
+            throw new IOException("Malformed erasure log line: " + line);
+        }
+        int second = rest.indexOf('\t');
+        if (second < 0) {
+            throw new IOException("Malformed erasure log line: " + line);
+        }
+        records.add(new Record(millisOf(line, rest.substring(0, second)),
+            rest.substring(second + 1), APPLIED.equals(kind)));
+    }
+
+    private static Instant millisOf(String line, String millis) throws IOException {
+        try {
+            return Instant.ofEpochMilli(Long.parseLong(millis));
+        } catch (NumberFormatException e) {
+            throw new IOException("Malformed erasure log timestamp: " + line, e);
+        }
+    }
+
+    /** Marks every unapplied record of these keys applied, in place. */
+    private static int confirm(List<Record> records, Set<String> keys) {
+        int confirmed = 0;
+        for (int i = 0; i < records.size(); i++) {
+            Record record = records.get(i);
+            if (!record.applied() && keys.contains(record.key())) {
+                records.set(i, new Record(record.requestedAt(), record.key(), true));
+                confirmed++;
+            }
+        }
+        return confirmed;
     }
 
     /**
@@ -107,23 +201,61 @@ public final class DocumentErasureLog {
         if (keys.isEmpty()) {
             return;
         }
+        List<Record> appended = new ArrayList<>(keys.size());
+        StringBuilder sb = new StringBuilder();
+        for (String key : keys) {
+            Record record = new Record(requestedAt, key);
+            appended.add(record);
+            appendRecord(sb, record);
+        }
+        appendLines(sb);
+        records.addAll(appended);
+    }
+
+    /**
+     * Confirms that the store has durably applied every outstanding promise of these keys.
+     *
+     * <p>Called only once the tombstones or deletes are on the device. Confirming earlier would
+     * let a crash in between lose a promise that a reopen then declines to replay; confirming
+     * never is safe but reaches too far, which is what this exists to prevent.</p>
+     *
+     * @param keys Document keys whose promises are now applied
+     */
+    public void confirmApplied(Collection<String> keys) throws IOException {
+        Objects.requireNonNull(keys, "keys must not be null");
+        Set<String> pending = new LinkedHashSet<>();
+        for (Record record : records) {
+            if (!record.applied() && keys.contains(record.key())) {
+                pending.add(record.key());
+            }
+        }
+        if (pending.isEmpty()) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String key : pending) {
+            sb.append(CONFIRMED).append('\t').append(key).append('\n');
+        }
+        appendLines(sb);
+        confirm(records, pending);
+    }
+
+    /** Appends lines in the current format, forcing them to disk before returning. */
+    private void appendLines(StringBuilder lines) throws IOException {
+        if (!current) {
+            // A version 1 file cannot take a version 2 line, so it is rewritten first - with
+            // every promise it held still unapplied, which is all a version 1 log could say.
+            rewrite(records);
+            current = true;
+        }
         // Empty counts as absent: a file created but not yet written to is what a crash between
         // the two leaves behind, and appending records to it without a header would make the
         // first of them look like one on the next read.
         boolean fresh = !Files.exists(file) || Files.size(file) == 0;
-        StringBuilder sb = new StringBuilder();
-        if (fresh) {
-            sb.append(HEADER).append('\n');
-        }
-        List<Record> appended = new ArrayList<>(keys.size());
-        for (String key : keys) {
-            Record record = new Record(requestedAt, key);
-            appended.add(record);
-            sb.append(requestedAt.toEpochMilli()).append('\t').append(key).append('\n');
-        }
+        String text = fresh ? HEADER + "\n" + lines : lines.toString();
         try (FileChannel channel = FileChannel.open(file, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
-            channel.write(ByteBuffer.wrap(sb.toString().getBytes(StandardCharsets.UTF_8)));
+            channel.write(ByteBuffer.wrap(text.getBytes(StandardCharsets.UTF_8)));
             channel.force(true);
         }
         if (fresh) {
@@ -131,7 +263,12 @@ public final class DocumentErasureLog {
             // promise in a file the directory has forgotten is a promise lost.
             forceDirectory();
         }
-        records.addAll(appended);
+    }
+
+    private static void appendRecord(StringBuilder sb, Record record) {
+        sb.append(record.applied() ? APPLIED : PROMISED).append('\t')
+          .append(record.requestedAt().toEpochMilli()).append('\t')
+          .append(record.key()).append('\n');
     }
 
     /**
@@ -156,12 +293,20 @@ public final class DocumentErasureLog {
         if (kept.isEmpty()) {
             Files.deleteIfExists(file);
             records.clear();
+            current = true;
             return;
         }
+        rewrite(kept);
+        current = true;
+        records.clear();
+        records.addAll(kept);
+    }
+
+    /** Replaces the file with these records, in the current format, durably. */
+    private void rewrite(List<Record> kept) throws IOException {
         StringBuilder sb = new StringBuilder(HEADER).append('\n');
         for (Record record : kept) {
-            sb.append(record.requestedAt().toEpochMilli()).append('\t')
-              .append(record.key()).append('\n');
+            appendRecord(sb, record);
         }
         Path temp = file.resolveSibling(FILE + ".tmp");
         try (FileChannel channel = FileChannel.open(temp, StandardOpenOption.CREATE,
@@ -171,8 +316,7 @@ public final class DocumentErasureLog {
         }
         Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING,
             StandardCopyOption.ATOMIC_MOVE);
-        records.clear();
-        records.addAll(kept);
+        forceDirectory();
     }
 
     private void forceDirectory() throws IOException {
@@ -206,6 +350,22 @@ public final class DocumentErasureLog {
         Set<String> keys = new LinkedHashSet<>();
         for (Record record : records) {
             keys.add(record.key());
+        }
+        return keys;
+    }
+
+    /**
+     * Every key with a promise the store has not confirmed as applied.
+     *
+     * <p>What a reopen replays. A promise that was applied stays owed until compaction removes
+     * the document, but replaying it would hide whatever has since been written under its key.</p>
+     */
+    public Set<String> unappliedKeys() {
+        Set<String> keys = new LinkedHashSet<>();
+        for (Record record : records) {
+            if (!record.applied()) {
+                keys.add(record.key());
+            }
         }
         return keys;
     }

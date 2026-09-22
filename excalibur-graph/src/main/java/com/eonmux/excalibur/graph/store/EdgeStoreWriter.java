@@ -3,7 +3,12 @@ package com.eonmux.excalibur.graph.store;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.format.ColumnFileWriter;
@@ -49,6 +54,7 @@ public final class EdgeStoreWriter {
     private int[] objects = new int[INITIAL_CAPACITY];
     private int[] validFrom = new int[INITIAL_CAPACITY];
     private int[] validTo = new int[INITIAL_CAPACITY];
+    private int[] statedOn = new int[INITIAL_CAPACITY];
     private byte[] sourceTypes = new byte[INITIAL_CAPACITY];
     private long[] sourceIds = new long[INITIAL_CAPACITY];
     private byte[] confidences = new byte[INITIAL_CAPACITY];
@@ -75,22 +81,77 @@ public final class EdgeStoreWriter {
 
     /** Adds an edge that holds over all time, with no recorded provenance. */
     public EdgeStoreWriter add(int subject, int relation, int object) {
-        return add(subject, relation, object, Integer.MIN_VALUE, TemporalFilter.OPEN,
+        return add(subject, relation, object, TemporalFilter.UNDATED, TemporalFilter.OPEN,
             Provenance.UNKNOWN);
     }
 
     /**
-     * Adds an edge.
+     * Adds an edge whose statement carries no date of its own.
      *
      * @param subject   subject entity id, non-negative
      * @param relation  relation id, non-negative
      * @param object    object entity id, non-negative
-     * @param validFrom first day the fact held, days since epoch
+     * @param validFrom first day the fact held, days since epoch, or
+     *                  {@link TemporalFilter#UNDATED}
      * @param validTo   first day it no longer held, or {@link TemporalFilter#OPEN}
      * @param provenance where the edge came from; never null, use {@link Provenance#UNKNOWN}
      */
     public EdgeStoreWriter add(int subject, int relation, int object,
                                int validFrom, int validTo, Provenance provenance) {
+        return add(subject, relation, object, validFrom, validTo, TemporalFilter.UNDATED,
+            provenance);
+    }
+
+    /**
+     * Adds an edge, with the day its statement was made.
+     *
+     * <p>The stated-on day is not stored. It orders the statements of a single-valued relation
+     * whose values do not say when they began, and once supersession has closed the intervals
+     * that ordering implied, the intervals are the whole of what it decided. The order edges are
+     * added in is the last tie-break, so a caller replaying statements adds them in the order they
+     * were made.
+     *
+     * @param subject   subject entity id, non-negative
+     * @param relation  relation id, non-negative
+     * @param object    object entity id, non-negative
+     * @param validFrom first day the fact held, days since epoch, or
+     *                  {@link TemporalFilter#UNDATED}
+     * @param validTo   first day it no longer held, or {@link TemporalFilter#OPEN}
+     * @param statedOn  the day the statement was made, days since epoch, or
+     *                  {@link TemporalFilter#UNDATED}
+     * @param provenance where the edge came from; never null, use {@link Provenance#UNKNOWN}
+     */
+    public EdgeStoreWriter add(int subject, int relation, int object,
+                               int validFrom, int validTo, int statedOn, Provenance provenance) {
+        TemporalFilter.checkInterval(validFrom, validTo);
+        return append(subject, relation, object, validFrom, validTo, statedOn, provenance);
+    }
+
+    /**
+     * Adds an edge exactly as a built store holds it, for a store rewritten from another.
+     *
+     * <p>Unlike {@link #add}, accepts an empty interval: supersession closes a statement
+     * superseded on the day it began at that same day, and a rewrite that refused it would make
+     * every store holding one impossible to compact. See
+     * {@link TemporalFilter#checkStoredInterval}.
+     *
+     * @param subject   subject entity id, non-negative
+     * @param relation  relation id, non-negative
+     * @param object    object entity id, non-negative
+     * @param validFrom first day the fact held, as stored
+     * @param validTo   first day it no longer held, as stored
+     * @param provenance where the edge came from
+     */
+    public EdgeStoreWriter addStored(int subject, int relation, int object,
+                                     int validFrom, int validTo, Provenance provenance) {
+        TemporalFilter.checkStoredInterval(validFrom, validTo);
+        return append(subject, relation, object, validFrom, validTo, TemporalFilter.UNDATED,
+            provenance);
+    }
+
+    private EdgeStoreWriter append(int subject, int relation, int object,
+                                   int validFrom, int validTo, int statedOn,
+                                   Provenance provenance) {
         if (subject < 0) {
             throw new IllegalArgumentException("subject must be non-negative, got " + subject);
         }
@@ -98,7 +159,10 @@ public final class EdgeStoreWriter {
             throw new IllegalArgumentException("object must be non-negative, got " + object);
         }
         RelationSelector.checkRelation(relation);
-        TemporalFilter.checkInterval(validFrom, validTo);
+        if (statedOn == TemporalFilter.OPEN) {
+            throw new IllegalArgumentException(
+                "statedOn must be a day or UNDATED, not the open-interval sentinel");
+        }
         if (provenance == null) {
             throw new IllegalArgumentException(
                 "provenance must not be null; use Provenance.UNKNOWN to record that it is unknown");
@@ -115,6 +179,7 @@ public final class EdgeStoreWriter {
         objects[count] = object;
         this.validFrom[count] = validFrom;
         this.validTo[count] = validTo;
+        this.statedOn[count] = statedOn;
         sourceTypes[count] = provenance.sourceType().toByte();
         sourceIds[count] = provenance.sourceId();
         confidences[count] = provenance.confidenceByte();
@@ -140,6 +205,7 @@ public final class EdgeStoreWriter {
         objects = Arrays.copyOf(objects, grown);
         validFrom = Arrays.copyOf(validFrom, grown);
         validTo = Arrays.copyOf(validTo, grown);
+        statedOn = Arrays.copyOf(statedOn, grown);
         sourceTypes = Arrays.copyOf(sourceTypes, grown);
         sourceIds = Arrays.copyOf(sourceIds, grown);
         confidences = Arrays.copyOf(confidences, grown);
@@ -163,10 +229,10 @@ public final class EdgeStoreWriter {
      *
      * <p>The columns are forced before the descriptor is written, which is what turns "the
      * descriptor is written last" from a statement about the order of two writes into the
-     * guarantee the format actually needs. Until this, the ordering held against the page cache
-     * and nothing else: a power loss could leave the descriptor durable over columns that were
-     * not, producing the one outcome the ordering exists to prevent — a directory that opens as
-     * a store and reads truncated columns.
+     * guarantee the format actually needs. Ordered only against the page cache, a power loss
+     * could leave the descriptor durable over columns that were not, producing the one outcome
+     * the ordering exists to prevent — a directory that opens as a store and reads truncated
+     * columns.
      *
      * @param directory   where the store goes
      * @param entityCount how many entity ids the store addresses
@@ -226,12 +292,10 @@ public final class EdgeStoreWriter {
      * Closes the interval of every statement that a later statement on the same
      * (subject, relation) supersedes.
      *
-     * <p>Only for relations the policy calls single-valued. Applied by walking each group in
-     * {@code validFrom} order and closing an open interval at the next statement's start.
-     *
-     * <p>An interval that already has an explicit end is left alone: the source said when the fact
-     * stopped holding, and that is better information than an inference from the next statement's
-     * arrival.
+     * <p>Only for relations the policy calls single-valued. Each group is walked in the order its
+     * values began - see {@link #orderingDay} - and then in the order the edges were added, so
+     * a group's order is total and a rebuild from the same statements always closes the same
+     * intervals.
      *
      * @return how many intervals were closed
      */
@@ -249,7 +313,11 @@ public final class EdgeStoreWriter {
             if (c != 0) {
                 return c;
             }
-            return Integer.compare(validFrom[a], validFrom[b]);
+            c = Integer.compare(orderingDay(a), orderingDay(b));
+            if (c != 0) {
+                return c;
+            }
+            return Integer.compare(a, b);
         });
 
         int closed = 0;
@@ -270,51 +338,114 @@ public final class EdgeStoreWriter {
     }
 
     /**
-     * Closes the open intervals of one single-valued (subject, relation) group.
+     * The day an edge's value is taken to have begun, for ordering it against the rest of its
+     * group.
      *
-     * <p>The group arrives sorted ascending by {@code validFrom}, so it is a sequence of runs of
-     * equal start days. Every statement in a run is superseded by the <em>next distinct</em>
-     * start to its right, and the runs are walked from the right so that start is already known.
+     * <p>Its {@code validFrom} when the source said when the value began. Otherwise, for a
+     * statement that is still open, the day it was stated: a document that says "X runs Y"
+     * without saying since when is evidence that X ran Y on the day it was written, and that is
+     * the latest the change to X can have happened. A statement with a stated end and no stated
+     * start is history rather than a claim about the present, and orders as having begun
+     * before anything dated.
+     */
+    private int orderingDay(int edge) {
+        if (validFrom[edge] != TemporalFilter.UNDATED) {
+            return validFrom[edge];
+        }
+        return validTo[edge] == TemporalFilter.OPEN ? statedOn[edge] : TemporalFilter.UNDATED;
+    }
+
+    /**
+     * Closes the open intervals of one single-valued (subject, relation) group, and dates the
+     * start of each value that took over from another.
      *
-     * <p>Two statements starting on the same day carry no ordering information about which
-     * supersedes which, so neither closes the other — but both are closed by anything that
-     * starts later. Comparing only adjacent pairs got the first half right and the second half
-     * wrong: in "Acme day 100, Beta day 100, Gamma day 900" it closed Beta at 900 and left Acme
-     * open, so a query two years later returned a job the subject had left, presented as current
-     * and sitting beside the correct answer.
+     * <p>The group arrives in order (see {@link #applySupersession}). Walking it, each statement
+     * closes every still-open statement of a <em>different</em> value at the day its own value
+     * began, with three exceptions, each of which keeps information rather than inventing it:</p>
+     * <ul>
+     *   <li><b>A restatement closes nothing.</b> A later document repeating the current value
+     *       corroborates it; it is not a change. Both stay open, each with its own provenance,
+     *       until a different value arrives and closes them together.</li>
+     *   <li><b>One source's statements on one day do not order each other.</b> Two values the
+     *       same document gives on the same day - "worked at Acme and at Beta" - carry no
+     *       evidence of which came second, and the order a model listed them in is not any. Both
+     *       remain, and both are closed by whatever begins later. Between different sources the
+     *       later-staged statement is the later statement, which is what makes a batch of
+     *       documents ingested on one day resolve to one current value rather than to all of
+     *       them.</li>
+     *   <li><b>A stated end is kept.</b> An interval the source ended already is left alone: the
+     *       source said when the fact stopped holding, which beats an inference from the next
+     *       arrival. And a statement with an end but no start does not close anything, because
+     *       it never says when it began.</li>
+     * </ul>
+     *
+     * <p>A value that closed another, or that began after the group's first, and whose own start
+     * the source did not state, is given the day it is ordered by as its start. Without that the
+     * new value would reach back over all of time and a question about the years before the
+     * change would get both answers. The group's first value keeps an unknown start: nothing
+     * earlier is known, and the fact is what the graph holds for those years.</p>
+     *
+     * <p>Superseding a statement on the day it began leaves an empty interval, which no snapshot
+     * admits and the whole history still returns - a statement made and contradicted the same
+     * day.</p>
      *
      * @return how many intervals were closed
      */
     private int closeGroup(int[] order, int from, int to) {
         int closed = 0;
-        boolean haveSuccessor = false;
-        int successorStart = TemporalFilter.OPEN;
+        int earliest = orderingDay(order[from]);
+        // The group's still-open statements, by the value each holds. A group is one subject's
+        // one relation, so this holds a handful of values however many statements there are.
+        Map<Integer, List<Integer>> openByValue = new LinkedHashMap<>();
 
-        int i = to - 1;
-        while (i >= from) {
-            int runStart = validFrom[order[i]];
-            int runFrom = i;
-            while (runFrom > from && validFrom[order[runFrom - 1]] == runStart) {
-                runFrom--;
-            }
+        for (int k = from; k < to; k++) {
+            int edge = order[k];
+            int day = orderingDay(edge);
+            boolean begins = validFrom[edge] != TemporalFilter.UNDATED
+                || validTo[edge] == TemporalFilter.OPEN;
 
-            if (haveSuccessor) {
-                for (int k = runFrom; k <= i; k++) {
-                    int edge = order[k];
-                    // An interval with an explicit end is left alone: the source said when the
-                    // fact stopped holding, which beats an inference from the next arrival.
-                    if (validTo[edge] == TemporalFilter.OPEN) {
-                        validTo[edge] = successorStart;
+            boolean supersededAny = false;
+            if (begins) {
+                Iterator<Map.Entry<Integer, List<Integer>>> values =
+                    openByValue.entrySet().iterator();
+                while (values.hasNext()) {
+                    Map.Entry<Integer, List<Integer>> value = values.next();
+                    if (value.getKey() == objects[edge]) {
+                        continue;
+                    }
+                    Iterator<Integer> held = value.getValue().iterator();
+                    while (held.hasNext()) {
+                        int previous = held.next();
+                        if (orderingDay(previous) == day && sameSource(previous, edge)) {
+                            continue;
+                        }
+                        validTo[previous] = day;
+                        held.remove();
                         closed++;
+                        supersededAny = true;
+                    }
+                    if (value.getValue().isEmpty()) {
+                        values.remove();
                     }
                 }
             }
 
-            haveSuccessor = true;
-            successorStart = runStart;
-            i = runFrom - 1;
+            if (validFrom[edge] == TemporalFilter.UNDATED
+                && validTo[edge] == TemporalFilter.OPEN
+                && day != TemporalFilter.UNDATED
+                && (supersededAny || day > earliest)) {
+                validFrom[edge] = day;
+            }
+            if (validTo[edge] == TemporalFilter.OPEN) {
+                openByValue.computeIfAbsent(objects[edge], value -> new ArrayList<>()).add(edge);
+            }
         }
         return closed;
+    }
+
+    /** Whether two edges were extracted from the same source. */
+    private boolean sameSource(int a, int b) {
+        return sourceTypes[a] == sourceTypes[b] && sourceIds[a] == sourceIds[b];
     }
 
     /**

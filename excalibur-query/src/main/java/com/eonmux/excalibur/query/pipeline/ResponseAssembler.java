@@ -117,13 +117,15 @@ final class ResponseAssembler {
             .orDegraded(CoverageCounts.anySegmentIncomplete(context.segmentResults))
             .build();
 
+        // Whether Stage 5 ordered the ranking is part of the answer, not of how it was made:
+        // it decides whether a score is a similarity or a relevancy judgement.
         QueryResponse response = new QueryResponse(
             context.mergedResults,
             coverage,
             durationMs,
             false,
             false
-        );
+        ).withLlmScored(context.llmScored);
 
         // DOMAIN CORRECTNESS VALIDATION:
         // Validate the response meets all domain correctness constraints
@@ -200,7 +202,7 @@ final class ResponseAssembler {
             false,
             timedOut,
             cancelled
-        );
+        ).withLlmScored(interrupted && partialContext != null && partialContext.llmScored);
     }
 
     /**

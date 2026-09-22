@@ -113,7 +113,7 @@ class CorpusVersionInvalidationTest {
                 CorpusVersion before = fixture.pipeline().corpusVersion();
                 cache.put(key(), before, answer());
 
-                assertThat(cache.get(key(), fixture.pipeline().corpusVersion()))
+                assertThat(cache.get(key(), fixture.pipeline().corpusVersion(), QueryResponse.class))
                     .as("nothing has changed yet, so the entry is still an answer")
                     .isNotNull();
 
@@ -131,7 +131,7 @@ class CorpusVersionInvalidationTest {
                     .as("a vector erased under GDPR must not go on being served out of the "
                         + "cache because no cheap counter happened to record it")
                     .isNotEqualTo(before);
-                assertThat(cache.get(key(), after))
+                assertThat(cache.get(key(), after, QueryResponse.class))
                     .as("an answer computed while the vector was live is not an answer now")
                     .isNull();
             } finally {
@@ -162,7 +162,7 @@ class CorpusVersionInvalidationTest {
                     .as("the clock is not a mutation; an entry must outlive a tick or the "
                         + "cache expires everything within one epoch-tick-ms and is useless")
                     .isEqualTo(before);
-                assertThat(cache.get(key(), after))
+                assertThat(cache.get(key(), after, QueryResponse.class))
                     .as("nothing changed, so the cached answer is still the answer")
                     .isNotNull();
             } finally {
@@ -204,7 +204,7 @@ class CorpusVersionInvalidationTest {
                 CorpusVersion before = fixture.pipeline().corpusVersion();
                 cache.put(key(), before, answer());
 
-                assertThat(cache.get(key(), fixture.pipeline().corpusVersion()))
+                assertThat(cache.get(key(), fixture.pipeline().corpusVersion(), QueryResponse.class))
                     .as("nothing has changed yet, so the entry is still an answer")
                     .isNotNull();
 
@@ -216,7 +216,7 @@ class CorpusVersionInvalidationTest {
                 assertThat(after)
                     .as("a chunk a query would now find must move the fingerprint")
                     .isNotEqualTo(before);
-                assertThat(cache.get(key(), after))
+                assertThat(cache.get(key(), after, QueryResponse.class))
                     .as("an entry computed before the write is not an answer after it")
                     .isNull();
             } finally {
@@ -248,7 +248,7 @@ class CorpusVersionInvalidationTest {
                     .as("an erased chunk must move the fingerprint, or it stays searchable "
                         + "out of the cache after it is gone from the corpus")
                     .isNotEqualTo(before);
-                assertThat(cache.get(key(), after)).isNull();
+                assertThat(cache.get(key(), after, QueryResponse.class)).isNull();
             } finally {
                 close(fixture);
             }
@@ -275,7 +275,7 @@ class CorpusVersionInvalidationTest {
                 assertThat(after)
                     .as("a vector that has become searchable must move the fingerprint")
                     .isNotEqualTo(before);
-                assertThat(cache.get(key(), after)).isNull();
+                assertThat(cache.get(key(), after, QueryResponse.class)).isNull();
             } finally {
                 close(fixture);
             }

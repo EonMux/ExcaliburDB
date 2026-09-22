@@ -9,25 +9,20 @@ import org.junit.jupiter.api.io.TempDir;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Whether a segment ID names somewhere writes can actually land.
  *
- * <p>Two things allocate segment IDs. The storage engine's routing directory holds a fixed,
- * power-of-two number of slots and writes reach a segment by index. {@link SegmentCatalog#create}
- * draws from its own counter, which continues past that width - so it hands back IDs that name
- * metadata and no storage.</p>
+ * <p>Two things allocate segment IDs. The storage engine's routing directory holds a
+ * power-of-two number of slots, at most {@code int}-wide, and writes reach a segment by index.
+ * {@link SegmentCatalog#create} draws from a range that starts above every index such a directory
+ * can hold ({@link SegmentCatalog#FIRST_CREATED_SEGMENT_ID}) - so it hands back IDs that name
+ * metadata and no storage, however far the directory has split.</p>
  *
  * <p>A caller that discovers this by writing finds out one chunk at a time, after paying to fetch,
  * chunk and embed each of them. Asking first is one map lookup.</p>
- *
- * <p>Once the directory has doubled, the question stops being whether the ID resolves at all. The
- * upper half of a split directory is filled with buddy pointers, so an ID past every canonical
- * index still resolves - to a segment already routing other keys. A write target has to be a
- * segment the engine holds under that ID, not merely one reachable through it.</p>
  */
 @DisplayName("Segment write targets")
 class StorageChunkWriterTargetTest {
@@ -54,7 +49,7 @@ class StorageChunkWriterTargetTest {
             long catalogId = created.getSegmentId();
 
             assertThat(engine.getSegment(catalogId))
-                .as("the catalog's counter runs past the routing width, so this names no segment")
+                .as("created ids lie above every routing index, so this names no segment")
                 .isNull();
             assertThat(writer.canWriteTo(catalogId))
                 .as("and it must be reported as unwritable before any chunk is embedded for it")
@@ -94,8 +89,8 @@ class StorageChunkWriterTargetTest {
     }
 
     @Test
-    @DisplayName("a catalog id resolving to another segment's buddy slot is not a write target")
-    void aBuddySlotIsNotAWriteTarget(@TempDir Path tempDir) throws Exception {
+    @DisplayName("after a split, a catalog-created segment still names no segment and is not writable")
+    void aCreatedSegmentStaysClearOfASplitDirectory(@TempDir Path tempDir) throws Exception {
         Path dataDir = Files.createDirectories(tempDir.resolve("split"));
 
         try (Arena arena = Arena.ofShared();
@@ -104,43 +99,30 @@ class StorageChunkWriterTargetTest {
 
             int widthBefore = engine.getSegmentCount();
             engine.getSplitWorker().requestSplit(engine.getSegment(0L));
-            awaitRoutingWidth(engine, widthBefore * 2);
+            // Joins every split requestSplit dispatched, so the split has been published or
+            // refused by the time this returns.
+            engine.getSplitWorker().stop();
+            assertThat(engine.getSegmentCount())
+                .as("the split must publish before the rest of the test means anything")
+                .isEqualTo(widthBefore * 2);
+
+            long rightChildIndex = widthBefore;
+            assertThat(engine.getCatalog().get(rightChildIndex).getSourceId())
+                .as("the right child's catalog record is its own, not a source's")
+                .isNull();
 
             StorageChunkWriter writer = new StorageChunkWriter(engine);
-            SegmentCatalog.SegmentMetadata created =
-                engine.getCatalog().create("a-source", dataDir.resolve("rolling.dat"));
-            long catalogId = created.getSegmentId();
+            long catalogId = engine.getCatalog()
+                .create("a-source", dataDir.resolve("rolling.dat")).getSegmentId();
 
-            // The split reserved its children's IDs in the catalog, so the counter is past every
-            // canonical index - and the doubled directory resolves that ID anyway.
+            assertThat(catalogId)
+                .as("a created id never lands on an index a split publishes at")
+                .isGreaterThanOrEqualTo(SegmentCatalog.FIRST_CREATED_SEGMENT_ID);
             assertThat(engine.getSegment(catalogId))
-                .as("the directory resolves it, which is why a null check calls it writable")
-                .isNotNull();
-            assertThat(engine.getSegments())
-                .as("but the engine holds no segment of its own under that ID")
-                .doesNotContainKey(catalogId);
-
-            assertThat(writer.canWriteTo(catalogId))
-                .as("filling it writes one source's data into a segment routing unrelated keys, "
-                    + "and retires that source's real segments in favour of it")
-                .isFalse();
+                .as("the doubled directory does not reach it either")
+                .isNull();
+            assertThat(engine.getSegments()).doesNotContainKey(catalogId);
+            assertThat(writer.canWriteTo(catalogId)).isFalse();
         }
-    }
-
-    /**
-     * Waits for a requested split to be published, which happens on its own thread.
-     *
-     * @param engine The engine whose routing directory is doubling
-     * @param target The width to wait for
-     */
-    private static void awaitRoutingWidth(StorageEngine engine, int target)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
-        while (engine.getSegmentCount() < target && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
-        assertThat(engine.getSegmentCount())
-            .as("the split must publish before the rest of the test means anything")
-            .isEqualTo(target);
     }
 }

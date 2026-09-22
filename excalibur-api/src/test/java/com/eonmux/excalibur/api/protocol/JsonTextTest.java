@@ -381,4 +381,33 @@ class JsonTextTest {
                 .hasMessageContaining("documents");
         }
     }
+
+    @Nested
+    @DisplayName("has")
+    class Has {
+
+        @Test
+        @DisplayName("true for a field carrying a value, false for an absent one")
+        void presentAndAbsent() {
+            assertThat(JsonText.has("{\"depth\": 3}", "depth")).isTrue();
+            assertThat(JsonText.has("{\"depth\": 3}", "limit")).isFalse();
+        }
+
+        @Test
+        @DisplayName("an explicit null is absence, as it is in every typed accessor")
+        void explicitNullIsAbsent() {
+            // Read as present, a bounded setting sent as null took its minimum: a response
+            // cap of one byte for a caller who asked for the default.
+            assertThat(JsonText.has("{\"max_response_bytes\": null}", "max_response_bytes"))
+                .isFalse();
+            assertThat(JsonText.longValue("{\"max_response_bytes\": null}",
+                "max_response_bytes", 42L)).isEqualTo(42L);
+        }
+
+        @Test
+        @DisplayName("a value that merely starts with the letters of null is still a value")
+        void nullPrefixedStringIsPresent() {
+            assertThat(JsonText.has("{\"name\": \"nullable\"}", "name")).isTrue();
+        }
+    }
 }

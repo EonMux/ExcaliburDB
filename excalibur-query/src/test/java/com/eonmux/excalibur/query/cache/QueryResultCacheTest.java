@@ -83,13 +83,13 @@ class QueryResultCacheTest {
         @DisplayName("a repeated identical query is served from cache and says so")
         void repeatedQueryIsServedFromCache() {
             QueryResultCache cache = new QueryResultCache(16);
-            assertThat(cache.get(key("alpha"), V1))
+            assertThat(cache.get(key("alpha"), V1, QueryResponse.class))
                 .as("nothing has been stored yet")
                 .isNull();
 
             cache.put(key("alpha"), V1, healthy("doc-1"));
 
-            QueryResponse served = cache.get(key("alpha"), V1);
+            QueryResponse served = cache.get(key("alpha"), V1, QueryResponse.class);
             assertThat(served).isNotNull();
             assertThat(served.fromCache())
                 .as("a cached answer must say that is what it is")
@@ -108,7 +108,7 @@ class QueryResultCacheTest {
             assertThat(original.fromCache())
                 .as("the caller's own response is not retroactively a cache hit")
                 .isFalse();
-            assertThat(cache.get(key("alpha"), V1).fromCache()).isTrue();
+            assertThat(cache.get(key("alpha"), V1, QueryResponse.class).fromCache()).isTrue();
         }
 
         @Test
@@ -116,7 +116,7 @@ class QueryResultCacheTest {
         void differentKeyIsAMiss() {
             QueryResultCache cache = new QueryResultCache(16);
             cache.put(key("alpha"), V1, healthy("doc-1"));
-            assertThat(cache.get(key("beta"), V1)).isNull();
+            assertThat(cache.get(key("beta"), V1, QueryResponse.class)).isNull();
         }
     }
 
@@ -129,9 +129,9 @@ class QueryResultCacheTest {
         void corpusChangeInvalidates() {
             QueryResultCache cache = new QueryResultCache(16);
             cache.put(key("alpha"), V1, healthy("doc-1"));
-            assertThat(cache.get(key("alpha"), V1)).isNotNull();
+            assertThat(cache.get(key("alpha"), V1, QueryResponse.class)).isNotNull();
 
-            assertThat(cache.get(key("alpha"), V2))
+            assertThat(cache.get(key("alpha"), V2, QueryResponse.class))
                 .as("the corpus moved under the entry, so it is not an answer any more")
                 .isNull();
         }
@@ -144,11 +144,11 @@ class QueryResultCacheTest {
             cache.put(key("beta"), V1, healthy("doc-2"));
             assertThat(cache.stats().size()).isEqualTo(2);
 
-            cache.get(key("alpha"), V2);
+            cache.get(key("alpha"), V2, QueryResponse.class);
 
             assertThat(cache.stats().size()).isZero();
             assertThat(cache.stats().invalidations()).isEqualTo(2);
-            assertThat(cache.get(key("beta"), V1))
+            assertThat(cache.get(key("beta"), V1, QueryResponse.class))
                 .as("an entry from a superseded corpus must never come back")
                 .isNull();
         }
@@ -160,17 +160,17 @@ class QueryResultCacheTest {
 
             // A slow query fingerprints V1. While it runs, a second query observes V2, which
             // discards the old generation, and stores its own answer.
-            cache.get(key("alpha"), V1);
-            cache.get(key("beta"), V2);
+            cache.get(key("alpha"), V1, QueryResponse.class);
+            cache.get(key("beta"), V2, QueryResponse.class);
             cache.put(key("beta"), V2, healthy("doc-2"));
 
             // The slow query now finishes and offers an answer computed against V1.
             cache.put(key("alpha"), V1, healthy("doc-1"));
 
-            assertThat(cache.get(key("alpha"), V2))
+            assertThat(cache.get(key("alpha"), V2, QueryResponse.class))
                 .as("an answer to a corpus that no longer exists must not be stored")
                 .isNull();
-            assertThat(cache.get(key("beta"), V2))
+            assertThat(cache.get(key("beta"), V2, QueryResponse.class))
                 .as("and it must not evict the entries that are still answers")
                 .isNotNull();
         }
@@ -183,7 +183,7 @@ class QueryResultCacheTest {
             assertThat(cache.stats().size()).isZero();
 
             cache.put(key("alpha"), V1, healthy("doc-1"));
-            assertThat(cache.get(key("alpha"), CorpusVersion.UNREADABLE))
+            assertThat(cache.get(key("alpha"), CorpusVersion.UNREADABLE, QueryResponse.class))
                 .as("a corpus that cannot be read cannot be shown to be unchanged")
                 .isNull();
         }
@@ -199,7 +199,7 @@ class QueryResultCacheTest {
             QueryResultCache cache = new QueryResultCache(16);
             cache.put(key("alpha"), V1, degraded());
             assertThat(cache.stats().size()).isZero();
-            assertThat(cache.get(key("alpha"), V1)).isNull();
+            assertThat(cache.get(key("alpha"), V1, QueryResponse.class)).isNull();
         }
 
         @Test
@@ -226,6 +226,58 @@ class QueryResultCacheTest {
             assertThat(QueryResultCache.cacheable(healthy("d").withTimedOut(true))).isFalse();
             assertThat(QueryResultCache.cacheable(healthy("d").withCancelled(true))).isFalse();
             assertThat(QueryResultCache.cacheable(null)).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("Answers of more than one shape")
+    class Shapes {
+
+        /** An answer of some other route, cacheable or not as told. */
+        private record Other(String id, boolean cacheable, boolean replayed)
+                implements CachedAnswer {
+
+            @Override
+            public Other forStorage() {
+                return new Other(null, cacheable, replayed);
+            }
+
+            @Override
+            public Other servedFromCache() {
+                return new Other(id, cacheable, true);
+            }
+        }
+
+        @Test
+        @DisplayName("hands an answer back as the shape it was stored as, stripped and marked")
+        void servesItsOwnShape() {
+            QueryResultCache cache = new QueryResultCache(16);
+            cache.put(key("alpha"), V1, new Other("q-1", true, false));
+
+            Other served = cache.get(key("alpha"), V1, Other.class);
+
+            assertThat(served).isNotNull();
+            assertThat(served.id()).as("the stored copy forgot the request's id").isNull();
+            assertThat(served.replayed()).isTrue();
+        }
+
+        @Test
+        @DisplayName("counts a request for a different shape as a miss rather than failing")
+        void aDifferentShapeIsAMiss() {
+            QueryResultCache cache = new QueryResultCache(16);
+            cache.put(key("alpha"), V1, new Other("q-1", true, false));
+
+            assertThat(cache.get(key("alpha"), V1, QueryResponse.class)).isNull();
+            assertThat(cache.stats().misses()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("refuses an answer of any shape that says it is not fit to replay")
+        void refusesWhatIsNotCacheable() {
+            QueryResultCache cache = new QueryResultCache(16);
+            cache.put(key("alpha"), V1, new Other("q-1", false, false));
+
+            assertThat(cache.stats().size()).isZero();
         }
     }
 
@@ -260,12 +312,12 @@ class QueryResultCacheTest {
             cache.put(key("beta"), V1, healthy("doc-2"));
 
             // Touch alpha so beta becomes the least recently used of the two.
-            assertThat(cache.get(key("alpha"), V1)).isNotNull();
+            assertThat(cache.get(key("alpha"), V1, QueryResponse.class)).isNotNull();
             cache.put(key("gamma"), V1, healthy("doc-3"));
 
-            assertThat(cache.get(key("alpha"), V1)).isNotNull();
-            assertThat(cache.get(key("beta"), V1)).isNull();
-            assertThat(cache.get(key("gamma"), V1)).isNotNull();
+            assertThat(cache.get(key("alpha"), V1, QueryResponse.class)).isNotNull();
+            assertThat(cache.get(key("beta"), V1, QueryResponse.class)).isNull();
+            assertThat(cache.get(key("gamma"), V1, QueryResponse.class)).isNotNull();
         }
 
         @Test
@@ -286,10 +338,10 @@ class QueryResultCacheTest {
         @DisplayName("hits, misses, evictions and size are all counted")
         void countsEverythingAnOperatorNeeds() {
             QueryResultCache cache = new QueryResultCache(2);
-            cache.get(key("alpha"), V1);                  // miss
+            cache.get(key("alpha"), V1, QueryResponse.class);                  // miss
             cache.put(key("alpha"), V1, healthy("doc-1"));
-            cache.get(key("alpha"), V1);                  // hit
-            cache.get(key("alpha"), V1);                  // hit
+            cache.get(key("alpha"), V1, QueryResponse.class);                  // hit
+            cache.get(key("alpha"), V1, QueryResponse.class);                  // hit
             cache.put(key("beta"), V1, healthy("doc-2"));
             cache.put(key("gamma"), V1, healthy("doc-3")); // evicts one
 
@@ -332,7 +384,7 @@ class QueryResultCacheTest {
                             for (int i = 0; i < perThread; i++) {
                                 QueryCacheKey k = key("q-" + ((id * 7 + i) % 64));
                                 cache.put(k, V1, healthy("doc-" + i));
-                                cache.get(k, V1);
+                                cache.get(k, V1, QueryResponse.class);
                                 if (cache.stats().size() > 32) {
                                     failures.incrementAndGet();
                                 }

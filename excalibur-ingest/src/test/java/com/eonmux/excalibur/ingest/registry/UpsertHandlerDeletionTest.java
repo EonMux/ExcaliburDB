@@ -33,7 +33,6 @@ class UpsertHandlerDeletionTest {
     private TestStorageAdapter storageAdapter;
 
     private static final String SOURCE_ID = "test-source";
-    private static final String CLUSTER_ID = "cluster-1";
     private static final String SEGMENT_ID = "segment-1";
     private static final String DOCUMENT_ID = "doc-1";
 
@@ -43,7 +42,7 @@ class UpsertHandlerDeletionTest {
         hierarchicalFilter = new HierarchicalCuckooFilter(100_000);
         storageAdapter = new TestStorageAdapter();
 
-        hierarchicalFilter.registerSegment(SEGMENT_ID, CLUSTER_ID);
+        hierarchicalFilter.registerSegment(SEGMENT_ID);
     }
 
     @Nested

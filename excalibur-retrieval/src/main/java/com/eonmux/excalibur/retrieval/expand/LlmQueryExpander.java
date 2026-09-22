@@ -48,6 +48,15 @@ import java.util.concurrent.TimeoutException;
  * belongs to has been withdrawn, and returning the original query would have the search carry
  * on for an answer nobody will read - holding, for the length of a full BM25 pass, the permit
  * that bounds how much of that work can accumulate.</p>
+ *
+ * <h2>How long a query may be</h2>
+ * <p>Not bounded here. The query is the body of an outbound call the operator is billed for,
+ * and the bound on it belongs where the text enters the process: {@code /v1/query} refuses a
+ * query longer than {@code excalibur.api.max-query-chars} before anything is sent anywhere.
+ * A second bound here would either repeat that one, and never apply, or sit below it, and make
+ * a longer question be answered by plain BM25 while a shorter one is answered by an expanded
+ * search - two retrieval strategies behind one endpoint, chosen by a length the caller cannot
+ * see. A caller embedding this outside the API bounds its own input.</p>
  */
 public final class LlmQueryExpander implements QueryExpander {
 
@@ -80,19 +89,6 @@ public final class LlmQueryExpander implements QueryExpander {
     public static final double UNWEIGHTED_TERM_WEIGHT = MIN_USEFUL_WEIGHT;
 
     /**
-     * Longest query this will send to the model by default; longer ones are searched as typed.
-     *
-     * <p>Matches the default of {@code excalibur.api.max-query-chars}, which is the bound the
-     * query text is already held to and exists for this very call - a query is the body of an
-     * outbound request the operator is billed for. A second, lower bound here would mean a
-     * 600-character question is answered by plain BM25 while a 500-character one is answered by
-     * an expanded search, which is two retrieval strategies behind one endpoint. A deployment
-     * that wants a tighter bound sets one, and {@link #maxExpandableChars()} is how the
-     * response gets to say that it applied.</p>
-     */
-    public static final int DEFAULT_MAX_QUERY_CHARS = 8_192;
-
-    /**
      * How long one expansion call may take, by default.
      *
      * <p>The generation is a few dozen tokens and completes in around two seconds against a
@@ -123,7 +119,6 @@ public final class LlmQueryExpander implements QueryExpander {
     private final LLMHttpClient client;
     private final int maxFormulations;
     private final long timeoutMs;
-    private final int maxQueryChars;
 
     /**
      * Creates an expander on the built-in bounds.
@@ -131,7 +126,7 @@ public final class LlmQueryExpander implements QueryExpander {
      * @param client The chat endpoint to ask
      */
     public LlmQueryExpander(LLMHttpClient client) {
-        this(client, DEFAULT_MAX_FORMULATIONS, DEFAULT_TIMEOUT_MS, DEFAULT_MAX_QUERY_CHARS);
+        this(client, DEFAULT_MAX_FORMULATIONS, DEFAULT_TIMEOUT_MS);
     }
 
     /**
@@ -141,7 +136,7 @@ public final class LlmQueryExpander implements QueryExpander {
      * @param timeoutMs How long one expansion call may take
      */
     public LlmQueryExpander(LLMHttpClient client, long timeoutMs) {
-        this(client, DEFAULT_MAX_FORMULATIONS, timeoutMs, DEFAULT_MAX_QUERY_CHARS);
+        this(client, DEFAULT_MAX_FORMULATIONS, timeoutMs);
     }
 
     /**
@@ -150,12 +145,10 @@ public final class LlmQueryExpander implements QueryExpander {
      * @param client          The chat endpoint to ask
      * @param maxFormulations Cap on formulations returned, the original included
      * @param timeoutMs       How long one expansion call may take
-     * @param maxQueryChars   Longest query sent to the model; longer ones are searched as typed
      * @throws NullPointerException     if client is null
      * @throws IllegalArgumentException if any bound is not positive
      */
-    public LlmQueryExpander(LLMHttpClient client, int maxFormulations, long timeoutMs,
-                            int maxQueryChars) {
+    public LlmQueryExpander(LLMHttpClient client, int maxFormulations, long timeoutMs) {
         this.client = Objects.requireNonNull(client, "client must not be null");
         if (maxFormulations < 1) {
             throw new IllegalArgumentException("maxFormulations must be positive: " + maxFormulations);
@@ -163,17 +156,8 @@ public final class LlmQueryExpander implements QueryExpander {
         if (timeoutMs < 1) {
             throw new IllegalArgumentException("timeoutMs must be positive: " + timeoutMs);
         }
-        if (maxQueryChars < 1) {
-            throw new IllegalArgumentException("maxQueryChars must be positive: " + maxQueryChars);
-        }
         this.maxFormulations = maxFormulations;
         this.timeoutMs = timeoutMs;
-        this.maxQueryChars = maxQueryChars;
-    }
-
-    @Override
-    public int maxExpandableChars() {
-        return maxQueryChars;
     }
 
     @Override
@@ -184,15 +168,6 @@ public final class LlmQueryExpander implements QueryExpander {
         String trimmed = query.trim();
         List<SearchFormulation> out = new ArrayList<>();
         out.add(SearchFormulation.original(trimmed));
-
-        if (trimmed.length() > maxQueryChars) {
-            // Reported rather than merely logged: the query route reads maxExpandableChars()
-            // and names the missing stage in the answer, because a longer question answered by
-            // a narrower search looks exactly like one the corpus had less to say about.
-            LOGGER.debug("Query of {} characters is past the {}-character expansion bound; "
-                + "searching it as typed", trimmed.length(), maxQueryChars);
-            return List.copyOf(out);
-        }
 
         String response = ask(trimmed);
         if (response == null) {

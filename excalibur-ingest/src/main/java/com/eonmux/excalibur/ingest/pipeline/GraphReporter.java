@@ -54,7 +54,9 @@ final class GraphReporter {
             return;
         }
         try {
-            sink.onDocumentPublished(documentKey, doc.getText());
+            // With the document's own date, which is what its facts are ordered by when a later
+            // document gives a single-valued relation a different value.
+            sink.onDocumentPublished(documentKey, doc.getText(), doc.getLastModifiedMillis());
         } catch (RuntimeException e) {
             LOGGER.warn("Graph sink failed for {}: {}", documentKey, e.toString());
         }

@@ -70,7 +70,9 @@ class QueryResponseFromCacheTest {
         @Test
         @DisplayName("reports the vector half's cache status")
         void hit() {
-            assertThat(QueryResponseJson.hybrid(response(true), List.of(), plainAnswer()))
+            assertThat(QueryResponseJson.hybrid(
+                    HybridResponse.unscored(response(true), List.of(), List.of(), 10),
+                    List.of(), plainAnswer()))
                 .contains("\"from_cache\": true");
         }
     }
@@ -79,11 +81,22 @@ class QueryResponseFromCacheTest {
     @DisplayName("the lexical path")
     class Lexical {
 
+        private LexicalResponse lexical(boolean fromCache) {
+            return new LexicalResponse("q-1", List.of(), true, FULL, false, false, false, false,
+                3L, fromCache);
+        }
+
         @Test
-        @DisplayName("is never from cache, and says so rather than staying silent")
-        void never() {
-            assertThat(QueryResponseJson.lexical("q-1", List.of(), FULL, List.of(),
-                false, false, 3L, plainAnswer()))
+        @DisplayName("says so when the answer came from cache")
+        void hit() {
+            assertThat(QueryResponseJson.lexical(lexical(true), List.of(), plainAnswer()))
+                .contains("\"from_cache\": true");
+        }
+
+        @Test
+        @DisplayName("says so when it did not, rather than omitting the field")
+        void miss() {
+            assertThat(QueryResponseJson.lexical(lexical(false), List.of(), plainAnswer()))
                 .contains("\"from_cache\": false");
         }
     }

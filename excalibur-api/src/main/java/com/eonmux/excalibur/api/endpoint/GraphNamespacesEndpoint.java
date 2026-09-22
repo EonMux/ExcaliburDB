@@ -21,10 +21,10 @@ import java.util.StringJoiner;
  * {@code GET /v1/graph/namespaces} - every namespace this node holds on disk.
  *
  * <p>A namespace is created by naming it in the {@value GraphTenants#NAMESPACE_HEADER} header on
- * a graph request. Until this route there was no way to find out what that had created: the node
- * could report which graphs were resident, which is a cache's contents, and nothing else. A
- * tenant offboarded from the product left its graph, its staged facts and its erasure log here
- * indefinitely, and an operator had no way to discover them, let alone act.</p>
+ * a graph request, and this route is how an operator finds out what that has created. Which
+ * graphs are resident is a cache's contents, not what is on disk: a tenant offboarded from the
+ * product leaves its graph, its staged facts and its erasure log here until they are deleted, and
+ * this listing is what makes them discoverable.</p>
  *
  * <h3>Response</h3>
  * <pre>{@code

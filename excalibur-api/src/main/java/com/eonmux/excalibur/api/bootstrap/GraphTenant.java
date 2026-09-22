@@ -6,6 +6,7 @@ import com.eonmux.excalibur.graph.erasure.CompactionPolicy;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.erasure.ServedArtifactEraser;
+import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.retrieval.build.GraphDirectoryBuilder;
 import com.eonmux.excalibur.retrieval.lexical.DerivedArtifactEraser;
@@ -122,8 +123,10 @@ public final class GraphTenant implements AutoCloseable {
             ErasureLog erasureLog = ErasureLog.open(stagingDirectory.resolve(ERASURE_LOG));
             opened.push(erasureLog);
 
-            GraphRagHolder holder = new GraphRagHolder(directory,
-                Files.isDirectory(directory) ? GraphRagFactory.openAt(config, directory) : null);
+            // openAt restores a graph an interrupted publish displaced before it looks, and
+            // answers null when there is still none.
+            GraphRagHolder holder =
+                new GraphRagHolder(directory, GraphRagFactory.openAt(config, directory));
             opened.push(holder);
 
             // One embedder for the tenant rather than one per collaborator: the two that need
@@ -198,23 +201,27 @@ public final class GraphTenant implements AutoCloseable {
      * Whether a namespace has ever published a graph, without opening one.
      *
      * <p>{@link #open} answers the same question the same way: the directory is written by the
-     * build that publishes into it, so a tenant that has only staged facts has none.</p>
+     * build that publishes into it, so a tenant that has only staged facts has none. A graph an
+     * interrupted publish left displaced counts, because opening the namespace restores it.</p>
      *
      * @param graphDirectory The namespace's graph directory
      * @return true if a build has published a graph there
      */
     public static boolean hasBuiltGraph(Path graphDirectory) {
         Objects.requireNonNull(graphDirectory, "graphDirectory must not be null");
-        return Files.isDirectory(graphDirectory);
+        return Files.isDirectory(graphDirectory)
+            || Files.isDirectory(GraphBuilder.previousFor(graphDirectory));
     }
 
     /**
      * How many facts a namespace has staged, read from the log rather than from a store.
      *
      * <h3>What it costs</h3>
-     * <p>One {@code stat}. The triple log is fixed-width records behind a fixed header, which is
-     * how {@link GraphStagingStore#open} itself arrives at the count, so the length of the file
-     * is the count. Nothing is opened, mapped or replayed.</p>
+     * <p>A {@code stat} and a sixteen-byte read. The triple log is fixed-width records behind a
+     * fixed header, which is how {@link GraphStagingStore#open} itself arrives at the count, so
+     * the length of the file is the count once the header has said which version - and therefore
+     * which width - its records are. Nothing is opened, mapped or replayed, and a log in an
+     * earlier version is counted as it stands rather than upgraded by a status read.</p>
      *
      * <h3>What it is not</h3>
      * <p>The answer for a namespace nobody has open. A resident tenant may hold appends that are
@@ -226,17 +233,8 @@ public final class GraphTenant implements AutoCloseable {
      * @throws IOException if the log exists and cannot be measured
      */
     public static long stagedFactsOnDisk(Path graphDirectory) throws IOException {
-        Path log = stagingDirectoryOf(graphDirectory).resolve(GraphStagingStore.TRIPLE_LOG);
-        if (!Files.isRegularFile(log)) {
-            return 0L;
-        }
-        long size = Files.size(log);
-        if (size < GraphStagingStore.HEADER_BYTES) {
-            return 0L;
-        }
-        // Integer division deliberately: a trailing partial record is a process killed
-        // mid-append, and the next open trims it rather than counting it.
-        return (size - GraphStagingStore.HEADER_BYTES) / GraphStagingStore.RECORD_BYTES;
+        return GraphStagingStore.factsOnDisk(
+            stagingDirectoryOf(graphDirectory).resolve(GraphStagingStore.TRIPLE_LOG));
     }
 
     /**

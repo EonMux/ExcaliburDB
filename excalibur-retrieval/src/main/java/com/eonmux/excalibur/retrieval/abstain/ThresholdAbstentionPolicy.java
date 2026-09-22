@@ -24,6 +24,13 @@ import com.eonmux.excalibur.retrieval.fusion.FusedDocument;
  *       the same confidence as its firmest.</li>
  * </ul>
  *
+ * <p>Both score gates read the score the retriever ranked by, so they mean something only when that
+ * score does. A reciprocal-rank fusion of one list scores its first document {@code 1/(k+1)}
+ * whatever the evidence, and a gate on it passes everything or nothing; which is why a retriever
+ * with a single signal hands that signal's own score through instead of fusing it. The graph
+ * route's signal reports relevance on a unit scale - a share of the attainable BM25 score, or a
+ * vector similarity - so a threshold of {@code 0.05} means the same thing for every question.
+ *
  * <p>The thresholds are configuration. Serving cannot fit them itself: fitting needs to know
  * whether an answer was right, and that is exactly what a server answering a live question does
  * not have. {@link AbstentionCalibrator} fits them offline against outcomes that could actually be
@@ -50,7 +57,7 @@ public final class ThresholdAbstentionPolicy implements AbstentionPolicy {
     /**
      * Ceiling on reported confidence. Deliberately below one.
      *
-     * <p>Nothing this policy can observe justifies certainty. The score is a fused rank statistic,
+     * <p>Nothing this policy can observe justifies certainty. The score is a ranking statistic,
      * the evidence is extracted, and the calibration behind the threshold was fitted on a finite
      * and biased sample. A system that reports 1.0 is claiming the answer cannot be wrong, and
      * downstream code that sees 1.0 will reasonably stop hedging — so the value has to be
@@ -68,7 +75,7 @@ public final class ThresholdAbstentionPolicy implements AbstentionPolicy {
     private final int maxAmbiguousCandidates;
 
     /**
-     * @param minScore               fused score the best candidate must reach
+     * @param minScore               score the best candidate must reach, on the retriever's scale
      * @param minSeparation          relative gap the best must have over the second, as a fraction
      *                               of the best score; below this the two are called ambiguous
      * @param minMeanConfidence      mean extractor confidence the subgraph must reach, in [0, 1]
@@ -98,7 +105,7 @@ public final class ThresholdAbstentionPolicy implements AbstentionPolicy {
         this.maxAmbiguousCandidates = maxAmbiguousCandidates;
     }
 
-    /** The fused score threshold in use. */
+    /** The score threshold in use. */
     public double minScore() {
         return minScore;
     }
@@ -120,17 +127,19 @@ public final class ThresholdAbstentionPolicy implements AbstentionPolicy {
         }
 
         FusedDocument best = fused.get(0);
-        if (best.score() < minScore) {
+        // A best score of zero or less is nothing matched, whatever the threshold: no share of the
+        // question's terms, no similarity to it. Refused outright so that a threshold of zero
+        // means "any evidence at all" rather than "anything, including none".
+        if (best.score() <= 0 || best.score() < minScore) {
             return new RetrievalOutcome.NoResults(
                 RetrievalOutcome.Reason.BELOW_CONFIDENCE_THRESHOLD,
-                "best fused score " + format(best.score()) + " is below " + format(minScore));
+                "best score " + format(best.score()) + " is below " + format(minScore));
         }
 
         // Checked before provenance: two candidates that cannot be told apart is a question the
         // caller can resolve, whereas untrustworthy evidence is not.
         if (fused.size() > 1) {
-            double separation = (best.score() - fused.get(1).score()) / best.score();
-            if (separation < minSeparation) {
+            if (separation(best.score(), fused.get(1).score()) < minSeparation) {
                 return new RetrievalOutcome.Ambiguous(candidatesOf(fused));
             }
         }
@@ -151,13 +160,35 @@ public final class ThresholdAbstentionPolicy implements AbstentionPolicy {
     }
 
     /**
+     * How far the best candidate stands above the second, as a fraction of the best, in
+     * {@code [0, 1]}.
+     *
+     * <p>Capped at one because a runner-up can score below zero - a reranker places candidates it
+     * could not measure beneath every one it could - and a gap wider than the best score itself is
+     * no more decisive than one the full width of it. A best score of zero or less has no
+     * fraction to take, and is refused before separation is asked; it reads as separated
+     * completely from a lower rival and not at all from an equal one.
+     *
+     * @param best   the best candidate's score
+     * @param second the runner-up's score
+     * @return the relative separation
+     */
+    static double separation(double best, double second) {
+        if (best <= 0) {
+            return best > second ? 1.0 : 0.0;
+        }
+        return Math.max(0.0, Math.min(1.0, (best - second) / best));
+    }
+
+    /**
      * Maps the evidence onto a calibrated {@code [0, 1]} confidence.
      *
-     * <p>A fused reciprocal-rank score has no absolute meaning — its range depends on how many
-     * signals ran — so reporting it directly would be a number that looks like a probability and
-     * is not one. This expresses the score as how far it cleared the threshold, then tempers it by
-     * the evidence's own confidence, so a strong match over weak extractions does not report as
-     * certain.
+     * <p>A ranking score is not a probability - a fused reciprocal rank's range depends on how many
+     * signals ran, and even a unit-scale relevance says how much of the question matched rather
+     * than how likely the answer is right - so reporting it directly would be a number that looks
+     * like a probability and is not one. This expresses the score as how far it cleared the
+     * threshold, then tempers it by the evidence's own confidence, so a strong match over weak
+     * extractions does not report as certain.
      */
     private double confidenceOf(FusedDocument best, List<FusedDocument> fused, Subgraph subgraph) {
         double headroom = minScore <= 0

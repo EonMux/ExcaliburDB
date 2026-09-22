@@ -347,4 +347,61 @@ class ApiSecurityConfigTest {
             assertThat(resolved.keySet()).allMatch(key -> key.startsWith("excalibur."));
         }
     }
+
+    @Nested
+    @DisplayName("Limits read from configuration")
+    class Limits {
+
+        private Config configOf(Map<String, String> properties) {
+            return new Config(new HashMap<>(properties));
+        }
+
+        @Test
+        @DisplayName("a limit too large for an int is refused rather than wrapped negative")
+        void anOversizedLimitIsRefused() {
+            assertThatThrownBy(() -> ApiSecurityConfig.fromProperties(
+                    Map.of(ApiSecurityConfig.KEY_MAX_TOP_K, "3000000000")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(ApiSecurityConfig.KEY_MAX_TOP_K)
+                .hasMessageContaining(String.valueOf(Integer.MAX_VALUE));
+            assertThat(ApiSecurityConfig.fromProperties(Map.of(
+                    ApiSecurityConfig.KEY_MAX_TOP_K, String.valueOf(Integer.MAX_VALUE)))
+                .maxTopK()).isEqualTo(Integer.MAX_VALUE);
+        }
+
+        @Test
+        @DisplayName("a default top_k above the ceiling is refused, since every query would be")
+        void aDefaultTopKAboveTheCeilingIsRefused() {
+            assertThatThrownBy(() -> ApiSecurityConfig.fromConfig(configOf(Map.of(
+                    "excalibur.query.top-k-default", "50",
+                    ApiSecurityConfig.KEY_MAX_TOP_K, "20"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("excalibur.query.top-k-default")
+                .hasMessageContaining(ApiSecurityConfig.KEY_MAX_TOP_K);
+        }
+
+        @Test
+        @DisplayName("a default timeout above the ceiling is refused, since every query would be")
+        void aDefaultTimeoutAboveTheCeilingIsRefused() {
+            assertThatThrownBy(() -> ApiSecurityConfig.fromConfig(configOf(Map.of(
+                    "excalibur.visibility.query-timeout-ms", "60000",
+                    ApiSecurityConfig.KEY_MAX_QUERY_TIMEOUT_MS, "5000"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("excalibur.visibility.query-timeout-ms")
+                .hasMessageContaining(ApiSecurityConfig.KEY_MAX_QUERY_TIMEOUT_MS);
+        }
+
+        @Test
+        @DisplayName("defaults at their ceilings are accepted")
+        void defaultsAtTheCeilingAreAccepted() {
+            ApiSecurityConfig policy = ApiSecurityConfig.fromConfig(configOf(Map.of(
+                "excalibur.query.top-k-default", "20",
+                ApiSecurityConfig.KEY_MAX_TOP_K, "20",
+                "excalibur.visibility.query-timeout-ms", "5000",
+                ApiSecurityConfig.KEY_MAX_QUERY_TIMEOUT_MS, "5000")));
+
+            assertThat(policy.maxTopK()).isEqualTo(20);
+            assertThat(policy.maxQueryTimeoutMs()).isEqualTo(5000);
+        }
+    }
 }

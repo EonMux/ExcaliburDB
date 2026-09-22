@@ -135,6 +135,7 @@ public final class GraphTenants implements AutoCloseable {
     private final NamespaceRegistry<GraphTenant> registry;
     private final MappingBudget budget;
     private final Duration erasureMaxLatency;
+    private final int maxOpen;
     private final int reopensPerSweep;
     private final ScheduledExecutorService erasureSweep;
 
@@ -176,6 +177,7 @@ public final class GraphTenants implements AutoCloseable {
         this.root = root.toAbsolutePath().normalize();
         this.erasureMaxLatency =
             Duration.ofSeconds(config.graph().getErasureMaxLatencySeconds());
+        this.maxOpen = maxOpen;
         // Never more than the registry can hold open: beyond that a pass is only evicting the
         // tenants it reopened earlier in the same pass.
         this.reopensPerSweep = Math.max(1, Math.min(MAX_REOPENS_PER_SWEEP, maxOpen));
@@ -903,6 +905,135 @@ public final class GraphTenants implements AutoCloseable {
     }
 
     /**
+     * Most graphs kept open at once, from {@code excalibur.graph.max-open-namespaces}.
+     *
+     * @return The bound
+     */
+    public int maxOpenNamespaces() {
+        return maxOpen;
+    }
+
+    /**
+     * What every namespace on disk owes in erasure, totalled, as of now.
+     *
+     * <p>A total rather than a row per namespace, because it is read by the node's stats and a
+     * scraper, and one series per tenant is a figure that grows with the tenants a node was ever
+     * handed. Which namespace owes what is {@link #describeNamespaces()}'s job.</p>
+     *
+     * <p>Asked, not remembered. The sweep already reads every namespace's erasure log on each
+     * pass, and this reads them the same way - the resident tenants from memory, the rest from
+     * their logs - so it costs what one pass of the sweep costs without the compaction, and it
+     * cannot report a backlog the sweep discharged a moment ago. Remembering it from the last
+     * sweep would be a second copy of exactly the fact the sweep's own documentation says must
+     * never be stale.</p>
+     *
+     * <p>A log that cannot be read is counted as unreadable and not as owing nothing, for the
+     * reason the sweep gives: an obligation nobody can account for is not a discharged one.</p>
+     *
+     * @return The backlog
+     * @throws IOException if the root cannot be listed
+     */
+    public ErasureBacklog erasureBacklog() throws IOException {
+        Instant now = Instant.now();
+        int owing = 0;
+        long obligations = 0;
+        int overdue = 0;
+        int unreadable = 0;
+        Instant oldest = null;
+        for (NamespaceId id : namespacesOnDisk()) {
+            ErasureLog.Pending pending;
+            try {
+                pending = pendingErasures(id);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.warn("could not read the erasure log of namespace {} for the backlog "
+                    + "report: {}", id, e.toString());
+                unreadable++;
+                continue;
+            }
+            if (pending.count() == 0) {
+                continue;
+            }
+            owing++;
+            obligations += pending.count();
+            if (pending.dueAt(now, erasureMaxLatency)) {
+                overdue++;
+            }
+            Instant requestedAt = pending.oldestRequestedAt().orElseThrow();
+            if (oldest == null || requestedAt.isBefore(oldest)) {
+                oldest = requestedAt;
+            }
+        }
+        return new ErasureBacklog(owing, obligations, overdue, unreadable,
+            Optional.ofNullable(oldest), erasureMaxLatency);
+    }
+
+    /**
+     * What one namespace owes, from the resident tenant where there is one.
+     *
+     * <p>A resident tenant's log may be mid-append, and the tenant holds the same obligations in
+     * memory, so it is asked; a namespace nothing has open is read from its log.</p>
+     *
+     * @param id The namespace
+     * @return What it owes
+     * @throws IOException if its log exists and cannot be read
+     */
+    private ErasureLog.Pending pendingErasures(NamespaceId id) throws IOException {
+        Optional<NamespaceRegistry.Lease<GraphTenant>> resident = registry.borrowResident(id);
+        if (resident.isPresent()) {
+            try (NamespaceRegistry.Lease<GraphTenant> held = resident.get()) {
+                return held.resource().erasureService().pending();
+            }
+        }
+        return ErasureLog.inspect(GraphTenant.erasureLogOf(graphDirectoryOf(id)));
+    }
+
+    /**
+     * The erasure obligations of every namespace on the node, totalled.
+     *
+     * @param namespacesOwing      Namespaces with at least one obligation outstanding
+     * @param obligations          Obligations outstanding across all of them
+     * @param overdueNamespaces    Namespaces whose oldest obligation has passed the deadline
+     * @param unreadableNamespaces Namespaces whose erasure log could not be read, and whose
+     *                             obligations are therefore not in the other figures
+     * @param oldestRequestedAt    When the longest-waiting obligation on the node arrived, empty
+     *                             when nothing is owed
+     * @param maxLatency           {@code excalibur.graph.erasure-max-latency-seconds}, the
+     *                             deadline "overdue" is measured against
+     */
+    public record ErasureBacklog(int namespacesOwing, long obligations, int overdueNamespaces,
+                                 int unreadableNamespaces, Optional<Instant> oldestRequestedAt,
+                                 Duration maxLatency) {
+
+        /**
+         * Validates the figures.
+         *
+         * @throws IllegalArgumentException if a count is negative
+         * @throws NullPointerException     if an optional or the deadline is null
+         */
+        public ErasureBacklog {
+            if (namespacesOwing < 0 || obligations < 0 || overdueNamespaces < 0
+                    || unreadableNamespaces < 0) {
+                throw new IllegalArgumentException("erasure backlog counts must not be negative");
+            }
+            Objects.requireNonNull(oldestRequestedAt, "oldestRequestedAt must not be null");
+            Objects.requireNonNull(maxLatency, "maxLatency must not be null");
+        }
+
+        /**
+         * How long the longest-waiting obligation has waited.
+         *
+         * @param now The clock the wait is measured against
+         * @return The wait, or empty when nothing is owed
+         */
+        public Optional<Duration> oldestAge(Instant now) {
+            return oldestRequestedAt.map(at -> {
+                Duration age = Duration.between(at, now);
+                return age.isNegative() ? Duration.ZERO : age;
+            });
+        }
+    }
+
+    /**
      * How many graphs have been evicted to stay within the budget.
      *
      * @return The count
@@ -941,6 +1072,12 @@ public final class GraphTenants implements AutoCloseable {
      * something a node acquires by accident, and an operator who has never heard of it should not
      * have to configure it away.</p>
      *
+     * <p>Naming {@code shared} is the same request as naming nothing, and is answered the same
+     * way. {@link NamespaceId#of} refuses the name so that no tenant can be created under it, not
+     * so that a caller cannot ask for it: leaving the header off already reaches it, so refusing
+     * the explicit form protects nothing and breaks a client that stamps the header on every
+     * request it makes.</p>
+     *
      * @param header The header value, or null when absent
      * @return The namespace
      * @throws IllegalArgumentException if the header is present but not a valid namespace
@@ -949,7 +1086,11 @@ public final class GraphTenants implements AutoCloseable {
         if (header == null || header.isBlank()) {
             return NamespaceId.SHARED;
         }
-        return NamespaceId.of(header.trim());
+        String named = header.trim();
+        if (named.equals(NamespaceId.SHARED.value())) {
+            return NamespaceId.SHARED;
+        }
+        return NamespaceId.of(named);
     }
 
     @Override

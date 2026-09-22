@@ -12,6 +12,14 @@ import java.util.stream.Collectors;
  * edges open, and a query as of today returns two employers with no way to tell which is current.
  * With it, the second statement closes the first at its own start, and the same query returns one.
  *
+ * <p>"Second" needs an order, and most statements do not say when their value began. The build
+ * orders a (subject, relation)'s statements by the start the source stated; failing that, by the
+ * day the statement was made - the document's own date, or the day it was staged - which is then
+ * also taken as the new value's start; and last by the order the statements were staged in. A
+ * question asked as of a day before the change gets the earlier value, and one asked after it
+ * gets the later. The rules for restatements, same-day statements and stated ends are on
+ * {@code EdgeStoreWriter}, which applies them.
+ *
  * <p>This is necessarily per-relation rather than global. {@code employer} is single-valued, so a
  * new value supersedes the old; {@code authored} is not, and closing the previous book when someone
  * writes another would be a straightforward data-loss bug. There is no safe default that covers

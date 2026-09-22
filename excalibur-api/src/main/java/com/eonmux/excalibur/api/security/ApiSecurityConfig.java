@@ -218,6 +218,40 @@ public final class ApiSecurityConfig {
     }
 
     /**
+     * Resolves the policy from the node's configuration, and checks the query defaults against it.
+     *
+     * <p>A request that omits {@code top_k} or {@code timeout_ms} is given
+     * {@code excalibur.query.top-k-default} or {@code excalibur.visibility.query-timeout-ms}, and
+     * then held to {@code excalibur.api.max-top-k} and {@code excalibur.api.max-query-timeout-ms}
+     * like any other. A default above its ceiling therefore refuses every request that relies on
+     * it, with a 400 naming a field the caller never sent. That is a configuration no request can
+     * satisfy, so it is refused here, before the node serves one.</p>
+     *
+     * @param config The node's configuration
+     * @return The resolved policy
+     * @throws IllegalArgumentException if a limit is malformed, or a query default exceeds the
+     *                                  ceiling it is checked against
+     */
+    public static ApiSecurityConfig fromConfig(com.eonmux.excalibur.config.Config config) {
+        java.util.Objects.requireNonNull(config, "config must not be null");
+        ApiSecurityConfig policy = fromProperties(config.getEffectiveProperties());
+        int defaultTopK = config.query().getDefaultTopK();
+        if (defaultTopK > policy.maxTopK) {
+            throw new IllegalArgumentException("excalibur.query.top-k-default (" + defaultTopK
+                + ") exceeds excalibur.api.max-top-k (" + policy.maxTopK + "): every query that "
+                + "does not name top_k would be refused. Lower the default or raise the ceiling.");
+        }
+        long defaultTimeoutMs = config.visibility().getQueryTimeoutMs();
+        if (defaultTimeoutMs > policy.maxQueryTimeoutMs) {
+            throw new IllegalArgumentException("excalibur.visibility.query-timeout-ms ("
+                + defaultTimeoutMs + ") exceeds excalibur.api.max-query-timeout-ms ("
+                + policy.maxQueryTimeoutMs + "): every query that does not name timeout_ms would "
+                + "be refused. Lower the default or raise the ceiling.");
+        }
+        return policy;
+    }
+
+    /**
      * Resolves the policy from a properties map.
      *
      * @param properties Effective properties, from {@code Config.getEffectiveProperties()}
@@ -244,15 +278,15 @@ public final class ApiSecurityConfig {
             ConfigText.positiveDouble(props, KEY_MUTATE_RATE, DEFAULT_MUTATE_RATE),
             ConfigText.positiveDouble(props, KEY_MUTATE_BURST, DEFAULT_MUTATE_BURST));
         builder.rateLimitMaxClients(
-            (int) ConfigText.positiveLong(props, KEY_RATE_LIMIT_MAX_CLIENTS, DEFAULT_RATE_LIMIT_MAX_CLIENTS));
-        builder.maxTopK((int) ConfigText.positiveLong(props, KEY_MAX_TOP_K, DEFAULT_MAX_TOP_K));
+            ConfigText.positiveInt(props, KEY_RATE_LIMIT_MAX_CLIENTS, DEFAULT_RATE_LIMIT_MAX_CLIENTS));
+        builder.maxTopK(ConfigText.positiveInt(props, KEY_MAX_TOP_K, DEFAULT_MAX_TOP_K));
         builder.maxQueryTimeoutMs(ConfigText.positiveLong(props, KEY_MAX_QUERY_TIMEOUT_MS, DEFAULT_MAX_QUERY_TIMEOUT_MS));
-        builder.maxQueryChars((int) ConfigText.positiveLong(props, KEY_MAX_QUERY_CHARS, DEFAULT_MAX_QUERY_CHARS));
-        builder.maxOversamplingFactor((int) ConfigText.positiveLong(
+        builder.maxQueryChars(ConfigText.positiveInt(props, KEY_MAX_QUERY_CHARS, DEFAULT_MAX_QUERY_CHARS));
+        builder.maxOversamplingFactor(ConfigText.positiveInt(
             props, KEY_MAX_OVERSAMPLING_FACTOR, DEFAULT_MAX_OVERSAMPLING_FACTOR));
-        builder.maxResultTextChars((int) ConfigText.positiveLong(
+        builder.maxResultTextChars(ConfigText.positiveInt(
             props, KEY_MAX_RESULT_TEXT_CHARS, DEFAULT_MAX_RESULT_TEXT_CHARS));
-        builder.maxRegisteredSources((int) ConfigText.positiveLong(props, KEY_MAX_SOURCES, DEFAULT_MAX_SOURCES));
+        builder.maxRegisteredSources(ConfigText.positiveInt(props, KEY_MAX_SOURCES, DEFAULT_MAX_SOURCES));
 
         for (String root : ConfigText.splitList(props.get(KEY_ALLOWED_ROOTS))) {
             builder.allowIngestRoot(root);

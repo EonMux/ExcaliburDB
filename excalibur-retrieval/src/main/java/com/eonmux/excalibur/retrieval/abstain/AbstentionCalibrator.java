@@ -109,7 +109,8 @@ public final class AbstentionCalibrator {
     /**
      * One query's outcome, with the ground truth.
      *
-     * @param topScore       the best fused score retrieval produced
+     * @param topScore       the best score retrieval produced, on the retriever's scale; zero when
+     *                       nothing scored above it
      * @param separation     relative gap between the best and second candidate
      * @param meanConfidence mean extractor confidence of the evidence
      * @param correct        whether the answer retrieval would have given was right
@@ -140,7 +141,7 @@ public final class AbstentionCalibrator {
          * failed such a query against it would fit a threshold to a check that never happens.
          */
         Verdict verdictAt(double minScore, double minSeparation, double minMeanConfidence) {
-            if (topScore < minScore) {
+            if (topScore <= 0 || topScore < minScore) {
                 return Verdict.REFUSED;
             }
             if (separation < minSeparation) {
@@ -176,7 +177,7 @@ public final class AbstentionCalibrator {
      * than one that buys the same precision with refusals, and only this split shows which
      * happened.
      *
-     * @param minScore          the fitted fused-score threshold
+     * @param minScore          the fitted score threshold
      * @param minSeparation     the fitted ambiguity threshold
      * @param minMeanConfidence the fitted provenance threshold
      * @param precision         fraction of answered queries that were correct, at these thresholds
@@ -227,10 +228,12 @@ public final class AbstentionCalibrator {
                 hasEvidence ? subgraph.meanConfidence() : 0.0, hasEvidence, correct);
         }
         double top = fused.get(0).score();
-        double separation = fused.size() > 1 && top > 0
-            ? (top - fused.get(1).score()) / top
+        double separation = fused.size() > 1
+            ? ThresholdAbstentionPolicy.separation(top, fused.get(1).score())
             : 1.0;
-        return new LabelledOutcome(top, separation,
+        // A negative best - a similarity below zero - is refused by the policy exactly as a zero
+        // is, so recording it as zero loses nothing the verdict reads.
+        return new LabelledOutcome(Math.max(0.0, top), separation,
             hasEvidence ? subgraph.meanConfidence() : 0.0, hasEvidence, correct);
     }
 

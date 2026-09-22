@@ -14,7 +14,6 @@ import com.eonmux.excalibur.bench.benchmark.MappedFileBenchmark;
 import com.eonmux.excalibur.bench.benchmark.PointLookupBenchmark;
 import com.eonmux.excalibur.bench.benchmark.SegmentBenchmark;
 import com.eonmux.excalibur.bench.benchmark.TailScanBenchmark;
-import com.eonmux.excalibur.bench.benchmark.VectorLayoutBenchmark;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -69,8 +68,7 @@ class BenchmarkTargetRegistryTest {
         MappedFileBenchmark.class,
         PointLookupBenchmark.class,
         SegmentBenchmark.class,
-        TailScanBenchmark.class,
-        VectorLayoutBenchmark.class
+        TailScanBenchmark.class
     );
 
     @Test

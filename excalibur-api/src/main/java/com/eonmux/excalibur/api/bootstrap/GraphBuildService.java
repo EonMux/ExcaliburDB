@@ -26,8 +26,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * doing one per document would spend all of a node's time rebuilding and none of it ingesting.</p>
  *
  * <h2>One build at a time</h2>
- * <p>Builds are serialised. Two at once would race over the same scratch directory and could
- * publish a directory assembled from two different snapshots of staging.</p>
+ * <p>Builds are serialised, and serialised against erasure compaction, by the holder's
+ * {@link GraphRagHolder#replacementLock() replacement lock}. Two builds at once would race over the
+ * same scratch directory, and a build beside a compaction could republish facts the compaction
+ * had just erased from staging.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use; a build in progress blocks another rather than overlapping it.</p>
@@ -42,7 +44,6 @@ public final class GraphBuildService {
     private final GraphRagHolder holder;
     private final Config config;
     private final List<String> singleValuedRelations;
-    private final ReentrantLock buildLock = new ReentrantLock();
 
     /**
      * Embeds each entity's text at build time, when this node has an embedding endpoint.
@@ -112,6 +113,7 @@ public final class GraphBuildService {
      * @throws IOException if the graph cannot be built or reopened
      */
     public BuildOutcome build() throws IOException {
+        ReentrantLock buildLock = holder.replacementLock();
         buildLock.lock();
         try {
             Path target = holder.directory();
@@ -140,18 +142,21 @@ public final class GraphBuildService {
                 : GraphDirectoryBuilder.writeEntityVectors(
                     staging, scratch, embedder, embeddingDimension);
 
-            // The served stack goes before the directory moves. Lucene takes a write lock per
-            // index directory and tracks it by path for the whole JVM, so the replacement cannot
-            // open at the path the old one still holds - and after the rename the old stack maps
-            // files that are no longer the graph anyway. Queries in the gap are told there is no
-            // graph, which is a moment rather than a state: the reopen is the next statement.
-            holder.install(null);
-            GraphBuilder.publish(scratch, target);
-
-            // Reopened from the directory that was just published, rather than from the objects
+            // Opened from the directory that was just published, rather than from the objects
             // the build held: what the node serves has to be what is on disk, or a restart would
-            // answer differently from the process that built it.
-            holder.install(GraphRagFactory.openAt(config, target));
+            // answer differently from the process that built it. The previous graph goes on
+            // serving throughout - the stack opens read-only and takes no lock the replacement
+            // needs - and is kept on disk until the new one has opened, so a build that
+            // publishes something unopenable leaves the node serving what it served before.
+            GraphRagFactory.GraphRag opened = GraphBuilder.publish(scratch, target,
+                com.eonmux.excalibur.graph.file.Durability.DEVICE, published -> {
+                    GraphRagFactory.GraphRag stack = GraphRagFactory.openAt(config, published);
+                    if (stack == null) {
+                        throw new IOException("the published graph is not at " + published);
+                    }
+                    return stack;
+                });
+            holder.install(opened);
 
             GraphDirectoryBuilder.BuildResult result = new GraphDirectoryBuilder.BuildResult(
                 assembled.edges(), assembled.entities(), assembled.relations(), indexed,

@@ -147,9 +147,9 @@ class CoreComponentsTest {
         }
 
         @Test
-        @DisplayName("a per-segment value that is not a positive number fails the start")
+        @DisplayName("a per-segment value that is not a positive int fails the start")
         void refusesNonsenseSegmentCapacity(@TempDir Path dataDir) {
-            for (String bad : new String[] {"not-a-number", "0", "-1"}) {
+            for (String bad : new String[] {"not-a-number", "0", "-1", "2147483648"}) {
                 Map<String, String> props = new HashMap<>();
                 props.put("excalibur.query.vector-dimensions", "128");
                 props.put(CoreComponents.KEY_SEGMENT_CAPACITY, bad);
@@ -159,6 +159,40 @@ class CoreComponentsTest {
                     .as("rejected value: %s", bad)
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining(CoreComponents.KEY_SEGMENT_CAPACITY);
+            }
+
+            assertThat(dataDir).isEmptyDirectory();
+        }
+
+        @Test
+        @DisplayName("a segment level larger than the corpus level fails the start")
+        void refusesASegmentLevelPastTheCorpus(@TempDir Path dataDir) {
+            Map<String, String> props = new HashMap<>();
+            props.put("excalibur.query.vector-dimensions", "128");
+            props.put(CoreComponents.KEY_CORPUS_CAPACITY, "1000");
+            props.put(CoreComponents.KEY_SEGMENT_CAPACITY, "1001");
+
+            assertThatThrownBy(() -> CoreComponents.create(
+                new Config(props), dataDir, HnswConfigFactory.withDefaults()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(CoreComponents.KEY_SEGMENT_CAPACITY)
+                .hasMessageContaining(CoreComponents.KEY_CORPUS_CAPACITY);
+            assertThat(dataDir).isEmptyDirectory();
+        }
+
+        @Test
+        @DisplayName("a fingerprint width the filter cannot hold fails the start, naming the key")
+        void refusesFingerprintWidthsOutsideTheFormat(@TempDir Path dataDir) {
+            for (String bad : new String[] {"7", "17", "twelve"}) {
+                Map<String, String> props = new HashMap<>();
+                props.put("excalibur.query.vector-dimensions", "128");
+                props.put(CoreComponents.KEY_FINGERPRINT_BITS, bad);
+
+                assertThatThrownBy(() -> CoreComponents.create(
+                    new Config(props), dataDir, HnswConfigFactory.withDefaults()))
+                    .as("rejected value: %s", bad)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining(CoreComponents.KEY_FINGERPRINT_BITS);
             }
 
             assertThat(dataDir).isEmptyDirectory();

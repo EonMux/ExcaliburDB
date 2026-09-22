@@ -6,6 +6,8 @@ import com.eonmux.excalibur.retrieval.expand.QueryExpander;
 import com.eonmux.excalibur.retrieval.rank.Ranker;
 
 import java.io.IOException;
+import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -44,6 +46,19 @@ public interface ChunkIndex extends AutoCloseable {
      * neither engine has a version order to resolve it by.</p>
      */
     void add(String chunkId, String text) throws IOException;
+
+    /**
+     * Indexes every chunk of one document, as one unit.
+     *
+     * <p>A {@link #refresh()} running concurrently publishes all of them or none of them. Runs
+     * over different sources share one index and refresh it on their own schedules, so a chunk
+     * added one at a time can be published by another run's refresh while the rest of its
+     * document is still arriving - and half a document is a wrong answer rather than a partial
+     * one. The same rules as {@link #add} apply to each chunk.</p>
+     *
+     * @param chunks Chunk identifier to text, for one document; empty texts are skipped
+     */
+    void addDocument(Map<String, String> chunks) throws IOException;
 
     /** Makes everything added so far searchable. */
     void refresh() throws IOException;
@@ -103,6 +118,26 @@ public interface ChunkIndex extends AutoCloseable {
      * <p>Read from state the index already holds, so it is safe to call on a request path.</p>
      */
     ChunkIndexStats stats();
+
+    /**
+     * Which published state of the index a search started now would read.
+     *
+     * <p>For a cache of answers, which may replay an earlier answer only to a query that would
+     * read the same state. The version has to be read through what a search reads rather than
+     * from anything that merely describes writes: a publication here becomes visible at a
+     * boundary - a refresh, or the query epoch crossing the epoch it was published at - that
+     * no write is observed making at the moment it takes effect.</p>
+     *
+     * <p>Empty means this index cannot say, and nothing answered from it may be cached; that
+     * is the default, so an index that has not worked out what its searches read is never
+     * assumed to be unchanged.</p>
+     *
+     * @return A value that changes whenever a search's answer can, or empty when this index
+     *         cannot tell
+     */
+    default OptionalLong searchVersion() {
+        return OptionalLong.empty();
+    }
 
     @Override
     void close();

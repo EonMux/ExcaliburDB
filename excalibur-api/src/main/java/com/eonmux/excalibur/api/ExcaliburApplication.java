@@ -129,7 +129,7 @@ public final class ExcaliburApplication {
     private final ApiSecurityConfig apiSecurity;
 
     /**
-     * Hierarchical Cuckoo filter for corpus → cluster → segment membership testing.
+     * Hierarchical Cuckoo filter for corpus → segment membership testing.
      * Shared between ingestion (inserts) and maintenance worker (deletions).
      */
     private final HierarchicalCuckooFilter hierarchicalFilter;
@@ -371,7 +371,7 @@ public final class ExcaliburApplication {
         // Read straight off Config, which already merged the file with the EXCALIBUR_* environment.
         // Re-reading the file here would be a second parser that can disagree with that one about
         // precedence -- and the setting it most affects is the auth token.
-        this.apiSecurity = ApiSecurityConfig.fromProperties(config.getEffectiveProperties());
+        this.apiSecurity = ApiSecurityConfig.fromConfig(config);
         this.apiSecurity.requireSafeToServe();
         LOGGER.info("API security policy: {}", apiSecurity);
 
@@ -794,7 +794,7 @@ public final class ExcaliburApplication {
     }
 
     /**
-     * Gets the hierarchical Cuckoo filter for corpus → cluster → segment membership.
+     * Gets the hierarchical Cuckoo filter for corpus → segment membership.
      *
      * <p>This filter is shared between:</p>
      * <ul>

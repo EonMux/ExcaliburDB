@@ -42,18 +42,21 @@ public final class Usage {
           checker for its format.
 
         RESTORE
-          Verifies the image in full, then builds the new tree beside the target and
-          renames it on in one move. Refuses an image that does not verify. Refuses a
-          target that already holds something unless --force is given. In both cases the
-          target is left exactly as it was.
+          Verifies the image to the same depth as verify - lengths and CRC32C, or with
+          --deep also SHA-256 and the format checkers - then builds the new tree beside
+          the target and renames it on in one move. Refuses an image that does not
+          verify. Refuses a target that already holds something unless --force is given.
+          In both cases the target is left exactly as it was.
 
         EXIT CODES
           0   the command did what it was asked
           2   the command line was wrong
           3   a snapshot did not verify; nothing was restored
-          4   the restore target is not empty and --force was not given
+          4   the restore target is not empty and --force was not given, or the
+              snapshot --out directory is not empty
           5   the data directory moved while it was being copied; a node is running
-          6   a file could not be read or written
+          6   a file could not be read or written, or a copy did not read back as
+              what was written
           70  an unanticipated failure
         """;
 

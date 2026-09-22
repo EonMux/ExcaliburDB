@@ -16,11 +16,27 @@ import java.util.Objects;
  */
 public final class GraphConfig {
 
-    /** Smallest fused score any candidate must reach before an answer is attempted. */
-    public static final double DEFAULT_MIN_SCORE = 0.005;
+    /**
+     * Smallest relevance the entity a question named must reach before an answer is attempted.
+     *
+     * <p>Read on the graph route's unit scale: the share of the question's attainable BM25 score
+     * the entity carries - over the words the graph's descriptions hold at all - or its vector
+     * similarity to the question once the exact rerank has run. One twentieth declines a named
+     * entity whose description carries almost none of what the question asks, the rest of it
+     * pointing at other entities, while one matching a single distinctive word of a short
+     * question clears it several times over.
+     */
+    public static final double DEFAULT_MIN_SCORE = 0.05;
 
-    /** Smallest gap between the best and second candidate before the result is ambiguous. */
-    public static final double DEFAULT_MIN_SEPARATION = 0.001;
+    /**
+     * Smallest gap between the two best readings of one name, as a fraction of the best, before
+     * the result is ambiguous.
+     *
+     * <p>One percent: two entities sharing the name the question gave, which it matched within a
+     * hundredth of each other, were not told apart by anything the question said, and are handed
+     * back to be chosen between rather than chosen by a rounding error.
+     */
+    public static final double DEFAULT_MIN_SEPARATION = 0.01;
 
     /** Smallest mean confidence across the surviving evidence. */
     public static final double DEFAULT_MIN_MEAN_CONFIDENCE = 0.3;
@@ -146,7 +162,7 @@ public final class GraphConfig {
             props, "excalibur.graph.entity-vectors-enabled", DEFAULT_ENTITY_VECTORS_ENABLED);
         this.maxOpenNamespaces = ConfigBounds.atLeast(
             props, "excalibur.graph.max-open-namespaces", DEFAULT_MAX_OPEN_NAMESPACES, 1);
-        this.erasureTombstoneRatio = requireInUnitRange(PropertyParser.parseDouble(
+        this.erasureTombstoneRatio = requirePositiveFraction(PropertyParser.parseDouble(
             props, "excalibur.graph.erasure-tombstone-ratio",
             DEFAULT_ERASURE_TOMBSTONE_RATIO), "erasure-tombstone-ratio");
         this.erasureMaxLatencySeconds = PropertyParser.parseLong(
@@ -228,6 +244,20 @@ public final class GraphConfig {
         return value;
     }
 
+    /**
+     * Refuses a fraction that is not above zero and at most one.
+     *
+     * <p>For a threshold that is reached by accumulating something: at zero it would be reached
+     * before anything had accumulated.</p>
+     */
+    private static double requirePositiveFraction(double value, String name) {
+        if (!(value > 0.0) || value > 1.0) {
+            throw new IllegalArgumentException(
+                "excalibur.graph." + name + " must be in (0.0, 1.0], got: " + value);
+        }
+        return value;
+    }
+
     private static double requireInUnitRange(double value, String name) {
         if (value < 0.0 || value > 1.0) {
             throw new IllegalArgumentException(
@@ -241,12 +271,12 @@ public final class GraphConfig {
         return path;
     }
 
-    /** @return smallest fused score a candidate must reach */
+    /** @return smallest relevance the best candidate must reach, on the unit scale */
     public double getMinScore() {
         return minScore;
     }
 
-    /** @return smallest gap between the best two candidates */
+    /** @return smallest gap between the best two candidates, as a fraction of the best */
     public double getMinSeparation() {
         return minSeparation;
     }
@@ -374,7 +404,7 @@ public final class GraphConfig {
 
     @Override
     public String toString() {
-        return "Graph{path=" + (path != null ? path : "<data dir>/graph")
+        return "Graph{root=" + (path != null ? path : "<data dir>")
             + ", minScore=" + minScore
             + ", minSeparation=" + minSeparation
             + ", minMeanConfidence=" + minMeanConfidence

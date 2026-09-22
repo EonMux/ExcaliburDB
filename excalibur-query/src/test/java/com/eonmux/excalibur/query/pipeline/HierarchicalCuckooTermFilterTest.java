@@ -30,7 +30,6 @@ class HierarchicalCuckooTermFilterTest {
     private static final String SEGMENT_ID_1 = "1";
     private static final String SEGMENT_ID_2 = "2";
     private static final String SEGMENT_ID_3 = "3";
-    private static final String CLUSTER_ID = "default";
 
     @BeforeEach
     void setUp() {
@@ -38,9 +37,9 @@ class HierarchicalCuckooTermFilterTest {
         hierarchicalFilter = new HierarchicalCuckooFilter(10000);
 
         // Register segments
-        hierarchicalFilter.registerSegment(SEGMENT_ID_1, CLUSTER_ID);
-        hierarchicalFilter.registerSegment(SEGMENT_ID_2, CLUSTER_ID);
-        hierarchicalFilter.registerSegment(SEGMENT_ID_3, CLUSTER_ID);
+        hierarchicalFilter.registerSegment(SEGMENT_ID_1);
+        hierarchicalFilter.registerSegment(SEGMENT_ID_2);
+        hierarchicalFilter.registerSegment(SEGMENT_ID_3);
     }
 
     @Test
@@ -270,7 +269,7 @@ class HierarchicalCuckooTermFilterTest {
         assertEquals("42", segmentIdString, "String.valueOf(42L) should produce '42'");
 
         // Domain correctness: segment must be registered before insertion
-        hierarchicalFilter.registerSegment(segmentIdString, CLUSTER_ID);
+        hierarchicalFilter.registerSegment(segmentIdString);
 
         // Insert into filter with this format
         String term = "testterm";

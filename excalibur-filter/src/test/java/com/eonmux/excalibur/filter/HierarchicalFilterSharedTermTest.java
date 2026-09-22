@@ -13,7 +13,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * A term that appears in many segments.
  *
  * <p>The ordinary case for any real corpus, and the one the hierarchy used to break on. The
- * cluster and corpus filters were given one entry per (term, segment) pair, and a cuckoo filter
+ * shared filters above the segments were given one entry per (term, segment) pair, and a cuckoo filter
  * stores a fingerprint in one of two buckets holding a fixed handful of entries each — so the
  * ninth segment's insert failed, and the rollback removed the term from that segment's own
  * filter as well. The segment stopped being a candidate for a term it contains.
@@ -28,9 +28,9 @@ class HierarchicalFilterSharedTermTest {
 
     private static HierarchicalCuckooFilter filter(int segments) {
         HierarchicalCuckooFilter filter =
-            new HierarchicalCuckooFilter(100_000L, 13, 10_000, 1_000);
+            new HierarchicalCuckooFilter(100_000L, 13, 1_000);
         for (int i = 0; i < segments; i++) {
-            filter.registerSegment(String.valueOf(i), "cluster-0");
+            filter.registerSegment(String.valueOf(i));
         }
         return filter;
     }
@@ -107,12 +107,12 @@ class HierarchicalFilterSharedTermTest {
     }
 
     @Test
-    @DisplayName("terms in different clusters do not retire each other")
-    void clustersAreIndependent() {
+    @DisplayName("deleting a term from one segment does not retire it from another")
+    void segmentsAreIndependent() {
         HierarchicalCuckooFilter filter =
-            new HierarchicalCuckooFilter(100_000L, 13, 10_000, 1_000);
-        filter.registerSegment("0", "cluster-a");
-        filter.registerSegment("1", "cluster-b");
+            new HierarchicalCuckooFilter(100_000L, 13, 1_000);
+        filter.registerSegment("0");
+        filter.registerSegment("1");
 
         filter.insert(TERM, "0");
         filter.insert(TERM, "1");
@@ -120,7 +120,7 @@ class HierarchicalFilterSharedTermTest {
         assertThat(filter.deleteFromHierarchy(TERM, "0")).isTrue();
 
         assertThat(filter.mightContain(TERM))
-            .as("cluster-b still holds it, so the corpus entry must stay")
+            .as("segment 1 still holds it, so the corpus entry must stay")
             .isTrue();
         assertThat(filter.findCandidateSegments(TERM)).containsExactly("1");
     }
