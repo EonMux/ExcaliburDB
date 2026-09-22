@@ -20,8 +20,9 @@ import io.excalibur.graph.temporal.TemporalFilter;
  * <h2>Relation filters</h2>
  * Filters are arrays of selectors as encoded by {@link RelationSelector}, so one array names both
  * the relations to follow and the direction to follow each of them in. A {@code null} filter means
- * every relation, forward only; an empty array means no relation at all and yields no results,
- * which is a legitimate request rather than an error.
+ * every relation in both directions - see below, because the direction half of that is the part an
+ * implementer gets wrong. An empty array means no relation at all and yields no results, which is
+ * a legitimate request rather than an error.
  *
  * <h2>Time</h2>
  * Every method that walks edges takes valid time into account. Filtering happens <em>while</em>

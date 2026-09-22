@@ -50,8 +50,15 @@ public final class WriteAheadLogCheck {
         try (ReadOnlyMapping mapping = ReadOnlyMapping.of(file)) {
             return scan(file, relative, size, mapping);
         } catch (CorruptLogException e) {
+            // needsOperator, and this is the one place in the tool where the flag carries its
+            // full weight. The only repair on offer for a CORRUPT file is to move the whole
+            // file aside, and the records behind damage in a log were fsynced and acknowledged
+            // before the writer was told the write had happened. Setting them aside is losing
+            // committed writes - which is exactly what this tool promises --repair will never
+            // do - and the planner would otherwise file the log under derived state that a
+            // reindex rebuilds. Nothing rebuilds a log.
             return new FileCheck(file, relative, FORMAT, null, CheckStatus.CORRUPT,
-                e.getMessage(), size);
+                e.getMessage(), size, true);
         } catch (IOException | RuntimeException e) {
             return new FileCheck(file, relative, FORMAT, null, CheckStatus.UNREADABLE,
                 "it could not be mapped and scanned: " + e, size);

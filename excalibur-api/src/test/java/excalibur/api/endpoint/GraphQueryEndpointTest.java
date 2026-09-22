@@ -216,15 +216,42 @@ class GraphQueryEndpointTest {
         }
 
         @Test
-        @DisplayName("a question with no as_of does not claim one")
-        void noAsOfIsNotReported() throws IOException {
+        @DisplayName("a caller's instant is reported as the caller's")
+        void aRequestedInstantSaysSo() throws IOException {
+            var node = parse(call("POST", "{\"query\": \"Who did Ada Lovelace collaborate with?\","
+                + " \"as_of\": \"1843-01-01\"}"));
+
+            assertThat(node.get("as_of_source").asText()).isEqualTo("request");
+        }
+
+        @Test
+        @DisplayName("a question with no as_of reports the instant it was answered at anyway")
+        void anUnrequestedInstantIsStillReported() throws IOException {
+            // Omitting it left a caller unable to tell an answer about today from an answer the
+            // classifier dated off the question's own words. as_of_source is what makes echoing
+            // the instant honest: it is reported, and it is reported as not having been asked for.
             var node = parse(call("POST",
                 "{\"query\": \"Who did Ada Lovelace collaborate with?\"}"));
 
             assertThat(node.get("status").asText()).isEqualTo("answered");
-            assertThat(node.has("as_of"))
-                .as("a node that answered at now has not been asked for an instant")
-                .isFalse();
+            assertThat(node.get("as_of").asText())
+                .isEqualTo(java.time.LocalDate.now(java.time.ZoneOffset.UTC).toString());
+            assertThat(node.get("as_of_source").asText())
+                .as("a node that answered at today was not asked to")
+                .isEqualTo("default");
+        }
+
+        @Test
+        @DisplayName("an instant read out of the question is reported as inferred")
+        void aQuestionsOwnInstantSaysSo() throws IOException {
+            var node = parse(call("POST",
+                "{\"query\": \"Who did Ada Lovelace collaborate with as of 1843-01-01?\"}"));
+
+            assertThat(node.get("as_of").asText()).isEqualTo("1843-01-01");
+            assertThat(node.get("as_of_source").asText())
+                .as("a date the classifier found is a guess at what the asker meant, and a "
+                    + "client has to be able to see that it was one")
+                .isEqualTo("question");
         }
 
         @Test

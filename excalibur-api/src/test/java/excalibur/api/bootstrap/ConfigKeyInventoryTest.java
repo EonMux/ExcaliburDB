@@ -164,6 +164,92 @@ class ConfigKeyInventoryTest {
         }
     }
 
+    @Nested
+    @DisplayName("against the reference table in the README")
+    class AgainstTheReadme {
+
+        @Test
+        @DisplayName("every key an inventory knows has a row in the configuration table")
+        void theReadmeDocumentsEveryKnownKey() throws IOException {
+            var documented = new TreeSet<>(readmeTableKeys());
+            List<String> undocumented = new ArrayList<>();
+            for (String key : new TreeSet<>(ConfigKeys.known())) {
+                if (!documented.contains(key)) {
+                    undocumented.add(key);
+                }
+            }
+            for (String key : new TreeSet<>(ApiConfigKeys.known())) {
+                if (!documented.contains(key)) {
+                    undocumented.add(key);
+                }
+            }
+
+            assertThat(undocumented)
+                .as("the README's table is where a reader looks for a setting's default, and a "
+                    + "key mentioned only in prose elsewhere is one they will conclude does not "
+                    + "exist")
+                .isEmpty();
+        }
+
+        @Test
+        @DisplayName("every key the table lists is one some inventory knows")
+        void theReadmeNamesNoUnknownKey() throws IOException {
+            List<String> unrecognised = new ArrayList<>();
+            for (String key : readmeTableKeys()) {
+                if (!recognised(key)) {
+                    unrecognised.add(key);
+                }
+            }
+
+            assertThat(unrecognised)
+                .as("a row for a setting nothing reads documents a knob that does nothing")
+                .isEmpty();
+        }
+    }
+
+    /**
+     * README sections whose {@code excalibur.}-prefixed table rows are not properties file keys.
+     *
+     * <p>"System properties" documents the JVM {@code -D} namespace, which is a different set of
+     * names that no properties-file inventory knows or should. "Documentation" is the table of
+     * where to read things, and one of its rows is the template's file name.</p>
+     */
+    private static final List<String> NOT_SETTINGS_TABLES =
+        List.of("### System properties", "### Documentation");
+
+    /**
+     * The keys the README gives a table row to.
+     *
+     * <p>Rows, not prose: the same keys are named throughout the text, and counting those would
+     * let every table go empty while this still passed. More than one table carries them - the
+     * reference table, and the one in the section on the chunk lexical index - so this reads
+     * them all and names the sections that are not settings tables instead.</p>
+     *
+     * @return Every key with a row
+     * @throws IOException if the README cannot be read
+     */
+    private static List<String> readmeTableKeys() throws IOException {
+        List<String> keys = new ArrayList<>();
+        boolean settingsMayFollow = true;
+        for (String line : Files.readAllLines(repositoryFile("README.md"))) {
+            String trimmed = line.strip();
+            if (trimmed.startsWith("#")) {
+                settingsMayFollow = !NOT_SETTINGS_TABLES.contains(trimmed);
+                continue;
+            }
+            if (!settingsMayFollow || !trimmed.startsWith("| `excalibur.")) {
+                continue;
+            }
+            int close = trimmed.indexOf('`', 3);
+            if (close > 0) {
+                keys.add(trimmed.substring(3, close));
+            }
+        }
+        assertThat(keys).as("no rows were parsed out of the README, so this tests nothing")
+            .isNotEmpty();
+        return keys;
+    }
+
     /**
      * The keys the shipped template sets, commented-out lines included.
      *
@@ -193,15 +279,24 @@ class ConfigKeyInventoryTest {
 
     /** The template, found by walking up from wherever the test happens to be run. */
     private static Path template() {
+        return repositoryFile("excalibur.properties.example");
+    }
+
+    /**
+     * A file at the repository root, found by walking up from wherever the test is run.
+     *
+     * @param name The file's name at the root
+     * @return Its path
+     */
+    private static Path repositoryFile(String name) {
         Path directory = Path.of("").toAbsolutePath();
         while (directory != null) {
-            Path candidate = directory.resolve("excalibur.properties.example");
+            Path candidate = directory.resolve(name);
             if (Files.isRegularFile(candidate)) {
                 return candidate;
             }
             directory = directory.getParent();
         }
-        throw new AssertionError("excalibur.properties.example not found above "
-            + Path.of("").toAbsolutePath());
+        throw new AssertionError(name + " not found above " + Path.of("").toAbsolutePath());
     }
 }

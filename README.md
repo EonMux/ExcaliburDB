@@ -257,7 +257,20 @@ times slower at every search.
 
 Heap comes from the container's limit rather than a fixed `-Xmx`, capped at 60% rather than the
 usual 75%: segments live in memory-mapped arenas outside the heap, and a heap sized to crowd out
-the page cache turns every search into a disk read.
+the page cache turns every search into a disk read. The image also sets `+UseG1GC`,
+`+HeapDumpOnOutOfMemoryError` with the dump written to the volume, and `+ExitOnOutOfMemoryError` —
+a JVM that survives an OOM in a worker goes on answering `/health` while indexing nothing.
+
+`excalibur-fsck` is on the image's `PATH`, so the check is reachable at the one moment anyone
+wants it — when the node will not start:
+
+```bash
+docker run --rm -v excalibur-data:/var/lib/excalibur \
+  --entrypoint excalibur-fsck excalibur /var/lib/excalibur
+```
+
+`excalibur-backup` is not in the image. It requires the node to be stopped, which is not the
+shape a container that exists to run the node is in.
 
 Nothing is baked in. The API binds `127.0.0.1` by default and binding anything else requires a
 bearer token and either TLS or an explicit `EXCALIBUR_API_ALLOW_PLAINTEXT=true` where something in
@@ -271,7 +284,8 @@ chunk index, which is what publishes the tail of an ingestion run.
 ## Operator tools
 
 Two commands ship beside the server. Both run against a data directory rather than a running
-node, both run and exit, and neither opens a port.
+node, both run and exit, and neither opens a port. `excalibur-fsck` is also in the container
+image; `excalibur-backup` is not, because a snapshot needs the node stopped.
 
 ```bash
 ./gradlew :excalibur-fsck:installDist :excalibur-backup:installDist
@@ -283,6 +297,7 @@ node, both run and exit, and neither opens a port.
 excalibur-fsck /var/lib/excalibur              # report only; nothing is touched
 excalibur-fsck /var/lib/excalibur --strict     # also fail on anything unverifiable
 excalibur-fsck /var/lib/excalibur --repair     # apply only the repairs shown to be safe
+excalibur-fsck /var/lib/excalibur --repair --quarantine-dir=/var/tmp/quarantine
 excalibur-fsck /var/lib/excalibur --json
 excalibur-fsck --help                          # the flags and the exit codes
 ```
@@ -307,9 +322,15 @@ damaged `catalog.dat`, a damaged `routing.dir`, a routing slot pointing at a mis
 a write-ahead log damaged in the middle are all reported under *needs an operator* and left
 alone. Which hash slot belongs to which segment after a split is not recoverable from file
 names — that is why the directory is written down — and the records behind damage in a log were
-fsynced and acknowledged, so trimming past them would destroy committed writes.
+fsynced and acknowledged, so trimming past them would destroy committed writes. A log damaged in
+the middle is not moved aside either, for the same reason: setting the file aside sets those
+records aside with it, and unlike an index, nothing rebuilds a log.
 
-Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong.
+Damaged files are moved into a timestamped directory beside the data directory unless
+`--quarantine-dir=<path>` names another. It takes the `--flag=value` form only.
+
+Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
+failed, so nothing is known about the directory — which is not the same claim as `0`.
 
 ### Snapshots — `excalibur-backup`
 
@@ -322,11 +343,13 @@ excalibur-backup restore  --snapshot /backups/2026-09-14 --target /var/lib/excal
 A snapshot is a self-describing image: the payload, plus a manifest naming every file with its
 length, its CRC32C and its SHA-256, the format versions, and the epoch the image is coherent at.
 `verify` checks an image against that manifest in both directions — every named file must be
-present and match, and every present file must be named. `--deep` also hands each file to the
-engine's own integrity checker for its format, so a snapshot can be shown to hold openable
-segments and graphs rather than merely unaltered bytes. `restore` verifies in full first, builds
-the new tree beside the target, and renames it on in one move; an image that does not verify is
-refused with the target untouched, and a target that already holds something needs `--force`.
+present and match, and every present file must be named. By default matching means the length and
+the CRC32C; `--deep` adds the SHA-256 and hands each file to the engine's own integrity checker
+for its format, so a snapshot can be shown to hold openable segments and graphs rather than merely
+unaltered bytes. `restore` verifies before it writes anything, to the same default depth and to
+the deeper one with `restore --deep`, then builds the new tree beside the target and renames it on
+in one move; an image that does not verify is refused with the target untouched, and a target that
+already holds something needs `--force`.
 
 **The node must be stopped.** Nothing in this engine orders one file against another and nothing
 locks the directory, so a clean shutdown is the only moment at which every file describes the
@@ -351,7 +374,8 @@ holes would turn that into a 50 GB backup. Checksums still cover every logical b
 
 Exit codes: `0` done, `2` bad command line, `3` the image did not verify and nothing was
 restored, `4` the target is not empty, `5` the data directory moved while being copied, `6` a
-file could not be read or written.
+file could not be read or written — or a copy did not read back as what was written — and `70`
+something this build did not anticipate, reported rather than hidden.
 
 ## Configuration
 
@@ -398,6 +422,7 @@ spell them this way:
 | `excalibur.query.cache.enabled` | false | Whether a repeated identical query is answered without searching again. Every lookup re-reads a fingerprint of the live corpus and an entry is served only to a lookup presenting the identical one, so an entry is discarded the moment anything it was computed against changes |
 | `excalibur.query.cache.max-entries` | 1024 | How many answers the cache may hold. Entries, not bytes: one entry is one answer, whose result list is bounded by `excalibur.api.max-top-k`. 1–1000000, refused rather than clamped |
 | `excalibur.query.expand-hybrid-queries` | false | Whether a node that embeds its corpus also expands the BM25 half of a hybrid query with the chat model. Off, the vector signal carries the meaning and BM25 matches the words as typed; on, the lexical half contributes the recall it would on a node with no embeddings, at one extra chat call per query |
+| `excalibur.query.expansion-timeout-ms` | 5000 | How long one query-side expansion call may take before it is abandoned and the query runs as typed. Its own budget, not the LLM client's 60-second one: expansion sits in front of a search a caller is waiting on, and a timeout that generous would be indistinguishable from a hang |
 | `excalibur.query.per-signal-over-fetch` | 3 | How many times `top_k` each signal contributes before fusion. A document has to be in a signal's list to be fused at all, so this is what lets a result that is mediocre on one signal and excellent on the other survive to be ranked |
 | `excalibur.shard.segment-load-factor` | 0.7 | Fraction of slots a segment may fill before it splits |
 | `excalibur.shard.default-ef-construction` | 128 | HNSW construction candidate list size |
@@ -894,12 +919,11 @@ separate so a burst of writes cannot starve ordinary reads.
 | `GET` | `/v1/graph/namespaces` | bearer | read | Every namespace on disk, and what each one holds and owes |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | mutate | Remove a namespace entirely. Irreversible, and `409` for `shared` |
 
-A method a registered path does not serve answers 405. On `/health`, `/v1/query` and
-`/v1/ingest` - the paths that serve more than one method - the 405 is unauthenticated and charged
-against the read budget, because leaving it uncharged would let an anonymous caller spend a
-routing decision per request at line rate. Every other path serves one method and refuses the
-rest from behind its own guard, so a wrong method there is authenticated first and charged to
-that path's own budget: on a mutating route, the mutate one. Anything else answers 404. The graph routes are registered on every
+A method a registered path does not serve answers 405, on every path, unauthenticated and charged
+against the read budget. Unauthenticated because a 405 is a routing answer rather than a resource:
+nothing about the corpus is in it. Charged because leaving it uncharged would let an anonymous
+caller spend a routing decision per request at line rate, and charged as a read rather than a
+mutation because nothing was mutated. Anything else answers 404. The graph routes are registered on every
 node; a node that has never built a graph answers `/v1/graph/query` with 503 rather than 404, because the capability is there
 and only the data is missing. `/v1/erasure` is the opposite case: a node built without an erasure
 service does not register it at all, so a caller under an obligation gets a 404 they can escalate
@@ -1090,8 +1114,12 @@ For mutual TLS, set `excalibur.api.tls-client-auth` to `want` or `need` and name
 JVM default store, which trusts the public web CAs — so almost any certificate would pass.
 
 A request without a token, or with the wrong one, is `401`. Once a token is configured that
-applies to every route except `/health` and `/health/ready`, and the check runs before the route
-decides anything else, so an unauthenticated caller learns nothing about which routes exist.
+applies to every route except `/health`, `/health/ready` and the 405 a registered path answers a
+method it does not serve. The check runs before the handler, so an unauthenticated caller reaches
+nothing and learns nothing about the corpus - but it can tell a registered path from an unknown
+one by probing with a wrong method and reading 405 against 404. That is not treated as a secret:
+the route table is in this README, and the alternative - authenticating the 405 - would make an
+anonymous caller's routing decisions free while telling an attacker nothing it cannot read here.
 
 Requests are rate limited with separate budgets for reads and mutations; exceeding either returns
 429 with `Retry-After`.
@@ -1240,6 +1268,25 @@ curl -X POST http://localhost:8080/v1/ingest \
 `excalibur.ingest.allowed-roots`, which is empty until configured — a 403 here is the allow-list,
 not the path. The other supported `source_type` is `http`, whose `base_url` is checked against
 `excalibur.ingest.allowed-hosts` and refused if it resolves to any private address.
+
+Beyond `source_id` and the target, every field in `config` is optional and left to the source's
+own default when absent. Each is bounded, and a value outside its bound is a 400 naming the field
+rather than a silent clamp:
+
+| Field | Applies to | Bound | What it does |
+|-------|-----------|-------|--------------|
+| `included_extensions` | filesystem | — | Only these file extensions are read |
+| `excluded_directories` | filesystem | — | Directory names the walk does not descend into |
+| `follow_symlinks` | filesystem | — | Whether the walk descends through symbolic links. A link out of the allowed root is still refused: the real path is what is checked |
+| `include_hidden` | filesystem | — | Whether dot-files are read |
+| `max_file_bytes` | filesystem | 1 – 2 GiB | Largest single file the walk will read |
+| `included_path_patterns` | http | — | Substrings a URL path must contain to be crawled |
+| `excluded_path_patterns` | http | — | Substrings that keep a URL path out of the crawl |
+| `max_documents` | http | 1 – 10000000 | How many pages one crawl fetches |
+| `max_response_bytes` | http | 1 – 256 MiB | Largest single response body held |
+| `timeout_seconds` | http | 1 – 600 | How long one request may take |
+| `user_agent` | http | ≤ 200 chars | What the crawl identifies itself as. Screened for header injection |
+| `max_depth` | both | 0 – 1000 | How far the crawl descends |
 
 `source_id` is bounded at 256 characters. A copy of it is kept in every document's registry record
 and printed with every log line about the source, so its length is multiplied by the size of the
@@ -1533,6 +1580,7 @@ curl -X POST http://localhost:8080/v1/graph/query \
   "context": "...serialised subgraph...",
   "confidence": 0.8140,
   "as_of": "2019-03-01",
+  "as_of_source": "request",
   "tokens": 1873,
   "facts_included": 24,
   "facts_dropped": 3,
@@ -1565,10 +1613,7 @@ characters each. Exceeding either is a 400 naming the bound. A context is refuse
 truncated, because dropping part of one silently changes which entity a pronoun binds to and the
 answer would read as though the whole conversation had been given.
 
-`as_of` names the valid-time instant to answer at, and the response echoes back the one that was
-used. Without it the instant comes from date words the classifier finds in the question — a guess
-at what the asker meant, which is the wrong mechanism for a client that already knows the date it
-wants. Three spellings:
+`as_of` names the valid-time instant to answer at. Three spellings:
 
 | `as_of` | Meaning |
 |---------|---------|
@@ -1579,6 +1624,14 @@ wants. Three spellings:
 Anything else is a 400. A value that could not be understood must not quietly become "now": a
 request that asked for 2019 and was answered for today is wrong in a way nothing in the response
 would show.
+
+Every walk happens at some instant, so every answer reports the one it used and where that instant
+came from. `as_of_source` is `request` when the caller named it, `question` when the classifier
+read it out of the question's own date words, and `default` when neither did and the walk ran at
+today. The pair is what makes the echo honest: an instant nobody asked for is reported, and is
+reported as not having been asked for, so "who reported the Frankfurt outage in 2019" cannot come
+back answered as of today with nothing in the response to say so. Both fields are absent on
+`needs_input`, which stops before the traversal and has no instant to report.
 
 ```bash
 curl -X POST http://localhost:8080/v1/graph/erasure \
@@ -1693,10 +1746,12 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | `deregister_source` | Stops a source being crawled again; the documents already indexed stay |
 | `search_documents` | Searches the indexed documents and returns the matching passages, best first |
 | `build_graph` | Publishes the staged facts as the served graph |
+| `graph_build_status` | How far a build has got, and what the last one published |
 | `search_graph` | Asks the graph a question, optionally `as_of` a date, an instant or `all` of history |
 
 Together they are the whole loop, so a model can prepare a corpus as well as query one. The order
-matters: `build_graph` has to run after ingestion finishes, and `search_graph` reports that no
+matters: `build_graph` has to run after ingestion finishes - it answers as soon as the build
+starts, so `graph_build_status` is how a model waits for one - and `search_graph` reports that no
 graph is being served until it has.
 
 The two ways in are not alternatives either. `ingest_documents` points the node at a directory,
@@ -1714,8 +1769,8 @@ registered and replaces what changed - which is what a model reaching for a seco
 `ingest_documents` under the same id was trying to do, and what that call refuses with a 409.
 `deregister_source` is the way back: it stops the source being crawled again and leaves every
 document it indexed in place. Neither erases anything, which is why they are here and the
-erasure routes are not - `DELETE /v1/documents` and `DELETE /v1/graph/entity` destroy data and
-stay operator-only.
+erasure routes are not - `POST /v1/erasure` and `POST /v1/graph/erasure` destroy data and stay
+operator-only.
 
 The two searches are not alternatives. `search_documents` returns the passages that match and
 needs nothing but an ingestion run - the adapter asks the node for the text, because a model has
@@ -1782,6 +1837,8 @@ key plus `excalibur.graph.extraction-enabled=true`.
 | `excalibur-shard` | Index orchestration, volume management, visibility tracking |
 | `excalibur-llm` | LLM client with circuit breaker and retry logic |
 | `excalibur-api` | HTTP server, API endpoints and the MCP server |
+| `excalibur-fsck` | Offline integrity check and repair for a data directory |
+| `excalibur-backup` | Verified snapshot, verify and restore for a data directory |
 | `excalibur-metrics` | JMX metrics and observability |
 | `excalibur-config` | Configuration loading and validation |
 | `excalibur-test` | Test utilities and fixtures |
@@ -1791,27 +1848,34 @@ key plus `excalibur.graph.extraction-enabled=true`.
 
 ### Query Pipeline
 
-Queries execute through a 6-stage pipeline:
+Queries execute through a 7-stage pipeline:
 
 1. **Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
-2. **Cuckoo Filter Cascade** - Eliminate segments that cannot contain relevant terms
-3. **LSH Pre-filter** - Coarse vector similarity filtering
-4. **HNSW Vector Search** - Precise ANN search with tail scan for unindexed entries
-5. **Full Vector Rerank** - Exact distance computation on candidates
-6. **LLM Relevancy Scoring** - Optional semantic relevancy scoring
+2. **Segment Prioritisation** - Order the candidate segments by estimated selectivity
+3. **Cuckoo Filter Cascade** - Eliminate segments that cannot contain relevant terms
+4. **LSH Pre-filter** - Coarse vector similarity filtering
+5. **HNSW Vector Search** - Precise ANN search with tail scan for unindexed entries
+6. **Full Vector Rerank** - Exact distance computation on candidates
+7. **LLM Relevancy Scoring** - Optional semantic relevancy scoring
 
 Each stage checks for cancellation and timeout, allowing queries to return partial results if time-constrained.
 
-Stage 2 prunes only where the term filter can speak for a segment. Both write paths fill it:
+Stage 2 orders and never excludes. The estimate comes from a Count-Min sketch, which over-counts,
+and a segment dropped on an over-count loses results that are in the corpus; a segment with no
+sketch is given the highest estimate rather than the lowest. What the ordering buys is that the
+stage after it, and a query that runs out of time, spend what time there is on the segments most
+likely to answer.
+
+Stage 3 prunes only where the term filter can speak for a segment. Both write paths fill it:
 `POST /v1/reindex` through the batch publisher, which targets a segment it chose itself, and
 `POST /v1/ingest` through the storage engine, which reports the segment each chunk routed to. The
 filter is in memory only and is not reloaded at startup, so a restarted node prunes nothing until
 something is written again. Three things make a segment unprunable rather than excluded — the
 filter holding nothing for it, a level having refused a term for want of room, and no filter being
-configured at all — and in each case stage 2 passes the segment through. Pruning is an
+configured at all — and in each case stage 3 passes the segment through. Pruning is an
 optimisation; the filter never costs a result.
 
-The pre-filter in stage 3 hands stage 4 a set of candidate ids per segment, and stage 4 answers
+The pre-filter in stage 4 hands stage 5 a set of candidate ids per segment, and stage 5 answers
 with the nearest members of that set rather than the nearest of the whole graph. The set is carried
 on the dispatcher input the segment is searched under, because each segment has its own index, its
 own probe and its own node ids; a segment the pre-filter had no opinion about is handed no set and
@@ -1824,7 +1888,7 @@ search but empty it, since every candidate would name a node the graph does not 
 A candidate set names a scattering of nodes drawn from wherever the pre-filter's buckets fell, not a
 connected region of the graph, so the graph's edges are used to reach named nodes and never to
 decide which of them may be returned. A walk permitted to step only from one named node to another
-would be walking an edgeless subgraph and would come back with whatever it started on. Stage 4
+would be walking an edgeless subgraph and would come back with whatever it started on. Stage 5
 therefore answers a set one of two ways, whichever does less work: it measures every named node
 when the set is small, which is exact at one node read per name, or it runs the ordinary graph
 search and admits only named nodes to its results. Measuring reads `|C|` nodes; a search that
@@ -1845,7 +1909,7 @@ full, because the nodes it missed are exactly the ones its answer cannot mention
 search to such an answer drops matches just as surely as excluding the segment would, only fewer
 of them. An index that does cover the graph narrows what the search may return; excluding the
 segment needs more than that, because it skips the tail scan too, so it also needs the graph to have absorbed the
-whole write log. No index has ever seen that un-integrated tail, which stage 4 scans directly from
+whole write log. No index has ever seen that un-integrated tail, which stage 5 scans directly from
 the log.
 
 ### Segment Identity
@@ -2428,9 +2492,11 @@ is the only thing that runs them.
 
 **Can I depend on these modules from Maven?**
 Not from Maven Central — nothing is published there. `./gradlew publishToMavenLocal` installs the
-sixteen library modules into `~/.m2`, which is every module except `excalibur-bench`,
-`excalibur-integration` and `excalibur-test-bootstrap` — a benchmark harness and two test
-modules with nothing to publish. A
+sixteen library modules into `~/.m2`. The five that stay out are not libraries: `excalibur-bench`
+is a JMH harness whose entry points are benchmark runs, `excalibur-integration` and
+`excalibur-test-bootstrap` are test modules with nothing an embedder would depend on, and
+`excalibur-fsck` and `excalibur-backup` are commands that run against a stopped data directory —
+build them with `installDist` rather than depending on them. A
 composite build is the better option while you are also changing ExcaliburDB — see
 [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded).
 

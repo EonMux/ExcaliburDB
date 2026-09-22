@@ -17,6 +17,16 @@ import java.util.Map;
  * The first underscore after the prefix separates the section from the value name;
  * remaining underscores become hyphens.</p>
  *
+ * <p>That rule alone is not enough, because a key's name is not always one dot deep.
+ * <code>excalibur.query.cache.enabled</code> is three, and a rule that puts a dot only at the
+ * first underscore turns <code>EXCALIBUR_QUERY_CACHE_ENABLED</code> into
+ * <code>excalibur.query.cache-enabled</code> — a key nothing reads. The documented promise is
+ * that <em>any</em> setting can be supplied from the environment, so the boundary is resolved
+ * against {@link ConfigKeys} instead of assumed: each underscore in turn is tried as the last
+ * dot, shallowest first, and the first spelling the inventory recognises wins. A name that
+ * matches nothing keeps the shallow reading, which is what the unrecognised-key warning at
+ * start-up is phrased for.</p>
+ *
  * <p>Variables without the <code>EXCALIBUR_</code> prefix are ignored so that the
  * ambient environment (HOME, PATH, LANG, ...) never pollutes the properties map.</p>
  *
@@ -63,20 +73,39 @@ final class EnvOverrides {
      * @param envKey Environment variable name, with the EXCALIBUR_ prefix
      * @return Property key in <code>excalibur.&lt;section&gt;.&lt;value-name&gt;</code> form
      */
-    private static String toPropertyKey(String envKey) {
-        String suffix = envKey.substring(ENV_PREFIX.length());
-
-        // VISIBILITY_EPOCH_TICK_MS -> section=visibility, value-name=epoch-tick-ms
-        int firstUnderscore = suffix.indexOf('_');
-        if (firstUnderscore > 0) {
-            String section = suffix.substring(0, firstUnderscore).toLowerCase(Locale.ROOT);
-            String valueName = suffix.substring(firstUnderscore + 1)
-                .replace('_', '-')
-                .toLowerCase(Locale.ROOT);
-            return "excalibur." + section + "." + valueName;
+    static String toPropertyKey(String envKey) {
+        String[] words = envKey.substring(ENV_PREFIX.length()).toLowerCase(Locale.ROOT).split("_");
+        if (words.length < 2) {
+            // Nothing to place: there is no underscore for a dot to go at.
+            return "excalibur." + String.join("", words);
         }
 
-        // Fallback for names with no underscore after the prefix
-        return "excalibur." + suffix.toLowerCase(Locale.ROOT);
+        // VISIBILITY_EPOCH_TICK_MS -> excalibur.visibility.epoch-tick-ms, the shallow reading,
+        // and the one to keep when nothing deeper is recognised.
+        for (int sections = 1; sections < words.length; sections++) {
+            String candidate = spell(words, sections);
+            if (ConfigKeys.isKnown(candidate)) {
+                return candidate;
+            }
+        }
+        return spell(words, 1);
+    }
+
+    /**
+     * Spells the words as a key whose first few are dotted section names.
+     *
+     * @param words    The lower-cased words between the underscores
+     * @param sections How many leading words name sections; the rest are one hyphenated name
+     * @return The property key
+     */
+    private static String spell(String[] words, int sections) {
+        StringBuilder key = new StringBuilder("excalibur");
+        for (int i = 0; i < sections; i++) {
+            key.append('.').append(words[i]);
+        }
+        for (int i = sections; i < words.length; i++) {
+            key.append(i == sections ? '.' : '-').append(words[i]);
+        }
+        return key.toString();
     }
 }

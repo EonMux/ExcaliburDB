@@ -138,6 +138,15 @@ public final class RepairPlanner {
      * @return What to weigh
      */
     private static String unrepairableAdvice(FileCheck file) {
+        if (FileClassifier.classify(file.relative()) == FileKind.WRITE_AHEAD_LOG) {
+            return file.relative() + " is damaged in a way no repair here can act on: "
+                + file.detail() + ". It is not moved aside automatically, and it must not be: "
+                + "the sound records behind the damage were fsynced and acknowledged before "
+                + "their writers were told the write had happened, and nothing rebuilds a log "
+                + "the way a reindex rebuilds an index. Setting it aside loses those writes, "
+                + "and trimming past the damage loses them too. Restore the log from a backup "
+                + "or a replica, or accept the loss deliberately by moving it aside by hand";
+        }
         return file.relative() + " is damaged in a way no repair here can act on: "
             + file.detail() + ". It is not moved aside automatically, because the only "
             + "repair that would apply sets the whole file aside and most of what is in it "

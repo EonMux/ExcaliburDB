@@ -56,7 +56,9 @@ subprojects {
     // install could not be assembled into a working dependency.
     //
     // Absent by intent: excalibur-bench is a JMH harness whose entry points are benchmark runs,
-    // and excalibur-integration has no main sources to publish.
+    // excalibur-integration and excalibur-test-bootstrap exist only for the test classpath, and
+    // excalibur-fsck and excalibur-backup are commands run against a stopped data directory
+    // rather than libraries anything would compile against.
     val publishedModules = mapOf(
         "excalibur-config" to "Configuration loading and validation",
         "excalibur-metrics" to "Metrics registry and instrumentation",

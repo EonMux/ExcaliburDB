@@ -254,6 +254,34 @@ class ConfigLoaderTest {
         }
 
         @Test
+        @DisplayName("reaches a key whose name is more than one section deep")
+        void reachesADeeperSection() throws IOException {
+            // The documented rule is that any setting can be supplied from the environment.
+            // Placing a dot only at the first underscore spelled this one
+            // excalibur.query.cache-enabled, which nothing reads, so the two cache settings
+            // were the only pair in the inventory the environment could not reach.
+            Files.writeString(configFile, "excalibur.query.cache.max-entries=64\n");
+
+            Map<String, String> envOverrides = new HashMap<>();
+            envOverrides.put("EXCALIBUR_QUERY_CACHE_ENABLED", "true");
+            envOverrides.put("EXCALIBUR_QUERY_CACHE_MAX_ENTRIES", "512");
+
+            Config config = ConfigLoader.load(configFile.toString(), envOverrides);
+
+            assertThat(config.query().isCacheEnabled()).isTrue();
+            assertThat(config.query().getCacheMaxEntries()).isEqualTo(512);
+        }
+
+        @Test
+        @DisplayName("a name the inventory does not know keeps the shallow spelling")
+        void anUnknownNameKeepsTheShallowSpelling() {
+            // So that the unrecognised-key warning names what the operator actually typed,
+            // rather than one of the spellings that were tried on the way past it.
+            assertThat(io.excalibur.config.EnvOverrides.toPropertyKey("EXCALIBUR_LLM_NO_SUCH_KEY"))
+                .isEqualTo("excalibur.llm.no-such-key");
+        }
+
+        @Test
         @DisplayName("handles key without underscore after prefix")
         void handlesKeyWithoutUnderscoreAfterPrefix() throws IOException {
             String content = "excalibur.llm.timeout-ms=60000\n";

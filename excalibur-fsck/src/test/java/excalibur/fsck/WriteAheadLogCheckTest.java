@@ -106,6 +106,45 @@ class WriteAheadLogCheckTest {
     }
 
     @Test
+    void repairLeavesAMidDamagedLogAloneAndSaysWhy(@TempDir Path tempDir) throws IOException {
+        // The promise this locks in: --repair never destroys committed writes. Damage with
+        // sound records behind it used to fall through to the same quarantine any derived
+        // file gets, under a rationale that said the file "can be rebuilt by reindexing".
+        // Nothing rebuilds a log, and the records behind the damage had been acknowledged.
+        Path dir = tempDir.resolve("data");
+        DataDirectoryFixture.createStore(dir, 32);
+        // The fixture spreads its entries one per segment, and damage to a lone record is a
+        // torn tail rather than damage in the middle. More records behind it are what make
+        // this the case where writers were told their writes had happened.
+        Path log = dir.resolve("segment_0.wal");
+        appendRecords(log, 4);
+        corruptTheFirstRecord(log);
+        byte[] before = Files.readAllBytes(log);
+        Path quarantine = tempDir.resolve("q");
+
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        int exitCode;
+        try (PrintStream stream = new PrintStream(sink, true, StandardCharsets.UTF_8)) {
+            exitCode = ExcaliburFsck.run(
+                new String[] {dir.toString(), "--repair", "--quarantine-dir=" + quarantine},
+                stream, stream);
+        }
+        String report = sink.toString(StandardCharsets.UTF_8);
+
+        assertThat(exitCode).as("damage was found").isEqualTo(1);
+        assertThat(Files.readAllBytes(log))
+            .as("the log must be byte for byte what it was")
+            .isEqualTo(before);
+        assertThat(Files.exists(quarantine.resolve("segment_0.wal")))
+            .as("a log damaged in the middle is not moved aside")
+            .isFalse();
+        assertThat(report)
+            .as("the operator has to be told this is theirs to decide, and why")
+            .contains("fsynced and acknowledged")
+            .doesNotContain("can be rebuilt by reindexing");
+    }
+
+    @Test
     void trimmingIsSkippedWhenTheTearIsNoLongerThere(@TempDir Path dir) throws IOException {
         Path log = writtenLog(dir, 4);
 
@@ -145,6 +184,22 @@ class WriteAheadLogCheckTest {
             }
         }
         return log;
+    }
+
+    /**
+     * Appends more records to a log that already holds some, through the log's own writer.
+     *
+     * @param log     The log file
+     * @param records How many entries to add
+     * @throws IOException if it cannot be written
+     */
+    private static void appendRecords(Path log, int records) throws IOException {
+        try (WriteLog writeLog = new WriteLog(log)) {
+            for (int i = 0; i < records; i++) {
+                writeLog.appendPut(("appended-" + i).getBytes(StandardCharsets.UTF_8),
+                    ("appended-value-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+        }
     }
 
     /**

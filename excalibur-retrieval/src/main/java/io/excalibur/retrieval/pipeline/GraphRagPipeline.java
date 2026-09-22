@@ -403,8 +403,7 @@ public final class GraphRagPipeline {
     private static int[] bothDirections(int[] relations) {
         int[] selectors = new int[relations.length * 2];
         for (int i = 0; i < relations.length; i++) {
-            selectors[2 * i] = RelationSelector.forward(relations[i]);
-            selectors[2 * i + 1] = RelationSelector.reverse(relations[i]);
+            System.arraycopy(RelationSelector.both(relations[i]), 0, selectors, 2 * i, 2);
         }
         return selectors;
     }

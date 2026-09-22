@@ -13,6 +13,7 @@ import io.excalibur.graph.temporal.TemporalFilter;
 import io.excalibur.core.trace.Stage;
 import io.excalibur.planner.ConversationContext;
 import io.excalibur.planner.Grammar;
+import io.excalibur.planner.QueryPlan;
 import io.excalibur.retrieval.pipeline.GraphRagPipeline;
 import io.excalibur.retrieval.pipeline.GraphRagResult;
 
@@ -364,6 +365,42 @@ public class GraphQueryEndpoint implements HttpHandler {
             : java.time.LocalDate.ofEpochDay(asOf.asOfDays()).toString();
     }
 
+    /**
+     * Reports the instant the graph was actually walked at, and where that instant came from.
+     *
+     * <p>Every walk happens at one: the caller's, the one the classifier read out of the
+     * question's date words, or today when neither named one. Reporting only the first left a
+     * caller who asked "who reported the Frankfurt outage in 2019" unable to tell whether the
+     * classifier picked up the year or answered as of today - the same failure the 400 on an
+     * unparseable {@code as_of} exists to prevent, arriving by a different route.
+     *
+     * <p>{@code as_of_source} is what keeps the echo from over-claiming. An instant nobody asked
+     * for is reported as {@code question} or {@code default}, never bare, so a client can tell an
+     * honoured request from an inference and act on the difference.
+     *
+     * <p>Absent on both fields when no plan was produced: {@code needs_input} stops before the
+     * traversal, so there is no instant to report rather than one worth defaulting.</p>
+     *
+     * @param json      the response being built
+     * @param result    what the pipeline produced, carrying the plan the walk actually used
+     * @param requested the caller's instant, or null when the request carried none
+     */
+    private static void appendAsOf(StringBuilder json, GraphRagResult result,
+                                   TemporalFilter requested) {
+        var plan = result.plan();
+        if (plan.isEmpty()) {
+            return;
+        }
+        TemporalFilter used = plan.get() instanceof QueryPlan.Temporal temporal
+            ? temporal.asOf()
+            : TemporalFilter.now();
+        String source = requested != null ? "request"
+            : plan.get() instanceof QueryPlan.Temporal ? "question"
+            : "default";
+        json.append(",\"as_of\":").append(quoted(textOf(used)))
+            .append(",\"as_of_source\":").append(quoted(source));
+    }
+
     private String render(GraphRagResult result, QueryTrace trace, TemporalFilter asOf) {
         StringBuilder json = new StringBuilder("{");
 
@@ -399,11 +436,7 @@ public class GraphQueryEndpoint implements HttpHandler {
         json.append(",\"plan\":").append(result.plan()
             .map(plan -> quoted(plan.shape().getClass().getSimpleName().toLowerCase(Locale.ROOT)))
             .orElse("null"));
-        // Only when the caller named one. Echoing the instant a node happened to answer at
-        // when nobody asked for one would read as a promise that the value was honoured.
-        if (asOf != null) {
-            json.append(",\"as_of\":").append(quoted(textOf(asOf)));
-        }
+        appendAsOf(json, result, asOf);
         json.append(",\"timings_ms\":{");
         boolean first = true;
         for (Stage stage : Stage.values()) {

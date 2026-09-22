@@ -14,9 +14,10 @@ excalibur.ingest.document-atomicity-timeout-ms=2000
 # Whether a document's chunks become visible together. Leave it on: off, a query can match half
 # a document while the rest is still being written, which is a wrong answer rather than a slow one.
 excalibur.ingest.document-atomicity=true
-# How often a registered source is re-crawled on its own. One hour. Needs an embedding endpoint:
-# a re-crawl re-embeds what it rewrites, so on a node without one the sweep fires and records a
-# failed run, and the corpus stays as it was first crawled.
+# How often a registered source is re-crawled on its own. One hour. A node with no embedding
+# endpoint re-crawls too: it re-chunks what changed and re-indexes it lexically, and reports the
+# run as `indexing` rather than `embedding`. Only the vectors are missing, which is one signal of
+# several rather than the precondition for re-crawling at all.
 excalibur.ingest.reindex-interval-ms=3600000
 
 # How a document is split before it is indexed. The target is what one chunk aims for and the

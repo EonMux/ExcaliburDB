@@ -1799,6 +1799,7 @@ curl -i http://localhost:8080/health/ready
 | `indexer` | the index orchestrator is not running | A dead integration worker: the queue grows while coverage stays `1.0000` |
 | `disk` | free volume space is below `excalibur.health.min-free-disk-ratio` (default `0.05`) | A node that can no longer write the replacement segment a compaction or a rolling reindex produces |
 | `coverage` | `coverage < excalibur.health.readiness-threshold` | Segments stranded in a state no query reads |
+| `unreadable` | this node's own state could not be read at all | A node too broken to answer the question, reported as `503` rather than `500` — a probe reads a `500` from a readiness route as "the probe is broken" and keeps sending traffic. It is the only label that appears alone, without the measurements beside it |
 
 Use it as the readiness probe and `/health` as the liveness probe:
 
@@ -2276,10 +2277,10 @@ byte, so every action is reversible by hand. What it refuses to attempt matters 
 |---|---|
 | A damaged `catalog.dat` | Segment files are rediscovered on start-up, but lifecycle state, integrated offsets, source ids and epochs live only there. A node that starts without them looks like a first start |
 | A damaged `routing.dir`, or a slot pointing at a missing segment | Which hash slot belongs to which segment after a split is not derivable from file names. That is why the directory is written down |
-| A write-ahead log damaged in the middle | The records behind the damage were fsynced and acknowledged. Trimming past them would destroy committed writes |
+| A write-ahead log damaged in the middle | The records behind the damage were fsynced and acknowledged. Trimming past them would destroy committed writes, and so would moving the file aside — nothing rebuilds a log the way a reindex rebuilds an index |
 | Anything `UNREADABLE` | A device or permission problem, where nothing is known about the contents |
 
-Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong.
+Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself failed — which says nothing about the directory and must not be read as `0`.
 
 ---
 
@@ -2389,8 +2390,10 @@ watches only `file:` and `http:` URLs, and a `jar:` URL is not one.
 You can embed ExcaliburDB directly in a JVM application.
 
 **Nothing is on Maven Central.** `./gradlew publishToMavenLocal` installs all sixteen library
-modules into `~/.m2`, so a coordinate dependency resolves there; `excalibur-bench` and
-`excalibur-integration` are not published, being a benchmark harness and a test module.
+modules into `~/.m2`, so a coordinate dependency resolves there. The other five are not libraries:
+`excalibur-bench` is a benchmark harness, `excalibur-integration` and `excalibur-test-bootstrap`
+are test modules, and `excalibur-fsck` and `excalibur-backup` are commands rather than something
+to depend on.
 
 ```bash
 ./gradlew publishToMavenLocal
