@@ -1,0 +1,71 @@
+# What never belongs in the build context.
+#
+# The build stage runs Gradle inside the image, so the context is the source tree and nothing
+# that a previous build, a running node or an IDE left beside it. Keeping those out is not only
+# about upload size: build/ holds jars compiled against another JDK, data/ holds a live engine's
+# segments and write-ahead logs, and /excalibur.properties is the gitignored working copy that
+# may carry a real EXCALIBUR_LLM_API_KEY.
+
+# Build outputs. Anchored the way .gitignore anchors them: a bare "build" would also match a
+# Java package named build, which this repository has.
+/build/
+*/build/
+**/out/
+**/target/
+*.class
+*.war
+
+# Gradle state. The wrapper jar and its properties are required by the build stage and must
+# survive the exclusion above them.
+.gradle/
+gradle/wrapper/dists/
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# Version control and CI metadata.
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Engine runtime state: segments, write-ahead logs, catalogs, per-segment index files.
+data/
+*.db
+*.dat
+*.wal
+*.idx
+*.csr
+*.hnsw
+*.lsh
+*.hprof
+
+# Local configuration. The working copy may hold a real API key. Anchored, so the packaged
+# default at excalibur-api/src/main/resources/excalibur.properties - which the node falls back
+# to from the classpath - is still copied in. The template beside it is not excluded:
+# ConfigKeyInventoryTest reads excalibur.properties.example from the repository root, so a
+# context without it cannot run this module's tests.
+/excalibur.properties
+
+# IDE and editor state.
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+*.swp
+*.swo
+*~
+
+# Logs, benchmark output and scratch.
+*.log
+**/jmh-results/
+**/benchmark-results/
+tmp/
+temp/
+*.tmp
+
+# Documentation and the image's own inputs: none of it is read by the build.
+*.md
+LICENSE
+Dockerfile
+.dockerignore
