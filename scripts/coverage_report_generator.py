@@ -24,13 +24,23 @@ from xml.etree import ElementTree as ET
 # Coverage threshold (80% minimum per project constraint)
 COVERAGE_THRESHOLD = 0.80
 
-# Target modules for coverage reporting
-TARGET_MODULES = [
-    "excalibur-core",
-    "excalibur-store",
-    "excalibur-filter",
-    "excalibur-vector"
-]
+# Where a module leaves the report this reads, relative to the module directory.
+REPORT_PATH = "build/reports/jacoco/test/jacocoTestReport.xml"
+
+
+def target_modules(project_root):
+    """The modules that carry a JaCoCo report, discovered rather than listed.
+
+    This used to be a literal naming four of the twenty-one modules, so the summary
+    described a fifth of the repository while presenting itself as the project's number.
+    A directory counts as a module because it holds a report, which is also what makes a
+    module whose tests have not run absent rather than reported as zero coverage.
+    """
+    return sorted(
+        directory.name
+        for directory in project_root.iterdir()
+        if directory.is_dir() and (directory / REPORT_PATH).exists()
+    )
 
 
 class CoverageData:
@@ -563,8 +573,8 @@ def main():
 
     # Parse coverage data from each module
     coverages = []
-    for module in TARGET_MODULES:
-        xml_path = project_root / module / "build/reports/jacoco/test/jacocoTestReport.xml"
+    for module in target_modules(project_root):
+        xml_path = project_root / module / REPORT_PATH
 
         if xml_path.exists():
             coverage = parse_jacoco_xml(xml_path)

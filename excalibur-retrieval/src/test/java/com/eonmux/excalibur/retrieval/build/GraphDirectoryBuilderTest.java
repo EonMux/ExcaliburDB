@@ -1,0 +1,315 @@
+package com.eonmux.excalibur.retrieval.build;
+
+import com.eonmux.excalibur.graph.provenance.Provenance;
+import com.eonmux.excalibur.graph.provenance.SourceType;
+import com.eonmux.excalibur.graph.staging.ExtractedTriple;
+import com.eonmux.excalibur.graph.staging.GraphBuilder;
+import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.graph.store.MappedEdgeStore;
+import com.eonmux.excalibur.graph.temporal.SupersessionPolicy;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * Staged facts becoming a graph the read side can open.
+ *
+ * <p>This is the half of the system that did not exist: the edge store, the dictionaries and the
+ * two Lucene indexes were all read by {@code GraphRagFactory} and produced by nothing, so
+ * {@code /v1/graph/query} could only answer from artifacts built elsewhere.</p>
+ */
+@DisplayName("Graph directory build")
+class GraphDirectoryBuilderTest {
+
+    private static final double RAM_BUFFER_MB = 4.0;
+
+    private static Provenance from(long document) {
+        return Provenance.of(SourceType.DOCUMENT, document, 0.9, 1);
+    }
+
+    private static void stage(GraphStagingStore staging) throws IOException {
+        staging.append(ExtractedTriple.alwaysValid(
+            "Ada Lovelace", "collaborated_with", "Charles Babbage", from(1)));
+        staging.append(ExtractedTriple.alwaysValid(
+            "Charles Babbage", "designed", "Analytical Engine", from(1)));
+        staging.append(ExtractedTriple.alwaysValid(
+            "Ada Lovelace", "wrote", "Note G", from(2)));
+
+        staging.appendEntityText(staging.entityIdOf("Ada Lovelace"),
+            "Ada Lovelace was a mathematician who wrote the first published algorithm.");
+        staging.appendEntityText(staging.entityIdOf("Charles Babbage"),
+            "Charles Babbage designed the Analytical Engine.");
+    }
+
+    @Test
+    @DisplayName("a built directory holds everything the read side opens")
+    void aBuiltDirectoryIsComplete(@TempDir Path tempDir) throws IOException {
+        Path target = tempDir.resolve("graph");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
+            stage(staging);
+
+            GraphDirectoryBuilder.BuildResult result = GraphDirectoryBuilder.build(
+                staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+
+            assertThat(result.published()).isTrue();
+            assertThat(result.edges()).isEqualTo(3);
+            assertThat(result.entities()).isEqualTo(4);
+            assertThat(result.relations()).isEqualTo(3);
+        }
+
+        // Exactly what GraphRagFactory.open looks for.
+        assertThat(target.resolve("edgestore.meta")).exists();
+        assertThat(target.resolve("edges_fwd.csr")).exists();
+        assertThat(target.resolve("offsets_rev.idx")).exists();
+        assertThat(target.resolve("entities.idx")).exists();
+        assertThat(target.resolve("entities.dat")).exists();
+        assertThat(target.resolve("relations.idx")).exists();
+        assertThat(target.resolve("documents")).isDirectory();
+        assertThat(target.resolve("labels")).isDirectory();
+    }
+
+    @Test
+    @DisplayName("the built store holds the facts that were staged")
+    void theStoreHoldsTheFacts(@TempDir Path tempDir) throws IOException {
+        Path target = tempDir.resolve("graph");
+
+        int ada;
+        int babbage;
+        int collaboratedWith;
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
+            stage(staging);
+            ada = staging.entityIdOf("Ada Lovelace");
+            babbage = staging.entityIdOf("Charles Babbage");
+            collaboratedWith = staging.relationIdOf("collaborated_with");
+            GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+        }
+
+        try (MappedEdgeStore store = MappedEdgeStore.open(target)) {
+            assertThat(store.edgeCount()).isEqualTo(3);
+            assertThat(store.neighbors(ada, null)).contains(babbage);
+
+            // The reverse index is mandatory, and a reverse selector is how a caller asks for it:
+            // an unfiltered walk is forward-only.
+            assertThat(store.neighbors(babbage, new int[] {
+                com.eonmux.excalibur.graph.store.RelationSelector.reverse(collaboratedWith) }))
+                .contains(ada);
+        }
+    }
+
+    @Test
+    @DisplayName("entity ids survive a rebuild")
+    void entityIdsSurviveARebuild(@TempDir Path tempDir) throws IOException {
+        Path target = tempDir.resolve("graph");
+        Path stagingDir = tempDir.resolve("staging");
+
+        int adaBefore;
+        try (GraphStagingStore staging = GraphStagingStore.open(stagingDir)) {
+            stage(staging);
+            adaBefore = staging.entityIdOf("Ada Lovelace");
+            GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+        }
+
+        // Reopened staging, a further fact, and a second build. The Lucene indexes store entity
+        // ids; renumbering them on a rebuild would point every one of those documents at a
+        // different entity, silently, because an integer is always a valid integer.
+        try (GraphStagingStore staging = GraphStagingStore.open(stagingDir)) {
+            assertThat(staging.entityIdOf("Ada Lovelace")).isEqualTo(adaBefore);
+            staging.append(ExtractedTriple.alwaysValid(
+                "Ada Lovelace", "lived_in", "London", from(3)));
+
+            GraphDirectoryBuilder.BuildResult result = GraphDirectoryBuilder.build(
+                staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+
+            assertThat(result.edges()).isEqualTo(4);
+            assertThat(staging.entityIdOf("Ada Lovelace")).isEqualTo(adaBefore);
+        }
+    }
+
+    @Test
+    @DisplayName("a build from nothing leaves the served graph alone")
+    void anEmptyBuildLeavesTheGraphAlone(@TempDir Path tempDir) throws IOException {
+        Path target = tempDir.resolve("graph");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
+            stage(staging);
+            GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+        }
+        long edgesBefore;
+        try (MappedEdgeStore store = MappedEdgeStore.open(target)) {
+            edgesBefore = store.edgeCount();
+        }
+
+        // A second staging directory with nothing in it. Replacing a served graph with an empty
+        // one would turn every question into a refusal.
+        try (GraphStagingStore empty = GraphStagingStore.open(tempDir.resolve("empty"))) {
+            GraphDirectoryBuilder.BuildResult result =
+                GraphDirectoryBuilder.build(empty, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+            assertThat(result.published()).isFalse();
+        }
+
+        try (MappedEdgeStore store = MappedEdgeStore.open(target)) {
+            assertThat(store.edgeCount()).isEqualTo(edgesBefore);
+        }
+    }
+
+    @Test
+    @DisplayName("a build leaves no scratch directory behind")
+    void aBuildCleansUpAfterItself(@TempDir Path tempDir) throws IOException {
+        Path target = tempDir.resolve("graph");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
+            stage(staging);
+            GraphDirectoryBuilder.build(staging, target, SupersessionPolicy.NONE, RAM_BUFFER_MB);
+        }
+
+        assertThat(GraphBuilder.scratchFor(target)).doesNotExist();
+        assertThat(target.resolveSibling(target.getFileName() + GraphBuilder.PREVIOUS_SUFFIX))
+            .doesNotExist();
+    }
+
+    @Test
+    @DisplayName("staged facts survive a restart of the staging store")
+    void stagedFactsSurviveARestart(@TempDir Path tempDir) throws IOException {
+        Path stagingDir = tempDir.resolve("staging");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(stagingDir)) {
+            stage(staging);
+            assertThat(staging.stagedCount()).isEqualTo(3);
+        }
+
+        try (GraphStagingStore reopened = GraphStagingStore.open(stagingDir)) {
+            assertThat(reopened.stagedCount()).isEqualTo(3);
+            assertThat(reopened.entityCount()).isEqualTo(4);
+            assertThat(reopened.relationCount()).isEqualTo(3);
+
+            // And the facts themselves replay, not merely their count.
+            List<String> replayed = new java.util.ArrayList<>();
+            reopened.forEach((s, r, o, from, to, provenance) -> replayed.add(s + "-" + r + "->" + o));
+            assertThat(replayed).hasSize(3);
+        }
+    }
+
+    @Test
+    @DisplayName("a supersedable relation closes its predecessor")
+    void supersessionClosesThePreviousValue(@TempDir Path tempDir) throws IOException {
+        Path target = tempDir.resolve("graph");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(tempDir.resolve("staging"))) {
+            staging.append(new ExtractedTriple("Ada Lovelace", "employer", "Acme",
+                0, com.eonmux.excalibur.graph.temporal.TemporalFilter.OPEN, from(1)));
+            staging.append(new ExtractedTriple("Ada Lovelace", "employer", "Beta",
+                100, com.eonmux.excalibur.graph.temporal.TemporalFilter.OPEN, from(2)));
+
+            SupersessionPolicy single = GraphBuilder.singleValued(staging, List.of("employer"));
+            GraphDirectoryBuilder.build(staging, target, single, RAM_BUFFER_MB);
+        }
+
+        try (MappedEdgeStore store = MappedEdgeStore.open(target)) {
+            // Both edges are stored; the earlier one is closed rather than dropped, so a query
+            // about the past still answers and a query about now returns one employer.
+            assertThat(store.edgeCount()).isEqualTo(2);
+
+            long[] now = store.expand(new long[] { 0 }, 1, null,
+                com.eonmux.excalibur.graph.temporal.TemporalFilter.asOf(
+                    java.time.LocalDate.ofEpochDay(200)));
+            assertThat(now).hasSizeGreaterThanOrEqualTo(1);
+        }
+    }
+
+    @Test
+    @DisplayName("a corrupt tail costs only the facts after it")
+    void aCorruptTailIsTolerated(@TempDir Path tempDir) throws IOException {
+        Path stagingDir = tempDir.resolve("staging");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(stagingDir)) {
+            stage(staging);
+        }
+
+        // A process killed mid-append leaves a partial record. The facts before it are still the
+        // ids every existing artifact refers to, so replay keeps them rather than refusing.
+        Path log = stagingDir.resolve(GraphStagingStore.TRIPLE_LOG);
+        byte[] bytes = Files.readAllBytes(log);
+        byte[] torn = new byte[bytes.length - 7];
+        System.arraycopy(bytes, 0, torn, 0, torn.length);
+        Files.write(log, torn);
+
+        try (GraphStagingStore reopened = GraphStagingStore.open(stagingDir)) {
+            List<String> replayed = new java.util.ArrayList<>();
+            reopened.forEach((s, r, o, from, to, provenance) -> replayed.add(s + "->" + o));
+            assertThat(replayed).hasSize(2);
+        }
+    }
+
+    @Test
+    @DisplayName("facts staged after a torn tail are still readable")
+    void appendsAfterATornTailAreNotLost(@TempDir Path tempDir) throws IOException {
+        Path stagingDir = tempDir.resolve("staging");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(stagingDir)) {
+            stage(staging);
+        }
+
+        // A process killed mid-append. Reopening must trim the partial record: appending after it
+        // would put every later fact behind a record replay stops at, present on disk and
+        // invisible to every build from then on.
+        Path log = stagingDir.resolve(GraphStagingStore.TRIPLE_LOG);
+        byte[] bytes = Files.readAllBytes(log);
+        byte[] torn = new byte[bytes.length - 7];
+        System.arraycopy(bytes, 0, torn, 0, torn.length);
+        Files.write(log, torn);
+
+        try (GraphStagingStore reopened = GraphStagingStore.open(stagingDir)) {
+            reopened.append(ExtractedTriple.alwaysValid(
+                "Ada Lovelace", "lived_in", "London", from(9)));
+        }
+
+        try (GraphStagingStore reread = GraphStagingStore.open(stagingDir)) {
+            List<String> replayed = new java.util.ArrayList<>();
+            reread.forEach((s, r, o, from, to, provenance) -> replayed.add(s + "->" + o));
+            assertThat(replayed)
+                .as("the two intact facts plus the one appended after the trim")
+                .hasSize(3);
+        }
+    }
+
+    @Test
+    @DisplayName("a label interned after a torn tail keeps its id across a restart")
+    void entityIdsSurviveATornLabelFile(@TempDir Path tempDir) throws IOException {
+        Path stagingDir = tempDir.resolve("staging");
+
+        try (GraphStagingStore staging = GraphStagingStore.open(stagingDir)) {
+            stage(staging);
+        }
+
+        // Half a label record at the end, as a process killed mid-append leaves.
+        Path labels = stagingDir.resolve(GraphStagingStore.ENTITY_LABELS);
+        byte[] bytes = Files.readAllBytes(labels);
+        Files.write(labels, java.util.Arrays.copyOf(bytes, bytes.length - 3));
+
+        int londonFirst;
+        try (GraphStagingStore reopened = GraphStagingStore.open(stagingDir)) {
+            londonFirst = reopened.entityIdOf("London");
+        }
+
+        // The discriminator: intern a different label first on the next open. If London's
+        // assignment was appended behind an un-trimmed torn record, replay cannot see it, Turin
+        // takes the id London was given, and London is handed a different one - an entity id that
+        // moved, which every artifact keyed by it now resolves wrongly.
+        try (GraphStagingStore reread = GraphStagingStore.open(stagingDir)) {
+            int turin = reread.entityIdOf("Turin");
+            assertThat(turin).isNotEqualTo(londonFirst);
+            assertThat(reread.entityIdOf("London"))
+                .as("the id London was given survives another restart")
+                .isEqualTo(londonFirst);
+        }
+    }
+}

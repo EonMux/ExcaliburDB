@@ -41,7 +41,7 @@ val runtimeJvmFlags = listOf(
 )
 
 application {
-    mainClass.set("excalibur.backup.cli.BackupCli")
+    mainClass.set("com.eonmux.excalibur.backup.cli.BackupCli")
     applicationDefaultJvmArgs = runtimeJvmFlags
 }
 

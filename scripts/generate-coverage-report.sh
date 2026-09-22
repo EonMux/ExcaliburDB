@@ -97,9 +97,16 @@ for module in "${MODULES[@]}"; do
 
     # Run tests with coverage
     echo -e "${YELLOW}Running tests and generating coverage data...${NC}"
-    ./gradlew ":$module:test" ":$module:jacocoTestReport" --no-daemon 2>&1 | grep -E "(BUILD|FAIL|PASS|test)" || true
+    # PIPESTATUS, not $?: the pipeline ends in grep, and the `|| true` that keeps `set -e` from
+    # killing the loop made $? unconditionally 0 - so every module, including one whose tests
+    # failed outright, was reported with a green tick.
+    set +e
+    ./gradlew ":$module:test" ":$module:jacocoTestReport" --no-daemon 2>&1 \
+        | grep -E "(BUILD|FAIL|PASS|test)"
+    GRADLE_STATUS=${PIPESTATUS[0]}
+    set -e
 
-    if [ $? -eq 0 ]; then
+    if [ "$GRADLE_STATUS" -eq 0 ]; then
         echo -e "${GREEN}✓ Coverage report generated for $module${NC}"
 
         # Check if report exists
@@ -145,10 +152,10 @@ echo -e "${BLUE}─────────────────────�
 SUMMARY_FILE="$REPORT_DIR/COVERAGE_SUMMARY.html"
 
 # Try Java-based generator first
-if [ -f "$PROJECT_ROOT/excalibur-core/build/classes/java/main/io/excalibur/core/report/CoverageReportGenerator.class" ]; then
+if [ -f "$PROJECT_ROOT/excalibur-core/build/classes/java/main/com/eonmux/excalibur/core/report/CoverageReportGenerator.class" ]; then
     echo -e "${YELLOW}Generating summary using Java report generator...${NC}"
     java -cp "$PROJECT_ROOT/excalibur-core/build/classes/java/main" \
-         io.excalibur.core.report.CoverageReportGenerator \
+         com.eonmux.excalibur.core.report.CoverageReportGenerator \
          "$PROJECT_ROOT" "$SUMMARY_FILE" 2>/dev/null || {
         echo -e "${YELLOW}Java generator failed, falling back to Python...${NC}"
     }

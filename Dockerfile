@@ -30,7 +30,7 @@
 # Configuration: excalibur.properties is read from the working directory, then from the
 # classpath (the packaged default in excalibur-api/src/main/resources). Any setting can be
 # supplied from the environment instead - EXCALIBUR_<SECTION>_<NAME>, upper-cased with
-# hyphens as underscores, overrides the file (io.excalibur.config.EnvOverrides). No secret is
+# hyphens as underscores, overrides the file (com.eonmux.excalibur.config.EnvOverrides). No secret is
 # baked into this image: pass excalibur.llm.api-key as EXCALIBUR_LLM_API_KEY at run time.
 #
 # Reachability: the API binds 127.0.0.1 by default, and binding anything else requires a bearer

@@ -49,12 +49,47 @@ jobs:
       - run: ./excalibur-fsck/build/install/excalibur-fsck/bin/excalibur-fsck --help
       - run: ./excalibur-backup/build/install/excalibur-backup/bin/excalibur-backup --help
 
+      # The command USAGE.md gives an embedder, and the only thing that checks it. A module can
+      # apply maven-publish and still produce a publication Maven cannot express - two artifacts
+      # of one extension and classifier, a declared publication with nothing in it - and none of
+      # that is visible from `build`, which never asks for a POM to be written.
+      - run: ./gradlew publishToMavenLocal
+
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
           path: '**/build/reports/tests/test'
+          retention-days: 7
+
+  gates:
+    name: Slow and benchmark gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # `test` excludes the `slow` and `benchmark` tags, so the assertions behind this project's
+      # stated guarantees - the cuckoo filter's false positive rate at a million items, HNSW
+      # recall against brute force, the point-lookup regression floor - run here or nowhere. A
+      # job of its own rather than a step on the build: it takes minutes, and a build that went
+      # red for a timing gate would say nothing about whether the code compiles and passes.
+      - run: ./gradlew benchmarkTest
+
+      - name: Upload gate reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-reports
+          path: '**/build/reports/tests/benchmarkTest'
           retention-days: 7
 
   image:

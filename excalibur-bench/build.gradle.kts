@@ -6,7 +6,7 @@ plugins {
 
 
 application {
-    mainClass.set("excalibur.bench.BenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.BenchmarkRunner")
     applicationDefaultJvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -78,56 +78,12 @@ tasks.test {
     jvmArgs("--add-modules=jdk.incubator.vector")
 }
 
-// Runs the throughput and FP-rate gates that the root build excludes from `test` via
-// excludeTags("slow", "benchmark"). Without this task those tests never execute at all,
-// so the targets they assert are never enforced anywhere.
-tasks.register<Test>("benchmarkTest") {
-    group = "verification"
-    description = "Runs the tag-excluded benchmark gate tests (slow: takes minutes)"
-    testClassesDirs = sourceSets["test"].output.classesDirs
-    classpath = sourceSets["test"].runtimeClasspath
-    useJUnitPlatform {
-        // The root build applies excludeTags("slow", "benchmark") to every Test task.
-        // Exclusion beats inclusion, so it has to be cleared here or this task would
-        // select nothing at all - which is how these gates came to never run.
-        excludeTags = LinkedHashSet()
-        includeTags("slow", "benchmark")
-    }
-    testLogging {
-        events("passed", "skipped", "failed")
-        showStandardStreams = true
-    }
-    jvmArgs("--enable-preview")
-    jvmArgs("--enable-native-access=ALL-UNNAMED")
-    jvmArgs("--add-modules=jdk.incubator.vector")
-    jvmArgs("-Xmx2g")
-
-    // No coverage agent. The root build applies jacoco to every subproject, and the plugin
-    // attaches its agent to every Test task it finds - including this one, which is the one
-    // task in the build whose entire output is a measurement of how fast the code runs.
-    //
-    // It is not a uniform tax that a target could simply be set below. JaCoCo counts through a
-    // boolean[] of probes per class, shared by every thread executing that class, so a hot loop
-    // run on twenty-four threads turns into twenty-four cores writing the same few cache lines.
-    // Measured on this benchmark's own workload: 6.98 M ops/sec single-threaded and 37.40 M on
-    // twenty-four threads without the agent, against 5.61 M and 1.31 M with it. The scaling
-    // gate therefore read 0.23x - it was measuring the instrumentation contending with itself,
-    // and would have gone on reporting a concurrency defect in the storage engine that the
-    // engine does not have.
-    extensions.configure<JacocoTaskExtension> {
-        isEnabled = false
-    }
-
-    // Benchmarks measure a moving system; never reuse a previous run's verdict.
-    outputs.upToDateWhen { false }
-}
-
 // Task to run the JMH benchmark for Segment
 tasks.register<JavaExec>("runBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for Segment lookups"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.BenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.BenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -141,7 +97,7 @@ tasks.register<JavaExec>("runCuckooFilterBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for Cuckoo Filter lookup throughput at various load factors"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.CuckooFilterBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.CuckooFilterBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -155,7 +111,7 @@ tasks.register<JavaExec>("runCuckooFilterMemoryMappedBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for Cuckoo Filter memory-mapped read/write throughput"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.CuckooFilterMemoryMappedBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.CuckooFilterMemoryMappedBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -169,7 +125,7 @@ tasks.register<JavaExec>("runCuckooFilterDeleteBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for Cuckoo Filter delete throughput at various load factors"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.CuckooFilterDeleteBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.CuckooFilterDeleteBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -183,7 +139,7 @@ tasks.register<JavaExec>("runCuckooFilterFPRateBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for Cuckoo Filter actual false positive rate measurement (target: <=0.1%)"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.CuckooFilterFPRateBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.CuckooFilterFPRateBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -197,7 +153,7 @@ tasks.register<JavaExec>("runDistanceBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for Vector Distance functions (Cosine, L2, Inner Product)"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.DistanceBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.DistanceBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -212,7 +168,7 @@ tasks.register<JavaExec>("runHnswRecallBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for HNSW recall@10 validation (target: >=99%)"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.HnswRecallBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.HnswRecallBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -226,7 +182,7 @@ tasks.register<JavaExec>("runMappedFileBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for MappedFile read/write throughput (Phase 1)"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.MappedFileBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.MappedFileBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -240,7 +196,7 @@ tasks.register<JavaExec>("runHashBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for XxHash64 hash function speed"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.HashBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.HashBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -254,7 +210,7 @@ tasks.register<JavaExec>("runTailScanBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for tail scan brute-force throughput at varying tail sizes"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.TailScanBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.TailScanBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -268,7 +224,7 @@ tasks.register<JavaExec>("runEndToEndQueryBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for end-to-end query latency p50/p99"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.EndToEndQueryBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.EndToEndQueryBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -282,7 +238,7 @@ tasks.register<JavaExec>("runVectorLayoutBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for Vector Layout operations (SoA vs AoS)"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.VectorLayoutBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.VectorLayoutBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -297,7 +253,7 @@ tasks.register<JavaExec>("runPointLookupBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark for point lookup throughput (target: >=1B ops/sec)"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.PointLookupBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.PointLookupBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -312,7 +268,7 @@ tasks.register<JavaExec>("runDistanceVectorApiBenchmark") {
     group = "benchmark"
     description = "Runs the JMH benchmark comparing scalar vs Vector API distance computation"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.DistanceVectorApiBenchmarkRunner")
+    mainClass.set("com.eonmux.excalibur.bench.DistanceVectorApiBenchmarkRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -327,7 +283,7 @@ tasks.register<JavaExec>("runBenchmarksWithCapture") {
     group = "benchmark"
     description = "Runs all benchmarks and captures results in JSON, Markdown, CSV, and text formats"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.BenchmarkResultsCaptureRunner")
+    mainClass.set("com.eonmux.excalibur.bench.BenchmarkResultsCaptureRunner")
     jvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
@@ -361,7 +317,7 @@ tasks.register<JavaExec>("runGraphCalibration") {
     group = "verification"
     description = "Fits the graph route's abstention thresholds and confidence temperature against a judged question set"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.calibration.GraphCalibrationRunner")
+    mainClass.set("com.eonmux.excalibur.bench.calibration.GraphCalibrationRunner")
     jvmArgs = listOf("--enable-preview", "--enable-native-access=ALL-UNNAMED", "-Xmx4g")
     if (project.hasProperty("calibrationArgs")) {
         args = (project.property("calibrationArgs") as String).split(" ")
@@ -372,7 +328,7 @@ tasks.register<JavaExec>("runRetrievalEvaluation") {
     group = "verification"
     description = "Indexes a corpus on the native (or lucene, or both) engine and scores the retrieval strategies over it, with the index size beside the quality"
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("excalibur.bench.retrieval.CorpusEvaluationRunner")
+    mainClass.set("com.eonmux.excalibur.bench.retrieval.CorpusEvaluationRunner")
     jvmArgs = listOf("--enable-preview", "--enable-native-access=ALL-UNNAMED", "-Xmx6g")
     if (project.hasProperty("evalArgs")) {
         args = (project.property("evalArgs") as String).split(" ")

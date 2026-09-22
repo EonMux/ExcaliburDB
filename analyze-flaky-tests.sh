@@ -86,11 +86,13 @@ echo ""
 echo "Running flaky test analysis..."
 echo ""
 
+# `|| EXIT_CODE=$?` rather than a bare call: `set -e` is on, and a non-zero exit from the
+# analyzer would otherwise end the script here - taking the summary below with it, so the one
+# run that found something is the one run that never says what.
+EXIT_CODE=0
 java --enable-preview --enable-native-access=ALL-UNNAMED \
     -cp "excalibur-test/build/classes/java/main:excalibur-test/build/resources/main" \
-    io.excalibur.test.FlakyTestAnalyzer "$MODULE" "$RUNS" "$VERBOSE"
-
-EXIT_CODE=$?
+    com.eonmux.excalibur.test.FlakyTestAnalyzer "$MODULE" "$RUNS" "$VERBOSE" || EXIT_CODE=$?
 
 echo ""
 echo "============================================================"

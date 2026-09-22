@@ -17,7 +17,7 @@ plugins {
 // through memory mappings, and --add-modules=jdk.incubator.vector because excalibur-vector's
 // classes import it and would fail to link without it.
 application {
-    mainClass.set("excalibur.fsck.ExcaliburFsck")
+    mainClass.set("com.eonmux.excalibur.fsck.ExcaliburFsck")
     applicationName = "excalibur-fsck"
     applicationDefaultJvmArgs = listOf(
         "--enable-preview",
@@ -73,7 +73,7 @@ tasks.withType<Javadoc> {
 tasks.register<JavaExec>("fsck") {
     group = "verification"
     description = "Runs the offline data directory integrity checker"
-    mainClass.set("excalibur.fsck.ExcaliburFsck")
+    mainClass.set("com.eonmux.excalibur.fsck.ExcaliburFsck")
     classpath = sourceSets["main"].runtimeClasspath
     // A meaningful exit code is the point of the tool, so the task must not swallow it.
     isIgnoreExitValue = false

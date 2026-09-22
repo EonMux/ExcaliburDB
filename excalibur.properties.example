@@ -19,6 +19,14 @@ excalibur.ingest.document-atomicity=true
 # run as `indexing` rather than `embedding`. Only the vectors are missing, which is one signal of
 # several rather than the precondition for re-crawling at all.
 excalibur.ingest.reindex-interval-ms=3600000
+# The shortest gap a web crawl leaves between two requests to its host, in milliseconds. 200ms is
+# five a second. A crawl is a sequential walk that makes two requests per page - one to read its
+# links, one to fetch it - so before this existed a host behind a fast link was asked for pages as
+# quickly as it would answer them, up to the ten million a single registration may ask for.
+# A registration's own `crawl_delay_ms` may ask for a longer gap and never a shorter one: the rate
+# a host is asked to bear is the deployment's decision. 0 turns pacing off entirely; the maximum
+# is 60000, and a value outside that range is refused at startup rather than clamped.
+excalibur.ingest.crawl-delay-ms=200
 
 # How a document is split before it is indexed. The target is what one chunk aims for and the
 # overlap is what it repeats from the chunk before it, both counted in tokens. Larger chunks carry

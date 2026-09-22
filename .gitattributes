@@ -1,0 +1,11 @@
+# The two wrapper launchers, each with the line endings its interpreter needs.
+#
+# cmd.exe reads a batch file line by line as it executes it, so a gradlew.bat normalised to LF
+# is a build that fails on Windows for a reason nothing in the output names. The shell script is
+# pinned the other way for the same reason: a clone on a Windows checkout with autocrlf would
+# otherwise hand /bin/sh a file whose first line ends in a carriage return.
+gradlew text eol=lf
+gradlew.bat text eol=crlf
+
+# Binary, so git neither normalises it nor tries to diff it.
+gradle/wrapper/gradle-wrapper.jar binary

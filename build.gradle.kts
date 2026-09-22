@@ -5,7 +5,11 @@ plugins {
     id("com.github.johnrengelman.shadow") version "8.1.1" apply false
 }
 
-group = "io.excalibur"
+// Maven Central namespaces are claimed by domain, and eonmux.com is the one this project can
+// prove. The sources sit under com.eonmux.excalibur; the coordinate stops at com.eonmux because
+// every artifact id already begins with excalibur-, and com.eonmux.excalibur:excalibur-store
+// would say it twice.
+group = "com.eonmux"
 version = "1.0.0-SNAPSHOT"
 
 /** Stated once; every published POM's url and scm entries read from here. */
@@ -28,8 +32,8 @@ subprojects {
     apply(plugin = "jacoco")
 
     // Declared once here rather than per module. Ten modules had drifted to "com.excaliburdb",
-    // which matches no package in the source, so the same build published two different
-    // coordinate namespaces depending on which module you asked for.
+    // so the same build published two different coordinate namespaces depending on which module
+    // you asked for, and USAGE.md's dependency block resolved for some of them and not others.
     group = rootProject.group
     version = rootProject.version
 
@@ -85,6 +89,21 @@ subprojects {
             publications {
                 create<MavenPublication>("mavenJava") {
                     from(components["java"])
+
+                    // The shadow plugin adds its fat jar to the java component as a second
+                    // runtime variant, and excalibur-api gives that jar an empty classifier so
+                    // the launch commands and the Dockerfile can name excalibur.jar. Two
+                    // artifacts of the same extension and classifier is not a publication Maven
+                    // can express, so `publishToMavenLocal` - a documented command - failed on
+                    // that module alone. Dropped rather than renamed: a library consumer wants
+                    // the module's own classes and resolves the rest through its POM, and
+                    // renaming the file would break the commands that name it.
+                    afterEvaluate {
+                        configurations.findByName("shadowRuntimeElements")?.let { shadow ->
+                            (components["java"] as AdhocComponentWithVariants)
+                                .withVariantsFromConfiguration(shadow) { skip() }
+                        }
+                    }
 
                     pom {
                         name.set(project.name)
@@ -217,6 +236,51 @@ subprojects {
         setForkEvery(100)
     }
 
+    // The counterpart to that exclusion, in every module rather than in one.
+    //
+    // `test` excludes the `slow` and `benchmark` tags because those tests take minutes, which
+    // leaves them running nowhere at all unless something asks for them by name. This is that
+    // something. It was registered in excalibur-bench alone, and a Test task only ever runs its
+    // own project's classes, so the tags outside that module -- the Cuckoo filter's false
+    // positive rate at a million items, HNSW recall against brute force -- were assertions about
+    // this system's stated guarantees that no task in the build could execute.
+    tasks.register<Test>("benchmarkTest") {
+        group = "verification"
+        description = "Runs the tag-excluded gate tests in this module (slow: takes minutes)"
+        val testSourceSet = project.the<SourceSetContainer>()["test"]
+        testClassesDirs = testSourceSet.output.classesDirs
+        classpath = testSourceSet.runtimeClasspath
+        useJUnitPlatform {
+            // Exclusion beats inclusion, so the block above has to be cleared here or this task
+            // would select nothing -- which is how these gates came to never run.
+            excludeTags = LinkedHashSet()
+            includeTags("slow", "benchmark")
+        }
+        testLogging {
+            events("passed", "skipped", "failed")
+            showStandardStreams = true
+        }
+
+        // No coverage agent. The root build applies jacoco to every subproject, and the plugin
+        // attaches its agent to every Test task it finds -- including this one, whose entire
+        // output is a measurement of how fast the code runs.
+        //
+        // It is not a uniform tax that a target could simply be set below. JaCoCo counts through
+        // a boolean[] of probes per class, shared by every thread executing that class, so a hot
+        // loop run on twenty-four threads turns into twenty-four cores writing the same few cache
+        // lines. Measured on the point-lookup benchmark's own workload: 6.98 M ops/sec
+        // single-threaded and 37.40 M on twenty-four threads without the agent, against 5.61 M
+        // and 1.31 M with it. The scaling gate therefore read 0.23x - it was measuring the
+        // instrumentation contending with itself, and would have gone on reporting a concurrency
+        // defect in the storage engine that the engine does not have.
+        extensions.configure<JacocoTaskExtension> {
+            isEnabled = false
+        }
+
+        // Benchmarks measure a moving system; never reuse a previous run's verdict.
+        outputs.upToDateWhen { false }
+    }
+
     // Source sets configuration
     sourceSets {
         main {
@@ -342,7 +406,7 @@ tasks.register<JacocoReport>("jacocoAggregateReport") {
     // and a unit test of one would either not run it or not be a unit test. What they used to
     // contain that is ordinary code (the scalar distance kernels, brute-force ground truth and
     // recall, false-positive accumulation, latency percentiles) now lives in
-    // excalibur.bench.kernel, which is counted here and tested directly. Only the measurement
+    // com.eonmux.excalibur.bench.kernel, which is counted here and tested directly. Only the measurement
     // loop is excluded, and only where it cannot be separated from the thing being measured.
     classDirectories.from(covered.map { project ->
         project.fileTree(project.layout.buildDirectory.dir("classes/java/main")) {
@@ -374,15 +438,34 @@ tasks.register<JavaExec>("generateCoverageSummary") {
     classpath = files("excalibur-core/build/classes/java/main")
     classpath = classpath.plus(files("excalibur-core/build/resources/main"))
 
-    mainClass.set("io.excalibur.core.report.CoverageReportGenerator")
+    mainClass.set("com.eonmux.excalibur.core.report.CoverageReportGenerator")
 
+    // The module list comes from the build, for the same reason the aggregate report's does: a
+    // list compiled into the generator named four modules of twenty-one, so `./gradlew coverage`
+    // ran every module's tests and then printed a summary describing a fifth of the repository.
     args(
-        rootProject.projectDir.absolutePath,
-        rootProject.layout.buildDirectory.file("reports/jacoco/COVERAGE_SUMMARY.html").get().asFile.absolutePath
+        listOf(
+            rootProject.projectDir.absolutePath,
+            rootProject.layout.buildDirectory.file("reports/jacoco/COVERAGE_SUMMARY.html")
+                .get().asFile.absolutePath
+        ) + subprojects.map { it.name }.sorted()
     )
 
     // Run after core module is compiled
     dependsOn(":excalibur-core:classes")
+}
+
+// Every module's tag-excluded gates, in one command.
+//
+// Derived from the build rather than listed, for the reason the coverage task below is: a list
+// goes stale the moment a module is added, and a gate run that silently skips a module reports
+// a pass over assertions it never executed.
+tasks.register("benchmarkTest") {
+    group = "verification"
+    description = "Runs every module's slow and benchmark gate tests (takes minutes)"
+    subprojects.map { it.name }.sorted().forEach { projectName ->
+        dependsOn(":${projectName}:benchmarkTest")
+    }
 }
 
 // Per-module reports plus the aggregate. The floors are enforced by `check` as well, so this
@@ -443,9 +526,11 @@ tasks.register<JavaExec>("coverageGaps") {
     classpath = files("excalibur-core/build/classes/java/main")
     classpath = classpath.plus(files("excalibur-core/build/resources/main"))
 
-    mainClass.set("io.excalibur.core.report.CoverageGapAnalyzer")
+    mainClass.set("com.eonmux.excalibur.core.report.CoverageGapAnalyzer")
 
-    args(rootProject.projectDir.absolutePath)
+    // Named rather than discovered, so a module whose tests have not run is reported as a gap
+    // instead of quietly missing from the analysis.
+    args(listOf(rootProject.projectDir.absolutePath) + subprojects.map { it.name }.sorted())
 
     // Run after core module is compiled
     dependsOn(":excalibur-core:classes")

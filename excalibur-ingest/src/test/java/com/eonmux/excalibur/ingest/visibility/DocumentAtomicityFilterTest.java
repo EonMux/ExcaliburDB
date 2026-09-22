@@ -1,0 +1,200 @@
+package com.eonmux.excalibur.ingest.visibility;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.Arrays;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Unit tests for DocumentVisibilityChecker interface and implementations.
+ *
+ * <p>Tests verify that the document-atomic visibility guarantee is enforced:
+ * query results never contain chunks from documents that are not fully visible.</p>
+ *
+ * <p>Note: Tests for DocumentAtomicityFilter with QueryResultItem are in
+ * the query module to avoid circular dependencies.</p>
+ */
+class DocumentAtomicityFilterTest {
+
+    private DocumentVisibilityTracker tracker;
+    private DocumentVisibilityChecker checker;
+
+    @BeforeEach
+    void setUp() {
+        tracker = new DocumentVisibilityTracker();
+        checker = new TrackerAdapter(tracker);
+    }
+
+    @Test
+    void testIsDocumentVisible_nullDocumentId() {
+        assertThrows(NullPointerException.class, () -> checker.isDocumentVisible(null, 0L));
+    }
+
+    @Test
+    void testIsDocumentVisible_visibleDocument() {
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+
+        assertTrue(checker.isDocumentVisible("1", 10L));
+    }
+
+    @Test
+    void testIsDocumentVisible_notYetVisible() {
+        tracker.registerDocument("1", List.of("1:chunk:0"), 10L);
+
+        assertFalse(checker.isDocumentVisible("1", 5L));
+    }
+
+    @Test
+    void testIsDocumentVisible_unregisteredDocument() {
+        assertFalse(checker.isDocumentVisible("999", 10L));
+    }
+
+    @Test
+    void testIsChunkVisible_filtersByVisibility() {
+        tracker.registerDocument("doc1", List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"), 5L);
+
+        assertTrue(checker.isChunkVisible("doc1:chunk:0", 10L));
+        assertTrue(checker.isChunkVisible("doc1:chunk:1", 10L));
+        assertTrue(checker.isChunkVisible("doc1:chunk:2", 10L));
+        assertFalse(checker.isChunkVisible("doc2:chunk:0", 10L));
+    }
+
+    @Test
+    void testFilterPartialDocuments_filtersByVisibility() {
+        tracker.registerDocument("doc1", List.of("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2"), 5L);
+
+        List<String> chunks = Arrays.asList("doc1:chunk:0", "doc1:chunk:1", "doc1:chunk:2", "doc2:chunk:0");
+
+        List<String> filtered = checker.filterPartialDocuments(chunks, 10L);
+
+        assertEquals(3, filtered.size());
+        assertTrue(filtered.contains("doc1:chunk:0"));
+        assertTrue(filtered.contains("doc1:chunk:1"));
+        assertTrue(filtered.contains("doc1:chunk:2"));
+        assertFalse(filtered.contains("doc2:chunk:0"));
+    }
+
+    @Test
+    void testGetVisibleDocuments() {
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 10L);
+        tracker.registerDocument("3", List.of("3:chunk:0"), 15L);
+
+        assertEquals(1, checker.getVisibleDocuments(5L).size());
+        assertEquals(2, checker.getVisibleDocuments(10L).size());
+        assertEquals(3, checker.getVisibleDocuments(20L).size());
+    }
+
+    @Test
+    void testGetCommitEpoch() {
+        tracker.registerDocument("1", List.of("1:chunk:0"), 10L);
+
+        assertEquals(10L, checker.getCommitEpoch("1"));
+        assertEquals(-1L, checker.getCommitEpoch("999"));
+    }
+
+    @Test
+    void testGetChunkCount() {
+        tracker.registerDocument("1", List.of("1:chunk:0", "1:chunk:1"), 5L);
+
+        assertEquals(2, checker.getChunkCount("1"));
+        assertEquals(0, checker.getChunkCount("999"));
+    }
+
+    @Test
+    void testGetDocumentCount() {
+        assertEquals(0, checker.getDocumentCount());
+        
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        assertEquals(1, checker.getDocumentCount());
+        
+        tracker.registerDocument("2", List.of("2:chunk:0"), 10L);
+        assertEquals(2, checker.getDocumentCount());
+    }
+
+    @Test
+    void testEpochIsolation() {
+        tracker.registerDocument("1", List.of("1:chunk:0"), 5L);
+        tracker.registerDocument("2", List.of("2:chunk:0"), 10L);
+
+        List<String> chunks = Arrays.asList("1:chunk:0", "2:chunk:0");
+
+        List<String> atEpoch5 = checker.filterPartialDocuments(chunks, 5L);
+        assertEquals(1, atEpoch5.size());
+        assertTrue(atEpoch5.contains("1:chunk:0"));
+
+        List<String> atEpoch10 = checker.filterPartialDocuments(chunks, 10L);
+        assertEquals(2, atEpoch10.size());
+    }
+
+    @Test
+    void testNoPartialDocumentsVisible() {
+        tracker.registerDocument("1", List.of("1:chunk:0", "1:chunk:1", "1:chunk:2"), 5L);
+
+        long commitEpoch = checker.getCommitEpoch("1");
+
+        List<String> chunks = Arrays.asList("1:chunk:0", "1:chunk:1", "1:chunk:2");
+
+        List<String> atCommit = checker.filterPartialDocuments(chunks, commitEpoch);
+        assertEquals(3, atCommit.size());
+
+        List<String> beforeCommit = checker.filterPartialDocuments(chunks, commitEpoch - 1);
+        assertEquals(0, beforeCommit.size());
+    }
+
+    /**
+     * Adapter to use DocumentVisibilityTracker as DocumentVisibilityChecker.
+     */
+    private static class TrackerAdapter implements DocumentVisibilityChecker {
+        @Override
+        public long currentEpoch() {
+            // A test double with no epoch of its own. Unbounded keeps these tests asserting the
+            // completeness behaviour they were written for, rather than an epoch bound.
+            return Long.MAX_VALUE;
+        }
+
+        private final DocumentVisibilityTracker tracker;
+
+        TrackerAdapter(DocumentVisibilityTracker tracker) {
+            this.tracker = tracker;
+        }
+
+        @Override
+        public boolean isDocumentVisible(String documentId, long queryEpoch) {
+            return tracker.isDocumentFullyVisible(documentId, queryEpoch);
+        }
+
+        @Override
+        public boolean isChunkVisible(String chunkId, long queryEpoch) {
+            return tracker.isChunkVisible(chunkId, queryEpoch);
+        }
+
+        @Override
+        public List<String> filterPartialDocuments(List<String> chunkIds, long queryEpoch) {
+            return tracker.filterPartialDocuments(chunkIds, queryEpoch);
+        }
+
+        @Override
+        public java.util.Set<String> getVisibleDocuments(long queryEpoch) {
+            return tracker.getVisibleDocuments(queryEpoch);
+        }
+
+        @Override
+        public long getCommitEpoch(String documentId) {
+            return tracker.getCommitEpoch(documentId);
+        }
+
+        @Override
+        public int getChunkCount(String documentId) {
+            return tracker.getChunkCount(documentId);
+        }
+
+        @Override
+        public int getDocumentCount() {
+            return tracker.getDocumentCount();
+        }
+    }
+}

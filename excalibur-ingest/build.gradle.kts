@@ -24,7 +24,10 @@ dependencies {
     // Phase 2, 3, 4, 5, 7 dependencies
     implementation(project(":excalibur-store"))
     implementation(project(":excalibur-filter"))
-    implementation(project(":excalibur-graph"))
+    // api rather than implementation: ChunkLexicalIndex.open takes a CompactionPolicy and
+    // RelationExtractor deals in ExtractedTriple, both of which are graph types on the public
+    // shape of this module, so a consumer of either needs them on its compile classpath.
+    api(project(":excalibur-graph"))
     implementation(project(":excalibur-vector"))
     implementation(project(":excalibur-metrics"))
     implementation(project(":excalibur-shard"))

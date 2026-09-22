@@ -15,7 +15,7 @@ plugins {
 // applicationDefaultJvmArgs is what puts the flag into bin/excalibur-api, bin/excalibur-api.bat
 // and the shadow start scripts.
 application {
-    mainClass.set("excalibur.api.ExcaliburApplication")
+    mainClass.set("com.eonmux.excalibur.api.ExcaliburApplication")
     // The two preview flags are required to start at all. The rest are the flags that decide
     // whether the first failure in production is diagnosable: a memory-mapped engine that runs
     // out of heap leaves no artefact unless it is asked for one, and a JVM that survives an
@@ -23,6 +23,10 @@ application {
     applicationDefaultJvmArgs = listOf(
         "--enable-preview",
         "--enable-native-access=ALL-UNNAMED",
+        // Without it the SIMD distance kernels fall back to scalar arithmetic silently: a node
+        // that works and is several times slower at every search. The container passes it, so
+        // omitting it here would make the start scripts a different node from the image.
+        "--add-modules=jdk.incubator.vector",
         "-XX:+HeapDumpOnOutOfMemoryError",
         "-XX:HeapDumpPath=.",
         "-XX:+ExitOnOutOfMemoryError"
@@ -89,6 +93,16 @@ tasks.test {
         events("passed", "skipped", "failed")
         showStandardStreams = true
     }
+    // ConfigKeyInventoryTest holds the README's settings table and the shipped properties
+    // template against the keys and defaults the node actually reads. Gradle cannot see a file a
+    // test opens for itself, so without these the task stays up to date when one of them changes
+    // - and the check is skipped in exactly the case it exists for.
+    inputs.file(rootProject.file("README.md"))
+        .withPropertyName("readme")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file(rootProject.file("excalibur.properties.example"))
+        .withPropertyName("propertiesTemplate")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
 }
 
 // Shadow JAR configuration for fat JAR packaging
@@ -106,7 +120,7 @@ tasks.shadowJar {
     exclude("META-INF/*.RSA")
 
     manifest {
-        attributes["Main-Class"] = "excalibur.api.ExcaliburApplication"
+        attributes["Main-Class"] = "com.eonmux.excalibur.api.ExcaliburApplication"
         attributes["Enable-Native-Access"] = "ALL-UNNAMED"
         // Stamped so a running node can say which build it is. "Which version is on this host"
         // is the first question of an incident and of a rollback, and a jar that cannot answer
@@ -121,7 +135,8 @@ tasks.shadowJar {
     // flag supplied explicitly. State that where whoever ships it will read it.
     doLast {
         logger.lifecycle(
-            "Built {}. Launch it with: java --enable-preview --enable-native-access=ALL-UNNAMED -jar {}",
+            "Built {}. Launch it with: java --enable-preview --enable-native-access=ALL-UNNAMED "
+                + "--add-modules=jdk.incubator.vector -jar {}",
             archiveFileName.get(), archiveFileName.get()
         )
     }
@@ -136,6 +151,7 @@ tasks.build {
 tasks.withType<JavaExec> {
     jvmArgs(
         "--enable-preview",
-        "--enable-native-access=ALL-UNNAMED"
+        "--enable-native-access=ALL-UNNAMED",
+        "--add-modules=jdk.incubator.vector"
     )
 }

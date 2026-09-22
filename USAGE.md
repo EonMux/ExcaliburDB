@@ -18,6 +18,7 @@ echo 'excalibur.ingest.allowed-roots=/absolute/path/to/docs' >> excalibur.proper
 
 # 3. Run the server (listens on :8080)
 java --enable-preview --enable-native-access=ALL-UNNAMED \
+     --add-modules=jdk.incubator.vector \
      -jar excalibur-api/build/libs/excalibur.jar
 
 # 4. Register a source to index (in another terminal)
@@ -119,6 +120,7 @@ environment variables work the same way they do for the jar.
 
 ```bash
 java --enable-preview --enable-native-access=ALL-UNNAMED \
+     --add-modules=jdk.incubator.vector \
      -jar excalibur-api/build/libs/excalibur.jar
 ```
 
@@ -133,6 +135,7 @@ Place `excalibur.properties` in the working directory, or pass it explicitly:
 
 ```bash
 java --enable-preview --enable-native-access=ALL-UNNAMED \
+     --add-modules=jdk.incubator.vector \
      -jar excalibur.jar --config /path/to/excalibur.properties
 ```
 
@@ -140,6 +143,7 @@ java --enable-preview --enable-native-access=ALL-UNNAMED \
 
 ```bash
 EXCALIBUR_PORT=9090 java --enable-preview --enable-native-access=ALL-UNNAMED \
+     --add-modules=jdk.incubator.vector \
      -jar excalibur.jar
 ```
 
@@ -333,8 +337,10 @@ See [README.md](README.md#configuration-options) for the full property table.
 | `GET` | `/v1/graph/namespaces` | bearer | Every namespace on disk: whether it is open, whether it has built a graph, what it has staged and what it still owes |
 | `DELETE` | `/v1/graph/namespaces/{namespace}` | bearer | Remove a namespace entirely - its graph, its staged facts and its erasure log. Irreversible; `409` for `shared` |
 
-All request/response bodies are JSON. Request size limit: **1 MB**, and a body over it is refused with `413` by every endpoint that reads one - split the payload rather than retrying it. The `GET` routes, `DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build` and
-`POST /v1/graph/build` read no body, so they never produce a `413`.
+All request/response bodies are JSON. Request size limit: **1 MB**, and a body over it is refused with `413` by every endpoint that reads one - split the payload rather than retrying it. The `GET` routes read no body, and neither do `POST` and `DELETE /v1/drain`,
+`DELETE /v1/query/{query_id}`, `DELETE /v1/compact`,
+`DELETE /v1/graph/namespaces/{namespace}`, `DELETE /v1/graph/build` or `POST /v1/graph/build`,
+so none of them ever produces a `413`.
 
 Three routes that change what is registered — `POST /v1/ingest`, `DELETE /v1/ingest` and
 `POST /v1/erasure` — answer `503` when the change could not be recorded in the source catalog.
@@ -505,6 +511,11 @@ curl -X POST http://localhost:8080/v1/ingest \
 | `included_path_patterns` | array of string | _(all)_ | A URL path must contain one of these substrings to be crawled. Plain substrings, not globs or regexes |
 | `excluded_path_patterns` | array of string | `/api`, `/admin`, `/login`, `/logout` | A URL path containing one of these is skipped. Supplying this **replaces** the default list, and `[]` clears it |
 | `user_agent` | string | `ExcaliburDB/1.0` | How the crawl identifies itself. At most 200 characters and no control characters: a carriage return or newline would end the header and turn the rest of the value into headers this node never agreed to send |
+| `crawl_delay_ms` | integer | `excalibur.ingest.crawl-delay-ms` (200) | The gap left between two requests to the host, 0 to 60000. The node takes the larger of this and its own setting, so a registration can ask to be gentler than the deployment requires and never quicker; `0` therefore reads as "no preference", not "crawl flat out" |
+
+The walk is sequential and makes two requests per page — one to read its links, one to fetch it —
+and every one of them, redirect hops included, waits out the gap above. A crawl left unpaced asks
+a host for pages as fast as it will answer them, up to the ten million `max_documents` allows.
 
 The crawl stays on the base URL's host regardless of any of these — redirects are followed by the
 crawler itself, with the host policy re-applied at every hop — and hosts resolving to loopback,
@@ -513,8 +524,8 @@ private, link-local or multicast addresses are refused whatever the allow-list s
 Settings that belong to the other source type are refused here with a `400` rather than accepted
 and ignored, in both directions: `included_extensions`, `excluded_directories`,
 `follow_symlinks`, `include_hidden` and `max_file_bytes` on a crawl, and `max_documents`,
-`max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns` and
-`user_agent` on a filesystem walk. See [error responses](#error-responses). `max_depth` is the one
+`max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns`,
+`user_agent` and `crawl_delay_ms` on a filesystem walk. See [error responses](#error-responses). `max_depth` is the one
 setting both understand.
 
 **Response — `200 OK`**
@@ -577,10 +588,10 @@ the source, so its length is multiplied by the size of the corpus rather than by
 requests. The routes that only look a source up — deregister, reindex, erasure and status — refuse
 the same lengths, because nothing can be registered under one.
 
-**`405 Method Not Allowed` — a method other than POST or DELETE**
+**`405 Method Not Allowed` — a method other than GET, POST or DELETE**
 
 ```json
-{"error": "Method Not Allowed - Use POST to register a source or DELETE to stop crawling one"}
+{"error": "Method Not Allowed - Use GET to read the registrations, POST to register a source or DELETE to stop crawling one"}
 ```
 
 Unauthenticated, and charged against the read budget: which handler serves a request is decided
@@ -663,6 +674,7 @@ curl http://localhost:8080/v1/ingest/status
       "progress": 0.7300,
       "entries_ingested": 450000,
       "entries_pending": 170000,
+      "entries_skipped": 1204,
       "last_updated_ms": 1730000042000,
       "last_error": null
     },
@@ -672,6 +684,7 @@ curl http://localhost:8080/v1/ingest/status
       "progress": 1.0000,
       "entries_ingested": 12034,
       "entries_pending": 0,
+      "entries_skipped": 0,
       "last_updated_ms": 1729900000000,
       "last_error": null
     }
@@ -694,6 +707,7 @@ curl "http://localhost:8080/v1/ingest/status?source_id=project-docs"
   "progress": 0.7300,
   "entries_ingested": 450000,
   "entries_pending": 170000,
+  "entries_skipped": 1204,
   "last_updated_ms": 1730000042000,
   "last_error": null
 }
@@ -703,6 +717,18 @@ curl "http://localhost:8080/v1/ingest/status?source_id=project-docs"
 progress. Without it an `idle` source reads the same whether it was crawled a minute ago or
 before a restart three weeks back, and "is the index still following the source?" cannot be
 answered from the API at all.
+
+`entries_skipped` is how many of the files the crawl listed were not text and so had nothing in
+them to index — images, archives, compiled output, anything whose decoded bytes carry a U+0000 or
+run a third or more replacement characters. It is reported apart from `last_error` on purpose: a
+crawl root holding those beside its documents is ordinary, not broken. A source that indexed far
+fewer documents than the directory holds, with `last_error` null, is answered by this number.
+Narrow `included_extensions` if you want those files never read in the first place.
+
+Every run rewrites it, including a re-crawl — the scheduled one and `POST /v1/reindex` alike — so
+it describes what the root holds now and not what it held the first time the node walked it. The
+other counts on this response belong to the run that wrote them; a reindex reports its own
+progress through `GET /v1/reindex/status`.
 
 **Response — `404 Not Found`** (unknown source)
 
@@ -755,12 +781,13 @@ answers `202` because a crawl is of unknown size and duration.
 | `source_id` | string | yes | What the documents are recorded as belonging to, so `/v1/erasure` and `/v1/reindex` can name them later. At most 256 characters |
 | `documents` | array | yes | 1 to 256 documents |
 | `documents[].document_id` | string | yes | Names the document within its source. Posting the same id again replaces what the node holds under it |
-| `documents[].text` | string | yes | The document's text. Empty is refused rather than indexed, because it would produce no chunks and be reported as ingested while being unfindable |
+| `documents[].text` | string | yes | The document's text. Empty is refused rather than indexed, because it would produce no chunks and be reported as ingested while being unfindable. Text that is not text — one carrying U+0000, which a crawl treats as the mark of a binary file — is refused for the same reason |
 | `documents[].content_type` | string | no | Defaults to `text/plain` |
 | `documents[].last_modified_millis` | int | no | Epoch millis; `0` when unknown |
 
 **Error — `400 Bad Request`** — no `source_id`, no `documents`, more than 256 of them, a document
-with no `document_id` or no `text`, or the same `document_id` twice in one request.
+with no `document_id`, no `text` or text that is not text, or the same `document_id` twice in one
+request.
 
 **Error — `409 Conflict`** — either the `source_id` is a registered crawl source, or a run over
 that source is already in flight. The first is refused because documents recorded under a crawl's
@@ -1981,7 +2008,7 @@ reporting zeroes are different states. Within it:
 - `liveChunks` is what a query can match. `erasedChunks` is hidden from queries but still on disk — erased chunks and replaced versions of re-crawled ones both count here, and a compaction is what removes them.
 - `erasureRequests` and `oldestErasureAgeMs` are the erasure backlog: what was promised and not yet discharged, and how long the oldest has waited. Compare the age against `excalibur.ingest.lexical-max-latency-seconds`. Nothing else in this response would show that deadline going unmet.
 - `compactionDue` is what the index's policy would decide if asked right now. Compaction runs at the end of an ingestion or reindex run, and on the sweep that enforces `excalibur.ingest.lexical-max-latency-seconds`, so a node reporting `true` settles within a tenth of that bound even when nothing ingests.
-- On `engine: "lucene"` the erasure fields are always zero and `compactionDue` always `false`: Lucene reclaims deleted documents on its own merge schedule, holding no obligation this node could report on.
+- Both engines answer these the same way. Lucene's own merges reclaim deleted documents on a schedule of their own, which never fires for one erased chunk in a large index, so the Lucene engine records the same durable obligation the native one does and is held to the same `excalibur.ingest.lexical-max-latency-seconds`. What differs is only what a compaction rewrites: the native engine rewrites the segments it selected, Lucene force-merges every segment holding a deletion.
 
 ### Reclaim space now
 
@@ -2107,7 +2134,7 @@ excalibur_segments_without_vector_index > 0
 
 #### JMX
 
-The same figures are also published as MBeans under the `io.excalibur` domain, for a local
+The same figures are also published as MBeans under the `com.eonmux.excalibur` domain, for a local
 VisualVM or JConsole session attached to the process. JMX is **not** reachable from outside the
 host unless the JVM was started with the flags below, and none of the packaged start scripts set
 them — RMI's callback address does not survive a container's port mapping either. `/metrics` is
@@ -2147,7 +2174,7 @@ B=excalibur-backup/build/install/excalibur-backup/bin/excalibur-backup
 # 1. Stop the node and wait for the process to exit. Match on the main class, not on the jar
 #    name: a node started through bin/excalibur-api or ./gradlew :excalibur-api:run has no
 #    "excalibur.jar" on its command line, so a pattern matching that silently selects nothing.
-pid="$(pgrep -f excalibur.api.ExcaliburApplication)" || { echo "no node found"; exit 1; }
+pid="$(pgrep -f com.eonmux.excalibur.api.ExcaliburApplication)" || { echo "no node found"; exit 1; }
 kill -TERM "$pid"
 while kill -0 "$pid" 2>/dev/null; do sleep 1; done
 
@@ -2156,7 +2183,7 @@ $B snapshot --data-dir /var/lib/excalibur/data --out /backups/excalibur-$(date +
 
 # 3. Restart.
 EXCALIBUR_DATA_DIR=/var/lib/excalibur/data java --enable-preview \
-    --enable-native-access=ALL-UNNAMED -jar excalibur.jar
+    --enable-native-access=ALL-UNNAMED --add-modules=jdk.incubator.vector -jar excalibur.jar
 ```
 
 The image is self-describing: the payload, plus a manifest naming every file with its length,
@@ -2367,6 +2394,7 @@ At startup, set `EXCALIBUR_LOG_LEVEL`:
 
 ```bash
 EXCALIBUR_LOG_LEVEL=DEBUG java --enable-preview --enable-native-access=ALL-UNNAMED \
+    --add-modules=jdk.incubator.vector \
     -jar excalibur.jar
 ```
 
@@ -2410,9 +2438,9 @@ includeBuild("/path/to/ExcaliburDB")
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("io.excalibur:excalibur-store:1.0.0-SNAPSHOT")
-    implementation("io.excalibur:excalibur-query:1.0.0-SNAPSHOT")
-    implementation("io.excalibur:excalibur-vector:1.0.0-SNAPSHOT")
+    implementation("com.eonmux:excalibur-store:1.0.0-SNAPSHOT")
+    implementation("com.eonmux:excalibur-query:1.0.0-SNAPSHOT")
+    implementation("com.eonmux:excalibur-vector:1.0.0-SNAPSHOT")
 }
 ```
 
@@ -2425,11 +2453,11 @@ must also compile and run on Java 21 with `--enable-preview`, for the reason in
 When embedding ExcaliburDB directly, the pipeline still operates on vectors — it's your wrapper's job to generate the embedding (typically via `EmbeddingClient`) before invoking the pipeline. The HTTP API handles this step automatically; the embedded API is one level lower.
 
 ```java
-import excalibur.query.QueryRequest;
-import excalibur.query.QueryResponse;
-import excalibur.query.pipeline.QueryPipeline;
-import excalibur.query.executor.CancellationToken;
-import excalibur.llm.embedding.EmbeddingClient;
+import com.eonmux.excalibur.query.QueryRequest;
+import com.eonmux.excalibur.query.QueryResponse;
+import com.eonmux.excalibur.query.pipeline.QueryPipeline;
+import com.eonmux.excalibur.query.executor.CancellationToken;
+import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 
 // Assume `pipeline` and `embeddingClient` are already configured.
 // Use the SAME embeddingClient for ingestion and query to keep
@@ -2467,7 +2495,9 @@ the HNSW node id and matches nothing a caller can look up.
   in `ExcaliburApplication.main`; an embedder has no such entry point, so it has to do it itself.
   Two threads is all it takes - storage, query, retrieval, graph and shard components hand work
   to virtual threads, so one sequential caller that starts a worker is already a race.
-- Always pass `--enable-preview --enable-native-access=ALL-UNNAMED` JVM flags.
+- Always pass `--enable-preview --enable-native-access=ALL-UNNAMED
+  --add-modules=jdk.incubator.vector` JVM flags. Without the last one the SIMD distance
+  kernels fall back to scalar arithmetic silently.
 - HNSW graphs cap at `Integer.MAX_VALUE` nodes per segment.
 - Segment counts are power-of-two (extensible hashing on split).
 - `StorageEngine` is thread-safe; multiple concurrent queries and ingests are supported.
