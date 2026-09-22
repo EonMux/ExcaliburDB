@@ -101,6 +101,23 @@ tasks.register<Test>("benchmarkTest") {
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     jvmArgs("--add-modules=jdk.incubator.vector")
     jvmArgs("-Xmx2g")
+
+    // No coverage agent. The root build applies jacoco to every subproject, and the plugin
+    // attaches its agent to every Test task it finds - including this one, which is the one
+    // task in the build whose entire output is a measurement of how fast the code runs.
+    //
+    // It is not a uniform tax that a target could simply be set below. JaCoCo counts through a
+    // boolean[] of probes per class, shared by every thread executing that class, so a hot loop
+    // run on twenty-four threads turns into twenty-four cores writing the same few cache lines.
+    // Measured on this benchmark's own workload: 6.98 M ops/sec single-threaded and 37.40 M on
+    // twenty-four threads without the agent, against 5.61 M and 1.31 M with it. The scaling
+    // gate therefore read 0.23x - it was measuring the instrumentation contending with itself,
+    // and would have gone on reporting a concurrency defect in the storage engine that the
+    // engine does not have.
+    extensions.configure<JacocoTaskExtension> {
+        isEnabled = false
+    }
+
     // Benchmarks measure a moving system; never reuse a previous run's verdict.
     outputs.upToDateWhen { false }
 }
