@@ -433,7 +433,8 @@ it from its key table and the stored text.
 Damaged files are moved into a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another. It takes the `--flag=value` form only. The default needs
 the data directory's parent to be writable; a quarantine on another filesystem works too, by a
-copy that is forced and compared before the original is removed, since a rename cannot cross.
+copy that is forced and compared before the original is removed, since a rename cannot cross — a
+lexical segment's directory included, copied whole and compared file by file.
 
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
 failed, so nothing is known about the directory — which is not the same claim as `0`.

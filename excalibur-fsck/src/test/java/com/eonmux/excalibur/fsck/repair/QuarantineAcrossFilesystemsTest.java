@@ -57,6 +57,98 @@ class QuarantineAcrossFilesystemsTest {
     }
 
     @Test
+    void aDirectoryIsCopiedWholeVerifiedAndOnlyThenRemoved(@TempDir Path dir)
+            throws IOException {
+        Path segment = Files.createDirectories(dir.resolve("data/chunk-index/seg-3"));
+        byte[] postings = new byte[64 * 1024];
+        new Random(13L).nextBytes(postings);
+        Files.write(segment.resolve("post.dat"), postings);
+        Files.writeString(segment.resolve("index.meta"), "meta");
+        Files.writeString(Files.createDirectories(segment.resolve("nested"))
+            .resolve("extra.bin"), "nested bytes");
+        Files.createDirectories(segment.resolve("empty"));
+
+        Path taken = new Quarantine(dir.resolve("q"), ACROSS_MOUNTS)
+            .take(segment, "chunk-index/seg-3");
+
+        assertThat(taken).isEqualTo(dir.resolve("q/chunk-index_seg-3"));
+        assertThat(taken.resolve("post.dat")).hasBinaryContent(postings);
+        assertThat(taken.resolve("index.meta")).hasContent("meta");
+        assertThat(taken.resolve("nested/extra.bin")).hasContent("nested bytes");
+        assertThat(taken.resolve("empty")).isEmptyDirectory();
+        assertThat(segment).doesNotExist();
+        assertThat(dir.resolve("data/chunk-index")).isEmptyDirectory();
+        try (var left = Files.list(dir.resolve("q"))) {
+            assertThat(left.map(p -> p.getFileName().toString()))
+                .as("the staged copy is published under its final name, not left beside it")
+                .containsExactly("chunk-index_seg-3");
+        }
+    }
+
+    @Test
+    void aDirectoryWhoseCopyCannotBeWrittenIsLeftWhole(@TempDir Path dir) throws IOException {
+        Path segment = Files.createDirectories(dir.resolve("data/seg-4"));
+        Files.writeString(segment.resolve("post.dat"), "evidence");
+        Path quarantineDir = Files.createDirectories(dir.resolve("q"));
+        Files.setPosixFilePermissions(quarantineDir, PosixFilePermissions.fromString("r-xr-xr-x"));
+        try {
+            assumeFalse(Files.isWritable(quarantineDir),
+                "a process that writes through directory permissions (root) cannot be refused");
+            Quarantine quarantine = new Quarantine(quarantineDir, ACROSS_MOUNTS);
+
+            assertThatThrownBy(() -> quarantine.take(segment, "seg-4"))
+                .isInstanceOf(IOException.class)
+                .isNotInstanceOf(PartialQuarantineException.class);
+
+            assertThat(segment.resolve("post.dat")).as("nothing is removed until its copy is "
+                + "proven").hasContent("evidence");
+        } finally {
+            Files.setPosixFilePermissions(quarantineDir,
+                PosixFilePermissions.fromString("rwxr-xr-x"));
+        }
+    }
+
+    @Test
+    void aDirectoryHoldingSomethingOtherThanFilesIsLeftWhole(@TempDir Path dir)
+            throws IOException {
+        Path segment = Files.createDirectories(dir.resolve("data/seg-5"));
+        Files.writeString(segment.resolve("post.dat"), "evidence");
+        Files.createSymbolicLink(segment.resolve("link"), segment.resolve("post.dat"));
+
+        assertThatThrownBy(() -> new Quarantine(dir.resolve("q"), ACROSS_MOUNTS)
+                .take(segment, "seg-5"))
+            .isInstanceOf(IOException.class)
+            .hasMessageContaining("link");
+
+        assertThat(segment.resolve("post.dat")).hasContent("evidence");
+        assertThat(segment.resolve("link")).isSymbolicLink();
+        try (var left = Files.list(dir.resolve("q"))) {
+            assertThat(left).as("no partial copy is left in quarantine").isEmpty();
+        }
+    }
+
+    @Test
+    void aDirectoryCopyIsForcedFileByFileBeforeItIsPublished(@TempDir Path dir)
+            throws IOException {
+        Path segment = Files.createDirectories(dir.resolve("data/seg-6"));
+        Files.writeString(segment.resolve("post.dat"), "evidence");
+        Path quarantineDir = Files.createDirectories(dir.resolve("q"));
+        List<String> events = new ArrayList<>();
+
+        new Quarantine(quarantineDir, ACROSS_MOUNTS, directory -> {
+            events.add("force " + quarantineDir.relativize(directory)
+                + (Files.exists(quarantineDir.resolve("seg-6")) ? " (published)" : "")
+                + (Files.exists(segment) ? "" : " (original gone)"));
+            Quarantine.forceDirectory(directory);
+        }).take(segment, "seg-6");
+
+        assertThat(events).containsExactly(
+            "force seg-6.quarantine-partial",
+            "force  (published)",
+            "force ../data (published) (original gone)");
+    }
+
+    @Test
     void aTakenNameIsStillNeverOverwritten(@TempDir Path dir) throws IOException {
         Path store = Files.createDirectories(dir.resolve("data"));
         Quarantine quarantine = new Quarantine(dir.resolve("q"), ACROSS_MOUNTS);

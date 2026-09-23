@@ -2972,8 +2972,10 @@ the tool writes, stating each write before it makes it, and **no repair ever del
 The quarantine is a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another; the default needs the data directory's parent to be
 writable. A quarantine on another filesystem works as well: a rename cannot cross, so each file is
-copied, forced to disk and compared byte for byte before the original is removed. What it refuses
-to attempt matters as much:
+copied, forced to disk and compared byte for byte before the original is removed. A damaged lexical
+segment is a directory, and it crosses whole: every file in it is copied and forced, the copy is
+checked to hold exactly the same entries with the same bytes, and only then is it published in the
+quarantine and the original directory removed. What it refuses to attempt matters as much:
 
 | Left for an operator | Why |
 |---|---|

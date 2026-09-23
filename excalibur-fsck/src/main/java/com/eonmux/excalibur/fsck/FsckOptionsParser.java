@@ -132,8 +132,9 @@ public final class FsckOptionsParser {
               --quarantine-dir=<path>  Where damaged files are moved to. Defaults to a
                                        timestamped directory beside the data directory,
                                        whose parent must then be writable. On another
-                                       filesystem a file is copied, compared, and only
-                                       then removed from the data directory.
+                                       filesystem a file, or a lexical segment's whole
+                                       directory, is copied, compared, and only then
+                                       removed from the data directory.
               --json                   Emit the report as JSON instead of text.
               --strict                 Exit non-zero when any file could not be verified, not
                                        only when one is damaged.
