@@ -376,7 +376,7 @@ final class CompactionSwap implements CompactionListener {
         // segment closes as soon as this listener returns, and Segment.close() closes whatever is
         // still attached - one mapped file per hash table, released underneath a live query path.
         // Left behind instead, a segment loses its pre-filter permanently on its first compaction
-        // and falls back to a full graph search for good.
+        // and its queries recover no neighbour the graph search walks past, for good.
         com.eonmux.excalibur.filter.lsh.LshIndex prefilter = oldSegment.detachLshIndex();
         if (prefilter != null) {
             newSegment.attachLshIndex(prefilter);

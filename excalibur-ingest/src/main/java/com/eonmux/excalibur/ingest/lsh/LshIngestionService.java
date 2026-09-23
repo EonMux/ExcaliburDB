@@ -16,8 +16,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * The LSH implementation of a segment's {@link com.eonmux.excalibur.store.VectorPrefilter}.
  *
  * <h2>Purpose</h2>
- * <p>Maintains one locality-sensitive hash index per segment, keyed by HNSW node id, which
- * stage 2 of the query pipeline uses to narrow a vector search before the graph is walked.</p>
+ * <p>Maintains one locality-sensitive hash index per segment, keyed by HNSW node id, whose
+ * bucket-mates of a query stage 2 of the query pipeline hands to stage 3 to measure exactly beside
+ * the graph search.</p>
  *
  * <h2>Integration Points</h2>
  * <ul>
@@ -256,14 +257,15 @@ public class LshIngestionService implements com.eonmux.excalibur.store.VectorPre
         } catch (IllegalArgumentException e) {
             // The tables on disk record the shape they were built with and refuse to open under
             // another. That is right - hyperplanes from a different shape put a vector in the
-            // wrong bucket - but it must not stop the segment being used: LSH only narrows the
-            // candidates a search considers, so a segment without it is searched in full and
-            // answers correctly, just more slowly. Said plainly here because the alternative is
-            // an operator who changed the shape, kept correct answers, and lost the prefilter on
-            // every existing segment with nothing telling them why the node got slower.
+            // wrong bucket - but it must not stop the segment being used: LSH only adds
+            // candidates beside the graph search, so a segment without it is still searched in
+            // full and answers correctly, only without the near neighbours its buckets would
+            // have recovered where the graph search walks past them. Said plainly here because
+            // the alternative is an operator who changed the shape and lost the prefilter on
+            // every existing segment with nothing telling them.
             LOGGER.warn("Segment {} has an LSH index built with a different shape than this "
-                + "node is configured for ({}). It is being searched without the prefilter, "
-                + "which is slower and still correct. Reindex the corpus to build the index "
+                + "node is configured for ({}). It is being searched without its LSH "
+                + "candidates, which is still correct. Reindex the corpus to build the index "
                 + "the new configuration describes.", segment.segmentId(), e.getMessage());
             return null;
         }

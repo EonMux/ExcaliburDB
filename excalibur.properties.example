@@ -409,11 +409,13 @@ excalibur.shard.compaction-max-concurrent=4
 excalibur.shard.hnsw-compaction-interval-ms=60000
 excalibur.shard.hnsw-compaction-tombstone-ratio=0.2
 
-# The shape of each segment's LSH index, which narrows the candidates a vector search considers.
-# More tables and more probes find more of the true neighbours and read more buckets; more hash
-# functions make each bucket narrower. The shape is recorded in the tables a segment writes: a
-# segment built under one shape is searched without the prefilter under another - slower, still
-# correct - and the node says so in its log. Reindex to apply a new shape to an existing corpus.
+# The shape of each segment's LSH index. A query's bucket-mates are measured exactly beside the
+# graph search and ranked in with its results, recovering near neighbours the graph walks past;
+# they never exclude a segment or confine its search, so no shape can lose a result. More tables
+# and more probes name more candidates and read more buckets; more hash functions make each bucket
+# narrower. The shape is recorded in the tables a segment writes: a segment built under one shape
+# is searched without its LSH candidates under another - still correct - and the node says so in
+# its log. Reindex to apply a new shape to an existing corpus.
 # Bounded: at most 256 tables (each one allocates hash-functions x dimensions floats, per
 # segment), at most 63 hash functions (the bucket key is packed into a long) and at most 64
 # probes. A value past those is refused at startup rather than per segment, so a configuration

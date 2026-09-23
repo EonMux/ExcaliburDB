@@ -19,16 +19,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * A segment's vector pre-filter has to have the same lifetime as the graph it is keyed against.
  *
- * <p>The pre-filter holds HNSW node ids, and stage 2 of the query pipeline restricts the graph
- * search to the ids it returns. Its files are named after the segment, but node ids belong to the
+ * <p>The pre-filter holds HNSW node ids, and stage 3 of the query pipeline measures the nodes it
+ * names beside the graph search. Its files are named after the segment, but node ids belong to the
  * graph - so any point where a name outlives the graph stored under it is a point where the
  * pre-filter starts describing data that is no longer there. A split is exactly that point: the
  * left child takes its parent's canonical name and starts a brand new graph whose ids begin again
  * at zero.</p>
  *
  * <p>Neither side of that arrangement can detect the mismatch. The index answers, the graph
- * accepts the ids, and the query returns the wrong entries or - when the inherited index is well
- * populated enough to be treated as authoritative - none at all.</p>
+ * accepts the ids, and every query spends its measurements on vectors the inherited buckets never
+ * described.</p>
  */
 @DisplayName("Segment pre-filter lifecycle")
 class SegmentPrefilterLifecycleTest {

@@ -3,12 +3,12 @@ package com.eonmux.excalibur.store;
 /**
  * Writes a segment's approximate vector pre-filter, keyed by HNSW node id.
  *
- * <p>The query pipeline asks a segment's pre-filter for the entries that could match a query
- * vector and hands the answer to {@code HnswGraph.search(query, k, candidateIds)}, which keeps
- * only the results whose node id appears in that set. The pre-filter and the graph therefore
- * share one id space, and it is the graph's: an id the graph does not recognise names no node,
- * so a candidate set built from foreign ids excludes every result rather than narrowing the
- * search.</p>
+ * <p>The query pipeline asks a segment's pre-filter for the entries that share a hash bucket
+ * with a query vector and measures those nodes exactly beside the graph search, ranking them in
+ * with its results. The pre-filter and the graph therefore share one id space, and it is the
+ * graph's: an id the graph does not recognise names no node, and one it does recognise names
+ * whichever vector the graph holds under it, so a pre-filter keyed any other way contributes
+ * nothing but wasted measurements.</p>
  *
  * <p>Node ids exist only once the HNSW integration worker has absorbed an entry from the write
  * log, which is why this interface is written from there rather than from ingestion. Ingestion
@@ -40,9 +40,9 @@ public interface VectorPrefilter {
      * from that name - so the left child, which takes its parent's name, would open the parent's
      * pre-filter. That state describes the parent's graph, and the child starts a new graph whose
      * node ids begin again at zero: every id in it names a different vector in the child, or none
-     * at all. Since the query pipeline restricts the graph search to those ids, the child would
-     * return results for the wrong vectors, and would be excluded outright whenever the inherited
-     * index answered a query with nothing.</p>
+     * at all. The query pipeline would spend every query measuring vectors the inherited buckets
+     * never described, and the child would recover none of the neighbours its own index would
+     * have named.</p>
      *
      * <p>Called before {@link #initialize(Segment)} on a segment whose contents no longer match
      * the state stored under its name.</p>
@@ -55,9 +55,9 @@ public interface VectorPrefilter {
      * Records one integrated vector under the node id the graph assigned it.
      *
      * <p>Implementations are best-effort: the pre-filter is an optimisation, and a failure to
-     * record an entry must not fail the integration that produced it. A missing entry costs
-     * recall in the pre-filter only if the pre-filter is later treated as authoritative, which
-     * is a coverage decision the query pipeline makes for itself.</p>
+     * record an entry must not fail the integration that produced it. The query pipeline only
+     * adds the nodes a pre-filter names to what the graph search finds, so a missing entry costs
+     * nothing but the chance to recover that node when the graph search walks past it.</p>
      *
      * @param segment The segment the vector was integrated into
      * @param vector  The vector as integrated
