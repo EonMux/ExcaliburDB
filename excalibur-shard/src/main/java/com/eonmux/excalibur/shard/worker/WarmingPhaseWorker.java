@@ -11,6 +11,7 @@ import com.eonmux.excalibur.vector.quantization.ProductQuantizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -130,9 +131,6 @@ public class WarmingPhaseWorker {
      */
     private volatile StopSignal stopSignal = new StopSignal();
 
-    /** How long {@link #stop()} waits for a segment being warmed to finish. */
-    private static final long STOP_JOIN_TIMEOUT_MS = 5_000;
-
     // ==================== Constructors ====================
 
     /**
@@ -232,28 +230,35 @@ public class WarmingPhaseWorker {
      * on {@code stopSignal}. A worker still warming a segment when the wait runs out is
      * reported: the caller closes the arena that segment's graph is mapped from next.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, so a longer budget gives a segment being warmed needs to finish training its quantizer rather than a fixed wait cut short.
+     * A later call waits again for a thread an earlier one left running.</p>
+     *
+     * @param wait How long to wait for the worker thread to end
      * @return true if the worker thread has ended, or was never started
+     * @throws NullPointerException if wait is null
      */
-    public boolean stop() {
+    public boolean stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
         Thread worker = workerThread;
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
             stopSignal.request();
-
-            if (worker != null) {
-                try {
-                    worker.join(STOP_JOIN_TIMEOUT_MS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                if (worker.isAlive()) {
-                    LOGGER.warn("WarmingPhaseWorker did not finish warming within {}ms of being "
-                        + "asked to stop", STOP_JOIN_TIMEOUT_MS);
-                }
-            }
-
-            LOGGER.info("WarmingPhaseWorker stopped. PQ trained: {}, PQ failed: {}, Transitions: {}",
+            LOGGER.info("WarmingPhaseWorker asked to stop. PQ trained: {}, PQ failed: {}, Transitions: {}",
                 totalPqTrained.get(), totalPqFailed.get(), totalTransitions.get());
+        }
+        // Outside the guard, so a later call waits again for a thread an earlier one left
+        // running instead of answering from a snapshot of it.
+        if (worker != null) {
+            try {
+                worker.join(wait);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (worker.isAlive()) {
+                LOGGER.warn("WarmingPhaseWorker did not finish warming within {}ms of being "
+                    + "asked to stop", wait.toMillis());
+            }
         }
         return worker == null || !worker.isAlive();
     }

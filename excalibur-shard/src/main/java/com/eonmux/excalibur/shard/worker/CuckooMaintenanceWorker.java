@@ -15,9 +15,11 @@ import org.slf4j.LoggerFactory;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -322,24 +324,28 @@ public class CuckooMaintenanceWorker {
      * so there is no point inside one at which it could honour an interrupt anyway. A cycle
      * that outlives the wait is reported rather than abandoned to a closing arena.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains. A later call waits again for a cycle an earlier one left running.</p>
+     *
+     * @param wait How long to wait for a maintenance cycle in progress
      * @return true if no maintenance cycle is still running
+     * @throws NullPointerException if wait is null
      */
-    public boolean stop() {
+    public boolean stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
-
             scheduler.shutdown();
-            try {
-                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                    LOGGER.warn("A Cuckoo maintenance cycle was still cleaning tombstoned "
-                        + "segments 5s after being asked to stop");
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-
-            LOGGER.info("Cuckoo maintenance worker stopped. Total deletions: {}",
+            LOGGER.info("Cuckoo maintenance worker asked to stop. Total deletions: {}",
                 totalDeletions.get());
+        }
+        try {
+            if (!scheduler.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
+                LOGGER.warn("A Cuckoo maintenance cycle was still cleaning tombstoned segments "
+                    + "{}ms after being asked to stop", wait.toMillis());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
         return scheduler.isTerminated();
     }

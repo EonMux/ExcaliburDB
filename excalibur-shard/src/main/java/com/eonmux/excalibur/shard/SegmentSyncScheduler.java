@@ -5,6 +5,7 @@ import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -44,9 +45,6 @@ final class SegmentSyncScheduler {
      * clamped, so an operator who asks for 10ms is told, instead of quietly getting 250.</p>
      */
     static final long MIN_INTERVAL_MS = 250;
-
-    /** How long {@link #shutdown()} waits for a sweep in progress. */
-    private static final long SHUTDOWN_WAIT_MS = 5_000;
 
     private final StorageEngine engine;
     private final SplitWorker.SplitListener observer;
@@ -114,7 +112,7 @@ final class SegmentSyncScheduler {
     /**
      * Registers the split observer and schedules the reconciliation sweep.
      *
-     * <p>The executor is recreated when a previous {@link #shutdown()} shut it down, so a
+     * <p>The executor is recreated when a previous {@link #shutdown(Duration)} shut it down, so a
      * stop/start cycle does not hand the scheduler a terminated executor.</p>
      */
     void start() {
@@ -160,16 +158,20 @@ final class SegmentSyncScheduler {
      * and leaves the graph unusable by anyone. A sweep that outlives the wait is reported,
      * because the caller closes the arena those graphs are mapped from next.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains.</p>
+     *
+     * @param wait How long to wait for a sweep in progress
      * @return true if no sweep is still running
      */
-    boolean shutdown() {
+    boolean shutdown(Duration wait) {
         ScheduledExecutorService current = executor;
         if (current == null) {
             return true;
         }
         current.shutdown();
         try {
-            if (current.awaitTermination(SHUTDOWN_WAIT_MS, TimeUnit.MILLISECONDS)) {
+            if (current.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
                 return true;
             }
         } catch (InterruptedException e) {
@@ -179,7 +181,7 @@ final class SegmentSyncScheduler {
             }
         }
         LOGGER.warn("A segment reconciliation sweep was still registering index structures "
-            + "{}ms after shutdown", SHUTDOWN_WAIT_MS);
+            + "{}ms after shutdown", wait.toMillis());
         return false;
     }
 

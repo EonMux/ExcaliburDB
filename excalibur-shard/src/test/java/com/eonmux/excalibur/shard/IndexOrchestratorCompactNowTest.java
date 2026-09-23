@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -30,6 +31,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @DisplayName("Compaction on demand")
 class IndexOrchestratorCompactNowTest {
+
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
 
     @TempDir
     Path tempDir;
@@ -188,15 +192,15 @@ class IndexOrchestratorCompactNowTest {
     void shutdownReportsWorkersEnded() {
         orchestrator.start();
 
-        assertThat(orchestrator.shutdown()).isTrue();
+        assertThat(orchestrator.shutdown(STOP_WAIT)).isTrue();
         assertThat(orchestrator.isRunning()).isFalse();
-        assertThat(orchestrator.shutdown()).isTrue();
+        assertThat(orchestrator.shutdown(STOP_WAIT)).isTrue();
     }
 
     @Test
     @DisplayName("shutdown of an orchestrator never started reports ended")
     void shutdownOfAnUnstartedOrchestrator() {
-        assertThat(orchestrator.shutdown()).isTrue();
+        assertThat(orchestrator.shutdown(STOP_WAIT)).isTrue();
     }
 
     @Test

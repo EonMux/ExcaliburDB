@@ -20,8 +20,10 @@ import org.slf4j.LoggerFactory;
 
 import com.eonmux.excalibur.core.codec.ChunkPayloadCodec;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -212,9 +214,6 @@ public class HnswIntegrationWorker {
      */
     private volatile StopSignal stopSignal = new StopSignal();
 
-    /** How long {@link #stop()} waits for an integration batch in progress to finish. */
-    private static final long STOP_JOIN_TIMEOUT_MS = 5_000;
-
     /**
      * The offset each stalled segment's tail is stuck at, keyed by segment file.
      *
@@ -386,28 +385,35 @@ public class HnswIntegrationWorker {
      * still inside a batch when the wait runs out is reported, because the caller closes the
      * arena that batch is writing into next.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, so a longer budget gives a batch in progress needs to finish growing its graph rather than a fixed wait cut short.
+     * A later call waits again for a thread an earlier one left running.</p>
+     *
+     * @param wait How long to wait for the worker thread to end
      * @return true if the worker thread has ended, or was never started
+     * @throws NullPointerException if wait is null
      */
-    public boolean stop() {
+    public boolean stop(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
         Thread worker = workerThread;
         if (stopped.compareAndSet(false, true)) {
             running.set(false);
             stopSignal.request();
-
-            if (worker != null) {
-                try {
-                    worker.join(STOP_JOIN_TIMEOUT_MS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                if (worker.isAlive()) {
-                    LOGGER.warn("HnswIntegrationWorker did not finish its batch within {}ms of "
-                        + "being asked to stop", STOP_JOIN_TIMEOUT_MS);
-                }
-            }
-
-            LOGGER.info("HnswIntegrationWorker stopped. Total integrated: {}, batches: {}",
+            LOGGER.info("HnswIntegrationWorker asked to stop. Total integrated: {}, batches: {}",
                 totalIntegrated.get(), totalBatches.get());
+        }
+        // Outside the guard, so a later call waits again for a thread an earlier one left
+        // running instead of answering from a snapshot of it.
+        if (worker != null) {
+            try {
+                worker.join(wait);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (worker.isAlive()) {
+                LOGGER.warn("HnswIntegrationWorker did not finish its batch within {}ms of being "
+                    + "asked to stop", wait.toMillis());
+            }
         }
         return worker == null || !worker.isAlive();
     }

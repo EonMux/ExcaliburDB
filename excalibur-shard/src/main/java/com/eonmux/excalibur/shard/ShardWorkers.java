@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.foreign.Arena;
+import java.time.Duration;
 
 /**
  * The shard's background workers, and the order they are allowed to come up and go down in.
@@ -164,27 +165,34 @@ final class ShardWorkers {
      * already been dispatched, so after it returns the epoch cannot advance - a promise that
      * only holds if every worker that makes new work visible has already stopped.</p>
      *
-     * <p>Every worker is asked, and waited for within its own bound, even after one has
-     * reported that it outlasted its wait: stopping the rest is still worth doing, and the
-     * answer is the conjunction. Workers are stopped by a signal they read at safe points,
-     * never by an interrupt, so a false here means work is still running against the storage
-     * and the arena it is mapped out of must stay open.</p>
+     * <p>Every worker is asked, and waited for with what is left of {@code wait}, even after one
+     * has reported that it outlasted it: stopping the rest is still worth doing, and the answer
+     * is the conjunction. One wait for all of them rather than one each, so a caller that hands
+     * this what its shutdown budget has left is never kept past it; a worker reached once the
+     * wait is spent is still asked to stop, and answers from whether it already has. Workers are
+     * stopped by a signal they read at safe points, never by an interrupt, so a false here means
+     * work is still running against the storage and the arena it is mapped out of must stay
+     * open.</p>
      *
+     * @param wait How long to wait for all of them together
      * @return true if every worker has ended
      */
-    boolean stop() {
+    boolean stop(Duration wait) {
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; left()
+        // subtracts the current time first, which undoes it.
+        long deadline = System.nanoTime() + wait.toNanos();
         boolean ended = true;
         // Stop workers in reverse order
         if (segmentCompaction != null) {
-            ended &= segmentCompaction.stop();
+            ended &= segmentCompaction.stop(left(deadline));
         }
-        ended &= reindex.stop();
-        ended &= graphCompaction.stop();
-        ended &= warming.stop();
-        ended &= hnsw.stop();
+        ended &= reindex.stop(left(deadline));
+        ended &= graphCompaction.stop(left(deadline));
+        ended &= warming.stop(left(deadline));
+        ended &= hnsw.stop(left(deadline));
         // Sampling and JMX only: nothing it runs touches storage, so it cannot hold the arena.
-        cuckooMetrics.stop();
-        ended &= cuckoo.stop();
+        cuckooMetrics.stop(left(deadline));
+        ended &= cuckoo.stop(left(deadline));
 
         // Stop epoch tick scheduler last. Its stop fences any dispatched tick under its own
         // lock, so it has always ended when it returns.
@@ -193,9 +201,19 @@ final class ShardWorkers {
     }
 
     /**
+     * What is left of a wait that ends at {@code deadline}.
+     *
+     * @param deadline The {@link System#nanoTime()} the wait ends at
+     * @return The time left, zero once it has passed
+     */
+    static Duration left(long deadline) {
+        return Duration.ofNanos(Math.max(0, deadline - System.nanoTime()));
+    }
+
+    /**
      * Releases the epoch tick scheduler's executor.
      *
-     * <p>Separate from {@link #stop()} because a stopped orchestrator can be started again,
+     * <p>Separate from {@link #stop(Duration)} because a stopped orchestrator can be started again,
      * and only the close path is allowed to make that impossible.</p>
      */
     void close() {

@@ -12,6 +12,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.foreign.Arena;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,6 +36,9 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("Compaction arena ownership")
 class IndexOrchestratorCompactionArenaTest {
+
+    /** Far longer than any work here takes to stop once asked. */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
 
     @TempDir
     Path tempDir;
@@ -99,7 +103,7 @@ class IndexOrchestratorCompactionArenaTest {
 
             assertThatCode(() -> {
                 orchestrator.start();
-                orchestrator.stop();
+                orchestrator.stop(STOP_WAIT);
                 orchestrator.close();
             }).doesNotThrowAnyException();
         }

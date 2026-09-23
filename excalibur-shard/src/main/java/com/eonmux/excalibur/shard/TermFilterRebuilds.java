@@ -112,19 +112,15 @@ import java.util.function.Supplier;
  * <p>Rebuilds still queued when the shard closes are dropped - each would read a whole segment
  * for a filter about to be discarded - but each is still counted off the queue, so a caller of
  * {@link #awaitIdle} is not left waiting on work that will never run. The rebuild already
- * running is asked to stop and awaited for a bounded time, so the segments it reads are not
- * closed under it.</p>
+ * running is asked to stop and awaited for the time its caller gives, so the segments it
+ * reads are not closed under it.</p>
  */
 final class TermFilterRebuilds implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(TermFilterRebuilds.class);
 
-    /**
-     * How long {@link #close()} waits for the rebuild already running. It is asked to stop and
-     * does so between entries, so this bounds one entry's tokenising or the lock-held copy of
-     * one segment's text, not a whole rebuild.
-     */
-    static final Duration CLOSE_WAIT = Duration.ofSeconds(10);
+    /** What {@link #close()} waits for: the rebuild already running, for as long as it takes. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     /**
      * How long a rebuild that found its segment splitting waits before it is queued again. A
@@ -247,18 +243,21 @@ final class TermFilterRebuilds implements AutoCloseable {
     }
 
     /**
-     * Stops taking rebuilds, drops the queued ones and waits a bounded time for the running one.
+     * Stops taking rebuilds, drops the queued ones and waits for the running one, for as long as
+     * it takes to stop - the way {@code ExecutorService.close} waits.
      *
      * <p>See "Closing". Every level a dropped or stopped rebuild would have vouched for stays
-     * stale, which is what a filter being discarded needs of it anyway.</p>
+     * stale, which is what a filter being discarded needs of it anyway. A shard's shutdown uses
+     * {@link #drain(Duration)} instead, with what its budget leaves it.</p>
      */
     @Override
     public void close() {
-        drain();
+        drain(UNTIL_STOPPED);
     }
 
     /**
-     * As {@link #close()}, saying whether the running rebuild actually ended.
+     * As {@link #close()}, waiting no longer than {@code wait}, and saying whether the running
+     * rebuild actually ended.
      *
      * <p>The one interrupt this delivers, through {@code shutdownNow}, is safe to deliver: a
      * rebuild copies text out of the segment's memory mapping and files terms into the in-memory
@@ -266,20 +265,25 @@ final class TermFilterRebuilds implements AutoCloseable {
      * flag, read between entries, that actually stops it. The answer matters because the
      * mapping it copies from lives in the arena the caller closes next.</p>
      *
+     * <p>The rebuild is asked to stop and does so between entries, so what a stopped one needs
+     * is one entry's tokenising or the lock-held copy of one segment's text, not a whole
+     * rebuild.</p>
+     *
+     * @param wait How long to wait for the running rebuild
      * @return true if no rebuild is still running
      */
-    boolean drain() {
+    boolean drain(Duration wait) {
         closing = true;
         List<Runnable> dropped = executor.shutdownNow();
         for (int i = 0; i < dropped.size(); i++) {
             finished();
         }
         try {
-            if (executor.awaitTermination(CLOSE_WAIT.toMillis(), TimeUnit.MILLISECONDS)) {
+            if (executor.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
                 return true;
             }
-            LOGGER.warn("A term filter rebuild was still running {} after the shard began "
-                + "closing; it is left to finish on its own", CLOSE_WAIT);
+            LOGGER.warn("A term filter rebuild was still running {}ms after the shard began "
+                + "closing; it is left to finish on its own", wait.toMillis());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
