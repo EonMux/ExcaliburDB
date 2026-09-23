@@ -356,6 +356,7 @@ excalibur.llm.retry-base-delay-ms=500
 
 # Shard Configuration
 excalibur.shard.segment-load-factor=0.7
+excalibur.shard.max-routing-width=1048576
 excalibur.shard.default-ef-construction=128
 excalibur.shard.default-ef-search=64
 excalibur.shard.compaction-delay-ms=10000

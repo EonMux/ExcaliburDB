@@ -3619,7 +3619,7 @@ memory is about to be released, which ends the process rather than failing it.
   already owns. `getSegmentCount()` returns that width, and `getSegments().size()` the number of
   distinct segments behind it. The directory lives on the heap at about 60 bytes a slot and stays
   within a small multiple of the segment count: 300 MB of 1536-dimensional chunks fills 510
-  segments behind a 512-slot directory. `withMaxRoutingWidth(int)` (default 2^20 slots) bounds
+  segments behind a 512-slot directory. `withMaxRoutingWidth(int)` (default 2^20 slots; `excalibur.shard.max-routing-width` on a node) bounds
   the case keys that do not hash evenly would otherwise make unbounded: a split that would double
   past it is refused with `RoutingDirectoryFullException` and counted in
   `getStatistics().getRefusedSplits()`.

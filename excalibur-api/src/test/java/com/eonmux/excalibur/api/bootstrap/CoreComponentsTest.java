@@ -1,10 +1,12 @@
 package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.config.ShardConfig;
 import com.eonmux.excalibur.retrieval.lexical.native_.SegmentManifest;
 import com.eonmux.excalibur.store.CompactionWorker;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.SegmentLifecycleManager;
+import com.eonmux.excalibur.store.StorageEngine;
 import com.eonmux.excalibur.vector.hnsw.HnswConfigFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -185,6 +187,33 @@ class CoreComponentsTest {
 
             assertThat(callback.onCompactionNeeded(Long.MAX_VALUE)).isFalse();
         }
+    }
+
+    @Test
+    @DisplayName("hands the storage engine the configured routing directory limit")
+    void appliesTheRoutingWidthLimit(@TempDir Path dataDir) {
+        Map<String, String> props = new HashMap<>();
+        props.put("excalibur.query.vector-dimensions", "128");
+        props.put("excalibur.shard.max-routing-width", "4096");
+
+        components = CoreComponents.create(
+            new Config(props), dataDir, HnswConfigFactory.withDefaults());
+
+        assertThat(components.storageEngine().maxRoutingWidth()).isEqualTo(4096);
+    }
+
+    @Test
+    @DisplayName("bounds the routing directory limit exactly as the engine does")
+    void routingWidthBoundsAreTheEngines() {
+        // The config module cannot see the store, so its bounds are written out twice. A value
+        // one side accepts and the other refuses would turn a startup check into a refusal from
+        // inside the engine, or let through a width the engine then throws on.
+        assertThat(ShardConfig.DEFAULT_MAX_ROUTING_WIDTH)
+            .isEqualTo(StorageEngine.DEFAULT_MAX_ROUTING_WIDTH);
+        assertThat(ShardConfig.MIN_MAX_ROUTING_WIDTH)
+            .isEqualTo(StorageEngine.DEFAULT_INITIAL_SEGMENTS);
+        assertThat(ShardConfig.MAX_MAX_ROUTING_WIDTH)
+            .isEqualTo(StorageEngine.MAX_ROUTING_WIDTH_LIMIT);
     }
 
     private static Config config() {

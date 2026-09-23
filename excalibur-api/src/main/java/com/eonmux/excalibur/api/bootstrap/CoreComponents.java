@@ -114,6 +114,10 @@ public record CoreComponents(Arena arena,
         // pre-allocates the base keyspace.
         engine.withLoadFactorThreshold(config.shard().getLoadFactor());
 
+        // Also before start(): a limit is a statement about the directory the engine opens, and
+        // the engine refuses one set after it is serving.
+        engine.withMaxRoutingWidth(config.shard().getMaxRoutingWidth());
+
         // Install the HNSW initializer BEFORE start(). start() discovers existing
         // segments and pre-allocates the whole base keyspace; a segment created without
         // a graph carries no vector index, and a query pipeline whose graph provider

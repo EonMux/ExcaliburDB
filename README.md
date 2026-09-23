@@ -675,6 +675,7 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.query.expansion-timeout-ms` | 5000 | How long one query-side expansion call may take before it is abandoned and the query runs as typed. Its own budget, not the LLM client's 60-second one: expansion sits in front of a search a caller is waiting on, and a timeout that generous would be indistinguishable from a hang. 500 to 60000 |
 | `excalibur.query.per-signal-over-fetch` | 3 | How many times `top_k` each signal contributes before fusion. A document has to be in a signal's list to be fused at all, so this is what lets a result that is mediocre on one signal and excellent on the other survive to be ranked. At least 1 |
 | `excalibur.shard.segment-load-factor` | 0.7 | Fraction of slots a segment may fill before it splits. 0.5 to 0.9 |
+| `excalibur.shard.max-routing-width` | 1048576 | Slots the routing directory may grow to; a split that would double it past this is refused. A power of two from 64 to 2^30 |
 | `excalibur.shard.default-ef-construction` | 128 | HNSW construction candidate list size. 16 to 1024 |
 | `excalibur.shard.default-ef-search` | 64 | HNSW search candidate list size. 8 to 1024 |
 | `excalibur.shard.hnsw-integration-queue-depth-limit` | 100000 | Max vectors in HNSW integration queue. 10000 to 1000000 |
@@ -2755,7 +2756,7 @@ are mapped files — a small multiple of the segment count: 300 MB of chunks wit
 embeddings fill 510 segments behind a 512-slot directory, and ingest in a 256 MB heap. What it
 does not bound on its own is keys whose hashes share far more low bits than chance allows, which a
 split cannot separate. So the directory has a limit, 2^20 slots by default
-(`StorageEngine.withMaxRoutingWidth`): a split that would double it past that is refused, logged
+(`excalibur.shard.max-routing-width`, or `StorageEngine.withMaxRoutingWidth` when embedding): a split that would double it past that is refused, logged
 once for the segment and counted in `Statistics.getRefusedSplits()`, and the write that needed it
 gets `RoutingDirectoryFullException` rather than the heap running out. An entry larger than an
 empty segment's data region is refused outright, because no split makes room for it.

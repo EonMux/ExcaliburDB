@@ -165,6 +165,24 @@ public final class ShardConfig {
     /** Vectors the codebook training samples from a segment, or 0 for all of them. */
     public static final int DEFAULT_PQ_TRAINING_SAMPLES = 100_000;
 
+    /**
+     * Slots the routing directory may grow to: 2^20, some tens of megabytes of heap at the limit.
+     *
+     * <p>The directory doubles only when a segment as deep as it splits, so for keys that hash
+     * evenly it stays within a small multiple of the segment count and never nears this. What
+     * the limit bounds is keys whose hashes agree in many low bits, which no split separates and
+     * each split would otherwise double the directory for; past it such a split is refused rather
+     * than allowed to exhaust the heap. The three routing-width values mirror the storage
+     * engine's, which this module cannot see; a test in the api module holds them equal.</p>
+     */
+    public static final int DEFAULT_MAX_ROUTING_WIDTH = 1 << 20;
+
+    /** The narrowest limit: the directory's base width, which it never starts below. */
+    public static final int MIN_MAX_ROUTING_WIDTH = 64;
+
+    /** The widest limit: slot indices are ints. */
+    public static final int MAX_MAX_ROUTING_WIDTH = 1 << 30;
+
     // All fields final for immutability
     private final double loadFactor;
     private final int efConstruction;
@@ -189,6 +207,7 @@ public final class ShardConfig {
     private final int pqSubspaces;
     private final int pqCentroids;
     private final int pqTrainingSamples;
+    private final int maxRoutingWidth;
 
     /**
      * Creates a Shard config from properties.
@@ -304,6 +323,15 @@ public final class ShardConfig {
         this.pqTrainingSamples = ConfigBounds.atLeast(props,
             "excalibur.shard.pq-training-samples", DEFAULT_PQ_TRAINING_SAMPLES, 0);
 
+        // Routing masks a key's hash with the directory width, so every width it can take - and
+        // so every limit on it - is a power of two.
+        this.maxRoutingWidth = ConfigBounds.inRange(props, "excalibur.shard.max-routing-width",
+            DEFAULT_MAX_ROUTING_WIDTH, MIN_MAX_ROUTING_WIDTH, MAX_MAX_ROUTING_WIDTH);
+        if (Integer.bitCount(maxRoutingWidth) != 1) {
+            throw new IllegalArgumentException("excalibur.shard.max-routing-width must be a power "
+                + "of two, got: " + maxRoutingWidth);
+        }
+
         // K-means cannot produce more clusters than it has points. A ceiling below the
         // codebook size leaves centroids that no vector ever lands on, and every code
         // that points at one is a distance the search computes against nothing.
@@ -314,6 +342,16 @@ public final class ShardConfig {
                     + pqCentroids + "), or 0 to train on every vector: k-means cannot fill "
                     + "a codebook from fewer samples than it has centroids");
         }
+    }
+
+    /**
+     * Gets how many slots the routing directory may grow to.
+     *
+     * @return A power of two from {@value #MIN_MAX_ROUTING_WIDTH} to 2^30
+     * @see #DEFAULT_MAX_ROUTING_WIDTH
+     */
+    public int getMaxRoutingWidth() {
+        return maxRoutingWidth;
     }
 
     /**
@@ -517,7 +555,8 @@ public final class ShardConfig {
                ", volumes=" + volumes + ", pqSearchEnabled=" + pqSearchEnabled +
                ", pqOversample=" + pqOversample +
                ", pqSubspaces=" + pqSubspaces + ", pqCentroids=" + pqCentroids +
-               ", pqTrainingSamples=" + pqTrainingSamples + '}';
+               ", pqTrainingSamples=" + pqTrainingSamples +
+               ", maxRoutingWidth=" + maxRoutingWidth + '}';
     }
 
     @Override
@@ -552,6 +591,7 @@ public final class ShardConfig {
             && pqSubspaces == other.pqSubspaces
             && pqCentroids == other.pqCentroids
             && pqTrainingSamples == other.pqTrainingSamples
+            && maxRoutingWidth == other.maxRoutingWidth
             && Objects.equals(volumes, other.volumes);
     }
 
@@ -562,6 +602,6 @@ public final class ShardConfig {
             segmentSyncIntervalMs, compactionTombstoneRatio, compactionWriteLogMb,
             compactionMaxConcurrent, hnswCompactionIntervalMs, hnswCompactionTombstoneRatio,
             lshHashTables, lshHashFunctions, lshProbes, volumes, pqSearchEnabled, pqOversample,
-            pqSubspaces, pqCentroids, pqTrainingSamples);
+            pqSubspaces, pqCentroids, pqTrainingSamples, maxRoutingWidth);
     }
 }

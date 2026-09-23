@@ -126,6 +126,7 @@ public final class ConfigKeys {
         "excalibur.shard.lsh-hash-functions",
         "excalibur.shard.lsh-hash-tables",
         "excalibur.shard.lsh-probes",
+        "excalibur.shard.max-routing-width",
         "excalibur.shard.pq-centroids",
         "excalibur.shard.pq-oversample",
         "excalibur.shard.pq-search-enabled",

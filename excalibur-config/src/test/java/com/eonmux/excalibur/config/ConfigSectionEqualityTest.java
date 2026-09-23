@@ -239,7 +239,8 @@ class ConfigSectionEqualityTest {
             v("pqOversample", "excalibur.shard.pq-oversample", "8"),
             v("pqSubspaces", "excalibur.shard.pq-subspaces", "16"),
             v("pqCentroids", "excalibur.shard.pq-centroids", "128"),
-            v("pqTrainingSamples", "excalibur.shard.pq-training-samples", "200000")));
+            v("pqTrainingSamples", "excalibur.shard.pq-training-samples", "200000"),
+            v("maxRoutingWidth", "excalibur.shard.max-routing-width", "4096")));
     }
 
     private static SectionUnderTest graph() {
