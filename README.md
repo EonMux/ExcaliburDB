@@ -335,8 +335,25 @@ front of the process terminates it — so the container ships with none of those
 default that listened on every interface unauthenticated is the one mistake that policy exists to
 prevent. `HEALTHCHECK` points at `/health/ready`, not `/health`: readiness answers 200 or 503 on
 whether this node can serve a query, where liveness answers 200 while it is still opening
-segments. Allow at least 30 seconds to stop — the shutdown hook publishes the chunk index's buffer,
-which is the tail of an ingestion run, and closes the storage engine.
+segments.
+
+### Stopping the node
+
+`SIGTERM` runs a shutdown hook that stops the listener and drains the node. It then publishes the
+chunk index's buffer, which is the tail of an ingestion run. Next it forces staged graph facts and
+the document registry to disk, and finally closes the storage engine. The whole sequence runs
+against one deadline, `excalibur.api.shutdown-timeout-seconds` (30 by default). The drains run in
+parallel and share that deadline minus its last 10 seconds. Those 10 seconds are kept for the
+writes, so a slow drain cannot use them up. A reindex, compaction or graph build still running when
+the drains' share runs out is reported and left alone. Nothing it is using is closed underneath it,
+and the next start recovers from its write log.
+
+Set the supervisor's stop timeout to **the configured deadline plus 10 seconds**. The margin covers
+the JVM reaching its hook and the storage engine's own close. With the default, that is
+`docker run --stop-timeout 40` or `docker stop --time 40`, `terminationGracePeriodSeconds: 40`, or
+systemd `TimeoutStopSec=40`. Raising the deadline means raising these to match. A SIGKILL that
+arrives before the hook finishes loses the unpublished buffer, and nothing reindexes those chunks
+afterwards.
 
 ## Operator tools
 
@@ -538,6 +555,7 @@ variable of the same name as the token it presents to the node — see
 | Property | Default | Description |
 |----------|---------|-------------|
 | `excalibur.api.port` | 8080 | Port to listen on; `EXCALIBUR_PORT` overrides it |
+| `excalibur.api.shutdown-timeout-seconds` | 30 | How long a stop may take, from the signal to the last file closed. Every drain shares this one deadline. The last 10 seconds are kept for publishing buffered chunks, forcing staged graph facts and persisting the registry. Work still running when the drains' share runs out is reported and left for the next start to recover. Set the supervisor's stop timeout to at least this plus 10 (see [Stopping the node](#stopping-the-node)). 15 to 3600; any other value stops startup |
 | `excalibur.visibility.epoch-tick-ms` | 100 | Visibility epoch tick interval (ms). 10 to 10000 |
 | `excalibur.visibility.query-timeout-ms` | 30000 | Query timeout (ms) for a request that names none. Must not exceed `excalibur.api.max-query-timeout-ms`, or the node refuses to start: every such request would be refused. 1000 to 300000 |
 | `excalibur.query.top-k-default` | 100 | Default number of results. Must not exceed `excalibur.api.max-top-k`, or the node refuses to start, for the same reason. 1 to 10000 |

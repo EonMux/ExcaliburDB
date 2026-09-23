@@ -178,9 +178,10 @@ Environment=EXCALIBUR_DATA_DIR=/var/lib/excalibur/data
 Environment=EXCALIBUR_API_AUTH_TOKEN=...
 WorkingDirectory=/var/lib/excalibur
 User=excalibur
-# The node drains in-flight queries and closes storage durably on SIGTERM; give it room to.
+# The node drains in-flight queries and closes storage durably on SIGTERM; give it room to:
+# excalibur.api.shutdown-timeout-seconds (30 by default) plus 10.
 KillSignal=SIGTERM
-TimeoutStopSec=60
+TimeoutStopSec=40
 Restart=on-failure
 
 [Install]
@@ -226,7 +227,7 @@ uid `10001`, with the jar owned by `root` and read-only to the process. Nothing 
 | Heap dumps | Written on an out-of-memory exit to `/var/lib/excalibur-diagnostics`, not the data directory. Mount a volume there to keep one past `docker rm` |
 | Operator tools | `excalibur-fsck` and `excalibur-backup` are on the `PATH`. Run them with the node stopped, against the same volume; a repair needs `/var/lib/excalibur-quarantine` mounted, and a snapshot `/var/lib/excalibur-backups` — see below |
 | Health | `HEALTHCHECK` polls `/health/ready` with a 90s start period, which covers segment recovery on a large data directory |
-| Stop | Allow at least 30 seconds. The JVM is pid 1, so `SIGTERM` reaches the shutdown hook that publishes the chunk index's buffer — the tail of an ingestion run — and closes the storage engine. `--stop-timeout 40`, or `terminationGracePeriodSeconds: 40` |
+| Stop | The JVM is pid 1, so `SIGTERM` reaches the shutdown hook. The hook publishes the chunk index's buffer, which is the tail of an ingestion run, and closes the storage engine. It does all of this within `excalibur.api.shutdown-timeout-seconds` (30 by default). Give it that plus 10: `--stop-timeout 40`, or `terminationGracePeriodSeconds: 40`, and more if you raise the setting |
 
 Bind-mounting a host directory instead of a named volume means `chown 10001:10001` on it first;
 the process does not run as root and will not be able to create its catalog otherwise. The same

@@ -9,6 +9,7 @@ import com.eonmux.excalibur.api.bootstrap.ReindexerFactory;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
 import com.eonmux.excalibur.api.server.ListenPort;
+import com.eonmux.excalibur.api.server.ShutdownBudget;
 import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
@@ -35,6 +36,7 @@ import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 
 /**
  * Main entry point for ExcaliburDB server.
@@ -88,12 +90,16 @@ public final class ExcaliburApplication {
      */
     public static final String DEFAULT_DATA_DIR = "data";
 
-    /**
-     * Shutdown timeout in seconds.
-     */
-    public static final int SHUTDOWN_TIMEOUT_SECONDS = 30;
-
     private final Config config;
+
+    /**
+     * How long the whole shutdown may take, from {@link ShutdownBudget#KEY_TIMEOUT}.
+     *
+     * <p>Read at construction rather than when the shutdown hook fires, so a value that cannot be
+     * used stops startup instead of surfacing as a failed stop.</p>
+     */
+    private final Duration shutdownTimeout;
+
     private final Arena arena;
     private final StorageEngine storageEngine;
     private final IndexOrchestrator indexOrchestrator;
@@ -364,6 +370,9 @@ public final class ExcaliburApplication {
 
         // Determine server port from config or use default
         this.port = determinePort();
+        this.shutdownTimeout = ShutdownBudget.configuredTimeout(config.getEffectiveProperties());
+        LOGGER.info("Shutdown deadline: {}s ({} to stop within it)", shutdownTimeout.toSeconds(),
+            ShutdownBudget.KEY_TIMEOUT);
 
         // Resolve and validate the API security policy before any component starts.
         // A non-loopback bind without a token fails here rather than after the socket
@@ -733,7 +742,7 @@ public final class ExcaliburApplication {
         // sure it runs once, because run() is watching shutdownRequested to stop its own loop.
         new NodeShutdown(server, indexOrchestrator, lexicalErasureSweep, chunkIndex,
             documentVisibilityTracker, graphTenants, storageEngine, arena,
-            SHUTDOWN_TIMEOUT_SECONDS).run();
+            shutdownTimeout).run();
     }
 
     /**

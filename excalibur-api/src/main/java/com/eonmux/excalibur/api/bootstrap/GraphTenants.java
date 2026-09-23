@@ -1238,21 +1238,37 @@ public final class GraphTenants implements AutoCloseable {
      */
     @Override
     public void close() {
+        close(Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS));
+    }
+
+    /**
+     * As {@link #close()}, waiting for the sweep no longer than {@code sweepWait} - for a
+     * shutdown whose budget has less left than the sweep's own wait.
+     *
+     * @param sweepWait How long to wait for a sweep in flight to reach its next boundary
+     * @throws IllegalStateException if the sweep is still compacting when the wait runs out
+     * @throws NullPointerException  if sweepWait is null
+     */
+    public void close(Duration sweepWait) {
+        Objects.requireNonNull(sweepWait, "sweepWait must not be null");
+        Duration wait = sweepWait.compareTo(Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS)) < 0
+            ? sweepWait
+            : Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS);
         closing = true;
         // shutdown, not shutdownNow: the periodic task is cancelled and a sweep in progress
         // runs to its next namespace boundary uninterrupted.
         erasureSweep.shutdown();
         boolean sweepEnded;
         try {
-            sweepEnded = erasureSweep.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS);
+            sweepEnded = erasureSweep.awaitTermination(wait.toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             sweepEnded = erasureSweep.isTerminated();
         }
         if (!sweepEnded) {
-            LOGGER.error("the graph erasure sweep was still compacting {}s after being asked to "
+            LOGGER.error("the graph erasure sweep was still compacting {}ms after being asked to "
                 + "stop; the graph tenants are left open rather than closed under it",
-                SHUTDOWN_WAIT_SECONDS);
+                wait.toMillis());
             throw new IllegalStateException("left the graph tenants open: the erasure sweep is "
                 + "still compacting a namespace");
         }

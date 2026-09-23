@@ -62,6 +62,12 @@ excalibur.filter.fingerprint-bits=13
 # Port to listen on. EXCALIBUR_PORT in the environment overrides this; a value that is not a
 # port number fails startup rather than quietly falling back to 8080.
 excalibur.api.port=8080
+# How long a stop may take, in seconds, from the signal to the last file closed. Every drain
+# shares it, and its last 10 seconds are kept for publishing buffered chunks and persisting the
+# registry. Work still running when the drains' share ends is left for the next start to
+# recover. Set the supervisor's stop timeout (docker --stop-timeout, k8s
+# terminationGracePeriodSeconds, systemd TimeoutStopSec) to at least this plus 10. 15 to 3600.
+excalibur.api.shutdown-timeout-seconds=30
 # The API binds to loopback by default. Binding any other address requires an explicit
 # excalibur.api.bind-address, excalibur.api.auth-token, AND TLS; without them the server
 # refuses to start rather than serving the network unauthenticated or in cleartext.
