@@ -10,6 +10,7 @@ import com.eonmux.excalibur.fsck.check.FileCheck;
 import com.eonmux.excalibur.fsck.check.FileClassifier;
 import com.eonmux.excalibur.fsck.check.FileKind;
 import com.eonmux.excalibur.fsck.check.GraphStagingCheck;
+import com.eonmux.excalibur.fsck.check.GraphStoreCheck;
 import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.retrieval.lexical.native_.DocumentErasureLog;
@@ -81,6 +82,12 @@ public final class RepairPlanner {
             }
             return;
         }
+        if (FileClassifier.classify(file.relative()) == FileKind.GRAPH_STORE_PART
+                && (file.status() == CheckStatus.CORRUPT
+                    || file.status() == CheckStatus.MISSING)) {
+            addGraphAction(scan, file, actions, operator);
+            return;
+        }
         if (file.status() == CheckStatus.CORRUPT
                 && alreadyPlanned(actions, file.relative())) {
             return;
@@ -107,6 +114,59 @@ public final class RepairPlanner {
             return;
         }
         actions.add(quarantineCorrupt(scan, file));
+    }
+
+    /**
+     * Decides what to do about a damaged or missing file of a tenant's built graph.
+     *
+     * <p>The graph is one structure: the node refuses all of it when any file fails, so the
+     * whole directory is what is moved aside, once however many of its files were found wrong.
+     * Nothing is lost by it - the graph is derived from the namespace's staging logs, which a
+     * build reads whole - and nothing is served from it meanwhile either way.</p>
+     *
+     * <p>Unless a displaced copy sits beside it. The node restores a {@code graph.previous} or
+     * {@code graph.retired} when nothing is served in its place, and such a copy may be the graph
+     * an erasure compaction replaced, still holding what the erasure removed after the
+     * obligation was discharged. Moving the damaged graph away would have the node restore and
+     * serve it, so that is put to an operator instead.</p>
+     *
+     * @param scan     The survey
+     * @param file     A corrupt or missing verdict on a file of the graph
+     * @param actions  Where the move is collected
+     * @param operator Where the question is collected when the move is unsafe
+     */
+    private static void addGraphAction(DataDirectoryScan scan, FileCheck file,
+                                       List<RepairAction> actions, List<String> operator) {
+        String root = GraphStoreCheck.rootOf(file.relative());
+        if (alreadyPlanned(actions, root)
+                || operator.stream().anyMatch(note -> note.startsWith(root + " "))) {
+            return;
+        }
+        Path directory = scan.dataDirectory().resolve(root);
+        List<Path> displaced = GraphStoreCheck.displacedBeside(directory);
+        if (!displaced.isEmpty()) {
+            operator.add(root + " is damaged: " + file.relative() + ": " + file.detail()
+                + ". It is not moved aside automatically while " + displaced.stream()
+                    .map(each -> each.getFileName().toString()).toList()
+                + " is beside it: with nothing left in its place the node would restore that "
+                + "copy and serve it, and a copy an erasure compaction replaced still holds what "
+                + "the erasure removed. Start the node once, which deletes the copy beside a "
+                + "served graph, or delete the copy yourself, and run the repair again - or "
+                + "POST /v1/graph/build, which replaces the damaged graph without either");
+            return;
+        }
+        actions.add(RepairAction.onFile(RepairKind.QUARANTINE_CORRUPT_FILE, directory, root,
+            "move the graph directory " + root + " out of " + scan.dataDirectory()
+                + " into the quarantine directory, deleting nothing (first fault: "
+                + file.relative() + ", " + file.status() + ")",
+            "Every byte is preserved under the quarantine directory. The node already refuses "
+                + "to serve a graph with any file that fails its check, and keeps the "
+                + "namespace's staging and its erasures running; with the directory gone it "
+                + "reports that no graph is built, and POST /v1/graph/build publishes a new one "
+                + "from the staging logs, which hold everything the graph was built from. "
+                + "Erasures accepted from now on never reach the quarantined copy, so delete it "
+                + "once the rebuilt graph serves and never move it back into the data "
+                + "directory"));
     }
 
     /**

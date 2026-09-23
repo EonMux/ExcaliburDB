@@ -26,7 +26,8 @@ import java.util.Optional;
  * <p>The native lexical store is the one structure that is not a file: its manifest names
  * segment directories whose columns are verified together. {@link #inspect} reports each file
  * inside it as a lexical store part, and {@link #lexicalStore} checks the store as a whole;
- * the verdicts the second returns supersede the first's for the files they cover.</p>
+ * the verdicts the second returns supersede the first's for the files they cover. A tenant's
+ * built graph is the same: {@link #graphStores} judges each graph directory as a whole.</p>
  */
 public final class FileInspector {
 
@@ -87,6 +88,21 @@ public final class FileInspector {
     }
 
     /**
+     * Checks every tenant's built graph under a data directory, and the directories a publish,
+     * a build or an erasure compaction left beside it.
+     *
+     * <p>Each inspection gives a verdict on every file under its directory, which supersedes the
+     * per-file verdict {@link #inspect} gives each of them alone.</p>
+     *
+     * @param dataDirectory The data directory, or a snapshot's payload root
+     * @return One inspection per graph directory, empty when no namespace has one
+     * @throws NullPointerException if dataDirectory is null
+     */
+    public static List<GraphStoreCheck.GraphInspection> graphStores(Path dataDirectory) {
+        return GraphStoreCheck.inspect(dataDirectory);
+    }
+
+    /**
      * Reports whether a directory tree holds no regular file anywhere in it.
      *
      * @param directory The directory
@@ -121,6 +137,11 @@ public final class FileInspector {
             case TERM_SKETCH -> TermSketchCheck.check(file, relative);
             case LSH_TABLE -> LshTableCheck.check(file, relative);
             case GRAPH_STAGING_LOG -> GraphStagingCheck.check(file, relative);
+            case GRAPH_ERASURE_MARKER -> GraphStagingCheck.marker(file, relative);
+            case GRAPH_STORE_PART -> unverifiable(file, relative, GraphStoreCheck.FORMAT,
+                "this file sits in a tenant's graph directory and is judged with the graph as a "
+                    + "whole, which records what each of its files must hold; taken alone it "
+                    + "proves nothing");
             case DOCUMENT_REGISTRY -> CountMarkedTextCheck.check(
                 file, relative, CountMarkedFormat.DOCUMENT_REGISTRY);
             case SOURCE_CATALOG -> CountMarkedTextCheck.check(

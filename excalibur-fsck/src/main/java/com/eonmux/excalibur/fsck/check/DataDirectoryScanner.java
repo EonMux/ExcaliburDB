@@ -66,6 +66,7 @@ public final class DataDirectoryScanner {
             }
         }
         addLexicalStore(files, findings);
+        addGraphStores(files);
         files.sort(Comparator.comparing(FileCheck::relative));
         findings.addAll(new CrossFileChecks(dataDirectory).run(files, catalogRows, routingSlots));
         return new DataDirectoryScan(dataDirectory, files, findings, catalogRows, routingSlots);
@@ -86,6 +87,19 @@ public final class DataDirectoryScanner {
             files.addAll(inspection.verdicts());
             findings.addAll(inspection.findings());
         });
+    }
+
+    /**
+     * Checks each tenant's built graph and the directories beside it.
+     *
+     * @param files Where the graphs' verdicts replace the per-file ones they cover
+     */
+    private void addGraphStores(List<FileCheck> files) {
+        for (GraphStoreCheck.GraphInspection inspection
+                : FileInspector.graphStores(dataDirectory)) {
+            files.removeIf(file -> inspection.covers(file.relative()));
+            files.addAll(inspection.verdicts());
+        }
     }
 
     /**

@@ -108,6 +108,16 @@ public final class GraphStagingCheck {
      */
     public static final String WITHDRAWAL_LOG = "withdrawals.log";
 
+    /**
+     * Name of the marker that withholds the graph until an interrupted erasure is applied.
+     *
+     * <p>Stated here for the reason {@link #ERASURE_LOG} is.</p>
+     */
+    public static final String ERASURE_INTERRUPTED_MARKER = "erasure.interrupted";
+
+    /** Name the marker goes by in a report. */
+    public static final String MARKER_FORMAT = "erasure interrupted marker";
+
     private GraphStagingCheck() {
         throw new AssertionError("Utility class");
     }
@@ -125,6 +135,38 @@ public final class GraphStagingCheck {
             || GraphStagingStore.ENTITY_TEXT_LOG.equals(fileName)
             || ERASURE_LOG.equals(fileName)
             || WITHDRAWAL_LOG.equals(fileName);
+    }
+
+    /**
+     * Checks the marker an interrupted erasure leaves.
+     *
+     * <p>The node writes it empty and reads only whether it is there, so an empty one is exactly
+     * what was written. One that holds bytes was not written by the node; they are never read,
+     * and are reported unchecked rather than judged.</p>
+     *
+     * @param file     The marker
+     * @param relative Its path relative to the data directory
+     * @return The verdict
+     */
+    public static FileCheck marker(Path file, String relative) {
+        long size;
+        try {
+            size = Files.size(file);
+        } catch (IOException e) {
+            return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.UNREADABLE,
+                "the marker could not be sized: " + e, -1);
+        }
+        String meaning = "the tenant's graph is withheld until the erasures it still owes have "
+            + "been applied to it, which the node does on its next open or compaction before it "
+            + "serves the graph, removing the marker once they are";
+        if (size == 0) {
+            return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.INTACT,
+                "empty, as written: its presence is its whole content, and says " + meaning,
+                size);
+        }
+        return new FileCheck(file, relative, MARKER_FORMAT, null, CheckStatus.UNCHECKED,
+            "holds " + size + " bytes, which the node never writes and never reads; its presence "
+                + "still says " + meaning, size);
     }
 
     /**
