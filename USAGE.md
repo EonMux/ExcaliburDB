@@ -2984,7 +2984,13 @@ the tool writes, stating each write before it makes it, and **no repair ever del
 
 The quarantine is a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another; the default needs the data directory's parent to be
-writable. A quarantine on another filesystem works as well: a rename cannot cross, so each file is
+writable, and for a data directory named through a symbolic link it is beside the directory the
+link points at. The quarantine must be outside the data directory once symbolic links and `..` are
+followed. One inside it, or the data directory itself, is refused with exit code `2` before
+anything is read. A check is refused as well as a repair, because the scan skips the quarantine
+and would pass over whatever lies under it. A data directory at a filesystem root has nothing
+beside it, so there the quarantine has to be named. A quarantine on another filesystem works as
+well: a rename cannot cross, so each file is
 copied, forced to disk and compared byte for byte before the original is removed. A damaged lexical
 segment is a directory, and it crosses whole: every file in it is copied and forced, the copy is
 checked to hold exactly the same entries with the same bytes, and only then is it published in the

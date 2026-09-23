@@ -436,9 +436,14 @@ it from its key table and the stored text.
 
 Damaged files are moved into a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another. It takes the `--flag=value` form only. The default needs
-the data directory's parent to be writable; a quarantine on another filesystem works too, by a
-copy that is forced and compared before the original is removed, since a rename cannot cross — a
-lexical segment's directory included, copied whole and compared file by file.
+the data directory's parent to be writable; a data directory named through a symbolic link gets
+its default beside the directory the link points at. A quarantine on another filesystem works too,
+by a copy that is forced and compared before the original is removed, since a rename cannot cross —
+a lexical segment's directory included, copied whole and compared file by file. A quarantine inside
+the data directory, or the data directory itself, is refused with exit code `2` before anything is
+read, check or repair alike. Symbolic links and `..` are followed as the filesystem follows them,
+so a path that only reads as outside is refused too. A data directory at a filesystem root has
+nothing beside it, so there the quarantine has to be named.
 
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
 failed, so nothing is known about the directory — which is not the same claim as `0`.

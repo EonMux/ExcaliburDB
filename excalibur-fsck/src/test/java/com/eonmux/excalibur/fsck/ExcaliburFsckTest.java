@@ -271,6 +271,63 @@ class ExcaliburFsckTest {
     }
 
     @Test
+    void aQuarantineInsideTheDataDirectoryIsRefused(@TempDir Path tempDir) throws IOException {
+        Path dataDir = tempDir.resolve("data");
+        DataDirectoryFixture.createStore(dataDir, 32);
+        Path damaged = DataDirectoryFixture.flipPayloadByteInSomeSegment(dataDir);
+        Map<String, String> before = DataDirectoryFixture.fingerprint(dataDir);
+
+        Invocation repair = invoke(dataDir.toString(), "--repair",
+            "--quarantine-dir=" + dataDir.resolve("quarantine"));
+        Invocation check = invoke(dataDir.toString(),
+            "--quarantine-dir=" + dataDir.resolve("quarantine"));
+
+        assertThat(repair.exitCode()).isEqualTo(FsckExit.USAGE);
+        assertThat(repair.err())
+            .contains("inside the data directory")
+            .contains("--quarantine-dir");
+        assertThat(repair.out()).as("nothing was checked, so nothing is reported").isEmpty();
+        assertThat(check.exitCode())
+            .as("a check skips the quarantine, so one inside would hide files from it")
+            .isEqualTo(FsckExit.USAGE);
+        assertThat(Files.exists(damaged)).isTrue();
+        assertThat(DataDirectoryFixture.fingerprint(dataDir))
+            .as("a refused command touches nothing")
+            .isEqualTo(before);
+    }
+
+    @Test
+    void aQuarantineReachingTheDataDirectoryThroughALinkIsRefused(@TempDir Path tempDir)
+            throws IOException {
+        Path dataDir = tempDir.resolve("data");
+        DataDirectoryFixture.createStore(dataDir, 32);
+        Files.createDirectories(dataDir.resolve("inner"));
+        Files.createSymbolicLink(tempDir.resolve("link"), dataDir.resolve("inner"));
+
+        // Reads as a sibling of the data directory; the filesystem climbs out of inner/.
+        Invocation result = invoke(dataDir.toString(), "--repair",
+            "--quarantine-dir=" + tempDir.resolve("link").resolve("..").resolve("q"));
+
+        assertThat(result.exitCode()).isEqualTo(FsckExit.USAGE);
+        assertThat(result.err())
+            .contains("inside the data directory")
+            .contains(dataDir.toRealPath().resolve("q").toString());
+        assertThat(dataDir.resolve("q")).doesNotExist();
+    }
+
+    @Test
+    void theDataDirectoryItselfIsRefusedAsItsOwnQuarantine(@TempDir Path tempDir)
+            throws IOException {
+        Path dataDir = tempDir.resolve("data");
+        DataDirectoryFixture.createStore(dataDir, 32);
+
+        Invocation result = invoke(dataDir.toString(), "--repair",
+            "--quarantine-dir=" + dataDir);
+
+        assertThat(result.exitCode()).isEqualTo(FsckExit.USAGE);
+    }
+
+    @Test
     void usageTextDocumentsEveryFlagTheParserAccepts() {
         String usage = FsckOptionsParser.usage();
 
