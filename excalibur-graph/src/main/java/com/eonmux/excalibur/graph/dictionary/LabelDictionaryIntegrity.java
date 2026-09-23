@@ -127,12 +127,39 @@ public final class LabelDictionaryIntegrity {
     }
 
     /**
+     * Reaches a verdict on a dictionary's index alone, refusing nothing.
+     *
+     * <p>For a caller that needs only the ids a dictionary names - which the index holds in full -
+     * and has no use for the names. The index is held to every check {@link #inspect} holds it
+     * to, its checksum included, so an id read from an index reported intact is the id the build
+     * wrote; the text is not read.</p>
+     *
+     * @param directory The directory the dictionary was published in
+     * @param name      The base name, without extension
+     * @return The index's report
+     * @throws NullPointerException if either argument is null
+     */
+    public static IntegrityReport inspectIndex(Path directory, String name) {
+        Objects.requireNonNull(directory, "directory must not be null");
+        Objects.requireNonNull(name, "name must not be null");
+        Path indexPath = directory.resolve(name + ".idx");
+        if (!Files.isRegularFile(indexPath)) {
+            return IntegrityReport.missing(indexPath, INDEX_FORMAT);
+        }
+        try (FileChannel index = FileChannel.open(indexPath, StandardOpenOption.READ)) {
+            return inspect(indexPath, index, null).get(0);
+        } catch (IOException e) {
+            return IntegrityReport.unreadable(indexPath, INDEX_FORMAT, e.toString());
+        }
+    }
+
+    /**
      * Judges an open index, then the text it describes.
      *
      * @param indexPath The index
      * @param index     A channel over it
-     * @param textPath  The text
-     * @return The index's report, then the text's when it could be judged
+     * @param textPath  The text, or null to judge the index alone
+     * @return The index's report, then the text's when it could be judged and was asked for
      * @throws IOException if the index cannot be read
      */
     private static List<IntegrityReport> inspect(Path indexPath, FileChannel index,
@@ -186,6 +213,9 @@ public final class LabelDictionaryIntegrity {
             throws IOException {
         IntegrityReport indexReport = new IntegrityReport(indexPath, INDEX_FORMAT,
             IntegrityStatus.LEGACY_UNPROTECTED, legacyDetail(count));
+        if (textPath == null) {
+            return List.of(indexReport);
+        }
         if (!Files.isRegularFile(textPath)) {
             return List.of(indexReport, IntegrityReport.missing(textPath, TEXT_FORMAT));
         }
@@ -240,6 +270,9 @@ public final class LabelDictionaryIntegrity {
         IntegrityReport indexReport = IntegrityReport.intact(indexPath, INDEX_FORMAT,
             "format version " + LabelDictionary.VERSION + ": the CRC32C in its trailer matched "
                 + "the header and all " + count + " entries");
+        if (textPath == null) {
+            return List.of(indexReport);
+        }
         return List.of(indexReport,
             inspectText(textPath, recordedTextBytes, recordedTextCrc));
     }

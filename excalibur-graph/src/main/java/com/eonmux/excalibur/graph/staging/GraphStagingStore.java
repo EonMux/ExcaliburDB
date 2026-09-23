@@ -180,6 +180,23 @@ public final class GraphStagingStore implements AutoCloseable {
     /** Suffix of the replacement an upgrade from an earlier version builds before swapping it. */
     private static final String REWRITE_SUFFIX = ".rewriting";
 
+    /**
+     * The name of every replacement a rewrite of one of this store's logs builds beside it: an
+     * erasure's, a tombstoning's, an upgrade's.
+     *
+     * <p>A rewrite renames its replacement over the log once it is forced, and removes it when it
+     * fails, so one on disk is a rewrite a crash cut short - the log itself is whole either way.
+     * What it holds is the log's surviving records, which an erasure accepted since may cover, so
+     * {@link #open} removes them: no rewrite can be under way before the store that runs it has
+     * opened.</p>
+     */
+    public static final List<String> UNFINISHED_REWRITES = List.of(
+        TRIPLE_LOG + ERASING_SUFFIX,
+        TRIPLE_LOG + REWRITE_SUFFIX,
+        ENTITY_TEXT_LOG + EntityTextLog.REWRITE_SUFFIX,
+        ENTITY_LABELS + LabelInterner.REWRITE_SUFFIX,
+        RELATION_LABELS + LabelInterner.REWRITE_SUFFIX);
+
     private final Path directory;
     private final Path logPath;
     private final LabelInterner entities;
@@ -318,6 +335,8 @@ public final class GraphStagingStore implements AutoCloseable {
             out = openLog(logPath);
 
             text = EntityTextLog.open(directory.resolve(ENTITY_TEXT_LOG));
+
+            removeUnfinishedRewrites(directory);
 
             LOGGER.info("graph staging at {}: {} facts, {} entities, {} relations",
                 directory, existing, entities.size(), relations.size());
@@ -970,6 +989,31 @@ public final class GraphStagingStore implements AutoCloseable {
         return LabelInterner.inspect(interner, relationLabels
             ? () -> held.reach().relations()
             : () -> held.reach().entities());
+    }
+
+    /**
+     * Removes the replacements rewrites a crash cut short left beside the logs, durably.
+     *
+     * <p>See {@link #UNFINISHED_REWRITES}. Forced afterwards, so an erasure the node goes on to
+     * discharge is not discharged over a name a power loss could bring back.</p>
+     *
+     * @param directory The staging directory
+     * @throws IOException if one cannot be removed, or the removal forced
+     */
+    private static void removeUnfinishedRewrites(Path directory) throws IOException {
+        boolean removed = false;
+        for (String name : UNFINISHED_REWRITES) {
+            Path leftover = directory.resolve(name);
+            if (Files.deleteIfExists(leftover)) {
+                LOGGER.warn("removed {}, a rewrite of a staging log that a crash cut short; the "
+                    + "log itself is whole, and what the rewrite was for is applied again if it "
+                    + "is still owed", leftover);
+                removed = true;
+            }
+        }
+        if (removed) {
+            Durability.DEVICE.fsyncDirectory(directory);
+        }
     }
 
     /**

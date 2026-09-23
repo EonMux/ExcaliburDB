@@ -2,8 +2,10 @@ package com.eonmux.excalibur.graph.staging;
 
 import com.eonmux.excalibur.graph.dictionary.LabelDictionary;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
+import com.eonmux.excalibur.graph.file.GraphCorruptionException;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
@@ -41,40 +43,93 @@ public interface ReferencedLabels {
     /**
      * Reads the highest ids this holder refers to.
      *
-     * @return The highest entity and relation id held, with what holds each
-     * @throws IOException if the holder cannot be read; a label interner is then not opened,
-     *                     since whether it may give up an id cannot be decided
+     * @return The highest entity and relation id held, with what holds each; a holder that is
+     *         damaged answers {@link Reference#unknown} for the kinds it cannot say
+     * @throws IOException if the holder cannot be read for a reason other than damage; a label
+     *                     interner is then not opened, since whether it may give up an id cannot
+     *                     be decided
      */
     Reach reach() throws IOException;
 
     /**
-     * The highest id of one kind something holds.
+     * The highest id of one kind something holds, or that what may hold ids cannot say which.
      *
-     * @param highestId The id, or -1 when nothing is held
-     * @param heldBy    What holds it, phrased for the operator reading a refusal
+     * <p>A holder that is present and cannot be read - a published dictionary whose index no
+     * longer matches its checksum, or is missing from the graph it belongs to - may hold any id
+     * at all, so it is {@linkplain #unknown unknown} rather than empty: it outranks every id that
+     * can be read, and an interner with damage to cut refuses the cut, since whether the ids it
+     * would lose are held cannot be told. It stops nothing else: it is read only when an interner
+     * has damage to cut.</p>
+     *
+     * @param highestId      The id, or -1 when nothing is held; {@link Long#MAX_VALUE} when
+     *                       unknown
+     * @param heldBy         What holds it, phrased for the operator reading a refusal
+     * @param unknownBecause Why what holds ids cannot say which, or null when it could
      */
-    record Reference(long highestId, String heldBy) {
+    record Reference(long highestId, String heldBy, String unknownBecause) {
 
         /** Nothing held. */
         public static final Reference NONE = new Reference(-1, "nothing");
 
-        /** @throws NullPointerException if {@code heldBy} is null */
+        /**
+         * @throws NullPointerException if {@code heldBy} is null
+         * @throws IllegalArgumentException if the id is below -1, or an unknown reference names
+         *                                  an id
+         */
         public Reference {
             Objects.requireNonNull(heldBy, "heldBy must not be null");
             if (highestId < -1) {
                 throw new IllegalArgumentException("highestId must be -1 or an id, got "
                     + highestId);
             }
+            if (unknownBecause != null && highestId != Long.MAX_VALUE) {
+                throw new IllegalArgumentException("an unknown reference holds no particular id");
+            }
         }
 
         /**
-         * The higher of two references; this one when they are equal.
+         * A holder that was read.
+         *
+         * @param highestId The id, or -1 when nothing is held
+         * @param heldBy    What holds it
+         */
+        public Reference(long highestId, String heldBy) {
+            this(highestId, heldBy, null);
+        }
+
+        /**
+         * A holder that may hold ids and cannot be read to say which.
+         *
+         * @param heldBy What may hold them
+         * @param why    Why it cannot be read, for the operator
+         * @return The reference, which outranks every known one
+         * @throws NullPointerException if either argument is null
+         */
+        public static Reference unknown(String heldBy, String why) {
+            return new Reference(Long.MAX_VALUE, heldBy, Objects.requireNonNull(why, "why"));
+        }
+
+        /**
+         * Whether the holder was read, so {@link #highestId()} is an id it holds.
+         *
+         * @return false for a holder that cannot say which ids it holds
+         */
+        public boolean known() {
+            return unknownBecause == null;
+        }
+
+        /**
+         * The higher of two references; this one when they are equal. An unknown reference is
+         * higher than any known one.
          *
          * @param other The other reference
          * @return Whichever holds the higher id
          */
         public Reference higher(Reference other) {
-            return other.highestId > highestId ? other : this;
+            if (!known()) {
+                return this;
+            }
+            return !other.known() || other.highestId > highestId ? other : this;
         }
     }
 
@@ -132,6 +187,16 @@ public interface ReferencedLabels {
      * with and callers have kept. A graph a publish interrupted by a crash left set aside is read
      * too, since the node restores it when it opens the graph.</p>
      *
+     * <h3>A graph whose dictionary is damaged</h3>
+     * <p>Only the dictionaries are read, each verified against its checksum; damage anywhere else
+     * in the graph stops it being served and has no bearing on which ids it names. A dictionary
+     * that is damaged, or missing from a graph that is there, is {@linkplain Reference#unknown
+     * unknown} for its kind. The graph can be the only holder of an id: it names every label the
+     * interners held when it was built, including one no staged fact or text mentions any more,
+     * and it is how the ids queries answered with reached their callers. So when its dictionary
+     * cannot say which ids it names, an interner with damage to cut is refused rather than risk
+     * one of them; an interner with nothing to cut never asks, and opens as it would have.</p>
+     *
      * @param graphDirectory Where the graph is served from; need not exist
      * @return The holder
      * @throws NullPointerException if {@code graphDirectory} is null
@@ -143,13 +208,34 @@ public interface ReferencedLabels {
             for (Path graph : GraphBuilder.servedOrDisplaced(graphDirectory)) {
                 String heldBy = "the published graph at " + graph;
                 reach = reach.higher(new Reach(
-                    new Reference(LabelDictionary.highestId(graph,
-                        GraphBuilder.ENTITY_DICTIONARY), heldBy),
-                    new Reference(LabelDictionary.highestId(graph,
-                        GraphBuilder.RELATION_DICTIONARY), heldBy)));
+                    highestIn(graph, GraphBuilder.ENTITY_DICTIONARY, heldBy),
+                    highestIn(graph, GraphBuilder.RELATION_DICTIONARY, heldBy)));
             }
             return reach;
         };
+    }
+
+    /**
+     * The highest id one dictionary of a published graph names, or why it cannot say.
+     *
+     * @param graph      A graph directory that exists
+     * @param dictionary The dictionary's base name
+     * @param heldBy     How the graph is named in a refusal
+     * @return The reference
+     * @throws IOException if the dictionary cannot be read for a reason other than damage
+     */
+    private static Reference highestIn(Path graph, String dictionary, String heldBy)
+            throws IOException {
+        Path index = graph.resolve(dictionary + ".idx");
+        if (!Files.exists(index)) {
+            // Every build writes both dictionaries, so a graph without one has lost it.
+            return Reference.unknown(heldBy, "its dictionary " + index + " is missing");
+        }
+        try {
+            return new Reference(LabelDictionary.highestId(graph, dictionary), heldBy);
+        } catch (GraphCorruptionException damage) {
+            return Reference.unknown(heldBy, damage.getMessage());
+        }
     }
 
     /**

@@ -99,7 +99,7 @@ public final class EntityTextLog implements AutoCloseable {
     private static final int LEGACY_RECORD_HEADER_BYTES = 8;
 
     /** Suffix of the replacement a rewrite builds beside the log before swapping it in. */
-    private static final String REWRITE_SUFFIX = ".rewriting";
+    static final String REWRITE_SUFFIX = ".rewriting";
 
     /** What this log is called in messages. */
     private static final String WHAT = "entity text log";

@@ -294,18 +294,177 @@ class LabelIdReuseTest {
         }
 
         @Test
-        @DisplayName("a published dictionary that is not one is refused rather than read as empty")
-        void aDamagedDictionaryIsRefused(@TempDir Path dir) throws IOException {
+        @DisplayName("a published dictionary that is not one answers that it cannot be read")
+        void aDamagedDictionaryCannotAnswer(@TempDir Path dir) throws IOException {
             Path graph = Files.createDirectories(dir.resolve("graph"));
             Path index = graph.resolve(GraphBuilder.ENTITY_DICTIONARY + ".idx");
 
             Files.write(index, new byte[3]);
-            assertThatThrownBy(() -> ReferencedLabels.publishedIn(graph).reach())
-                .isInstanceOf(IOException.class).hasMessageContaining("shorter than its header");
+            ReferencedLabels.Reference shortIndex =
+                ReferencedLabels.publishedIn(graph).reach().entities();
+            assertThat(shortIndex.known()).isFalse();
+            assertThat(shortIndex.unknownBecause()).contains("shorter than its");
 
             Files.write(index, new byte[16]);
-            assertThatThrownBy(() -> ReferencedLabels.publishedIn(graph).reach())
-                .isInstanceOf(IOException.class).hasMessageContaining("not a label dictionary");
+            ReferencedLabels.Reference junk =
+                ReferencedLabels.publishedIn(graph).reach().entities();
+            assertThat(junk.known()).isFalse();
+            assertThat(junk.unknownBecause()).contains("not a label dictionary");
+        }
+
+        @Test
+        @DisplayName("what cannot be read outranks every id that can")
+        void unknownOutranksKnown() {
+            ReferencedLabels.Reference known = new ReferencedLabels.Reference(7, "a log");
+            ReferencedLabels.Reference unknown =
+                ReferencedLabels.Reference.unknown("a graph", "its index is damaged");
+
+            assertThat(known.higher(unknown)).isSameAs(unknown);
+            assertThat(unknown.higher(known)).isSameAs(unknown);
+            assertThat(known.known()).isTrue();
+            assertThatThrownBy(() -> new ReferencedLabels.Reference(-2, "a log"))
+                .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("a published graph whose dictionary is damaged")
+    class DamagedDictionary {
+
+        /**
+         * Stages Alice and Bob in one fact, names Carol only by interning her, and builds.
+         *
+         * @return The graph directory, whose entity dictionary is the only holder of Carol's id
+         */
+        private Path stagedAndBuilt(Path root) throws IOException {
+            Path graph = root.resolve("graph");
+            try (GraphStagingStore staging = GraphStagingStore.open(root.resolve("graph-staging"))) {
+                staging.append(fact("Alice", "knows", "Bob"));
+                staging.entityIdOf("Carol");
+                GraphBuilder.build(staging, graph);
+            }
+            return graph;
+        }
+
+        /** Alters the id in a dictionary's last entry to one that still sorts: well formed, wrong. */
+        private void alterLastId(Path graph, String dictionary, long id) throws IOException {
+            Path index = graph.resolve(dictionary + ".idx");
+            byte[] bytes = Files.readAllBytes(index);
+            java.nio.ByteBuffer view = java.nio.ByteBuffer.wrap(bytes)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            int count = view.getInt(12);
+            view.putLong(16 + (count - 1) * 16, id);
+            Files.write(index, bytes);
+        }
+
+        @Test
+        @DisplayName("keeps the ids it may hold: an entry altered to a lower id does not let the "
+            + "cut through")
+        void anAlteredEntryDoesNotVouchForTheCut(@TempDir Path root) throws IOException {
+            Path graph = stagedAndBuilt(root);
+            Path staging = root.resolve("graph-staging");
+            // Carol, id 2, is named by the dictionary alone. Read as 1, the cut would give her id
+            // to the next new label while callers still hold it from query answers.
+            alterLastId(graph, GraphBuilder.ENTITY_DICTIONARY, 1);
+            Path entities = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+            damageLastLabel(entities);
+            String before = fingerprint(entities);
+
+            assertThatThrownBy(() -> GraphStagingStore.open(staging,
+                    ReferencedLabels.publishedIn(graph)))
+                .isInstanceOf(LogCorruptionException.class)
+                .hasMessageContaining("cannot be read")
+                .hasMessageContaining(graph.resolve(GraphBuilder.ENTITY_DICTIONARY + ".idx")
+                    .toString());
+            assertThat(fingerprint(entities)).isEqualTo(before);
+        }
+
+        @Test
+        @DisplayName("refuses a cut when its header is damaged, naming why, and the inspection "
+            + "agrees")
+        void aDamagedHeaderRefusesTheCut(@TempDir Path root) throws IOException {
+            Path graph = stagedAndBuilt(root);
+            Path staging = root.resolve("graph-staging");
+            Files.write(graph.resolve(GraphBuilder.ENTITY_DICTIONARY + ".idx"), new byte[16]);
+            Path entities = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+            damageLastLabel(entities);
+
+            assertThatThrownBy(() -> GraphStagingStore.open(staging,
+                    ReferencedLabels.publishedIn(graph)))
+                .isInstanceOf(LogCorruptionException.class)
+                .hasMessageContaining("not a label dictionary");
+            assertThatThrownBy(() -> GraphStagingStore.inspectLabels(entities,
+                    ReferencedLabels.publishedIn(graph)))
+                .isInstanceOf(LogCorruptionException.class)
+                .hasMessageContaining("not a label dictionary");
+        }
+
+        @Test
+        @DisplayName("refuses a cut when it is missing from a graph that is there")
+        void aMissingDictionaryRefusesTheCut(@TempDir Path root) throws IOException {
+            Path graph = stagedAndBuilt(root);
+            Path staging = root.resolve("graph-staging");
+            Files.delete(graph.resolve(GraphBuilder.ENTITY_DICTIONARY + ".idx"));
+            damageLastLabel(staging.resolve(GraphStagingStore.ENTITY_LABELS));
+
+            assertThatThrownBy(() -> GraphStagingStore.open(staging,
+                    ReferencedLabels.publishedIn(graph)))
+                .isInstanceOf(LogCorruptionException.class)
+                .hasMessageContaining("missing");
+        }
+
+        @Test
+        @DisplayName("does not stop staging opening when no interner has anything to cut")
+        void stagingOpensOverAnIntactInterner(@TempDir Path root) throws IOException {
+            Path graph = stagedAndBuilt(root);
+            Path staging = root.resolve("graph-staging");
+            Files.write(graph.resolve(GraphBuilder.ENTITY_DICTIONARY + ".idx"), new byte[16]);
+            Files.write(graph.resolve(GraphBuilder.RELATION_DICTIONARY + ".idx"), new byte[3]);
+
+            try (GraphStagingStore store = GraphStagingStore.open(staging,
+                    ReferencedLabels.publishedIn(graph))) {
+                assertThat(store.entityCount()).isEqualTo(3);
+                store.append(fact("Carol", "knows", "Dave"));
+                assertThat(store.entityIdOf("Dave")).isEqualTo(3);
+            }
+        }
+
+        @Test
+        @DisplayName("of one kind does not decide a cut of the other")
+        void onlyTheDamagedKindIsUnknown(@TempDir Path root) throws IOException {
+            Path graph = root.resolve("graph");
+            Path staging = root.resolve("graph-staging");
+            try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+                store.append(fact("Alice", "knows", "Bob"));
+                GraphBuilder.build(store, graph);
+                // Interned after the build: no graph names it, and nothing staged does.
+                store.entityIdOf("Carol");
+            }
+            Files.write(graph.resolve(GraphBuilder.RELATION_DICTIONARY + ".idx"), new byte[16]);
+            damageLastLabel(staging.resolve(GraphStagingStore.ENTITY_LABELS));
+
+            try (GraphStagingStore store = GraphStagingStore.open(staging,
+                    ReferencedLabels.publishedIn(graph))) {
+                assertThat(store.entityLabels()).containsExactly("Alice", "Bob");
+            }
+        }
+
+        @Test
+        @DisplayName("elsewhere than its dictionaries still vouches for the cut through them")
+        void damageBesideTheDictionariesDoesNotMatter(@TempDir Path root) throws IOException {
+            Path graph = stagedAndBuilt(root);
+            Path staging = root.resolve("graph-staging");
+            Path column = graph.resolve(
+                com.eonmux.excalibur.graph.format.EdgeColumn.EDGES_FWD.fileName());
+            byte[] bytes = Files.readAllBytes(column);
+            bytes[bytes.length / 2] ^= 0x20;
+            Files.write(column, bytes);
+            damageLastLabel(staging.resolve(GraphStagingStore.ENTITY_LABELS));
+
+            assertThatThrownBy(() -> GraphStagingStore.open(staging,
+                    ReferencedLabels.publishedIn(graph)))
+                .isInstanceOf(LogCorruptionException.class)
+                .hasMessageContaining("id 2 is held by the published graph");
         }
     }
 

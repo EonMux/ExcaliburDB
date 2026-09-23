@@ -390,6 +390,52 @@ class GraphStagingLogCheckTest {
     }
 
     @Test
+    @DisplayName("a damaged last label is corrupt while the published graph's dictionary, which "
+        + "may name it, cannot be read - and the damaged graph is not moved aside")
+    void aDamagedLastLabelBesideADamagedDictionaryIsCorrupt() throws IOException {
+        Path graph = dataDir.resolve("shared/graph");
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            store.entityIdOf("Carol");
+            com.eonmux.excalibur.graph.staging.GraphBuilder.build(store, graph);
+        }
+        Path index = graph.resolve(
+            com.eonmux.excalibur.graph.staging.GraphBuilder.ENTITY_DICTIONARY + ".idx");
+        flip(index, Files.size(index) / 2);
+        Path file = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+        flip(file, Files.size(file) - Integer.BYTES - 1);
+
+        FileCheck result = check(GraphStagingStore.ENTITY_LABELS);
+        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir).scan());
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.needsOperator()).isTrue();
+        assertThat(result.detail()).contains("cannot be read").contains(index.toString());
+        assertThat(plan.actions())
+            .as("moving the graph away would let the node cut ids its dictionary may name")
+            .isEmpty();
+        assertThat(plan.needsOperator()).anySatisfy(note -> assertThat(note)
+            .startsWith("shared/graph ")
+            .contains(GraphStagingStore.ENTITY_LABELS));
+    }
+
+    @Test
+    @DisplayName("a damaged graph beside an interner with nothing to cut is moved aside as before")
+    void aDamagedGraphBesideSoundInternersIsQuarantined() throws IOException {
+        Path graph = dataDir.resolve("shared/graph");
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            com.eonmux.excalibur.graph.staging.GraphBuilder.build(store, graph);
+        }
+        Path index = graph.resolve(
+            com.eonmux.excalibur.graph.staging.GraphBuilder.ENTITY_DICTIONARY + ".idx");
+        flip(index, Files.size(index) / 2);
+
+        RepairPlan plan = RepairPlanner.plan(new DataDirectoryScanner(dataDir).scan());
+
+        assertThat(plan.actions()).singleElement()
+            .satisfies(action -> assertThat(action.subject()).isEqualTo(graph));
+    }
+
+    @Test
     @DisplayName("a damaged last label an outstanding erasure refers to is corrupt")
     void aDamagedLastLabelAnErasureHoldsIsCorrupt() throws IOException {
         int carol;

@@ -188,6 +188,7 @@ public final class GraphTenant implements AutoCloseable {
             // what is there, and answers null when there is no graph.
             Path withheldMarker = stagingDirectory.resolve(ERASURE_INTERRUPTED_MARKER);
             boolean withhold = erasureInterrupted(directory, withheldMarker, erasureLog);
+            removeStaleScratch(id, directory, withhold);
             GraphRagHolder holder = new GraphRagHolder(
                 directory, withhold ? null : openServable(id, config, directory, models));
             opened.push(holder);
@@ -296,6 +297,52 @@ public final class GraphTenant implements AutoCloseable {
             Files.delete(withheldMarker);
         }
         return (restored || scratchLeft || marked) && owed;
+    }
+
+    /**
+     * Removes the scratch a build or compaction that died left beside the graph.
+     *
+     * <p>Each is a whole graph that nothing serves, and each may hold what an erasure has since
+     * removed from staging and from the served graph - a name, a relationship, a snippet of
+     * prose - until something clears it. Nothing else would soon: a build clears its scratch
+     * only when the next build starts, and a namespace may not be built again for a long time.</p>
+     *
+     * <p>No build or compaction can be using either now. Both run only in the tenant that owns
+     * the directory, holding its replacement lock, and this tenant is opening: exactly one is
+     * ever open per namespace directory, and the one before it is closed. Publish recovery has
+     * already run, and it restores from the displaced graph a publish set aside, never from a
+     * build's scratch.</p>
+     *
+     * <p>A compaction's scratch is kept when the graph is withheld, since it is then one of the
+     * signs that an erasure was interrupted, and a node that has not yet applied what is owed
+     * must find that sign again if it stops before it does. The erasure that applies what is
+     * owed removes it before it discharges anything.</p>
+     *
+     * <p>A scratch that cannot be removed does not fail the open: it is logged, and the next
+     * erasure discharged refuses to complete until it is gone.</p>
+     *
+     * @param id        The namespace, for the log lines
+     * @param directory Where the graph is served from
+     * @param withhold  Whether the graph is withheld because an erasure was interrupted
+     */
+    private static void removeStaleScratch(NamespaceId id, Path directory, boolean withhold) {
+        List<Path> stale = withhold
+            ? List.of(GraphBuilder.scratchFor(directory))
+            : List.of(GraphBuilder.scratchFor(directory), EdgeStoreCompactor.scratchFor(directory));
+        for (Path scratch : stale) {
+            if (!Files.exists(scratch)) {
+                continue;
+            }
+            try {
+                GraphBuilder.discard(scratch);
+                LOGGER.warn("graph tenant {} removed {}, which a build or compaction that did not "
+                    + "finish left behind", id, scratch);
+            } catch (IOException e) {
+                LOGGER.error("graph tenant {} could not remove {}, which a build or compaction "
+                    + "that did not finish left behind and which may hold erased data: {}. No "
+                    + "erasure is discharged until it is gone", id, scratch, e.toString());
+            }
+        }
     }
 
     /**

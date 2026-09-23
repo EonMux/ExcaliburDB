@@ -371,6 +371,55 @@ class GraphStoreCheckTest {
     }
 
     @Test
+    @DisplayName("an interner counts as having damage to cut as its open would judge it")
+    void internersWithDamageAreJudgedAsTheOpenJudgesThem(@TempDir Path tempDir)
+            throws IOException {
+        Path dataDir = builtNamespace(tempDir);
+        Path graph = dataDir.resolve(GRAPH);
+        Path staging = dataDir.resolve(NAMESPACE + "/graph-staging");
+        assertThat(GraphStoreCheck.internersWithDamageBeside(graph)).isEmpty();
+
+        // A creation cut short held no id, and its open asks nobody.
+        Files.write(staging.resolve(GraphStagingStore.RELATION_LABELS),
+            Arrays.copyOf(com.eonmux.excalibur.graph.file.LogHeader.of(
+                com.eonmux.excalibur.graph.staging.LabelInterner.MAGIC,
+                com.eonmux.excalibur.graph.staging.LabelInterner.VERSION), 5));
+        assertThat(GraphStoreCheck.internersWithDamageBeside(graph)).isEmpty();
+
+        // Bytes that are not an interner at all: what its open would do cannot be told.
+        Files.writeString(staging.resolve(GraphStagingStore.ENTITY_LABELS),
+            "not a label interner, and longer than its header");
+        assertThat(GraphStoreCheck.internersWithDamageBeside(graph))
+            .containsExactly(staging.resolve(GraphStagingStore.ENTITY_LABELS).toAbsolutePath());
+    }
+
+    @Test
+    @DisplayName("the move is refused at the moment of acting if a staging interner beside the "
+        + "graph has since been found with damage to cut")
+    void refusedAtApplyTimeOverADamagedInterner(@TempDir Path tempDir) throws IOException {
+        Path dataDir = builtNamespace(tempDir);
+        flip(dataDir.resolve(GRAPH).resolve(EdgeColumn.EDGES_FWD.fileName()));
+        RepairPlan plan = RepairPlanner.plan(scan(dataDir));
+        Path interner = dataDir.resolve(NAMESPACE + "/graph-staging")
+            .resolve(GraphStagingStore.RELATION_LABELS);
+        byte[] labels = Files.readAllBytes(interner);
+        labels[labels.length - Integer.BYTES - 1] ^= 0x40;
+        Files.write(interner, labels);
+
+        List<RepairOutcome> outcomes;
+        try (PrintStream out = new PrintStream(new ByteArrayOutputStream(), true,
+                StandardCharsets.UTF_8)) {
+            outcomes = new RepairExecutor(new Quarantine(tempDir.resolve("q")), out).apply(plan);
+        }
+
+        assertThat(outcomes).singleElement().satisfies(outcome -> {
+            assertThat(outcome.applied()).isFalse();
+            assertThat(outcome.detail()).contains(GraphStagingStore.RELATION_LABELS);
+        });
+        assertThat(dataDir.resolve(GRAPH)).isDirectory();
+    }
+
+    @Test
     @DisplayName("scratch a build or a compaction left is recognised, unchecked and left alone")
     void scratch(@TempDir Path tempDir) throws IOException {
         Path dataDir = builtNamespace(tempDir);
@@ -384,16 +433,56 @@ class GraphStoreCheckTest {
 
         assertThat(under(scan, GRAPH + ".building")).isNotEmpty().allSatisfy(file -> {
             assertThat(file.status()).isEqualTo(CheckStatus.UNCHECKED);
-            assertThat(file.detail()).contains("next build deletes");
+            assertThat(file.detail()).contains("deletes it when the namespace next opens")
+                .contains("before it discharges an erasure");
         });
         assertThat(under(scan, GRAPH + ".compacting")).isNotEmpty().allSatisfy(file -> {
             assertThat(file.status()).isEqualTo(CheckStatus.UNCHECKED);
-            assertThat(file.detail()).contains("erasure may have been interrupted");
+            assertThat(file.detail()).contains("erasure may have been interrupted")
+                .contains("deletes it when the namespace next opens")
+                .contains("before it discharges");
         });
         assertThat(scan.hasDamage()).isFalse();
         assertThat(RepairPlanner.plan(scan).isEmpty())
             .as("moving the compaction's scratch would hide an interrupted erasure from the node")
             .isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"triples.log.erasing", "triples.log.rewriting",
+        "entity_text.log.rewriting", "entities.labels.rewriting", "relations.labels.rewriting"})
+    @DisplayName("a staging rewrite that did not finish is left for the node, which deletes it on "
+        + "open, rather than moved where it would keep what an erasure removed")
+    void aStagingRewriteLeftoverIsLeftForTheNode(String name, @TempDir Path tempDir)
+            throws IOException {
+        assertThat(GraphStagingStore.UNFINISHED_REWRITES).contains(name);
+        Path dataDir = builtNamespace(tempDir);
+        String relative = NAMESPACE + "/graph-staging/" + name;
+        Files.writeString(dataDir.resolve(relative), "Ada Lovelace wrote the first algorithm.");
+
+        DataDirectoryScan scan = scan(dataDir);
+
+        FileCheck verdict = verdictOn(scan, relative);
+        assertThat(verdict.status()).isEqualTo(CheckStatus.UNCHECKED);
+        assertThat(verdict.detail()).contains("deletes it when the namespace next opens");
+        RepairPlan plan = RepairPlanner.plan(scan);
+        assertThat(plan.actions())
+            .noneMatch(action -> action.kind() == RepairKind.QUARANTINE_STAGING_LEFTOVER);
+        assertThat(Files.exists(dataDir.resolve(relative))).isTrue();
+    }
+
+    @Test
+    @DisplayName("a leftover with a staging rewrite's name outside graph staging is still "
+        + "quarantined")
+    void aLeftoverElsewhereIsStillQuarantined(@TempDir Path tempDir) throws IOException {
+        Path dataDir = builtNamespace(tempDir);
+        String relative = NAMESPACE + "/triples.log.rewriting";
+        Files.writeString(dataDir.resolve(relative), "x");
+
+        RepairPlan plan = RepairPlanner.plan(scan(dataDir));
+
+        assertThat(plan.actions())
+            .anyMatch(action -> action.kind() == RepairKind.QUARANTINE_STAGING_LEFTOVER);
     }
 
     @Test

@@ -196,6 +196,37 @@ class LabelDictionaryTest {
         }
 
         @Test
+        @DisplayName("the highest id is refused from an index whose checksum fails, not read off "
+            + "a damaged entry")
+        void highestIdIsVerified(@TempDir Path dir) throws IOException {
+            new LabelDictionaryWriter().put(3, "three").put(9, "nine").write(dir, "entities");
+            Path index = dir.resolve("entities.idx");
+            byte[] bytes = Files.readAllBytes(index);
+            // The last entry's id, altered to one that still sorts after the first: the index
+            // is well formed, and only its checksum says the answer would be wrong.
+            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+                .putLong(LabelDictionary.HEADER_BYTES + LabelDictionary.ENTRY_BYTES, 4);
+            Files.write(index, bytes);
+
+            assertThatThrownBy(() -> LabelDictionary.highestId(dir, "entities"))
+                .isInstanceOf(com.eonmux.excalibur.graph.file.GraphCorruptionException.class)
+                .hasMessageContaining("entities.idx");
+        }
+
+        @Test
+        @DisplayName("the highest id of an index that is not a dictionary is refused as damage")
+        void highestIdOfJunkIsDamage(@TempDir Path dir) throws IOException {
+            Files.write(dir.resolve("entities.idx"), new byte[16]);
+
+            assertThatThrownBy(() -> LabelDictionary.highestId(dir, "entities"))
+                .isInstanceOf(com.eonmux.excalibur.graph.file.GraphCorruptionException.class)
+                .hasMessageContaining("not a label dictionary");
+            assertThat(LabelDictionary.highestId(dir, "relations"))
+                .as("an absent dictionary names nothing")
+                .isEqualTo(-1);
+        }
+
+        @Test
         @DisplayName("the highest id is read from a version 1 index as from a current one")
         void highestIdAcrossVersions(@TempDir Path dir) throws IOException {
             new LabelDictionaryWriter().put(3, "three").put(9, "nine").write(dir, "entities");

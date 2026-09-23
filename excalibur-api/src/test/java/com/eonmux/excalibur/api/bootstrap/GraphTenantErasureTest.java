@@ -506,5 +506,113 @@ class GraphTenantErasureTest {
         assertThat(anyFileContains(directory, NAME_TERM)).isFalse();
         assertThat(marker).doesNotExist();
     }
+
+    /** Copies a graph directory, as the scratch of a build or compaction that died holds one. */
+    private static Path copyOf(Path directory, Path copy) throws IOException {
+        try (var walk = Files.walk(directory)) {
+            for (Path source : walk.toList()) {
+                Path target = copy.resolve(directory.relativize(source).toString());
+                if (Files.isDirectory(source)) {
+                    Files.createDirectories(target);
+                } else {
+                    Files.copy(source, target);
+                }
+            }
+        }
+        return copy;
+    }
+
+    @Test
+    @DisplayName("an erasure leaves no copy of what it covers anywhere under the namespace, a "
+        + "build's leftover scratch included")
+    void anErasureRemovesABuildsLeftoverScratch(@TempDir Path root) throws IOException {
+        // A build that fails after assembling - or whose publish is rolled back - leaves its
+        // scratch until the next build: a whole graph, name and prose included, that nothing
+        // serves and an erasure would otherwise never look at.
+        Path directory = root.resolve("graph");
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            stageAndBuild(tenant);
+            Path scratch = copyOf(directory,
+                com.eonmux.excalibur.graph.staging.GraphBuilder.scratchFor(directory));
+            assertThat(anyFileContains(scratch, NAME_TERM)).isTrue();
+
+            tenant.erasureService()
+                .submit(new ErasureScope.Entity(tenant.staging().entityIdOf("Alice "
+                    + "Quazzlethorpe")));
+            GraphErasureService.ErasureOutcome outcome = tenant.erasureService().compactNow();
+
+            assertThat(outcome.requestsSatisfied()).isEqualTo(1);
+            assertThat(scratch).doesNotExist();
+        }
+        assertThat(anyFileContains(root, NAME_TERM))
+            .as("not in the served graph, not in staging, not beside either")
+            .isFalse();
+        assertThat(anyFileContains(root, WITHDRAWN_TERM)).isFalse();
+    }
+
+    @Test
+    @DisplayName("a build's leftover scratch is removed when the tenant opens, since no build can "
+        + "be running then")
+    void aBuildsLeftoverScratchIsRemovedOnOpen(@TempDir Path root) throws IOException {
+        Path directory = root.resolve("graph");
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            stageAndBuild(tenant);
+        }
+        Path scratch = copyOf(directory,
+            com.eonmux.excalibur.graph.staging.GraphBuilder.scratchFor(directory));
+
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            assertThat(scratch).doesNotExist();
+            assertThat(tenant.holder().isPresent()).isTrue();
+        }
+    }
+
+    @Test
+    @DisplayName("a compaction's leftover scratch with nothing owed is removed when the tenant "
+        + "opens, and the graph is served")
+    void aCompactionsLeftoverScratchWithNothingOwedIsRemovedOnOpen(@TempDir Path root)
+            throws IOException {
+        Path directory = root.resolve("graph");
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            stageAndBuild(tenant);
+        }
+        Path scratch = copyOf(directory, EdgeStoreCompactor.scratchFor(directory));
+
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            assertThat(scratch).doesNotExist();
+            assertThat(tenant.erasureService().servingWithheld()).isFalse();
+            assertThat(tenant.holder().isPresent()).isTrue();
+        }
+    }
+
+    @Test
+    @DisplayName("a compaction's leftover scratch beside what is owed is kept as the sign it is "
+        + "until the erasure is applied, and removed with it even when nothing needs rewriting")
+    void aCompactionsLeftoverScratchIsKeptUntilTheErasureIsApplied(@TempDir Path root)
+            throws IOException {
+        Path directory = root.resolve("graph");
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            stageAndBuild(tenant);
+            // A document nothing was extracted from: the compaction has nothing to rewrite, and
+            // so no scratch of its own to replace the leftover with.
+            tenant.erasureService().submit(new ErasureScope.Source(SourceType.DOCUMENT, 999));
+        }
+        Path scratch = copyOf(directory, EdgeStoreCompactor.scratchFor(directory));
+
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            assertThat(tenant.erasureService().outstandingCount()).isZero();
+            assertThat(tenant.holder().isPresent()).isTrue();
+        }
+        assertThat(scratch).doesNotExist();
+        assertThat(GraphTenant.stagingDirectoryOf(directory)
+            .resolve(GraphTenant.ERASURE_INTERRUPTED_MARKER)).doesNotExist();
+    }
 }
 

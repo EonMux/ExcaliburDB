@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.graph.dictionary;
 
+import com.eonmux.excalibur.core.integrity.IntegrityReport;
+import com.eonmux.excalibur.graph.file.GraphCorruptionException;
 import com.eonmux.excalibur.graph.format.EdgeStoreDescriptor;
 
 import org.slf4j.Logger;
@@ -162,46 +164,72 @@ public final class LabelDictionary
      *
      * <p>For a caller that needs to know which ids a published graph has already given out -
      * the staging store, before it lets a label interner give one up - and has no use for the
-     * names. The index is sorted by id, so this reads the header and the last entry and nothing
-     * else.</p>
+     * names. The index is sorted by id, so the answer is its last entry.</p>
+     *
+     * <p>The index is verified against its checksum first, in full, as an open verifies it; the
+     * text is not read, since it names nothing. An answer read off a damaged index would be
+     * worse than none: an entry whose id rotted to a lower one would say the graph holds fewer
+     * ids than it does, and the caller would give one of them to a new label. A version 1 index
+     * carries no checksum and is held to its structure, as an open holds it.</p>
      *
      * @param directory The directory the dictionary was published in
      * @param name      The base name, without extension
      * @return The highest id with an entry, or -1 when the dictionary is absent or empty
-     * @throws IOException if the index is present and is not a dictionary this build reads
+     * @throws GraphCorruptionException if the index is present and is not the one written: not a
+     *         dictionary, cut short or extended, or failing its checksum
+     * @throws IOException if the index cannot be read, or is at a version this build does not
+     *         read
      */
     public static long highestId(Path directory, String name) throws IOException {
         Path indexPath = directory.resolve(name + ".idx");
         if (!Files.exists(indexPath)) {
             return -1;
         }
+        IntegrityReport verdict = LabelDictionaryIntegrity.inspectIndex(directory, name);
+        switch (verdict.status()) {
+            case CORRUPT, MISSING -> throw new GraphCorruptionException(indexPath,
+                LabelDictionaryIntegrity.INDEX_FORMAT + " " + indexPath + " failed its integrity "
+                    + "check: " + verdict.detail());
+            case UNREADABLE -> throw new IOException(LabelDictionaryIntegrity.INDEX_FORMAT + " "
+                + indexPath + " cannot be read: " + verdict.detail());
+            default -> {
+                // Intact, or a version 1 index that holds together: its entries can be read.
+            }
+        }
         try (FileChannel channel = FileChannel.open(indexPath, StandardOpenOption.READ)) {
-            long indexBytes = channel.size();
             java.nio.ByteBuffer header = java.nio.ByteBuffer.allocate(HEADER_BYTES)
                 .order(EdgeStoreDescriptor.COLUMN_BYTE_ORDER);
-            if (indexBytes < HEADER_BYTES || channel.read(header, 0) < HEADER_BYTES) {
-                throw new IOException(indexPath + " is shorter than its header");
-            }
-            if (header.getLong(0) != MAGIC) {
-                throw new IOException(indexPath + " is not a label dictionary");
-            }
-            int version = header.getInt(8);
-            if (version < OLDEST_VERSION || version > VERSION) {
-                throw new IOException(indexPath + " is version " + version
-                    + "; this build reads versions " + OLDEST_VERSION + " to " + VERSION);
-            }
+            readFully(channel, header, 0);
             int count = header.getInt(12);
-            if (count < 0 || HEADER_BYTES + (long) count * ENTRY_BYTES > indexBytes) {
-                throw new IOException(indexPath + " declares " + count
-                    + " entries, which does not fit in " + indexBytes + " bytes");
-            }
             if (count == 0) {
                 return -1;
             }
             java.nio.ByteBuffer last = java.nio.ByteBuffer.allocate(Long.BYTES)
                 .order(EdgeStoreDescriptor.COLUMN_BYTE_ORDER);
-            channel.read(last, HEADER_BYTES + (long) (count - 1) * ENTRY_BYTES);
+            readFully(channel, last, HEADER_BYTES + (long) (count - 1) * ENTRY_BYTES);
             return last.getLong(0);
+        }
+    }
+
+    /**
+     * Fills a buffer from a position in a channel.
+     *
+     * @param channel  The channel
+     * @param buffer   The buffer to fill
+     * @param position Where to read from
+     * @throws IOException if the read fails or the file ends first, which a file verified a
+     *                     moment earlier does only when something else is changing it
+     */
+    private static void readFully(FileChannel channel, java.nio.ByteBuffer buffer, long position)
+            throws IOException {
+        long at = position;
+        while (buffer.hasRemaining()) {
+            int read = channel.read(buffer, at);
+            if (read < 0) {
+                throw new IOException("the label dictionary index ended at " + at
+                    + " while it was being read");
+            }
+            at += read;
         }
     }
 

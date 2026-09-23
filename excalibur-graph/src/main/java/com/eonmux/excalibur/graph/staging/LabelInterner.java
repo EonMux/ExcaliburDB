@@ -124,7 +124,7 @@ public final class LabelInterner implements AutoCloseable {
     public static final int MAX_LABEL_BYTES = 4096;
 
     /** Suffix of the whole-file replacement a tombstoning rewrite builds before swapping it in. */
-    private static final String REWRITE_SUFFIX = ".rewriting";
+    static final String REWRITE_SUFFIX = ".rewriting";
 
     /** What this log is called in messages. */
     private static final String WHAT = "label interner";
@@ -356,10 +356,24 @@ public final class LabelInterner implements AutoCloseable {
     private static void requireUnheld(Path path, int kept, long torn, long cut, Holders holders)
             throws IOException {
         ReferencedLabels.Reference held = holders.highest();
-        if (held.highestId() < kept) {
+        if (held.known() && held.highestId() < kept) {
             return;
         }
         String among = cut == 0 ? "" : ", " + cut + " intact label(s) among them,";
+        if (!held.known()) {
+            throw new LogCorruptionException(WHAT + " " + path + " holds " + kept + " intact "
+                + "labels and then " + torn + " bytes that do not all read as labels" + among
+                + " and whether any id from " + kept + " on is in use cannot be told: "
+                + held.heldBy() + " may name such ids, and it cannot be read - "
+                + held.unknownBecause() + ". That graph names every label staging held when it "
+                + "was built, including ones nothing staged mentions any more, and queries have "
+                + "answered with its ids; cutting the damage off could give one of them to a new "
+                + "label, and whoever holds it would find a different entity behind it. This "
+                + "build refuses to open the interner instead. Restore the graph or the staging "
+                + "directory from a backup, or rebuild staging from the source documents, before "
+                + "restarting. Removing the damaged graph does not make the cut safe: the ids it "
+                + "answered with are held by its callers, not by the file.");
+        }
         throw new LogCorruptionException(WHAT + " " + path + " holds " + kept + " intact labels "
             + "and then " + torn + " bytes that do not all read as labels" + among + " but id "
             + held.highestId() + " is held by " + held.heldBy() + ". A label is forced to the "

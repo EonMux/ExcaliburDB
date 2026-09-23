@@ -92,9 +92,10 @@ public final class RepairExecutor {
      * engine's own {@code discardStagedPair} forces the mapping's removal before it touches
      * the graph. A directory that cannot be forced leaves the graph where it is.</p>
      *
-     * <p>A tenant's built graph is moved only while no displaced copy of it sits beside it,
-     * checked again here because the plan describes the directory as it was: see
-     * {@link GraphStoreCheck#displacedBeside}.</p>
+     * <p>A tenant's built graph is moved only while no displaced copy of it sits beside it and no
+     * staging interner beside it has damage to cut, checked again here because the plan
+     * describes the directory as it was: see {@link GraphStoreCheck#displacedBeside} and
+     * {@link GraphStoreCheck#internersWithDamageBeside}.</p>
      *
      * @param action What to do
      * @return What happened
@@ -108,6 +109,13 @@ public final class RepairExecutor {
                     + displaced.get(0).getFileName() + " is now beside it. With nothing left in "
                     + "its place the node would restore that copy and serve it, and a copy an "
                     + "erasure compaction replaced still holds what the erasure removed");
+            }
+            List<Path> interners = GraphStoreCheck.internersWithDamageBeside(action.subject());
+            if (!interners.isEmpty()) {
+                return new RepairOutcome(action, false, "not moved, because "
+                    + interners.get(0).getFileName() + " beside it now holds damage its open "
+                    + "would cut off, and the graph's dictionaries are what refuses that cut "
+                    + "when they name an id the cut would lose");
             }
         }
         Path stagedMapping = stagedMappingBeside(action.subject());
