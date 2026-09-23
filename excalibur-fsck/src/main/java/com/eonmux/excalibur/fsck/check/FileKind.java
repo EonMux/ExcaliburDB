@@ -166,8 +166,9 @@ public enum FileKind {
      *
      * <p>The other way damage can cost the node nothing but the file. The source status history
      * is not rebuilt - what each source's last crawl did is not derivable from anything else -
-     * but nothing the node serves depends on it either: one that does not read back whole is
-     * logged and treated as empty, each source reports from its next run, and the file is
+     * but nothing the node serves depends on it either: one its reader will not take - cut
+     * short, without a header, or at a version this build does not read - is logged and treated
+     * as empty, each source reports from its next run, and the file is
      * rewritten when the first run ends. What is lost is the history, never data.</p>
      *
      * @return true for a kind the node discards, rather than refuses to start on, when damaged

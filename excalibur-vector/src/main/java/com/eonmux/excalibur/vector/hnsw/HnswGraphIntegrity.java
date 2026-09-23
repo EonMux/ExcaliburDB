@@ -136,6 +136,9 @@ final class HnswGraphIntegrity {
      * @return What the check concluded
      */
     static IntegrityReport inspect(MappedFile file, Path path, int version) {
+        if (!HnswGraphHeader.isSupportedVersion(version)) {
+            return unsupported(path, version);
+        }
         if (version < HnswGraphHeader.VERSION) {
             return IntegrityReport.legacy(path, FORMAT, version);
         }
@@ -203,6 +206,9 @@ final class HnswGraphIntegrity {
                 "the file does not start with the HNSW magic number");
         }
         int version = view.getInt(8);
+        if (!HnswGraphHeader.isSupportedVersion(version)) {
+            return unsupported(path, version);
+        }
         if (version < HnswGraphHeader.VERSION) {
             return IntegrityReport.legacy(path, FORMAT, version);
         }
@@ -227,6 +233,19 @@ final class HnswGraphIntegrity {
             return payloadMismatch(path, covered, storedPayloadCrc, actualPayloadCrc);
         }
         return IntegrityReport.intact(path, FORMAT, covered + " bytes of graph data verified");
+    }
+
+    /**
+     * Reports a graph at a version the opener refuses.
+     *
+     * <p>Checked before the version is compared with the current one, because both
+     * comparisons are one-sided: a version above the current one would otherwise be checked as
+     * if it were the current layout and could pass, and one below the oldest would be called
+     * legacy - and the opener refuses both.</p>
+     */
+    private static IntegrityReport unsupported(Path path, int version) {
+        return IntegrityReport.unsupportedVersion(path, FORMAT, version,
+            HnswGraphHeader.VERSION_WITHOUT_METRIC, HnswGraphHeader.VERSION);
     }
 
     /**

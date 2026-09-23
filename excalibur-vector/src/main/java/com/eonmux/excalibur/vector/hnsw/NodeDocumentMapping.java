@@ -565,6 +565,19 @@ public class NodeDocumentMapping {
     }
 
     /**
+     * Reports whether this build reads a mapping file written at a given version.
+     *
+     * <p>The one statement of the range, shared by the loader and the verifier, so that a
+     * version the loader refuses is never one the verifier vouches for.</p>
+     *
+     * @param version The version a file's header names
+     * @return true for {@link #VERSION_V1} through {@link #VERSION}
+     */
+    static boolean isSupportedVersion(int version) {
+        return version == VERSION || version == VERSION_DOCUMENT_KEYED || version == VERSION_V1;
+    }
+
+    /**
      * What the entries of a file at a given version name.
      *
      * @param version A version {@link #readVersion} accepted
@@ -816,7 +829,7 @@ public class NodeDocumentMapping {
             throw new IOException("Invalid mapping file (bad magic number): " + mappingPath);
         }
         int version = probe.getInt(Long.BYTES);
-        if (version != VERSION && version != VERSION_DOCUMENT_KEYED && version != VERSION_V1) {
+        if (!isSupportedVersion(version)) {
             throw new IOException("Unsupported mapping file version " + version + " in "
                 + mappingPath);
         }

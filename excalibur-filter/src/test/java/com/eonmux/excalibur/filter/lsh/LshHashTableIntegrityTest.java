@@ -203,6 +203,23 @@ class LshHashTableIntegrityTest {
     }
 
     @Test
+    @DisplayName("a version 1 file, which this build does not open, is unreadable, not legacy")
+    void versionOneIsUnreadableBecauseItIsNotOpened() throws IOException {
+        Path tableFile = writeVersionTwoTable("version-one.dat");
+
+        writeInt(tableFile, LshHashTable.OFFSET_VERSION, 1);
+
+        var report = LshHashTable.verifyIntegrity(tableFile);
+        assertThat(report.status())
+            .as("the engine refuses a version 1 table on open, so a verifier that calls it "
+                + "legacy passes a file the node will not serve from")
+            .isEqualTo(IntegrityStatus.UNREADABLE);
+        assertThat(report.detail()).contains("format version 1").contains("versions 2 to 3");
+        assertThatThrownBy(() -> new LshHashTable(tableFile, DIMENSIONS, NUM_BITS, SEED))
+            .hasMessageContaining("version");
+    }
+
+    @Test
     @DisplayName("a genuine version 2 file is still reported legacy, not corrupt")
     void genuineLegacyFileIsStillLegacy() throws IOException {
         Path tableFile = writeVersionTwoTable("genuine-legacy.dat");

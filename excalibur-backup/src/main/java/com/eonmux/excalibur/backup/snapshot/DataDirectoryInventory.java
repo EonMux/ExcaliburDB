@@ -124,7 +124,8 @@ public final class DataDirectoryInventory {
      */
     public static String reason(String relativePath) {
         if (relativePath.endsWith(STAGED_MAPPING_SUFFIX)) {
-            return "the node-to-document mapping an interrupted HNSW compaction staged; with "
+            return "the node mapping - each node's chunk, or its document in a file an older "
+                + "build wrote - that an interrupted HNSW compaction staged; with "
                 + "its compacted graph beside it the node discards both, and without it the "
                 + "graph swap completed and this is the only mapping that matches the graph, "
                 + "which the node installs on open - so it is copied either way";
@@ -136,7 +137,7 @@ public final class DataDirectoryInventory {
         }
         return switch (classify(relativePath)) {
             case REQUIRED_DERIVED -> "vector index; derived from the segments in principle, "
-                + "but nothing rebuilds it, and a graph and its document mapping must be "
+                + "but nothing rebuilds it, and a graph and its node mapping must be "
                 + "restored as the pair they were written as";
             case TRANSIENT -> "a staged name left by a write that was never published; "
                 + "nothing reads it and copying it would put scratch in the image";

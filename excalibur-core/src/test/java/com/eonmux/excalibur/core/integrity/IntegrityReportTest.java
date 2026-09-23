@@ -63,6 +63,20 @@ class IntegrityReportTest {
     }
 
     @Test
+    @DisplayName("a version this build does not read is unreadable, and names what is read")
+    void unsupportedVersionIsUnreadable() {
+        IntegrityReport range = IntegrityReport.unsupportedVersion(FILE, "test", 4, 1, 3);
+        IntegrityReport single = IntegrityReport.unsupportedVersion(FILE, "test", 2, 1, 1);
+
+        assertThat(range.status()).isEqualTo(IntegrityStatus.UNREADABLE);
+        assertThat(range.loadable()).isFalse();
+        assertThat(range.verified()).isFalse();
+        assertThat(range.detail()).contains("format version 4").contains("versions 1 to 3");
+        assertThat(single.detail()).contains("format version 2").contains("reads version 1");
+        assertThatThrownBy(range::requireIntact).isInstanceOf(IOException.class);
+    }
+
+    @Test
     @DisplayName("an intact or unsealed report is not refused")
     void soundReportsPass() throws IOException {
         IntegrityReport.intact(FILE, "test", "all of it").requireIntact();

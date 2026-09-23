@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.vector.hnsw;
 
+import com.eonmux.excalibur.core.integrity.IndexChecksum;
 import com.eonmux.excalibur.core.integrity.IntegrityStatus;
 import com.eonmux.excalibur.vector.distance.L2Distance;
 import org.junit.jupiter.api.DisplayName;
@@ -12,6 +13,7 @@ import java.nio.file.Path;
 import java.util.Random;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for the HNSW graph's verification entry point and its handling of older files.
@@ -81,6 +83,31 @@ class HnswGraphVerificationTest {
     }
 
     @Test
+    @DisplayName("a sealed graph at a version this build does not read is unreadable, not intact")
+    void newerGraphIsUnreadableRatherThanIntact() throws IOException {
+        Path graphPath = writeGraph("newer.hnsw");
+        writeInt(graphPath, 8, HnswGraphHeader.VERSION + 1);
+        resealHeader(graphPath);
+
+        var report = HnswGraph.verifyIntegrity(graphPath);
+
+        assertThat(report.status()).isEqualTo(IntegrityStatus.UNREADABLE);
+        assertThat(report.detail()).contains("format version " + (HnswGraphHeader.VERSION + 1));
+        assertThatThrownBy(() -> HnswGraph.open(graphPath, L2Distance.getInstance()))
+            .isInstanceOf(IOException.class);
+    }
+
+    @Test
+    @DisplayName("a graph claiming a version below any ever written is unreadable, not legacy")
+    void graphBelowTheOldestVersionIsUnreadable() throws IOException {
+        Path graphPath = writeGraph("zero.hnsw");
+        writeInt(graphPath, 8, 0);
+
+        assertThat(HnswGraph.verifyIntegrity(graphPath).status())
+            .isEqualTo(IntegrityStatus.UNREADABLE);
+    }
+
+    @Test
     @DisplayName("a graph file that is not there is reported missing")
     void absentGraphIsReportedMissing() {
         assertThat(HnswGraph.verifyIntegrity(tempDir.resolve("absent.hnsw")).status())
@@ -113,6 +140,16 @@ class HnswGraphVerificationTest {
             int original = handle.readUnsignedByte();
             handle.seek(offset);
             handle.writeByte(original ^ 0x40);
+        }
+    }
+
+    /** Recomputes the header checksum, so the header vouches for whatever it now says. */
+    private static void resealHeader(Path file) throws IOException {
+        try (RandomAccessFile handle = new RandomAccessFile(file.toFile(), "rw")) {
+            byte[] header = new byte[HnswGraphIntegrity.HEADER_COVERED_BYTES];
+            handle.readFully(header);
+            handle.seek(HnswGraphIntegrity.OFFSET_HEADER_CRC);
+            handle.writeLong(IndexChecksum.of(header, 0, header.length));
         }
     }
 

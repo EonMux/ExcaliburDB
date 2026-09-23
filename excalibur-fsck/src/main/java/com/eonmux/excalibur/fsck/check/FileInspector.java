@@ -122,11 +122,11 @@ public final class FileInspector {
             case LSH_TABLE -> LshTableCheck.check(file, relative);
             case GRAPH_STAGING_LOG -> GraphStagingCheck.check(file, relative);
             case DOCUMENT_REGISTRY -> CountMarkedTextCheck.check(
-                file, relative, "document registry", "\\#document-registry");
+                file, relative, CountMarkedFormat.DOCUMENT_REGISTRY);
             case SOURCE_CATALOG -> CountMarkedTextCheck.check(
-                file, relative, "source catalog", "\\#source-catalog");
+                file, relative, CountMarkedFormat.SOURCE_CATALOG);
             case SOURCE_STATUS -> CountMarkedTextCheck.check(
-                file, relative, "source status history", "\\#source-status");
+                file, relative, CountMarkedFormat.SOURCE_STATUS);
             case IN_FLIGHT_JOURNAL -> unverifiable(file, relative, "in-flight ingest journal",
                 "this journal carries neither a checksum nor a record count, by design: it is "
                     + "truncation-tolerant, because losing either half of a begin/end pair is "

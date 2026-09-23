@@ -105,9 +105,12 @@ public record FileCheck(
      * rebuilding it, as a term sketch is rebuilt, or setting it aside, as the source status
      * history is. That file is reported as corrupt, because its bytes do not match what it
      * declares, and it costs the node a rebuild or a history at start-up and nothing else, so it
-     * does not make the directory damaged. Only corruption is exempt. A file that could not be read at all says something
-     * about the device or its permissions that reaches past the one file, and stays damage
-     * whatever its kind.</p>
+     * does not make the directory damaged. Only corruption is exempt. A file that could not be
+     * read far enough to judge - refused by the device, or in a format version this build does
+     * not know and so refuses to open - says something that reaches past the one file, and
+     * stays damage whatever its kind. The checkers of the recoverable kinds report a version
+     * their reader refuses as corrupt instead, since the node rebuilds or sets aside that file
+     * the same way.</p>
      *
      * @return true if this verdict should fail the run
      */

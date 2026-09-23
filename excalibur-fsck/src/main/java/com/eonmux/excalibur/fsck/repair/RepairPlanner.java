@@ -82,9 +82,13 @@ public final class RepairPlanner {
             return;
         }
         if (file.status() == CheckStatus.UNREADABLE) {
-            operator.add(file.relative() + " could not be read at all, so nothing here knows "
-                + "what is wrong with it: " + file.detail() + ". Check the device and the "
-                + "file's permissions before deciding anything about its contents");
+            // Two causes share this status: a read the operating system refused, and a format
+            // version this build does not know. Neither says the bytes are damaged, so neither
+            // is moved aside; the detail says which it was.
+            operator.add(file.relative() + " could not be read far enough to judge, so nothing "
+                + "here knows whether anything is wrong with it: " + file.detail() + ". Settle "
+                + "what stopped the read - the device, the file's permissions, or a newer "
+                + "build's format - before deciding anything about its contents");
             return;
         }
         if (file.status() != CheckStatus.CORRUPT) {

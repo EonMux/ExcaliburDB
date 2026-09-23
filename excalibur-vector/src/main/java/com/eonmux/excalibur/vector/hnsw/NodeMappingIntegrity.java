@@ -12,7 +12,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 /**
- * The integrity block of a node-to-document mapping file, and the rules for checking it.
+ * The integrity block of an HNSW node mapping file, and the rules for checking it.
+ *
+ * <p>The file maps each graph node to what its vector was embedded from: a chunk from version 3
+ * on, a document at versions 1 and 2.</p>
  *
  * <h2>Layout</h2>
  * <p>Version 2 widened the header from 24 bytes to 48 and put the entry count where it
@@ -48,11 +51,23 @@ import java.nio.file.StandardOpenOption;
  * because that is what an operator reading the report needs to know about it - the node re-keys
  * it from its segment the next time it opens the graph, and nothing about the file is
  * damaged.</p>
+ *
+ * <h2>Any other version</h2>
+ * <p>Reported unreadable, as the loader refuses it. A version above the current one is not
+ * checked as if it were the current layout, which a newer build's file could pass while the
+ * node will not open it, and nothing is said about what its entries name.</p>
  */
 final class NodeMappingIntegrity {
 
-    /** Name used when a damaged file is refused or reported. */
-    static final String FORMAT = "HNSW node-to-document mapping";
+    /**
+     * Name used when a damaged file is refused or reported.
+     *
+     * <p>Both keyings, because the name is printed before anything says which version the file
+     * is at, and an operator reading "document" of a chunk-keyed file would look for documents
+     * in it.</p>
+     */
+    static final String FORMAT =
+        "HNSW node mapping (each node's chunk at version 3, its document at versions 1 and 2)";
 
     /** Seal state written when the whole file has been rewritten and digested. */
     static final int STATE_SEALED = 0x5345414C;
@@ -125,6 +140,9 @@ final class NodeMappingIntegrity {
      */
     static IntegrityReport inspect(Path path, FileChannel channel, ByteBuffer header, int version)
             throws IOException {
+        if (!NodeDocumentMapping.isSupportedVersion(version)) {
+            return unsupported(path, version);
+        }
         if (version < NodeDocumentMapping.FIRST_SEALED_VERSION) {
             return IntegrityReport.legacy(path, FORMAT, version);
         }
@@ -155,10 +173,22 @@ final class NodeMappingIntegrity {
             return IntegrityReport.corrupt(path, FORMAT, "the stored checksum over " + covered
                 + " bytes of entries is 0x" + Long.toHexString(storedPayloadCrc)
                 + " but they digest to 0x" + Long.toHexString(actualPayloadCrc)
-                + ", so at least one node is now attributed to a different document");
+                + ", so at least one node is now attributed to a different chunk or document");
         }
         return IntegrityReport.intact(path, FORMAT, covered + " bytes of entries verified"
             + keyingNote(version));
+    }
+
+    /**
+     * Reports a mapping at a version the loader refuses.
+     *
+     * @param path    The file
+     * @param version The version its header names
+     * @return An unreadable report naming the versions this build reads
+     */
+    private static IntegrityReport unsupported(Path path, int version) {
+        return IntegrityReport.unsupportedVersion(path, FORMAT, version,
+            NodeDocumentMapping.VERSION_V1, NodeDocumentMapping.VERSION);
     }
 
     /**
@@ -214,6 +244,9 @@ final class NodeMappingIntegrity {
                 "the file does not start with the mapping magic number");
         }
         int version = probe.getInt(Long.BYTES);
+        if (!NodeDocumentMapping.isSupportedVersion(version)) {
+            return unsupported(path, version);
+        }
         if (version < NodeDocumentMapping.FIRST_SEALED_VERSION) {
             return IntegrityReport.legacy(path, FORMAT, version);
         }

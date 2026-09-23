@@ -1,6 +1,8 @@
 package com.eonmux.excalibur.backup.verify;
 
 import com.eonmux.excalibur.backup.testing.DataDirectoryFixture;
+import com.eonmux.excalibur.core.integrity.IndexChecksum;
+import com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -9,6 +11,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -81,6 +85,49 @@ class FormatChecksTest {
         assertThat(check.healthy()).as(check.detail()).isTrue();
         assertThat(check.proven()).as(check.detail()).isTrue();
         assertThat(check.detail()).contains("name documents");
+    }
+
+    @Test
+    @DisplayName("a node mapping at a version this build does not read fails, not proven")
+    void aMappingFromANewerBuildFails() throws IOException {
+        Path mapping = dataDir.resolve(DataDirectoryFixture.DOCUMENT_MAPPING);
+        byte[] bytes = Files.readAllBytes(mapping);
+        ByteBuffer header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        header.putInt(Long.BYTES, NodeDocumentMapping.VERSION + 1);
+        header.putLong(40, IndexChecksum.of(bytes, 0, 40));
+        Files.write(mapping, bytes);
+
+        ContentCheck check = check(DataDirectoryFixture.DOCUMENT_MAPPING);
+
+        assertThat(check.healthy())
+            .as("the node refuses the file, so an image holding it does not restore a node "
+                + "that serves: %s", check.detail())
+            .isFalse();
+        assertThat(check.proven()).isFalse();
+        assertThat(check.detail())
+            .contains("UNREADABLE")
+            .contains("format version " + (NodeDocumentMapping.VERSION + 1))
+            .doesNotContain("name documents");
+    }
+
+    @Test
+    @DisplayName("a registry at a version its reader refuses fails; a status history does not")
+    void aRegistryFromANewerBuildFailsAndAStatusHistoryDoesNot() throws IOException {
+        Files.writeString(dataDir.resolve("document-registry"),
+            "\\#document-registry|2\n\\#end|0\n");
+        Files.writeString(dataDir.resolve("source-status"),
+            "\\#source-status|3\ndocs|idle|1.0|420|0|7|0|1730000000000\n\\#end|1\n");
+
+        ContentCheck registry = check("document-registry");
+        ContentCheck status = check("source-status");
+
+        assertThat(registry.healthy()).as(registry.detail()).isFalse();
+        assertThat(registry.detail()).contains("refuses to start");
+        assertThat(status.healthy())
+            .as("the node discards a history it does not read, and a restored node starts")
+            .isTrue();
+        assertThat(status.proven()).isFalse();
+        assertThat(status.detail()).contains("discards it");
     }
 
     @ParameterizedTest(name = "a flipped byte in {0} fails its format's checker")

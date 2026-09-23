@@ -73,20 +73,40 @@ public final class SourceStatusFile {
     /** The status file, under the data directory. */
     public static final String FILE = "source-status";
 
-    /** The format this build writes. */
-    static final int FORMAT_VERSION = 2;
+    /**
+     * The format this build writes, and the newest it reads.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final int FORMAT_VERSION = 2;
 
-    /** The oldest format this build still reads: the one written before the disallowed count. */
-    static final int OLDEST_READABLE_VERSION = 1;
+    /**
+     * The oldest format this build still reads: the one written before the disallowed count.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final int OLDEST_READABLE_VERSION = 1;
 
     /** The version that first carried the disallowed count. */
     private static final int FIRST_DISALLOWED_VERSION = 2;
 
-    /** Opens the first line, which names the format the rest of the file is in. */
-    private static final String HEADER_MARKER = "\\#source-status";
+    /**
+     * Opens the first line, which names the format the rest of the file is in.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final String HEADER_MARKER = "\\#source-status";
 
-    /** Opens the last line, which states how many records precede it. */
-    private static final String END_MARKER = "\\#end";
+    /**
+     * Opens the last line, which states how many records precede it.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final String END_MARKER = "\\#end";
 
     /** Separates the fields of one record. */
     private static final char FIELD_SEPARATOR = '|';

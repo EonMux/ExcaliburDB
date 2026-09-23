@@ -3,9 +3,9 @@
 // A module of its own rather than a package inside excalibur-api, for two reasons. The tool has
 // to run when nothing is running: if it lived beside the server bootstrap it would share that
 // module's dependency graph and its start-up wiring, and the first thing an operator does with
-// it is run it on a node that will not start. And it reads formats owned by four different
-// modules - store, vector, filter and retrieval - so it belongs where depending on all four is
-// the point rather than an accident.
+// it is run it on a node that will not start. And it reads formats owned by six different
+// modules - store, vector, filter, retrieval, graph and ingest - so it belongs where depending on
+// all six is the point rather than an accident.
 plugins {
     `java-library`
     application
@@ -40,6 +40,10 @@ dependencies {
     // The per-tenant graph staging logs live in the data directory too, and this is where their
     // magic numbers and the one public read-only verifier among them are declared.
     implementation(project(":excalibur-graph"))
+    // The ingestion registries - the document registry, the source catalog and the source status
+    // history - are written and read there, and the versions and markers a checker must accept
+    // are that module's constants, not a copy of them that could drift.
+    implementation(project(":excalibur-ingest"))
 
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
