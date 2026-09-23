@@ -24,7 +24,8 @@ excalibur.ingest.reindex-interval-ms=3600000
 # links, one to fetch it - so without pacing a host behind a fast link is asked for pages as
 # quickly as it will answer them, up to the ten million a single registration may ask for.
 # A registration's own `crawl_delay_ms` may ask for a longer gap and never a shorter one: the rate
-# a host is asked to bear is the deployment's decision. 0 turns pacing off entirely; the maximum
+# a host is asked to bear is the deployment's decision. A site's robots.txt Crawl-delay can
+# likewise only lengthen it, and is capped at 60 seconds. 0 turns pacing off entirely; the maximum
 # is 60000, and a value outside that range is refused at startup rather than clamped.
 excalibur.ingest.crawl-delay-ms=200
 
