@@ -14,7 +14,6 @@ import java.util.Objects;
  * <ul>
  *   <li>Segment prioritization - search high-selectivity segments first</li>
  *   <li>Filter ordering - apply more selective filters first</li>
- *   <li>Early termination - skip segments with very low selectivity</li>
  * </ul>
  *
  * <h2>Selectivity Definition</h2>
@@ -51,8 +50,8 @@ public class SelectivityEstimator {
     public static final double DEFAULT_SELECTIVITY = 1.0;
 
     /**
-     * Minimum selectivity threshold for early termination optimization.
-     * Segments with combined selectivity below this threshold may be skipped.
+     * Combined selectivity below which the estimate stops multiplying and reports zero, since
+     * further terms can only shrink it.
      */
     public static final double MIN_SELECTIVITY_THRESHOLD = 0.001;
 
@@ -223,20 +222,6 @@ public class SelectivityEstimator {
     public boolean shouldPrioritizeSegment(List<String> terms) {
         double selectivity = estimateCombinedSelectivity(terms);
         return selectivity >= HIGH_SELECTIVITY_THRESHOLD;
-    }
-
-    /**
-     * Checks if a segment can be skipped based on selectivity.
-     *
-     * <p>Segments with selectivity below {@link #MIN_SELECTIVITY_THRESHOLD}
-     * can be safely skipped without significantly affecting recall.</p>
-     *
-     * @param terms The query terms
-     * @return true if the segment can be skipped
-     */
-    public boolean canSkipSegment(List<String> terms) {
-        double selectivity = estimateCombinedSelectivity(terms);
-        return selectivity < MIN_SELECTIVITY_THRESHOLD;
     }
 
     /**

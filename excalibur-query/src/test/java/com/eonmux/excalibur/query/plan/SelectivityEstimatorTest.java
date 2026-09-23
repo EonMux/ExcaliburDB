@@ -150,16 +150,6 @@ class SelectivityEstimatorTest {
         }
 
         @Test
-        @DisplayName("does not skip segments with null sketch")
-        void doesNotSkipSegmentsWithNullSketch() {
-            SelectivityEstimator nullEstimator = new SelectivityEstimator(null);
-            List<String> terms = Collections.singletonList("term");
-
-            assertFalse(nullEstimator.canSkipSegment(terms),
-                "Should not skip segment when sketch is null");
-        }
-
-        @Test
         @DisplayName("reports hasSketch as false")
         void reportsHasSketchAsFalse() {
             SelectivityEstimator nullEstimator = new SelectivityEstimator(null);
@@ -307,25 +297,6 @@ class SelectivityEstimatorTest {
     @Nested
     @DisplayName("selectivity thresholds")
     class SelectivityThresholds {
-
-        @Test
-        @DisplayName("canSkipSegment returns true for very low selectivity")
-        void canSkipSegmentReturnsTrueForVeryLowSelectivity() {
-            // Insert a term many times to make any single term have high frequency
-            for (int i = 0; i < 1000; i++) {
-                sketch.insert("common".getBytes(StandardCharsets.UTF_8));
-            }
-
-            // Multiple rare terms should result in very low combined selectivity
-            List<String> rareTerms = Arrays.asList("rare1", "rare2", "rare3", "rare4", "rare5");
-
-            // With no insertions for rare terms, selectivity should be 0
-            // and the segment should be skippable
-            boolean canSkip = estimator.canSkipSegment(rareTerms);
-
-            // Since these terms don't exist, selectivity is 0
-            assertTrue(canSkip, "Segment with very low selectivity should be skippable");
-        }
 
         @Test
         @DisplayName("shouldPrioritizeSegment respects threshold")
