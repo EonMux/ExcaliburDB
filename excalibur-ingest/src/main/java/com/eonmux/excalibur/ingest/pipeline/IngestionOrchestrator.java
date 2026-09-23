@@ -595,6 +595,11 @@ public class IngestionOrchestrator {
         long totalPending = documentIds.size();
         LOGGER.info("Discovered {} documents", totalPending);
 
+        // Zeroed at the start of the run rather than carried: a re-crawl that skips nothing must
+        // not go on reporting what the crawl before it skipped - and that includes a crawl that
+        // lists nothing at all, which is where a root emptied since the last one ends up.
+        status.setSkipped(0);
+
         if (totalPending == 0) {
             status.update("idle", 1.0, 0, 0);
             LOGGER.info("No documents to ingest");
@@ -603,10 +608,6 @@ public class IngestionOrchestrator {
 
         StructuredLoggingHelper.setStage("embedding");
         status.update("embedding", 0.0, 0, totalPending);
-
-        // Zeroed at the start of the run rather than carried: a re-crawl that skips nothing must
-        // not go on reporting what the crawl before it skipped.
-        status.setSkipped(0);
 
         try {
             return ingestDocuments(source, sourceId, status, documentIds, stop);

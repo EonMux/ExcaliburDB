@@ -1883,6 +1883,23 @@ class IngestionPipelineTest {
         }
 
         @Test
+        @DisplayName("a crawl that lists nothing clears what the crawl before it skipped")
+        void anEmptyCrawlClearsTheSkips() {
+            // The count describes what the root holds now. A root emptied since the last crawl
+            // holds nothing to skip, and going on reporting the previous crawl's photographs
+            // describes a directory that is no longer there.
+            FakeSource source = new FakeSource("docs", new ConcurrentHashMap<>())
+                .withRaw("pixel.png", PNG, "image/png");
+            IngestionOrchestrator orchestrator = orchestrator();
+            assertThat(ingest(orchestrator, source).skipped).as("precondition").isEqualTo(1);
+
+            source.rawDocuments.clear();
+            RecordingStatus status = ingest(orchestrator, source);
+
+            assertThat(status.skipped).isZero();
+        }
+
+        @Test
         @DisplayName("the embedding endpoint is never asked about it")
         void binaryIsNeverEmbedded() throws Exception {
             // A skip that happened after embedding would still cost what the corpus costs.
