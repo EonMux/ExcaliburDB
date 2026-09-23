@@ -270,7 +270,7 @@ class McpToolsTest {
             assertThat(result.isError()).as(result.text()).isFalse();
             assertThat(Json.at(Json.parse(node.onlyRequest().body()), "context_entities"))
                 .isEqualTo(List.of(
-                    Map.of("name", "Charles Babbage", "grammar", "singular_person", "turn", 0L),
+                    Map.of("name", " Charles Babbage ", "grammar", "singular_person", "turn", 0L),
                     Map.of("name", "Ada Lovelace", "grammar", "singular_person", "turn", 1L)));
         }
     }
@@ -301,6 +301,7 @@ class McpToolsTest {
             Map.of("name", "  "),
             Map.of("name", "Ada Lovelace", "grammar", "person"),
             Map.of("name", "Ada Lovelace", "grammar", 1),
+            Map.of("name", "Ada Lovelace", "grammar", " "),
             Map.of("name", "Ada Lovelace", "turn", -1),
             Map.of("name", "Ada Lovelace", "turn", 1.5),
             Map.of("name", "Ada Lovelace", "turn", Integer.MAX_VALUE),
@@ -398,13 +399,55 @@ class McpToolsTest {
 
     @Test
     @DisplayName("a query with no context entities omits the field rather than sending an empty one")
-    void emptyContextEntitiesAreOmitted() throws IOException {
+    void absentContextEntitiesAreOmitted() throws IOException {
         try (StubNode node = StubNode.start()) {
             new McpTools(node.client(Map.of()))
                 .call(McpTools.SEARCH_GRAPH, Map.of("query", "anything"));
 
             assertThat(Json.at(Json.parse(node.onlyRequest().body()), "context_entities"))
                 .isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("an empty context_entities is forwarded as the empty array it is")
+    void emptyContextEntitiesAreForwarded() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            new McpTools(node.client(Map.of())).call(McpTools.SEARCH_GRAPH,
+                Map.of("query", "anything", "context_entities", List.of()));
+
+            assertThat(Json.at(Json.parse(node.onlyRequest().body()), "context_entities"))
+                .isEqualTo(List.of());
+        }
+    }
+
+    @Test
+    @DisplayName("names are forwarded exactly as sent, blank ones included, for the node to read")
+    void contextNamesAreForwardedVerbatim() throws IOException {
+        // The node reads a blank name as mentioning nobody. Deciding that here as well would
+        // make the tool the second of two places that rule, and the body sent would no longer
+        // be the one the model wrote.
+        try (StubNode node = StubNode.start()) {
+            new McpTools(node.client(Map.of())).call(McpTools.SEARCH_GRAPH, Map.of(
+                "query", "What did she write?",
+                "context_entities", List.of(" Ada Lovelace ", " ")));
+
+            assertThat(Json.at(Json.parse(node.onlyRequest().body()), "context_entities"))
+                .isEqualTo(List.of(" Ada Lovelace ", " "));
+        }
+    }
+
+    @Test
+    @DisplayName("a null context entity is a tool error, as the same array is a 400 over HTTP")
+    void aNullContextEntityIsAToolError() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools.ToolResult result = new McpTools(node.client(Map.of())).call(
+                McpTools.SEARCH_GRAPH, Map.of("query", "What did she write?",
+                    "context_entities", java.util.Arrays.asList("Ada Lovelace", null)));
+
+            assertThat(result.isError()).isTrue();
+            assertThat(result.text()).contains("'context_entities' element 1");
+            assertThat(node.requests()).isEmpty();
         }
     }
 
@@ -447,6 +490,48 @@ class McpToolsTest {
                 Json.objectAt(Json.parse(node.onlyRequest().body()), "config");
             assertThat(config).containsEntry("included_extensions", List.of());
             assertThat(config).containsEntry("excluded_directories", List.of());
+        }
+    }
+
+    @Test
+    @DisplayName("list settings are forwarded element for element, blank ones included")
+    void listElementsAreForwardedVerbatim() throws IOException {
+        // [""] is not the same body as []. What the node makes of a blank element is the node's
+        // to decide, and a tool that decided it first would register a source from a body the
+        // model never wrote.
+        try (StubNode node = StubNode.start()) {
+            McpTools tools = new McpTools(node.client(Map.of()));
+            tools.call(McpTools.INGEST_DOCUMENTS, Map.of(
+                "source_id", "docs",
+                "root_path", "/srv/docs",
+                "included_extensions", List.of(""),
+                "excluded_directories", List.of(" vendor ", "  ")));
+            tools.call(McpTools.CRAWL_WEBSITE, Map.of(
+                "source_id", "site",
+                "base_url", "https://example.com",
+                "excluded_path_patterns", List.of("")));
+
+            Map<String, Object> ingest =
+                Json.objectAt(Json.parse(node.requests().get(0).body()), "config");
+            assertThat(ingest).containsEntry("included_extensions", List.of(""));
+            assertThat(ingest).containsEntry("excluded_directories", List.of(" vendor ", "  "));
+            Map<String, Object> crawl =
+                Json.objectAt(Json.parse(node.requests().get(1).body()), "config");
+            assertThat(crawl).containsEntry("excluded_path_patterns", List.of(""));
+        }
+    }
+
+    @Test
+    @DisplayName("a list setting holding a null is a tool error, and nothing is sent")
+    void aNullListElementIsAToolError() throws IOException {
+        try (StubNode node = StubNode.start()) {
+            McpTools.ToolResult result = new McpTools(node.client(Map.of())).call(
+                McpTools.INGEST_DOCUMENTS, Map.of("source_id", "docs", "root_path", "/srv/docs",
+                    "excluded_directories", java.util.Arrays.asList("vendor", null)));
+
+            assertThat(result.isError()).isTrue();
+            assertThat(result.text()).contains("excluded_directories");
+            assertThat(node.requests()).isEmpty();
         }
     }
 
@@ -756,6 +841,23 @@ class McpToolsTest {
 
             assertThat(result.isError()).isTrue();
             assertThat(result.text()).contains("documents");
+        }
+    }
+
+    @Test
+    @DisplayName("adding documents refuses a null document rather than sending the rest")
+    void addDocumentsRefusesANullDocument() throws IOException {
+        // Over HTTP the same array is a 400. Dropping the null and sending the others would
+        // report a batch as added that is one short of what the model sent.
+        try (StubNode node = StubNode.start()) {
+            McpTools.ToolResult result = new McpTools(node.client(Map.of())).call(
+                McpTools.ADD_DOCUMENTS, Map.of("source_id", "notes", "documents",
+                    java.util.Arrays.asList(Map.of("document_id", "a.md", "content", "alpha"),
+                        null)));
+
+            assertThat(result.isError()).isTrue();
+            assertThat(result.text()).contains("'documents'").contains("element 1");
+            assertThat(node.requests()).isEmpty();
         }
     }
 

@@ -2254,18 +2254,25 @@ error.
 element a name, or an object `{"name", "grammar", "turn"}` whose `grammar` is `singular_person`,
 `singular_thing`, `plural` or `unknown` and whose `turn` is a whole number from 0, higher being more
 recent. Unlike the HTTP route, a model may mix the two - the tool sends every element as an object
-when any one is - so it need not rewrite the names it has no shape for. A shape outside the four, a
-negative or fractional turn, an object with no `name`, or a field other than those three is a tool
-error naming the element; the last because the node ignores a field it does not read, and a
-misspelt `"gramar"` would otherwise arrive as an entity of unknown shape.
+when any one is - so it need not rewrite the names it has no shape for. A shape outside the four
+(a blank one included), a negative or fractional turn, an object with no `name` or a blank one, a
+`null` element, or a field other than those three is a tool error naming the element; the last
+because the node ignores a field it does not read, and a misspelt `"gramar"` would otherwise
+arrive as an entity of unknown shape. An array of names is sent exactly as written, an empty one
+and blank names included; the node reads a blank name as mentioning nobody, so in a mixed array a
+blank name is left out rather than sent as an object the node would refuse.
 
 Arguments are checked before anything is sent. One of the wrong type - a number where a string is
 declared, a string where an array is - is returned as a tool error naming the argument rather than
 coerced or dropped, so a model learns what it got wrong. An integer argument accepts `5`, `5.0` or
 `"5"`, and refuses a fraction. A true/false argument accepts `true` or `"true"`, in any case, and
-refuses anything else - `1` and `"yes"` included - rather than guess which was meant. An empty
-array is forwarded, never dropped, exactly as the same body sent over HTTP would be: supplying a
-list replaces the node's default rather than adding to it, so an empty one clears it. An empty
+refuses anything else - `1` and `"yes"` included - rather than guess which was meant. An array is
+forwarded element for element, exactly as the same body sent over HTTP would be: an empty one is
+never dropped, and a blank or space-padded element is neither dropped nor trimmed - what it means
+is the node's to decide, and in a list setting the node trims each element and ignores a blank
+one, so `[""]` there means what `[]` does. A `null` element is a tool error, as it is a `400` over
+HTTP. Supplying a list replaces the node's default rather than adding to it, so an empty one
+clears it. An empty
 `excluded_directories` on `ingest_documents` walks every directory, `node_modules` and `target`
 included; an empty `included_extensions` reads every file, which is also what leaving it out does;
 and an empty `excluded_path_patterns` on `crawl_website` clears the crawl's default exclusions.
