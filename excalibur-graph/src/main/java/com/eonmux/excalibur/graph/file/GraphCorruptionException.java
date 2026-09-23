@@ -43,6 +43,20 @@ public final class GraphCorruptionException extends IOException {
     }
 
     /**
+     * For damage another library found first, such as a Lucene index of the graph whose checksum
+     * footer no longer matches.
+     *
+     * @param file    The damaged file, or the directory of an index read as a whole
+     * @param message What is damaged and how
+     * @param cause   The refusal that found it
+     * @throws NullPointerException if {@code file} is null
+     */
+    public GraphCorruptionException(Path file, String message, Throwable cause) {
+        super(message, cause);
+        this.file = Objects.requireNonNull(file, "file must not be null");
+    }
+
+    /**
      * The damaged file.
      *
      * @return Its path

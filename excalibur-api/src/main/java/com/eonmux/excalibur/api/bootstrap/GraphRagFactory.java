@@ -4,6 +4,7 @@ import com.eonmux.excalibur.core.memory.MappedFootprint;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.config.GraphConfig;
 import com.eonmux.excalibur.graph.dictionary.LabelDictionary;
+import com.eonmux.excalibur.graph.file.GraphCorruptionException;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
 import com.eonmux.excalibur.planner.QueryClassifier;
 import com.eonmux.excalibur.retrieval.rank.Ranker;
@@ -21,6 +22,7 @@ import com.eonmux.excalibur.retrieval.abstain.AbstentionPolicy;
 import com.eonmux.excalibur.retrieval.abstain.CalibratedAbstentionPolicy;
 import com.eonmux.excalibur.retrieval.abstain.ThresholdAbstentionPolicy;
 import com.eonmux.excalibur.retrieval.lexical.LexicalIndex;
+import com.eonmux.excalibur.retrieval.lexical.LexicalIndexIntegrity;
 import com.eonmux.excalibur.retrieval.lexical.LuceneRanker;
 import com.eonmux.excalibur.retrieval.pipeline.EntityLinker;
 import com.eonmux.excalibur.retrieval.pipeline.GraphRagPipeline;
@@ -186,6 +188,8 @@ public final class GraphRagFactory {
      * @param directory The graph directory
      * @param models    The model clients to rerank and embed through
      * @return The opened stack, or null when the directory is not there
+     * @throws GraphCorruptionException if a file of the graph is missing or no longer what the
+     *         build wrote; the graph is derived from staging, and the next build replaces it
      * @throws IOException if the directory exists but cannot be opened
      */
     public static GraphRag openAt(Config config, Path directory, GraphModelClients models)
@@ -237,10 +241,16 @@ public final class GraphRagFactory {
     /**
      * Opens every artifact of a graph directory that is known to be there.
      *
+     * <p>Each artifact verifies its own bytes against the checksums the build recorded before it
+     * is mapped, and one that no longer matches is refused with a
+     * {@link GraphCorruptionException} naming it - the Lucene indexes' refusals included, so a
+     * caller deciding what to do about a damaged graph has one type to look for.</p>
+     *
      * @param config    Configuration, for the read-side settings
      * @param directory The graph directory
      * @param models    The model clients to rerank and embed through
      * @return The opened stack
+     * @throws GraphCorruptionException if an artifact is missing or damaged
      * @throws IOException if an artifact cannot be opened
      */
     private static GraphRag open(Config config, Path directory, GraphModelClients models)
@@ -255,10 +265,10 @@ public final class GraphRagFactory {
             // Without a writer no write lock is held, so a build can open its replacement at
             // this path while queries finish against this one - and an index missing from the
             // directory fails the open instead of being created empty and served as the graph.
-            LexicalIndex documents = LexicalIndex.openReadOnly(directory.resolve(DOCUMENT_INDEX));
+            LexicalIndex documents = openIndex(directory.resolve(DOCUMENT_INDEX));
             opened.push(documents);
 
-            LexicalIndex labels = LexicalIndex.openReadOnly(directory.resolve(LABEL_INDEX));
+            LexicalIndex labels = openIndex(directory.resolve(LABEL_INDEX));
             opened.push(labels);
 
             LabelDictionary entityNames =
@@ -309,6 +319,27 @@ public final class GraphRagFactory {
                 } catch (Exception suppressed) {
                     e.addSuppressed(suppressed);
                 }
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Opens one of a graph's Lucene indexes, reporting damage as damage to the graph.
+     *
+     * @param index The index directory
+     * @return The index, every file of which matched its checksum footer
+     * @throws GraphCorruptionException if the index is missing, has no commit, or a file of it
+     *         is short or does not match its footer
+     * @throws IOException if it cannot be read for any other reason
+     */
+    private static LexicalIndex openIndex(Path index) throws IOException {
+        try {
+            return LexicalIndex.openReadOnly(index);
+        } catch (IOException e) {
+            if (LexicalIndexIntegrity.isDamage(e)) {
+                throw new GraphCorruptionException(index, LexicalIndexIntegrity.FORMAT + " "
+                    + index + " failed its integrity check: " + e.getMessage(), e);
             }
             throw e;
         }

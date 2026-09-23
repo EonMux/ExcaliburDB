@@ -299,13 +299,20 @@ class GraphErasureServiceTest {
             Path graph = root.resolve("graph");
             GraphErasureService service = withheldServiceOver(graph, Duration.ofSeconds(3600));
             service.submit(new ErasureScope.Entity(ADA));
+            // A failure that says nothing about the bytes: the descriptor cannot be read at all.
+            // A damaged graph is discarded instead, which GraphTenantDamageTest covers.
             Path descriptor = graph.resolve(
                 com.eonmux.excalibur.graph.format.EdgeStoreDescriptor.FILE_NAME);
-            Path aside = root.resolve("descriptor.aside");
-            java.nio.file.Files.move(descriptor, aside);
+            java.util.Set<java.nio.file.attribute.PosixFilePermission> readable =
+                java.nio.file.Files.getPosixFilePermissions(descriptor);
+            java.nio.file.Files.setPosixFilePermissions(descriptor, java.util.Set.of());
+            org.junit.jupiter.api.Assumptions.assumeTrue(
+                !java.nio.file.Files.isReadable(descriptor),
+                "needs a user file permissions apply to");
 
             org.assertj.core.api.Assertions.assertThatThrownBy(service::finishInterruptedErasure)
-                .isInstanceOf(IOException.class);
+                .isInstanceOf(IOException.class)
+                .isNotInstanceOf(com.eonmux.excalibur.graph.file.GraphCorruptionException.class);
 
             assertThat(holder.isPresent())
                 .as("a graph that may still hold what was erased is not served")
@@ -316,7 +323,7 @@ class GraphErasureServiceTest {
                 .as("written down, so an eviction or a restart does not forget it")
                 .exists();
 
-            java.nio.file.Files.move(aside, descriptor);
+            java.nio.file.Files.setPosixFilePermissions(descriptor, readable);
             GraphErasureService.ErasureOutcome retried = service.compactIfDue();
 
             assertThat(retried.edgesRemoved())

@@ -501,6 +501,30 @@ public final class GraphBuilder {
     }
 
     /**
+     * Removes a served graph whose files are damaged, durably.
+     *
+     * <p>For a caller that has to discharge an erasure and cannot rewrite the graph it is owed
+     * against, because a file of it no longer holds what was built. A built graph is derived
+     * entirely from the staging logs, so removing it loses nothing the next build does not
+     * recreate - once staging itself has been erased, without what the erasure removes.</p>
+     *
+     * <p>A crash part-way through leaves a directory missing some of its files, which opens as
+     * damaged and is not served, so the removal is simply repeated by the next caller that finds
+     * it. The parent directory is forced afterwards, so a caller that goes on to record an
+     * erasure discharged is not recording it over a graph a power loss can bring back.</p>
+     *
+     * @param target Where the graph is served from
+     * @throws IOException if the graph cannot be removed, or its removal forced
+     */
+    public static void discard(Path target) throws IOException {
+        deleteRecursively(target);
+        Path parent = target.toAbsolutePath().getParent();
+        if (parent != null && Files.isDirectory(parent)) {
+            Durability.DEVICE.fsyncDirectory(parent);
+        }
+    }
+
+    /**
      * Removes a directory tree, if it is there.
      *
      * @param path The tree

@@ -8,6 +8,7 @@ import com.eonmux.excalibur.graph.erasure.ErasureLog;
 import com.eonmux.excalibur.graph.erasure.ErasureRequest;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.erasure.ServedArtifactEraser;
+import com.eonmux.excalibur.graph.file.GraphCorruptionException;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.ReferencedLabels;
@@ -115,6 +116,13 @@ public final class GraphTenant implements AutoCloseable {
      * it. So is the record of the withdrawals staging still owes, and whatever it holds is made
      * before the tenant is handed out.</p>
      *
+     * <p>A graph whose files no longer match the checksums its build recorded does not fail the
+     * open. It is not served, and the tenant opens without it, because everything that would
+     * repair it goes through the tenant: the graph is derived entirely from the staging logs, so
+     * the next build replaces it, and an erasure due against it discards it and erases staging
+     * alone. Refusing the namespace instead would refuse the build that fixes it, and the
+     * erasure requests the node still has to accept. See {@link #openServable}.</p>
+     *
      * @param id        The namespace
      * @param directory Where its graph is served from
      * @param config    Configuration, for the read side and the erasure policy
@@ -181,7 +189,7 @@ public final class GraphTenant implements AutoCloseable {
             Path withheldMarker = stagingDirectory.resolve(ERASURE_INTERRUPTED_MARKER);
             boolean withhold = erasureInterrupted(directory, withheldMarker, erasureLog);
             GraphRagHolder holder = new GraphRagHolder(
-                directory, withhold ? null : GraphRagFactory.openAt(config, directory, models));
+                directory, withhold ? null : openServable(id, config, directory, models));
             opened.push(holder);
 
             GraphBuildService buildService = new GraphBuildService(
@@ -198,7 +206,8 @@ public final class GraphTenant implements AutoCloseable {
             LOGGER.info("graph tenant {} opened at {} ({} facts staged, graph {})",
                 id, directory, staging.stagedCount(), holder.isPresent() ? "present"
                     : erasureService.servingWithheld() ? "withheld until an interrupted erasure "
-                    + "is applied" : "not built");
+                    + "is applied" : Files.isDirectory(directory)
+                    ? "not served until a build replaces it" : "not built");
             return new GraphTenant(id, directory, staging, withdrawals, erasureLog, holder,
                 buildService, erasureService);
         } catch (IOException | RuntimeException e) {
@@ -212,6 +221,40 @@ public final class GraphTenant implements AutoCloseable {
                 }
             }
             throw e;
+        }
+    }
+
+    /**
+     * Opens the graph a tenant serves, or answers null when there is none it can serve.
+     *
+     * <p>A graph with a damaged file is one of those. Every file of it is verified before it is
+     * mapped, and one whose bytes are not what the build wrote would answer queries with the
+     * wrong neighbours, names or rankings - so it is not served, the file is named once at
+     * ERROR, and graph queries answer that no graph is built, which tells the caller the remedy.
+     * Nothing is deleted here: the next build moves the damaged graph aside and deletes it once
+     * its replacement opens, and an erasure compaction that finds it discards it; see
+     * {@link GraphErasureService}. A graph at a format version this build does not read is not
+     * damage and still fails the open, because a build would replace a graph an operator may
+     * mean to keep.</p>
+     *
+     * @param id        The namespace, for the log line
+     * @param config    Configuration, for the read side
+     * @param directory Where the graph is served from
+     * @param models    The node's model clients
+     * @return The stack, or null when no graph is built or the one on disk is damaged
+     * @throws IOException if the graph cannot be read for a reason other than damage
+     */
+    private static GraphRagFactory.GraphRag openServable(NamespaceId id, Config config,
+                                                         Path directory, GraphModelClients models)
+            throws IOException {
+        try {
+            return GraphRagFactory.openAt(config, directory, models);
+        } catch (GraphCorruptionException damage) {
+            LOGGER.error("graph tenant {} does not serve its graph at {}: {}. The graph is "
+                + "derived from the namespace's staging logs, which are intact; POST "
+                + "/v1/graph/build rebuilds and replaces it, and until then graph queries "
+                + "answer that no graph is built", id, directory, damage.getMessage());
+            return null;
         }
     }
 

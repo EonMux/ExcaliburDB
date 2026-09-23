@@ -2,9 +2,11 @@ package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.ingest.graph.LlmRelationExtractor;
 import com.eonmux.excalibur.config.Config;
+import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor;
 import com.eonmux.excalibur.graph.erasure.ErasureScope;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.file.Durability;
+import com.eonmux.excalibur.graph.file.GraphCorruptionException;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 
@@ -44,6 +46,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * there is otherwise no sign on disk that one was under way. And a compaction that fails, rather
  * than dies, after staging was erased leaves the graph withheld for the same reason instead of
  * putting it back in service.</p>
+ *
+ * <h2>A graph with a damaged file</h2>
+ * <p>Every file of a graph is verified against the checksums its build recorded whenever the
+ * graph is opened, the compaction's own opens included, and a compaction cannot rewrite a graph
+ * whose bytes are not the ones built - its output would carry the damage under fresh checksums,
+ * or the rewrite would fail every time it was tried and leave the obligation outstanding for
+ * good. So a compaction that meets one discards the graph and applies what is outstanding to
+ * staging alone. That loses nothing: the graph is derived entirely from staging, and the next
+ * {@code POST /v1/graph/build} publishes it again from what the erasure left. Until then no graph
+ * is served, which a damaged one would not have been either.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use. Compactions are serialised against each other; a caller that submits
@@ -552,6 +564,12 @@ public final class GraphErasureService {
 
                 return new ErasureOutcome(outcome.ran(), outcome.edgesRemoved(),
                     outcome.requestsSatisfied(), outcome.requestsWithheld(), outcome.reason());
+            } catch (GraphCorruptionException damage) {
+                ErasureOutcome outcome = discardDamaged(directory, damage, force);
+                // Nothing is left on disk for the erasure to have missed: the graph is gone and
+                // staging has had the outstanding requests applied.
+                completed = true;
+                return outcome;
             } finally {
                 if (completed && (withheldForErasure || guard.stagingErased)) {
                     // The erasure that was interrupted, or the one this pass began, has now been
@@ -584,13 +602,50 @@ public final class GraphErasureService {
     }
 
     /**
+     * Removes a graph a compaction could not rewrite because a file of it is damaged, and applies
+     * what is outstanding to staging alone.
+     *
+     * <p>Called with the replacement lock held and the served stack withdrawn. The compaction's
+     * scratch is removed with the graph: a compaction that fails clears its own, and one left by
+     * an earlier crash may hold a partial rewrite of the same damaged graph.</p>
+     *
+     * @param directory The graph directory
+     * @param damage    What the compaction refused
+     * @param force     Whether the caller asked to skip the policy
+     * @return What the staging pass did
+     * @throws IOException if the graph cannot be removed or staging cannot be erased
+     */
+    private ErasureOutcome discardDamaged(Path directory, GraphCorruptionException damage,
+                                          boolean force) throws IOException {
+        LOGGER.error("the graph at {} cannot be compacted: {}. It is derived from the "
+            + "namespace's staging logs, so it is discarded and the outstanding erasures are "
+            + "applied to staging alone; POST /v1/graph/build publishes it again from what they "
+            + "leave", directory, damage.getMessage());
+        GraphBuilder.discard(EdgeStoreCompactor.scratchFor(directory));
+        GraphBuilder.discard(directory);
+        GraphErasureCoordinator.CompactionOutcome outcome = coordinator.eraseStagedOnly(!force);
+        return new ErasureOutcome(outcome.ran(), outcome.edgesRemoved(),
+            outcome.requestsSatisfied(), outcome.requestsWithheld(),
+            "the served graph was damaged (" + damage.file() + ") and has been discarded; "
+                + outcome.reason());
+    }
+
+    /**
      * Puts the served stack back after a compaction.
+     *
+     * <p>Nothing is served when the directory is gone, or when a file of the graph is found
+     * damaged as it is reopened; the next build replaces it.</p>
      *
      * @param directory The graph directory
      */
     private void reopen(java.nio.file.Path directory) {
         try {
             holder.install(GraphRagFactory.openAt(config, directory, models));
+        } catch (GraphCorruptionException damage) {
+            holder.install(null);
+            LOGGER.error("the graph at {} is not served after a compaction: {}. It is derived "
+                + "from the namespace's staging logs; POST /v1/graph/build replaces it",
+                directory, damage.getMessage());
         } catch (IOException | RuntimeException e) {
             // The graph is on disk and intact; this node just cannot serve it any more. Saying so
             // is better than leaving a stack mapped over files a compaction replaced.
