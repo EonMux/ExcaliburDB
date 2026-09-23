@@ -30,14 +30,13 @@ import java.util.TreeMap;
  * @param entries           How much the corpus holds
  * @param volumes           Disk, as the volume manager or the catalog sees it
  * @param hnsw              The vector integration queue
- * @param cuckoo            The membership filters
  * @param visibility        The epoch and what is visible in it
  * @param coverage          Share of live segments a query reads, in [0, 1]
  * @param lexical           The chunk lexical index, or null where this node keeps none
  * @param vectorIndex       Segments serving without a vector index, or null if unreadable
  * @param indexerRunning    Whether the worker that drains the HNSW queue is alive
  * @param embeddingBreaker  The embedding circuit breaker's state, or null where there is none
- * @param llmRelevancyBreaker The stage-5 relevancy breaker's state, or null where there is
+ * @param llmRelevancyBreaker The stage-4 relevancy breaker's state, or null where there is
  *                          no LLM scorer on this node
  * @param queryCache        What the query result cache has done, or null where this node
  *                          runs without one
@@ -63,7 +62,6 @@ public record NodeStats(
     EntryStats entries,
     VolumeStats volumes,
     HnswStats hnsw,
-    CuckooStats cuckoo,
     VisibilityStats visibility,
     double coverage,
     ChunkIndexStats lexical,
@@ -90,7 +88,6 @@ public record NodeStats(
      * @param entries             How much the corpus holds
      * @param volumes             Disk, as the volume manager or the catalog sees it
      * @param hnsw                The vector integration queue
-     * @param cuckoo              The membership filters
      * @param visibility          The epoch and what is visible in it
      * @param coverage            Share of live segments a query reads, in [0, 1]
      * @param lexical             The chunk lexical index, or null where this node keeps none
@@ -106,14 +103,14 @@ public record NodeStats(
      *                               is none
      */
     public NodeStats(SegmentStats segments, EntryStats entries, VolumeStats volumes,
-                     HnswStats hnsw, CuckooStats cuckoo, VisibilityStats visibility,
+                     HnswStats hnsw, VisibilityStats visibility,
                      double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
                      boolean indexerRunning, String embeddingBreaker,
                      String llmRelevancyBreaker,
                      com.eonmux.excalibur.query.cache.QueryCacheStats queryCache,
                      GraphStats graph, String queryExpansionBreaker,
                      String graphExtractionBreaker) {
-        this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
+        this(segments, entries, volumes, hnsw, visibility, coverage, lexical,
             vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, queryCache, graph,
             queryExpansionBreaker, graphExtractionBreaker, null, null, null);
     }
@@ -128,7 +125,6 @@ public record NodeStats(
      * @param entries             How much the corpus holds
      * @param volumes             Disk, as the volume manager or the catalog sees it
      * @param hnsw                The vector integration queue
-     * @param cuckoo              The membership filters
      * @param visibility          The epoch and what is visible in it
      * @param coverage            Share of live segments a query reads, in [0, 1]
      * @param lexical             The chunk lexical index, or null where this node keeps none
@@ -140,13 +136,13 @@ public record NodeStats(
      * @param graph               The graph half of the node, or null where it builds none
      */
     public NodeStats(SegmentStats segments, EntryStats entries, VolumeStats volumes,
-                     HnswStats hnsw, CuckooStats cuckoo, VisibilityStats visibility,
+                     HnswStats hnsw, VisibilityStats visibility,
                      double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
                      boolean indexerRunning, String embeddingBreaker,
                      String llmRelevancyBreaker,
                      com.eonmux.excalibur.query.cache.QueryCacheStats queryCache,
                      GraphStats graph) {
-        this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
+        this(segments, entries, volumes, hnsw, visibility, coverage, lexical,
             vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, queryCache, graph,
             null, null);
     }
@@ -162,7 +158,6 @@ public record NodeStats(
      * @param entries             How much the corpus holds
      * @param volumes             Disk, as the volume manager or the catalog sees it
      * @param hnsw                The vector integration queue
-     * @param cuckoo              The membership filters
      * @param visibility          The epoch and what is visible in it
      * @param coverage            Share of live segments a query reads, in [0, 1]
      * @param lexical             The chunk lexical index, or null where this node keeps none
@@ -173,12 +168,12 @@ public record NodeStats(
      * @param queryCache          What the query cache has done, or null where there is none
      */
     public NodeStats(SegmentStats segments, EntryStats entries, VolumeStats volumes,
-                     HnswStats hnsw, CuckooStats cuckoo, VisibilityStats visibility,
+                     HnswStats hnsw, VisibilityStats visibility,
                      double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
                      boolean indexerRunning, String embeddingBreaker,
                      String llmRelevancyBreaker,
                      com.eonmux.excalibur.query.cache.QueryCacheStats queryCache) {
-        this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
+        this(segments, entries, volumes, hnsw, visibility, coverage, lexical,
             vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, queryCache, null);
     }
 
@@ -193,7 +188,6 @@ public record NodeStats(
      * @param entries             How much the corpus holds
      * @param volumes             Disk, as the volume manager or the catalog sees it
      * @param hnsw                The vector integration queue
-     * @param cuckoo              The membership filters
      * @param visibility          The epoch and what is visible in it
      * @param coverage            Share of live segments a query reads, in [0, 1]
      * @param lexical             The chunk lexical index, or null where this node keeps none
@@ -203,11 +197,11 @@ public record NodeStats(
      * @param llmRelevancyBreaker The relevancy breaker's state, or null where there is none
      */
     public NodeStats(SegmentStats segments, EntryStats entries, VolumeStats volumes,
-                     HnswStats hnsw, CuckooStats cuckoo, VisibilityStats visibility,
+                     HnswStats hnsw, VisibilityStats visibility,
                      double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
                      boolean indexerRunning, String embeddingBreaker,
                      String llmRelevancyBreaker) {
-        this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
+        this(segments, entries, volumes, hnsw, visibility, coverage, lexical,
             vectorIndex, indexerRunning, embeddingBreaker, llmRelevancyBreaker, null, null);
     }
 
@@ -222,7 +216,6 @@ public record NodeStats(
      * @param entries        How much the corpus holds
      * @param volumes        Disk, as the volume manager or the catalog sees it
      * @param hnsw           The vector integration queue
-     * @param cuckoo         The membership filters
      * @param visibility     The epoch and what is visible in it
      * @param coverage       Share of live segments a query reads, in [0, 1]
      * @param lexical        The chunk lexical index, or null where this node keeps none
@@ -231,10 +224,10 @@ public record NodeStats(
      * @param embeddingBreaker The embedding breaker's state, or null where there is none
      */
     public NodeStats(SegmentStats segments, EntryStats entries, VolumeStats volumes,
-                     HnswStats hnsw, CuckooStats cuckoo, VisibilityStats visibility,
+                     HnswStats hnsw, VisibilityStats visibility,
                      double coverage, ChunkIndexStats lexical, VectorIndexStats vectorIndex,
                      boolean indexerRunning, String embeddingBreaker) {
-        this(segments, entries, volumes, hnsw, cuckoo, visibility, coverage, lexical,
+        this(segments, entries, volumes, hnsw, visibility, coverage, lexical,
             vectorIndex, indexerRunning, embeddingBreaker, null, null, null);
     }
 
@@ -246,7 +239,6 @@ public record NodeStats(
         Objects.requireNonNull(entries, "entries cannot be null");
         Objects.requireNonNull(volumes, "volumes cannot be null");
         Objects.requireNonNull(hnsw, "hnsw cannot be null");
-        Objects.requireNonNull(cuckoo, "cuckoo cannot be null");
         Objects.requireNonNull(visibility, "visibility cannot be null");
 
         if (Double.isNaN(coverage) || coverage < 0.0 || coverage > 1.0) {
@@ -373,55 +365,6 @@ public record NodeStats(
             if (vectorsIntegrated < 0) {
                 throw new IllegalArgumentException(
                     "Vectors integrated must be non-negative: " + vectorsIntegrated);
-            }
-        }
-    }
-
-    /**
-     * Cuckoo filter statistics.
-     *
-     * <p>Deletions are counted in filter entries - distinct terms, since a filter holds each
-     * term once. A segment's entries become pending when it is tombstoned and are removed by
-     * the maintenance worker's next sweep, which moves them from one count to the other. The
-     * false-positive rates are estimated from each segment filter's load at the time of the
-     * request, over the segments whose filters hold anything; both are 0 when none do.</p>
-     *
-     * @param pendingDeletions  Entries of tombstoned segments not yet removed from the filters
-     * @param totalDeletions    Entries removed since startup
-     * @param avgFpRate         Mean estimated false-positive rate across non-empty segment filters
-     * @param maxFpRate         Worst estimated false-positive rate of any segment filter
-     * @param saturated         Whether any filter can take no more
-     * @param saturatedSegments How many are in that state
-     */
-    public record CuckooStats(
-        int pendingDeletions,
-        long totalDeletions,
-        double avgFpRate,
-        double maxFpRate,
-        boolean saturated,
-        int saturatedSegments
-    ) {
-        /** Validates the counts and the two rates. */
-        public CuckooStats {
-            if (pendingDeletions < 0) {
-                throw new IllegalArgumentException(
-                    "Pending deletions must be non-negative: " + pendingDeletions);
-            }
-            if (totalDeletions < 0) {
-                throw new IllegalArgumentException(
-                    "Total deletions must be non-negative: " + totalDeletions);
-            }
-            if (saturatedSegments < 0) {
-                throw new IllegalArgumentException(
-                    "Saturated segments must be non-negative: " + saturatedSegments);
-            }
-            if (Double.isNaN(avgFpRate) || avgFpRate < 0.0 || avgFpRate > 1.0) {
-                throw new IllegalArgumentException(
-                    "Average FP rate must be in range [0.0, 1.0]: " + avgFpRate);
-            }
-            if (Double.isNaN(maxFpRate) || maxFpRate < 0.0 || maxFpRate > 1.0) {
-                throw new IllegalArgumentException(
-                    "Max FP rate must be in range [0.0, 1.0]: " + maxFpRate);
             }
         }
     }

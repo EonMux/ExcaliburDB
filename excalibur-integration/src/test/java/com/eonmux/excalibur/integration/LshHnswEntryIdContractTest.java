@@ -20,8 +20,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The LSH pre-filter and the HNSW graph share one id space, and it is the graph's.
  *
- * <p>Stage 2 of the query pipeline hands the ids an LSH index returns straight to
- * {@link HnswGraph#search(float[], int, Set)}, which measures the named nodes so stage 3 can rank
+ * <p>Stage 1 of the query pipeline hands the ids an LSH index returns straight to
+ * {@link HnswGraph#search(float[], int, Set)}, which measures the named nodes so stage 2 can rank
  * them in beside its graph search. This test holds both halves of that arrangement against each
  * other, because nothing else does: the two components live in different modules, neither
  * validates the ids it is given, and a disagreement between them produces no error at all - only

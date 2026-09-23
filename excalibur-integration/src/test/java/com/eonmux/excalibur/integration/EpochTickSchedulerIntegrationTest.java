@@ -146,7 +146,6 @@ class EpochTickSchedulerIntegrationTest {
             catalog,
             storageEngine,
             100000,  // hnswQueueDepthLimit
-            5000,    // cuckooMaintenanceIntervalMs
             60000,   // reindexCheckIntervalMs
             50       // epochTickIntervalMs (50ms for faster testing)
         );

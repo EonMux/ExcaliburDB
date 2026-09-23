@@ -13,10 +13,9 @@ import java.util.Set;
  * believes it changed.</p>
  *
  * <h2>Only the sections this module owns</h2>
- * <p>{@code excalibur.filter.*} and {@code excalibur.api.*} are read by modules that
- * {@code excalibur-config} has no dependency on, through
- * {@link Config#getEffectiveProperties()}. Listing their keys here would be a second copy that
- * drifts, so they are left alone: an unrecognised key is only reported for a section this
+ * <p>{@code excalibur.api.*} is read by a module that {@code excalibur-config} has no
+ * dependency on, through {@link Config#getEffectiveProperties()}. Listing its keys here would be
+ * a second copy that drifts, so it is left alone: an unrecognised key is only reported for a section this
  * module actually parses.</p>
  *
  * <h2>Reported, not refused</h2>

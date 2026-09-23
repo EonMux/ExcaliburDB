@@ -328,7 +328,6 @@ class IngestEndpointTest {
                 storageEngine,
                 volumeManager,
                 100000, // hnswQueueDepthLimit
-                60000,  // cuckooMaintenanceIntervalMs
                 60000,  // reindexCheckIntervalMs
                 100     // epochTickMs
             );

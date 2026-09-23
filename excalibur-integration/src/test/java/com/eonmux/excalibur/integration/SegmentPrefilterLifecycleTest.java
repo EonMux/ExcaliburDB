@@ -19,7 +19,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * A segment's vector pre-filter has to have the same lifetime as the graph it is keyed against.
  *
- * <p>The pre-filter holds HNSW node ids, and stage 3 of the query pipeline measures the nodes it
+ * <p>The pre-filter holds HNSW node ids, and stage 1 of the query pipeline measures the nodes it
  * names beside the graph search. Its files are named after the segment, but node ids belong to the
  * graph - so any point where a name outlives the graph stored under it is a point where the
  * pre-filter starts describing data that is no longer there. A split is exactly that point: the

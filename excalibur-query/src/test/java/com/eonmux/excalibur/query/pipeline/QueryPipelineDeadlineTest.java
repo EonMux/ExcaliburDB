@@ -168,8 +168,8 @@ class QueryPipelineDeadlineTest {
     @Test
     @DisplayName("a scorer that overruns hands back the ranking already made, cut to the size asked for")
     void aScorerThatOverrunsReturnsTheRankingSoFar() throws IOException {
-        // Stage 4 leaves its list oversampled on purpose, because Stage 5's threshold filter is
-        // supposed to choose from it. When Stage 5 never answers, that list is what the caller
+        // Stage 3 leaves its list oversampled on purpose, because Stage 4's threshold filter is
+        // supposed to choose from it. When Stage 4 never answers, that list is what the caller
         // gets - and the caller asked for topK results, not twice topK.
         register(1L, false, 5);
         register(2L, false, 5);
@@ -190,7 +190,7 @@ class QueryPipelineDeadlineTest {
         QueryResponse response = scoring.executeSync(scoredQuery(1_000), new CancellationToken());
 
         assertThat(response.results())
-            .as("the ranking Stage 4 already produced is the answer")
+            .as("the ranking Stage 3 already produced is the answer")
             .isNotEmpty()
             .hasSizeLessThanOrEqualTo(5);
         assertThat(response.coverage().segmentsTimedOut())
@@ -270,7 +270,7 @@ class QueryPipelineDeadlineTest {
         return v;
     }
 
-    /** A query that also asks for relevancy scoring, so Stage 5 runs. */
+    /** A query that also asks for relevancy scoring, so Stage 4 runs. */
     private static QueryRequest scoredQuery(long timeoutMs) {
         return QueryRequest.builder()
             .queryText("test")

@@ -81,7 +81,7 @@ public final class ChangeSet {
      * Returns the list of deleted document metadata.
      *
      * <p>The returned metadata includes chunk IDs that need to be tombstoned
-     * in the storage layer and removed from the Cuckoo filter hierarchy.</p>
+     * in the storage layer.</p>
      *
      * @return Unmodifiable list of deleted document metadata
      */

@@ -10,7 +10,6 @@
  * <p>A document's chunks become visible to queries atomically:</p>
  * <ol>
  *   <li>All chunks are written to the write log with contiguous offsets</li>
- *   <li>All chunks are inserted into the Cuckoo filter hierarchy</li>
  *   <li>Write log is synced (fsync)</li>
  *   <li>Visibility epoch is advanced</li>
  *   <li>Document is registered in the visibility registry at the new epoch</li>

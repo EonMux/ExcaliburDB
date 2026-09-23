@@ -17,7 +17,6 @@ import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.core.codec.ChunkPayloadCodec;
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.core.util.StopSignal;
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.llm.LLMException;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -76,7 +75,6 @@ final class DocumentIngestor {
     private final UpsertHandler upsertHandler;
 
     private final LexicalSideIndex lexicalSideIndex;
-    private final SegmentTermRecorder termRecorder;
     private final GraphReporter graphReporter;
 
     /**
@@ -86,7 +84,6 @@ final class DocumentIngestor {
      * @param visibilityTracker   Publishes documents at an epoch, or null for no atomicity
      * @param documentRegistry    Records what was ingested, or null when nothing is recorded
      * @param lexicalSideIndex    The BM25 index kept beside storage
-     * @param termRecorder        Files written terms under their segment
      * @param graphReporter       Reports published documents onwards
      */
     DocumentIngestor(TextChunker textChunker,
@@ -95,7 +92,6 @@ final class DocumentIngestor {
                      DocumentVisibilityTracker visibilityTracker,
                      DocumentRegistry documentRegistry,
                      LexicalSideIndex lexicalSideIndex,
-                     SegmentTermRecorder termRecorder,
                      GraphReporter graphReporter) {
         this.textChunker = Objects.requireNonNull(textChunker, "TextChunker cannot be null");
         // Nullable, deliberately. A null client is lexical-only ingestion: chunks are written,
@@ -109,9 +105,8 @@ final class DocumentIngestor {
         // Over the same registry and the same storage the reindex path tombstones through, so a
         // document replaced here retires its previous version exactly as a re-crawl would.
         this.upsertHandler = documentRegistry == null ? null
-            : new UpsertHandler(documentRegistry, (CuckooFilter) null, this::tombstone);
+            : new UpsertHandler(documentRegistry, this::tombstone);
         this.lexicalSideIndex = Objects.requireNonNull(lexicalSideIndex);
-        this.termRecorder = Objects.requireNonNull(termRecorder);
         this.graphReporter = Objects.requireNonNull(graphReporter);
     }
 
@@ -440,9 +435,6 @@ final class DocumentIngestor {
     /**
      * Writes every chunk to the storage engine, recording the keys written so a later failure
      * can undo them.
-     *
-     * <p>Each chunk's terms are worked out once and handed both to the engine, which counts
-     * them into the segment's frequency sketch, and to the membership filter.</p>
      */
     private void writeChunks(String documentKey, List<TextChunk> chunks,
                              Map<Integer, float[]> embeddings, List<String> writtenKeys) {
@@ -452,10 +444,7 @@ final class DocumentIngestor {
             byte[] value = vector == null
                 ? ChunkPayloadCodec.encodeTextOnly(chunk.getText())
                 : ChunkPayloadCodec.encode(chunk.getText(), vector);
-            List<String> terms = chunk.terms();
-            long segmentId = storageEngine.putReportingSegment(
-                chunkId.getBytes(StandardCharsets.UTF_8), value, terms);
-            termRecorder.record(segmentId, chunkId, terms);
+            storageEngine.put(chunkId.getBytes(StandardCharsets.UTF_8), value);
             writtenKeys.add(chunkId);
         }
     }

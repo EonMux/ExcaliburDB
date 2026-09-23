@@ -346,7 +346,7 @@ final class ServerWiring {
     }
 
     /**
-     * Wraps the query pipeline with an LLM scorer for stage 5 relevancy scoring.
+     * Wraps the query pipeline with an LLM scorer for stage 4 relevancy scoring.
      *
      * @param llmScorer The scorer, or null to disable LLM scoring
      */
@@ -473,7 +473,7 @@ final class ServerWiring {
     }
 
     /**
-     * Attaches an ingestion pipeline and the LSH index stage 2 of a query names candidates from.
+     * Attaches an ingestion pipeline and the LSH index stage 1 of a query names candidates from.
      *
      * @param textChunker        The text chunker for splitting documents into chunks
      * @param embeddings         The embedding client, or null for lexical-only ingestion

@@ -1,8 +1,6 @@
 package com.eonmux.excalibur.shard;
 
 import com.eonmux.excalibur.shard.visibility.EpochIsolationValidator;
-import com.eonmux.excalibur.shard.worker.CuckooMaintenanceWorker;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.worker.HnswCompactionWorker;
 import com.eonmux.excalibur.shard.worker.HnswIntegrationWorker;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
@@ -20,8 +18,7 @@ import java.time.Duration;
 /**
  * The shard's background workers, and the order they are allowed to come up and go down in.
  *
- * <p>The order is the reason this exists. Seven loops write to the same segments, graphs and
- * filters, and each one depends on something the previous one has already made safe:</p>
+ * <p>The order is the reason this exists. Six loops share the same segments and graphs, and each one depends on something the previous one has already made safe:</p>
  * <ul>
  *   <li>The epoch tick scheduler starts first and stops last. Everything else publishes work
  *       that becomes visible at an epoch, so the counter has to be advancing before any of it
@@ -32,7 +29,7 @@ import java.time.Duration;
  *       is ever left feeding a worker that has already gone away.</li>
  * </ul>
  *
- * <p>Held as one object rather than as seven fields on the orchestrator because that order is
+ * <p>Held as one object rather than as six fields on the orchestrator because that order is
  * the invariant, and an invariant spread across two methods in a two-thousand-line class is
  * one a later edit reorders without noticing.</p>
  */
@@ -41,8 +38,6 @@ final class ShardWorkers {
     private static final Logger LOGGER = LoggerFactory.getLogger(ShardWorkers.class);
 
     private final HnswIntegrationWorker hnsw;
-    private final CuckooMaintenanceWorker cuckoo;
-    private final CuckooMetricsWorker cuckooMetrics;
     private final WarmingPhaseWorker warming;
     private final HnswCompactionWorker graphCompaction;
     private final SegmentReindexScheduler reindex;
@@ -92,10 +87,6 @@ final class ShardWorkers {
         // "healthy" cannot be reported at the moment writes are being refused.
         com.eonmux.excalibur.metrics.Metrics.setHnswQueueLimit(tuning.hnswQueueDepthLimit());
 
-        this.cuckoo = new CuckooMaintenanceWorker(catalog, engine,
-            listeners.filterCleanup(),
-            tuning.cuckooMaintenanceIntervalMs(), 1000, 0.001);
-
         this.reindex = new SegmentReindexScheduler(catalog,
             listeners.reindex(),
             tuning.reindexCheckIntervalMs(), 3600000);
@@ -129,11 +120,6 @@ final class ShardWorkers {
         this.graphCompaction = compaction.newGraphWorker();
         this.graphCompaction.setCompactionListener(listeners.graphCompaction());
         LOGGER.info("HnswCompactionWorker initialized for graph compaction");
-
-        // Create Cuckoo metrics worker for FP rate monitoring
-        // Uses same interval as CuckooMaintenanceWorker for consistency
-        this.cuckooMetrics = new CuckooMetricsWorker(tuning.cuckooMaintenanceIntervalMs());
-        LOGGER.info("CuckooMetricsWorker initialized for FP rate monitoring");
     }
 
     /**
@@ -147,8 +133,6 @@ final class ShardWorkers {
         epochTicks.start();
 
         // Start workers in order
-        cuckoo.start();
-        cuckooMetrics.start();
         hnsw.start();
         warming.start();
         graphCompaction.start();
@@ -190,9 +174,6 @@ final class ShardWorkers {
         ended &= graphCompaction.stop(left(deadline));
         ended &= warming.stop(left(deadline));
         ended &= hnsw.stop(left(deadline));
-        // Sampling and JMX only: nothing it runs touches storage, so it cannot hold the arena.
-        cuckooMetrics.stop(left(deadline));
-        ended &= cuckoo.stop(left(deadline));
 
         // Stop epoch tick scheduler last. Its stop fences any dispatched tick under its own
         // lock, so it has always ended when it returns.
@@ -258,24 +239,6 @@ final class ShardWorkers {
      */
     HnswIntegrationWorker hnsw() {
         return hnsw;
-    }
-
-    /**
-     * Returns the Cuckoo maintenance worker.
-     *
-     * @return The maintenance worker, never null
-     */
-    CuckooMaintenanceWorker cuckoo() {
-        return cuckoo;
-    }
-
-    /**
-     * Returns the Cuckoo false-positive sampling worker.
-     *
-     * @return The metrics worker, never null
-     */
-    CuckooMetricsWorker cuckooMetrics() {
-        return cuckooMetrics;
     }
 
     /**

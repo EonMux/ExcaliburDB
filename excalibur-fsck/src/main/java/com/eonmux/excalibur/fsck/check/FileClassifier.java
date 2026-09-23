@@ -32,6 +32,11 @@ public final class FileClassifier {
         if (FileKind.isDiagnosticDump(name)) {
             return FileKind.DIAGNOSTIC_DUMP;
         }
+        // Before the leftover rule, which the staging name of a term sketch would otherwise
+        // match: the node removes both forms when it starts, and says why.
+        if (FileKind.isObsolete(name)) {
+            return FileKind.OBSOLETE;
+        }
         if (FileKind.isLeftover(name)) {
             return FileKind.STAGING_LEFTOVER;
         }
@@ -66,9 +71,6 @@ public final class FileClassifier {
         }
         if (LshTableCheck.matches(name)) {
             return FileKind.LSH_TABLE;
-        }
-        if (FileKind.TERM_SKETCH_NAME.matcher(name).matches()) {
-            return FileKind.TERM_SKETCH;
         }
         if (FileKind.SEGMENT_STAGED_MAPPING_NAME.matcher(name).matches()) {
             return FileKind.HNSW_STAGED_DOCUMENT_MAP;
@@ -149,8 +151,7 @@ public final class FileClassifier {
     public static long segmentNumber(String name) {
         for (java.util.regex.Pattern pattern : new java.util.regex.Pattern[] {
                 FileKind.SEGMENT_DATA_NAME, FileKind.SEGMENT_LOG_NAME,
-                FileKind.SEGMENT_INDEX_NAME, FileKind.SEGMENT_STAGED_MAPPING_NAME,
-                FileKind.TERM_SKETCH_NAME }) {
+                FileKind.SEGMENT_INDEX_NAME, FileKind.SEGMENT_STAGED_MAPPING_NAME }) {
             var matcher = pattern.matcher(name);
             if (matcher.matches()) {
                 return Long.parseLong(matcher.group(1));

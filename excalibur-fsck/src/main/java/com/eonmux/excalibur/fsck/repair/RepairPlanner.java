@@ -295,9 +295,8 @@ public final class RepairPlanner {
                 + "and /v1/stats says whether it can"
             : kind.rebuiltOnOpen()
             ? "Every byte is preserved under the quarantine directory. The node would rebuild "
-                + "this file from " + (kind == FileKind.LEXICAL_KEY_LOOKUP
-                    ? "the segment's names" : "the segment's live entries")
-                + " on its next open whether or not it is moved; moving it aside only means "
+                + "this file from the segment's names on its next open whether or not it is "
+                + "moved; moving it aside only means "
                 + "the damaged copy is no longer read first and rejected"
             : kind.discardedOnOpen()
             ? "Every byte is preserved under the quarantine directory. The node would read "

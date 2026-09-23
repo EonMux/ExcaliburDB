@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
@@ -48,7 +47,6 @@ class PublicationFailureAccountingTest {
     @BeforeEach
     void setUp() {
         registry = new DocumentRegistry();
-        CuckooFilter filter = CuckooFilter.create(1024);
         SegmentCatalog catalog = new SegmentCatalog(tempDir.resolve("catalog"));
         VisibilityTracker visibility = new VisibilityTracker(catalog);
         AcceptingWriter writer = new AcceptingWriter();
@@ -56,10 +54,10 @@ class PublicationFailureAccountingTest {
         reindexer = new DocumentReindexer(
             new TextChunker(512, 64),
             null,
-            new UpsertHandler(registry, filter, writer),
+            new UpsertHandler(registry, writer),
             registry,
             writer,
-            new RefusingPublisher(visibility, registry, filter));
+            new RefusingPublisher(visibility, registry));
     }
 
     @Test
@@ -123,9 +121,8 @@ class PublicationFailureAccountingTest {
     /** A publisher that refuses everything, as one whose write log will not sync does. */
     private static final class RefusingPublisher extends DocumentBatchPublisher {
 
-        RefusingPublisher(VisibilityTracker visibility, DocumentRegistry registry,
-                          CuckooFilter filter) {
-            super(visibility, registry, filter, () -> { }, new ReentrantLock());
+        RefusingPublisher(VisibilityTracker visibility, DocumentRegistry registry) {
+            super(visibility, registry, () -> { }, new ReentrantLock());
         }
 
         @Override

@@ -1,12 +1,8 @@
 package com.eonmux.excalibur.ingest.registry;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
-import com.eonmux.excalibur.store.Segment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -27,32 +23,12 @@ import java.util.Set;
  *   <li><strong>New documents:</strong> Chunk, embed, and insert (delegated to ingestion pipeline)</li>
  * </ul>
  *
- * <h2>Why Tombstoning Does Not Touch the Cuckoo Filter Hierarchy</h2>
- * <p>The filter hierarchy is a <em>term</em> index, not a chunk index:
- * {@code DocumentBatchPublisher.insertIntoFilters} extracts terms from each chunk's text and
- * inserts one entry per term. Removing a document's entries from it is unsound in two separate
- * ways, so this handler deliberately does not attempt it.</p>
- * <ol>
- *   <li><strong>Chunk ids were never inserted.</strong> A Cuckoo filter delete searches the two
- *       candidate buckets for a matching fingerprint and clears the first slot that matches,
- *       with no key comparison. Deleting a key that was never inserted therefore evicts an
- *       unrelated term whose fingerprint happens to collide, at every level of the hierarchy.</li>
- *   <li><strong>Terms are shared.</strong> Even deleting the correct term keys would be wrong:
- *       a term is almost always present in other live documents of the same segment, and the
- *       filter has no reference counts.</li>
- * </ol>
- * <p>An entry left behind is a false positive, which at worst moves a segment ahead of others in
- * the order a query searches them. An entry wrongly removed is a false negative, which a trusted
- * level reports as the segment lacking a term it holds - wrong for every document, until the
- * level is next rebuilt. The storage tombstone is the source of truth; segment filters are
- * rebuilt when the segment is compacted.</p>
- *
  * <h2>Why Tombstoning Does Not Touch the LSH Index</h2>
- * <p>The same argument applies once more, for a different reason. A segment's LSH index is keyed
- * by HNSW node id, because the nodes it names are measured in the segment's graph, and node ids
- * are assigned by the integration worker rather than by ingestion. This handler holds chunk ids
- * and cannot derive a node id from one, so any id it computed would name an unrelated node and
- * evict a live vector's entry.</p>
+ * <p>Removing a document's entries from the LSH index would be unsound. A segment's LSH index is
+ * keyed by HNSW node id, because the nodes it names are measured in the segment's graph, and
+ * node ids are assigned by the integration worker rather than by ingestion. This handler holds
+ * chunk ids and cannot derive a node id from one, so any id it computed would name an unrelated
+ * node and evict a live vector's entry.</p>
  * <p>Nothing is lost by leaving it: the index only names extra nodes for a search to measure
  * beside its graph walk, and {@code HnswGraph} skips a named node that is no longer active, so a
  * stale entry costs one node read and yields no result. The entry itself is reclaimed when the
@@ -72,30 +48,13 @@ import java.util.Set;
  * @see ChangeSet
  * @see ChangeDetector
  * @see DocumentRegistry
- * @see HierarchicalCuckooFilter
  */
 public class UpsertHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(UpsertHandler.class);
 
     private final DocumentRegistry registry;
-    private final CuckooFilter cuckooFilter;
-    private final HierarchicalCuckooFilter hierarchicalFilter;
     private final StorageAdapter storageAdapter;
-
-    /**
-     * Functional interface for segment lookup.
-     */
-    @FunctionalInterface
-    public interface SegmentProvider {
-        /**
-         * Gets a segment by its ID.
-         *
-         * @param segmentId The segment ID
-         * @return The segment, or null if not found
-         */
-        Segment getSegment(String segmentId);
-    }
 
     /**
      * Functional interface for storage operations.
@@ -116,54 +75,11 @@ public class UpsertHandler {
      * Creates a new UpsertHandler.
      *
      * @param registry The document registry
-     * @param cuckooFilter The Cuckoo filter for chunk membership (may be null for dry-run)
      * @param storageAdapter The storage adapter for tombstone operations (may be null for dry-run)
      * @throws NullPointerException if registry is null
      */
-    public UpsertHandler(DocumentRegistry registry, CuckooFilter cuckooFilter,
-                         StorageAdapter storageAdapter) {
+    public UpsertHandler(DocumentRegistry registry, StorageAdapter storageAdapter) {
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
-        this.cuckooFilter = cuckooFilter;
-        this.hierarchicalFilter = null;
-        this.storageAdapter = storageAdapter;
-    }
-
-    /**
-     * Creates a new UpsertHandler with hierarchical Cuckoo filter support.
-     *
-     * <p>Use this constructor when you have a hierarchical filter structure. The filter is held
-     * for {@link #getHierarchicalFilter()} and is never deleted from; see the class javadoc.</p>
-     *
-     * @param registry The document registry
-     * @param hierarchicalFilter The hierarchical Cuckoo filter (may be null for dry-run)
-     * @param storageAdapter The storage adapter for tombstone operations (may be null for dry-run)
-     * @throws NullPointerException if registry is null
-     */
-    public UpsertHandler(DocumentRegistry registry, HierarchicalCuckooFilter hierarchicalFilter,
-                         StorageAdapter storageAdapter) {
-        this.registry = Objects.requireNonNull(registry, "registry must not be null");
-        this.cuckooFilter = null;
-        this.hierarchicalFilter = hierarchicalFilter;
-        this.storageAdapter = storageAdapter;
-    }
-
-    /**
-     * Creates a new UpsertHandler with both flat and hierarchical filter support.
-     *
-     * <p>This constructor allows both filter types. Neither is deleted from; see the class
-     * javadoc.</p>
-     *
-     * @param registry The document registry
-     * @param cuckooFilter The flat Cuckoo filter (fallback, may be null)
-     * @param hierarchicalFilter The hierarchical Cuckoo filter (preferred, may be null)
-     * @param storageAdapter The storage adapter for tombstone operations (may be null for dry-run)
-     * @throws NullPointerException if registry is null
-     */
-    public UpsertHandler(DocumentRegistry registry, CuckooFilter cuckooFilter,
-                         HierarchicalCuckooFilter hierarchicalFilter, StorageAdapter storageAdapter) {
-        this.registry = Objects.requireNonNull(registry, "registry must not be null");
-        this.cuckooFilter = cuckooFilter;
-        this.hierarchicalFilter = hierarchicalFilter;
         this.storageAdapter = storageAdapter;
     }
 
@@ -288,62 +204,6 @@ public class UpsertHandler {
     }
 
     /**
-     * Processes a ChangeSet against a named segment.
-     *
-     * <p>It does <em>not</em> touch the Cuckoo filter hierarchy, although it is given a segment.
-     * See the class javadoc: the filter indexes terms rather than chunk ids, so deleting a
-     * document's entries from it evicts terms that live documents still contain, and a trusted
-     * level's negative sends its segment to the back of every query naming the term. The storage
-     * tombstone is the source of truth; segment filters are rebuilt when the segment is
-     * compacted.</p>
-     *
-     * @param changeSet The change set to process
-     * @param segmentId The segment the documents' chunks were written to
-     * @return Result containing counts of successful operations and any errors
-     * @throws NullPointerException if changeSet or segmentId is null
-     */
-    public UpsertResult processChangesWithSegment(ChangeSet changeSet, String segmentId) {
-        Objects.requireNonNull(changeSet, "changeSet must not be null");
-        Objects.requireNonNull(segmentId, "segmentId must not be null");
-        
-        UpsertResult.Builder result = UpsertResult.builder();
-        
-        // Process changed documents - tombstone old chunks with hierarchical deletion
-        for (ChangeSet.ChangedDocument changed : changeSet.getChangedDocuments()) {
-            processChangedDocumentWithSegment(changed, segmentId, result);
-        }
-        
-        // Process deleted documents - tombstone all chunks with hierarchical deletion
-        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            processDeletedDocumentWithSegment(deleted, segmentId, result);
-        }
-        
-        return result.build();
-    }
-
-    /**
-     * Tombstones only the deleted documents in a change set, with segment context.
-     *
-     * <p>The segment-aware sibling of {@link #processDeletions(ChangeSet)}; see that method for
-     * why re-indexing must not tombstone changed documents up front.</p>
-     *
-     * @param changeSet The change set whose deletions should be processed
-     * @param segmentId The segment the document's chunks were written to
-     * @return Result containing counts of successful operations and any errors
-     * @throws NullPointerException if changeSet or segmentId is null
-     */
-    public UpsertResult processDeletionsWithSegment(ChangeSet changeSet, String segmentId) {
-        Objects.requireNonNull(changeSet, "changeSet must not be null");
-        Objects.requireNonNull(segmentId, "segmentId must not be null");
-
-        UpsertResult.Builder result = UpsertResult.builder();
-        for (DocumentMetadata deleted : changeSet.getDeletedDocuments()) {
-            processDeletedDocumentWithSegment(deleted, segmentId, result);
-        }
-        return result.build();
-    }
-
-    /**
      * Tombstones chunks for a single changed document.
      *
      * <p>The old chunks are tombstoned in storage. The metadata remains in the registry for
@@ -363,8 +223,6 @@ public class UpsertHandler {
 
     /**
      * Tombstones every chunk id in storage, recording one error per failure.
-     *
-     * <p>The Cuckoo filter hierarchy is deliberately left untouched; see the class javadoc.</p>
      */
     private void tombstoneChunks(List<String> chunkIds, UpsertResult.Builder resultBuilder) {
         if (storageAdapter == null) {
@@ -386,58 +244,13 @@ public class UpsertHandler {
     /**
      * Tombstones chunks for a single deleted document and removes from registry.
      *
-     * <p>All chunks are tombstoned and the metadata is removed from the registry. The Cuckoo
-     * filter hierarchy is deliberately left untouched; see the class javadoc.</p>
+     * <p>All chunks are tombstoned and the metadata is removed from the registry.</p>
      *
      * @param metadata The deleted document metadata
      * @param resultBuilder The result builder to record operations
      */
     private void processDeletedDocument(DocumentMetadata metadata,
                                          UpsertResult.Builder resultBuilder) {
-        String sourceId = metadata.getSourceId();
-        String documentId = metadata.getDocumentId();
-        
-        tombstoneChunks(metadata.getChunkIds(), resultBuilder);
-
-        // Remove from registry
-        registry.remove(sourceId, documentId);
-        resultBuilder.incrementDocumentsDeleted();
-    }
-
-    /**
-     * Tombstones chunks for a single changed document with segment-aware hierarchical deletion.
-     *
-     * <p>Neither the Cuckoo filter hierarchy nor the LSH index is touched; see the class
-     * javadoc for why each is left to compaction.</p>
-     *
-     * @param changed The changed document information
-     * @param segmentId The segment ID for hierarchical deletion
-     * @param resultBuilder The result builder to record operations
-     */
-    private void processChangedDocumentWithSegment(ChangeSet.ChangedDocument changed,
-                                                    String segmentId,
-                                                    UpsertResult.Builder resultBuilder) {
-        String documentId = changed.getDocumentId();
-        DocumentMetadata oldMetadata = changed.getOldMetadata();
-
-        tombstoneChunks(oldMetadata.getChunkIds(), resultBuilder);
-
-        resultBuilder.incrementDocumentsChanged();
-    }
-
-    /**
-     * Tombstones a deleted document's chunks.
-     *
-     * <p>Neither the Cuckoo filter hierarchy nor the LSH index is touched; see the class
-     * javadoc for why each is left to compaction.</p>
-     *
-     * @param metadata The deleted document metadata
-     * @param segmentId The segment the chunks were written to
-     * @param resultBuilder The result builder to record operations
-     */
-    private void processDeletedDocumentWithSegment(DocumentMetadata metadata,
-                                                    String segmentId,
-                                                    UpsertResult.Builder resultBuilder) {
         String sourceId = metadata.getSourceId();
         String documentId = metadata.getDocumentId();
         
@@ -485,44 +298,6 @@ public class UpsertHandler {
     }
 
     /**
-     * Tombstones a single chunk by ID.
-     *
-     * <p>The Cuckoo filter hierarchy is deliberately left untouched; see the class javadoc.</p>
-     *
-     * @param chunkId The chunk ID to tombstone
-     * @param segmentId The segment the chunk was written to
-     * @return true if the chunk was present in storage and removed
-     * @throws NullPointerException if chunkId or segmentId is null
-     */
-    public boolean tombstoneChunk(String chunkId, String segmentId) {
-        Objects.requireNonNull(chunkId, "chunkId must not be null");
-        Objects.requireNonNull(segmentId, "segmentId must not be null");
-
-        return storageAdapter != null && storageAdapter.delete(toBytes(chunkId));
-    }
-
-    /**
-     * Tombstones multiple chunks in batch.
-     *
-     * @param chunkIds The chunk IDs to tombstone
-     * @param segmentId The segment the chunks were written to
-     * @return Count of successfully tombstoned chunks
-     * @throws NullPointerException if chunkIds or segmentId is null
-     */
-    public int tombstoneChunks(List<String> chunkIds, String segmentId) {
-        Objects.requireNonNull(chunkIds, "chunkIds must not be null");
-        Objects.requireNonNull(segmentId, "segmentId must not be null");
-        
-        int successCount = 0;
-        for (String chunkId : chunkIds) {
-            if (tombstoneChunk(chunkId, segmentId)) {
-                successCount++;
-            }
-        }
-        return successCount;
-    }
-
-    /**
      * Converts a chunk ID string to UTF-8 bytes.
      */
     private static byte[] toBytes(String chunkId) {
@@ -536,33 +311,6 @@ public class UpsertHandler {
      */
     public DocumentRegistry getRegistry() {
         return registry;
-    }
-
-    /**
-     * Returns the Cuckoo filter (may be null).
-     *
-     * @return The filter
-     */
-    public CuckooFilter getCuckooFilter() {
-        return cuckooFilter;
-    }
-
-    /**
-     * Returns the hierarchical Cuckoo filter (may be null).
-     *
-     * @return The hierarchical filter
-     */
-    public HierarchicalCuckooFilter getHierarchicalFilter() {
-        return hierarchicalFilter;
-    }
-
-    /**
-     * Checks if hierarchical filter deletion is available.
-     *
-     * @return true if hierarchical filter is configured
-     */
-    public boolean hasHierarchicalFilter() {
-        return hierarchicalFilter != null;
     }
 
     /**

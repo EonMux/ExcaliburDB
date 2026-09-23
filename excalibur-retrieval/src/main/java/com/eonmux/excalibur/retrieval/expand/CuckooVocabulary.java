@@ -13,8 +13,7 @@ import java.util.Objects;
  * exactly and is already in memory. The filter earns its place when the corpus is split across many
  * shards or namespaces, because it answers without opening any of them - one constant-size structure
  * instead of a dictionary seek per shard, and no reader, no file descriptor and no page cache per
- * index consulted. That is the same argument the hierarchical filter already makes for the vector
- * path, applied to the lexical one.
+ * index consulted.
  *
  * <h2>Direction of error</h2>
  * <p>A Cuckoo filter over-reports and never under-reports, which is the correct direction here. A

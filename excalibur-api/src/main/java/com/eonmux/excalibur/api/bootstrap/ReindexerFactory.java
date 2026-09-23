@@ -1,7 +1,5 @@
 package com.eonmux.excalibur.api.bootstrap;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.erasure.SegmentVectorEraser;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
 import com.eonmux.excalibur.ingest.lexical.StoredChunkText;
@@ -27,19 +25,8 @@ import java.util.Objects;
  * Builds the {@link DocumentReindexer} and everything it writes through.
  *
  * <p>Kept separate from the application bootstrap because the reindex path has its
- * own correctness requirements: superseded chunks must actually be tombstoned, chunks
- * must land in the segment their key routes to, and each chunk's terms must be filed in
- * the membership filter under that segment.</p>
- *
- * <p>The last is the one a reindex could get wrong without anything failing. Once a
- * segment's level is trusted, stage 1 of the query pipeline searches the segment after the
- * ones that may hold a query's terms whenever the level names none of them, so a reindexed-in
- * term filed under any other segment - or under none - sends the segment holding its chunk to
- * the back of every query for it until the segment is next rebuilt, where a query that runs
- * out of time never reaches it. The storage engine reports the segment each write landed in,
- * and the reindexer files the chunk's terms there as it writes it, through the same recorder a
- * first ingest uses. The batch publisher is given no filter of its own: a document's chunks span
- * segments, so no one segment id could describe a publication.</p>
+ * own correctness requirements: superseded chunks must actually be tombstoned, and chunks
+ * must land in the segment their key routes to.</p>
  *
  * <p>The lexical index is part of that. A reindex removes content a query could still be
  * matching, so a reindexer that wrote to storage alone would leave deleted documents answering
@@ -95,9 +82,6 @@ public final class ReindexerFactory {
      * @param storageEngine      Storage engine chunks are written to and tombstoned in
      * @param volumeManager      Volume manager, enabling rolling replacement when present
      * @param indexOrchestrator  Orchestrator supplying the visibility tracker
-     * @param hierarchicalFilter Filter that must see both inserts and tombstones, and that
-     *                           each written chunk's terms are filed in under the segment it
-     *                           landed in; may be null on a node that runs no term filter
      * @param registry           Document registry shared with the ingestion pipeline
      * @param chunkIndex         Lexical index to keep in step with storage, or null for none
      * @return A configured reindexer
@@ -107,7 +91,6 @@ public final class ReindexerFactory {
                                            StorageEngine storageEngine,
                                            VolumeManager volumeManager,
                                            IndexOrchestrator indexOrchestrator,
-                                           HierarchicalCuckooFilter hierarchicalFilter,
                                            DocumentRegistry registry,
                                            ChunkIndex chunkIndex) {
         Objects.requireNonNull(config, "config cannot be null");
@@ -125,7 +108,6 @@ public final class ReindexerFactory {
 
         UpsertHandler upsertHandler = new UpsertHandler(
             registry,
-            hierarchicalFilter,
             StorageChunkWriter.tombstoneAdapter(storageEngine)
         );
 
@@ -134,7 +116,6 @@ public final class ReindexerFactory {
         DocumentBatchPublisher batchPublisher = new DocumentBatchPublisher(
             indexOrchestrator.getVisibilityTracker(),
             registry,
-            (CuckooFilter) null,
             () -> { /* write log sync is performed by the storage engine */ },
             null
         );
@@ -164,8 +145,6 @@ public final class ReindexerFactory {
                 batchPublisher
             );
         }
-
-        reindexer.setMembershipFilter(hierarchicalFilter);
 
         if (chunkIndex != null) {
             // The text supplier reads through the same storage engine the reindexer writes to,

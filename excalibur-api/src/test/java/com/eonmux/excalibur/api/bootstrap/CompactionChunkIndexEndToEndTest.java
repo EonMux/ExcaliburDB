@@ -92,7 +92,7 @@ class CompactionChunkIndexEndToEndTest {
             core.indexOrchestrator(), core.storageEngine(), core.volumeManager(), config,
             mock(QueryPipeline.class, Answers.RETURNS_SELF));
         attachment = new IngestionWiring(config, dataDir, core.storageEngine(),
-            core.indexOrchestrator(), core.hierarchicalFilter(), tracker, tenants)
+            core.indexOrchestrator(), tracker, tenants)
             .attachTo(server);
         server.withDocumentErasure(new DocumentErasureService(tracker.getRegistry(),
             StorageChunkWriter.tombstoneAdapter(core.storageEngine()), attachment.chunkIndex(),

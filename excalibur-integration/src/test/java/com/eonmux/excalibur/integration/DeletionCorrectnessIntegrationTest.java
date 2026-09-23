@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.integration;
 
 import com.eonmux.excalibur.filter.CuckooFilter;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -39,8 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>Covers deletion one key at a time and in bulk, reinsertion after deletion, repeated
  * insert/delete cycles, deletion at a high load factor, and the false positive rate that
- * survives it — including the hierarchical case, where a delete must leave no trace at
- * any level.</p>
+ * survives it.</p>
  *
  * @author ExcaliburDB
  * @since 10.0
@@ -456,57 +454,6 @@ class DeletionCorrectnessIntegrationTest {
             System.out.println("Domain correctness verified: 0 false positives for " +
                 keys.size() + " deleted keys at " +
                 String.format("%.2f%%", loadFactor * 100) + " load factor");
-        }
-
-        /**
-         * Test: Hierarchical deletion removes entries from ALL levels.
-         *
-         * <p>Domain correctness: When deleting from a hierarchical filter,
-         * the entry must be removed from both the segment AND corpus levels.</p>
-         */
-        @Test
-        @DisplayName("hierarchical deletion removes from all levels")
-        void hierarchicalDeletionRemovesFromAllLevels() {
-            HierarchicalCuckooFilter hcf = new HierarchicalCuckooFilter(10000);
-
-            // Create hierarchy: corpus -> segments
-            hcf.registerSegment("seg-A1");
-            hcf.registerSegment("seg-A2");
-            hcf.registerSegment("seg-B1");
-
-            // Insert keys into different segments
-            String key1 = "hierarchy-test-key-1";
-            String key2 = "hierarchy-test-key-2";
-            String key3 = "hierarchy-test-key-3";
-
-            assertThat(hcf.insertKey(key1, "seg-A1")).isTrue();
-            assertThat(hcf.insertKey(key2, "seg-A2")).isTrue();
-            assertThat(hcf.insertKey(key3, "seg-B1")).isTrue();
-
-            // Verify presence at all levels before deletion
-            CuckooFilter corpusFilter = hcf.getCorpusFilter();
-            CuckooFilter segA1 = hcf.getSegmentFilter("seg-A1");
-
-            assertThat(corpusFilter.contains(HierarchicalCuckooFilter.toBytes(key1))).isTrue();
-            assertThat(segA1.contains(HierarchicalCuckooFilter.toBytes(key1))).isTrue();
-
-            // Delete key1 from hierarchy
-            boolean deleted = hcf.deleteKey(key1, "seg-A1");
-            assertThat(deleted).isTrue();
-
-            // CRITICAL: Verify key1 is gone from ALL levels
-            assertThat(segA1.contains(HierarchicalCuckooFilter.toBytes(key1)))
-                .as("Key must be removed from segment level")
-                .isFalse();
-            assertThat(corpusFilter.contains(HierarchicalCuckooFilter.toBytes(key1)))
-                .as("Key must be removed from corpus level")
-                .isFalse();
-
-            // Verify other keys are still present
-            assertThat(hcf.mightContainKey(key2)).isTrue();
-            assertThat(hcf.mightContainKey(key3)).isTrue();
-
-            System.out.println("Hierarchical deletion verified: key removed from all levels");
         }
 
         /**

@@ -38,25 +38,6 @@ class JsonTextTest {
             assertThat(JsonText.number(-1.5, 6)).isEqualTo("-1.500000");
         }
 
-        @Test
-        @DisplayName("keeps the digits of a small value that fixed decimals would round away")
-        void exactKeepsSmallValues() {
-            Locale.setDefault(Locale.GERMANY);
-
-            assertThat(JsonText.exact(1.2207e-6)).isEqualTo("0.0000012207");
-            assertThat(JsonText.exact(0.0)).isEqualTo("0");
-            assertThat(JsonText.exact(0.5)).isEqualTo("0.5");
-            assertThat(Double.parseDouble(JsonText.exact(7.054738e-6))).isEqualTo(7.054738e-6);
-        }
-
-        @Test
-        @DisplayName("refuses a value JSON cannot carry")
-        void exactRefusesNonFinite() {
-            assertThatThrownBy(() -> JsonText.exact(Double.NaN))
-                .isInstanceOf(IllegalArgumentException.class);
-            assertThatThrownBy(() -> JsonText.exact(Double.POSITIVE_INFINITY))
-                .isInstanceOf(IllegalArgumentException.class);
-        }
     }
 
     @Nested

@@ -10,12 +10,12 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Stage 2: LSH candidates.
+ * Stage 1: LSH candidates.
  *
  * <p>Asks each segment's LSH index which of its entries share a bucket with the query, and
- * attaches those node ids to the segment for stage 3 to measure exactly beside its graph search.
- * The stage never removes a segment and never narrows what stage 3 may return: it can only add
- * nodes to the pool stage 3 ranks.</p>
+ * attaches those node ids to the segment for stage 2 to measure exactly beside its graph search.
+ * The stage never removes a segment and never narrows what stage 2 may return: it can only add
+ * nodes to the pool stage 2 ranks.</p>
  *
  * <h2>Why the index may not filter</h2>
  * <p>A query asks for the k nearest vectors, which exist in every non-empty segment however far
@@ -30,14 +30,14 @@ import java.util.Set;
  *
  * <h2>What it contributes instead</h2>
  * <p>The graph search is approximate: its beam can pass over a near neighbour the query's buckets
- * would have named. Stage 3 therefore measures the named nodes exactly and ranks them together with
+ * would have named. Stage 2 therefore measures the named nodes exactly and ranks them together with
  * what the graph returned. Adding exactly-measured nodes to a pool ranked by exact distance can
  * displace a result only with a closer one, so the answer is never worse than the graph search
  * alone and is better wherever the beam missed something the buckets caught.</p>
  *
  * <p>Because the stage can only add, an index that disagrees with its graph costs work and nothing
  * else: an index that has not yet seen every node names fewer of them, and an id naming no live
- * node is skipped when stage 3 measures it.</p>
+ * node is skipped when stage 2 measures it.</p>
  */
 final class LshCandidateStage {
 
@@ -54,7 +54,7 @@ final class LshCandidateStage {
      * @return Context with the same candidates, each carrying the entries its index named
      */
     static PipelineContext apply(PipelineContext context, CancellationToken token) {
-        token.checkCancelled("Stage 2 cancelled before LSH candidate lookup");
+        token.checkCancelled("Stage 1 cancelled before LSH candidate lookup");
 
         float[] queryVector = context.request.queryVectorUnsafe();
 
@@ -63,7 +63,7 @@ final class LshCandidateStage {
         long totalLshCandidates = 0;
 
         for (SegmentCandidate candidate : context.candidates) {
-            token.checkCancelled("Stage 2 cancelled during LSH query");
+            token.checkCancelled("Stage 1 cancelled during LSH query");
 
             LshIndex lsh = candidate.lshIndex();
             if (lsh == null) {
@@ -77,7 +77,7 @@ final class LshCandidateStage {
             annotated.add(named.isEmpty() ? candidate : candidate.withLshCandidates(named));
         }
 
-        LOGGER.debug("Stage 2: {} segments, {} with an LSH index, {} LSH candidates to measure",
+        LOGGER.debug("Stage 1: {} segments, {} with an LSH index, {} LSH candidates to measure",
             annotated.size(), segmentsWithLsh, totalLshCandidates);
 
         return context.withCandidates(annotated);

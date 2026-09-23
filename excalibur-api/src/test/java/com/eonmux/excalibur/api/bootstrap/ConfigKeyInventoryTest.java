@@ -42,7 +42,7 @@ class ConfigKeyInventoryTest {
 
     /** Every class in this module that declares a property key constant. */
     private static final Class<?>[] KEY_DECLARING =
-        {ApiSecurityConfig.class, TlsConfig.class, ListenPort.class, CoreComponents.class};
+        {ApiSecurityConfig.class, TlsConfig.class, ListenPort.class};
 
     /** Whether any inventory in the process claims to recognise this key. */
     private static boolean recognised(String key) {

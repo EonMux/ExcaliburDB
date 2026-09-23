@@ -13,7 +13,7 @@ import java.util.stream.Stream;
  *
  * <h2>Why this is a Source</h2>
  * <p>Everything ingestion does to a document - decoding, chunking, embedding, the lexical index,
- * the graph sink, the membership filter, the registry record that makes erasure and reindexing
+ * the graph sink, the registry record that makes erasure and reindexing
  * work - happens inside the orchestrator's run over a {@link Source}. A direct write that reached
  * storage by another path would have to repeat all of it, and would drift from it. So a posted
  * batch is dressed as the thing the pipeline already knows how to ingest, and every stage applies

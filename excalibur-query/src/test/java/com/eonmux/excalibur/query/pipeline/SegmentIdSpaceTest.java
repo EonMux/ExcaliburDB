@@ -25,8 +25,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>Two numbers identify a segment. {@link Segment#segmentId()} counts every segment instance a
  * process has constructed. The directory index is the routing slot the storage engine holds it
- * at, and it is what the catalog, the visibility tracker, the term filter hierarchy and the graph
- * provider are all keyed by. They agree while segments are created in directory order, and part
+ * at, and it is what the catalog, the visibility tracker and the graph provider are all keyed
+ * by. They agree while segments are created in directory order, and part
  * company as soon as one is created out of it - a compacted replacement, or a split child.</p>
  *
  * <p>Nothing detects the disagreement. A catalog lookup on the wrong number returns no metadata,

@@ -116,8 +116,7 @@ class GraphRouteIntegrationTest {
         DocumentVisibilityTracker tracker = new DocumentVisibilityTracker(
             DocumentRegistryFactory.open(dataDir), core.indexOrchestrator().getVisibilityTracker());
         QueryPipeline queryPipeline = QueryPipelineFactory.create(config, core.storageEngine(),
-            core.indexOrchestrator(), new DocumentVisibilityTrackerAdapter(tracker),
-            core.hierarchicalFilter());
+            core.indexOrchestrator(), new DocumentVisibilityTrackerAdapter(tracker));
         tenants = new GraphTenants(GraphRagFactory.tenantRootFor(config, dataDir), config,
             MappingBudget.detect(), config.graph().getMaxOpenNamespaces());
 
@@ -127,7 +126,7 @@ class GraphRouteIntegrationTest {
         server.withSecurity(ApiSecurityConfig.fromConfig(config));
         server.withSourceCatalog(SourceCatalog.open(dataDir));
         attachment = new IngestionWiring(config, dataDir, core.storageEngine(),
-            core.indexOrchestrator(), core.hierarchicalFilter(), tracker, tenants)
+            core.indexOrchestrator(), tracker, tenants)
             .attachTo(server);
         server.withDocumentRegistry(tracker.getRegistry());
         server.withGraphSupport(tenants);

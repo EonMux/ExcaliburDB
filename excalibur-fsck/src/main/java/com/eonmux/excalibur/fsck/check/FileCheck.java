@@ -102,8 +102,8 @@ public record FileCheck(
      *
      * <p>Every corrupt, unreadable or missing file is, with one exception: a corrupt file of a
      * kind the node recovers from by itself when it opens ({@link FileKind#recoveredOnOpen()}) -
-     * rebuilding it, as a term sketch is rebuilt, or setting it aside, as the source status
-     * history is. That file is reported as corrupt, because its bytes do not match what it
+     * rebuilding it, as a lexical segment's lookup table is rebuilt, or setting it aside, as
+     * the source status history is. That file is reported as corrupt, because its bytes do not match what it
      * declares, and it costs the node a rebuild or a history at start-up and nothing else, so it
      * does not make the directory damaged. Only corruption is exempt. A file that could not be
      * read far enough to judge - refused by the device, or in a format version this build does

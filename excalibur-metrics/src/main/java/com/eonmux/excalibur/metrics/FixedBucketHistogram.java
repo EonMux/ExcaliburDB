@@ -47,12 +47,6 @@ public final class FixedBucketHistogram {
     private long overflowSum;
     private long overflowMin;
     private long overflowMax;
-
-    // FP rate metrics - per-epoch statistics
-    private static final int NUM_FP_RATES = 10000;
-    private long[] fpRateBuckets;
-    private long fpRateEntries;
-    private volatile long fpRateEpoch;
     
     /**
      * Creates a new fixed-bucket histogram.
@@ -60,8 +54,6 @@ public final class FixedBucketHistogram {
     public FixedBucketHistogram() {
         this.buckets = new long[NUM_BUCKETS];
         this.totalEntries = 0;
-        this.fpRateBuckets = new long[NUM_FP_RATES];
-        this.fpRateEntries = 0;
         this.overflowMin = Long.MAX_VALUE;
     }
     
@@ -102,35 +94,6 @@ public final class FixedBucketHistogram {
             buckets[getBucketIndex(latencyMs)]++;
         }
         totalEntries++;
-    }
-    
-    /**
-     * Records an FP rate measurement, stamping it with the epoch this histogram
-     * was last told about via {@link #setEpoch(long)} or {@link #recordFpRate(double, long)}.
-     *
-     * @param fpRate False positive rate as a value between 0.0 and 1.0
-     */
-    public void recordFpRate(double fpRate) {
-        recordFpRate(fpRate, this.currentEpoch);
-    }
-
-    /**
-     * Records an FP rate measurement and stamps it with the supplied epoch,
-     * which also becomes this histogram's current epoch.
-     *
-     * @param fpRate False positive rate as a value between 0.0 and 1.0
-     * @param epoch Visibility epoch the measurement was taken in
-     */
-    public void recordFpRate(double fpRate, long epoch) {
-        double normalizedRate = Math.max(0.0, Math.min(1.0, fpRate));
-        // Clamp index to prevent ArrayIndexOutOfBoundsException when normalizedRate == 1.0
-        int bucketIndex = Math.min((int) (normalizedRate * NUM_FP_RATES), NUM_FP_RATES - 1);
-        synchronized (this) {
-            fpRateBuckets[bucketIndex]++;
-            fpRateEntries++;
-            this.currentEpoch = epoch;
-            this.fpRateEpoch = epoch;
-        }
     }
     
     /**
@@ -242,61 +205,15 @@ public final class FixedBucketHistogram {
     }
 
     /**
-     * Gets the average FP rate (instance method).
-     */
-    public double getAverageFpRate() {
-        synchronized (this) {
-            if (fpRateEntries == 0) return 0.0;
-            long sum = 0;
-            for (int i = 0; i < NUM_FP_RATES; i++) {
-                sum += fpRateBuckets[i] * i;
-            }
-            return (double) sum / fpRateEntries / NUM_FP_RATES;
-        }
-    }
-
-    /**
-     * Gets the epoch the most recent FP rate measurement was stamped with (instance method).
-     */
-    public long getFpRateEpoch() {
-        return fpRateEpoch;
-    }
-
-    /**
      * Gets the epoch this histogram was last told about (instance method).
      *
-     * <p>This is the stamp the next {@link #recordFpRate(double)} will carry, moved by
-     * {@link #setEpoch(long)}, {@link #record(long, long)} and
-     * {@link #recordFpRate(double, long)} alike. It is not the node's published visibility
-     * epoch - {@code Metrics.getCurrentEpoch()} owns that, and is what both epoch-bearing
-     * MBeans report, so that a query recording the epoch it read at cannot move the number an
-     * operator watches.</p>
+     * <p>Moved by {@link #setEpoch(long)} and {@link #record(long, long)} alike. It is not the
+     * node's published visibility epoch - {@code Metrics.getCurrentEpoch()} owns that, and is
+     * what the epoch-bearing MBeans report, so that a query recording the epoch it read at
+     * cannot move the number an operator watches.</p>
      */
     public long getCurrentEpoch() {
         return currentEpoch;
-    }
-
-    /**
-     * Gets the FP rate count (instance method).
-     */
-    public long getFpRateCount() {
-        synchronized (this) {
-            return fpRateEntries;
-        }
-    }
-
-    /**
-     * Gets the maximum FP rate recorded (instance method).
-     */
-    public double getMaxFpRate() {
-        synchronized (this) {
-            for (int i = NUM_FP_RATES - 1; i >= 0; i--) {
-                if (fpRateBuckets[i] > 0) {
-                    return (double) i / NUM_FP_RATES;
-                }
-            }
-            return 0.0;
-        }
     }
 
     // Convenience methods for common percentiles (static for Metrics access)
@@ -361,14 +278,12 @@ public final class FixedBucketHistogram {
     }
 
     /**
-     * Discards all recorded measurements and FP rate samples.
+     * Discards all recorded measurements.
      */
     public void reset() {
         synchronized (this) {
             Arrays.fill(buckets, 0L);
-            Arrays.fill(fpRateBuckets, 0L);
             totalEntries = 0;
-            fpRateEntries = 0;
             overflowCount = 0;
             overflowSum = 0;
             overflowMin = Long.MAX_VALUE;

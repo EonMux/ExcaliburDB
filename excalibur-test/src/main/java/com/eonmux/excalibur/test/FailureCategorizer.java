@@ -459,7 +459,7 @@ public final class FailureCategorizer {
             case "Data Loss" -> "Check segment registration in VisibilityTracker and StorageEngine";
             case "Epoch Isolation" -> "Verify epoch capture happens before any data access";
             case "Document Atomicity" -> "Ensure DocumentBatchPublisher publishes all chunks in one epoch";
-            case "Deletion Correctness" -> "Verify Cuckoo filter delete() removes fingerprint at all hierarchy levels";
+            case "Deletion Correctness" -> "Verify Cuckoo filter delete() removes the key's fingerprint from its bucket";
             case "Coverage Correctness" -> "Check IndexCoverage calculation reflects actual segment states";
             case "Result Ordering" -> "Verify results are sorted by distance in ascending order";
             case "Duplicate Results" -> "Check for duplicate node IDs in HNSW graph or segment storage";
@@ -480,7 +480,7 @@ public final class FailureCategorizer {
 
     private static String getMinorRemediation(String category) {
         return switch (category) {
-            case "False Positive Rate" -> "Consider increasing fingerprint size in Cuckoo filter config";
+            case "False Positive Rate" -> "Consider a wider fingerprint for the Cuckoo filter";
             case "Test Infrastructure" -> "Add proper cleanup in @AfterEach methods";
             default -> "Minor issue - fix when convenient";
         };

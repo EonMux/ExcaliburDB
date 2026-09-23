@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.graph.GraphIngestSink;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentLocks;
@@ -55,7 +54,7 @@ class ReindexGraphReportingTest {
     void setUp() {
         registry = new DocumentRegistry();
         writer = new RecordingWriter();
-        upsertHandler = new UpsertHandler(registry, CuckooFilter.create(10_000), writer);
+        upsertHandler = new UpsertHandler(registry, writer);
         sink = new RecordingSink();
         GraphReporter reporter = new GraphReporter();
         reporter.setSink(sink);

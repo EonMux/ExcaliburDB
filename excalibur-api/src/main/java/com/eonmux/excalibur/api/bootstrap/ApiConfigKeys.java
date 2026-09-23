@@ -56,15 +56,17 @@ public final class ApiConfigKeys {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ApiConfigKeys.class);
 
+    /** The prefixes this module answers for. */
+    private static final List<String> PREFIXES = List.of("excalibur.api.");
+
     /**
-     * The prefixes this module answers for.
+     * The prefix of the settings that sized the term filter the query pipeline no longer has.
      *
-     * <p>{@code excalibur.filter.} is here rather than in the config module for the same reason
-     * {@code excalibur.api.} is: the membership filter is sized by this module and the config
-     * module never reads those keys. It was claimed by neither, so a typo in the one setting the
-     * troubleshooting guide tells an operator to change was accepted in silence.</p>
+     * <p>A file written for an earlier build still carries them, and nothing reads them any
+     * more. Each is named once at startup so an operator knows the line can go, rather than
+     * being left to wonder whether a node that ignores it is misconfigured.</p>
      */
-    private static final List<String> PREFIXES = List.of("excalibur.api.", "excalibur.filter.");
+    private static final String RETIRED_PREFIX = "excalibur.filter.";
 
     /**
      * Every class in this module that declares a property key constant.
@@ -74,8 +76,7 @@ public final class ApiConfigKeys {
      * the list against the template an operator copies.</p>
      */
     private static final Class<?>[] DECLARING =
-        {ApiSecurityConfig.class, TlsConfig.class, ListenPort.class, ShutdownBudget.class,
-            CoreComponents.class};
+        {ApiSecurityConfig.class, TlsConfig.class, ListenPort.class, ShutdownBudget.class};
 
     /** Every key the declaring classes read, under the prefixes this module answers for. */
     private static final Set<String> KNOWN = declaredKeys();
@@ -87,13 +88,19 @@ public final class ApiConfigKeys {
     }
 
     /**
-     * Warns about an {@code excalibur.api.} key no setting answers to.
+     * Warns about an {@code excalibur.api.} key no setting answers to, and about a retired
+     * {@code excalibur.filter.} key a file from an earlier build still sets.
      *
      * @param properties The effective settings, file and environment overlaid
      * @throws NullPointerException if properties is null
      */
     public static void reportUnrecognised(Map<String, String> properties) {
         for (String key : new TreeSet<>(properties.keySet())) {
+            if (key.startsWith(RETIRED_PREFIX)) {
+                LOGGER.warn("{} is no longer read: the term filter it configured has been "
+                    + "removed, and the line can be deleted", key);
+                continue;
+            }
             if (!owns(key) || KNOWN.contains(key)) {
                 continue;
             }

@@ -39,13 +39,13 @@ public final class Usage {
           image as LIVE_UNSAFE.
 
           --exclude-derived leaves out state something will rebuild: the lexical chunk
-          index, a tenant's built edge store, the quantiser codebooks and the segments'
-          term sketches. The HNSW graphs and their node mappings, a compaction's staged
+          index, a tenant's built edge store and the quantiser codebooks. The HNSW graphs and their node mappings, a compaction's staged
           mapping included, are never left out, because nothing rebuilds them. A mapping
           names each node's chunk, or its document in a file an older build wrote.
 
-          Never copied, and reported as omitted: staged names a crash left behind, and
-          JVM heap dumps (*.hprof), which are a record of a process rather than state.
+          Never copied, and reported as omitted: staged names a crash left behind, JVM
+          heap dumps (*.hprof), which are a record of a process rather than state, and
+          the segment_N.tfs term sketches an earlier build kept, which nothing reads.
 
         """;
 
@@ -64,8 +64,9 @@ public final class Usage {
           quantiser codebooks and LSH tables, each run on a scratch copy; excalibur-fsck's
           for the write-ahead logs, the routing directory, the document registry, source
           catalog and source status history, the graph staging logs, the lexical store,
-          the term sketches and a compaction's staged graph and mapping, which the node
-          discards on open while both are there. The report says how many were proven
+          a term sketch an earlier build kept, which is reported and not counted against
+          the image, and a compaction's staged graph and mapping, which the node discards
+          on open while both are there. The report says how many were proven
           against a checksum or seal, and lists the ones whose format carries nothing to
           prove them by.
 
@@ -81,7 +82,8 @@ public final class Usage {
           --deep also SHA-256 and the format checkers - then builds the new tree beside
           the target and renames it on in one move. Refuses an image that does not
           verify. Refuses a target that already holds something unless --force is given.
-          In both cases the target is left exactly as it was.
+          In both cases the target is left exactly as it was. A term sketch in an image an
+          earlier build took is verified with the image and not restored.
 
         """;
 

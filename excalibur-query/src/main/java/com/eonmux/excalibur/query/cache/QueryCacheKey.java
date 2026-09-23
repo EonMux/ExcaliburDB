@@ -49,8 +49,8 @@ import java.util.Objects;
  * @param offset                 How many of the best results the page skips
  * @param threshold              The score floor applied to the vector signal
  * @param includePartialSegments Whether a segment still being built may contribute
- * @param enableLlmScoring       Whether stage-5 relevancy scoring runs
- * @param llmThreshold           The relevancy floor stage 5 applies
+ * @param enableLlmScoring       Whether stage-4 relevancy scoring runs
+ * @param llmThreshold           The relevancy floor stage 4 applies
  * @param oversamplingFactor     How far past {@code topK} the beam is widened
  * @param includeText            Whether each result carries the text behind its identifier
  * @param snippet                Whether that text is the matched window rather than the start
@@ -276,7 +276,7 @@ public record QueryCacheKey(
         }
 
         /**
-         * Sets whether stage-5 relevancy scoring runs.
+         * Sets whether stage-4 relevancy scoring runs.
          *
          * @param enableLlmScoring true to score
          * @return This builder
@@ -287,7 +287,7 @@ public record QueryCacheKey(
         }
 
         /**
-         * Sets the relevancy floor stage 5 applies.
+         * Sets the relevancy floor stage 4 applies.
          *
          * @param llmThreshold The floor
          * @return This builder

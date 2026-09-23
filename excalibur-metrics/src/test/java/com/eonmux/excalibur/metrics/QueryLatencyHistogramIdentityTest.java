@@ -75,10 +75,7 @@ class QueryLatencyHistogramIdentityTest {
         Metrics.recordQueryLatency(11L, epoch + 77L);
 
         Object published = Metrics.getVisibilityEpochMBean().getAttribute("epoch");
-        Object onFpRateBean = Metrics.getCuckooFpRateMBean().getAttribute("currentEpoch");
 
         assertEquals(epoch, published, "the visibility epoch bean publishes the recorded epoch");
-        assertEquals(published, onFpRateBean,
-            "both beans that publish a current epoch must publish the same one");
     }
 }

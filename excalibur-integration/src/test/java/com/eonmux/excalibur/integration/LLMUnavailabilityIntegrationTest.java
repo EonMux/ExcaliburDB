@@ -107,7 +107,7 @@ class LLMUnavailabilityIntegrationTest {
     private static final int QUERY_COUNT = SUCCESSFUL_LLM_CALLS + FAILURE_THRESHOLD;
 
     /**
-     * Upper bound on the candidates Stage 5 can send: Stage 4 oversamples to twice topK.
+     * Upper bound on the candidates Stage 4 can send: Stage 3 oversamples to twice topK.
      * The mock scores every index up to this, so no candidate is dropped for want of a
      * score.
      */
@@ -766,10 +766,10 @@ class LLMUnavailabilityIntegrationTest {
                 // CRITICAL ASSERTIONS:
 
                 // 0. The LLM must genuinely have been called. Every other assertion here is
-                // vacuous if Stage 5 skipped scoring, which is exactly what happens when
+                // vacuous if Stage 4 skipped scoring, which is exactly what happens when
                 // results reach it without any text attached.
                 assertThat(requestCount.get())
-                    .as("Stage 5 must reach the LLM endpoint for every query until the "
+                    .as("Stage 4 must reach the LLM endpoint for every query until the "
                         + "circuit opens")
                     .isEqualTo(SUCCESSFUL_LLM_CALLS + FAILURE_THRESHOLD);
 
@@ -956,7 +956,7 @@ class LLMUnavailabilityIntegrationTest {
      * <p>The chunk is written to storage under the ingestion pipeline's key format
      * ({@code sourceId:documentId:chunk:index}) and the graph node is registered under the
      * owning document key, exactly as {@code HnswIntegrationWorker} does. That is what lets
-     * the query pipeline resolve a result back to its text before Stage 5.</p>
+     * the query pipeline resolve a result back to its text before Stage 4.</p>
      *
      * @param segment The segment to write the chunks into
      * @param graph   The graph to insert the embeddings into

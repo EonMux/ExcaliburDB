@@ -41,7 +41,19 @@ class ApiConfigKeysTest {
     void otherPrefixesAreNotJudged() {
         assertThat(ApiConfigKeys.isKnown("excalibur.shard.lsh-probes")).isFalse();
         assertThatCode(() -> ApiConfigKeys.reportUnrecognised(
-            Map.of("excalibur.shard.lsh-probes", "3", "excalibur.filter.fingerprint-bits", "13")))
+            Map.of("excalibur.shard.lsh-probes", "3")))
+            .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("a retired term filter key is named as retired, not judged as a typo")
+    void retiredFilterKeysAreNotJudged() {
+        // A file written for an earlier build still sizes the term filter that was removed.
+        // The node starts on it; it is told the line does nothing rather than refused.
+        assertThat(ApiConfigKeys.owns("excalibur.filter.fingerprint-bits")).isFalse();
+        assertThat(ApiConfigKeys.isKnown("excalibur.filter.fingerprint-bits")).isFalse();
+        assertThatCode(() -> ApiConfigKeys.reportUnrecognised(
+            Map.of("excalibur.filter.corpus-capacity", "10000000")))
             .doesNotThrowAnyException();
     }
 

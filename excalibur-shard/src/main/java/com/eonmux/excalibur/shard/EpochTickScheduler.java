@@ -30,7 +30,6 @@ import java.util.concurrent.atomic.AtomicLong;
  * of write log fsync. The pipeline:</p>
  * <ol>
  *   <li>Write log append</li>
- *   <li>Cuckoo filter insert</li>
  *   <li>LSH insert</li>
  *   <li>Enqueue for HNSW integration</li>
  *   <li>fsync</li>

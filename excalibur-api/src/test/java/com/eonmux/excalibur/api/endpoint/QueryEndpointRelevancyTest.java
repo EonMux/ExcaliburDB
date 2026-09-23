@@ -403,7 +403,7 @@ class QueryEndpointRelevancyTest extends QueryEndpointTestBase {
 
             assertThat(asked.getValue().enableLlmScoring()).isTrue();
             assertThat(asked.getValue().topK()).isEqualTo(2);
-            assertThat(judged).as("the endpoint does not score what Stage 5 already did")
+            assertThat(judged).as("the endpoint does not score what Stage 4 already did")
                 .isEmpty();
             assertThat(json).contains("\"retrieval\": \"vector\"")
                 .contains("\"llm_scored\": true")

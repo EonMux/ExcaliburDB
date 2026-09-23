@@ -22,13 +22,11 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
  * Each format in an image, handed to the checker that knows it.
@@ -64,8 +62,7 @@ class FormatChecksTest {
         DataDirectoryFixture.GRAPH,
         DataDirectoryFixture.DOCUMENT_MAPPING,
         DataDirectoryFixture.CODEBOOK,
-        DataDirectoryFixture.LSH_TABLE,
-        DataDirectoryFixture.TERM_SKETCH
+        DataDirectoryFixture.LSH_TABLE
     })
     void aSealedFileIsProven(String relativePath) throws IOException {
         ContentCheck check = check(relativePath);
@@ -155,46 +152,19 @@ class FormatChecksTest {
     }
 
     @Test
-    @DisplayName("a term sketch is checked by the store's sketch verifier, where it lies")
-    void aTermSketchGoesThroughFsck() throws IOException {
-        Path file = dataDir.resolve(DataDirectoryFixture.TERM_SKETCH);
-        String before = DataDirectoryFixture.digest(file);
+    @DisplayName("an earlier build's term sketch is reported, never read, and not damage")
+    void anObsoleteTermSketchIsHealthyButUnproven() throws IOException {
+        // An image an earlier build took names each segment's segment_N.tfs. Nothing in this
+        // build reads one, so its bytes say nothing about the image's health either way.
+        Path file = dataDir.resolve("segment_0.tfs");
+        Files.write(file, new byte[48]);
+        DataDirectoryFixture.flipAByte(file);
 
-        ContentCheck check = check(DataDirectoryFixture.TERM_SKETCH);
-
-        assertThat(check.format()).isEqualTo("term frequency sketch");
-        assertThat(DataDirectoryFixture.digest(file)).isEqualTo(before);
-    }
-
-    @Test
-    @DisplayName("a damaged term sketch is unproven but not damage: a restored node rebuilds it")
-    void aDamagedTermSketchIsHealthyButUnproven() throws IOException {
-        DataDirectoryFixture.flipAByte(dataDir.resolve(DataDirectoryFixture.TERM_SKETCH));
-
-        ContentCheck check = check(DataDirectoryFixture.TERM_SKETCH);
+        ContentCheck check = check("segment_0.tfs");
 
         assertThat(check.healthy()).as(check.detail()).isTrue();
         assertThat(check.proven()).isFalse();
-        assertThat(check.detail()).contains("CORRUPT", "rebuilds");
-    }
-
-    @Test
-    @DisplayName("a term sketch the operating system will not read is damage, not a rebuild")
-    void anUnreadableTermSketchIsDamage() throws IOException {
-        Path file = dataDir.resolve(DataDirectoryFixture.TERM_SKETCH);
-        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("---------"));
-        try {
-            assumeFalse(Files.isReadable(file),
-                "a process that reads through file permissions (root) cannot be refused");
-
-            ContentCheck check = check(DataDirectoryFixture.TERM_SKETCH);
-
-            assertThat(check.healthy()).as(check.detail()).isFalse();
-            assertThat(check.proven()).isFalse();
-            assertThat(check.detail()).contains("UNREADABLE");
-        } finally {
-            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-r--r--"));
-        }
+        assertThat(check.detail()).contains("NOT_DATA", "earlier build");
     }
 
     @Test

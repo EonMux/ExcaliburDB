@@ -45,12 +45,13 @@ public enum CheckStatus {
 
     /**
      * The file is not engine state: a JVM diagnostic dump the process wrote into the
-     * directory.
+     * directory, or a file an earlier build kept that this build neither reads nor writes.
      *
      * <p>Reported, with its size, and never read. It is neither damage nor unverified data -
      * nothing in the engine reads it, so there is nothing about it to verify - and counting
      * it as unverified would fail {@code --strict} on every node that has ever run out of
-     * heap, for as long as the evidence of why is kept.</p>
+     * heap, for as long as the evidence of why is kept, and on every directory an upgrade has
+     * not yet started on.</p>
      */
     NOT_DATA;
 

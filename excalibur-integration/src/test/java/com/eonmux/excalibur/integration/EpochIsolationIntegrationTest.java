@@ -126,7 +126,6 @@ class EpochIsolationIntegrationTest {
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
             documentRegistry,
-            null,
             // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
             // durability barrier is already satisfied before the adapter runs.
             () -> { },

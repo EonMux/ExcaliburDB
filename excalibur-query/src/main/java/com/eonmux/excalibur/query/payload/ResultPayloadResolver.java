@@ -20,7 +20,7 @@ import java.util.Objects;
  * score.
  *
  * <h2>Why this exists</h2>
- * <p>A vector search result identifies a node, not a document body. Stage 5 compares the
+ * <p>A vector search result identifies a node, not a document body. Stage 4 compares the
  * query against candidate <em>text</em>, so between selection and scoring the surviving
  * results have to be resolved back to the values they were ingested from. Without this
  * step every candidate is blank and the LLM is asked to rank a list of empty strings.</p>

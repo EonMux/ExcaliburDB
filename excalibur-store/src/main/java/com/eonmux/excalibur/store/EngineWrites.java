@@ -73,18 +73,12 @@ final class EngineWrites {
      * retry. Classifying them by message would silently miss the data-region case, which is
      * the one vector payloads hit first.</p>
      *
-     * <h2>Why the terms are hashed here</h2>
-     * <p>The value's chunk-text terms are counted into the sketch of whichever segment accepts
-     * the write, under that segment's write lock. Hashing them here, once and before any lock,
-     * keeps the tokenising out of the lock and out of every retry.</p>
-     *
-     * @param key        The key
-     * @param value      The value
-     * @param termHashes The value's {@linkplain SegmentTermSketch#termHashes(byte[]) term hashes}
+     * @param key   The key
+     * @param value The value
      * @return The catalog index of the segment the key was written to
      * @see StorageEngine#putReportingSegment(byte[], byte[])
      */
-    long putReportingSegment(byte[] key, byte[] value, long[] termHashes) {
+    long putReportingSegment(byte[] key, byte[] value) {
         if (key == null || value == null) {
             throw new NullPointerException("Key and value cannot be null");
         }
@@ -113,7 +107,7 @@ final class EngineWrites {
             }
 
             try {
-                segment.put(key, value, termHashes);
+                segment.put(key, value);
 
                 // Update catalog entry count only - don't change lifecycle state
                 // Segments remain in INDEXING state during writes
@@ -130,8 +124,7 @@ final class EngineWrites {
                 // unsatisfiable probe chain - is handled the same way: split and retry.
                 // Classifying these by exception message would silently miss the data
                 // region case, which is the one vector payloads hit first.
-                return putWithSplitHandling(key, value, termHashes, keyHash, segment,
-                    segmentIndex);
+                return putWithSplitHandling(key, value, keyHash, segment, segmentIndex);
             } catch (SegmentRetiredException e) {
                 // The split published while this write was in flight. The key belongs to one of
                 // the children now; writing it here would land in a file nothing can reach.
@@ -161,13 +154,12 @@ final class EngineWrites {
      *
      * @param key The key to insert
      * @param value The value to insert
-     * @param termHashes The value's term hashes
      * @param keyHash The pre-computed key hash
      * @param segment The segment that is at capacity
      * @param segmentIndex The segment index
      * @throws SegmentAtCapacityException if split cannot complete in time
      */
-    private long putWithSplitHandling(byte[] key, byte[] value, long[] termHashes, long keyHash,
+    private long putWithSplitHandling(byte[] key, byte[] value, long keyHash,
                                        Segment segment, int segmentIndex) {
         if (engine.splitWorker == null || !engine.splitWorker.isRunning()) {
             // No split worker available - cannot handle capacity automatically
@@ -194,7 +186,7 @@ final class EngineWrites {
         }
 
         // Insert into child segment
-        child.put(key, value, termHashes);
+        child.put(key, value);
 
         long catalogIndex = engine.routingTable.catalogIndexOf(child, segmentIndex);
         engine.catalog.updateEntryCount(catalogIndex, 1);

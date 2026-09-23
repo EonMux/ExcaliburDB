@@ -107,6 +107,9 @@ final class EngineLifecycle {
         // segments over indices it did not find.
         refuseIfAnyVolumeIsMissing(discoveredSegments);
 
+        // Files an earlier build kept beside its segments and nothing here reads.
+        ObsoleteSidecars.removeFrom(discovery.getDirectories());
+
         // Every segment this start opens, so that a start that fails part-way releases them
         // rather than leaving their descriptors, write logs and graphs open behind an engine
         // that never started - and that a caller has no reason to close.
@@ -215,14 +218,6 @@ final class EngineLifecycle {
                         + "created. Anything it accepted since the log was lost is not "
                         + "recoverable.",
                         new Object[] { segmentIndex, walPath });
-                }
-
-                // After the replay, so the watermark it is judged by - the log's sequence number
-                // and the entry counts - is the state the segment will serve from.
-                if (!segment.terms.loadOrRebuild()) {
-                    StorageEngine.LOGGER.log(Level.FINE,
-                        "Rebuilt the term sketch of segment {0} from its live entries",
-                        segmentIndex);
                 }
 
                 // Update last integrated offset from catalog if available

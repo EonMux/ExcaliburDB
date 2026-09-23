@@ -1051,7 +1051,7 @@ class ResultAggregatorTest {
 
     /**
      * Test that LLM-relevancy scored results are sorted descending.
-     * This simulates the flow in QueryPipeline.stage5_LlmScoring.
+     * This simulates the flow in LlmScoringStage.
      */
     @Test
     void testLlmScoredResultsSortedDescending() {
@@ -1063,7 +1063,7 @@ class ResultAggregatorTest {
         llmScoredResults.add(new QueryResultItem(103L, 0.31f, "doc4".getBytes(), 2L, 103L));
         llmScoredResults.add(new QueryResultItem(104L, 0.85f, "doc5".getBytes(), 3L, 104L));
 
-        // Sort by relevance descending (as done in stage5_LlmScoring)
+        // Sort by relevance descending (as done in LlmScoringStage)
         List<QueryResultItem> sorted = ResultAggregator.sortByRelevanceDescending(llmScoredResults);
 
         // Verify results are sorted by relevance score descending

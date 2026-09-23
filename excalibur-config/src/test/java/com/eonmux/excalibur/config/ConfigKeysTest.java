@@ -41,7 +41,6 @@ class ConfigKeysTest {
     @DisplayName("the sections other modules own are left alone")
     void moduleOwnedSectionsAreNotJudged() {
         assertThat(ConfigKeys.isOwned("excalibur.api.auth-token")).isFalse();
-        assertThat(ConfigKeys.isOwned("excalibur.filter.corpus-capacity")).isFalse();
         assertThat(ConfigKeys.isOwned("excalibur.shard.volumes")).isTrue();
     }
 

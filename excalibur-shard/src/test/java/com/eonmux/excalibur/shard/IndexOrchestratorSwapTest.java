@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.shard;
 
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.StorageEngine;
 import com.eonmux.excalibur.vector.distance.CosineSimilarity;
@@ -73,7 +72,7 @@ class IndexOrchestratorSwapTest {
         Segment original = storageEngine.getSegment(0L);
         assertThat(original).isNotNull();
         original.put("alpha".getBytes(StandardCharsets.UTF_8), "one".getBytes(StandardCharsets.UTF_8));
-        orchestrator.registerSegment(0L, original, null, null, null);
+        orchestrator.registerSegment(0L, original, null, null);
 
         Segment replacement = compact(original);
 
@@ -92,7 +91,7 @@ class IndexOrchestratorSwapTest {
         TailOffsetTracker tracker = new TailOffsetTracker(graph);
         original.attachHnswGraph(graph);
         original.attachTailOffsetTracker(tracker);
-        orchestrator.registerSegment(0L, original, graph, null, tracker);
+        orchestrator.registerSegment(0L, original, graph, tracker);
 
         Segment replacement = compact(original);
 
@@ -118,7 +117,7 @@ class IndexOrchestratorSwapTest {
         Segment original = storageEngine.getSegment(0L);
         com.eonmux.excalibur.filter.lsh.LshIndex prefilter = com.eonmux.excalibur.filter.lsh.LshIndex.create(DIMENSION);
         original.attachLshIndex(prefilter);
-        orchestrator.registerSegment(0L, original, null, null, null);
+        orchestrator.registerSegment(0L, original, null, null);
 
         Segment replacement = compact(original);
 
@@ -148,7 +147,7 @@ class IndexOrchestratorSwapTest {
         original.attachHnswGraph(graph);
         original.attachTailOffsetTracker(tracker);
         original.attachLshIndex(prefilter);
-        orchestrator.registerSegment(0L, original, graph, null, tracker);
+        orchestrator.registerSegment(0L, original, graph, tracker);
 
         // Put a different segment in the directory slot the orchestrator still associates with
         // the original. This is the state a split reaches by publishing its children while a
@@ -178,7 +177,7 @@ class IndexOrchestratorSwapTest {
         // The orchestrator remembers this segment under an index the directory does not use for
         // it. That drift is what makes replaceSegment refuse: it compares the segment it holds at
         // the index it is given, and index 7 holds nothing at all.
-        orchestrator.registerSegment(7L, original, null, null, null);
+        orchestrator.registerSegment(7L, original, null, null);
 
         Segment replacement = compact(original);
 
@@ -212,7 +211,7 @@ class IndexOrchestratorSwapTest {
         assertThat(orchestrator.syncSegmentsFromStorage()).isZero();
 
         // A segment the engine no longer holds is retired.
-        orchestrator.registerSegment(9999L, storageEngine.getSegment(0L), null, null, null);
+        orchestrator.registerSegment(9999L, storageEngine.getSegment(0L), null, null);
         assertThat(orchestrator.syncSegmentsFromStorage()).isEqualTo(1);
         assertThat(orchestrator.getRegisteredSegmentCount()).isEqualTo(distinctSegments);
     }
@@ -230,44 +229,6 @@ class IndexOrchestratorSwapTest {
 
         assertThat(storageEngine.getSegment(0L)).isSameAs(replacement);
         assertThat(replacement.path()).isEqualTo(tempDir.resolve("segment_0.dat"));
-    }
-
-    @Test
-    @DisplayName("Re-registering a segment ID keeps its place in the filter hierarchy")
-    void reRegisteringASegmentIdKeepsItsHierarchyEntry() throws InterruptedException {
-        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(100_000L, 13, 1_000);
-        orchestrator.setHierarchicalCuckooFilter(filter);
-
-        // Segment 0 holds a chunk mentioning the term, filed under it as ingestion files it.
-        storageEngine.getSegment(0L).put("doc-0#0".getBytes(StandardCharsets.UTF_8),
-            com.eonmux.excalibur.core.codec.ChunkPayloadCodec.encodeTextOnly("excalibur"));
-
-        // Register index 0 against a stale instance, the state the orchestrator is in
-        // after a compaction or a split has replaced the Segment behind an index.
-        orchestrator.registerSegment(0L, storageEngine.getSegment(1L), null, null, null);
-        assertThat(orchestrator.awaitTermFilterRebuilds(10, java.util.concurrent.TimeUnit.SECONDS))
-            .isTrue();
-
-        byte[] term = "excalibur".getBytes(StandardCharsets.UTF_8);
-        assertThat(filter.insert(term, "0")).isTrue();
-        assertThat(filter.findCandidateSegments(term)).contains("0");
-        com.eonmux.excalibur.filter.CuckooFilter level = filter.getSegmentFilter("0");
-
-        orchestrator.syncSegmentsFromStorage();
-
-        // Stage 1 treats a covered level's miss as ground truth and searches the segment last
-        // on it. Whatever the re-registration does to the level, it must never leave segment 0
-        // covered and denying a term it holds: the level either names it or does not claim to
-        // cover it.
-        assertThat(filter.findCandidateSegments(term).contains("0") || !filter.coversSegment("0"))
-            .isTrue();
-        assertThat(orchestrator.awaitTermFilterRebuilds(10, java.util.concurrent.TimeUnit.SECONDS))
-            .isTrue();
-        assertThat(filter.getSegmentFilter("0"))
-            .as("the id keeps its level, which every holder of it still sees")
-            .isSameAs(level);
-        assertThat(filter.coversSegment("0")).isTrue();
-        assertThat(filter.findCandidateSegments(term)).contains("0");
     }
 
     /**

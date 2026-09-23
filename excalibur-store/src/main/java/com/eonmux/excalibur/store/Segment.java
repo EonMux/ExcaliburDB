@@ -205,13 +205,6 @@ public class Segment implements AutoCloseable {
      */
     volatile com.eonmux.excalibur.filter.lsh.LshIndex lshIndex;
 
-    /**
-     * Approximate term frequencies of the chunk text written here, counted on every applied put
-     * and kept on disk beside the segment; see {@link SegmentTermSketch}. The query pipeline
-     * orders a query's candidate segments by it.
-     */
-    volatile com.eonmux.excalibur.filter.sketch.CountMinSketch termFrequencySketch;
-
     /** Vector index for this segment, attached at initialisation; volatile so attachment publishes. */
     volatile com.eonmux.excalibur.vector.hnsw.HnswGraph hnswGraph;
 
@@ -256,9 +249,6 @@ public class Segment implements AutoCloseable {
 
     /** Opening, recovering and closing the backing file. */
     final SegmentFile file = new SegmentFile(this);
-
-    /** The term-frequency sketch's counting and its sidecar file. */
-    final SegmentTermSketch terms = new SegmentTermSketch(this);
 
     // ==================== Constructors ====================
 
@@ -322,11 +312,6 @@ public class Segment implements AutoCloseable {
         this.dataOffset = format.firstEntryOffset();
 
         slots.clearSlotTable();
-
-        // The file was just created empty, so any sidecar at its name describes a file that no
-        // longer exists; the sketch starts empty with it and counts every write from here.
-        TermSketchFile.deleteFor(path);
-        this.termFrequencySketch = SegmentTermSketch.newSketch();
     }
 
     /**
@@ -438,21 +423,6 @@ public class Segment implements AutoCloseable {
      */
     public void put(byte[] key, byte[] value) {
         mutations.put(key, value);
-    }
-
-    /**
-     * Inserts or updates a key-value pair whose chunk-text terms are already hashed.
-     *
-     * <p>{@link #put(byte[], byte[])} for a caller that hashed the terms once for several
-     * attempts, so that neither the tokenising nor the hashing is repeated or done under the
-     * write lock. See {@link SegmentTermSketch}.</p>
-     *
-     * @param key        The key (must not be null)
-     * @param value      The value (must not be null)
-     * @param termHashes {@link SegmentTermSketch#termHashes(byte[])} of the value
-     */
-    void put(byte[] key, byte[] value, long[] termHashes) {
-        mutations.put(key, value, termHashes);
     }
 
     /**
@@ -634,16 +604,11 @@ public class Segment implements AutoCloseable {
     }
 
     /**
-     * Flushes all changes to disk, and writes the term-frequency sketch beside them.
-     *
-     * <p>The sketch goes to its sidecar only for a segment that owns its name - one with a write
-     * log attached - and only if it has changed since it was last written; see
-     * {@link SegmentTermSketch}.</p>
+     * Flushes all changes to disk.
      */
     public void flush() {
         validateNotClosed();
         segment.force();
-        terms.persist();
     }
 
     /**
@@ -1017,70 +982,6 @@ public class Segment implements AutoCloseable {
         com.eonmux.excalibur.filter.lsh.LshIndex detached = this.lshIndex;
         this.lshIndex = null;
         return detached;
-    }
-
-    /**
-     * Replaces the term-frequency sketch the query pipeline orders segments by.
-     *
-     * <p>A segment created by this build starts with an empty sketch and a reopened one is given
-     * its sketch by the engine once its log has been replayed, so this is for a caller that has
-     * built the counts some other way. Every write applied after it is counted into the sketch
-     * attached here.</p>
-     *
-     * @param sketch The Count-Min Sketch to attach (must not be null)
-     * @throws NullPointerException if sketch is null
-     * @throws IllegalStateException if segment is closed
-     */
-    public void attachTermFrequencySketch(com.eonmux.excalibur.filter.sketch.CountMinSketch sketch) {
-        Objects.requireNonNull(sketch, "CountMinSketch cannot be null");
-        validateNotClosed();
-
-        lock.writeLock().lock();
-        try {
-            this.termFrequencySketch = sketch;
-            terms.sketchReplaced();
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    /**
-     * Gives up the term-frequency sketch, so this segment neither counts into it nor writes it.
-     *
-     * <p>For a segment another one has replaced under the same name - a compacted original, a
-     * split parent. Its {@link #close()} would otherwise write its sketch over the sidecar the
-     * replacement owns.</p>
-     *
-     * @return The sketch that was attached, or null if there was none
-     */
-    public com.eonmux.excalibur.filter.sketch.CountMinSketch detachTermFrequencySketch() {
-        lock.writeLock().lock();
-        try {
-            com.eonmux.excalibur.filter.sketch.CountMinSketch detached = this.termFrequencySketch;
-            this.termFrequencySketch = null;
-            terms.sketchReplaced();
-            return detached;
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    /**
-     * Returns the approximate term frequencies of what this segment holds.
-     *
-     * @return The Count-Min Sketch, or null if none is attached
-     */
-    public com.eonmux.excalibur.filter.sketch.CountMinSketch termFrequencySketch() {
-        return termFrequencySketch;
-    }
-
-    /**
-     * An alias for {@link #termFrequencySketch()}, kept for API consistency.
-     *
-     * @return The Count-Min Sketch, or null if none is attached
-     */
-    public com.eonmux.excalibur.filter.sketch.CountMinSketch getTermFrequencySketch() {
-        return termFrequencySketch;
     }
 
     // ==================== HNSW Graph Methods ====================

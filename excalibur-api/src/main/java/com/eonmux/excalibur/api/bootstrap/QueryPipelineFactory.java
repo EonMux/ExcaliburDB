@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.api.bootstrap;
 
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.query.executor.PqSearchSettings;
 import com.eonmux.excalibur.query.pipeline.QueryPipeline;
@@ -20,11 +19,10 @@ import java.util.Objects;
  * Builds the query pipeline with every filter the node is able to give it.
  *
  * <p>Kept out of the composition root because the pipeline's correctness is mostly in what is
- * passed to it rather than in the call itself. Each of the last four arguments is a filter that
- * is inert when omitted and silently wrong when omitted by accident: without the atomicity
- * checker a query can see half an ingested document, without the membership filter Stage 1
- * cannot put the segments holding a query's terms first, and without the epoch validator a long-running query
- * can return graph nodes written after the snapshot it captured. None of those has a symptom an
+ * passed to it rather than in the call itself. The atomicity checker and the epoch validator are
+ * each inert when omitted and silently wrong when omitted by accident: without the atomicity
+ * checker a query can see half an ingested document, and without the epoch validator a
+ * long-running query can return graph nodes written after the snapshot it captured. None of those has a symptom an
  * operator would recognise as a missing argument, so the assembly is written down in one place
  * where it can be read against that list.</p>
  *
@@ -48,21 +46,18 @@ public final class QueryPipelineFactory {
      * @param storageEngine             Storage holding the segments and their HNSW graphs
      * @param indexOrchestrator         Supplies the visibility clock and the epoch validator
      * @param documentVisibilityChecker The document atomicity filter, shared with ingestion
-     * @param hierarchicalFilter        The membership filter Stage 1 orders segments by
      * @return A pipeline ready to answer queries
      * @throws NullPointerException if any argument is null
      */
     public static QueryPipeline create(Config config,
                                        StorageEngine storageEngine,
                                        IndexOrchestrator indexOrchestrator,
-                                       DocumentVisibilityChecker documentVisibilityChecker,
-                                       HierarchicalCuckooFilter hierarchicalFilter) {
+                                       DocumentVisibilityChecker documentVisibilityChecker) {
         Objects.requireNonNull(config, "config cannot be null");
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
         Objects.requireNonNull(indexOrchestrator, "indexOrchestrator cannot be null");
         Objects.requireNonNull(documentVisibilityChecker,
             "documentVisibilityChecker cannot be null");
-        Objects.requireNonNull(hierarchicalFilter, "hierarchicalFilter cannot be null");
 
         LOGGER.info("Initializing query pipeline...");
 
@@ -81,7 +76,6 @@ public final class QueryPipelineFactory {
             distanceFunction,
             llmScorer(config),  // LLM scorer with query-specific timeout
             QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
-            hierarchicalFilter,  // Stage 1 searches the segments holding the query's terms first
             // Node-level epoch filtering. Omitting it leaves the pipeline unable to exclude graph
             // nodes written after the query's snapshot epoch, so a long-running query can return
             // vectors that did not exist when it started. The orchestrator maintains the
@@ -93,8 +87,8 @@ public final class QueryPipelineFactory {
             pqSearchSettings(config)
         );
 
-        LOGGER.info("Query pipeline initialized with document atomicity, hierarchical Cuckoo "
-            + "filter and node-level epoch isolation enabled");
+        LOGGER.info("Query pipeline initialized with document atomicity and node-level epoch "
+            + "isolation enabled");
         return pipeline;
     }
 

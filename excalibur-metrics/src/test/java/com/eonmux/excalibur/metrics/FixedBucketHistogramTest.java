@@ -109,68 +109,24 @@ class FixedBucketHistogramTest {
     }
 
     @Test
-    @DisplayName("FP rate recording and retrieval")
-    void testFpRateMetrics() {
-        histogram.recordFpRate(0.001);
-        histogram.recordFpRate(0.002);
-        histogram.recordFpRate(0.003);
-
-        assertEquals(3, histogram.getFpRateCount());
-        assertTrue(histogram.getAverageFpRate() > 0,
-            "Average FP rate should be positive");
-    }
-
-    @Test
-    @DisplayName("FP rate boundary values do not throw ArrayIndexOutOfBoundsException")
-    void testFpRateBoundaryValues() {
-        // These should not throw ArrayIndexOutOfBoundsException
-        assertDoesNotThrow(() -> histogram.recordFpRate(0.0));
-        assertDoesNotThrow(() -> histogram.recordFpRate(1.0));
-        assertDoesNotThrow(() -> histogram.recordFpRate(0.9999));
-        assertDoesNotThrow(() -> histogram.recordFpRate(-0.1));  // Should be clamped to 0.0
-        assertDoesNotThrow(() -> histogram.recordFpRate(1.1));   // Should be clamped to 1.0
-
-        assertEquals(5, histogram.getFpRateCount());
-        assertTrue(histogram.getMaxFpRate() >= 0.0 && histogram.getMaxFpRate() <= 1.0,
-            "Max FP rate should be in valid range");
-    }
-
-    @Test
-    @DisplayName("FP rate samples are stamped with the epoch they were taken in")
-    void testFpRateEpochStamping() {
+    @DisplayName("setEpoch and an epoch-stamped latency both move the histogram's epoch")
+    void testEpochTracking() {
         histogram.setEpoch(11L);
-        histogram.recordFpRate(0.001);
-        assertEquals(11L, histogram.getFpRateEpoch(),
-            "a sample must carry the epoch the histogram was told about");
+        assertEquals(11L, histogram.getCurrentEpoch(), "setEpoch moves the epoch");
 
-        histogram.recordFpRate(0.002, 12L);
-        assertEquals(12L, histogram.getFpRateEpoch(), "an explicit epoch stamps the sample");
+        histogram.record(25, 12L);
         assertEquals(12L, histogram.getCurrentEpoch(),
-            "an explicit epoch also advances the histogram's own epoch");
+            "an epoch-stamped latency also advances the histogram's own epoch");
     }
 
     @Test
-    @DisplayName("Recorded FP rates carry the visibility epoch, not zero")
-    void testCuckooFpRateCarriesVisibilityEpoch() {
-        long epoch = Metrics.getCurrentEpoch() + 500L;
-        Metrics.recordEpoch(epoch);
-        Metrics.recordCuckooFpRate(0.0005);
-
-        assertEquals(epoch, FixedBucketHistogram.getInstance().getFpRateEpoch(),
-            "the FP rate epoch must track the epoch the tick scheduler advances");
-    }
-
-    @Test
-    @DisplayName("reset() discards latencies and FP rate samples")
+    @DisplayName("reset() discards latencies")
     void testReset() {
         histogram.record(25);
-        histogram.recordFpRate(0.01);
 
         histogram.reset();
 
         assertEquals(0, histogram.getTotalCount(), "latencies are discarded");
-        assertEquals(0, histogram.getFpRateCount(), "FP rate samples are discarded");
-        assertEquals(0.0, histogram.getAverageFpRate(), "average FP rate returns to zero");
     }
 
     @Test

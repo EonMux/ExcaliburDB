@@ -49,7 +49,6 @@ class JmxMBeanIntegrationTest {
             "com.eonmux.excalibur:type=SystemHealth",
             "com.eonmux.excalibur:type=IngestionQueue",
             "com.eonmux.excalibur:type=VisibilityEpoch",
-            "com.eonmux.excalibur:type=CuckooFpRate",
             "com.eonmux.excalibur:type=HnswQueueDepth",
             "com.eonmux.excalibur:type=IngestionThroughput"
         };
@@ -144,27 +143,6 @@ class JmxMBeanIntegrationTest {
     }
 
     @Test
-    @DisplayName("CuckooFpRate MBean should be registered and visible")
-    void cuckooFpRateMBeanShouldBeRegistered() throws Exception {
-        ObjectName objectName = new ObjectName("com.eonmux.excalibur:type=CuckooFpRate");
-
-        assertTrue(mbeanServer.isRegistered(objectName),
-            "CuckooFpRate MBean should be registered in JMX");
-
-        MBeanInfo info = mbeanServer.getMBeanInfo(objectName);
-        assertNotNull(info, "MBeanInfo should not be null");
-        assertEquals("Cuckoo Filter False Positive Rate MBean", info.getDescription(),
-            "MBean description should match");
-
-        assertAttributeExists(info, "fpRate");
-        assertAttributeExists(info, "fpRateEpoch");
-        assertAttributeExists(info, "fpRateCount");
-        assertAttributeExists(info, "avgFpRate");
-        assertAttributeExists(info, "maxFpRate");
-        assertAttributeExists(info, "currentEpoch");
-    }
-
-    @Test
     @DisplayName("HnswQueueDepth MBean should be registered and visible")
     void hnswQueueDepthMBeanShouldBeRegistered() throws Exception {
         ObjectName objectName = new ObjectName("com.eonmux.excalibur:type=HnswQueueDepth");
@@ -201,14 +179,12 @@ class JmxMBeanIntegrationTest {
             "IngestionQueue MBean should be discoverable");
         assertTrue(mbeans.contains(new ObjectName("com.eonmux.excalibur:type=VisibilityEpoch")),
             "VisibilityEpoch MBean should be discoverable");
-        assertTrue(mbeans.contains(new ObjectName("com.eonmux.excalibur:type=CuckooFpRate")),
-            "CuckooFpRate MBean should be discoverable");
         assertTrue(mbeans.contains(new ObjectName("com.eonmux.excalibur:type=HnswQueueDepth")),
             "HnswQueueDepth MBean should be discoverable");
         assertTrue(mbeans.contains(new ObjectName("com.eonmux.excalibur:type=IngestionThroughput")),
             "IngestionThroughput MBean should be discoverable");
 
-        assertEquals(7, mbeans.size(), "Exactly 7 ExcaliburDB MBeans should be registered");
+        assertEquals(6, mbeans.size(), "Exactly 6 ExcaliburDB MBeans should be registered");
     }
 
     @Test

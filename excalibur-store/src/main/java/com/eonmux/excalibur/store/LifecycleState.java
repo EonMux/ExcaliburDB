@@ -31,7 +31,7 @@ package com.eonmux.excalibur.store;
  * <ul>
  *   <li>INDEXING, WARMING, ACTIVE, COMPACTING: Queryable</li>
  *   <li>BOOTSTRAPPING: Not queryable (no data)</li>
- *   <li>TOMBSTONED: Not queryable (data removed from filter hierarchy)</li>
+ *   <li>TOMBSTONED: Not queryable (awaiting epoch-based reclamation)</li>
  *   <li>PURGED: Not queryable (disk freed)</li>
  * </ul>
  *
@@ -74,8 +74,7 @@ public enum LifecycleState {
     
     /**
      * Invisible to new queries. Kept on disk until epoch-based reclamation.
-     * <p>Cuckoo filter entries for this segment are deleted and removals 
-     * propagated up the hierarchy. Segment remains visible to in-flight queries.</p>
+     * <p>Segment remains visible to in-flight queries.</p>
      */
     TOMBSTONED(5),
     

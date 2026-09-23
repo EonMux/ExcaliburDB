@@ -132,7 +132,6 @@ class LiveIndexingIntegrationTest {
         publisher = new DocumentBatchPublisher(
             visibilityTracker,
             documentRegistry,
-            null,
             // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
             // durability barrier is already satisfied before the adapter runs.
             () -> { },
@@ -210,9 +209,7 @@ class LiveIndexingIntegrationTest {
             graphProvider,
             distanceFunction,
             null,
-            QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
-            null
-        );
+            QueryPipeline.DEFAULT_COVERAGE_THRESHOLD);
         assertThat(pipeline.getVisibilityChecker())
             .as("The document atomicity filter must be configured for requirement (d)")
             .isNotNull();
@@ -879,9 +876,7 @@ class LiveIndexingIntegrationTest {
                 graphProvider,
                 distanceFunction,
                 null,
-                QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
-                null
-            );
+                QueryPipeline.DEFAULT_COVERAGE_THRESHOLD);
             assertThat(pipeline.getVisibilityChecker())
                 .as("The document atomicity filter must be configured")
                 .isNotNull();

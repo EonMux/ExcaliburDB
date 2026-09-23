@@ -2,7 +2,6 @@ package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.api.retrieval.LexicalQueryService;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.erasure.SegmentVectorEraser;
 import com.eonmux.excalibur.ingest.graph.LlmRelationExtractor;
 import com.eonmux.excalibur.ingest.graph.RelationExtractor;
@@ -58,8 +57,6 @@ import java.util.Optional;
  * @param dataDirectory             Where the chunk index is opened, beside the segments
  * @param storageEngine             Storage the chunk text is read back from and vectors erased in
  * @param indexOrchestrator         Supplies the visibility clock the chunk index stamps with
- * @param hierarchicalFilter        The membership filter ingestion must populate for Stage 1
- *                                  to have term membership to order segments by
  * @param documentVisibilityTracker The atomicity tracker shared with the query pipeline
  * @param graphTenants              Every namespace's graph, for the staging store ingestion
  *                                  writes facts into
@@ -69,7 +66,6 @@ public record IngestionWiring(Config config,
                               Path dataDirectory,
                               StorageEngine storageEngine,
                               IndexOrchestrator indexOrchestrator,
-                              HierarchicalCuckooFilter hierarchicalFilter,
                               DocumentVisibilityTracker documentVisibilityTracker,
                               GraphTenants graphTenants) {
 
@@ -78,7 +74,7 @@ public record IngestionWiring(Config config,
     /**
      * Validates that every collaborator is present.
      *
-     * <p>All seven are required. None of them has a sensible absent case: a missing one is a
+     * <p>All six are required. None of them has a sensible absent case: a missing one is a
      * composition-root bug, and left unchecked it surfaces as the pipeline quietly declining to
      * configure itself, which reads in the log exactly like an unreachable embedding endpoint.</p>
      *
@@ -89,7 +85,6 @@ public record IngestionWiring(Config config,
         Objects.requireNonNull(dataDirectory, "dataDirectory cannot be null");
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
         Objects.requireNonNull(indexOrchestrator, "indexOrchestrator cannot be null");
-        Objects.requireNonNull(hierarchicalFilter, "hierarchicalFilter cannot be null");
         Objects.requireNonNull(documentVisibilityTracker, "documentVisibilityTracker cannot be null");
         Objects.requireNonNull(graphTenants, "graphTenants cannot be null");
     }
@@ -301,21 +296,17 @@ public record IngestionWiring(Config config,
     }
 
     /**
-     * Gives the new orchestrator the two things it cannot discover for itself.
+     * Gives the new orchestrator the vector eraser it cannot discover for itself.
      *
-     * <p>Stage 1 of the query pipeline orders segments by the membership filter, and without this
-     * only the reindex path fills it - so a node that crawled its corpus once had no term to order
-     * any query by. The vector eraser is the rollback counterpart: an ingestion that is rolled back
-     * deletes the chunks it wrote, and without it the graph nodes built from them stay behind and
-     * a vector query keeps returning a name and a distance for content that is no longer there.
-     * </p>
+     * <p>An ingestion that is rolled back deletes the chunks it wrote, and without the eraser the
+     * graph nodes built from them stay behind and a vector query keeps returning a name and a
+     * distance for content that is no longer there.</p>
      *
      * @param server The server holding the orchestrator the attachment just created
      */
     private void attachOrchestratorHooks(ExcaliburDBServer server) {
         IngestionOrchestrator ingestion = server.getIngestionOrchestrator();
         if (ingestion != null) {
-            ingestion.setMembershipFilter(hierarchicalFilter);
             ingestion.setVectorEraser(SegmentVectorEraser.of(storageEngine));
         }
     }

@@ -1,20 +1,15 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import com.eonmux.excalibur.ingest.processor.TextChunk;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityRegistry;
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.store.VisibilityTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -35,18 +30,10 @@ import java.util.concurrent.locks.Lock;
  * <h2>Publication Pipeline</h2>
  * <ol>
  *   <li>Write all chunks to write log (via {@link DocumentBatchBuffer})</li>
- *   <li>Insert chunk terms into the Cuckoo filter, where one is configured</li>
  *   <li>Fsync write log to ensure durability</li>
  *   <li>Advance visibility epoch (single atomic operation)</li>
  *   <li>Register document metadata in registry</li>
  * </ol>
- *
- * <h2>What this does not file</h2>
- * <p>The per-segment membership filter the query pipeline orders segments by is not written
- * here. A document's chunks are routed by key across the storage engine's segments, so no one
- * segment id describes a batch; each chunk's terms are filed under the segment its own write
- * landed in, as it is written, by the writer's caller - see {@link DocumentReindexStep}. The
- * filter this publisher takes is a single, segment-agnostic one.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is fully thread-safe. Publication operations acquire
@@ -56,7 +43,6 @@ import java.util.concurrent.locks.Lock;
  * <ul>
  *   <li>Epoch advances monotonically after each successful publication</li>
  *   <li>Write log fsync occurs before epoch advancement</li>
- *   <li>Cuckoo filter insertions happen before visibility</li>
  *   <li>Document metadata registration is atomic with epoch tick</li>
  *   <li>Publication fails as a unit if any chunk fails</li>
  * </ul>
@@ -71,7 +57,6 @@ public class DocumentBatchPublisher {
     private final VisibilityTracker visibilityTracker;
     private final DocumentRegistry documentRegistry;
     private final DocumentVisibilityRegistry visibilityRegistry;
-    private final CuckooFilter cuckooFilter;
     private final WriteLogAdapter writeLogAdapter;
     private final Lock publicationLock;
 
@@ -105,7 +90,6 @@ public class DocumentBatchPublisher {
      * @param visibilityTracker The visibility tracker for epoch management
      * @param documentRegistry The document registry for metadata tracking
      * @param visibilityRegistry The visibility registry for document-atomic visibility (may be null)
-     * @param cuckooFilter The Cuckoo filter for chunk membership (may be null)
      * @param writeLogAdapter The write log adapter for fsync operations
      * @param publicationLock Lock for serializing publications (may be null)
      * @throws NullPointerException if visibilityTracker or documentRegistry is null
@@ -114,11 +98,10 @@ public class DocumentBatchPublisher {
             VisibilityTracker visibilityTracker,
             DocumentRegistry documentRegistry,
             DocumentVisibilityRegistry visibilityRegistry,
-            CuckooFilter cuckooFilter,
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock) {
-        this(visibilityTracker, documentRegistry, visibilityRegistry, cuckooFilter,
-             writeLogAdapter, publicationLock, null);
+        this(visibilityTracker, documentRegistry, visibilityRegistry, writeLogAdapter,
+             publicationLock, null);
     }
 
     /**
@@ -127,7 +110,6 @@ public class DocumentBatchPublisher {
      * @param visibilityTracker The visibility tracker for epoch management
      * @param documentRegistry The document registry for metadata tracking
      * @param visibilityRegistry The visibility registry for document-atomic visibility (may be null)
-     * @param cuckooFilter The Cuckoo filter for chunk membership (may be null)
      * @param writeLogAdapter The write log adapter for fsync operations
      * @param publicationLock Lock for serializing publications (may be null)
      * @param orchestrator The index orchestrator for backpressure checking (may be null)
@@ -137,25 +119,22 @@ public class DocumentBatchPublisher {
             VisibilityTracker visibilityTracker,
             DocumentRegistry documentRegistry,
             DocumentVisibilityRegistry visibilityRegistry,
-            CuckooFilter cuckooFilter,
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock,
             IndexOrchestrator orchestrator) {
         this.visibilityTracker = Objects.requireNonNull(visibilityTracker, "visibilityTracker must not be null");
         this.documentRegistry = Objects.requireNonNull(documentRegistry, "documentRegistry must not be null");
         this.visibilityRegistry = visibilityRegistry;
-        this.cuckooFilter = cuckooFilter;
         this.writeLogAdapter = writeLogAdapter;
         this.publicationLock = publicationLock;
         this.orchestrator = orchestrator;
     }
 
     /**
-     * Creates a new DocumentBatchPublisher without visibility registry (legacy compatibility).
+     * Creates a new DocumentBatchPublisher without a visibility registry.
      *
      * @param visibilityTracker The visibility tracker for epoch management
      * @param documentRegistry The document registry for metadata tracking
-     * @param cuckooFilter The Cuckoo filter for chunk membership (may be null)
      * @param writeLogAdapter The write log adapter for fsync operations
      * @param publicationLock Lock for serializing publications (may be null)
      * @throws NullPointerException if visibilityTracker or documentRegistry is null
@@ -163,32 +142,9 @@ public class DocumentBatchPublisher {
     public DocumentBatchPublisher(
             VisibilityTracker visibilityTracker,
             DocumentRegistry documentRegistry,
-            CuckooFilter cuckooFilter,
             WriteLogAdapter writeLogAdapter,
             Lock publicationLock) {
-        this(visibilityTracker, documentRegistry, null, cuckooFilter, writeLogAdapter, publicationLock, null);
-    }
-
-    /**
-     * Creates a new DocumentBatchPublisher with backpressure support (legacy compatibility).
-     *
-     * @param visibilityTracker The visibility tracker for epoch management
-     * @param documentRegistry The document registry for metadata tracking
-     * @param cuckooFilter The Cuckoo filter for chunk membership (may be null)
-     * @param writeLogAdapter The write log adapter for fsync operations
-     * @param publicationLock Lock for serializing publications (may be null)
-     * @param orchestrator The index orchestrator for backpressure checking (may be null)
-     * @throws NullPointerException if visibilityTracker or documentRegistry is null
-     */
-    public DocumentBatchPublisher(
-            VisibilityTracker visibilityTracker,
-            DocumentRegistry documentRegistry,
-            CuckooFilter cuckooFilter,
-            WriteLogAdapter writeLogAdapter,
-            Lock publicationLock,
-            IndexOrchestrator orchestrator) {
-        this(visibilityTracker, documentRegistry, null, cuckooFilter,
-             writeLogAdapter, publicationLock, orchestrator);
+        this(visibilityTracker, documentRegistry, null, writeLogAdapter, publicationLock, null);
     }
 
     /**
@@ -201,7 +157,6 @@ public class DocumentBatchPublisher {
      * <h3>Publication Steps</h3>
      * <ol>
      *   <li>Validate buffer state (must be SEALED)</li>
-     *   <li>Insert all chunk terms into the Cuckoo filter, where one is configured</li>
      *   <li>Fsync write log to ensure durability</li>
      *   <li>Advance visibility epoch atomically</li>
      *   <li>Register document metadata in registry</li>
@@ -271,13 +226,6 @@ public class DocumentBatchPublisher {
         long epochBefore = visibilityTracker.currentEpoch();
 
         try {
-            List<String> failedChunkIds = insertIntoFilters(buffer);
-            if (!failedChunkIds.isEmpty()) {
-                throw new PublicationException(
-                    "Failed to insert chunks into Cuckoo filter: " + failedChunkIds,
-                    failedChunkIds);
-            }
-
             if (writeLogAdapter != null) {
                 writeLogAdapter.sync();
                 LOGGER.trace("Write log synced for document: {}", documentId);
@@ -312,65 +260,10 @@ public class DocumentBatchPublisher {
         } catch (IOException e) {
             buffer.markFailed(e);
             throw new PublicationException("Failed to sync write log for document: " + documentId, e);
-        } catch (PublicationException e) {
-            buffer.markFailed(e);
-            throw e;
         } catch (Exception e) {
             buffer.markFailed(e);
             throw new PublicationException("Unexpected error during publication for document: " + documentId, e);
         }
-    }
-
-    /**
-     * Inserts the terms of every chunk's text into the Cuckoo filter.
-     *
-     * <p>Term-based, like the query side: a query extracts terms from its text and asks the
-     * filter for each. Distinct terms per chunk, and inserted only if absent, because the filter
-     * answers whether a term is present at all: a term occurring forty times, or in every chunk,
-     * is one fact.</p>
-     *
-     * @param buffer The buffer containing chunk entries
-     * @return List of chunk IDs none of whose terms could be inserted (empty if all succeeded,
-     *         and always empty when no filter is configured)
-     */
-    private List<String> insertIntoFilters(DocumentBatchBuffer buffer) {
-        List<String> failed = new ArrayList<>();
-        if (cuckooFilter == null) {
-            return failed;
-        }
-
-        for (DocumentBatchBuffer.ChunkEntry entry : buffer.getEntries()) {
-            String chunkId = entry.chunkId();
-            TextChunk textChunk = entry.textChunk();
-
-            if (textChunk == null || textChunk.getText() == null || textChunk.getText().isEmpty()) {
-                LOGGER.debug("Skipping chunk with no text content for Cuckoo filter: {}", chunkId);
-                continue;
-            }
-
-            Set<String> terms = new LinkedHashSet<>(textChunk.terms());
-            if (terms.isEmpty()) {
-                continue;
-            }
-
-            int failedTerms = 0;
-            for (String term : terms) {
-                byte[] termBytes = term.getBytes(StandardCharsets.UTF_8);
-                try {
-                    if (!cuckooFilter.insertIfAbsent(termBytes)) {
-                        failedTerms++;
-                    }
-                } catch (Exception e) {
-                    failedTerms++;
-                    LOGGER.warn("Exception inserting term '{}' into Cuckoo filter: {}", term, e.getMessage());
-                }
-            }
-
-            if (failedTerms == terms.size()) {
-                failed.add(chunkId);
-            }
-        }
-        return failed;
     }
 
     /**
@@ -438,32 +331,12 @@ public class DocumentBatchPublisher {
             LOGGER.debug("Backpressure released, proceeding with bulk publication");
         }
 
-        long epochBefore = visibilityTracker.currentEpoch();
         int totalChunks = 0;
-        List<String> failedDocuments = new ArrayList<>();
+        for (DocumentBatchBuffer buffer : buffers) {
+            totalChunks += buffer.getChunkCount();
+        }
 
         try {
-            for (int i = 0; i < buffers.size(); i++) {
-                DocumentBatchBuffer buffer = buffers.get(i);
-                List<String> failed = insertIntoFilters(buffer);
-                if (!failed.isEmpty()) {
-                    failedDocuments.add(buffer.getDocumentId());
-                    LOGGER.warn("Document {} is not published: {} of its {} chunks could not be "
-                        + "inserted into the filters, and a document is published whole or not "
-                        + "at all", buffer.getDocumentId(), failed.size(), buffer.getChunkCount());
-                    continue;
-                }
-                // Only what is published is counted. A refused document's chunks are not in the
-                // index, and counting them reports a corpus larger than the one that exists.
-                totalChunks += buffer.getChunkCount();
-            }
-
-            if (!failedDocuments.isEmpty() && failedDocuments.size() == buffers.size()) {
-                throw new PublicationException(
-                    "All documents failed filter insertion: " + failedDocuments,
-                    failedDocuments);
-            }
-
             if (writeLogAdapter != null) {
                 writeLogAdapter.sync();
             }
@@ -472,25 +345,20 @@ public class DocumentBatchPublisher {
 
             for (int i = 0; i < metadataList.size(); i++) {
                 DocumentBatchBuffer buffer = buffers.get(i);
-                if (!failedDocuments.contains(buffer.getDocumentId())) {
-                    documentRegistry.register(metadataList.get(i));
-                    
-                    if (visibilityRegistry != null) {
-                        Set<String> chunkIds = new HashSet<>(buffer.getChunkIds());
-                        visibilityRegistry.registerDocument(buffer.getDocumentId(), chunkIds, newEpoch);
-                    }
-                    
-                    buffer.markPublished();
-                } else {
-                    buffer.markFailed(new PublicationException("Filter insertion failed for document: " + buffer.getDocumentId()));
+                documentRegistry.register(metadataList.get(i));
+
+                if (visibilityRegistry != null) {
+                    Set<String> chunkIds = new HashSet<>(buffer.getChunkIds());
+                    visibilityRegistry.registerDocument(buffer.getDocumentId(), chunkIds, newEpoch);
                 }
+
+                buffer.markPublished();
             }
 
-            int successCount = buffers.size() - failedDocuments.size();
             LOGGER.info("Bulk publication complete: {} documents, {} chunks, epoch {}",
-                successCount, totalChunks, newEpoch);
+                buffers.size(), totalChunks, newEpoch);
 
-            return new BulkPublicationResult(newEpoch, totalChunks, successCount);
+            return new BulkPublicationResult(newEpoch, totalChunks, buffers.size());
 
         } catch (IOException e) {
             for (DocumentBatchBuffer buffer : buffers) {
@@ -563,25 +431,13 @@ public class DocumentBatchPublisher {
      * Exception thrown when publication fails.
      */
     public static class PublicationException extends RuntimeException {
-        private final List<String> failedItems;
 
         public PublicationException(String message) {
             super(message);
-            this.failedItems = List.of();
         }
 
         public PublicationException(String message, Throwable cause) {
             super(message, cause);
-            this.failedItems = List.of();
-        }
-
-        public PublicationException(String message, List<String> failedItems) {
-            super(message);
-            this.failedItems = failedItems != null ? List.copyOf(failedItems) : List.of();
-        }
-
-        public List<String> getFailedItems() {
-            return failedItems;
         }
     }
 }

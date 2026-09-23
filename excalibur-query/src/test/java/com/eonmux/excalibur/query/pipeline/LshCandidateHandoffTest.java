@@ -29,8 +29,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * What the LSH stage finds has to reach the search it supplements - and must never cut it short.
  *
- * <p>Stage 2 probes every candidate segment's LSH index and records the node ids that came back.
- * Stage 3 measures those nodes exactly beside its graph search, which recovers a near neighbour
+ * <p>Stage 1 probes every candidate segment's LSH index and records the node ids that came back.
+ * Stage 2 measures those nodes exactly beside its graph search, which recovers a near neighbour
  * the approximate search walked past. The two are joined by a value that has to survive being
  * turned into a dispatcher input; if it does not, nothing fails - the index is probed on every
  * query and never once consulted.</p>

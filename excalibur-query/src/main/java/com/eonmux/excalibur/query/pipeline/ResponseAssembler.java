@@ -106,7 +106,7 @@ final class ResponseAssembler {
         // timed out - all three of which computeDegraded reads off the numbers below - and for
         // three reasons no count records, which are ORed in afterwards: LLM scoring that fell
         // back to vector-only ranking, a segment that answered from part of its write log, and
-        // results Stage 4 found and dropped because nothing names them.
+        // results Stage 3 found and dropped because nothing names them.
         IndexCoverage coverage = coverageCounts.census().onto(IndexCoverage.builder())
             .tailScanEntries(context.totalTailScanEntries)
             .segmentsSearched(CoverageCounts.segmentsAnswering(context.segmentResults))
@@ -124,7 +124,7 @@ final class ResponseAssembler {
             .build();
         Metrics.recordUnnamedResultsDropped(context.unnamedResultsDropped);
 
-        // Whether Stage 5 ordered the ranking is part of the answer, not of how it was made:
+        // Whether Stage 4 ordered the ranking is part of the answer, not of how it was made:
         // it decides whether a score is a similarity or a relevancy judgement.
         QueryResponse response = new QueryResponse(
             context.mergedResults,
@@ -193,8 +193,8 @@ final class ResponseAssembler {
         // is answered with nothing for the reason the caller gave: the question was taken
         // back.
         boolean partial = timedOut && !cancelled;
-        // Stage 4 leaves its ranking oversampled when Stage 5 is going to run, because Stage 5's
-        // threshold filter is meant to choose from it. If Stage 5 is what the interruption
+        // Stage 3 leaves its ranking oversampled when Stage 4 is going to run, because Stage 4's
+        // threshold filter is meant to choose from it. If Stage 4 is what the interruption
         // caught, that list goes to the caller as it stands - so it is cut here to the size the
         // caller actually asked for.
         List<QueryResultItem> partialResults = (partial && partialContext != null)

@@ -183,7 +183,7 @@ public final class QueryRequestParser {
      * @param threshold           Minimum score
      * @param timeoutMs           Request budget in milliseconds
      * @param includePartial      Whether partially indexed segments may contribute
-     * @param enableLlmScoring    Whether Stage 5 LLM scoring runs
+     * @param enableLlmScoring    Whether Stage 4 LLM scoring runs
      * @param llmThreshold        Minimum LLM relevancy score
      * @param oversamplingFactor  Candidate oversampling factor
      * @param includeText         Whether each result carries the text behind its identifier

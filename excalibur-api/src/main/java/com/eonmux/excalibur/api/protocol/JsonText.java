@@ -41,27 +41,6 @@ public final class JsonText {
     }
 
     /**
-     * Formats a double for a JSON body at the precision it carries, without an exponent.
-     *
-     * <p>For values whose interesting digits sit further right than any fixed number of
-     * decimals would reach. A Cuckoo filter's estimated false-positive rate at a light load is
-     * of the order of {@code 1e-6}, which six decimals render as {@code 0.000001} or as zero -
-     * the same figure a filter holding nothing reports. {@code Double.toString} keeps the
-     * digits but writes {@code 1.2E-6}, which strict readers of the plain-decimal convention
-     * the other fields follow do not expect.</p>
-     *
-     * @param value The value, which must be finite
-     * @return The shortest plain decimal that reads back as the same double
-     * @throws IllegalArgumentException if the value is NaN or infinite, which JSON cannot carry
-     */
-    public static String exact(double value) {
-        if (!Double.isFinite(value)) {
-            throw new IllegalArgumentException("JSON has no representation for " + value);
-        }
-        return java.math.BigDecimal.valueOf(value).stripTrailingZeros().toPlainString();
-    }
-
-    /**
      * Escapes a string for inclusion in a JSON string literal.
      *
      * <p>Every character below {@code U+0020} is escaped, not just the five with short

@@ -8,7 +8,6 @@ import com.eonmux.excalibur.ingest.registry.UpsertHandler;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.llm.client.LLMClientConfig;
 import com.eonmux.excalibur.llm.client.LLMHttpClient;
 import com.eonmux.excalibur.llm.LLMException;
@@ -43,7 +42,6 @@ class DocumentReindexerTest {
     private DocumentRegistry registry;
     private MockStorageWriter storageWriter;
     private UpsertHandler upsertHandler;
-    private CuckooFilter cuckooFilter;
 
     @BeforeEach
     void setUp() {
@@ -51,9 +49,8 @@ class DocumentReindexerTest {
         llmClient = new MockLLMClient(1536);
         registry = new DocumentRegistry();
         storageWriter = new MockStorageWriter();
-        cuckooFilter = CuckooFilter.create(10000);
         
-        upsertHandler = new UpsertHandler(registry, cuckooFilter, storageWriter);
+        upsertHandler = new UpsertHandler(registry, storageWriter);
     }
 
     @Nested
@@ -284,8 +281,6 @@ class DocumentReindexerTest {
                 upsertHandler, registry, storageWriter);
             
             String oldChunkId = "doc-changed:chunk:0";
-            byte[] oldChunkBytes = oldChunkId.getBytes(StandardCharsets.UTF_8);
-            cuckooFilter.insert(oldChunkBytes);
             storageWriter.writeChunk(oldChunkId, "Old content", new float[1536]);
             
             DocumentMetadata oldMetadata = DocumentMetadata.builder()
@@ -319,10 +314,6 @@ class DocumentReindexerTest {
             
             String chunk1 = "doc-deleted:chunk:0";
             String chunk2 = "doc-deleted:chunk:1";
-            byte[] chunk1Bytes = chunk1.getBytes(StandardCharsets.UTF_8);
-            byte[] chunk2Bytes = chunk2.getBytes(StandardCharsets.UTF_8);
-            cuckooFilter.insert(chunk1Bytes);
-            cuckooFilter.insert(chunk2Bytes);
             storageWriter.writeChunk(chunk1, "Content 1", new float[1536]);
             storageWriter.writeChunk(chunk2, "Content 2", new float[1536]);
             
@@ -542,47 +533,8 @@ class DocumentReindexerTest {
     }
 
     @Nested
-    @DisplayName("Cuckoo Filter Integration")
-    class CuckooFilterTests {
-
-        /**
-         * Re-indexing must not delete anything from the Cuckoo filter.
-         *
-         * <p>The filter holds one entry per <em>term</em>, never a chunk id, and a Cuckoo delete
-         * clears the first slot whose fingerprint matches without comparing keys. Deleting a
-         * chunk id therefore evicts whichever term collides with it, and the query pipeline
-         * trusts a covered level's negative as ground truth - it would search the segment last
-         * for that term, for every document, until its level is next rebuilt. A surviving entry is
-         * only a false positive, which at worst moves a segment ahead of others.</p>
-         */
-        @Test
-        @DisplayName("Should leave the term filter untouched when a document changes")
-        void testCuckooFilterUntouchedOnChange() throws SourceException {
-            DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient, 
-                upsertHandler, registry, storageWriter);
-
-            byte[] termBytes = "content".getBytes(StandardCharsets.UTF_8);
-            cuckooFilter.insert(termBytes);
-            assertTrue(cuckooFilter.contains(termBytes));
-
-            String oldChunkId = "test-source:old-doc:chunk:0";
-            DocumentMetadata oldMetadata = DocumentMetadata.builder()
-                .sourceId("test-source")
-                .documentId("old-doc")
-                .contentHash(111L)
-                .contentLength(100)
-                .addChunkId(oldChunkId)
-                .build();
-            registry.register(oldMetadata);
-            
-            MockSource source = new MockSource("test-source");
-            source.addDocument("old-doc", "Updated content. ".repeat(50));
-            
-            reindexer.reindexAll(source);
-
-            assertTrue(cuckooFilter.contains(termBytes),
-                "A term shared with live documents must survive a re-index");
-        }
+    @DisplayName("Replacing a previous version")
+    class PreviousVersionTests {
 
         @Test
         @DisplayName("Should tombstone the surplus chunks of the previous version")

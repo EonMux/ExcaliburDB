@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.api.bootstrap;
 
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.shard.allocator.VolumePlacements;
@@ -41,41 +40,15 @@ import java.util.Objects;
  *                           ByteBuffer fallback
  * @param storageEngine      The started storage engine
  * @param volumeManager      Volume manager registered with the data directory
- * @param indexOrchestrator  Orchestrator with the hierarchical filter attached
- * @param hierarchicalFilter Corpus/segment membership filter
+ * @param indexOrchestrator  Orchestrator tracking every registered segment
  * @author ExcaliburDB
  */
 public record CoreComponents(Arena arena,
                              StorageEngine storageEngine,
                              VolumeManager volumeManager,
-                             IndexOrchestrator indexOrchestrator,
-                             HierarchicalCuckooFilter hierarchicalFilter) {
+                             IndexOrchestrator indexOrchestrator) {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CoreComponents.class);
-
-    /** Property sizing the membership filter against the expected corpus. */
-    public static final String KEY_CORPUS_CAPACITY = "excalibur.filter.corpus-capacity";
-
-    /** Entries the membership filter is sized for when nothing says otherwise. */
-    public static final long DEFAULT_CORPUS_CAPACITY = 10_000_000L;
-
-    /** Property sizing each segment's own level of the membership filter. */
-    public static final String KEY_SEGMENT_CAPACITY = "excalibur.filter.segment-capacity";
-
-    /** Distinct terms one segment's filter is sized for when nothing says otherwise. */
-    public static final int DEFAULT_SEGMENT_CAPACITY = 10_000;
-
-    /** Property setting how many bits of each term the membership filter keeps. */
-    public static final String KEY_FINGERPRINT_BITS = "excalibur.filter.fingerprint-bits";
-
-    /** Bits kept per term when nothing says otherwise, for roughly a 0.1% false positive rate. */
-    public static final int DEFAULT_FINGERPRINT_BITS = 13;
-
-    /** Fewest bits a fingerprint may be kept at; the filter's slot format holds no fewer. */
-    public static final int MIN_FINGERPRINT_BITS = 8;
-
-    /** Most bits a fingerprint may be kept at. */
-    public static final int MAX_FINGERPRINT_BITS = 16;
 
     /**
      * Builds and starts the storage stack.
@@ -89,21 +62,6 @@ public record CoreComponents(Arena arena,
         Objects.requireNonNull(config, "config cannot be null");
         Objects.requireNonNull(dataDir, "dataDir cannot be null");
         Objects.requireNonNull(hnswConfigFactory, "hnswConfigFactory cannot be null");
-
-        // Resolved before anything is allocated. Every other misconfiguration in this server
-        // fails before the resource it would govern exists -- the port before the socket, the
-        // keystore before the listener -- and a value rejected halfway through leaves an open
-        // Arena and a started storage engine behind with nothing left holding them, at a point
-        // where the shutdown hook is not registered yet and storage closes non-durably.
-        long corpusCapacity = corpusCapacity(config);
-        int segmentCapacity = segmentCapacity(config);
-        int fingerprintBits = fingerprintBits(config);
-        if (segmentCapacity > corpusCapacity) {
-            // The corpus level holds every segment's terms; a segment level larger than it would
-            // also break the hashing relationship that makes a delete safe between them.
-            throw new IllegalArgumentException(KEY_SEGMENT_CAPACITY + " (" + segmentCapacity
-                + ") must not exceed " + KEY_CORPUS_CAPACITY + " (" + corpusCapacity + ")");
-        }
 
         boolean panamaAvailable = MemorySegmentFactory.isPanamaAvailable();
         Arena arena = panamaAvailable ? Arena.ofShared() : null;
@@ -123,15 +81,12 @@ public record CoreComponents(Arena arena,
         IndexOrchestrator indexOrchestrator =
             createIndexOrchestrator(config, dataDir, storageEngine, volumeManager);
         shareTheVisibilityClock(storageEngine, indexOrchestrator);
-        HierarchicalCuckooFilter hierarchicalFilter =
-            createHierarchicalCuckooFilter(corpusCapacity, segmentCapacity, fingerprintBits);
-        indexOrchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
 
         wireCompactionCallback(storageEngine, indexOrchestrator);
         registerExistingSegmentsWithOrchestrator(storageEngine, indexOrchestrator);
         storageEngine.startLifecycleManager();
 
-        return new CoreComponents(arena, storageEngine, volumeManager, indexOrchestrator, hierarchicalFilter);
+        return new CoreComponents(arena, storageEngine, volumeManager, indexOrchestrator);
     }
 
     /**
@@ -231,145 +186,6 @@ public record CoreComponents(Arena arena,
 
         LOGGER.info("Index orchestrator initialized");
         return orchestrator;
-    }
-
-    /**
-     * Creates the hierarchical Cuckoo filter for corpus → segment membership.
-     *
-     * <p>The hierarchical filter tells a query which segments hold its terms, so they are
-     * searched first, and propagates deletions through all filter levels when segments are
-     * tombstoned.</p>
-     *
-     * <h3>Domain Constraints</h3>
-     * <ul>
-     *   <li>Corpus capacity: {@value #DEFAULT_CORPUS_CAPACITY} entries, or
-     *       {@code excalibur.filter.corpus-capacity}</li>
-     *   <li>Fingerprint bits: {@value #DEFAULT_FINGERPRINT_BITS}, or
-     *       {@code excalibur.filter.fingerprint-bits}</li>
-     *   <li>Segment capacity: {@value #DEFAULT_SEGMENT_CAPACITY} distinct terms, or
-     *       {@code excalibur.filter.segment-capacity}</li>
-     * </ul>
-     *
-     * @param corpusCapacity  Entries the corpus level is sized for, already validated
-     * @param segmentCapacity Distinct terms each segment's level is sized for, already validated
-     * @param fingerprintBits Bits kept per term, already validated
-     * @return Initialized hierarchical Cuckoo filter
-     */
-    private static HierarchicalCuckooFilter createHierarchicalCuckooFilter(long corpusCapacity,
-                                                                           int segmentCapacity,
-                                                                           int fingerprintBits) {
-        LOGGER.info("Initializing hierarchical Cuckoo filter...");
-
-        HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(
-            corpusCapacity,
-            fingerprintBits,
-            segmentCapacity
-        );
-
-        LOGGER.info("Hierarchical Cuckoo filter initialized: corpusCapacity={}, fingerprintBits={}, segmentCapacity={}",
-            corpusCapacity, fingerprintBits, segmentCapacity);
-
-        return filter;
-    }
-
-    /**
-     * Resolves the expected corpus size the membership filter is sized against.
-     *
-     * <p>Read off the effective properties, so the file and the {@code EXCALIBUR_*} environment
-     * override reach it the way they reach every other key. It was previously read from
-     * {@link System#getProperty}, which no other setting in this server uses: the key looked
-     * ordinary, appeared in the same namespace as the rest, and responded to neither of the two
-     * channels the documentation describes. A deployment that raised it in
-     * {@code excalibur.properties} got the default silently.</p>
-     *
-     * @param config The application configuration
-     * @return The configured capacity, or {@link #DEFAULT_CORPUS_CAPACITY}
-     * @throws IllegalArgumentException if a value is configured and is not a positive number
-     */
-    private static long corpusCapacity(Config config) {
-        return positiveCapacity(config, KEY_CORPUS_CAPACITY, DEFAULT_CORPUS_CAPACITY);
-    }
-
-    /**
-     * Resolves the distinct terms one segment's level of the filter is sized against.
-     *
-     * <p>Separate from the corpus capacity because the two answer different questions: the
-     * corpus level holds every term on the node, a segment level holds one segment's
-     * vocabulary. A segment that outgrows its level keeps answering correctly and is no longer
-     * ordered by its terms, which shows up as {@code cuckoo.saturatedSegments} on
-     * {@code /v1/stats}. This is the knob that responds to it.</p>
-     *
-     * @param config The application configuration
-     * @return The configured capacity, or {@link #DEFAULT_SEGMENT_CAPACITY}
-     * @throws IllegalArgumentException if a value is configured and is not a positive number
-     *                                  that fits an int
-     */
-    private static int segmentCapacity(Config config) {
-        long parsed = positiveCapacity(config, KEY_SEGMENT_CAPACITY, DEFAULT_SEGMENT_CAPACITY);
-        if (parsed > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException(KEY_SEGMENT_CAPACITY + " must be at most "
-                + Integer.MAX_VALUE + "; got: " + parsed);
-        }
-        return (int) parsed;
-    }
-
-    /**
-     * Resolves how many bits of each term the membership filter keeps.
-     *
-     * <p>This is the accuracy-for-memory trade the filter makes. Each extra bit halves the
-     * chance that two unrelated terms look alike, and so halves the segments a query scans for
-     * nothing; each costs one more bit per slot, and the filter has about twice as many slots
-     * as the corpus capacity. Below the floor the filter stops ruling anything out; above the
-     * ceiling a fingerprint no longer fits the slot the format gives it.</p>
-     *
-     * @param config The application configuration
-     * @return The configured bit width, or {@link #DEFAULT_FINGERPRINT_BITS}
-     * @throws IllegalArgumentException if a value is configured and is outside the range
-     */
-    private static int fingerprintBits(Config config) {
-        String value = config.getEffectiveProperties().get(KEY_FINGERPRINT_BITS);
-        if (value == null || value.isBlank()) {
-            return DEFAULT_FINGERPRINT_BITS;
-        }
-        int parsed;
-        try {
-            parsed = Integer.parseInt(value.trim());
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(
-                KEY_FINGERPRINT_BITS + " must be a whole number, got: " + value, e);
-        }
-        if (parsed < MIN_FINGERPRINT_BITS || parsed > MAX_FINGERPRINT_BITS) {
-            throw new IllegalArgumentException(KEY_FINGERPRINT_BITS + " must be between "
-                + MIN_FINGERPRINT_BITS + " and " + MAX_FINGERPRINT_BITS + ", got: " + parsed);
-        }
-        return parsed;
-    }
-
-    /**
-     * Reads one capacity key, refusing a value that cannot be one.
-     *
-     * @param config       The application configuration
-     * @param key          The property key
-     * @param fallback     What an absent or blank value means
-     * @return The configured capacity, or the fallback
-     * @throws IllegalArgumentException if a value is configured and is not a positive number
-     */
-    private static long positiveCapacity(Config config, String key, long fallback) {
-        String value = config.getEffectiveProperties().get(key);
-        if (value == null || value.isBlank()) {
-            return fallback;
-        }
-        long parsed;
-        try {
-            parsed = Long.parseLong(value.trim());
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(key
-                + " must be a positive number of entries; got: " + value, e);
-        }
-        if (parsed <= 0) {
-            throw new IllegalArgumentException(key + " must be positive; got: " + parsed);
-        }
-        return parsed;
     }
 
     /**
@@ -480,11 +296,9 @@ public record CoreComponents(Arena arena,
     /**
      * Registers every segment opened at startup with the IndexOrchestrator.
      *
-     * <p>Registration is what schedules a segment's refill in the term membership filter, and
-     * a level no refill has vouched for is never trusted to say what its segment lacks. A
-     * segment left unregistered here would go unordered by its terms until something else
-     * happened to register it, and would be integrated into no graph, compacted by nobody and invisible
-     * to epoch-based visibility for the same time. So every segment is registered, as the
+     * <p>A segment left unregistered here would be integrated into no graph, compacted by
+     * nobody and invisible to epoch-based visibility until something else happened to
+     * register it. So every segment is registered, as the
      * orchestrator's own reconciliation with the directory does; one without an HNSW graph or
      * tail tracker is registered with none, and the HNSW workers are simply not told of it.</p>
      */
@@ -511,7 +325,6 @@ public record CoreComponents(Arena arena,
                 segmentId,
                 segment,
                 graph,
-                null, // CuckooFilter - the segment's level in the hierarchy is resolved there
                 tracker
             );
             registeredCount++;

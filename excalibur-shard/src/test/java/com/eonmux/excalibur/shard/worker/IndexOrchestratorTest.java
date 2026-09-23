@@ -2,7 +2,6 @@ package com.eonmux.excalibur.shard.worker;
 
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
@@ -78,23 +77,6 @@ class IndexOrchestratorTest {
     }
 
     @Test
-    @DisplayName("CuckooMaintenanceWorker should have correct default configuration")
-    void testCuckooWorkerDefaults() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog,
-            storageEngine, segmentId -> {});
-
-        assertEquals(5000L, worker.getMaintenanceIntervalMs());
-        assertEquals(1000, worker.getMaxDeletionsPerCycle());
-        assertEquals(0.001, worker.getFpRateThreshold());
-        assertEquals(0, worker.getRegisteredFilterCount());
-        assertEquals(0, worker.getPendingDeletionCount());
-        assertFalse(worker.isRunning());
-
-        catalog.close();
-    }
-
-    @Test
     @DisplayName("SegmentReindexScheduler should have correct default configuration")
     void testReindexSchedulerDefaults() {
         SegmentCatalog catalog = new SegmentCatalog();
@@ -118,24 +100,6 @@ class IndexOrchestratorTest {
         SegmentCatalog catalog = new SegmentCatalog();
         HnswIntegrationWorker worker = new HnswIntegrationWorker(catalog,
             (segment, count) -> {});
-
-        assertFalse(worker.isRunning());
-        assertTrue(worker.start());
-        assertTrue(worker.isRunning());
-        assertFalse(worker.start()); // Already running
-
-        worker.stop(STOP_WAIT);
-        assertFalse(worker.isRunning());
-
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("CuckooMaintenanceWorker should start and stop successfully")
-    void testCuckooWorkerStartStop() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog,
-            storageEngine, segmentId -> {});
 
         assertFalse(worker.isRunning());
         assertTrue(worker.start());
@@ -190,29 +154,6 @@ class IndexOrchestratorTest {
     }
 
     @Test
-    @DisplayName("CuckooMaintenanceWorker should support configuration changes")
-    void testCuckooWorkerConfiguration() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog,
-            storageEngine, segmentId -> {}, 10000, 5000, 0.005);
-
-        assertEquals(10000L, worker.getMaintenanceIntervalMs());
-        assertEquals(5000, worker.getMaxDeletionsPerCycle());
-        assertEquals(0.005, worker.getFpRateThreshold());
-
-        worker.setMaintenanceIntervalMs(15000);
-        assertEquals(15000L, worker.getMaintenanceIntervalMs());
-
-        worker.setMaxDeletionsPerCycle(7500);
-        assertEquals(7500, worker.getMaxDeletionsPerCycle());
-
-        worker.setFpRateThreshold(0.002);
-        assertEquals(0.002, worker.getFpRateThreshold());
-
-        catalog.close();
-    }
-
-    @Test
     @DisplayName("SegmentReindexScheduler should support source registration")
     void testReindexSchedulerSourceRegistration() {
         SegmentCatalog catalog = new SegmentCatalog();
@@ -249,94 +190,6 @@ class IndexOrchestratorTest {
         // Invalid batch size
         assertThrows(IllegalArgumentException.class, () ->
             new HnswIntegrationWorker(catalog, (segment, count) -> {}, 100, 100_000, 0));
-
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("CuckooMaintenanceWorker should validate configuration")
-    void testCuckooWorkerValidation() {
-        SegmentCatalog catalog = new SegmentCatalog();
-
-        // Invalid interval
-        assertThrows(IllegalArgumentException.class, () ->
-            new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {}, 100, 1000, 0.001));
-
-        // Invalid max deletions
-        assertThrows(IllegalArgumentException.class, () ->
-            new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {}, 5000, 10, 0.001));
-
-        // Invalid FP rate threshold
-        assertThrows(IllegalArgumentException.class, () ->
-            new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {}, 5000, 1000, 0.5));
-
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("CuckooMaintenanceWorker should support filter registration")
-    void testCuckooWorkerFilterRegistration() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
-
-        assertEquals(0, worker.getRegisteredFilterCount());
-
-        com.eonmux.excalibur.filter.CuckooFilter filter = com.eonmux.excalibur.filter.CuckooFilter.create(1000, 8);
-        worker.registerFilter(1L, filter);
-        assertEquals(1, worker.getRegisteredFilterCount());
-
-        // Duplicate registration should not add
-        worker.registerFilter(1L, filter);
-        assertEquals(1, worker.getRegisteredFilterCount());
-
-        // Null filter should be ignored
-        worker.registerFilter(2L, null);
-        assertEquals(1, worker.getRegisteredFilterCount());
-
-        worker.unregisterFilter(1L);
-        assertEquals(0, worker.getRegisteredFilterCount());
-
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("CuckooMaintenanceWorker should track statistics")
-    void testCuckooWorkerStatistics() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
-
-        assertEquals(0L, worker.getTotalDeletions());
-        assertEquals(0L, worker.getLastMaintenanceTime());
-        assertEquals(0L, worker.getTombstonedSegmentsProcessed());
-
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("CuckooMaintenanceWorker should reject null parameters")
-    void testCuckooWorkerNullParameters() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        assertThrows(NullPointerException.class, () ->
-            new CuckooMaintenanceWorker(null, storageEngine, segmentId -> {}));
-
-        assertThrows(NullPointerException.class, () ->
-            new CuckooMaintenanceWorker(catalog, null, segmentId -> {}));
-
-        assertThrows(NullPointerException.class, () ->
-            new CuckooMaintenanceWorker(catalog, storageEngine, null));
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("CuckooMaintenanceWorker should have correct toString")
-    void testCuckooWorkerToString() {
-        SegmentCatalog catalog = new SegmentCatalog();
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
-
-        String str = worker.toString();
-        assertNotNull(str);
-        assertTrue(str.contains("CuckooMaintenanceWorker"));
-        assertTrue(str.contains("running=false"));
 
         catalog.close();
     }
@@ -570,7 +423,6 @@ class IndexOrchestratorTest {
         assertEquals(0, orchestrator.getRegisteredSegmentCount());
         assertEquals(0L, orchestrator.getVisibilityEpoch());
         assertEquals(0L, orchestrator.getTotalVectorsIntegrated());
-        assertEquals(0L, orchestrator.getTotalCuckooDeletions());
         assertEquals(0L, orchestrator.getTotalReindexesTriggered());
 
         orchestrator.close();
@@ -588,7 +440,7 @@ class IndexOrchestratorTest {
         Arena arena = Arena.ofShared();
         com.eonmux.excalibur.store.StorageEngine storageEngine = new com.eonmux.excalibur.store.StorageEngine(dataDir, arena);
         IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine,
-            50_000, 10_000, 30_000, 50);
+            50_000, 30_000, 50);
 
         assertEquals(50_000, orchestrator.getHnswQueueDepthLimit());
 
@@ -717,7 +569,6 @@ class IndexOrchestratorTest {
         IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
 
         assertNotNull(orchestrator.getHnswWorker());
-        assertNotNull(orchestrator.getCuckooWorker());
         assertNotNull(orchestrator.getReindexScheduler());
 
         orchestrator.close();
@@ -738,24 +589,6 @@ class IndexOrchestratorTest {
 
         assertFalse(orchestrator.isBackpressured());
         assertEquals(0L, orchestrator.getHnswQueueDepth());
-
-        orchestrator.close();
-        storageEngine.close();
-        arena.close();
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("IndexOrchestrator should support pending cuckoo deletions check")
-    void testIndexOrchestratorPendingDeletions() throws IOException {
-        SegmentCatalog catalog = new SegmentCatalog();
-        Path dataDir = tempDir.resolve("data10");
-        Files.createDirectories(dataDir);
-        Arena arena = Arena.ofShared();
-        com.eonmux.excalibur.store.StorageEngine storageEngine = new com.eonmux.excalibur.store.StorageEngine(dataDir, arena);
-        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
-
-        assertEquals(0, orchestrator.getPendingCuckooDeletions());
 
         orchestrator.close();
         storageEngine.close();
@@ -813,7 +646,7 @@ class IndexOrchestratorTest {
 
         // Custom configuration should work
         IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine,
-            50_000, 10_000, 30_000, 200);
+            50_000, 30_000, 200);
         assertEquals(50_000, orchestrator.getHnswQueueDepthLimit());
 
         orchestrator.close();
@@ -1037,45 +870,7 @@ class IndexOrchestratorTest {
         catalog.close();
     }
 
-    // ==================== Hierarchical Cuckoo Filter Wiring Tests ====================
-
-    @Test
-    @DisplayName("IndexOrchestrator should wire hierarchical Cuckoo filter to maintenance worker")
-    void testIndexOrchestratorHierarchicalCuckooFilterWiring() throws IOException {
-        SegmentCatalog catalog = new SegmentCatalog();
-        Path dataDir = tempDir.resolve("data17");
-        Files.createDirectories(dataDir);
-        Arena arena = Arena.ofShared();
-        com.eonmux.excalibur.store.StorageEngine storageEngine = new com.eonmux.excalibur.store.StorageEngine(dataDir, arena);
-        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
-
-        // Initially, the cuckoo worker should have no hierarchical filter
-        CuckooMaintenanceWorker cuckooWorker = orchestrator.getCuckooWorker();
-        assertNull(cuckooWorker.getHierarchicalFilter(),
-            "CuckooMaintenanceWorker should start with null hierarchical filter");
-
-        // Create and wire a hierarchical filter
-        HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(
-            1_000_000L,  // corpus capacity
-            13,          // fingerprint bits
-            10_000       // segment capacity
-        );
-        orchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
-
-        // Verify the filter is now wired to the cuckoo worker
-        assertSame(hierarchicalFilter, cuckooWorker.getHierarchicalFilter(),
-            "Hierarchical filter should be wired to CuckooMaintenanceWorker");
-
-        // Verify we can clear it
-        orchestrator.setHierarchicalCuckooFilter(null);
-        assertNull(cuckooWorker.getHierarchicalFilter(),
-            "Hierarchical filter should be clearable");
-
-        orchestrator.close();
-        storageEngine.close();
-        arena.close();
-        catalog.close();
-    }
+    // ==================== Reindex Operation Handler Tests ====================
 
     @Test
     @DisplayName("Scheduled reindex should use ReindexOperationHandler when configured")
@@ -1141,125 +936,6 @@ class IndexOrchestratorTest {
         orchestrator.setReindexOperationHandler(null);
         assertNull(orchestrator.getReindexOperationHandler(),
             "Handler should be cleared");
-
-        orchestrator.close();
-        storageEngine.close();
-        arena.close();
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("CuckooMaintenanceWorker should use hierarchical filter for deletions when set")
-    void testCuckooWorkerUsesHierarchicalFilterForDeletions() throws IOException {
-        SegmentCatalog catalog = new SegmentCatalog();
-        Path dataDir = tempDir.resolve("data18");
-        Files.createDirectories(dataDir);
-        Arena arena = Arena.ofShared();
-        com.eonmux.excalibur.store.StorageEngine storageEngine = new com.eonmux.excalibur.store.StorageEngine(dataDir, arena);
-
-        CuckooMaintenanceWorker worker = new CuckooMaintenanceWorker(catalog, storageEngine, segmentId -> {});
-
-        // Create and wire hierarchical filter
-        HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(10_000L, 13, 100);
-        worker.setHierarchicalFilter(hierarchicalFilter);
-
-        // Register a segment in the hierarchy
-        String segmentId = "test-segment-1";
-        hierarchicalFilter.registerSegment(segmentId);
-
-        // Insert a test item
-        byte[] testKey = "test-key".getBytes();
-        assertTrue(hierarchicalFilter.insert(testKey, segmentId),
-            "Insert into hierarchical filter should succeed");
-
-        // Verify the item is in the filter
-        assertTrue(hierarchicalFilter.mightContain(testKey),
-            "Item should be present in corpus filter");
-        assertTrue(hierarchicalFilter.mightContainInSegment(testKey, segmentId),
-            "Item should be present in segment filter");
-
-        // Delete from hierarchy
-        boolean deleted = hierarchicalFilter.deleteFromHierarchy(testKey, segmentId);
-        assertTrue(deleted, "Delete from hierarchy should succeed");
-
-        // Verify the item is no longer in the filter
-        assertFalse(hierarchicalFilter.mightContainInSegment(testKey, segmentId),
-            "Item should no longer be present in segment filter after deletion");
-
-        worker.stop(STOP_WAIT);
-        storageEngine.close();
-        arena.close();
-        catalog.close();
-    }
-
-    @Test
-    @DisplayName("HierarchicalCuckooFilter setHierarchicalCuckooFilter registers existing segments")
-    void hierarchicalCuckooFilterRegistrationTest() throws IOException {
-        SegmentCatalog catalog = new SegmentCatalog();
-        Path dataDir = tempDir.resolve("data19");
-        Files.createDirectories(dataDir);
-        Arena arena = Arena.ofShared();
-        com.eonmux.excalibur.store.StorageEngine storageEngine = new com.eonmux.excalibur.store.StorageEngine(dataDir, arena);
-
-        IndexOrchestrator orchestrator = new IndexOrchestrator(catalog, storageEngine);
-
-        // Verify initial state
-        assertNull(orchestrator.getHierarchicalCuckooFilter(),
-            "Filter should be null initially");
-
-        // Create hierarchical filter
-        HierarchicalCuckooFilter hierarchicalFilter = new HierarchicalCuckooFilter(
-            100_000L,  // corpus capacity
-            13,        // fingerprint bits
-            1_000      // segment capacity
-        );
-
-        // Set the filter
-        orchestrator.setHierarchicalCuckooFilter(hierarchicalFilter);
-
-        // Verify filter is set
-        assertSame(hierarchicalFilter, orchestrator.getHierarchicalCuckooFilter(),
-            "Filter should be set");
-
-        // The setHierarchicalCuckooFilter should register any existing segments
-        // In this case there are no segments, so the filter should be empty
-        assertEquals(0, hierarchicalFilter.getSegmentCount(),
-            "Filter should have no segments since none were registered");
-
-        // Create a hierarchical filter and pre-register some segments in it
-        HierarchicalCuckooFilter filter2 = new HierarchicalCuckooFilter(100_000L, 13, 1_000);
-
-        // Pre-register some segment IDs in the filter
-        filter2.registerSegment("100");
-        filter2.registerSegment("200");
-        filter2.registerSegment("300");
-
-        assertEquals(3, filter2.getSegmentCount(),
-            "Filter should have 3 segments pre-registered");
-
-        // Verify we can insert for these pre-registered segments
-        byte[] testKey1 = "test-key-100".getBytes();
-        byte[] testKey2 = "test-key-200".getBytes();
-
-        assertTrue(filter2.insert(testKey1, "100"),
-            "Should be able to insert for segment 100");
-        assertTrue(filter2.insert(testKey2, "200"),
-            "Should be able to insert for segment 200");
-
-        // Verify the keys are in the filter
-        assertTrue(filter2.mightContain(testKey1),
-            "Key 1 should be in corpus filter");
-        assertTrue(filter2.mightContain(testKey2),
-            "Key 2 should be in corpus filter");
-
-        // Verify findCandidateSegments works
-        java.util.List<String> candidates1 = filter2.findCandidateSegments(testKey1);
-        assertTrue(candidates1.contains("100"),
-            "Segment 100 should be a candidate for key 1");
-
-        java.util.List<String> candidates2 = filter2.findCandidateSegments(testKey2);
-        assertTrue(candidates2.contains("200"),
-            "Segment 200 should be a candidate for key 2");
 
         orchestrator.close();
         storageEngine.close();

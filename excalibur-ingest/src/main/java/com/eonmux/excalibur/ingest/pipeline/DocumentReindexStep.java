@@ -47,15 +47,6 @@ import java.util.function.LongSupplier;
  * an erasure of the same document cannot interleave with it and leave a chunk in storage that
  * nothing names.</p>
  *
- * <h2>Where a chunk's terms are filed</h2>
- * <p>Under the segment its write landed in, as each chunk is written, through the same
- * {@link SegmentTermRecorder} a first ingest files through. The storage engine routes a chunk by
- * its key and reports the segment it chose; stage 1 of the query pipeline searches a segment
- * last when its trusted level names none of a query's terms, so a term filed anywhere else - or
- * nowhere - sends the chunk's segment to the back of every query for it until the segment is
- * next rebuilt. Filing before publication costs nothing in correctness: a term filed for a chunk
- * that is then rolled back only moves its segment ahead of where it belonged.</p>
- *
  * <h2>What the graph is told</h2>
  * <p>A published version is reported to the graph exactly as a first ingest's is, through the
  * {@link GraphReporter} ingestion reports through: numbered under the document's lock, at the
@@ -87,9 +78,9 @@ final class DocumentReindexStep {
          * @param chunkId   The chunk's deterministic identifier
          * @param chunk     The chunk itself
          * @param embedding Its vector, or null on a node that keeps none
-         * @return Where the chunk landed, or {@link ChunkPlacement#FAILED}
+         * @return true if the chunk was written
          */
-        ChunkPlacement store(String chunkId, TextChunk chunk, float[] embedding);
+        boolean store(String chunkId, TextChunk chunk, float[] embedding);
     }
 
     /** What the write loop got through, before anything is published. */
@@ -105,9 +96,6 @@ final class DocumentReindexStep {
     private final DocumentRegistry registry;
     private final UpsertHandler upsertHandler;
     private final ReindexLexicalIndex lexical;
-
-    /** Files each written chunk's terms under the segment it landed in. */
-    private final SegmentTermRecorder termRecorder;
 
     /** The atomic target, or null on a node that writes straight to storage. */
     private final AtomicTarget atomic;
@@ -153,18 +141,15 @@ final class DocumentReindexStep {
      * @param registry      Records what the document's new version consists of
      * @param upsertHandler Removes chunks an abandoned attempt left behind
      * @param lexical       The lexical index to keep in step with storage
-     * @param termRecorder  Files each written chunk's terms under the segment it landed in
      * @param graphReporter Tells the graph about each version published
      * @param target        Where the chunks go and how they are made visible
      */
     static DocumentReindexStep publishing(TextChunker chunker, LLMHttpClient llmClient,
                                           DocumentRegistry registry, UpsertHandler upsertHandler,
                                           ReindexLexicalIndex lexical,
-                                          SegmentTermRecorder termRecorder,
                                           GraphReporter graphReporter, AtomicTarget target) {
         return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical,
-            termRecorder, graphReporter, Objects.requireNonNull(target, "target must not be null"),
-            null);
+            graphReporter, Objects.requireNonNull(target, "target must not be null"), null);
     }
 
     /**
@@ -175,7 +160,6 @@ final class DocumentReindexStep {
      * @param registry      Records what the document's new version consists of
      * @param upsertHandler Removes chunks an abandoned attempt left behind
      * @param lexical       The lexical index to keep in step with storage
-     * @param termRecorder  Files each written chunk's terms under the segment it landed in
      * @param graphReporter Tells the graph about each version published
      * @param storageWriter Persists one chunk
      */
@@ -183,17 +167,16 @@ final class DocumentReindexStep {
                                                DocumentRegistry registry,
                                                UpsertHandler upsertHandler,
                                                ReindexLexicalIndex lexical,
-                                               SegmentTermRecorder termRecorder,
                                                GraphReporter graphReporter,
                                                DocumentReindexer.StorageWriter storageWriter) {
         return new DocumentReindexStep(chunker, llmClient, registry, upsertHandler, lexical,
-            termRecorder, graphReporter, null,
+            graphReporter, null,
             Objects.requireNonNull(storageWriter, "storageWriter must not be null"));
     }
 
     private DocumentReindexStep(TextChunker chunker, LLMHttpClient llmClient,
                                 DocumentRegistry registry, UpsertHandler upsertHandler,
-                                ReindexLexicalIndex lexical, SegmentTermRecorder termRecorder,
+                                ReindexLexicalIndex lexical,
                                 GraphReporter graphReporter, AtomicTarget atomic,
                                 DocumentReindexer.StorageWriter storageWriter) {
         this.chunker = chunker;
@@ -201,7 +184,6 @@ final class DocumentReindexStep {
         this.registry = registry;
         this.upsertHandler = upsertHandler;
         this.lexical = lexical;
-        this.termRecorder = Objects.requireNonNull(termRecorder, "termRecorder must not be null");
         this.graphReporter =
             Objects.requireNonNull(graphReporter, "graphReporter must not be null");
         this.atomic = atomic;
@@ -290,12 +272,13 @@ final class DocumentReindexStep {
 
         ChunkWrites writes = writeChunks(sourceId, documentId, chunks, stop,
             (chunkId, chunk, embedding) -> {
-                ChunkPlacement placement = atomic.writer().writeChunk(chunkId,
-                    chunk.getText(), chunk.terms(), embedding);
-                if (placement.written()) {
-                    batchBuffer.addChunk(chunkId, chunk, placement.writeLogOffset(), embedding);
+                long offset = atomic.writer().writeChunkWithOffset(chunkId, chunk.getText(),
+                    embedding);
+                if (offset < 0) {
+                    return false;
                 }
-                return placement;
+                batchBuffer.addChunk(chunkId, chunk, offset, embedding);
+                return true;
             });
 
         // A document is indexed whole or not at all. Publishing the chunks that survived would
@@ -367,7 +350,7 @@ final class DocumentReindexStep {
 
         ChunkWrites writes = writeChunks(sourceId, documentId, chunks, stop,
             (chunkId, chunk, embedding) ->
-                storageWriter.writeChunk(chunkId, chunk.getText(), chunk.terms(), embedding));
+                storageWriter.writeChunk(chunkId, chunk.getText(), embedding));
 
         // As in the atomic paths: the registry entry is what change detection reads, so recording
         // the new hash for anything less than a complete document retires it from ever being
@@ -448,17 +431,12 @@ final class DocumentReindexStep {
     }
 
     /**
-     * Embeds and stores every chunk, filing each written chunk's terms under the segment it
-     * landed in, and collecting what failed rather than stopping at the first failure.
+     * Embeds and stores every chunk, collecting what failed rather than stopping at the first
+     * failure.
      *
      * <p>Every chunk is attempted because the decision this feeds is about the document as a
      * whole: a caller that stopped early would report one failure where there were ten, and an
      * operator reading the result would retry against an endpoint that is still down.</p>
-     *
-     * <p>The terms are filed from the same list the write handed the storage engine, so the
-     * membership filter and the segment's frequency sketch come from one tokenisation. A writer
-     * that reports no segment has none to file them under; see
-     * {@link OffsetAwareStorageWriter#writeChunk(String, String, List, float[])}.</p>
      */
     private ChunkWrites writeChunks(String sourceId, String documentId, List<TextChunk> chunks,
                                     StopSignal stop, ChunkSink sink) {
@@ -475,12 +453,7 @@ final class DocumentReindexStep {
                 float[] embedding =
                     stop.interruptibly(() -> embed(chunk.getText(), sourceId, documentId));
 
-                ChunkPlacement placement = sink.store(chunkId, chunk, embedding);
-
-                if (placement.written()) {
-                    if (placement.segmentKnown()) {
-                        termRecorder.record(placement.segmentId(), chunkId, chunk.terms());
-                    }
+                if (sink.store(chunkId, chunk, embedding)) {
                     chunkIds.add(chunkId);
                     successes++;
                 } else {

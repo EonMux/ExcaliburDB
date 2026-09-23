@@ -28,7 +28,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * Relevancy scoring over a ranking the pipeline did not produce.
  *
- * <p>The contract is Stage 5's, so these hold it to Stage 5's terms: a judged candidate carries
+ * <p>The contract is Stage 4's, so these hold it to Stage 4's terms: a judged candidate carries
  * the model's relevancy, an unjudged one keeps its retrieval score, the threshold removes, the
  * result is ordered by score and cut to the page's depth, and a scorer that fails or is too slow
  * leaves the retrieval ranking in place rather than failing the query.</p>

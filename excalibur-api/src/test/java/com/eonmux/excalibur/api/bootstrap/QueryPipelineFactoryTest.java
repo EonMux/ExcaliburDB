@@ -22,11 +22,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * The pipeline assembly, checked for the arguments whose absence has no symptom.
  *
- * <p>Four of the pipeline's arguments are filters that are inert when omitted: the atomicity
- * checker, the membership filter, the epoch validator and the quantised-search policy. A
- * pipeline built without one of them answers queries perfectly happily and answers them wrongly
- * - half an ingested document, every segment scanned, a vector written after the snapshot was
- * taken. Nothing downstream can tell, which is why they are pinned here at the point of
+ * <p>Three of the pipeline's arguments are inert when omitted: the atomicity checker, the epoch
+ * validator and the quantised-search policy. A pipeline built without one of them answers
+ * queries perfectly happily and answers them wrongly - half an ingested document, a vector
+ * written after the snapshot was taken, a beam that is not the one configured. Nothing downstream can tell, which is why they are pinned here at the point of
  * assembly.</p>
  */
 @DisplayName("Query pipeline factory")
@@ -76,7 +75,7 @@ class QueryPipelineFactoryTest {
             new DocumentVisibilityTracker(DocumentRegistryFactory.open(dataDir),
                 core.indexOrchestrator().getVisibilityTracker()));
         return QueryPipelineFactory.create(config, core.storageEngine(),
-            core.indexOrchestrator(), checker, core.hierarchicalFilter());
+            core.indexOrchestrator(), checker);
     }
 
     @Test
@@ -101,11 +100,11 @@ class QueryPipelineFactoryTest {
         core = CoreComponents.create(config, dataDir, HnswConfigFactory.withDefaults());
 
         assertThatThrownBy(() -> QueryPipelineFactory.create(
-            null, core.storageEngine(), core.indexOrchestrator(), null, null))
+            null, core.storageEngine(), core.indexOrchestrator(), null))
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("config");
         assertThatThrownBy(() -> QueryPipelineFactory.create(
-            config, core.storageEngine(), core.indexOrchestrator(), null, null))
+            config, core.storageEngine(), core.indexOrchestrator(), null))
             .as("a pipeline with no atomicity filter can return half an ingested document")
             .isInstanceOf(NullPointerException.class)
             .hasMessageContaining("documentVisibilityChecker");

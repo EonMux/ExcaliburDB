@@ -52,21 +52,13 @@ import java.util.function.Function;
  *       </li>
  * </ol>
  *
- * <h2>What it deliberately does not touch</h2>
- * <p>The membership filter. It indexes <em>terms</em>, not chunk ids, and a term is almost always
- * shared with live documents; removing entries for an erased document would make the filter deny
- * terms that other documents still contain, and the query pipeline searches a segment the filter
- * says lacks every query term after the ones that may hold some. A filter entry left behind at
- * most moves a segment ahead in that order, which is the safe direction to be wrong in. Segment
- * filters are rebuilt when the segment is compacted.</p>
- *
  * <h2>What is left until a segment is compacted</h2>
  * <p>Disk, not answers. The graph node of an erased chunk is retired as part of the erasure, so no
  * search traverses it or ranks it; the space it occupies is reclaimed when its graph is compacted.
  * Its entry in the LSH index is left alone, because that index only names extra nodes for a search
  * to measure beside its graph walk - it cannot produce a result of its own, and a named node that
  * is no longer active is skipped when measured, so an entry left behind costs one node read.
- * Segment filters and LSH tables are rebuilt when the segment is compacted.</p>
+ * LSH tables are rebuilt when the segment is compacted.</p>
  *
  * <h2>What it cannot reach</h2>
  * <p>The source. This removes what the node holds, not what the source serves: a document erased

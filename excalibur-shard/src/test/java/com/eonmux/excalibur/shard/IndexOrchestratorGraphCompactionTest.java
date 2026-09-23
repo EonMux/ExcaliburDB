@@ -73,7 +73,7 @@ class IndexOrchestratorGraphCompactionTest {
     void rebuildDropsOnlyThatSegmentsNodeVisibility() throws IOException {
         graph = graphWithTombstones(10, 6);
         orchestrator.registerSegment(COMPACTED_SEGMENT, storageEngine.getSegment(COMPACTED_SEGMENT),
-            graph, null, new TailOffsetTracker(graph));
+            graph, new TailOffsetTracker(graph));
 
         EpochIsolationValidator epochIsolation = orchestrator.getEpochIsolationValidator();
         epochIsolation.registerNodeRange(COMPACTED_SEGMENT, 0L, VISIBLE_EPOCH);

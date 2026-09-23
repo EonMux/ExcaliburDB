@@ -377,10 +377,10 @@ public class ExcaliburDBServer {
     }
 
     /**
-     * Configures the LLM scorer for relevancy scoring in Stage 5 of the query pipeline.
+     * Configures the LLM scorer for relevancy scoring in Stage 4 of the query pipeline.
      *
      * <p>This method wraps the existing {@link QueryPipeline} with an LLM scorer,
-     * enabling Stage 5 LLM-based relevancy scoring for query results. The scorer
+     * enabling Stage 4 LLM-based relevancy scoring for query results. The scorer
      * uses an LLM endpoint to evaluate semantic relevance of candidates.</p>
      *
      * <h3>Domain Correctness</h3>
@@ -394,7 +394,7 @@ public class ExcaliburDBServer {
      * <p>This method is NOT thread-safe and should only be called during initialization,
      * before starting the server.</p>
      *
-     * @param llmScorer The LLM scorer to use for Stage 5 relevancy scoring, or null to disable
+     * @param llmScorer The LLM scorer to use for Stage 4 relevancy scoring, or null to disable
      * @throws IllegalStateException if the server is already running
      * @see com.eonmux.excalibur.query.scorer.LlmScorerFactory
      */
@@ -512,7 +512,7 @@ public class ExcaliburDBServer {
     }
 
     /**
-     * Configures the ingestion pipeline and the vector pre-filter used by stage 2 of queries.
+     * Configures the ingestion pipeline and the vector pre-filter used by stage 1 of queries.
      *
      * <p>With a pipeline attached, {@code POST /v1/ingest} crawls, chunks, embeds and indexes
      * the documents of every source it registers, in the background. Without one it records
@@ -537,7 +537,7 @@ public class ExcaliburDBServer {
      * <p>When LSH is configured:</p>
      * <ul>
      *   <li>Every vector written to a segment is also inserted into its LSH index</li>
-     *   <li>Query Stage 2 names each query's bucket-mates, which Stage 3 measures beside the
+     *   <li>Query Stage 1 names each query's bucket-mates, which Stage 2 measures beside the
      *       graph search</li>
      *   <li>Tombstones are removed from LSH indices during deletion propagation</li>
      * </ul>

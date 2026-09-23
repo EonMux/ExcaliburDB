@@ -1,6 +1,6 @@
 package com.eonmux.excalibur.backup.snapshot;
 
-import com.eonmux.excalibur.store.TermSketchFile;
+import com.eonmux.excalibur.store.ObsoleteSidecars;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -14,12 +14,13 @@ import java.util.Objects;
  *
  * <h2>What is here</h2>
  * <p>{@code catalog.dat}; {@code segment_N.dat}, {@code segment_N.wal},
- * {@code segment_N.hnsw}, {@code segment_N.hnsw.docmap} and {@code segment_N.tfs} per
- * segment, with {@code segment_N.hnsw.compact.docmap} beside a graph whose compaction was
+ * {@code segment_N.hnsw} and {@code segment_N.hnsw.docmap} per segment, with {@code segment_N.hnsw.compact.docmap} beside a graph whose compaction was
  * interrupted; {@code routing.dir}; {@code document-registry}; {@code source-catalog};
  * {@code source-status}, how each source's last crawl ended, which exists nowhere else and so is
  * kept like the catalog beside it; {@code chunk-index/}; and a directory per tenant namespace
- * holding {@code graph-staging/} and, once a build has run, {@code graph/}.</p>
+ * holding {@code graph-staging/} and, once a build has run, {@code graph/}. A directory an
+ * earlier build wrote may also hold {@code segment_N.tfs}, a term sketch this build has no use
+ * for; it is {@link Inclusion#OBSOLETE} and never copied.</p>
  *
  * <h2>Why the classification is a table and not a filter</h2>
  * <p>An unrecognised file is kept, not dropped. A build newer than this tool will write
@@ -51,9 +52,6 @@ public final class DataDirectoryInventory {
 
     /** The quantiser codebook sidecar, rebuildable by retraining. */
     private static final String CODEBOOK_SUFFIX = ".pqcb";
-
-    /** A segment's term-frequency sketch, which the node rebuilds when it opens the segment. */
-    private static final String TERM_SKETCH_SUFFIX = TermSketchFile.SUFFIX;
 
     /** The mapping an HNSW compaction stages in the compacted numbering. */
     private static final String STAGED_MAPPING_SUFFIX = ".hnsw.compact.docmap";
@@ -88,8 +86,9 @@ public final class DataDirectoryInventory {
      *
      * <p>The order of the tests is load-bearing. A heap dump is recognised first, wherever
      * it sits and whatever precedes its suffix, because the JVM names it and nothing about
-     * the directory it landed in makes it that directory's state. An HNSW file is recognised
-     * before the
+     * the directory it landed in makes it that directory's state. An obsolete file is
+     * recognised next, before the staged-name test its staging name would otherwise match,
+     * so that it is reported as what it is. An HNSW file is recognised before the
      * staged-name test, because a graph staged by an interrupted compaction ends in
      * {@code .compact} and is part of the recovery record rather than scratch; and scratch
      * is recognised before the lexical directory, because the lexical store stages its
@@ -103,6 +102,9 @@ public final class DataDirectoryInventory {
         Objects.requireNonNull(relativePath, "relativePath");
         if (relativePath.endsWith(HEAP_DUMP_SUFFIX)) {
             return Inclusion.DIAGNOSTIC;
+        }
+        if (ObsoleteSidecars.isObsolete(nameOf(relativePath))) {
+            return Inclusion.OBSOLETE;
         }
         if (isVectorIndex(relativePath)) {
             return Inclusion.REQUIRED_DERIVED;
@@ -130,11 +132,6 @@ public final class DataDirectoryInventory {
                 + "graph swap completed and this is the only mapping that matches the graph, "
                 + "which the node installs on open - so it is copied either way";
         }
-        if (isTermSketch(relativePath)) {
-            return "a segment's term sketch; derived state the node rebuilds from the "
-                + "segment's live entries when it opens the segment, so a restore without it "
-                + "serves at once and pays for the rebuild at start-up";
-        }
         return switch (classify(relativePath)) {
             case REQUIRED_DERIVED -> "vector index; derived from the segments in principle, "
                 + "but nothing rebuilds it, and a graph and its node mapping must be "
@@ -146,6 +143,8 @@ public final class DataDirectoryInventory {
             case DIAGNOSTIC -> "a JVM heap dump, not engine state; nothing reads it and it is "
                 + "the size of the heap it records. Point the node's -XX:HeapDumpPath outside "
                 + "the data directory, and move this one there if it is still wanted";
+            case OBSOLETE -> "a term sketch an earlier build kept beside its segment; nothing "
+                + "in this build reads it, and the node removes it when it starts";
             case AUTHORITATIVE -> "authoritative state that exists nowhere else";
         };
     }
@@ -182,7 +181,7 @@ public final class DataDirectoryInventory {
      * @return true if a reindex, a graph build or a retrain would produce it again
      */
     private static boolean isRebuildable(String path) {
-        if (path.endsWith(CODEBOOK_SUFFIX) || isTermSketch(path)) {
+        if (path.endsWith(CODEBOOK_SUFFIX)) {
             return true;
         }
         String[] segments = path.split("/");
@@ -193,17 +192,13 @@ public final class DataDirectoryInventory {
     }
 
     /**
-     * Reports whether a path is a segment's term sketch.
+     * Returns the last element of a relative path.
      *
-     * <p>By suffix, the way the codebook is recognised: the store names the sidecar after its
-     * segment, and its staged write ends in {@code .tmp} and is recognised as staged before
-     * this is asked.</p>
-     *
-     * @param path The relative path
-     * @return true for a {@code .tfs} sidecar
+     * @param path A forward-slashed relative path
+     * @return Its file name
      */
-    private static boolean isTermSketch(String path) {
-        return path.endsWith(TERM_SKETCH_SUFFIX);
+    private static String nameOf(String path) {
+        return path.substring(path.lastIndexOf('/') + 1);
     }
 
     /**

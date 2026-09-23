@@ -33,7 +33,6 @@ import java.util.stream.Collectors;
  * <p>A document is considered "atomic" when:</p>
  * <ul>
  *   <li>All its chunks have been written to the write log</li>
- *   <li>All chunks have been inserted into the Cuckoo filter hierarchy</li>
  *   <li>The write log has been synced (fsync)</li>
  *   <li>The visibility epoch has been advanced</li>
  *   <li>The document's visible epoch is recorded in this registry</li>

@@ -47,18 +47,13 @@ class QueryPipelineVectorRecallTest {
     }
 
     @Test
-    @DisplayName("query text that shares no term with the nearest documents costs no recall")
+    @DisplayName("query text carried beside the vector costs no recall")
     void queryTextSharingNoTermWithTheNeighboursCostsNoRecall(@TempDir Path dir) throws Exception {
         // The HTTP route hands the pipeline the question's text beside its embedding. The nearest
-        // vectors sit in every segment, and only one segment's documents use the question's
-        // words: the others say the same thing in other terms, which is what an embedding is
-        // for. Recall must not depend on which words the question happened to use.
+        // vectors sit in every segment, and recall must not depend on which words the question
+        // happened to use.
         try (VectorRecallCorpus corpus = new VectorRecallCorpus(
                 dir, 4, 2_000, 32, VectorRecallCorpus.PRODUCTION_SHAPE, 20260923L)) {
-
-            assertThat(corpus.termFilterCoversEverySegment())
-                .as("the term filter has to speak for every segment for the text to be tested")
-                .isTrue();
 
             VectorRecallCorpus.Recall recall =
                 corpus.measure(40, K, VectorRecallCorpus.MISMATCHED_QUERY_TEXT);

@@ -10,7 +10,6 @@ import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
 import com.eonmux.excalibur.api.server.ListenPort;
 import com.eonmux.excalibur.api.server.ShutdownBudget;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.ingest.pipeline.DocumentReindexer;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
@@ -133,13 +132,6 @@ public final class ExcaliburApplication {
      * the environment and validated before anything binds.
      */
     private final ApiSecurityConfig apiSecurity;
-
-    /**
-     * Hierarchical Cuckoo filter for corpus → segment membership testing.
-     * Shared between ingestion (inserts), the maintenance worker (deletions) and the query
-     * pipeline, which searches the segments holding a query's terms first.
-     */
-    private final HierarchicalCuckooFilter hierarchicalFilter;
 
     /**
      * Document visibility tracker for atomic document-level visibility.
@@ -390,14 +382,12 @@ public final class ExcaliburApplication {
         this.dataDirectory = dataDir;
 
         // Build the storage stack: arena, storage engine with its HNSW initializer
-        // installed before start(), volume manager, index orchestrator and the
-        // hierarchical Cuckoo filter.
+        // installed before start(), volume manager and index orchestrator.
         CoreComponents core = CoreComponents.create(config, dataDir, hnswConfigFactory);
         this.arena = core.arena();
         this.storageEngine = core.storageEngine();
         this.volumeManager = core.volumeManager();
         this.indexOrchestrator = core.indexOrchestrator();
-        this.hierarchicalFilter = core.hierarchicalFilter();
 
         // Document visibility, on the node's own epoch clock. Built here rather than earlier
         // because it needs the index orchestrator's visibility tracker: publishing a document
@@ -415,7 +405,7 @@ public final class ExcaliburApplication {
         LOGGER.info("Document visibility tracker initialized on the node epoch clock");
 
         this.queryPipeline = QueryPipelineFactory.create(config, storageEngine, indexOrchestrator,
-            documentVisibilityChecker, hierarchicalFilter);
+            documentVisibilityChecker);
 
         // The build side of the graph, per namespace. A node that never sees the namespace
         // header runs with exactly one, called shared, which is the single-tenant arrangement.
@@ -556,7 +546,6 @@ public final class ExcaliburApplication {
             storageEngine,
             volumeManager,
             indexOrchestrator,
-            hierarchicalFilter,
             documentVisibilityTracker.getRegistry(),
             chunkIndex
         );
@@ -637,7 +626,7 @@ public final class ExcaliburApplication {
      */
     private void attachIngestionPipeline(ExcaliburDBServer srv) {
         IngestionWiring.Attachment ingestion = new IngestionWiring(config, dataDirectory,
-            storageEngine, indexOrchestrator, hierarchicalFilter, documentVisibilityTracker,
+            storageEngine, indexOrchestrator, documentVisibilityTracker,
             graphTenants).attachTo(srv);
         this.chunkIndex = ingestion.chunkIndex();
         this.lexicalErasureSweep = ingestion.lexicalErasureSweep();
@@ -814,26 +803,6 @@ public final class ExcaliburApplication {
     }
 
     /**
-     * Gets the hierarchical Cuckoo filter for corpus → segment membership.
-     *
-     * <p>This filter is shared between:</p>
-     * <ul>
-     *   <li>Ingestion pipeline - inserts entries during document ingestion</li>
-     *   <li>CuckooMaintenanceWorker - propagates deletions through the hierarchy</li>
-     *   <li>Query pipeline - orders a query's segments, those holding its terms first</li>
-     * </ul>
-     *
-     * <p>Use this to pass the same filter instance to ingestion components,
-     * ensuring that entries inserted during ingestion can be properly cleaned
-     * up when segments are tombstoned.</p>
-     *
-     * @return The hierarchical Cuckoo filter
-     */
-    public HierarchicalCuckooFilter getHierarchicalFilter() {
-        return hierarchicalFilter;
-    }
-
-    /**
      * Gets the document visibility tracker for atomic document-level visibility.
      *
      * <p>The visibility tracker ensures that:</p>
@@ -874,7 +843,6 @@ public final class ExcaliburApplication {
      *   <li>System health score</li>
      *   <li>Ingestion queue depth</li>
      *   <li>Visibility epoch</li>
-     *   <li>Cuckoo filter false positive rate</li>
      *   <li>HNSW queue depth</li>
      * </ul>
      *

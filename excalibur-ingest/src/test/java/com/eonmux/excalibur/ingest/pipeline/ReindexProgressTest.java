@@ -1,6 +1,5 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
@@ -42,7 +41,7 @@ class ReindexProgressTest {
         registry = new DocumentRegistry();
         RecordingWriter writer = new RecordingWriter();
         reindexer = new DocumentReindexer(new TextChunker(512, 64), null,
-            new UpsertHandler(registry, CuckooFilter.create(10_000), writer), registry, writer);
+            new UpsertHandler(registry, writer), registry, writer);
     }
 
     /** Every (processed, total) pair a run published, in order. */

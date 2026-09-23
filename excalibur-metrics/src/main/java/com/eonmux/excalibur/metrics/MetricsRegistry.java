@@ -338,9 +338,8 @@ public final class MetricsRegistry {
     /**
      * Clears the recorded metric values.
      *
-     * <p>This discards the Cuckoo filter false-positive samples along with the latencies:
-     * both live in the one histogram this node measures into, and {@code reset()} clears it
-     * whole. Sampling repopulates the FP rates on the next tick.</p>
+     * <p>This discards the latencies: they live in the one histogram this node measures into,
+     * and {@code reset()} clears it whole.</p>
      *
      * <p>The visibility epoch is deliberately left alone: it is monotone state that drives
      * which entries are visible to queries, so winding it back would corrupt reads rather

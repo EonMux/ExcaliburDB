@@ -34,8 +34,8 @@ import java.util.stream.Collectors;
  * JMH benchmark for end-to-end query latency (p50/p99).
  *
  * <p>Measures the full query pipeline latency from request to response,
- * including all stages: epoch snapshot, segment prioritisation, Cuckoo filter ordering,
- * LSH candidates, HNSW search, tail scan, reranking, and optional LLM scoring.</p>
+ * including all stages: epoch snapshot, LSH candidates, HNSW search, tail scan, reranking,
+ * and optional LLM scoring.</p>
  *
  * <h2>Performance Target</h2>
  * <ul>
@@ -234,11 +234,10 @@ public class EndToEndQueryBenchmark {
      * through the complete 6-stage query pipeline:</p>
      * <ol>
      *   <li>Stage 0 - Epoch Snapshot: Capture visibility epoch and resolve queryable segments</li>
-     *   <li>Stage 1 - Cuckoo Filter Cascade: Search the segments holding the query's terms first</li>
-     *   <li>Stage 2 - LSH Candidates: Name entries sharing the query's buckets, measured beside the graph search</li>
-     *   <li>Stage 3 - HNSW Vector Search: Precise ANN within candidate segments with tail scan</li>
-     *   <li>Stage 4 - Full Vector Rerank: Exact distance on full-precision vectors</li>
-     *   <li>Stage 5 - LLM Relevancy Scoring: Score candidates with LLM (optional - disabled for benchmark)</li>
+     *   <li>Stage 1 - LSH Candidates: Name entries sharing the query's buckets, measured beside the graph search</li>
+     *   <li>Stage 2 - HNSW Vector Search: Precise ANN within candidate segments with tail scan</li>
+     *   <li>Stage 3 - Full Vector Rerank: Exact distance on full-precision vectors</li>
+     *   <li>Stage 4 - LLM Relevancy Scoring: Score candidates with LLM (optional - disabled for benchmark)</li>
      * </ol>
      *
      * <p><strong>Domain Correctness:</strong></p>

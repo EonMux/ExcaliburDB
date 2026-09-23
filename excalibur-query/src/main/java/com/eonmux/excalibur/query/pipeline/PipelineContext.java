@@ -27,11 +27,11 @@ final class PipelineContext {
     final boolean llmScored;
     final boolean llmFallback;
     /**
-     * Whether Stage 4's merge came back shallower than the candidate count it asked for, so
+     * Whether Stage 3's merge came back shallower than the candidate count it asked for, so
      * nothing past the ranking was left unconsidered.
      */
     final boolean retrievalExhausted;
-    /** Results Stage 4 dropped because they carried no name and the request needs one. */
+    /** Results Stage 3 dropped because they carried no name and the request needs one. */
     final int unnamedResultsDropped;
 
     PipelineContext(
@@ -106,7 +106,7 @@ final class PipelineContext {
     }
 
     /**
-     * Stage 4's ranking, with what it established about the candidates behind it.
+     * Stage 3's ranking, with what it established about the candidates behind it.
      *
      * @param results               The ranking
      * @param exhausted             Whether the merge ran out of candidates before its limit

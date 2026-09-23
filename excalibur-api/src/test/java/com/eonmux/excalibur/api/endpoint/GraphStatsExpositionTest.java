@@ -3,7 +3,6 @@ package com.eonmux.excalibur.api.endpoint;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.StorageEngine;
@@ -66,7 +65,6 @@ class GraphStatsExpositionTest {
     void setUp() throws IOException {
         SegmentCatalog catalog = new SegmentCatalog();
         IndexOrchestrator orchestrator = mock(IndexOrchestrator.class);
-        when(orchestrator.getCuckooFpRates()).thenReturn(CuckooMetricsWorker.FpRates.NONE);
         StorageEngine storage = mock(StorageEngine.class);
         when(orchestrator.getVisibilityTracker()).thenReturn(new VisibilityTracker(catalog));
         when(orchestrator.getHnswQueueDepthLimit()).thenReturn(100_000);

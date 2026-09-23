@@ -17,8 +17,8 @@ import java.util.Objects;
 /**
  * Reranks query candidates by computing exact distances on full-precision vectors.
  *
- * <p>Stage 4 of the query pipeline uses this class to measure the candidates Stage 3 returned
- * against the query as the graph holds them now. Stage 3's distances are exact already, so the
+ * <p>Stage 3 of the query pipeline uses this class to measure the candidates Stage 2 returned
+ * against the query as the graph holds them now. Stage 2's distances are exact already, so the
  * number this recomputes matches for a node that has not moved; what the second look catches is
  * one that has. The node is re-read under the generation it was found at, so a candidate
  * tombstoned since, or whose id a compaction has since given to another node, drops out instead
@@ -26,7 +26,7 @@ import java.util.Objects;
  *
  * <h2>Reranking Process</h2>
  * <ol>
- *   <li>Take candidates with nodeId and a normalized score from Stage 3</li>
+ *   <li>Take candidates with nodeId and a normalized score from Stage 2</li>
  *   <li>Fetch the full-precision vector from the HNSW graph for each nodeId</li>
  *   <li>Compute the exact dissimilarity using the distance function</li>
  *   <li>Re-sort by the resulting normalized score and return top-k</li>
@@ -90,7 +90,7 @@ public class VectorReranker {
      *   <li>Exactly topK results are returned (or fewer if insufficient valid candidates)</li>
      * </ul>
      *
-     * @param candidates The candidates to rerank (from Stage 3)
+     * @param candidates The candidates to rerank (from Stage 2)
      * @param queryVector The query vector
      * @param graph The HNSW graph containing the full-precision vectors
      * @param topK The maximum number of results to return
@@ -147,7 +147,7 @@ public class VectorReranker {
      * <p>Everything that can go wrong here ends the same way, with the candidate dropped
      * rather than kept at its old score: a node that is gone, tombstoned, empty, of the wrong
      * dimension, or that measures to a value that cannot be ranked. Keeping it would mean
-     * ranking it on stage 3's reading of a node that no longer answers to it.</p>
+     * ranking it on stage 2's reading of a node that no longer answers to it.</p>
      *
      * @param candidate The candidate to re-measure
      * @param queryVector The query vector

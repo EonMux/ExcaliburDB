@@ -1,12 +1,8 @@
 package com.eonmux.excalibur.shard;
 
-import com.eonmux.excalibur.filter.CuckooFilter;
-import com.eonmux.excalibur.filter.HierarchicalCuckooFilter;
 import com.eonmux.excalibur.shard.allocator.VolumeManager;
 import com.eonmux.excalibur.shard.allocator.VolumePlacements;
 import com.eonmux.excalibur.shard.visibility.EpochIsolationValidator;
-import com.eonmux.excalibur.shard.worker.CuckooMaintenanceWorker;
-import com.eonmux.excalibur.shard.worker.CuckooMetricsWorker;
 import com.eonmux.excalibur.shard.worker.HnswCompactionWorker;
 import com.eonmux.excalibur.shard.worker.HnswIntegrationWorker;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
@@ -39,8 +35,6 @@ import java.util.function.BooleanSupplier;
  * that perform asynchronous index operations:</p>
  * <ul>
  *   <li>{@link HnswIntegrationWorker} - Integrates write log entries into HNSW graph</li>
- *   <li>{@link CuckooMaintenanceWorker} - Maintains Cuckoo filter consistency</li>
- *   <li>{@link CuckooMetricsWorker} - Monitors and records Cuckoo filter FP rates</li>
  *   <li>{@link SegmentReindexScheduler} - Schedules stale segment re-indexing</li>
  *   <li>{@link EpochTickScheduler} - Advances visibility epoch periodically</li>
  *   <li>{@link HnswCompactionWorker} - Compacts HNSW graphs by removing tombstoned nodes</li>
@@ -63,21 +57,17 @@ import java.util.function.BooleanSupplier;
  * where it is justified. {@link VisibilityTracker} is not in it: it is a counter with no
  * lifecycle, and it is {@link EpochTickScheduler} that advances it.</p>
  * <ol>
- *   <li>Start: EpochTickScheduler → CuckooMaintenanceWorker → CuckooMetricsWorker →
- *       HnswIntegrationWorker → WarmingPhaseWorker → HnswCompactionWorker →
+ *   <li>Start: EpochTickScheduler → HnswIntegrationWorker → WarmingPhaseWorker → HnswCompactionWorker →
  *       SegmentReindexScheduler → CompactionWorker, then the reconciliation sweep</li>
  *   <li>Stop: the reconciliation sweep, then exactly the reverse - CompactionWorker →
  *       SegmentReindexScheduler → HnswCompactionWorker → WarmingPhaseWorker →
- *       HnswIntegrationWorker → CuckooMetricsWorker → CuckooMaintenanceWorker →
- *       EpochTickScheduler</li>
+ *       HnswIntegrationWorker → EpochTickScheduler</li>
  * </ol>
  *
  * <h2>Metrics Exposure</h2>
  * <p>The orchestrator exposes queue depth metrics for backpressure monitoring:</p>
  * <ul>
  *   <li>HNSW integration queue depth</li>
- *   <li>Pending Cuckoo filter deletions</li>
- *   <li>Cuckoo filter false positive rates</li>
  *   <li>Scheduled re-index count</li>
  *   <li>Current visibility epoch</li>
  * </ul>
@@ -93,7 +83,6 @@ import java.util.function.BooleanSupplier;
  * <h2>Domain Constraints</h2>
  * <ul>
  *   <li>HNSW queue depth limit: 100,000 entries (configurable)</li>
- *   <li>Cuckoo maintenance interval: 5 seconds (configurable)</li>
  *   <li>Re-index check interval: 1 minute (configurable)</li>
  *   <li>Epoch tick interval: 100ms (configurable)</li>
  * </ul>
@@ -101,8 +90,6 @@ import java.util.function.BooleanSupplier;
  * @author ExcaliburDB
  * @since 5.0
  * @see HnswIntegrationWorker
- * @see CuckooMaintenanceWorker
- * @see CuckooMetricsWorker
  * @see SegmentReindexScheduler
  * @see VisibilityTracker
  * @see EpochTickScheduler
@@ -120,11 +107,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * Default HNSW queue depth limit.
      */
     public static final int DEFAULT_HNSW_QUEUE_DEPTH_LIMIT = 100_000;
-
-    /**
-     * Default Cuckoo maintenance interval in milliseconds.
-     */
-    public static final long DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS = 5000;
 
     /**
      * Default re-index check interval in milliseconds.
@@ -218,7 +200,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine) {
         this(catalog, storageEngine,
              DEFAULT_HNSW_QUEUE_DEPTH_LIMIT,
-             DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,
              DEFAULT_REINDEX_CHECK_INTERVAL_MS,
              DEFAULT_EPOCH_TICK_INTERVAL_MS);
     }
@@ -229,16 +210,15 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * @param catalog                       The segment catalog
      * @param storageEngine                 The storage engine
      * @param hnswQueueDepthLimit           HNSW integration queue depth limit
-     * @param cuckooMaintenanceIntervalMs   Cuckoo maintenance interval (ms)
      * @param reindexCheckIntervalMs        Re-index check interval (ms)
      * @throws NullPointerException         if catalog or storageEngine is null
      * @throws IllegalArgumentException     if configuration values are invalid
      */
     public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
-                              int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
+                              int hnswQueueDepthLimit,
                               long reindexCheckIntervalMs) {
-        this(catalog, storageEngine, hnswQueueDepthLimit, cuckooMaintenanceIntervalMs,
-             reindexCheckIntervalMs, DEFAULT_EPOCH_TICK_INTERVAL_MS);
+        this(catalog, storageEngine, hnswQueueDepthLimit, reindexCheckIntervalMs,
+             DEFAULT_EPOCH_TICK_INTERVAL_MS);
     }
 
     /**
@@ -247,17 +227,16 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * @param catalog                       The segment catalog
      * @param storageEngine                 The storage engine
      * @param hnswQueueDepthLimit           HNSW integration queue depth limit
-     * @param cuckooMaintenanceIntervalMs   Cuckoo maintenance interval (ms)
      * @param reindexCheckIntervalMs        Re-index check interval (ms)
      * @param epochTickIntervalMs           Epoch tick interval (ms)
      * @throws NullPointerException         if catalog or storageEngine is null
      * @throws IllegalArgumentException     if configuration values are invalid
      */
     public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
-                              int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
+                              int hnswQueueDepthLimit,
                               long reindexCheckIntervalMs, long epochTickIntervalMs) {
-        this(catalog, storageEngine, null, hnswQueueDepthLimit, cuckooMaintenanceIntervalMs,
-             reindexCheckIntervalMs, epochTickIntervalMs);
+        this(catalog, storageEngine, null, hnswQueueDepthLimit, reindexCheckIntervalMs,
+             epochTickIntervalMs);
     }
 
     /**
@@ -267,7 +246,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * @param storageEngine                 The storage engine
      * @param volumeManager                 The volume manager for disk space tracking (optional)
      * @param hnswQueueDepthLimit           HNSW integration queue depth limit
-     * @param cuckooMaintenanceIntervalMs   Cuckoo maintenance interval (ms)
      * @param reindexCheckIntervalMs        Re-index check interval (ms)
      * @param epochTickIntervalMs           Epoch tick interval (ms)
      * @throws NullPointerException         if catalog or storageEngine is null
@@ -275,11 +253,10 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      */
     public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
                               VolumeManager volumeManager,
-                              int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
+                              int hnswQueueDepthLimit,
                               long reindexCheckIntervalMs, long epochTickIntervalMs) {
         this(catalog, storageEngine, volumeManager, hnswQueueDepthLimit,
-             cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs,
-             DEFAULT_INITIAL_EPOCH);
+             reindexCheckIntervalMs, epochTickIntervalMs, DEFAULT_INITIAL_EPOCH);
     }
 
     /**
@@ -295,7 +272,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * @param storageEngine                 The storage engine
      * @param volumeManager                 The volume manager for disk space tracking (optional)
      * @param hnswQueueDepthLimit           HNSW integration queue depth limit
-     * @param cuckooMaintenanceIntervalMs   Cuckoo maintenance interval (ms)
      * @param reindexCheckIntervalMs        Re-index check interval (ms)
      * @param epochTickIntervalMs           Epoch tick interval (ms)
      * @param initialEpoch                  Epoch the visibility counter starts at
@@ -304,12 +280,12 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      */
     public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
                               VolumeManager volumeManager,
-                              int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
+                              int hnswQueueDepthLimit,
                               long reindexCheckIntervalMs, long epochTickIntervalMs,
                               long initialEpoch) {
         this(catalog, storageEngine, volumeManager, hnswQueueDepthLimit,
-             cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs,
-             initialEpoch, CompactionSettings.DEFAULTS);
+             reindexCheckIntervalMs, epochTickIntervalMs, initialEpoch,
+             CompactionSettings.DEFAULTS);
     }
 
     /**
@@ -323,7 +299,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * @param storageEngine                 The storage engine
      * @param volumeManager                 The volume manager for segment placement (optional)
      * @param hnswQueueDepthLimit           HNSW integration queue depth limit
-     * @param cuckooMaintenanceIntervalMs   Cuckoo maintenance interval (ms)
      * @param reindexCheckIntervalMs        Re-index check interval (ms)
      * @param epochTickIntervalMs           Epoch tick interval (ms)
      * @param initialEpoch                  Epoch the visibility counter starts at
@@ -333,7 +308,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      */
     public IndexOrchestrator(SegmentCatalog catalog, StorageEngine storageEngine,
                               VolumeManager volumeManager,
-                              int hnswQueueDepthLimit, long cuckooMaintenanceIntervalMs,
+                              int hnswQueueDepthLimit,
                               long reindexCheckIntervalMs, long epochTickIntervalMs,
                               long initialEpoch, CompactionSettings compaction) {
         Objects.requireNonNull(compaction, "compaction settings cannot be null");
@@ -363,7 +338,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         // this constructor and observed by nobody in between.
         ShardWorkerListeners listeners = new ShardWorkerListeners(
             (segment, count) -> onVectorsIntegrated(segment, count),
-            segmentId -> { onSegmentFilterCleaned(segmentId); },
             (segmentId, pqSuccess, vectorCount) -> onWarmingComplete(segmentId, pqSuccess, vectorCount),
             sourceId -> onReindexNeeded(sourceId),
             (oldSegment, newSegment) -> onCompactionComplete(oldSegment, newSegment),
@@ -380,8 +354,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             });
 
         this.workers = new ShardWorkers(catalog, storageEngine, visibility, epochIsolation,
-            new WorkerTuning(hnswQueueDepthLimit, cuckooMaintenanceIntervalMs,
-                reindexCheckIntervalMs, epochTickIntervalMs),
+            new WorkerTuning(hnswQueueDepthLimit, reindexCheckIntervalMs, epochTickIntervalMs),
             compaction, listeners);
 
         this.registry = new SegmentRegistry(storageEngine, workers, visibility, epochIsolation);
@@ -394,8 +367,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         this.segmentSync = new SegmentSyncScheduler(storageEngine, this,
             () -> registry.syncFromStorage(), DEFAULT_SEGMENT_SYNC_INTERVAL_MS);
 
-        LOGGER.info("IndexOrchestrator created with hnswQueueDepthLimit={}, cuckooInterval={}ms, reindexInterval={}ms, epochTickInterval={}ms, volumeManager={}",
-            hnswQueueDepthLimit, cuckooMaintenanceIntervalMs, reindexCheckIntervalMs, epochTickIntervalMs, volumeManager != null);
+        LOGGER.info("IndexOrchestrator created with hnswQueueDepthLimit={}, reindexInterval={}ms, epochTickInterval={}ms, volumeManager={}",
+            hnswQueueDepthLimit, reindexCheckIntervalMs, epochTickIntervalMs, volumeManager != null);
     }
 
     // ==================== Factory Methods ====================
@@ -414,7 +387,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *       segment directory, via {@link #withSegmentSyncIntervalMs(long)}</li>
      *   <li>{@code volumes} → the directories segments are spread across, via
      *       {@link #withVolumePlacement(List)}</li>
-     *   <li>{@code cuckooMaintenanceIntervalMs} → Uses default (5000ms)</li>
      *   <li>{@code reindexCheckIntervalMs} → Uses default (60000ms)</li>
      *   <li>{@code epochTickIntervalMs} → Uses default (100ms)</li>
      * </ul>
@@ -524,7 +496,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
             storageEngine,
             volumeManager,
             settings.hnswQueueLimit(),
-            DEFAULT_CUCKOO_MAINTENANCE_INTERVAL_MS,
             DEFAULT_REINDEX_CHECK_INTERVAL_MS,
             epochTickIntervalMs,
             initialEpoch,
@@ -597,8 +568,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     /**
      * Starts all background workers.
      *
-     * <p>EpochTickScheduler → CuckooMaintenanceWorker → CuckooMetricsWorker →
-     * HnswIntegrationWorker → WarmingPhaseWorker → HnswCompactionWorker →
+     * <p>EpochTickScheduler → HnswIntegrationWorker → WarmingPhaseWorker → HnswCompactionWorker →
      * SegmentReindexScheduler → CompactionWorker, and then the segment reconciliation sweep.
      * The order is enforced by {@code ShardWorkers}, which documents why it is that order; the
      * sweep is started last because it is the only thing here that registers new index
@@ -631,8 +601,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *
      * <p>The reconciliation sweep first, then exactly the reverse of {@link #start()}:
      * CompactionWorker → SegmentReindexScheduler → HnswCompactionWorker → WarmingPhaseWorker →
-     * HnswIntegrationWorker → CuckooMetricsWorker → CuckooMaintenanceWorker →
-     * EpochTickScheduler. The epoch ticker is last because its stop fences an
+     * HnswIntegrationWorker → EpochTickScheduler. The epoch ticker is last because its stop fences an
      * already-dispatched tick, a promise that only holds once nothing can publish new work.</p>
      *
      * <p>The workers are asked to stop, not interrupted, and waited for with what is left of
@@ -655,8 +624,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * units of work and waited for with what is left of {@code wait}. A worker still inside a
      * segment rewrite or a graph swap when the wait runs out is left to finish it.</p>
      *
-     * <p>One wait for everything here, not one per worker: the sweep, the workers in their order
-     * and then the term filter rebuilds each get what the ones before them left. How long is the
+     * <p>One wait for everything here, not one per worker: the sweep and then the workers in
+     * their order each get what the ones before them left. How long is the
      * caller's - a node's shutdown passes what its budget leaves the drains, so a longer budget
      * is a longer wait for a slow worker rather than a fixed one cut short.</p>
      *
@@ -666,24 +635,15 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * for what an earlier one left running, and answers from the workers' state, not from
      * whether this is the first call.</p>
      *
-     * <p>Unlike {@link #stop(Duration)} this is final: it also drains the term filter rebuilds,
-     * which copy out of the same segment mappings, and a drained orchestrator is not started
-     * again. {@link #close(Duration)} still has to be called for the rest of what the
-     * orchestrator holds, and calls this first.</p>
+     * <p>{@link #close(Duration)} still has to be called for the rest of what the orchestrator
+     * holds, and calls this first.</p>
      *
      * @param wait How long to wait for all of it together
-     * @return true if every background worker, the reconciliation sweep and every term filter
-     *         rebuild have ended
+     * @return true if every background worker and the reconciliation sweep have ended
      * @throws NullPointerException if wait is null
      */
     public boolean shutdown(Duration wait) {
-        Objects.requireNonNull(wait, "wait cannot be null");
-        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; left()
-        // subtracts the current time first, which undoes it.
-        long deadline = System.nanoTime() + wait.toNanos();
-        boolean workersEnded = stopWorkers(wait);
-        boolean rebuildsEnded = registry.close(ShardWorkers.left(deadline));
-        return workersEnded && rebuildsEnded;
+        return stopWorkers(Objects.requireNonNull(wait, "wait cannot be null"));
     }
 
     /**
@@ -709,12 +669,11 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
         boolean workersEnded = workers.stop(ShardWorkers.left(deadline));
         if (first) {
 
-            LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Cuckoo deletions: {}, Reindexes: {}, Compactions: {}, HNSW compactions: {}, PQ trained: {}, Epoch ticks: {}, Cuckoo FP samples: {}",
-                workers.hnsw().getTotalIntegrated(), workers.cuckoo().getTotalDeletions(),
+            LOGGER.info("Index orchestrator stopped. HNSW integrated: {}, Reindexes: {}, Compactions: {}, HNSW compactions: {}, PQ trained: {}, Epoch ticks: {}",
+                workers.hnsw().getTotalIntegrated(),
                 workers.reindex().getTotalReindexesTriggered(), workers.segmentCompactionCount(),
                 workers.graphCompaction().getCompactionCount(),
-                workers.warming().getTotalPqTrained(), workers.epochTicks().getTickCount(),
-                workers.cuckooMetrics().getTotalSamplesRecorded());
+                workers.warming().getTotalPqTrained(), workers.epochTicks().getTickCount());
         }
         boolean ended = syncEnded && workersEnded;
         if (!ended) {
@@ -785,22 +744,18 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * <p>This registers the segment with all appropriate workers:</p>
      * <ul>
      *   <li>HNSW integration (if it has a graph)</li>
-     *   <li>Cuckoo maintenance (if it has a filter)</li>
-     *   <li>Cuckoo metrics (for FP rate monitoring, if it has a filter)</li>
      *   <li>Compaction worker (for tombstone cleanup)</li>
      *   <li>Warming phase worker (for PQ training during WARMING state)</li>
-     *   <li>Hierarchical Cuckoo filter (for corpus → segment membership)</li>
      * </ul>
      *
      * @param segmentId The segment ID
      * @param segment   The segment
      * @param graph     The HNSW graph (can be null)
-     * @param filter    The Cuckoo filter (can be null)
      * @param tracker   The tail offset tracker (can be null)
      */
     public void registerSegment(long segmentId, Segment segment, HnswGraph graph,
-                                 CuckooFilter filter, TailOffsetTracker tracker) {
-        registry.register(segmentId, segment, graph, filter, tracker);
+                                 TailOffsetTracker tracker) {
+        registry.register(segmentId, segment, graph, tracker);
     }
 
     /**
@@ -992,30 +947,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
-     * Returns how many Cuckoo filter entries are waiting to be removed.
-     *
-     * <p>Every entry still held by a tombstoned segment the maintenance worker has not yet
-     * cleaned; see {@link CuckooMaintenanceWorker#getPendingDeletionCount()}.</p>
-     *
-     * @return Pending deletion count, in filter entries
-     */
-    public int getPendingCuckooDeletions() {
-        return workers.cuckoo().getPendingDeletionCount();
-    }
-
-    /**
-     * Returns the estimated false-positive rates of the registered segments' Cuckoo filters.
-     *
-     * <p>Read now, from the filters themselves, rather than from the last scheduled sample;
-     * see {@link CuckooMetricsWorker#sample()}.</p>
-     *
-     * @return The average and worst rate over the segments whose filters hold anything
-     */
-    public CuckooMetricsWorker.FpRates getCuckooFpRates() {
-        return workers.cuckooMetrics().sample();
-    }
-
-    /**
      * Returns the number of sources scheduled for re-index.
      *
      * @return Scheduled source count
@@ -1114,15 +1045,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
-     * Returns the total number of Cuckoo filter deletions.
-     *
-     * @return Total deletions
-     */
-    public long getTotalCuckooDeletions() {
-        return workers.cuckoo().getTotalDeletions();
-    }
-
-    /**
      * Returns the total number of re-indexes triggered.
      *
      * @return Total re-indexes triggered
@@ -1183,20 +1105,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
-     * Called when a segment's filter is cleaned after tombstoning.
-     *
-     * <p>Returns nothing, because {@link CuckooMaintenanceWorker.MaintenanceListener} does not
-     * ask for anything back. It used to report {@code true}, which the language quietly
-     * discarded at the lambda that adapted it - a value that looks like an acknowledgement and
-     * reaches nobody.</p>
-     *
-     * @param segmentId The segment whose filter was cleaned
-     */
-    private void onSegmentFilterCleaned(long segmentId) {
-        LOGGER.info("Filter cleaned for tombstoned segment {}", segmentId);
-    }
-
-    /**
      * Called when a segment completes the warming phase.
      *
      * <p>This method is invoked after PQ codebook training completes
@@ -1232,59 +1140,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     @Override
     public void onSplitComplete(Segment parent, Segment leftChild, Segment rightChild) {
         splitBookkeeping.onSplitComplete(parent, leftChild, rightChild);
-    }
-
-    /**
-     * Marks both children's term filter levels stale before either can take a write.
-     *
-     * <p>Each child holds a share of its parent's entries that no write ever filed under it. The
-     * right child's first write would otherwise leave its level non-empty and missing everything
-     * it inherited, and stage 1 of the query pipeline would search it last for those terms from
-     * then until something noticed - a window that opens the moment routing reaches the child,
-     * before {@link #onSplitComplete} is called. The rebuilds that clear these marks are queued
-     * when the children are registered.</p>
-     *
-     * @param parent     The segment being split
-     * @param leftIndex  The left child's directory index
-     * @param rightIndex The right child's directory index
-     */
-    @Override
-    public void onSplitPublishing(Segment parent, long leftIndex, long rightIndex) {
-        registry.markTermFilterStale(leftIndex);
-        registry.markTermFilterStale(rightIndex);
-    }
-
-    /**
-     * Returns the parent's level to service after a split that was not published.
-     *
-     * <p>The parent still holds every key and is still registered under the left index, so its
-     * level is refilled from it, which clears the advance mark. Nothing serves the right index;
-     * its mark stays until a segment is registered there, which rebuilds it anyway.</p>
-     *
-     * @param parent     The segment that stays in service
-     * @param leftIndex  The index it is registered under
-     * @param rightIndex The index the right child would have taken
-     */
-    @Override
-    public void onSplitAbandoned(Segment parent, long leftIndex, long rightIndex) {
-        registry.rebuildTermFilter(leftIndex);
-    }
-
-    /**
-     * Waits until every queued refill of a segment's term filter level has finished.
-     *
-     * <p>A segment whose level is being refilled is one the filter says nothing about, so
-     * nothing waits on this for correctness. It is for callers that want the filter's ordering
-     * back before they measure - a benchmark after bootstrap, or a test.</p>
-     *
-     * @param timeout How long to wait
-     * @param unit    The unit of the timeout
-     * @return true if every queued refill finished in time
-     * @throws InterruptedException if the wait is interrupted
-     */
-    public boolean awaitTermFilterRebuilds(long timeout, java.util.concurrent.TimeUnit unit)
-            throws InterruptedException {
-        return registry.awaitTermFilterRebuilds(timeout, unit);
     }
 
     /**
@@ -1324,15 +1179,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      */
     public HnswIntegrationWorker getHnswWorker() {
         return workers.hnsw();
-    }
-
-    /**
-     * Returns the Cuckoo maintenance worker.
-     *
-     * @return Cuckoo worker
-     */
-    public CuckooMaintenanceWorker getCuckooWorker() {
-        return workers.cuckoo();
     }
 
     /**
@@ -1421,45 +1267,6 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     }
 
     /**
-     * Sets the hierarchical Cuckoo filter for deletion propagation.
-     *
-     * <p>When set, the Cuckoo maintenance worker will propagate deletions through
-     * the hierarchy: segment → corpus. This ensures no stale false
-     * positives from tombstoned entries.</p>
-     *
-     * <p>The filter is also stored locally to enable segment registration
-     * in the hierarchy via {@link #registerSegment}.</p>
-     *
-     * <p><strong>CRITICAL:</strong> This method also registers all existing segments
-     * with the new filter. This ensures that segments registered before the filter
-     * was configured are properly included in the hierarchical filter cascade that
-     * Stage 1 of a query orders segments by.</p>
-     *
-     * @param filter The hierarchical Cuckoo filter (may be null)
-     */
-    public void setHierarchicalCuckooFilter(HierarchicalCuckooFilter filter) {
-        registry.setHierarchicalFilter(filter);
-        LOGGER.info("Hierarchical Cuckoo filter {} for IndexOrchestrator",
-            filter != null ? "configured" : "cleared");
-    }
-
-    /**
-     * Returns the hierarchical Cuckoo filter for corpus → segment membership.
-     *
-     * <p>The hierarchical filter is used for:</p>
-     * <ul>
-     *   <li>Ordering a query's segments, those holding its terms first, in the Stage 1
-     *       Cuckoo filter cascade</li>
-     *   <li>Proper deletion propagation when segments are tombstoned</li>
-     * </ul>
-     *
-     * @return The hierarchical Cuckoo filter, or null if not configured
-     */
-    public HierarchicalCuckooFilter getHierarchicalCuckooFilter() {
-        return registry.hierarchicalFilter();
-    }
-
-    /**
      * Returns the segment re-index scheduler.
      *
      * @return Re-index scheduler
@@ -1520,10 +1327,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     @Override
     public String toString() {
         return String.format(
-            "IndexOrchestrator{running=%s, segments=%d, hnswQueueDepth=%d, " +
-            "pendingCuckooDeletions=%d, epoch=%d}",
-            running.get(), registry.size(), getHnswQueueDepth(),
-            getPendingCuckooDeletions(), visibility.currentEpoch());
+            "IndexOrchestrator{running=%s, segments=%d, hnswQueueDepth=%d, epoch=%d}",
+            running.get(), registry.size(), getHnswQueueDepth(), visibility.currentEpoch());
     }
 }
 

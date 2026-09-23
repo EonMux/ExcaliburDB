@@ -148,7 +148,7 @@ import java.util.concurrent.*;
  * <h2>Relevancy scoring</h2>
  * <p>{@code enable_llm_scoring}, {@code llm_threshold} and {@code oversampling_factor} apply on
  * every route, with the same scorer, circuit breaker and model timeout. A vector answer is
- * scored by the pipeline's Stage 5. A fused answer is scored after fusion, over the fused
+ * scored by the pipeline's Stage 4. A fused answer is scored after fusion, over the fused
  * candidate set, and a BM25 answer over the BM25 one - see {@link RelevancyScoring}.
  * {@code llm_scored} on the response says whether the scores are the model's judgement; a
  * scorer that was planned and failed or ran out of time leaves the retrieval order and marks
@@ -579,7 +579,7 @@ public class QueryEndpoint implements HttpHandler {
      * @param lexical        The lexical index, or null on a node that keeps none
      * @param plan           How an answer the pipeline does not score is scored
      * @param scoringPlanned Whether this request's answer is to be scored by anything - the
-     *                       pipeline's Stage 5 or {@link RelevancyScoring}
+     *                       pipeline's Stage 4 or {@link RelevancyScoring}
      */
     private record Request(String queryId, String correlationId, long startTime,
                            String requestBody, QueryRequestParser.ParsedQuery parsed,
@@ -638,12 +638,12 @@ public class QueryEndpoint implements HttpHandler {
      * Searches for one request and answers it, from both signals, from one, or with nothing.
      *
      * <h3>Where relevancy scoring runs</h3>
-     * <p>On an answer from vector search alone, in the pipeline's Stage 5, as it always has. On
+     * <p>On an answer from vector search alone, in the pipeline's Stage 4, as it always has. On
      * a fused answer, after fusion: the pipeline is asked for the candidate set unscored, the
      * BM25 signal ranks as deep, and the fused ranking is what the model judges. Scoring the
      * vector half before fusion would judge half the candidates and then let reciprocal rank
      * undo the judgement. The share of the budget the model needs is held back from both
-     * signals, as Stage 5's is held back from the segment search.</p>
+     * signals, as Stage 4's is held back from the segment search.</p>
      *
      * <h3>When the caller withdraws it</h3>
      * <p>The answer is decided while the query can still be withdrawn and written only once it

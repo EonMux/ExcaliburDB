@@ -235,8 +235,8 @@ public final class QuerySnapshot {
      * Resolves the visible segments, each paired with the ID it was resolved from.
      *
      * <p>The ID is the directory index the storage engine routes by, and it is the ID every
-     * other component keys a segment on: the catalog, the visibility tracker, the term filter
-     * hierarchy and the graph provider. It is not {@link Segment#segmentId()}, which counts
+     * other component keys a segment on: the catalog, the visibility tracker and the graph
+     * provider. It is not {@link Segment#segmentId()}, which counts
      * every segment instance a process has ever constructed and coincides with the directory
      * index only until the first compaction or split creates one out of order.</p>
      *

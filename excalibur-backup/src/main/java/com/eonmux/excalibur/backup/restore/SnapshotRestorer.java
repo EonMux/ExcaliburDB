@@ -11,7 +11,7 @@ import com.eonmux.excalibur.backup.snapshot.SnapshotLayout;
 import com.eonmux.excalibur.backup.verify.Problem;
 import com.eonmux.excalibur.backup.verify.SnapshotVerifier;
 import com.eonmux.excalibur.backup.verify.VerificationReport;
-import com.eonmux.excalibur.fsck.check.FileKind;
+import com.eonmux.excalibur.store.ObsoleteSidecars;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -96,16 +96,17 @@ public final class SnapshotRestorer {
         Path staging = parent.resolve(options.target().getFileName() + SnapshotLayout.
             STAGING_INFIX + UUID.randomUUID());
         SnapshotManifest manifest = report.manifest();
+        List<FileEntry> restored = restorable(manifest);
         long bytes;
         try {
-            bytes = populate(options.snapshotDir(), staging, manifest);
+            bytes = populate(options.snapshotDir(), staging, restored);
             AtomicPublish.syncTree(staging);
             swapIntoPlace(staging, options.target(), parent);
         } catch (IOException | RuntimeException e) {
             AtomicPublish.deleteTree(staging);
             throw e;
         }
-        return new RestoreResult(options.target(), manifest.files().size(), bytes, manifest,
+        return new RestoreResult(options.target(), restored.size(), bytes, manifest,
             rebuildRequired(manifest));
     }
 
@@ -177,20 +178,38 @@ public final class SnapshotRestorer {
     }
 
     /**
-     * Copies every file the manifest names into the staging tree, checking each copy.
+     * The files of the image this build restores: all of them, less the ones it has no use for.
+     *
+     * <p>An image an earlier build took carries each segment's term sketch,
+     * {@code segment_N.tfs}, which nothing in this build reads. It is verified with the rest of
+     * the image, since its bytes are part of what the image certifies, and then left out of the
+     * restored directory rather than written where the node would remove it as it starts.</p>
+     *
+     * @param manifest What the image contains
+     * @return The entries to write into the restored directory
+     */
+    private static List<FileEntry> restorable(SnapshotManifest manifest) {
+        return manifest.files().stream()
+            .filter(entry -> !ObsoleteSidecars.isObsolete(
+                entry.path().substring(entry.path().lastIndexOf('/') + 1)))
+            .toList();
+    }
+
+    /**
+     * Copies each given file of the image into the staging tree, checking each copy.
      *
      * @param snapshotDir The image
      * @param staging     The tree being built
-     * @param manifest    What the image contains
+     * @param entries     The files to write, as the manifest describes them
      * @return How many logical bytes were written
      * @throws IOException if a copy fails or does not read back as the manifest describes
      */
-    private static long populate(Path snapshotDir, Path staging, SnapshotManifest manifest)
+    private static long populate(Path snapshotDir, Path staging, List<FileEntry> entries)
         throws IOException {
         Path payload = snapshotDir.resolve(SnapshotLayout.PAYLOAD_DIRECTORY);
         Files.createDirectories(staging);
         long bytes = 0L;
-        for (FileEntry entry : manifest.files()) {
+        for (FileEntry entry : entries) {
             Path destination = staging.resolve(entry.path());
             SparseFileCopy.copy(payload.resolve(entry.path()), destination);
             FileDigest written = FileDigests.of(destination);
@@ -307,14 +326,6 @@ public final class SnapshotRestorer {
         if (!hasCodebooks) {
             required.add("no quantiser codebooks are in this image; they retrain on their own "
                 + "as segments warm, at a cost in early query latency");
-        }
-        boolean hasSegments = manifest.files().stream()
-            .anyMatch(entry -> FileKind.SEGMENT_DATA_NAME.matcher(entry.path()).matches());
-        boolean hasSketches = manifest.files().stream()
-            .anyMatch(entry -> FileKind.TERM_SKETCH_NAME.matcher(entry.path()).matches());
-        if (hasSegments && !hasSketches) {
-            required.add("no term sketches are in this image; the node rebuilds each from its "
-                + "segment's live entries as it opens the segment, at a cost in start-up time");
         }
         return required;
     }
