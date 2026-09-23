@@ -194,7 +194,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should replace segment atomically when old segment matches")
         void shouldReplaceSegmentAtomicallyWhenOldSegmentMatches() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -223,7 +223,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should fail replacement if old segment mismatched")
         void shouldFailReplacementIfOldSegmentMismatched() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -250,7 +250,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should get segment after successful replacement")
         void shouldGetSegmentAfterSuccessfulReplacement() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -287,7 +287,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should pre-allocate segment at index")
         void shouldPreAllocateSegmentAtIndex() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -315,7 +315,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should allow pre-allocation of existing segment index")
         void shouldAllowPreAllocationOfExistingSegmentIndex() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -332,7 +332,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should be able to get pre-allocated segment")
         void shouldBeAbleToGetPreAllocatedSegment() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -358,7 +358,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should tombstone segment")
         void shouldTombstoneSegment() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -382,7 +382,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Tombstoned segment should not be queryable")
         void tombstonedSegmentShouldNotBeQueryable() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -435,7 +435,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should complete segment indexing")
         void shouldCompleteSegmentIndexing() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -451,7 +451,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should complete segment warmup")
         void shouldCompleteSegmentWarmup() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -467,7 +467,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should begin segment compaction")
         void shouldBeginSegmentCompaction() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -487,7 +487,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should complete segment compaction")
         void shouldCompleteSegmentCompaction() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -508,7 +508,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should transition segment to INDEXING state")
         void shouldTransitionSegmentToIndexingState() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 
@@ -526,7 +526,7 @@ class StorageEngineSplitHandlingTest {
         @DisplayName("Should transition segment through lifecycle states")
         void shouldTransitionSegmentThroughLifecycleStates() throws IOException {
             try (Arena arena = Arena.ofShared()) {
-                StorageEngine engine = new StorageEngine(dataDir, arena, 4);
+                StorageEngine engine = new StorageEngine(dataDir, arena);
                 try {
                     engine.start();
 

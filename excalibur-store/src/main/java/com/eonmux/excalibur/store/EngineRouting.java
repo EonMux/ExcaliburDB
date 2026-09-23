@@ -4,9 +4,12 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.logging.Level;
 
 /**
@@ -15,22 +18,39 @@ import java.util.logging.Level;
  *
  * <h2>Why the directory is not just a set of segments</h2>
  * <p>{@code StorageEngine.segments} is a <em>directory</em>: several indices may point at the
- * same {@link Segment}. When one segment splits, the directory doubles and every index
- * {@code i} that did not split gets a buddy pointer at {@code i + oldCount} aimed at the same
- * segment, so widening the routing mask never orphans another segment's keys. Only the
- * segment that split gets two distinct children. That is what makes the directory the thing
- * with the invariants, rather than a bookkeeping detail of the map: its width must stay a
- * power of two, every slot below the width must resolve, and the smallest index pointing at a
- * segment - its <em>canonical</em> index - is the one that names its file and its catalog row.
- * Any traversal that must see each segment once has to de-duplicate first, which is
- * {@link #distinctSegments()}.</p>
+ * same {@link Segment}. That is what makes the directory the thing with the invariants, rather
+ * than a bookkeeping detail of the map: its width must stay a power of two, every slot below the
+ * width must resolve, and the smallest index pointing at a segment - its <em>canonical</em>
+ * index - is the one that names its file and its catalog row. Any traversal that must see each
+ * segment once has to de-duplicate first, which is {@link #distinctSegments()}.</p>
+ *
+ * <h2>Why the directory grows with the deepest segment, not with the splits</h2>
+ * <p>This is extendible hashing. A segment's <em>local depth</em> is how many low hash bits
+ * all of its keys share; it owns every slot whose low bits are those, which is
+ * {@code width / 2^depth} slots. A segment shallower than the directory therefore already
+ * owns several slots, and splitting it partitions on the lowest bit in which they differ and
+ * hands each child half of them: the width does not change. Only a segment that owns a single
+ * slot - one as deep as the directory - needs a new bit, and only then does the directory
+ * double, every other slot {@code i} gaining a buddy at {@code i + width} aimed at the segment
+ * it already had. {@link #planSplit(Segment)} makes that choice for every split.</p>
+ *
+ * <p>The difference is the whole heap cost of the directory. Doubling on every split makes it
+ * {@code 2^splits} slots wide: an ingest of 61 MB of embedded chunks held two million slots for
+ * seventy-nine segments when it ran out of a 256 MB heap. Growing with the deepest segment keeps
+ * it a small multiple of the segment count for keys that hash evenly, and
+ * {@code StorageEngine.maxRoutingWidth} bounds what keys that do not can cost: a split that
+ * would double past it is refused with {@link RoutingDirectoryFullException}, counted and
+ * logged, instead of being allowed to exhaust the heap.</p>
  *
  * <h2>Why the directory is persisted</h2>
- * <p>The bit each split partitioned on is recorded nowhere except the directory itself. From
- * the second split onwards it cannot be reconstructed from the segment file names, so this
- * class writes the directory down after every change and reads it back at start-up, and
- * refuses to guess when the file is gone and more than one split has happened. See
- * {@link #requireReconstructibleRouting(int)} for why guessing is worse than refusing.</p>
+ * <p>The bit each split partitioned on is recorded nowhere except the directory itself. A
+ * directory this build grew can be read back off the file names - every slot belongs to the
+ * segment whose index it reduces to by clearing high bits - but one grown by a build that
+ * doubled on every split cannot once two segments have split, and nothing in the names tells
+ * the two apart. So this class writes the directory down after every change and reads it back
+ * at start-up, and refuses to guess when the file is gone and the guess could be wrong. See
+ * {@link #requireReconstructibleRouting(int, String)} for why guessing is worse than
+ * refusing.</p>
  *
  * <h2>Concurrency</h2>
  * <p>Every mutation here happens under {@code StorageEngine.segmentLock} - the engine's one
@@ -47,6 +67,13 @@ final class EngineRouting {
 
     /** The engine whose directory this is. */
     private final StorageEngine engine;
+
+    /**
+     * Segments whose refused split has been logged, so a refusal is reported once per segment.
+     * Weak, so a segment retired later is not kept alive by having been refused once; guarded
+     * by {@code StorageEngine.segmentLock}.
+     */
+    private final Set<Segment> refusalsReported = Collections.newSetFromMap(new WeakHashMap<>());
 
     /**
      * Binds this directory to its engine.
@@ -146,13 +173,16 @@ final class EngineRouting {
     /**
      * Stops the start when the directory cannot be read and cannot be reconstructed either.
      *
-     * <p>Every split doubles the directory, so a width of {@code StorageEngine.DEFAULT_INITIAL_SEGMENTS}
-     * means nothing has split and a width of twice that means exactly one segment has. In both
-     * cases the buddy rule - slot {@code i} without a file of its own belongs to
-     * {@code i - highestOneBit(i)} - reproduces the directory exactly, because there is at most
-     * one partitioning bit to get wrong. From the second split onwards there is more than one,
-     * the bits are not recoverable from the file names, and the rule starts sending slots to a
-     * segment that does not hold them. {@link RoutingDirectory} carries the worked example.</p>
+     * <p>The buddy rule - slot {@code i} without a file of its own belongs to whatever
+     * {@code i - highestOneBit(i)} belongs to - is exactly how this build's splits assign slots,
+     * so it reproduces any directory this build grew. It does not reproduce one grown by a
+     * build that doubled the directory on every split, which partitioned each segment on the
+     * newest bit rather than its own next one; and the two leave the same file names behind. A
+     * width of at most twice {@code StorageEngine.DEFAULT_INITIAL_SEGMENTS} is the one case where
+     * both agree - at most one split of the older kind, or only the first round of this build's
+     * - because there is at most one partitioning bit to get wrong. Past it, the rule may send
+     * slots to a segment that does not hold them. {@link RoutingDirectory} carries the worked
+     * example.</p>
      *
      * <p>Nothing is lost when that happens, which is exactly why it has to stop the start: the
      * mis-addressed segment keeps its data and simply stops being reachable, while the next
@@ -173,9 +203,10 @@ final class EngineRouting {
             : "is present and cannot be used (" + problem + ")";
         throw new IllegalStateException(
             "Cannot start: " + engine.dataDir.resolve(RoutingDirectory.FILE_NAME) + " " + state
-                + ", and this store has more than one segment split behind it (the "
-                + "segment files imply " + width + " routing slots, and only up to "
-                + (StorageEngine.DEFAULT_INITIAL_SEGMENTS * 2) + " can be reconstructed from their names). "
+                + ", and this store has split too far for its directory to be rebuilt from "
+                + "file names (the segment files imply " + width + " routing slots, and only up "
+                + "to " + (StorageEngine.DEFAULT_INITIAL_SEGMENTS * 2) + " can be reconstructed "
+                + "from their names with certainty). "
                 + "The bit each split partitioned on is recorded nowhere else, so starting "
                 + "would route part of the keyspace to a segment that does not hold it, "
                 + "leaving the real data on disk and unreachable. No data has been lost: "
@@ -188,14 +219,19 @@ final class EngineRouting {
      *
      * <p>Rejected rather than partially applied when it does not: a directory naming a width
      * that disagrees with the files on disk, or pointing at a segment that is no longer there,
-     * describes a store this file was not written for.
+     * describes a store this file was not written for. The one disagreement that is corrected
+     * rather than rejected is a split published but not yet written down; see
+     * {@link #replayUnrecordedSplit(int[])}.
      *
-     * @param canonicalPerSlot The directory the previous run wrote, or null when there is no
-     *                         usable one
-     * @param width            The width implied by the segment files found
+     * @param persisted The directory the previous run wrote, or null when there is no usable one
+     * @param width     The width implied by the segment files found
      * @return true when the persisted directory was applied
      */
-    private boolean applyPersistedRouting(int[] canonicalPerSlot, int width) {
+    private boolean applyPersistedRouting(int[] persisted, int width) {
+        if (persisted == null) {
+            return false;
+        }
+        int[] canonicalPerSlot = replayUnrecordedSplit(persisted);
         if (canonicalPerSlot == null) {
             return false;
         }
@@ -223,9 +259,98 @@ final class EngineRouting {
         engine.segments.putAll(resolved);
         engine.routingSegmentCount = canonicalPerSlot.length;
         publishRouting();
+        if (canonicalPerSlot != persisted) {
+            persistRoutingDirectory();
+        }
         StorageEngine.LOGGER.log(Level.INFO, "Routing directory restored: {0} slots",
             canonicalPerSlot.length);
         return true;
+    }
+
+    /**
+     * Brings a persisted directory up to date with a split whose children reached disk and
+     * whose directory did not.
+     *
+     * <p>A split renames its children into place and routes to them first, and writes the
+     * directory down after - outside the lock, so that no routing decision waits on a disk
+     * write. A process that dies between the two leaves a right child's file that the directory
+     * does not name. Ignoring it is not an option once the left child has taken over its
+     * parent's file, because the keys with the split bit set are then only in the right child;
+     * and when the directory has the same width either way, nothing else would notice.</p>
+     *
+     * <p>The file's name says which split it came from. A right child is always published at its
+     * parent's canonical index plus {@code 2^b}, where {@code b} is the bit it was partitioned on
+     * and the parent's index is below {@code 2^b}; so clearing the highest bit of its index gives
+     * the parent, and that bit is the split bit. Replaying the split is then what publication
+     * did: double the directory if it does not reach the child's index, and hand the child every
+     * slot of the parent's with that bit set. Splits run one at a time and each writes the
+     * directory before the next begins, so at most one is ever missing.</p>
+     *
+     * <p>A file that cannot be read this way - its supposed parent is not in the directory, or
+     * the slot at its own index is not its parent's - is not a split this directory missed, and
+     * the directory is not applied.</p>
+     *
+     * @param persisted The directory as written
+     * @return {@code persisted} itself when it names every segment on disk, a corrected copy
+     *         when one split was missing from it, or null when it cannot be reconciled
+     */
+    private int[] replayUnrecordedSplit(int[] persisted) {
+        Set<Long> named = new HashSet<>();
+        for (int canonical : persisted) {
+            named.add((long) canonical);
+        }
+        List<Long> unnamed = new ArrayList<>();
+        for (Long index : engine.segments.keySet()) {
+            if (!named.contains(index)) {
+                unnamed.add(index);
+            }
+        }
+        if (unnamed.isEmpty()) {
+            return persisted;
+        }
+        if (unnamed.size() > 1) {
+            StorageEngine.LOGGER.log(Level.WARNING,
+                "Routing directory does not name segments {0}; at most one split can be missing "
+                    + "from it, so it is not applied", unnamed);
+            return null;
+        }
+
+        long child = unnamed.get(0);
+        long splitValue = Long.highestOneBit(child);
+        long parent = child - splitValue;
+        int splitBit = Long.numberOfTrailingZeros(splitValue);
+        if (child <= 0 || child >= StorageEngine.MAX_ROUTING_WIDTH_LIMIT
+                || !named.contains(parent)) {
+            StorageEngine.LOGGER.log(Level.WARNING,
+                "Routing directory does not name segment {0}, and no segment it names could have "
+                    + "split into it; it is not applied", child);
+            return null;
+        }
+
+        int[] replayed = persisted.clone();
+        while (replayed.length <= child) {
+            int[] doubled = new int[replayed.length * 2];
+            System.arraycopy(replayed, 0, doubled, 0, replayed.length);
+            System.arraycopy(replayed, 0, doubled, replayed.length, replayed.length);
+            replayed = doubled;
+        }
+        if (replayed[(int) child] != parent) {
+            StorageEngine.LOGGER.log(Level.WARNING,
+                "Routing directory sends slot {0} to segment {1}, so segment {0} is not a split "
+                    + "of segment {2} it missed; it is not applied",
+                new Object[] { child, replayed[(int) child], parent });
+            return null;
+        }
+        for (int slot = 0; slot < replayed.length; slot++) {
+            if (replayed[slot] == parent && Segment.shouldGoToRightChild(slot, splitBit)) {
+                replayed[slot] = (int) child;
+            }
+        }
+        StorageEngine.LOGGER.log(Level.WARNING,
+            "Routing directory predates the split of segment {0} into {0} and {1}; the split "
+                + "was replayed from the file names and the directory rewritten",
+            new Object[] { parent, child });
+        return replayed;
     }
 
     /**
@@ -289,6 +414,171 @@ final class EngineRouting {
         }
         Collections.sort(slots);
         return slots;
+    }
+
+    /**
+     * How one segment's split fits the directory: the bit it partitions on, and the slots it
+     * owns now.
+     *
+     * @param splitBit    The hash bit the children are partitioned on
+     * @param parentSlots The slots the segment owns before the split, smallest first; the first
+     *                    is its canonical index and stays the left child's
+     * @param doubles     Whether the directory has to double to give the right child a slot
+     */
+    record SplitPlan(int splitBit, List<Long> parentSlots, boolean doubles) {
+
+        /**
+         * Returns the canonical index the right child is published at: the smallest of the
+         * parent's slots with the split bit set, which after a doubling is the new buddy of the
+         * parent's only slot.
+         *
+         * @return The right child's index
+         */
+        long rightIndex() {
+            return parentSlots.get(0) + (1L << splitBit);
+        }
+    }
+
+    /**
+     * Decides how a segment splits. The caller holds {@code StorageEngine.segmentLock}.
+     *
+     * <p>The slots a segment owns are those whose low bits match its canonical index up to its
+     * local depth, so they differ only in the bits above it. The lowest bit they differ in is
+     * the one to partition on: each child keeps the slots with that bit clear or set, and both
+     * halves are again sets of that shape. A segment that owns one slot is as deep as the
+     * directory, and the only bit left is the one a doubling exposes.</p>
+     *
+     * <p>The same answer is reached for a slot set a build that doubled on every split left
+     * behind, because it too is every combination of some bits over fixed values of the rest;
+     * such a segment simply splits on its lowest free bit from then on.</p>
+     *
+     * <p>The answer depends only on the segment's own slots, and nothing re-points those
+     * except its own split - which the split worker runs one at a time, and a segment under
+     * split is never compacted - so the split worker's answer, taken before it partitions, is
+     * still the answer when {@link SplitPublication} publishes.</p>
+     *
+     * @param segment The segment to split
+     * @return The plan
+     * @throws IllegalStateException if the segment is not in the directory, or its slots are
+     *         not a set a split can halve
+     * @throws RoutingDirectoryFullException if the split needs a doubling past
+     *         {@code StorageEngine.maxRoutingWidth}
+     */
+    SplitPlan planSplit(Segment segment) {
+        SplitPlan plan = planSplitIfRouted(segment);
+        if (plan == null) {
+            throw new IllegalStateException(
+                "Segment is not in the routing directory, so it has no slots to split: "
+                    + segment.path());
+        }
+        return plan;
+    }
+
+    /**
+     * {@link #planSplit(Segment)}, answering null for a segment the directory no longer routes
+     * to - one a split or a compaction has already replaced. The caller holds
+     * {@code StorageEngine.segmentLock}.
+     *
+     * @param segment The segment to split
+     * @return The plan, or null when the segment owns no slot
+     * @throws IllegalStateException if its slots are not a set a split can halve
+     * @throws RoutingDirectoryFullException if the split needs a doubling past the limit
+     */
+    private SplitPlan planSplitIfRouted(Segment segment) {
+        // The published snapshot rather than the map: under the lock the two agree, and the
+        // array is a scan of references rather than of boxed keys.
+        RoutingSnapshot routing = engine.routing;
+        int width = routing.width();
+        Segment[] routed = routing.slots();
+        List<Long> slots = new ArrayList<>();
+        for (int slot = 0; slot < width; slot++) {
+            if (routed[slot] == segment) {
+                slots.add((long) slot);
+            }
+        }
+        if (slots.isEmpty()) {
+            return null;
+        }
+
+        long first = slots.get(0);
+        long varying = 0;
+        for (long slot : slots) {
+            varying |= slot ^ first;
+        }
+        if (slots.size() != 1L << Long.bitCount(varying)) {
+            throw new IllegalStateException(
+                "Segment " + segment.path() + " owns " + slots.size() + " routing slots that "
+                    + "are not every combination of the bits they differ in, so no single bit "
+                    + "halves them; the routing directory is inconsistent");
+        }
+
+        if (varying != 0) {
+            return new SplitPlan(Long.numberOfTrailingZeros(varying), List.copyOf(slots), false);
+        }
+        if ((long) width * 2 > engine.maxRoutingWidth) {
+            refuseDoubling(segment, width);
+        }
+        return new SplitPlan(Integer.numberOfTrailingZeros(width), List.copyOf(slots), true);
+    }
+
+    /**
+     * Returns the bit a split of this segment partitions on, deciding it under the lock.
+     *
+     * <p>The split worker's view of {@link #planSplit(Segment)}.</p>
+     *
+     * @param segment The segment to split
+     * @return The split bit
+     * @throws RoutingDirectoryFullException if the split needs a doubling past the limit
+     */
+    int splitBitFor(Segment segment) {
+        synchronized (engine.segmentLock) {
+            return planSplit(segment).splitBit();
+        }
+    }
+
+    /**
+     * Returns the bit a split of this segment partitions on, or -1 when the directory no longer
+     * routes to it.
+     *
+     * <p>The write path's view: a writer that found a segment full may find, by the time it
+     * asks, that another thread's split has already replaced it, and the answer to that is to
+     * route again rather than to fail.</p>
+     *
+     * @param segment The segment to split
+     * @return The split bit, or -1 when the segment has been replaced
+     * @throws RoutingDirectoryFullException if the split needs a doubling past the limit
+     */
+    int splitBitIfRouted(Segment segment) {
+        synchronized (engine.segmentLock) {
+            SplitPlan plan = planSplitIfRouted(segment);
+            return plan == null ? -1 : plan.splitBit();
+        }
+    }
+
+    /**
+     * Counts, reports and refuses a split that would double the directory past its limit.
+     *
+     * <p>Logged once per segment: the split worker offers a full segment again on every sweep
+     * and a writer on every write it routes there, and the thing worth knowing is that it
+     * happened and to which segment, not how often it was asked. Every refusal is counted.</p>
+     *
+     * @param segment The segment that cannot split
+     * @param width   The directory's width
+     * @throws RoutingDirectoryFullException always
+     */
+    private void refuseDoubling(Segment segment, int width) {
+        engine.statistics.incrementRefusedSplits();
+        String message = "Segment " + segment.path() + " is full and as deep as the routing "
+            + "directory, and splitting it would double the directory from " + width + " to "
+            + (width * 2L) + " slots, past its limit of " + engine.maxRoutingWidth + ". Its keys "
+            + "share their lowest " + Integer.numberOfTrailingZeros(width) + " hash bits, which "
+            + "for evenly hashed keys means a store of about " + (width / 2) + " segments or "
+            + "more; this one has " + engine.canonicalIndex.size() + ". The segment keeps what "
+            + "it holds and refuses further inserts.";
+        if (refusalsReported.add(segment)) {
+            StorageEngine.LOGGER.log(Level.WARNING, message);
+        }
+        throw new RoutingDirectoryFullException(message);
     }
 
     /**

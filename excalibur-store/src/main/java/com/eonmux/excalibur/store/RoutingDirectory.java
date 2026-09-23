@@ -18,22 +18,23 @@ import java.util.logging.Logger;
 /**
  * The slot-to-segment routing table, on disk.
  *
- * <p>Routing is {@code hash & (width - 1)}, and a split leaves several slots sharing one segment:
- * the left child keeps the parent's slots, the right child takes those slots offset by the old
- * width. Which slot belongs to which child is decided by the bit the split partitioned on, and
- * that bit is not recoverable from the segment file names afterwards.
+ * <p>Routing is {@code hash & (width - 1)}, and several slots may share one segment. A split
+ * hands the parent's slots to its two children by the bit it partitioned on - the lowest bit
+ * those slots differ in, or the bit a doubling of the directory exposes when the parent owned a
+ * single slot - and that bit is not recorded anywhere in the segment file names.
  *
  * <h2>Why guessing does not work</h2>
- * <p>The engine used to rebuild the directory by pointing each slot without a file of its own at
- * {@code slot - highestOneBit(slot)}. That is right while only one segment has ever split. After
- * two splits it is not: with segments 7 and then 3 split from a 64-wide directory, slot 195
- * belongs to the right child of 3 — file {@code segment_131.dat} — and the rule sends it to
- * {@code segment_3.dat} instead. The data in 131 is not deleted; it simply stops being
- * addressable, and the next write for those keys lands in 3 while the old values stay in 131.
+ * <p>Pointing each slot without a file of its own at whatever {@code slot - highestOneBit(slot)}
+ * points at reproduces a directory grown by this build's splits, because each of them hands the
+ * right child exactly the parent's slots that carry the new bit. It does not reproduce one grown
+ * by a build whose every split doubled the directory and partitioned on the newest bit. There,
+ * with segments 7 and then 3 split from a 64-wide directory, slot 195 belongs to the right child
+ * of 3 — file {@code segment_131.dat} — and the rule sends it to {@code segment_3.dat} instead.
+ * The data in 131 is not deleted; it simply stops being addressable, and the next write for those
+ * keys lands in 3 while the old values stay in 131.
  *
- * <p>No rule over file names can do better, because two segments that split from a common
- * ancestor are indistinguishable by name from two that did not. The directory is state, so it is
- * written down.
+ * <p>Both kinds of store leave the same file names behind, so no rule over file names can tell
+ * which one it is looking at. The directory is state, so it is written down.
  *
  * <h2>Format</h2>
  * <pre>

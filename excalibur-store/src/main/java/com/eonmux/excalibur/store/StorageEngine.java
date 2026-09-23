@@ -106,23 +106,28 @@ public class StorageEngine implements AutoCloseable {
     public static final int STATE_PURGED = 6;
 
     /**
-     * Minimum number of segments to pre-allocate for initial load.
+     * How many segments a new store starts with, and so the width of its first directory.
      *
-     * <p>This provides a reasonable default for most workloads while avoiding
-     * excessive fragmentation. Can be tuned based on expected dataset size.</p>
+     * <p>Fixed rather than configurable, because it is part of how a store is laid out on disk:
+     * a start that finds no routing directory rebuilds one on the assumption that every index
+     * below this has a segment file of its own and that the rest were split off them. A store
+     * created with a different base would be rebuilt wrongly by that rule, so letting each
+     * construction choose its own would make directory recovery depend on remembering what the
+     * store was created with. Growth beyond it is the splits' job, and a split costs the
+     * directory nothing until the segment splitting is as deep as the directory itself.</p>
      *
-     * <p><strong>Note:</strong> This value MUST be a power of 2 for correct
-     * hash-based routing using the bitwise AND mask.</p>
+     * <p>A power of two, as every directory width is: routing masks the hash with it.</p>
      */
     public static final int DEFAULT_INITIAL_SEGMENTS = 64;
 
     /**
-     * Target number of segments to pre-allocate based on estimated dataset size.
-     *
-     * <p>Formula: (estimated_entries / MAX_SEGMENT_CAPACITY) * BUFFER_FACTOR
-     * where BUFFER_FACTOR = 1.5 to account for growth during indexing</p>
+     * How many slots the routing directory may grow to unless {@link #withMaxRoutingWidth(int)}
+     * says otherwise: 2^20, about sixty megabytes of heap at the limit.
      */
-    public static final int SEGMENT_BUFFER_FACTOR = 15; // 1.5x buffer
+    public static final int DEFAULT_MAX_ROUTING_WIDTH = 1 << 20;
+
+    /** The widest limit {@link #withMaxRoutingWidth(int)} accepts: slot indices are ints. */
+    public static final int MAX_ROUTING_WIDTH_LIMIT = 1 << 30;
 
     // ==================== Instance Fields ====================
 
@@ -280,6 +285,12 @@ public class StorageEngine implements AutoCloseable {
     volatile VectorPrefilter vectorPrefilter;
 
     /**
+     * How many slots the routing directory may grow to; see {@link #withMaxRoutingWidth(int)}.
+     * Read by split planning under {@link #segmentLock}, written only before {@link #start()}.
+     */
+    volatile int maxRoutingWidth = DEFAULT_MAX_ROUTING_WIDTH;
+
+    /**
      * Threshold new segments are created with, from {@code excalibur.shard.segment-load-factor}.
      * Defaults to {@link Segment#LOAD_FACTOR_THRESHOLD}.
      */
@@ -421,10 +432,10 @@ public class StorageEngine implements AutoCloseable {
     /**
      * Creates the split worker for this engine.
      *
-     * <p>The worker is given the split bit explicitly rather than deriving one: the
-     * bit that a doubling of the routing table newly exposes is
-     * {@code Integer.numberOfTrailingZeros(routingSegmentCount)}, and partitioning on
-     * any other bit produces children the router cannot address.</p>
+     * <p>The worker is given the split bit by the directory rather than deriving one: it is the
+     * lowest bit in which the slots the segment owns differ, or the bit a doubling newly exposes
+     * when it owns a single slot, and partitioning on any other bit produces children the
+     * router cannot address. See {@link EngineRouting#planSplit(Segment)}.</p>
      *
      * @return A split worker wired to this engine's routing table
      */
@@ -432,21 +443,7 @@ public class StorageEngine implements AutoCloseable {
         return new SplitWorker(
             arena,
             splits::handleSplitComplete,
-            () -> Integer.numberOfTrailingZeros(routingSegmentCount));
-    }
-
-    /**
-     * Creates a new StorageEngine with custom initial segment count.
-     *
-     * @param dataDir Directory for storing segment files (must exist)
-     * @param arena Arena for memory allocation (must outlive this engine)
-     * @param initialSegments Number of segments to pre-allocate (should be power of 2)
-     * @throws IllegalArgumentException if dataDir is null or doesn't exist
-     */
-    public StorageEngine(Path dataDir, Arena arena, int initialSegments) {
-        this(dataDir, arena);
-        // Note: The HashMap is re-created here with the specified capacity
-        // but segments are still pre-allocated in start() using DEFAULT_INITIAL_SEGMENTS
+            routingTable::splitBitFor);
     }
 
     /**
@@ -477,6 +474,54 @@ public class StorageEngine implements AutoCloseable {
     /** The load-factor threshold new segments are created with. */
     public double loadFactorThreshold() {
         return loadFactorThreshold;
+    }
+
+    /**
+     * Sets how many slots the routing directory may grow to.
+     *
+     * <p>The directory is on the heap - a reference per slot in the routing snapshot and an
+     * entry per slot in the directory map, about sixty bytes a slot all told - while the data it
+     * routes to is in mapped files. It doubles only when a segment as deep as the directory
+     * splits, so for keys that hash evenly it stays within a small multiple of the segment count
+     * and never approaches {@value #DEFAULT_MAX_ROUTING_WIDTH}, which at the default segment
+     * size is some hundreds of gigabytes of data and some tens of megabytes of heap. What the
+     * limit bounds is the other case: keys whose hashes agree in many low bits, which a split
+     * cannot separate and each split would otherwise double the directory for. A split that
+     * would double past the limit is refused with {@link RoutingDirectoryFullException} and
+     * counted in {@link Statistics#getRefusedSplits()}.</p>
+     *
+     * <p>Must be called before {@link #start()}: a limit lowered under a directory already wider
+     * than it would describe a store the engine is already serving.</p>
+     *
+     * @param width The limit, a power of two no smaller than {@value #DEFAULT_INITIAL_SEGMENTS}
+     *              and no larger than 2^30
+     * @return This engine
+     * @throws IllegalArgumentException if the width is not such a power of two
+     * @throws IllegalStateException if the engine has started
+     */
+    public StorageEngine withMaxRoutingWidth(int width) {
+        if (width < DEFAULT_INITIAL_SEGMENTS || width > MAX_ROUTING_WIDTH_LIMIT
+                || Integer.bitCount(width) != 1) {
+            throw new IllegalArgumentException("the routing directory limit must be a power of "
+                + "two from " + DEFAULT_INITIAL_SEGMENTS + " to " + MAX_ROUTING_WIDTH_LIMIT
+                + ", got " + width);
+        }
+        if (started) {
+            throw new IllegalStateException(
+                "the routing directory limit must be set before start()");
+        }
+        this.maxRoutingWidth = width;
+        return this;
+    }
+
+    /**
+     * Returns how many slots the routing directory may grow to.
+     *
+     * @return The limit, {@value #DEFAULT_MAX_ROUTING_WIDTH} unless set
+     * @see #withMaxRoutingWidth(int)
+     */
+    public int maxRoutingWidth() {
+        return maxRoutingWidth;
     }
 
     // ==================== Public API - Keyspace Management ====================
@@ -520,8 +565,9 @@ public class StorageEngine implements AutoCloseable {
      * <p>After starting, the split worker monitors all registered segments.
      * When a segment's load factor reaches 0.7, it is automatically split
      * into two child segments using copy-on-write semantics. Reads continue
-     * to be served during splitting, while writes are briefly rejected until
-     * the split completes.</p>
+     * to be served during splitting, while writes and deletes that reach the
+     * segment wait for the split to publish and then route to the child that
+     * owns their key.</p>
      */
     public void start() {
         lifecycle.start();
@@ -546,11 +592,15 @@ public class StorageEngine implements AutoCloseable {
      * <ol>
      *   <li>Requests an immediate split for the full segment</li>
      *   <li>Waits briefly for the split to complete (up to 5 seconds)</li>
-     *   <li>Retries the insert into the appropriate child segment</li>
+     *   <li>Routes the insert again, to the child that now owns the key</li>
      * </ol>
      *
      * <p>If the split cannot complete in time, a {@link SegmentAtCapacityException}
-     * is thrown to allow the caller to implement retry logic.</p>
+     * is thrown to allow the caller to implement retry logic. A split that would widen the
+     * routing directory past {@link #maxRoutingWidth()} is not attempted, and the caller gets
+     * {@link RoutingDirectoryFullException}, a {@code SegmentAtCapacityException}, at once. An
+     * entry larger than an empty segment can hold is refused with
+     * {@link IllegalArgumentException}: no split makes room for it.</p>
      *
      * <p><strong>Lifecycle Note:</strong> Segments remain in INDEXING state during
      * writes. Lifecycle transitions (to WARMING, ACTIVE, etc.) are managed by the
@@ -559,6 +609,7 @@ public class StorageEngine implements AutoCloseable {
      * @param key The key (must not be null)
      * @param value The value (must not be null)
      * @throws NullPointerException if key or value is null
+     * @throws IllegalArgumentException if the entry is larger than an empty segment can hold
      * @throws IllegalStateException if engine is not started
      * @throws SegmentAtCapacityException if segment is at capacity and split cannot complete
      */
@@ -1041,9 +1092,13 @@ public class StorageEngine implements AutoCloseable {
     }
 
     /**
-     * Returns the number of segments in the engine.
+     * Returns the width of the routing directory: how many hash slots keys are routed over.
      *
-     * @return Segment count
+     * <p>Not the number of distinct segments, which is {@code getSegments().size()}: a segment
+     * shallower than the directory owns several slots. Slots {@code 0} to this minus one all
+     * resolve through {@link #getSegment(long)}.</p>
+     *
+     * @return The directory width, a power of two
      */
     public int getSegmentCount() {
         return routingSegmentCount;
@@ -1246,12 +1301,14 @@ public class StorageEngine implements AutoCloseable {
         private final AtomicLong readOperations = new AtomicLong(0);
         private final AtomicLong segmentOperations = new AtomicLong(0);
         private final AtomicLong startOperations = new AtomicLong(0);
+        private final AtomicLong refusedSplits = new AtomicLong(0);
 
         void incrementWriteOperations() { writeOperations.incrementAndGet(); }
         void incrementDeleteOperations() { deleteOperations.incrementAndGet(); }
         void incrementReadOperations() { readOperations.incrementAndGet(); }
         void incrementSegmentOperations() { segmentOperations.incrementAndGet(); }
         void incrementStartOperations() { startOperations.incrementAndGet(); }
+        void incrementRefusedSplits() { refusedSplits.incrementAndGet(); }
 
         public long getWriteOperations() { return writeOperations.get(); }
         public long getDeleteOperations() { return deleteOperations.get(); }
@@ -1259,12 +1316,26 @@ public class StorageEngine implements AutoCloseable {
         public long getSegmentOperations() { return segmentOperations.get(); }
         public long getStartOperations() { return startOperations.get(); }
 
+        /**
+         * Returns how many times a split was refused because it would have doubled the routing
+         * directory past {@link StorageEngine#maxRoutingWidth()}.
+         *
+         * <p>Counts attempts, not segments: a full segment that cannot split is offered again by
+         * every split sweep and every write routed to it. Zero for any store whose keys hash
+         * evenly; anything else names a lineage of segments whose keys a split cannot
+         * separate, and the log names the segment.</p>
+         *
+         * @return Refused split attempts since the engine was created
+         */
+        public long getRefusedSplits() { return refusedSplits.get(); }
+
         @Override
         public String toString() {
             return String.format(
-                "Statistics{writes=%d, deletes=%d, reads=%d, segments=%d, starts=%d}",
+                "Statistics{writes=%d, deletes=%d, reads=%d, segments=%d, starts=%d, "
+                    + "refusedSplits=%d}",
                 writeOperations.get(), deleteOperations.get(), readOperations.get(),
-                segmentOperations.get(), startOperations.get());
+                segmentOperations.get(), startOperations.get(), refusedSplits.get());
         }
     }
 

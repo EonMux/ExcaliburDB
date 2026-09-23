@@ -51,7 +51,7 @@ class ConfiguredLoadFactorInheritanceTest {
                 left.set(l);
                 right.set(r);
                 published.countDown();
-            }, () -> 0);
+            }, segment -> 0);
 
             worker.requestSplit(parent, 0);
             assertThat(published.await(30, TimeUnit.SECONDS))

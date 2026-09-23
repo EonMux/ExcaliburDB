@@ -46,7 +46,7 @@ final class DataDirectoryFixture {
     static void createStore(Path dataDir, int entries) throws IOException {
         Files.createDirectories(dataDir);
         try (Arena arena = Arena.ofShared();
-             StorageEngine engine = new StorageEngine(dataDir, arena, 2)) {
+             StorageEngine engine = new StorageEngine(dataDir, arena)) {
             engine.start();
             for (int i = 0; i < entries; i++) {
                 engine.put(key(i), value(i));

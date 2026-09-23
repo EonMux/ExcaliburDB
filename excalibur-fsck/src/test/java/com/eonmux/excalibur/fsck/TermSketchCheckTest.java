@@ -265,7 +265,7 @@ class TermSketchCheckTest {
         invoke(dataDir.toString(), "--repair", "--quarantine-dir=" + tempDir.resolve("q"));
 
         try (Arena arena = Arena.ofShared();
-             StorageEngine engine = new StorageEngine(dataDir, arena, 2)) {
+             StorageEngine engine = new StorageEngine(dataDir, arena)) {
             engine.start();
             for (int i = 0; i < 16; i++) {
                 assertThat(engine.get(DataDirectoryFixture.key(i))

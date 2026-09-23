@@ -80,25 +80,31 @@ final class SplitPublication {
      * <p>Called by the {@link SplitWorker} once both children are built. This method owns
      * everything the worker cannot do, because only the directory knows the children's
      * indices: moving each child from its temporary build name onto the canonical
-     * {@code segment_<index>.dat} name that {@link SegmentDiscovery} matches, doubling the
-     * directory with buddy pointers, installing the children and widening the mask.</p>
+     * {@code segment_<index>.dat} name that {@link SegmentDiscovery} matches, handing the
+     * parent's slots to the children, and doubling the directory when that takes a new
+     * slot.</p>
      *
-     * <h3>Extensible hashing</h3>
+     * <h3>Extendible hashing</h3>
      * <p>The parent may be reachable from several directory indices - it has a smaller local
-     * depth than the directory's global depth. Every one of those indices {@code j} must end
-     * up pointing at the left child and {@code j + oldCount} at the right child, because
-     * {@code j + oldCount} is exactly the index whose split bit is 1. Every other index
-     * {@code i} gets a buddy pointer at {@code i + oldCount} to the same segment, so its keys
-     * keep resolving once the mask widens.</p>
+     * depth than the directory's global depth. Then the split bit is the lowest bit those
+     * indices differ in: the ones with it clear go to the left child and the ones with it set to
+     * the right, and the directory keeps its width. Only a parent reachable from a single index
+     * {@code j} is as deep as the directory; then the directory doubles, the split bit is the one
+     * the doubling exposes, {@code j} goes to the left child and {@code j + oldCount} to the
+     * right, and every other index {@code i} gets a buddy pointer at {@code i + oldCount} to the
+     * segment it already had, so its keys keep resolving once the mask widens.
+     * {@link EngineRouting#planSplit(Segment)} decides which.</p>
      *
      * <h3>Publication order</h3>
-     * <p>The new upper half of the directory is filled first, then the mask is widened, and
-     * only then are the parent's own slots repointed at the left child. At every instant a
+     * <p>When the directory doubles, the new upper half is filled first, then the mask is
+     * widened, and only then are the parent's own slots repointed at the left child; when it
+     * does not, the right child's slots are repointed before the left child's. At every instant a
      * reader - using either the old mask or the new one - reaches a segment that holds its
-     * key. Both children's catalog rows are written before the upper half is filled, so a
-     * reader that reaches a child also finds its row. If publication fails the directory is
-     * left untouched and the exception propagates, which makes the worker discard the children
-     * and return the parent to service.</p>
+     * key, and the routing snapshot readers actually use is replaced only once, at the end. Both
+     * children's catalog rows are written before any slot points at them, so a reader that
+     * reaches a child also finds its row. If publication fails the directory is left untouched
+     * and the exception propagates, which makes the worker discard the children and return the
+     * parent to service.</p>
      *
      * <h3>Refused publication</h3>
      * <p>A child's index held in the catalog by a segment created for a source, rather than by
@@ -167,17 +173,12 @@ final class SplitPublication {
      * @throws AnnouncedPublicationFailure if it fails after they were
      */
     private long[] publishUnderLock(Segment parent, Segment leftChild, Segment rightChild) {
-        int oldRouting = engine.routingSegmentCount;
+        // The same plan the worker partitioned by: it depends only on the parent's own slots,
+        // and nothing but this publication re-points those.
+        EngineRouting.SplitPlan plan = engine.routingTable.planSplit(parent);
 
-        List<Long> parentSlots = engine.routingTable.directorySlotsOf(parent);
-        if (parentSlots.isEmpty()) {
-            throw new IllegalStateException(
-                "Parent segment not found in routing directory during split publication: "
-                + parent.path());
-        }
-
-        long leftIndex = parentSlots.get(0);
-        long rightIndex = leftIndex + oldRouting;
+        long leftIndex = plan.parentSlots().get(0);
+        long rightIndex = plan.rightIndex();
 
         // Before anything is moved: the catalog must be able to take both children at
         // their indices. The only thing that can stop it is a segment created for a source
@@ -225,23 +226,39 @@ final class SplitPublication {
             engine.catalog.registerFile(leftIndex, leftChild.path()).setEntryCount(leftChild.entryCount());
             engine.catalog.add(rightIndex, rightChild.path()).setEntryCount(rightChild.entryCount());
 
-            // Step 2: fill the new upper half. These indices are unreachable under the
-            // old mask, so this is invisible to concurrent readers.
-            for (int i = 0; i < oldRouting; i++) {
-                Segment current = engine.segments.get((long) i);
-                if (current == null) {
-                    continue;
+            if (plan.doubles()) {
+                // Step 2: fill the new upper half. These indices are unreachable under the
+                // old mask, so this is invisible to concurrent readers. The parent's buddy is
+                // the right child's slot, so it is given the right child directly.
+                int oldRouting = engine.routingSegmentCount;
+                for (int i = 0; i < oldRouting; i++) {
+                    Segment current = engine.segments.get((long) i);
+                    if (current == null) {
+                        continue;
+                    }
+                    engine.segments.put(i + (long) oldRouting,
+                        current == parent ? rightChild : current);
                 }
-                engine.segments.put(i + (long) oldRouting, current == parent ? rightChild : current);
+
+                // Step 3: widen the mask. The parent still serves its own slot and holds
+                // every key that maps to it, so this is safe to publish now.
+                engine.routingSegmentCount = oldRouting * 2;
+            } else {
+                // Step 2, without a doubling: the parent's slots with the split bit set go to
+                // the right child. The parent still holds every key both children were built
+                // from, so a reader that reaches either child or the parent finds its key.
+                for (long slot : plan.parentSlots()) {
+                    if (Segment.shouldGoToRightChild(slot, plan.splitBit())) {
+                        engine.segments.put(slot, rightChild);
+                    }
+                }
             }
 
-            // Step 3: widen the mask. The parent still serves its own slots and holds
-            // every key that maps to them, so this is safe to publish now.
-            engine.routingSegmentCount = oldRouting * 2;
-
-            // Step 4: retire the parent from the lower half.
-            for (long slot : parentSlots) {
-                engine.segments.put(slot, leftChild);
+            // Step 4: retire the parent from the slots the left child keeps.
+            for (long slot : plan.parentSlots()) {
+                if (!Segment.shouldGoToRightChild(slot, plan.splitBit())) {
+                    engine.segments.put(slot, leftChild);
+                }
             }
 
             engine.canonicalIndex.remove(parent);

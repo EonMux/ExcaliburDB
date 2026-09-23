@@ -1227,6 +1227,22 @@ public class Segment implements AutoCloseable {
     }
 
     /**
+     * Whether a segment of this geometry could hold this entry if it held nothing else.
+     *
+     * <p>Splitting is how a full segment makes room, and every segment a split produces has its
+     * parent's geometry. So an entry that fails this can never be stored by splitting, however
+     * many times the split is repeated - each repetition only deepens the routing directory.
+     * The write path asks this before it splits for a write.</p>
+     *
+     * @param key   The key
+     * @param value The value
+     * @return true if an empty segment of this geometry could take the entry
+     */
+    public boolean fitsWhenEmpty(byte[] key, byte[] value) {
+        return records.fitsEmptySegment(key.length, value.length);
+    }
+
+    /**
      * Returns the fraction of slots this segment may occupy before it counts as full.
      *
      * <p>Fixed for the life of a segment. A segment created to succeed this one - a split
@@ -1276,9 +1292,9 @@ public class Segment implements AutoCloseable {
      *
      * @param leftChild  The left child segment (keys whose {@code splitBit} is 0)
      * @param rightChild The right child segment (keys whose {@code splitBit} is 1)
-     * @param splitBit   The hash bit the entries were partitioned on. This is the bit
-     *                   the router will newly consult after the routing table doubles,
-     *                   i.e. {@code Integer.numberOfTrailingZeros(routingSegmentCount)}.
+     * @param splitBit   The hash bit the entries were partitioned on: the lowest bit in which
+     *                   the directory slots this segment owned differ, or the bit a doubling
+     *                   of the directory newly exposes when it owned a single slot
      * @throws IllegalStateException if segment is not in SPLITTING state
      * @throws IllegalArgumentException if splitBit is not in [0, 63]
      * @throws NullPointerException if any child is null

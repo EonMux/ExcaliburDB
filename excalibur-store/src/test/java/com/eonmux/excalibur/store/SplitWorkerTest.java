@@ -115,7 +115,7 @@ class SplitWorkerTest {
             AtomicBoolean listenerCalled = new AtomicBoolean(false);
             splitWorker = new SplitWorker(arena, (parent, left, right) -> {
                 listenerCalled.set(true);
-            }, () -> 0);
+            }, segment -> 0);
 
             assertFalse(splitWorker.isRunning(), "Worker should not be running initially");
 
@@ -133,7 +133,7 @@ class SplitWorkerTest {
         @DisplayName("SplitWorker rejects null arena")
         void testNullArena() {
             assertThrows(NullPointerException.class, () -> {
-                new SplitWorker(null, (parent, left, right) -> {}, () -> 0);
+                new SplitWorker(null, (parent, left, right) -> {}, segment -> 0);
             }, "Constructor should reject null arena");
         }
 
@@ -141,7 +141,7 @@ class SplitWorkerTest {
         @DisplayName("SplitWorker rejects null listener")
         void testNullListener() {
             assertThrows(NullPointerException.class, () -> {
-                new SplitWorker(arena, null, () -> 0);
+                new SplitWorker(arena, null, segment -> 0);
             }, "Constructor should reject null listener");
         }
 
@@ -149,7 +149,7 @@ class SplitWorkerTest {
         @DisplayName("SplitWorker validates split interval")
         void testInvalidSplitInterval() {
             assertThrows(IllegalArgumentException.class, () -> {
-                new SplitWorker(arena, (parent, left, right) -> {}, () -> 0, 50, 1);
+                new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0, 50, 1);
             }, "Should reject split interval below minimum");
         }
 
@@ -157,11 +157,11 @@ class SplitWorkerTest {
         @DisplayName("SplitWorker validates max concurrent splits")
         void testInvalidMaxConcurrent() {
             assertThrows(IllegalArgumentException.class, () -> {
-                new SplitWorker(arena, (parent, left, right) -> {}, () -> 0, 1000, 0);
+                new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0, 1000, 0);
             }, "Should reject max concurrent below 1");
 
             assertThrows(IllegalArgumentException.class, () -> {
-                new SplitWorker(arena, (parent, left, right) -> {}, () -> 0, 1000, 20);
+                new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0, 1000, 20);
             }, "Should reject max concurrent above limit");
         }
     }
@@ -175,7 +175,7 @@ class SplitWorkerTest {
         @Test
         @DisplayName("Can register and unregister segments")
         void testRegistration() {
-            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0);
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0);
 
             assertEquals(0, splitWorker.getRegisteredSegmentCount());
 
@@ -193,7 +193,7 @@ class SplitWorkerTest {
         @Test
         @DisplayName("Registering null segment throws exception")
         void testNullRegistration() {
-            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0);
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0);
 
             assertThrows(NullPointerException.class, () -> {
                 splitWorker.registerSegment(null);
@@ -218,7 +218,7 @@ class SplitWorkerTest {
                 leftChildRef.set(left);
                 rightChildRef.set(right);
                 splitLatch.countDown();
-            }, () -> 0);
+            }, segment -> 0);
 
             // Fill segment to have entries to split
             for (int i = 0; i < 100; i++) {
@@ -246,7 +246,7 @@ class SplitWorkerTest {
         @Test
         @DisplayName("Manual split of null segment throws exception")
         void testManualSplitNull() {
-            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0);
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0);
 
             assertThrows(NullPointerException.class, () -> {
                 splitWorker.requestSplit(null);
@@ -290,7 +290,7 @@ class SplitWorkerTest {
                     insideSecondSplit.countDown();
                     awaitRelease(releaseSecondSplit);
                 }
-            }, () -> 0);
+            }, segment -> 0);
 
             fill(segment, "first-key-");
             fill(second, "second-key-");
@@ -355,7 +355,7 @@ class SplitWorkerTest {
                 rightChildRef.set(right);
                 insideTheSplit.countDown();
                 awaitRelease(releaseTheSplit);
-            }, () -> 0);
+            }, segment -> 0);
             Duration wait = Duration.ofMillis(200);
 
             fill(segment, "held-key-");
@@ -414,7 +414,7 @@ class SplitWorkerTest {
                 insideTheSplit.countDown();
                 awaitRelease(releaseTheSplit);
                 interruptedInside.set(Thread.currentThread().isInterrupted());
-            }, () -> 0);
+            }, segment -> 0);
             fillToThreshold(segment);
             assertTrue(segment.shouldSplit(), "the loop needs a segment over its threshold");
             splitWorker.registerSegment(segment);
@@ -441,7 +441,7 @@ class SplitWorkerTest {
         @Test
         @DisplayName("stop() wakes the loop from its pause without waiting out the interval")
         void stopWakesThePausingLoop() {
-            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0,
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0,
                 TimeUnit.HOURS.toMillis(1), 1);
             splitWorker.start();
 
@@ -478,7 +478,7 @@ class SplitWorkerTest {
                     insideFirstSplit.countDown();
                     awaitRelease(releaseFirstSplit);
                 }
-            }, () -> 0);
+            }, segment -> 0);
 
             fill(segment, "shared-key-");
             fill(queuedA, "queued-a-key-");
@@ -537,7 +537,7 @@ class SplitWorkerTest {
                 leftChildRef.set(left);
                 rightChildRef.set(right);
                 splitLatch.countDown();
-            }, () -> 0);
+            }, segment -> 0);
             splitWorker.setSplitIntervalMs(100); // Check frequently
 
             // Register segment
@@ -684,7 +684,7 @@ class SplitWorkerTest {
 
             splitWorker = new SplitWorker(arena, (parent, left, right) -> {
                 splitLatch.countDown();
-            }, () -> 0);
+            }, segment -> 0);
 
             assertEquals(0, splitWorker.getSplitCount());
             assertEquals(0, splitWorker.getEntriesSplit());
@@ -719,7 +719,7 @@ class SplitWorkerTest {
         @Test
         @DisplayName("Can get and set split interval")
         void testSplitInterval() {
-            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0);
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0);
 
             assertEquals(SplitWorker.DEFAULT_SPLIT_INTERVAL_MS, splitWorker.getSplitIntervalMs());
 
@@ -735,7 +735,7 @@ class SplitWorkerTest {
         @Test
         @DisplayName("Can get and set max concurrent splits")
         void testMaxConcurrentSplits() {
-            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0);
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0);
 
             assertEquals(SplitWorker.DEFAULT_MAX_CONCURRENT_SPLITS, splitWorker.getMaxConcurrentSplits());
 
@@ -766,7 +766,7 @@ class SplitWorkerTest {
                 leftChildRef.set(left);
                 rightChildRef.set(right);
                 splitLatch.countDown();
-            }, () -> 0);
+            }, segment -> 0);
 
             // Insert entries with known distribution
             int entryCount = 200;
@@ -847,7 +847,7 @@ class SplitWorkerTest {
         @Test
         @DisplayName("toString provides useful debug info")
         void testToString() {
-            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, () -> 0);
+            splitWorker = new SplitWorker(arena, (parent, left, right) -> {}, segment -> 0);
             String str = splitWorker.toString();
 
             assertTrue(str.contains("SplitWorker"), "toString should contain class name");

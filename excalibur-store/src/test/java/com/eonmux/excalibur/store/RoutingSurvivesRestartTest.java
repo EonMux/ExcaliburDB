@@ -39,16 +39,15 @@ class RoutingSurvivesRestartTest {
         Segment target = engine.getSegment(slot);
         assertThat(target).as("segment at slot %s", slot).isNotNull();
 
-        int widthBefore = engine.getSegmentCount();
         engine.getSplitWorker().requestSplit(target);
 
         long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
-        while (engine.getSegmentCount() == widthBefore && System.nanoTime() < deadline) {
+        while (!target.isSplitComplete() && System.nanoTime() < deadline) {
             Thread.sleep(10);
         }
-        assertThat(engine.getSegmentCount())
-            .as("the split of slot %s must widen the routing table", slot)
-            .isEqualTo(widthBefore * 2);
+        assertThat(target.isSplitComplete())
+            .as("the split of slot %s must publish", slot)
+            .isTrue();
     }
 
     @Test
@@ -65,10 +64,12 @@ class RoutingSurvivesRestartTest {
                     ("routing-value-" + i).getBytes(StandardCharsets.UTF_8));
             }
 
-            // Two splits, the second on a segment the first has already given a second slot to.
-            // One split alone is reproducible from file names; two are not.
+            // Two splits, the second on a segment the first has already given a second slot to,
+            // so it re-points one of them instead of widening the directory again. Then the one
+            // deep segment the first split left behind splits, and the directory doubles.
             splitAndAwait(engine, 7);
             splitAndAwait(engine, 3);
+            splitAndAwait(engine, 71);
 
             before = routingMap(engine);
             assertThat(engine.getSegmentCount())
