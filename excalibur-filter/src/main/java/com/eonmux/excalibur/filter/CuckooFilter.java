@@ -155,10 +155,7 @@ public class CuckooFilter {
     private static final int FINGERPRINTS_PER_BUCKET = 4;
     private static final int DEFAULT_MAX_DISPLACEMENTS = 500;
 
-    // Cache-line alignment: x86/x64 cache line is 64 bytes
-    // Using 8-byte aligned buckets ensures no bucket crosses a cache line boundary
-    // 8 buckets fit per cache line (64 / 8 = 8)
-    private static final int CACHE_LINE_SIZE = 64;
+    // 8-byte buckets: eight fill a 64-byte cache line and none crosses one
     private static final int ALIGNED_BYTES_PER_BUCKET = 8;
 
     // A bucket read as one word. Unaligned because the segment's base address is whatever the
@@ -658,47 +655,6 @@ public class CuckooFilter {
      */
     public double loadFactor() {
         return (double) count.get() / capacity();
-    }
-
-    /**
-     * Estimates the current false positive rate based on load factor and fingerprint bits.
-     *
-     * <h3>Formula</h3>
-     * <pre>
-     * FP_rate ≈ 1 - (1 - 2^-f)^(2 * b * load_factor)
-     * </pre>
-     * <p>where:</p>
-     * <ul>
-     *   <li>f = fingerprintBits (number of bits per fingerprint)</li>
-     *   <li>b = FINGERPRINTS_PER_BUCKET (4 fingerprints per bucket)</li>
-     *   <li>load_factor = count / capacity</li>
-     * </ul>
-     *
-     * <h3>Domain Constraints</h3>
-     * <ul>
-     *   <li>With 13-bit fingerprints at 95% load: FP ≈ 0.093% (meets ≤0.1% target)</li>
-     *   <li>With 12-bit fingerprints at 95% load: FP ≈ 0.185% (exceeds target)</li>
-     *   <li>Returns 0.0 when filter is empty</li>
-     * </ul>
-     *
-     * @return Estimated false positive rate (0.0 to 1.0)
-     */
-    public double estimateFpRate() {
-        double loadFactor = loadFactor();
-        if (loadFactor == 0.0) {
-            return 0.0;
-        }
-
-        // Per-fingerprint collision probability: 2^-f
-        double perFpProb = 1.0 / (1L << fingerprintBits);
-
-        // Number of potential fingerprint checks: 2 * b * load_factor
-        // (2 buckets, b fingerprints per bucket, scaled by load)
-        double checks = 2.0 * FINGERPRINTS_PER_BUCKET * loadFactor;
-
-        // Probability of at least one match (FP rate)
-        // P(at least one) = 1 - P(none) = 1 - (1 - p)^n
-        return 1.0 - Math.pow(1.0 - perFpProb, checks);
     }
 
     /**
