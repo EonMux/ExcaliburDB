@@ -135,6 +135,27 @@ class ReindexIntegrationTest {
         }
 
         @Test
+        @DisplayName("an unknown source is told what can be reindexed and what to do instead")
+        void unknownSourceNamesTheAlternative() throws Exception {
+            // A source_id used with POST /v1/documents is recorded for erasure, but there is no
+            // target behind it to re-read. A bare "not found" for an id the caller has just
+            // posted documents under reads as a fault rather than as the contract.
+            HttpURLConnection conn = connect("POST", "/v1/reindex",
+                "{\"source_id\": \"supplied-notes\"}");
+            assertThat(conn.getResponseCode()).isEqualTo(404);
+            String body;
+            try (var error = conn.getErrorStream()) {
+                body = new String(error.readAllBytes(), StandardCharsets.UTF_8);
+            }
+            conn.disconnect();
+
+            assertThat(body)
+                .contains("Source not found: supplied-notes")
+                .contains("POST /v1/ingest")
+                .contains("POST /v1/documents");
+        }
+
+        @Test
         @DisplayName("reindex without a configured reindexer is refused, not silently accepted")
         void reindexWithoutReindexerIsRefused() throws Exception {
             // Register a source

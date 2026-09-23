@@ -290,9 +290,14 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
 
                 LOGGER.info("Reindex requested for source");
 
-                // Validate source exists
+                // Only a registered crawl has a target to re-read. Documents supplied through
+                // POST /v1/documents are recorded under their source id too, but nothing stands
+                // behind it to crawl, so the answer says what replaces a reindex for those.
                 if (!sourceRegistry.isRegistered(request.sourceId)) {
-                    sendError(exchange, 404, "Source not found: " + request.sourceId);
+                    sendError(exchange, 404, "Source not found: " + request.sourceId
+                        + ". Only a source registered with POST /v1/ingest can be reindexed; "
+                        + "documents supplied with POST /v1/documents are replaced by posting "
+                        + "them again");
                     return;
                 }
 
