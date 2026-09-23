@@ -106,23 +106,18 @@ public class StorageEngine implements AutoCloseable {
     public static final int STATE_PURGED = 6;
 
     /**
-     * Minimum number of segments to pre-allocate for initial load.
+     * How many segments a new store starts with, and so the width of its first directory.
      *
-     * <p>This provides a reasonable default for most workloads while avoiding
-     * excessive fragmentation. Can be tuned based on expected dataset size.</p>
+     * <p>Fixed rather than configurable, because it is part of how a store is laid out on disk:
+     * a start that finds no routing directory rebuilds one on the assumption that every index
+     * below this has a segment file of its own and that the rest were split off them. A store
+     * created with a different base would be rebuilt wrongly by that rule, so letting each
+     * construction choose its own would make directory recovery depend on remembering what the
+     * store was created with. Growth beyond it is the splits' job.</p>
      *
-     * <p><strong>Note:</strong> This value MUST be a power of 2 for correct
-     * hash-based routing using the bitwise AND mask.</p>
+     * <p>A power of two, as every directory width is: routing masks the hash with it.</p>
      */
     public static final int DEFAULT_INITIAL_SEGMENTS = 64;
-
-    /**
-     * Target number of segments to pre-allocate based on estimated dataset size.
-     *
-     * <p>Formula: (estimated_entries / MAX_SEGMENT_CAPACITY) * BUFFER_FACTOR
-     * where BUFFER_FACTOR = 1.5 to account for growth during indexing</p>
-     */
-    public static final int SEGMENT_BUFFER_FACTOR = 15; // 1.5x buffer
 
     // ==================== Instance Fields ====================
 
@@ -433,20 +428,6 @@ public class StorageEngine implements AutoCloseable {
             arena,
             splits::handleSplitComplete,
             () -> Integer.numberOfTrailingZeros(routingSegmentCount));
-    }
-
-    /**
-     * Creates a new StorageEngine with custom initial segment count.
-     *
-     * @param dataDir Directory for storing segment files (must exist)
-     * @param arena Arena for memory allocation (must outlive this engine)
-     * @param initialSegments Number of segments to pre-allocate (should be power of 2)
-     * @throws IllegalArgumentException if dataDir is null or doesn't exist
-     */
-    public StorageEngine(Path dataDir, Arena arena, int initialSegments) {
-        this(dataDir, arena);
-        // Note: The HashMap is re-created here with the specified capacity
-        // but segments are still pre-allocated in start() using DEFAULT_INITIAL_SEGMENTS
     }
 
     /**
