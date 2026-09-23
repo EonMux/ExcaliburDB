@@ -3009,7 +3009,11 @@ opens and builds from it with, so the verdict is the node's:
   staged facts, the entity text, the graph published beside the staging directory, nor an
   outstanding erasure or withdrawal — and the report says how many intact labels the node cuts off
   with it. When something does name such an id, a label was lost after it was written, the node
-  will not give those ids to new labels, and the interner is `CORRUPT`.
+  will not give those ids to new labels, and the interner is `CORRUPT`. So it is when the graph
+  published beside it has a damaged or missing dictionary of the same kind: the node verifies that
+  dictionary against its checksum before trusting the highest id in it, cannot tell which ids a
+  damaged one names, and refuses the cut rather than guess. Damage in the other kind's dictionary
+  does not change the verdict.
 - Other damage the node refuses — a record that fails its checksum with an intact record after
   it, or a file shorter than its header whose bytes are not the start of it: `CORRUPT`, and left
   for an operator (below). The node refuses the label interners and the entity text log when it
@@ -3043,8 +3047,10 @@ node runs before it serves one:
   since the node restores it on open. Beside a served graph, it is a copy the node deletes on open,
   and is reported `UNCHECKED` — it may hold facts an erasure removed, so it is left for the node to
   delete. The scratch in `graph.building` and `graph.compacting` is `UNCHECKED` too: nothing reads
-  it, and a `graph.compacting` directory tells the node an erasure may have been interrupted, so it
-  must not be moved.
+  it, and the node deletes it when the namespace next opens and again before it discharges an
+  erasure. While an erasure is owed against the graph, a `graph.compacting` directory is the sign
+  the node reads that one was interrupted, and it stays until what is owed has been applied. Either
+  may hold what an erasure removed, so neither is moved.
 - Any other file in a graph directory is `UNCHECKED`; the next build replaces the directory whole.
 
 Four files are judged by what the node does with them rather than by name alone:
@@ -3088,7 +3094,11 @@ Repair is off by default — without `--repair` the plan is printed and nothing 
 the tool writes, stating each write before it makes it, and **no repair ever deletes anything**:
 
 - A damaged file, an index whose segment is gone, or a staged file a rename never published is
-  moved into a quarantine directory byte for byte, so the action is reversible by hand.
+  moved into a quarantine directory byte for byte, so the action is reversible by hand. A graph
+  staging log's unfinished rewrite (`triples.log.erasing`, or a `.rewriting` beside
+  `triples.log`, `entity_text.log` or either label interner) is the exception: it may hold what an
+  erasure removed, the node deletes it when it opens the namespace, and a quarantine would keep it,
+  so it is reported and left for the node.
 - A damaged built graph is moved into the quarantine as one directory, once however many of its
   files failed. The node serves nothing from it either way, and `POST /v1/graph/build` publishes a
   new one from the namespace's staging logs, which hold everything it was built from. Erasures
@@ -3122,6 +3132,7 @@ quarantine and the original directory removed. What it refuses to attempt matter
 | A damaged `segment_<N>.hnsw.compact.docmap` with no `.hnsw.compact` beside it | The graph already holds the compacted numbering, and without this mapping it would be served through the pre-compaction one — wrong documents rather than an error. Restore the graph and both mappings together, or reindex the segment |
 | A damaged lexical store `manifest` | A store without its manifest opens as a new, empty index and deletes every segment the empty manifest does not name. Restore the manifest from a backup, or remove the whole `chunk-index` directory and reindex |
 | A damaged built graph with a `graph.previous` or `graph.retired` beside it | With the graph moved away the node would restore that copy and serve it, and a copy an erasure compaction replaced still holds what the erasure removed. Start the node once, which deletes the copy beside a served graph, or delete the copy, then repair again — or `POST /v1/graph/build`, which replaces the damaged graph without either. The move is checked again as it is made |
+| A damaged built graph beside a damaged label interner | The graph's dictionary may be all that still names the ids past the interner's damage. Moved away, the node would cut those ids off and hand them to new labels, serving one entity under another's name. Restore the namespace's `graph-staging` directory and graph from a backup. The move is checked again as it is made |
 | A damaged graph staging log | Nothing rebuilds one, and the node opens a missing one as empty. Moved aside, a label interner hands its ids out again under the published graph, so entities are served under other entities' names; `triples.log` empties the next graph build; `entity_text.log` leaves entities nothing to be ranked or embedded by; `erasure.log` and `withdrawals.log` forget what is still owed. Restore the namespace's `graph-staging` directory from a backup, all its logs together, since they refer to one another by id |
 | Anything `UNREADABLE` | A device or permission problem, or a header naming a format version a newer build wrote. Either way nothing is known about the contents, and a newer build's file is not damaged |
 

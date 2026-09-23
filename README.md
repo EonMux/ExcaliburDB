@@ -19,7 +19,7 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 - **Provenance per edge** - source, confidence and extractor version, stored columnar and serialised into the model's context so a curated claim can be told from a guess
 - **Staged reranking on the graph route** - BM25 over an embedded Lucene index, then reranked against the entities' uncompressed vectors, then reranked again in one batched call to the chat model; each stage falls back to the ordering beneath it when its endpoint is unavailable. The route has one signal, so its scores are handed through rather than fused - reciprocal-rank fusion over a single list would score every top result alike and leave the abstention thresholds nothing to read. Every stage reports on one unit relevance scale: BM25 as a share of what the question's words could score in this graph, the vector rerank as a similarity (an entity with no vector ranks beneath every one with), and the model as the relevance it judged. It is `/v1/query` that actually fuses two signals
 - **Abstention rather than a weak answer** - a sealed result type that can answer, decline, or hand back an ambiguity, rather than returning a weak answer as though it were a strong one. The thresholds a running node applies are configuration (`excalibur.graph.min-*`). `AbstentionCalibrator.calibrate` fits all three together instead, from labelled outcomes you supply - together rather than one at a time, because the gates overlap and combining three separate fits gives a node stricter than any of them measured. It is a library API rather than a server route, because the labels have to come from a query set whose answers are known, and a node cannot manufacture one for itself. The fit also reports where the coverage it gave up went, split between queries handed back as ambiguous and queries refused outright, and prefers the former where the two buy the same precision. The confidence attached to an answer is fitted separately and by a different method: `AbstentionCalibrator.fitTemperature` scales the reported confidence so it can be read as a probability, and `expectedCalibrationError` and `reliability` say how far off it was before and after. A fitted temperature goes into `excalibur.graph.confidence-temperature`, which is the whole of what a node needs to apply it; scaling is monotone and fixes the midpoint, so it changes how strongly an answer is claimed and never which answer is given. Which queries to answer and how strongly to claim them fail independently, so neither fit stands in for the other
-- **Erasure that removes data** - `POST /v1/graph/erasure` records an obligation durably, and a compaction rewrites the tombstoned edges out of the store and out of the staged facts it was built from, driven by the oldest outstanding request and not only by how much has accumulated. Erasing only the store would leave the next `POST /v1/graph/build` free to replay the staging log and restore exactly what was erased
+- **Erasure that removes data** - `POST /v1/graph/erasure` records an obligation durably, and a compaction rewrites the tombstoned edges out of the store and out of the staged facts it was built from, driven by the oldest outstanding request and not only by how much has accumulated. Erasing only the store would leave the next `POST /v1/graph/build` free to replay the staging log and restore exactly what was erased. Nor is a request discharged while a copy a crash left beside the graph could still hold what it covers: a build's or a compaction's scratch, a graph a publish set aside, a staging rewrite that never finished
 - **Per-namespace isolation** - one graph directory per tenant, selected by a request header, with mapping-count and descriptor budgets - `vm.max_map_count` and `RLIMIT_NOFILE`, read from the running process - counted against the whole process rather than the graphs alone — segments, vector indexes and the JVM share the same limits — that evict the least recently used graph before either limit is reached; a request holds a lease, so eviction never unmaps a graph out from under a reader. Ingestion routes by the same header: a source registered with it stages its facts into that tenant, one registered without it into `shared`, and the binding is written into the source catalog so a re-crawl after a restart stages where it did before
 - **A graph the node builds** - with `excalibur.graph.extraction-enabled=true` and a chat model, ingestion extracts facts from the documents it publishes and stages them; `POST /v1/graph/build` turns everything staged into the edge store, the dictionaries and the two Lucene indexes, and serves the result without a restart. Extraction is off by default because it is one chat-model call per document, the most expensive thing ingestion can do, and it has to be on *before* the documents are ingested - a build after the fact finds nothing staged
 - **An MCP server** - the ingest, search, build and graph-query calls exposed as tools, so a model can be pointed at a directory and then question what was built from it without any adapter code
@@ -459,7 +459,9 @@ ids was handed out — the report says how many intact labels the node cuts off 
 Damage the node refuses — a record failing its checksum with an intact one after it, in any log
 but a label interner, a label interner's damage when the staged facts, the entity text, the graph
 published beside the staging directory or an outstanding erasure or withdrawal names an id at or
-past it, or a file shorter than its header that does not begin it — is `CORRUPT`. The verdict on
+past it, a label interner's damage when that graph's dictionary of the same kind is damaged or
+missing, so that what it names cannot be read, or a file shorter than its header that does not
+begin it — is `CORRUPT`. The verdict on
 `erasure.log` also counts the outstanding entity erasures that name an id nothing in the namespace
 holds, which the node discharges when it next opens the namespace. The `erasure.interrupted`
 marker beside them is recognised as well; the node writes it empty and reads only whether it is
@@ -473,8 +475,14 @@ each Lucene index against the footer of every file in it — one verdict per ind
 is `LEGACY_UNPROTECTED`, and the next build replaces it; a newer build's is `UNREADABLE`. A
 `graph.previous` or `graph.retired` with nothing served in its place is checked the same way, since
 the node restores it. One beside a served graph, and the scratch in `graph.building` and
-`graph.compacting`, are reported `UNCHECKED` and left alone: the node deletes the first on open and
-never reads the others, and a copy an erasure compaction replaced may hold what the erasure removed.
+`graph.compacting`, are reported `UNCHECKED` and left alone for the node to delete: it deletes the
+copy and the build's scratch on open, and the compaction's scratch too unless an erasure is still
+owed against the graph, when it is the sign the node reads that one was interrupted and is deleted
+once what is owed has been applied. A copy an erasure compaction replaced, or scratch assembled
+before an erasure, may hold what the erasure removed, and a quarantine would keep it. So would a
+graph staging log's unfinished rewrite (`triples.log.erasing`, `triples.log.rewriting`,
+`entity_text.log.rewriting`, `entities.labels.rewriting`, `relations.labels.rewriting`), which the
+node deletes when it opens the namespace; it is reported as a staging leftover and left alone.
 
 Repair is off by default: without `--repair` the plan is printed and nothing is touched. With it,
 the tool writes, and each write is stated before it is made. **No repair ever deletes anything.**
@@ -506,7 +514,9 @@ publishes a new one from staging. Erasures accepted afterwards never reach the q
 delete it once the rebuilt graph serves and never move it back. The move is refused, and put to an
 operator, while a `graph.previous` or `graph.retired` sits beside the damaged graph: with nothing
 left in its place the node would restore that copy, and one an erasure compaction replaced still
-holds what the erasure removed.
+holds what the erasure removed. It is refused too while a label interner beside it is damaged: the
+graph's dictionaries may be all that still names the ids past the damage, and with them gone the
+node would cut those ids off and hand them to new labels.
 
 Damaged files are moved into a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another. It takes the `--flag=value` form only. The default needs
@@ -1300,10 +1310,15 @@ fails the start rather than serving a pipeline that silently resolves nothing, w
 vectors are a configuration rather than a fault - a graph built without an embedder has none, and
 the rerank stage that reads them is skipped. The whole directory is assembled beside the live
 one and renamed into place, so a reader sees the previous graph or the new one and never a mixture.
-While that happens the namespace's directory can also hold `graph.building` (a build's scratch, which
-the next build deletes), `graph.compacting` (an erasure compaction's scratch), and `graph.previous`
-or `graph.retired` (the graph a publish set aside, which the node deletes beside a served graph and
-restores when nothing is served in its place).
+While that happens the namespace's directory can also hold `graph.building` (a build's scratch),
+`graph.compacting` (an erasure compaction's scratch), and `graph.previous` or `graph.retired` (the
+graph a publish set aside, which the node restores when nothing is served in its place). None of
+them is ever served, and a crash can leave any of them behind. When the namespace next opens, the
+node deletes a set-aside copy beside a served graph and the build's scratch, and the compaction's
+scratch unless an erasure is still owed against the graph — then it is the sign of an interrupted
+erasure, and goes once what is owed has been applied. Each is a whole graph assembled at some
+earlier moment, so an erasure deletes all four, and any staging log's unfinished rewrite, before
+it marks anything discharged.
 
 Every file of the store is checked against its checksum each time the namespace opens, before
 anything is mapped — one sequential read of the graph, the policy the lexical segments and the HNSW
@@ -1343,6 +1358,13 @@ anybody has. A damaged label is therefore cut off, with every label after it, on
 staged facts, entity text, the published graph, an outstanding erasure or withdrawal - refers to
 an id at or past it; when something does, a label was lost after it was written, and the namespace
 refuses to open rather than hand those ids to new labels and serve one entity under another's name.
+The published graph is read for that only through its dictionary of the same kind, verified against
+its checksum first: it names every label interned when the graph was built, whether or not a fact
+used it, and its ids are the ones queries have already answered with. A dictionary that is damaged
+or missing cannot say which ids it names, so a cut that needs its answer is refused as well, with
+the damage named; a damaged label interner of the other kind, or one with no damage to cut, opens as
+before. Deleting the damaged graph does not make the cut safe — its ids were handed out all the
+same — so restore staging and the graph from a backup, or rebuild from the documents.
 A staging log shorter than its 16-byte header is started afresh when its bytes are the start of
 that header - its creation cut short - and refused, untouched, when they are anything else.
 
@@ -1424,6 +1446,19 @@ that on open (a restored graph, a compaction's leftover scratch directory, or th
 its graph until the outstanding obligations have been applied to it. That happens as the namespace
 opens; if it fails there, the graph stays unserved and the erasure sweep retries it, whatever the
 latency policy says, and serves the graph once it gets through.
+
+An obligation is discharged only once no copy of what it covers is left in the namespace. Between
+applying the requests and recording them discharged, under the lock builds and compactions share,
+a compaction deletes `graph.building`, `graph.compacting`, and — beside a served graph —
+`graph.previous` and `graph.retired`, and forces the deletions to the device; it does so whether or
+not the served graph needed rewriting, since the leftovers may hold what staging no longer does.
+A namespace with no graph deletes a build's scratch the same way before it discharges what staging
+alone answered. A graph set aside with nothing served in its place is not deleted but refused: it is
+the graph, which recovery restores, and the obligations wait until they have been applied to it.
+Staging is rewritten into a temporary file renamed over the log, so a crash leaves the log intact
+and the temporary file, a copy of it, beside it; the staging store deletes those when it opens. What
+this cannot reach is the device itself: a deleted file's blocks keep their bytes until the
+filesystem reuses them, which only encryption at rest or a device erase addresses.
 
 Recency alone is the wrong rule when namespaces are not interchangeable: the shared index is read by
 nearly every query and costs seconds to reopen, so it is pinned. Two keys extend that judgement to
