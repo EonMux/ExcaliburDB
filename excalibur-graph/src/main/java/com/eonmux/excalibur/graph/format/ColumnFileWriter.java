@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.zip.CRC32C;
 
 /**
  * Streaming writer for one column file.
@@ -17,6 +18,12 @@ import java.nio.file.StandardOpenOption;
  *
  * <p>Writes in {@link EdgeStoreDescriptor#COLUMN_BYTE_ORDER}, the one place the format's byte order
  * is applied on the write side.
+ *
+ * <p>Digests what it writes as it writes it. Every byte of the column passes through the one
+ * buffer on its way to the channel, so the CRC32C the descriptor records costs no second pass
+ * over a file that may be gigabytes long - see {@link #digest()}. It describes the bytes handed
+ * to the file rather than the bytes the device came to hold; the two are compared when the
+ * published store is opened, which verifies every column before it serves anything.
  */
 public final class ColumnFileWriter implements AutoCloseable {
 
@@ -29,7 +36,10 @@ public final class ColumnFileWriter implements AutoCloseable {
     private final FileChannel channel;
     private final ByteBuffer buffer;
     private final Path path;
+    private final CRC32C checksum = new CRC32C();
     private long elementsWritten;
+    private long bytesWritten;
+    private boolean closed;
 
     private ColumnFileWriter(FileChannel channel, Path path) {
         this.channel = channel;
@@ -88,6 +98,8 @@ public final class ColumnFileWriter implements AutoCloseable {
 
     private void flush() throws IOException {
         buffer.flip();
+        bytesWritten += buffer.remaining();
+        checksum.update(buffer.duplicate());
         while (buffer.hasRemaining()) {
             channel.write(buffer);
         }
@@ -106,9 +118,28 @@ public final class ColumnFileWriter implements AutoCloseable {
      */
     @Override
     public void close() throws IOException {
+        if (closed) {
+            return;
+        }
         try (FileChannel ch = channel) {
             flush();
         }
+        closed = true;
+    }
+
+    /**
+     * The length and CRC32C of everything written, once the writer is closed.
+     *
+     * @return The column's digest
+     * @throws IllegalStateException if the writer has not been closed, when buffered bytes would
+     *         still be missing from it
+     */
+    public ColumnDigest digest() {
+        if (!closed) {
+            throw new IllegalStateException("the column is not finished until it is closed: "
+                + path);
+        }
+        return new ColumnDigest(bytesWritten, checksum.getValue());
     }
 
     /** The file being written, for diagnostics. */

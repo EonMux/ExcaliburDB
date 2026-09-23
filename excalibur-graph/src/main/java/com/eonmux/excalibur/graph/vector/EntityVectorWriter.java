@@ -15,6 +15,7 @@ import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.zip.CRC32C;
 
 /**
  * Writes the entity vector file a graph is reranked against.
@@ -61,6 +62,7 @@ public final class EntityVectorWriter implements AutoCloseable {
     private final long count;
     private final byte[] present;
     private final ByteBuffer scratch;
+    private final CRC32C vectorsChecksum = new CRC32C();
 
     private OutputStream out;
     private long written;
@@ -167,12 +169,14 @@ public final class EntityVectorWriter implements AutoCloseable {
             scratch.clear();
             java.util.Arrays.fill(scratch.array(), (byte) 0);
             out.write(scratch.array());
+            vectorsChecksum.update(scratch.array());
         } else {
             scratch.clear();
             for (float value : vector) {
                 scratch.putFloat(value);
             }
             out.write(scratch.array());
+            vectorsChecksum.update(scratch.array());
             present[(int) written] = 1;
             withVector++;
         }
@@ -222,15 +226,28 @@ public final class EntityVectorWriter implements AutoCloseable {
     /**
      * Writes the header, the presence flags and the streamed body into the assembled copy.
      *
+     * <p>The vectors' checksum was taken as each one was streamed to the body, so assembling costs
+     * no second pass over them; the presence flags are digested here, where they are complete.
+     * The header then carries a checksum of itself, so the digests it records are only believed
+     * when they are the ones written.</p>
+     *
      * @throws IOException if the copy cannot be written
      */
     private void assemble() throws IOException {
+        CRC32C presenceChecksum = new CRC32C();
+        presenceChecksum.update(present);
         ByteBuffer header = ByteBuffer.allocate(EntityVectors.HEADER_BYTES)
             .order(ByteOrder.LITTLE_ENDIAN);
         header.putLong(EntityVectors.MAGIC);
         header.putInt(EntityVectors.VERSION);
         header.putInt(dimension);
         header.putLong(count);
+        header.putInt((int) presenceChecksum.getValue());
+        header.putInt((int) vectorsChecksum.getValue());
+        header.putInt(0);
+        CRC32C headerChecksum = new CRC32C();
+        headerChecksum.update(header.array(), 0, header.position());
+        header.putInt((int) headerChecksum.getValue());
 
         try (OutputStream complete = new BufferedOutputStream(Files.newOutputStream(assembled,
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE,

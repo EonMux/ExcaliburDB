@@ -5,12 +5,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.EnumMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 import com.eonmux.excalibur.graph.file.Durability;
+import com.eonmux.excalibur.graph.format.ColumnDigest;
 import com.eonmux.excalibur.graph.format.ColumnFileWriter;
 import com.eonmux.excalibur.graph.format.EdgeColumn;
 import com.eonmux.excalibur.graph.format.EdgeStoreDescriptor;
@@ -308,13 +310,16 @@ public final class EdgeStoreWriter {
         // Between the phases, which is where a build that has been asked to stop ends. Each is
         // a sort or one pass over the edges, and none of them has written anything the caller
         // serves: the directory is not a store until the descriptor below exists.
+        // Each column's digest is taken as it streams out, and recorded in the descriptor below:
+        // the only moment every byte of the column passes through this process anyway.
+        Map<EdgeColumn, ColumnDigest> digests = new EnumMap<>(EdgeColumn.class);
         BuildCancellation.checkpoint();
         int[] forwardOrder = sortForward();
-        writeForward(directory, forwardOrder, entityCount);
+        writeForward(directory, forwardOrder, entityCount, digests);
 
         BuildCancellation.checkpoint();
         int[] reverseOrder = sortReverse();
-        writeReverse(directory, forwardOrder, reverseOrder, entityCount);
+        writeReverse(directory, forwardOrder, reverseOrder, entityCount, digests);
 
         BuildCancellation.checkpoint();
 
@@ -326,7 +331,7 @@ public final class EdgeStoreWriter {
         }
 
         // Last, and atomically. Before this line the directory is not a store.
-        EdgeStoreDescriptor.of(entityCount, count).write(directory, durability);
+        EdgeStoreDescriptor.of(entityCount, count, digests).write(directory, durability);
         LOGGER.info("built edge store at {}: {} entities, {} edges", directory, entityCount, count);
     }
 
@@ -539,28 +544,40 @@ public final class EdgeStoreWriter {
         return order;
     }
 
-    private void writeForward(Path directory, int[] order, long entityCount) throws IOException {
-        writeColumn(directory, EdgeColumn.EDGES_FWD, order, (w, e) -> w.putInt(objects[e]));
-        writeColumn(directory, EdgeColumn.REL_FWD, order, (w, e) -> w.putInt(relations[e]));
-        writeOffsets(directory, EdgeColumn.OFFSETS_FWD, order, entityCount, i -> subjects[i]);
+    private void writeForward(Path directory, int[] order, long entityCount,
+                              Map<EdgeColumn, ColumnDigest> digests) throws IOException {
+        writeColumn(directory, EdgeColumn.EDGES_FWD, order, digests,
+            (w, e) -> w.putInt(objects[e]));
+        writeColumn(directory, EdgeColumn.REL_FWD, order, digests,
+            (w, e) -> w.putInt(relations[e]));
+        writeOffsets(directory, EdgeColumn.OFFSETS_FWD, order, entityCount, digests,
+            i -> subjects[i]);
 
         // Every per-edge column is laid out in forward order, and this is the only place that is
         // decided. Reverse traversal reaches them through PERM_REV rather than through a copy.
-        writeColumn(directory, EdgeColumn.VALID_FROM, order, (w, e) -> w.putInt(validFrom[e]));
-        writeColumn(directory, EdgeColumn.VALID_TO, order, (w, e) -> w.putInt(validTo[e]));
-        writeColumn(directory, EdgeColumn.SOURCE_TYPE, order, (w, e) -> w.putByte(sourceTypes[e]));
-        writeColumn(directory, EdgeColumn.SOURCE_ID, order, (w, e) -> w.putLong(sourceIds[e]));
-        writeColumn(directory, EdgeColumn.EXTRACTION_CONFIDENCE, order,
+        writeColumn(directory, EdgeColumn.VALID_FROM, order, digests,
+            (w, e) -> w.putInt(validFrom[e]));
+        writeColumn(directory, EdgeColumn.VALID_TO, order, digests,
+            (w, e) -> w.putInt(validTo[e]));
+        writeColumn(directory, EdgeColumn.SOURCE_TYPE, order, digests,
+            (w, e) -> w.putByte(sourceTypes[e]));
+        writeColumn(directory, EdgeColumn.SOURCE_ID, order, digests,
+            (w, e) -> w.putLong(sourceIds[e]));
+        writeColumn(directory, EdgeColumn.EXTRACTION_CONFIDENCE, order, digests,
             (w, e) -> w.putByte(confidences[e]));
-        writeColumn(directory, EdgeColumn.EXTRACTOR_VERSION, order,
+        writeColumn(directory, EdgeColumn.EXTRACTOR_VERSION, order, digests,
             (w, e) -> w.putShort(extractorVersions[e]));
     }
 
     private void writeReverse(Path directory, int[] forwardOrder, int[] reverseOrder,
-                              long entityCount) throws IOException {
-        writeColumn(directory, EdgeColumn.EDGES_REV, reverseOrder, (w, e) -> w.putInt(subjects[e]));
-        writeColumn(directory, EdgeColumn.REL_REV, reverseOrder, (w, e) -> w.putInt(relations[e]));
-        writeOffsets(directory, EdgeColumn.OFFSETS_REV, reverseOrder, entityCount, i -> objects[i]);
+                              long entityCount, Map<EdgeColumn, ColumnDigest> digests)
+            throws IOException {
+        writeColumn(directory, EdgeColumn.EDGES_REV, reverseOrder, digests,
+            (w, e) -> w.putInt(subjects[e]));
+        writeColumn(directory, EdgeColumn.REL_REV, reverseOrder, digests,
+            (w, e) -> w.putInt(relations[e]));
+        writeOffsets(directory, EdgeColumn.OFFSETS_REV, reverseOrder, entityCount, digests,
+            i -> objects[i]);
 
         // Position of each original edge in forward order, so a reverse position can name the
         // forward slot its columns live at.
@@ -568,21 +585,26 @@ public final class EdgeStoreWriter {
         for (int position = 0; position < count; position++) {
             forwardPosition[forwardOrder[position]] = position;
         }
-        try (ColumnFileWriter writer = ColumnFileWriter.create(directory, EdgeColumn.PERM_REV)) {
+        ColumnFileWriter writer = ColumnFileWriter.create(directory, EdgeColumn.PERM_REV);
+        try (writer) {
             for (int i = 0; i < count; i++) {
                 writer.putLong(forwardPosition[reverseOrder[i]]);
             }
         }
+        digests.put(EdgeColumn.PERM_REV, writer.digest());
     }
 
     /** Writes one per-edge column by walking {@code order} and emitting one element per edge. */
-    private void writeColumn(Path directory, EdgeColumn column, int[] order, ElementWriter emitter)
+    private void writeColumn(Path directory, EdgeColumn column, int[] order,
+                             Map<EdgeColumn, ColumnDigest> digests, ElementWriter emitter)
             throws IOException {
-        try (ColumnFileWriter writer = ColumnFileWriter.create(directory, column)) {
+        ColumnFileWriter writer = ColumnFileWriter.create(directory, column);
+        try (writer) {
             for (int i = 0; i < count; i++) {
                 emitter.write(writer, order[i]);
             }
         }
+        digests.put(column, writer.digest());
     }
 
     /**
@@ -594,8 +616,10 @@ public final class EdgeStoreWriter {
      * rather than only those that appear.
      */
     private void writeOffsets(Path directory, EdgeColumn column, int[] order, long entityCount,
-                              KeyExtractor key) throws IOException {
-        try (ColumnFileWriter writer = ColumnFileWriter.create(directory, column)) {
+                              Map<EdgeColumn, ColumnDigest> digests, KeyExtractor key)
+            throws IOException {
+        ColumnFileWriter writer = ColumnFileWriter.create(directory, column);
+        try (writer) {
             int position = 0;
             for (long entity = 0; entity < entityCount; entity++) {
                 writer.putLong(position);
@@ -610,6 +634,7 @@ public final class EdgeStoreWriter {
                     + "beyond entityCount " + entityCount);
             }
         }
+        digests.put(column, writer.digest());
     }
 
     @FunctionalInterface

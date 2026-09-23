@@ -34,9 +34,16 @@ import java.util.Objects;
  * <h2>Format</h2>
  * <pre>
  * [magic : int64][version : int32][dimension : int32][count : int64]
+ * [presence CRC32C : int32][vectors CRC32C : int32][reserved : int32][header CRC32C : int32]
  * [present : count * int8]           1 when the entity has a vector
  * [vectors : count * dimension * float32]
  * </pre>
+ *
+ * <p>The header CRC covers the 36 header bytes ahead of it. The whole file is verified against
+ * the three checksums on every open, and a file whose bytes are no longer the ones written is
+ * refused rather than mapped; {@link EntityVectorsIntegrity} gives the rules and the reasons. A
+ * version 1 file ends its header after the count, carries no checksums, is held to the size its
+ * header implies, and is replaced by the next build.</p>
  *
  * <p>Little-endian throughout, header included. The graph's column files are little-endian for the
  * hot path and its descriptor is big-endian because {@code DataOutputStream} is; a file that is one
@@ -63,11 +70,17 @@ public final class EntityVectors implements AutoCloseable, MappedFootprint {
     /** Identifies the file: ASCII {@code EXCLBVEC}. */
     public static final long MAGIC = 0x4558434C42564543L;
 
-    /** Format version written by this build. */
-    public static final int VERSION = 1;
+    /** Format version written by this build: the first to carry checksums. */
+    public static final int VERSION = 2;
 
-    /** Bytes before the presence flags. */
-    public static final int HEADER_BYTES = 24;
+    /** Oldest format version this build reads: the one written before checksums. */
+    public static final int OLDEST_VERSION = 1;
+
+    /** Bytes before the presence flags at the current version. */
+    public static final int HEADER_BYTES = 40;
+
+    /** Bytes before the presence flags at version 1, which every version begins with. */
+    public static final int V1_HEADER_BYTES = 24;
 
     /**
      * Largest dimension this will believe from a header.
@@ -82,16 +95,18 @@ public final class EntityVectors implements AutoCloseable, MappedFootprint {
     private final MemorySegment mapping;
     private final int dimension;
     private final long count;
+    private final long presenceOffset;
     private final long vectorsOffset;
 
-    private EntityVectors(Path path, Arena arena, MemorySegment mapping, int dimension,
-                          long count) {
+    private EntityVectors(Path path, Arena arena, MemorySegment mapping,
+                          EntityVectorsIntegrity.Header header) {
         this.path = path;
         this.arena = arena;
         this.mapping = mapping;
-        this.dimension = dimension;
-        this.count = count;
-        this.vectorsOffset = HEADER_BYTES + count;
+        this.dimension = header.dimension();
+        this.count = header.count();
+        this.presenceOffset = header.headerBytes();
+        this.vectorsOffset = presenceOffset + count;
     }
 
     /**
@@ -115,53 +130,25 @@ public final class EntityVectors implements AutoCloseable, MappedFootprint {
     }
 
     /**
-     * Opens a vector file.
+     * Opens a vector file, verifying it first.
      *
      * @param path The file
      * @return The vectors
-     * @throws IOException if the file is not one of these, or does not hold what it claims
+     * @throws com.eonmux.excalibur.graph.file.GraphCorruptionException if the file is not one of
+     *         these, does not hold what its header claims, or does not match its checksums
+     * @throws IOException if the file cannot be read, or is at a version this build does not read
      */
     public static EntityVectors open(Path path) throws IOException {
         Objects.requireNonNull(path, "path must not be null");
-
-        long size = Files.size(path);
-        if (size < HEADER_BYTES) {
-            throw new IOException("not an entity vector file, too short at " + size
-                + " bytes: " + path);
-        }
+        EntityVectorsIntegrity.Header header = EntityVectorsIntegrity.requireIntact(path);
 
         Arena arena = Arena.ofShared();
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            MemorySegment mapping = channel.map(FileChannel.MapMode.READ_ONLY, 0, size, arena);
-
-            long magic = mapping.get(ValueLayout.JAVA_LONG_UNALIGNED.withOrder(
-                java.nio.ByteOrder.LITTLE_ENDIAN), 0);
-            if (magic != MAGIC) {
-                throw new IOException("not an entity vector file (magic 0x"
-                    + Long.toHexString(magic) + "): " + path);
-            }
-            int version = readInt(mapping, 8);
-            if (version != VERSION) {
-                throw new IOException("unsupported entity vector version " + version + ": " + path);
-            }
-            int dimension = readInt(mapping, 12);
-            if (dimension <= 0 || dimension > MAX_DIMENSION) {
-                throw new IOException("entity vector file claims dimension " + dimension
-                    + ", which is not usable: " + path);
-            }
-            long count = readLong(mapping, 16);
-            if (count < 0) {
-                throw new IOException("entity vector file claims " + count + " entities: " + path);
-            }
-
-            long expected = HEADER_BYTES + count + count * dimension * (long) Float.BYTES;
-            if (size != expected) {
-                throw new IOException("entity vector file " + path + " is " + size
-                    + " bytes but its header describes " + expected);
-            }
-
-            LOGGER.debug("opened {} holding {} vectors of dimension {}", path, count, dimension);
-            return new EntityVectors(path, arena, mapping, dimension, count);
+            MemorySegment mapping =
+                channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size(), arena);
+            LOGGER.debug("opened {} (format version {}) holding {} vectors of dimension {}",
+                path, header.version(), header.count(), header.dimension());
+            return new EntityVectors(path, arena, mapping, header);
         } catch (IOException | RuntimeException e) {
             arena.close();
             throw e;
@@ -181,7 +168,7 @@ public final class EntityVectors implements AutoCloseable, MappedFootprint {
         if (entityId < 0 || entityId >= count) {
             return null;
         }
-        if (mapping.get(ValueLayout.JAVA_BYTE, HEADER_BYTES + entityId) == 0) {
+        if (mapping.get(ValueLayout.JAVA_BYTE, presenceOffset + entityId) == 0) {
             return null;
         }
 
@@ -221,7 +208,7 @@ public final class EntityVectors implements AutoCloseable, MappedFootprint {
     public long presentCount() {
         long present = 0;
         for (long id = 0; id < count; id++) {
-            if (mapping.get(ValueLayout.JAVA_BYTE, HEADER_BYTES + id) != 0) {
+            if (mapping.get(ValueLayout.JAVA_BYTE, presenceOffset + id) != 0) {
                 present++;
             }
         }
@@ -262,16 +249,6 @@ public final class EntityVectors implements AutoCloseable, MappedFootprint {
         if (arena.scope().isAlive()) {
             arena.close();
         }
-    }
-
-    private static int readInt(MemorySegment mapping, long offset) {
-        return mapping.get(
-            ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN), offset);
-    }
-
-    private static long readLong(MemorySegment mapping, long offset) {
-        return mapping.get(
-            ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN), offset);
     }
 
     @Override
