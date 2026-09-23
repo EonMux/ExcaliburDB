@@ -10,6 +10,7 @@ import com.eonmux.excalibur.fsck.check.FileCheck;
 import com.eonmux.excalibur.fsck.check.FileInspector;
 import com.eonmux.excalibur.fsck.check.FileKind;
 import com.eonmux.excalibur.fsck.check.FindingSeverity;
+import com.eonmux.excalibur.fsck.check.GraphStoreCheck;
 import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
 import com.eonmux.excalibur.fsck.check.LshTableCheck;
 import com.eonmux.excalibur.store.Segment;
@@ -56,7 +57,10 @@ import java.util.Optional;
  * graph staging logs; and the native lexical store, which is
  * checked as a whole by {@link #withLexicalStore} because its manifest - verified against the
  * checksum on its end line - the segments it names, the key table and tombstones beside each,
- * and its erasure log are one structure. The same dispatch is what {@code excalibur-fsck} surveys a live
+ * and its erasure log are one structure; and each tenant's built graph, checked as a whole by
+ * {@link #withGraphStores} because its descriptor and dictionaries record what every other file
+ * of it must hold, and because what a directory beside it is depends on its neighbours. The
+ * same dispatch is what {@code excalibur-fsck} surveys a live
  * directory with, so the two tools cannot disagree about which checker a file belongs to.</p>
  *
  * <p>That includes the pair an interrupted HNSW compaction stages,
@@ -70,16 +74,12 @@ import java.util.Optional;
  * pass the same directory - the disagreement one dispatch exists to rule out.</p>
  *
  * <h2>What "proven" means</h2>
-<<<<<<< HEAD
- * <p>Some formats carry nothing a checker could prove: the routing directory has no
- * checksum, the lexical store's sidecars have no verifier, and a registry or journal written
- * before its format carried a checksum has only its count or nothing at all. Those are reported as checked and unproven - healthy,
-=======
  * <p>Some files carry nothing a checker could prove: a routing directory, lexical store
- * manifest, key table, tombstone file or erasure log an older build wrote before those formats
- * carried a checksum, the in-flight ingest journal, which is truncation-tolerant by design, and
- * a file in the lexical store beside no segment its manifest names. Those are reported as checked and unproven - healthy,
->>>>>>> worktree-agent-a9a40c517c41a92c0
+ * manifest, key table, tombstone file, erasure log, registry or graph an older build wrote
+ * before those formats carried a checksum, the in-flight ingest journal, which is
+ * truncation-tolerant by design, a file in the lexical store beside no segment its manifest
+ * names, and a file in a graph directory that no build writes or that the node deletes on open.
+ * Those are reported as checked and unproven - healthy,
  * because nothing wrong was found, and not proven, because nothing could have been - rather
  * than left out, which would read as though nothing in the image went unverified.</p>
  *
@@ -167,6 +167,44 @@ public final class FormatChecks {
         }
         inspection.verdicts().forEach(verdict -> folded.add(fromFsck(verdict)));
         inspection.findings().forEach(finding -> folded.add(fromFinding(finding)));
+        return List.copyOf(folded);
+    }
+
+    /**
+     * Replaces the per-file verdicts on each tenant's built graph with the verdicts on the graph
+     * as a whole.
+     *
+     * <p>Every file under {@code <namespace>/graph}, and under the directories a publish, a build
+     * or an erasure compaction leaves beside it, is, taken alone, a graph part with nothing to
+     * prove. The graph is verified by the checks the node runs before it serves one: the edge
+     * store's descriptor and each column against the length and CRC32C it records, each label
+     * dictionary's index and text against the trailer the index carries, the entity vectors
+     * against the checksums in their header, and each Lucene index against the CRC32 footer of
+     * every file in it. Those verdicts, and the unchecked verdicts on scratch and on a copy the
+     * node deletes on open, supersede the per-file ones. A file the descriptor or a dictionary
+     * names and the image does not hold is a verdict here and nowhere else.</p>
+     *
+     * @param payloadRoot The payload root
+     * @param checks      The per-file verdicts on the image
+     * @return The same verdicts with every graph's folded in, unchanged if the image holds none
+     * @throws NullPointerException if either argument is null
+     */
+    public static List<ContentCheck> withGraphStores(Path payloadRoot,
+                                                     List<ContentCheck> checks) {
+        Objects.requireNonNull(payloadRoot, "payloadRoot");
+        Objects.requireNonNull(checks, "checks");
+        List<GraphStoreCheck.GraphInspection> graphs = FileInspector.graphStores(payloadRoot);
+        if (graphs.isEmpty()) {
+            return List.copyOf(checks);
+        }
+        List<ContentCheck> folded = new ArrayList<>(checks.size());
+        for (ContentCheck check : checks) {
+            if (graphs.stream().noneMatch(graph -> graph.covers(check.path()))) {
+                folded.add(check);
+            }
+        }
+        graphs.forEach(graph -> graph.verdicts().forEach(verdict ->
+            folded.add(fromFsck(verdict))));
         return List.copyOf(folded);
     }
 
