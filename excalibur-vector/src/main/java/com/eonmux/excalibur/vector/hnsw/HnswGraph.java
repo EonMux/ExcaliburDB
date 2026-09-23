@@ -73,7 +73,7 @@ public class HnswGraph implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(HnswGraph.class);
 
-    /** Suffix of the file holding a graph's node-to-document mapping. */
+    /** Suffix of the file holding a graph's node-to-chunk mapping. */
     public static final String DOCUMENT_MAPPING_SUFFIX = ".docmap";
 
     /** Suffix of the file holding a graph's trained product quantizer codebook. */
@@ -1286,7 +1286,7 @@ public class HnswGraph implements AutoCloseable {
         return null;
     }
 
-    // ==================== Node-to-Document Mapping ====================
+    // ==================== Node-to-Chunk Mapping ====================
 
     /**
      * Attributes a node to the identifier it will be reported under, and nothing more.
@@ -1359,7 +1359,7 @@ public class HnswGraph implements AutoCloseable {
     }
 
     /**
-     * Sets the node-to-document mapping for this graph.
+     * Sets the node-to-chunk mapping for this graph.
      *
      * <p>This allows using a persistent mapping that can survive restarts.</p>
      *
@@ -1370,7 +1370,7 @@ public class HnswGraph implements AutoCloseable {
     }
 
     /**
-     * Gets the current node-to-document mapping.
+     * Gets the current node-to-chunk mapping.
      *
      * @return The current mapping, or null if not set
      */

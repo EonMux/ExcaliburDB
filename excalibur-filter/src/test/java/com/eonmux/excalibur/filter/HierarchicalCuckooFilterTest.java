@@ -451,9 +451,9 @@ class HierarchicalCuckooFilterTest {
         @DisplayName("a segment that refused a term can no longer answer for that segment")
         void aRefusedTermWithdrawsTheSegmentsVerdict() {
             // A cuckoo filter that cannot accept a term does not hold it, and a query for that
-            // term would read the filter's silence as "not in this segment" and skip it. The
-            // documents are in storage and the answer is empty, which is the one outcome a
-            // pre-filter must never produce.
+            // term would read the filter's silence as "not in this segment" and search the
+            // segment after every one that may hold it - last, or not at all for a query that
+            // runs out of time, though the documents holding the term are in storage.
             HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 8);
             trust(small, SEGMENT_1);
             trust(small, SEGMENT_2, "kept");

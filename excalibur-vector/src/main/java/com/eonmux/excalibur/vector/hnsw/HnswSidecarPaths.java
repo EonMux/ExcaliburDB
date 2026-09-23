@@ -6,7 +6,7 @@ import java.nio.file.Path;
  * Names the files that live beside a graph file.
  *
  * <h2>Why beside, and why derived</h2>
- * <p>A graph's node-to-document mapping and its trained codebook are only meaningful for the
+ * <p>A graph's node-to-chunk mapping and its trained codebook are only meaningful for the
  * graph they were produced from, and its compaction staging file has to be renamed over the
  * live one. All three therefore sit in the graph's own directory under a name derived from the
  * graph's: the rename is then a move within one filesystem rather than a copy that can fail
@@ -26,7 +26,7 @@ final class HnswSidecarPaths {
     }
 
     /**
-     * Returns the path of the node-to-document mapping that belongs beside a graph file.
+     * Returns the path of the node-to-chunk mapping that belongs beside a graph file.
      *
      * @param graphPath The graph file
      * @return The sidecar path, which is the graph path plus

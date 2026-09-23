@@ -129,8 +129,8 @@ final class CuckooFilterIntegrity {
         }
         throw new IllegalArgumentException("This " + FORMAT + " image failed its checksum: "
             + report.detail() + ". It will not be loaded, because a membership filter that has "
-            + "rotted answers 'no' for terms its segment really holds, which prunes the "
-            + "segment out of every query that needs it. Rebuild the filter from its segment.");
+            + "rotted answers 'no' for terms its segment really holds, which sends the segment "
+            + "to the back of every query that needs it. Rebuild the filter from its segment.");
     }
 
     /**

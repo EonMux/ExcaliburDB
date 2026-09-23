@@ -20,7 +20,7 @@ import java.util.Objects;
  *
  * <h2>Why it is its own class</h2>
  * <p>A compaction is the one operation that replaces the file the graph is serving from while
- * it is serving from it, and it replaces two files - the graph and its node-to-document
+ * it is serving from it, and it replaces two files - the graph and its node-to-chunk
  * mapping - that must agree with each other. It therefore owns a crash protocol, a swap, a
  * rollback and a recovery, none of which the rest of the graph ever executes. It is also the
  * only place node ids are renumbered, which is what the graph's generation counter exists to
@@ -118,7 +118,7 @@ final class HnswCompactor {
      * Writes a tombstone-free copy of this graph to {@code compactPath}.
      *
      * <p>Must be called with the write lock held. The copy carries over the
-     * node-to-document mapping, the product quantizer codes, and the write-log integration
+     * node-to-chunk mapping, the product quantizer codes, and the write-log integration
      * checkpoint, so nothing has to be re-derived after the swap.</p>
      *
      * <p>The mapping is rebuilt rather than shared. Compaction renumbers nodes, so
@@ -222,7 +222,7 @@ final class HnswCompactor {
     /**
      * What a compaction produced, in the compacted numbering, for installation after the swap.
      *
-     * @param documentMapping The node-to-document mapping, already staged on disk beside the
+     * @param documentMapping The node-to-chunk mapping, already staged on disk beside the
      *                        compacted graph; carried in memory too so the live graph can
      *                        adopt it without reading the file back
      * @param keying What the mapping's keys name, which the adopted copy has to keep
@@ -257,7 +257,7 @@ final class HnswCompactor {
                 StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             DurableFiles.syncContainingDirectory(livePath);
         } catch (IOException e) {
-            LOGGER.error("Could not install the compacted node-to-document mapping at {}: {}. "
+            LOGGER.error("Could not install the compacted node-to-chunk mapping at {}: {}. "
                 + "The staged copy at {} is left in place and the next open of this graph "
                 + "will finish the swap from it.", livePath, e.toString(), stagedMapping, e);
         }
@@ -309,14 +309,14 @@ final class HnswCompactor {
 
         Path livePath = HnswSidecarPaths.documentMapping(graphPath);
         LOGGER.warn("An HNSW compaction of {} swapped its graph in and did not install the "
-            + "matching node-to-document mapping. Completing the swap from {}.",
+            + "matching node-to-chunk mapping. Completing the swap from {}.",
             graphPath, stagedMapping);
         try {
             Files.move(stagedMapping, livePath,
                 StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
             throw new IOException("HNSW graph " + graphPath + " holds a compacted numbering "
-                + "whose node-to-document mapping is still staged at " + stagedMapping
+                + "whose node-to-chunk mapping is still staged at " + stagedMapping
                 + " and could not be installed. Opening it would attribute every result to "
                 + "the wrong document.", e);
         }

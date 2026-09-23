@@ -260,18 +260,18 @@ public final class Metrics {
     }
 
     /**
-     * Query results dropped because they carried no document identity.
+     * Query results dropped because they carried no chunk identity.
      *
      * <p>A counter rather than a log line alone: each drop is a hit the node found and could
      * not return, it recurs on every query that reaches the same graph nodes until their
-     * segments' graphs are restored or reindexed, and any increase means a node-to-document
+     * segments' graphs are restored or reindexed, and any increase means a node-to-chunk
      * mapping is missing entries.</p>
      */
     private static final AtomicLong unnamedResultsDropped =
         new AtomicLong();
 
     /**
-     * Counts query results dropped because they carried no document identity.
+     * Counts query results dropped because they carried no chunk identity.
      *
      * @param count How many were dropped; non-positive counts are ignored
      */
@@ -282,7 +282,7 @@ public final class Metrics {
     }
 
     /**
-     * Gets how many query results were dropped because they carried no document identity.
+     * Gets how many query results were dropped because they carried no chunk identity.
      *
      * @return Lifetime count
      */

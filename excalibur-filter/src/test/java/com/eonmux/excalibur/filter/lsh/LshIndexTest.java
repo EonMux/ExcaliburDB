@@ -457,9 +457,8 @@ class LshIndexTest {
             }
 
             // Every entry is stored in every table, so a restored count that adds the tables up
-            // reports one entry per table per entry. Callers read this count as how much of a
-            // segment the index has seen, and an index that overstates its coverage is treated as
-            // authoritative enough to exclude a segment on an empty answer.
+            // reports one entry per table per entry. The count says how many entries the index
+            // holds, and a restart must not multiply it by the number of tables.
             assertThat(reopened.entryCount())
                 .as("re-opening must restore the number of entries, not the number of "
                     + "entry-to-table placements")

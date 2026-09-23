@@ -32,17 +32,18 @@ import java.util.Objects;
  * the membership filter under that segment.</p>
  *
  * <p>The last is the one a reindex could get wrong without anything failing. Once a
- * segment's level is trusted, stage 1 of the query pipeline rules the segment out for every
- * term the level does not name, so a reindexed-in term filed under any other segment - or
- * under none - hides the chunk that holds it from every query for it until the segment is
- * next rebuilt. The storage engine reports the segment each write landed in, and the
- * reindexer files the chunk's terms there as it writes it, through the same recorder a first
- * ingest uses. The batch publisher is given no filter of its own: a document's chunks span
+ * segment's level is trusted, stage 1 of the query pipeline searches the segment after the
+ * ones that may hold a query's terms whenever the level names none of them, so a reindexed-in
+ * term filed under any other segment - or under none - sends the segment holding its chunk to
+ * the back of every query for it until the segment is next rebuilt, where a query that runs
+ * out of time never reaches it. The storage engine reports the segment each write landed in,
+ * and the reindexer files the chunk's terms there as it writes it, through the same recorder a
+ * first ingest uses. The batch publisher is given no filter of its own: a document's chunks span
  * segments, so no one segment id could describe a publication.</p>
  *
- * <p>The lexical index is part of that. A reindex is the one operation that removes content a
- * query could still be matching, so a reindexer that wrote to storage alone would leave deleted
- * documents answering BM25 queries under identifiers whose chunks are gone.</p>
+ * <p>The lexical index is part of that. A reindex removes content a query could still be
+ * matching, so a reindexer that wrote to storage alone would leave deleted documents answering
+ * BM25 queries under identifiers whose chunks are gone.</p>
  *
  * <p>The embedding half is optional, because on many deployments it is simply not there. A node
  * with no embedding endpoint chunked, stored and term-indexed its corpus at ingestion; a reindex
@@ -96,7 +97,7 @@ public final class ReindexerFactory {
      * @param indexOrchestrator  Orchestrator supplying the visibility tracker
      * @param hierarchicalFilter Filter that must see both inserts and tombstones, and that
      *                           each written chunk's terms are filed in under the segment it
-     *                           landed in; may be null on a node that prunes on none
+     *                           landed in; may be null on a node that runs no term filter
      * @param registry           Document registry shared with the ingestion pipeline
      * @param chunkIndex         Lexical index to keep in step with storage, or null for none
      * @return A configured reindexer

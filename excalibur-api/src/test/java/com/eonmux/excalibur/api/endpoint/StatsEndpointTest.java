@@ -446,9 +446,9 @@ class StatsEndpointTest {
         @Test
         @DisplayName("reports that a full membership filter can no longer speak for segments")
         void reportsFilterSaturation() throws IOException {
-            // Saturation turns the pre-filter off rather than turning queries wrong, so it is
-            // invisible in the results: the node just gets slower. Nothing else in this
-            // response would tell an operator that the corpus capacity is now too small.
+            // Saturation stops the filter ordering segments rather than turning queries wrong,
+            // so it is invisible in the results of any query that finishes in time. Nothing else
+            // in this response would tell an operator that the corpus capacity is now too small.
             com.eonmux.excalibur.filter.HierarchicalCuckooFilter filter =
                 new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(8L, 13, 8);
             // Spread over many segments, so the level holding every term fills before any one.

@@ -113,7 +113,7 @@ class ReindexTermFilingTest {
 
     @Test
     @DisplayName("a reindexed-in term does not leave its trusted segment searched last")
-    void aTrustedSegmentIsNotPrunedForAReindexedTerm() {
+    void aTrustedSegmentIsNotSearchedLastForAReindexedTerm() {
         trust(11L);
         trust(12L);
         assertThat(searchedLast("zeppelin", 11L))

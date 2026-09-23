@@ -113,7 +113,7 @@ final class HnswGraphOpener {
         // Beside the graph file, and loaded if it is already there. In memory only, this
         // mapping was rebuilt empty on every restart: the integration worker records it as it
         // inserts vectors, so a graph that was fully integrated before a restart came back with
-        // no document identity on any of its nodes. Search still returned them; they simply
+        // no chunk identity on any of its nodes. Search still returned them; they simply
         // stopped being attributable to a document, which is what document-level filtering and
         // payload resolution work from.
         graph.nodeDocumentMapping = openDocumentMapping(path);
@@ -429,7 +429,7 @@ final class HnswGraphOpener {
     }
 
     /**
-     * Opens the node-to-document mapping that belongs beside a graph file.
+     * Opens the node-to-chunk mapping that belongs beside a graph file.
      *
      * <p>Falls back to an in-memory mapping if the file cannot be read. Losing the mapping
      * costs document attribution on this graph's results; refusing to open the graph would cost
@@ -443,7 +443,7 @@ final class HnswGraphOpener {
     }
 
     /**
-     * Opens the node-to-document mapping that belongs beside a graph file.
+     * Opens the node-to-chunk mapping that belongs beside a graph file.
      *
      * @param graphPath The graph file
      * @param loadExisting Whether to adopt the mappings already on disk. False when the
@@ -455,8 +455,8 @@ final class HnswGraphOpener {
         try {
             return NodeDocumentMapping.createOrLoad(mappingPath, loadExisting);
         } catch (IOException e) {
-            LOGGER.warn("Could not open the node-to-document mapping at {}: {}. Results from "
-                + "this graph will carry no document identity until it is rebuilt.",
+            LOGGER.warn("Could not open the node-to-chunk mapping at {}: {}. Results from "
+                + "this graph will carry no chunk identity until it is rebuilt.",
                 mappingPath, e.toString());
             return new NodeDocumentMapping();
         }

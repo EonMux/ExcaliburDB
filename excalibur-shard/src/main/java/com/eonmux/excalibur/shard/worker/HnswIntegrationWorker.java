@@ -206,7 +206,7 @@ public class HnswIntegrationWorker {
      *
      * <p>Never an interrupt. The loop inserts into HNSW graphs, and an insert grows the graph's
      * mapped file through the channel every search of that graph is served from, and appends
-     * to the node-to-document mapping; an interrupt landing there closes that channel for
+     * to the node-to-chunk mapping; an interrupt landing there closes that channel for
      * every other user of the graph. The signal is read between segments and wakes the pause
      * between cycles, which is all the interrupt was needed for.</p>
      */
@@ -955,8 +955,9 @@ public class HnswIntegrationWorker {
      * Mirrors each integrated vector into the segment's pre-filter under its new node id.
      *
      * <p>This is what keeps the pre-filter and the graph speaking the same id space. The query
-     * pipeline intersects the pre-filter's answer with the graph's node ids, so a pre-filter
-     * populated from any other id space excludes every result instead of narrowing the search.</p>
+     * pipeline measures the node ids the pre-filter names in the graph beside its own walk, so a
+     * pre-filter populated from any other id space names nodes unrelated to the query's buckets,
+     * or none, and stops recovering the neighbours the walk passed over.</p>
      *
      * <p>Best-effort throughout: the pre-filter is an optimisation, and no failure here may cost
      * a vector its place in the graph, which is already durable by this point.</p>

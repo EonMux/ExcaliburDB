@@ -34,7 +34,7 @@ import java.util.stream.Collectors;
  *   <li>For each segment, use VectorReranker to compute exact distances from full-precision vectors stored in HNSW graph</li>
  *   <li>Merge all reranked results and take top-k</li>
  *   <li>Apply DocumentAtomicityFilter to exclude partial documents</li>
- *   <li>Drop results that carry no document identity, when the request can only use named
+ *   <li>Drop results that carry no chunk identity, when the request can only use named
  *       ones - see {@link QueryRequest#requireNamedResults()}</li>
  * </ol>
  *
@@ -181,7 +181,7 @@ final class RerankStage {
     /**
      * The results that carry the identifier ingestion assigned.
      *
-     * <p>A result without one is a graph node the node-to-document mapping has no entry for:
+     * <p>A result without one is a graph node the node-to-chunk mapping has no entry for:
      * its mapping file could not be opened, or lost entries it had not yet persisted. The
      * search found it, but the only name it has is its node id, which compaction renumbers
      * and which names nothing a caller outside this process can fetch, fuse or erase by.
@@ -207,8 +207,8 @@ final class RerankStage {
         if (named.size() == results.size()) {
             return results;
         }
-        LOGGER.warn("Stage 4: dropped {} result(s) that carry no document identity, from "
-            + "segment(s) {}; their node-to-document mapping is missing entries. Run "
+        LOGGER.warn("Stage 4: dropped {} result(s) that carry no chunk identity, from "
+            + "segment(s) {}; their node-to-chunk mapping is missing entries. Run "
             + "excalibur-fsck, then restore each graph with its mapping or reindex its source",
             results.size() - named.size(),
             unnamedSegments);

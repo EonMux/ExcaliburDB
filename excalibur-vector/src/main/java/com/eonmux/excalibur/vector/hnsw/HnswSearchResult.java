@@ -76,11 +76,12 @@ public final class HnswSearchResult {
     }
 
     /**
-     * Creates a new search result with document ID, not bound to a graph generation.
+     * Creates a new search result with the chunk id it is named by, not bound to a graph
+     * generation.
      *
      * @param nodeId The ID of the node found
      * @param distance The dissimilarity to the query vector (smaller is closer)
-     * @param documentId The document ID this node belongs to (may be null)
+     * @param documentId The chunk id the node is registered under (may be null)
      */
     public HnswSearchResult(long nodeId, float distance, String documentId) {
         this(nodeId, distance, documentId, GENERATION_UNKNOWN);
@@ -91,7 +92,7 @@ public final class HnswSearchResult {
      *
      * @param nodeId The ID of the node found
      * @param distance The dissimilarity to the query vector (smaller is closer)
-     * @param documentId The document ID this node belongs to (may be null)
+     * @param documentId The chunk id the node is registered under (may be null)
      * @param generation The {@link HnswGraph#generation()} the node ID belongs to,
      *                   or {@link #GENERATION_UNKNOWN}
      * @since 1.3
@@ -122,7 +123,7 @@ public final class HnswSearchResult {
     }
 
     /**
-     * Creates a new search result with distance validation and document ID.
+     * Creates a new search result with distance validation and the chunk id it is named by.
      *
      * <p>This factory method validates the distance is within the expected range
      * for the given metric type. If the distance is out of range, it is clamped.</p>
@@ -130,7 +131,7 @@ public final class HnswSearchResult {
      * @param nodeId The ID of the node found
      * @param distance The distance/similarity to the query vector
      * @param isCosine true if using cosine similarity (range [-1, 1])
-     * @param documentId The document ID this node belongs to (may be null)
+     * @param documentId The chunk id the node is registered under (may be null)
      * @return A new HnswSearchResult with validated distance
      */
     public static HnswSearchResult createWithValidation(long nodeId, float distance, boolean isCosine, String documentId) {
@@ -154,14 +155,15 @@ public final class HnswSearchResult {
     }
 
     /**
-     * Returns the document ID this node belongs to.
+     * Returns the name this node is registered under: the chunk id its vector was written
+     * with, {@code sourceId:documentId:chunk:N}.
      *
-     * <p>The document ID is the actual identifier from the source document,
-     * such as "doc1" or "source1:file1". This is used by the
-     * {@code DocumentAtomicityFilter} to correctly identify which document
-     * each query result belongs to.</p>
+     * <p>A vector hit is named by the chunk it matched, not by its document. Whoever needs the
+     * document derives it from this id - the {@code DocumentAtomicityFilter} does, through
+     * {@code ChunkIdentifiers.documentKeyOfChunk} - so every reader splits the id the same
+     * way.</p>
      *
-     * @return The document ID, or null if not available
+     * @return The chunk id, or null when nothing names the node
      */
     public String documentId() {
         return documentId;
@@ -203,10 +205,10 @@ public final class HnswSearchResult {
     }
 
     /**
-     * Returns a new result with a different document ID.
+     * Returns a new result with a different chunk id.
      *
-     * @param newDocumentId The new document ID
-     * @return A new HnswSearchResult with the updated document ID
+     * @param newDocumentId The new chunk id
+     * @return A new HnswSearchResult with the updated chunk id
      */
     public HnswSearchResult withDocumentId(String newDocumentId) {
         return new HnswSearchResult(nodeId, distance, newDocumentId, generation);

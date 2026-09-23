@@ -895,9 +895,9 @@ class DocumentReindexerTest {
         @Test
         @DisplayName("a document the source stopped listing has its graph nodes retired")
         void deletedDocumentsVectorsAreRetired() throws SourceException {
-            // Storage tombstones the chunks and the registry entry goes, but a graph node is
-            // attributed to a document rather than to a chunk: nothing else reaches it, so the
-            // document stays rankable by vector search with its name and a distance.
+            // Storage tombstones the chunks and the registry entry goes, but neither reaches the
+            // graph: its nodes are retired only through the vector eraser, and without that the
+            // document's chunks stay rankable by vector search with their names and a distance.
             RecordingVectorEraser eraser = new RecordingVectorEraser(2);
             DocumentReindexer reindexer = new DocumentReindexer(chunker, llmClient,
                 upsertHandler, registry, storageWriter);

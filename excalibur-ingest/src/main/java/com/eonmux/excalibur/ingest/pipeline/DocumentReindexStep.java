@@ -50,11 +50,11 @@ import java.util.function.LongSupplier;
  * <h2>Where a chunk's terms are filed</h2>
  * <p>Under the segment its write landed in, as each chunk is written, through the same
  * {@link SegmentTermRecorder} a first ingest files through. The storage engine routes a chunk by
- * its key and reports the segment it chose; stage 1 of the query pipeline rules a segment out
- * for any term its trusted level does not name, so a term filed anywhere else - or nowhere -
- * hides the chunk from every query for it until the segment is next rebuilt. Filing before
- * publication costs nothing in correctness: a term filed for a chunk that is then rolled back
- * only costs its segment a search it did not need.</p>
+ * its key and reports the segment it chose; stage 1 of the query pipeline searches a segment
+ * last when its trusted level names none of a query's terms, so a term filed anywhere else - or
+ * nowhere - sends the chunk's segment to the back of every query for it until the segment is
+ * next rebuilt. Filing before publication costs nothing in correctness: a term filed for a chunk
+ * that is then rolled back only moves its segment ahead of where it belonged.</p>
  *
  * <h2>What the graph is told</h2>
  * <p>A published version is reported to the graph exactly as a first ingest's is, through the
@@ -566,8 +566,8 @@ final class DocumentReindexStep {
      * Generates a unique chunk ID from a source ID, document ID and chunk index.
      *
      * <p>Format: {@code sourceId:documentId:chunk:index}. The source-qualified form is what
-     * excalibur-shard parses back into a document id when it registers an HNSW node, and what
-     * the ingestion pipeline writes, so a reindex overwrites and tombstones exactly the keys the
+     * excalibur-shard registers whole as an HNSW node's name, and what the ingestion pipeline
+     * writes, so a reindex overwrites and tombstones exactly the keys the
      * initial ingest created. See {@link ChunkIdentifiers}.</p>
      *
      * <p>Domain correctness: chunk IDs are unique, deterministic, and URL-safe.</p>

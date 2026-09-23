@@ -20,8 +20,8 @@ import java.util.function.Function;
  * The lexical index a reindex has to keep in step with storage.
  *
  * <h2>Why a reindex has to touch it at all</h2>
- * <p>A reindex is the one operation that removes content a query could still be matching: a
- * deleted document's chunks, and the tail chunks a shortened document no longer has. Left in this
+ * <p>A reindex removes content a query could still be matching: a deleted document's chunks, and
+ * the tail chunks a shortened document no longer has. Left in this
  * index they stay searchable under identifiers whose storage entries are gone, so BM25 goes on
  * returning documents the corpus no longer contains.</p>
  *

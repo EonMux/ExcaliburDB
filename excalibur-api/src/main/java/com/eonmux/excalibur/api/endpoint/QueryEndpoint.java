@@ -163,7 +163,7 @@ import java.util.concurrent.*;
  *
  * <h2>Result identity</h2>
  * <p>Every {@code document_id} names stored content. A vector hit whose graph node has no
- * document identity - its segment's node-to-document mapping is missing or damaged - is dropped
+ * chunk identity - its segment's node-to-chunk mapping is missing or damaged - is dropped
  * before the page is cut rather than returned under a node number, which names nothing a caller
  * could fetch. Dropping one marks coverage degraded and counts it in
  * {@code excalibur_query_unnamed_results_dropped_total}.</p>

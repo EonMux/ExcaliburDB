@@ -335,7 +335,7 @@ public final class QueryRequest {
     /**
      * Returns whether a result the pipeline cannot name is dropped rather than returned.
      *
-     * <p>A graph node whose node-to-document mapping entry is missing - a mapping file that
+     * <p>A graph node whose node-to-chunk mapping entry is missing - a mapping file that
      * could not be opened, or an entry lost before it was persisted - is found by the search
      * but carries no identifier ingestion assigned, only its node id. An embedded caller can
      * still use that result, through {@link QueryResultItem#segmentId()} and

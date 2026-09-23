@@ -46,7 +46,7 @@ final class HnswGraphLifecycle {
         this.graph = graph;
     }
 
-    /** Flushes the mapping and writes the node-to-document mapping beside it. */
+    /** Flushes the mapping and writes the node-to-chunk mapping beside it. */
     void flush() {
         graph.validateNotClosed();
         graph.mappedFile.flush();
@@ -90,7 +90,7 @@ final class HnswGraphLifecycle {
     }
 
     /**
-     * Writes the node-to-document mapping beside the graph.
+     * Writes the node-to-chunk mapping beside the graph.
      *
      * <p>On flush and on close rather than on every registration: the integration worker
      * records one entry per vector it inserts, and a file write per vector would put the
@@ -109,7 +109,7 @@ final class HnswGraphLifecycle {
         try {
             mapping.persist();
         } catch (IOException e) {
-            LOGGER.warn("Failed to persist the node-to-document mapping for {}: {}",
+            LOGGER.warn("Failed to persist the node-to-chunk mapping for {}: {}",
                 graph.path, e.toString());
         }
     }

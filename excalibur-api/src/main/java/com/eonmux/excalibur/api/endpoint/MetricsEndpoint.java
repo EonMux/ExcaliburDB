@@ -144,9 +144,9 @@ public final class MetricsEndpoint implements HttpHandler {
                 Metrics.getQueriesExecuted())
             // A counter, because each drop recurs on every query that reaches the same graph
             // nodes until their segments' graphs are restored or reindexed; any increase means a
-            // node-to-document mapping is missing entries.
+            // node-to-chunk mapping is missing entries.
             .counter("excalibur_query_unnamed_results_dropped_total",
-                "Query results dropped because they carried no document identity",
+                "Query results dropped because they carried no chunk identity",
                 Metrics.getUnnamedResultsDropped())
             .counter("excalibur_entries_ingested_total", "Entries ingested",
                 Metrics.getEntriesIngested())

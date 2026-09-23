@@ -59,7 +59,7 @@ import java.util.Optional;
  * @param storageEngine             Storage the chunk text is read back from and vectors erased in
  * @param indexOrchestrator         Supplies the visibility clock the chunk index stamps with
  * @param hierarchicalFilter        The membership filter ingestion must populate for Stage 1
- *                                  pruning to have anything to prune on
+ *                                  to have term membership to order segments by
  * @param documentVisibilityTracker The atomicity tracker shared with the query pipeline
  * @param graphTenants              Every namespace's graph, for the staging store ingestion
  *                                  writes facts into

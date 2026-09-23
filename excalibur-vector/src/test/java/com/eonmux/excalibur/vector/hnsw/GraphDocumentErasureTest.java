@@ -19,10 +19,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Retiring every node a named document contributed.
  *
  * <p>A graph node carries no text, so an erased document's vectors are easy to mistake for
- * harmless residue. They are not: a node is attributed to a document, and a search that ranks it
- * says that document matched the query. The graph is the only component that can name a document's
- * nodes, so retiring them is its operation - the tombstone it writes is what every traversal, the
- * on-disk file and the compaction that reclaims the space all agree on.</p>
+ * harmless residue. They are not: a node is attributed to a chunk, whose id carries its document's
+ * key, and a search that ranks it says that chunk of that document matched the query. The graph is
+ * the only component that can find a document's nodes among its chunks', so retiring them is its
+ * operation - the tombstone it writes is what every traversal, the on-disk file and the compaction
+ * that reclaims the space all agree on.</p>
  */
 @DisplayName("Erasing a document from a graph")
 class GraphDocumentErasureTest {
@@ -77,7 +78,7 @@ class GraphDocumentErasureTest {
             graph.deleteDocument("source:secret.md");
 
             assertThat(nodeIds(graph.search(unitVector(0), 10)))
-                .as("a hit still names its document even with no text left to show")
+                .as("a hit still names its chunk even with no text left to show")
                 .doesNotContainAnyElementsOf(erased);
         }
     }
@@ -122,13 +123,16 @@ class GraphDocumentErasureTest {
         }
     }
 
-    /** Inserts count nodes attributed to one document, and returns their node IDs. */
+    /**
+     * Inserts count nodes attributed to consecutive chunks of one document, as the integration
+     * worker names them, and returns their node IDs.
+     */
     private static List<Long> insert(HnswGraph graph, String documentId, int firstVector,
                                      int count) throws IOException {
         List<Long> nodeIds = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             long nodeId = graph.insert(unitVector(firstVector + i));
-            graph.registerDocumentId(nodeId, documentId);
+            graph.registerDocumentId(nodeId, documentId + ":chunk:" + i);
             nodeIds.add(nodeId);
         }
         return nodeIds;

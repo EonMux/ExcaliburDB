@@ -125,7 +125,7 @@ class MetricsEndpointTest {
         }
 
         @Test
-        @DisplayName("exposes the query results dropped for want of a document identity")
+        @DisplayName("exposes the query results dropped for want of a chunk identity")
         void exposesUnnamedResultsDropped() throws IOException {
             long before = Metrics.getUnnamedResultsDropped();
             Metrics.recordUnnamedResultsDropped(2);

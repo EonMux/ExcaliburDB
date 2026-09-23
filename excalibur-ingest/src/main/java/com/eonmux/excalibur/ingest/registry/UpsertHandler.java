@@ -16,14 +16,14 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Handles document upsert operations including tombstoning old versions and
- * removing entries from the Cuckoo filter hierarchy.
+ * Handles document upsert operations: tombstoning the chunks of changed and deleted documents
+ * and keeping the registry in step with them.
  *
  * <h2>Upsert Logic</h2>
  * <p>On re-crawl, this handler processes:
  * <ul>
  *   <li><strong>Changed documents:</strong> Tombstone old chunks, re-chunk, re-embed, upsert new chunks</li>
- *   <li><strong>Deleted documents:</strong> Tombstone all chunks, remove from Cuckoo filter hierarchy</li>
+ *   <li><strong>Deleted documents:</strong> Tombstone all chunks, remove the registry entry</li>
  *   <li><strong>New documents:</strong> Chunk, embed, and insert (delegated to ingestion pipeline)</li>
  * </ul>
  *
@@ -47,15 +47,16 @@ import java.util.Set;
  * level is next rebuilt. The storage tombstone is the source of truth; segment filters are
  * rebuilt when the segment is compacted.</p>
  *
- * <h2>Why Tombstoning Does Not Touch the Vector Pre-Filter</h2>
- * <p>The same argument applies once more, for a different reason. A segment's LSH pre-filter is
- * keyed by HNSW node id, because that is the id space the query pipeline intersects it with, and
- * node ids are assigned by the integration worker rather than by ingestion. This handler holds
- * chunk ids and cannot derive a node id from one, so any id it computed would name an unrelated
- * node and evict a live vector's entry.</p>
- * <p>Nothing is lost by leaving it: {@code HnswGraph} re-reads every candidate it returns and
- * skips tombstoned nodes, so a stale pre-filter entry costs one node read and yields no result.
- * The entry itself is reclaimed when the segment is compacted.</p>
+ * <h2>Why Tombstoning Does Not Touch the LSH Index</h2>
+ * <p>The same argument applies once more, for a different reason. A segment's LSH index is keyed
+ * by HNSW node id, because the nodes it names are measured in the segment's graph, and node ids
+ * are assigned by the integration worker rather than by ingestion. This handler holds chunk ids
+ * and cannot derive a node id from one, so any id it computed would name an unrelated node and
+ * evict a live vector's entry.</p>
+ * <p>Nothing is lost by leaving it: the index only names extra nodes for a search to measure
+ * beside its graph walk, and {@code HnswGraph} skips a named node that is no longer active, so a
+ * stale entry costs one node read and yields no result. The entry itself is reclaimed when the
+ * segment is compacted.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is thread-safe. All operations that modify storage are performed atomically.</p>
@@ -130,8 +131,8 @@ public class UpsertHandler {
     /**
      * Creates a new UpsertHandler with hierarchical Cuckoo filter support.
      *
-     * <p>Use this constructor when you have a hierarchical filter structure.
-     * Deletions will be propagated to all levels of the hierarchy immediately.</p>
+     * <p>Use this constructor when you have a hierarchical filter structure. The filter is held
+     * for {@link #getHierarchicalFilter()} and is never deleted from; see the class javadoc.</p>
      *
      * @param registry The document registry
      * @param hierarchicalFilter The hierarchical Cuckoo filter (may be null for dry-run)
@@ -149,8 +150,8 @@ public class UpsertHandler {
     /**
      * Creates a new UpsertHandler with both flat and hierarchical filter support.
      *
-     * <p>This constructor allows both filter types. When hierarchical filter is present,
-     * it takes precedence for deletion operations.</p>
+     * <p>This constructor allows both filter types. Neither is deleted from; see the class
+     * javadoc.</p>
      *
      * @param registry The document registry
      * @param cuckooFilter The flat Cuckoo filter (fallback, may be null)
@@ -173,7 +174,6 @@ public class UpsertHandler {
      * <ol>
      *   <li>Tombstones all chunks from changed documents</li>
      *   <li>Tombstones all chunks from deleted documents</li>
-     *   <li>Removes all affected chunks from the Cuckoo filter hierarchy</li>
      *   <li>Removes deleted document metadata from the registry</li>
      * </ol>
      *
@@ -290,11 +290,12 @@ public class UpsertHandler {
     /**
      * Processes a ChangeSet against a named segment.
      *
-     * <p>It does <em>not</em> touch the Cuckoo filter hierarchy, despite what this method's name
-     * once suggested. See the class javadoc: the filter indexes terms rather than chunk ids, so
-     * deleting a document's entries from it evicts terms that live documents still contain, and a
-     * filter negative is treated by the query pipeline as ground truth. The storage tombstone is
-     * the source of truth; segment filters are rebuilt when the segment is compacted.</p>
+     * <p>It does <em>not</em> touch the Cuckoo filter hierarchy, although it is given a segment.
+     * See the class javadoc: the filter indexes terms rather than chunk ids, so deleting a
+     * document's entries from it evicts terms that live documents still contain, and a trusted
+     * level's negative sends its segment to the back of every query naming the term. The storage
+     * tombstone is the source of truth; segment filters are rebuilt when the segment is
+     * compacted.</p>
      *
      * @param changeSet The change set to process
      * @param segmentId The segment the documents' chunks were written to
@@ -385,8 +386,8 @@ public class UpsertHandler {
     /**
      * Tombstones chunks for a single deleted document and removes from registry.
      *
-     * <p>All chunks are tombstoned and removed from the Cuckoo filter.
-     * The metadata is removed from the registry.</p>
+     * <p>All chunks are tombstoned and the metadata is removed from the registry. The Cuckoo
+     * filter hierarchy is deliberately left untouched; see the class javadoc.</p>
      *
      * @param metadata The deleted document metadata
      * @param resultBuilder The result builder to record operations
@@ -406,7 +407,7 @@ public class UpsertHandler {
     /**
      * Tombstones chunks for a single changed document with segment-aware hierarchical deletion.
      *
-     * <p>Neither the Cuckoo filter hierarchy nor the vector pre-filter is touched; see the class
+     * <p>Neither the Cuckoo filter hierarchy nor the LSH index is touched; see the class
      * javadoc for why each is left to compaction.</p>
      *
      * @param changed The changed document information
@@ -427,7 +428,7 @@ public class UpsertHandler {
     /**
      * Tombstones a deleted document's chunks.
      *
-     * <p>Neither the Cuckoo filter hierarchy nor the vector pre-filter is touched; see the class
+     * <p>Neither the Cuckoo filter hierarchy nor the LSH index is touched; see the class
      * javadoc for why each is left to compaction.</p>
      *
      * @param metadata The deleted document metadata

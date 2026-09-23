@@ -12,11 +12,11 @@ import java.util.Objects;
  *       under a chunk id</li>
  *   <li>{@code DocumentRegistry} keys metadata by {@code sourceId:documentId} and stores the
  *       chunk ids that {@code UpsertHandler} later tombstones</li>
- *   <li>excalibur-shard's {@code HnswIntegrationWorker} derives a document id from the storage
- *       key by stripping the {@code :chunk:N} suffix, and registers it as the HNSW node's
- *       document id</li>
- *   <li>excalibur-query's {@code DocumentAtomicityFilter} looks that document id up in the
- *       visibility tracker</li>
+ *   <li>excalibur-shard's {@code HnswIntegrationWorker} registers the storage key - the chunk
+ *       id - as the HNSW node's name, so a vector hit is named by the chunk it matched</li>
+ *   <li>excalibur-query's {@code DocumentAtomicityFilter} derives the document key from that
+ *       chunk id by stripping the {@code :chunk:N} suffix, and looks it up in the visibility
+ *       tracker</li>
  * </ul>
  * <p>A mismatch between any two of them is silent: a reindex fails to tombstone the previous
  * version, or a query drops every result because the document was registered under a different

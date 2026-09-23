@@ -44,7 +44,7 @@ class ReindexTermFilingIntegrationTest {
 
     @Test
     @DisplayName("a term a reindex brings in is not searched last in the trusted segment holding it")
-    void aReindexedTermIsNotPruned() throws Exception {
+    void aReindexedTermIsNotSearchedLast() throws Exception {
         Path dataDir = Files.createDirectories(tempDir.resolve("data"));
         try (Arena arena = Arena.ofShared();
              StorageEngine engine = new StorageEngine(dataDir, arena)) {

@@ -783,7 +783,7 @@ public class HierarchicalCuckooFilter {
     public static final long NOT_COVERED = 0L;
 
     /**
-     * Whether this filter may be used to rule a segment out, as a stamp that changes whenever
+     * Whether this filter's silence may be taken as a segment lacking a term, as a stamp that changes whenever
      * the answer could have.
      *
      * <p>{@link #NOT_COVERED} when {@link #coversSegment(String)} would say false. Otherwise a
@@ -876,7 +876,7 @@ public class HierarchicalCuckooFilter {
     }
 
     /**
-     * Declares a segment's level refilled, so it may rule the segment out again.
+     * Declares a segment's level refilled, so its silence about a term is trusted again.
      *
      * <p>Only the rebuild that began after the latest mark may do this. A mark made while this
      * rebuild was running - a split or a compaction that changed the segment under it - means

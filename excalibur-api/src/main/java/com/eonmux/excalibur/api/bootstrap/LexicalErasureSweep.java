@@ -171,8 +171,10 @@ public final class LexicalErasureSweep implements AutoCloseable {
      * Whether a compaction now could do anything the index is waiting on.
      *
      * <p>An erasure owed, a damaged segment the index can rebuild, or a segment still in an older
-     * format. Not a damaged segment it cannot rebuild: no compaction changes that, and asking for
-     * one every sweep would only repeat the log line that already said so.</p>
+     * format. Not a damaged segment it cannot rebuild: a compaction has no names to rebuild it
+     * from, and the index removes such a segment itself, outright, the moment an erasure is
+     * recorded or found owed when it opens - so asking for a compaction every sweep would only
+     * repeat the log line that already reported the segment.</p>
      *
      * @param stats What the index says about itself
      * @return true when a compaction is worth asking for
