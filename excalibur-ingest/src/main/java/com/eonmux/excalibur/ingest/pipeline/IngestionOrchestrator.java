@@ -17,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -222,11 +223,6 @@ public class IngestionOrchestrator {
 
     /** How often shutdown re-checks whether a synchronous run has finished. */
     private static final long SHUTDOWN_POLL_MILLIS = 5;
-
-    /**
-     * How long {@link #shutdown()} waits for in-flight ingestion threads to unwind.
-     */
-    private static final long SHUTDOWN_AWAIT_MILLIS = 10_000;
 
     /**
      * Creates a new IngestionOrchestrator with required dependencies.
@@ -1010,9 +1006,17 @@ public class IngestionOrchestrator {
      * its next document boundary in time is still writing, and what it writes must stay
      * open.</p>
      *
-     * @return true if all ingestion runs finished within the shutdown timeout
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, and an embedded caller passes what its own process can spare. A run stops at its
+     * next document boundary, so a stopped run needs about one document's fetch, embedding and
+     * writes.</p>
+     *
+     * @param wait How long to wait for the runs asked to stop to end
+     * @return true if all ingestion runs finished within the wait
+     * @throws NullPointerException if wait is null
      */
-    public boolean shutdown() {
+    public boolean shutdown(Duration wait) {
+        Objects.requireNonNull(wait, "wait must not be null");
         LOGGER.info("Shutting down IngestionOrchestrator with {} active ingestions",
             activeIngestions.size());
         shutdown.set(true);
@@ -1027,17 +1031,19 @@ public class IngestionOrchestrator {
             run.stop().request();
         }
 
-        long deadline = System.nanoTime() + SHUTDOWN_AWAIT_MILLIS * 1_000_000L;
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; every use
+        // below subtracts the current time first, which undoes it.
+        long deadline = System.nanoTime() + wait.toNanos();
         boolean clean = true;
         for (Run run : ingestionThreads.values()) {
             Thread worker = run.thread();
-            long remainingMillis = (deadline - System.nanoTime()) / 1_000_000L;
-            if (remainingMillis <= 0) {
+            long remainingNanos = deadline - System.nanoTime();
+            if (remainingNanos <= 0) {
                 clean = false;
                 break;
             }
             try {
-                worker.join(remainingMillis);
+                worker.join(Duration.ofNanos(remainingNanos));
                 clean &= !worker.isAlive();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -1049,7 +1055,7 @@ public class IngestionOrchestrator {
         // run has left the storage engine alone - the question the caller is actually asking
         // before it closes the Arena.
         while (!synchronousIngestions.isEmpty()) {
-            if (System.nanoTime() >= deadline) {
+            if (deadline - System.nanoTime() <= 0) {
                 clean = false;
                 break;
             }
@@ -1062,8 +1068,8 @@ public class IngestionOrchestrator {
         }
 
         if (!clean) {
-            LOGGER.warn("Ingestion threads still running after {}ms shutdown timeout: {}",
-                SHUTDOWN_AWAIT_MILLIS, activeIngestions);
+            LOGGER.warn("Ingestion threads still running {}ms after being asked to stop: {}",
+                wait.toMillis(), activeIngestions);
         }
         return clean;
     }

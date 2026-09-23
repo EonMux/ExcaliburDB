@@ -21,6 +21,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -58,6 +59,9 @@ import static org.mockito.Mockito.when;
 class IngestionPipelineTest {
 
     private static final int DIMENSION = 8;
+
+    /** Far longer than any run here takes to reach its next document boundary. */
+    private static final Duration SHUTDOWN_WAIT = Duration.ofSeconds(30);
 
     /** Records what the orchestrator reported, in order. */
     private static final class RecordingStatus
@@ -1476,7 +1480,7 @@ class IngestionPipelineTest {
         void shutdownRefusesNewWork() {
             IngestionOrchestrator orchestrator = orchestrator();
 
-            assertThat(orchestrator.shutdown()).isTrue();
+            assertThat(orchestrator.shutdown(SHUTDOWN_WAIT)).isTrue();
             orchestrator.startIngestion(new FakeSource("docs", Map.of("a.txt", "text")));
 
             assertThat(orchestrator.isIngestionActive("docs"))
@@ -1489,8 +1493,8 @@ class IngestionPipelineTest {
         void shutdownIsIdempotent() {
             IngestionOrchestrator orchestrator = orchestrator();
 
-            assertThat(orchestrator.shutdown()).isTrue();
-            assertThat(orchestrator.shutdown()).isTrue();
+            assertThat(orchestrator.shutdown(SHUTDOWN_WAIT)).isTrue();
+            assertThat(orchestrator.shutdown(SHUTDOWN_WAIT)).isTrue();
         }
 
         @Test
@@ -1680,7 +1684,7 @@ class IngestionPipelineTest {
             orchestrator.startIngestion(source);
             assertThat(inFetch.await(30, TimeUnit.SECONDS)).isTrue();
             CompletableFuture<Boolean> shutdown = new CompletableFuture<>();
-            Thread closing = new Thread(() -> shutdown.complete(orchestrator.shutdown()),
+            Thread closing = new Thread(() -> shutdown.complete(orchestrator.shutdown(SHUTDOWN_WAIT)),
                 "closing-orchestrator");
             closing.start();
             // Released only once the shutdown is waiting for the run to end, which it does after
@@ -1699,6 +1703,42 @@ class IngestionPipelineTest {
             assertThat(storedChunkExists("closing", other, 0))
                 .as("the document the shutdown kept the run from starting")
                 .isFalse();
+        }
+
+        @Test
+        @DisplayName("shutdown waits out the whole of the wait it is given before reporting a run")
+        void shutdownWaitsAsLongAsItIsGiven() throws Exception {
+            IngestionOrchestrator orchestrator = orchestrator();
+            CountDownLatch inFetch = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            FakeSource source = new FakeSource("slow", Map.of("a.txt", "a fetch that will not "
+                + "be hurried")) {
+                @Override
+                public FetchedDocument fetch(String documentId)
+                        throws SourceException, DocumentNotFoundException {
+                    inFetch.countDown();
+                    awaitIgnoringInterrupts(release);
+                    return super.fetch(documentId);
+                }
+            };
+            orchestrator.startIngestion(source);
+            assertThat(inFetch.await(30, TimeUnit.SECONDS)).isTrue();
+            Duration wait = Duration.ofMillis(300);
+
+            long began = System.nanoTime();
+            try {
+                assertThat(orchestrator.shutdown(wait))
+                    .as("the run is inside a fetch that ignores its stop")
+                    .isFalse();
+                assertThat(Duration.ofNanos(System.nanoTime() - began))
+                    .as("the shutdown gave the run all of the wait it was handed")
+                    .isGreaterThanOrEqualTo(wait);
+            } finally {
+                release.countDown();
+            }
+            assertThat(orchestrator.shutdown(SHUTDOWN_WAIT))
+                .as("given longer, the shutdown sees the run end")
+                .isTrue();
         }
 
         /**
@@ -1859,7 +1899,7 @@ class IngestionPipelineTest {
             caller.start();
             assertThat(inFlight.await(30, TimeUnit.SECONDS)).isTrue();
 
-            orchestrator.shutdown();
+            orchestrator.shutdown(SHUTDOWN_WAIT);
 
             assertThat(runFinished)
                 .as("shutdown returned while the run was still going, so its caller is about to "

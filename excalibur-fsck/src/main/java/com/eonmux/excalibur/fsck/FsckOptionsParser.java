@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.fsck;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
 
@@ -100,16 +101,29 @@ public final class FsckOptionsParser {
      *
      * <p>Beside the data directory rather than inside it: a directory that grows a
      * subdirectory of damaged files is one whose next backup, next disk-usage alarm and
-     * next recursive copy all include them.</p>
+     * next recursive copy all include them. Beside the directory the data is really in,
+     * when it is named through a link, so the quarantine is on the data's own filesystem
+     * and a repair moves a file by renaming it rather than copying it across.</p>
+     *
+     * <p>A directory with no parent - a filesystem root - has nowhere beside it, and the
+     * default is then inside it. That is not quietly corrected here: the run refuses a
+     * quarantine inside the data directory, and says to name one.</p>
      *
      * @param dataDirectory The directory being checked
      * @return A timestamped sibling directory
      */
     private static Path defaultQuarantine(Path dataDirectory) {
-        Path absolute = dataDirectory.toAbsolutePath().normalize();
-        Path parent = absolute.getParent();
+        Path real;
+        try {
+            real = QuarantineLocation.canonical(dataDirectory);
+        } catch (IOException e) {
+            // Unresolvable - a link loop, an unreadable directory on the way. The run reports
+            // that about the data directory itself; the path as spelled serves until then.
+            real = dataDirectory.toAbsolutePath().normalize();
+        }
+        Path parent = real.getParent();
         String name = DEFAULT_QUARANTINE_PREFIX + Instant.now().toEpochMilli();
-        return parent != null ? parent.resolve(name) : absolute.resolve(name);
+        return parent != null ? parent.resolve(name) : real.resolve(name);
     }
 
     /**
@@ -131,10 +145,13 @@ public final class FsckOptionsParser {
                                        no repair ever deletes anything.
               --quarantine-dir=<path>  Where damaged files are moved to. Defaults to a
                                        timestamped directory beside the data directory,
-                                       whose parent must then be writable. On another
-                                       filesystem a file, or a lexical segment's whole
-                                       directory, is copied, compared, and only then
-                                       removed from the data directory.
+                                       whose parent must then be writable. Must be outside
+                                       the data directory once links are followed; one
+                                       inside it is refused with exit code 2, as is the
+                                       default for a data directory at a filesystem root.
+                                       On another filesystem a file, or a lexical
+                                       segment's whole directory, is copied, compared, and
+                                       only then removed from the data directory.
               --json                   Emit the report as JSON instead of text.
               --strict                 Exit non-zero when any file could not be verified, not
                                        only when one is damaged.

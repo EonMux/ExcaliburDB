@@ -129,7 +129,7 @@ class DocumentErasureIntegrationTest {
     @AfterEach
     void tearDown() {
         if (orchestrator != null) {
-            orchestrator.shutdown();
+            orchestrator.shutdown(Duration.ofSeconds(30));
         }
         if (lexical != null) {
             lexical.close();

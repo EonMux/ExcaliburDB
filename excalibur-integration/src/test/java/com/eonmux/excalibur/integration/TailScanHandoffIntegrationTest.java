@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -116,7 +117,7 @@ class TailScanHandoffIntegrationTest {
     @AfterEach
     void tearDown() {
         if (orchestrator != null) {
-            orchestrator.shutdown();
+            orchestrator.shutdown(Duration.ofSeconds(30));
         }
         if (storage != null) {
             try {

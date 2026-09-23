@@ -1052,8 +1052,10 @@ id whatever version it came from, so a replacement withdraws everything staged f
 exactly as `/v1/erasure` does, labels excepted — before it stages what the new version says. The
 graph being served keeps what it was built from until the next `POST /v1/graph/build`, which no
 longer holds the earlier version's facts. A withdrawal rewrites the namespace's staging logs, so
-it is paid per replaced or removed document that had facts staged; one that fails is logged and counted in
-`graph.ingest.withdrawalFailures` on `/v1/stats`, and the new facts are staged regardless. Two
+it is paid per replaced or removed document that had facts staged; one that fails is logged, counted in
+`graph.ingest.withdrawalFailures` on `/v1/stats` and retried until it is made, and the new
+version's facts are not staged, since the retry withdraws by document and would take them with the
+old ones. Two
 versions of one document published in quick succession are reported to the graph in the order
 they were published, and a version already superseded when its turn comes is skipped.
 
@@ -2524,7 +2526,9 @@ across namespaces, never a row per namespace — which namespace owes what is
 - `budget` sets two shares against each limit. `graphMappings` and `graphDescriptors` are what eviction can give back; `processMappings` and `processDescriptors` are the whole process — segments, vector graphs, the chunk index and the JVM itself — which is what the kernel limit is measured against. Graph eviction starts when the whole process crosses `mappingHighWater`. A process figure is `null` where the platform cannot be asked, and `descriptorLimit` is `0` where no descriptor limit is enforced.
 - `builds` counts builds since startup by how they ended. A cancelled build is one somebody asked to stop, not a failure.
 - `erasure` is the graph's erasure backlog across every namespace on disk, resident or not. Compare `oldestAgeMs` against `excalibur.graph.erasure-max-latency-seconds`; `overdueNamespaces` is how many have already missed it. `unreadableNamespaces` are namespaces whose log could not be read, and so are in none of the other figures. `oldestAgeMs` is `null` when nothing is owed. The block is absent when the graph root cannot be listed, which is not the same as owing nothing.
-- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures`, `tenantFailures` and `sinkRefusals` are documents that were published and are searchable but whose facts never reached the graph. `sinkRefusals` counts documents the graph sink failed on outright rather than under one of the other three reasons, a reindex's removals included — those keep their staged facts until the document is erased; any non-zero value is worth a look in the log. None of these documents is offered to the graph again unless it changes. Nothing else shows that. `withdrawalFailures` counts replaced or removed documents whose earlier staged facts could not be withdrawn, so the next build publishes them beside the new version's, or for a document a reindex removed; the log names each one.
+- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures` and `tenantFailures` count documents the graph did not take: no registered source named their namespace, the extractor failed on them, or their namespace would not open. A published one among them is searchable and its facts are missing, and it is not offered to the graph again unless it changes; nothing else shows that. A replaced or removed one whose namespace would not open still owes the withdrawal of what was staged from it: that is handed to the namespace when it next opens, which the erasure sweep keeps trying, and only a restart before then loses it — the log says so at `ERROR`, naming the document.
+- `sinkRefusals` counts reports the graph sink threw on instead of counting under one of those reasons. It should stay `0`: the sink is required to absorb its own failures, and one that throws has left a published document's facts missing, or a removed document's staged facts neither withdrawn nor owed. The log names each document.
+- `withdrawalFailures` counts the times a replaced or removed document's staged facts could not be withdrawn when it was reported. None of them is dropped. Each is recorded in the namespace's `graph-staging/withdrawals.log` and retried until it is made: when the namespace next opens, on the erasure sweep over the namespaces that are resident, before every build, and whenever the document is reported again. Nothing newer is staged for that document until then, because the retry withdraws by document and would take a newer version's facts with the old ones. A build tries the withdrawal first and, if it is still refused, publishes what the document used to say, so a figure that keeps climbing means the staging logs are refusing to be rewritten; the log names each document.
 
 ### Reclaim space now
 
@@ -2717,7 +2721,7 @@ Everything exported is a figure the node already measures; nothing here is estim
 | `excalibur_mappings{scope="graphs"\|"process"}`, `_high_water`, `_limit`; `excalibur_descriptors{scope=...}`, `_high_water`, `_limit` | gauge | The tenant budget. `scope="process"` is omitted where it cannot be measured, and the descriptor mark and limit where no limit is enforced |
 | `excalibur_graph_erasure_obligations`, `excalibur_graph_erasure_namespaces{state="owing"\|"overdue"\|"unreadable"}`, `excalibur_graph_erasure_oldest_age_seconds` | gauge | The graph erasure backlog, totalled across namespaces |
 | `excalibur_graph_ingest_documents_total`, `_facts_staged_total`, `excalibur_graph_ingest_failures_total{reason="unresolved_source"\|"extraction"\|"namespace_unavailable"\|"sink_refused"}` | counter | Documents whose facts did not reach the graph |
-| `excalibur_graph_ingest_withdrawal_failures_total` | counter | Replaced or removed documents whose earlier staged facts could not be withdrawn |
+| `excalibur_graph_ingest_withdrawal_failures_total` | counter | Withdrawals of a replaced or removed document's staged facts that failed and are retried |
 | `excalibur_node_draining`, `excalibur_uptime_seconds`, `excalibur_build_info{version,jvm}` | gauge | Whether an operator has drained the node, how long it has been up, and which build it is |
 
 Five alerts worth having, in ascending order of how quietly the condition fails:
@@ -3000,7 +3004,13 @@ the tool writes, stating each write before it makes it, and **no repair ever del
 
 The quarantine is a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another; the default needs the data directory's parent to be
-writable. A quarantine on another filesystem works as well: a rename cannot cross, so each file is
+writable, and for a data directory named through a symbolic link it is beside the directory the
+link points at. The quarantine must be outside the data directory once symbolic links and `..` are
+followed. One inside it, or the data directory itself, is refused with exit code `2` before
+anything is read. A check is refused as well as a repair, because the scan skips the quarantine
+and would pass over whatever lies under it. A data directory at a filesystem root has nothing
+beside it, so there the quarantine has to be named. A quarantine on another filesystem works as
+well: a rename cannot cross, so each file is
 copied, forced to disk and compared byte for byte before the original is removed. A damaged lexical
 segment is a directory, and it crosses whole: every file in it is copied and forced, the copy is
 checked to hold exactly the same entries with the same bytes, and only then is it published in the
@@ -3241,6 +3251,7 @@ import com.eonmux.excalibur.vector.hnsw.HnswConfigFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoint)
@@ -3337,7 +3348,7 @@ static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoi
             } finally {
                 // Stop taking work before the storage underneath it closes.
                 pipeline.shutdown();
-                ingestion.shutdown();
+                ingestion.shutdown(Duration.ofSeconds(30));
             }
         }
     }

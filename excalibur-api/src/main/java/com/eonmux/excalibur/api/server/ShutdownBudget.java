@@ -9,14 +9,14 @@ import java.util.function.LongSupplier;
  * The one deadline a node's shutdown runs against, and how it is shared between the steps.
  *
  * <h2>Why one deadline</h2>
- * <p>Every wait in a shutdown used to be its own constant: the listener's grace, a minute for a
- * reindex to stop, a minute for a compaction, a minute for a graph build, the request drain, the
- * erasure sweeps. Run one after another their worst case was minutes, while a supervisor sends
- * SIGKILL after its stop timeout - and the steps that actually make the stop worth waiting for,
- * the publish of the chunk index's buffer and the forcing of staged graph facts and the document
- * registry, run after all of them. A kill during the drains lost exactly those. With one
- * deadline the worst case is a number, {@link #KEY_TIMEOUT}, that a stop timeout can be set
- * from.</p>
+ * <p>A supervisor sends SIGKILL after its stop timeout, and the steps that make the stop worth
+ * waiting for - the publish of the chunk index's buffer and the forcing of staged graph facts
+ * and the document registry - run after every drain. Waits of their own, one per drain, would
+ * add up to a worst case nobody configured, and a kill during the drains would lose exactly
+ * those writes. With one deadline the worst case is a number, {@link #KEY_TIMEOUT}, that a stop
+ * timeout can be set from; and because every drain waits what this leaves it rather than a
+ * figure of its own, a longer budget buys a slow drain a longer wait instead of only ever
+ * cutting a fixed one short.</p>
  *
  * <h2>The reserve</h2>
  * <p>{@link #DURABILITY_RESERVE} of the total is held back from the drains for the writes that
@@ -61,7 +61,6 @@ public final class ShutdownBudget {
 
     private final long deadlineNanos;
     private final long drainsEndNanos;
-    private final boolean bounded;
     private final LongSupplier clock;
 
     /**
@@ -82,14 +81,6 @@ public final class ShutdownBudget {
         long now = clock.getAsLong();
         this.deadlineNanos = now + total.toNanos();
         this.drainsEndNanos = deadlineNanos - DURABILITY_RESERVE.toNanos();
-        this.bounded = true;
-    }
-
-    private ShutdownBudget() {
-        this.clock = System::nanoTime;
-        this.deadlineNanos = Long.MAX_VALUE;
-        this.drainsEndNanos = Long.MAX_VALUE;
-        this.bounded = false;
     }
 
     /**
@@ -101,18 +92,6 @@ public final class ShutdownBudget {
      */
     public static ShutdownBudget startingNow(Duration total) {
         return new ShutdownBudget(total, System::nanoTime);
-    }
-
-    /**
-     * A budget that bounds nothing, leaving every step the wait it has of its own.
-     *
-     * <p>For a caller that stops a server outside a node's shutdown - an embedder, a test - and
-     * has no supervisor counting down behind it.</p>
-     *
-     * @return The unbounded budget
-     */
-    public static ShutdownBudget unbounded() {
-        return new ShutdownBudget();
     }
 
     /**
@@ -145,15 +124,6 @@ public final class ShutdownBudget {
                 + MIN_TIMEOUT_SECONDS + "-" + MAX_TIMEOUT_SECONDS + ": " + seconds);
         }
         return Duration.ofSeconds(seconds);
-    }
-
-    /**
-     * Whether this budget bounds anything.
-     *
-     * @return false for {@link #unbounded()}
-     */
-    public boolean isBounded() {
-        return bounded;
     }
 
     /**
@@ -203,10 +173,8 @@ public final class ShutdownBudget {
     }
 
     private Duration until(long endNanos) {
-        if (endNanos == Long.MAX_VALUE) {
-            return Duration.ofNanos(Long.MAX_VALUE);
-        }
         long left = endNanos - clock.getAsLong();
+
         return left <= 0 ? Duration.ZERO : Duration.ofNanos(left);
     }
 }

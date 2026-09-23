@@ -1,9 +1,6 @@
 package com.eonmux.excalibur.ingest.graph;
 
-import com.eonmux.excalibur.graph.erasure.ErasureScope;
-import com.eonmux.excalibur.graph.erasure.ScopedStagedErasure;
 import com.eonmux.excalibur.graph.provenance.Provenance;
-import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 
@@ -41,6 +38,11 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>A document removed outright is withdrawn the same way, with nothing staged after it.</p>
  *
+ * <p>A withdrawal that fails is owed rather than dropped: {@link StagedWithdrawals} records it and
+ * retries it until it is made, and nothing newer is staged for the document in the meantime,
+ * since the retry withdraws by document and would take a newer version's facts with the old
+ * ones.</p>
+ *
  * <p>The withdrawal rewrites the staging logs, reading them whole, and holds the staging store's
  * append lock while it does. That is paid once per replaced or removed document -
  * a log with nothing to remove is scanned and left alone - and never for a document seen for the
@@ -65,6 +67,7 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     private static final long MILLIS_PER_DAY = 86_400_000L;
 
     private final GraphStagingStore staging;
+    private final StagedWithdrawals withdrawals;
     private final RelationExtractor extractor;
 
     private final AtomicLong documentsSeen = new AtomicLong();
@@ -76,31 +79,58 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     private final AtomicLong withdrawalFailures = new AtomicLong();
 
     /**
-     * Creates a sink.
+     * Creates a sink over a store whose owed withdrawals nothing records beyond this sink's life.
      *
      * @param staging   Where facts accumulate between graph builds
      * @param extractor Finds the facts; {@link RelationExtractor#none()} disables extraction
      */
     public StagingGraphIngestSink(GraphStagingStore staging, RelationExtractor extractor) {
-        this.staging = Objects.requireNonNull(staging, "staging must not be null");
+        this(StagedWithdrawals.inMemory(staging), extractor);
+    }
+
+    /**
+     * Creates a sink that stages into the store its withdrawals are made from.
+     *
+     * @param withdrawals The withdrawals owed against the staging store, which is where facts
+     *                    accumulate between graph builds
+     * @param extractor   Finds the facts; {@link RelationExtractor#none()} disables extraction
+     */
+    public StagingGraphIngestSink(StagedWithdrawals withdrawals, RelationExtractor extractor) {
+        this.withdrawals = Objects.requireNonNull(withdrawals, "withdrawals must not be null");
+        this.staging = withdrawals.staging();
         this.extractor = Objects.requireNonNull(extractor, "extractor must not be null");
     }
 
+    /**
+     * Stages a published document's facts, first making any withdrawal still owed for it.
+     *
+     * <p>A document this node did not hold can still owe one: a removal whose withdrawal failed,
+     * published again once its source listed it again. When that withdrawal fails once more,
+     * nothing is staged, for the reason {@link #onDocumentReplaced} gives.</p>
+     *
+     * @param documentKey        The source-qualified document key
+     * @param text               The document's text
+     * @param lastModifiedMillis The document's own date, or 0 when unknown
+     */
     @Override
     public void onDocumentPublished(String documentKey, String text, long lastModifiedMillis) {
         if (documentKey == null || documentKey.isBlank() || text == null || text.isBlank()) {
             return;
         }
         documentsSeen.incrementAndGet();
-        stageFacts(documentKey, text, lastModifiedMillis);
+        // Outside the document's lock: extraction may be a model call, and that lock is what a
+        // retry of an owed withdrawal waits on.
+        List<ExtractedTriple> triples = extract(documentKey, text);
+        counted(documentKey, withdrawals.stage(documentKey,
+            () -> stageFacts(triples, text, lastModifiedMillis)));
     }
 
     /**
      * Withdraws what was staged from the document's earlier version, then stages this one.
      *
-     * <p>A failed withdrawal is counted and logged and the new version is staged regardless:
-     * its facts are true of the published document, and leaving them out would add a missing
-     * fact to the stale one.</p>
+     * <p>A withdrawal that fails is counted, logged and owed, and the new version is not staged:
+     * the owed withdrawal is retried by document rather than by version, so it would take the
+     * new facts with the old ones - and until it did, the next build would publish both.</p>
      *
      * @param documentKey        The source-qualified document key
      * @param text               The new version's text
@@ -111,14 +141,19 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
         if (documentKey == null || documentKey.isBlank()) {
             return;
         }
-        withdraw(documentKey);
-        onDocumentPublished(documentKey, text, lastModifiedMillis);
+        boolean hasText = text != null && !text.isBlank();
+        if (hasText) {
+            documentsSeen.incrementAndGet();
+        }
+        List<ExtractedTriple> triples = hasText ? extract(documentKey, text) : List.of();
+        counted(documentKey, withdrawals.withdraw(documentKey,
+            () -> stageFacts(triples, text, lastModifiedMillis)));
     }
 
     /**
      * Withdraws what was staged from a document this node no longer holds.
      *
-     * <p>A failed withdrawal is counted and logged, as a replacement's is.</p>
+     * <p>A failed withdrawal is counted, logged and owed, as a replacement's is.</p>
      *
      * @param documentKey The source-qualified document key
      */
@@ -134,27 +169,28 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
      * Removes every staged fact and snippet extracted from a document, whatever its version.
      *
      * @param documentKey The document
-     * @return How many records were removed, or -1 when the withdrawal failed
+     * @return How many records were removed, or -1 when the withdrawal failed and is owed
      */
     public long withdraw(String documentKey) {
-        try {
-            GraphStagingStore.EraseResult result = staging.erase(ScopedStagedErasure.of(
-                new ErasureScope.Source(SourceType.DOCUMENT,
-                    LlmRelationExtractor.sourceIdOf(documentKey))));
-            recordsWithdrawn.addAndGet(result.removed());
-            if (result.removed() > 0) {
-                LOGGER.debug("withdrew {} fact(s) and {} snippet(s) staged from earlier "
-                    + "versions of {}", result.factsRemoved(), result.snippetsRemoved(),
-                    documentKey);
-            }
-            return result.removed();
-        } catch (IOException | RuntimeException e) {
+        StagedWithdrawals.Result result = withdrawals.withdraw(documentKey, null);
+        counted(documentKey, result);
+        return result.owed() ? -1 : result.removed();
+    }
+
+    /**
+     * Counts what a withdrawal did.
+     *
+     * @param documentKey The document, for the log line
+     * @param result      What the withdrawal did
+     */
+    private void counted(String documentKey, StagedWithdrawals.Result result) {
+        if (result.owed()) {
             withdrawalFailures.incrementAndGet();
-            LOGGER.warn("could not withdraw the facts staged from earlier versions of {}; "
-                + "the next graph build will publish them as though the document still said "
-                + "them: {}", documentKey, e.toString());
-            return -1;
+            LOGGER.warn("the facts staged from earlier versions of {} are still to be withdrawn; "
+                + "nothing newer is staged for it until they are", documentKey);
+            return;
         }
+        recordsWithdrawn.addAndGet(result.removed());
     }
 
     @Override
@@ -193,27 +229,39 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     }
 
     /**
-     * Extracts and stages the document's facts.
+     * Extracts a document's facts.
      *
-     * @param documentKey        The document
-     * @param text               Its text
-     * @param lastModifiedMillis The document's own date, or 0 when unknown
+     * @param documentKey The document
+     * @param text        Its text
+     * @return The facts, empty when there are none or the extractor failed
      */
-    private void stageFacts(String documentKey, String text, long lastModifiedMillis) {
-        List<ExtractedTriple> triples;
+    private List<ExtractedTriple> extract(String documentKey, String text) {
         try {
-            triples = extractor.extract(documentKey, text);
+            List<ExtractedTriple> triples = extractor.extract(documentKey, text);
+            return triples == null ? List.of() : triples;
         } catch (RuntimeException e) {
             extractionFailures.incrementAndGet();
             LOGGER.warn("could not extract facts from {}: {}", documentKey, e.toString());
-            return;
+            return List.of();
         }
-        if (triples == null || triples.isEmpty()) {
+    }
+
+    /**
+     * Stages a document's extracted facts and the text they were found in.
+     *
+     * @param triples            The facts
+     * @param text               The document's text
+     * @param lastModifiedMillis The document's own date, or 0 when unknown
+     */
+    private void stageFacts(List<ExtractedTriple> triples, String text,
+                            long lastModifiedMillis) {
+        if (triples.isEmpty()) {
             return;
         }
         stage(statedOn(triples, lastModifiedMillis));
         recordEntityText(triples, text);
     }
+
 
     /**
      * Dates every fact the extractor left undated with the day its document was written.
@@ -349,10 +397,11 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     }
 
     /**
-     * How many replaced or removed documents' earlier facts could not be withdrawn.
+     * How many times a replaced or removed document's earlier facts could not be withdrawn.
      *
-     * <p>Each one leaves what an earlier version said staged for the next build to publish, beside
-     * what the document says now or in place of a document that is gone.</p>
+     * <p>Each such withdrawal is owed from then on, retried until it is made, and nothing newer
+     * is staged for the document meanwhile; a build before it is made publishes what an earlier
+     * version said.</p>
      *
      * @return The count
      */

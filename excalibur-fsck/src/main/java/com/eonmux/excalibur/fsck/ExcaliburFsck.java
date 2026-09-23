@@ -16,7 +16,9 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
+import java.util.OptionalInt;
 
 /**
  * Offline integrity check and repair for an ExcaliburDB data directory.
@@ -77,7 +79,40 @@ public final class ExcaliburFsck {
                 + "the same as nothing being wrong.");
             return FsckExit.USAGE;
         }
-        return execute(options, out, err);
+        return refusesQuarantine(options, err).orElseGet(() -> execute(options, out, err));
+    }
+
+    /**
+     * Refuses a quarantine that lies inside the data directory, once links are followed.
+     *
+     * <p>Refused for a check as well as a repair. A repair would move damaged files to a place
+     * still inside the directory it is repairing; a check skips the quarantine's subtree, so
+     * one inside the data directory hides whatever lives under it from the check. Either way
+     * the answer would be about a different directory than the one asked about. A usage error,
+     * since the command line is what has to change.</p>
+     *
+     * @param options What was asked for
+     * @param err     Where the refusal is written
+     * @return The exit code if refused, or empty to go on
+     */
+    private static OptionalInt refusesQuarantine(FsckOptions options, PrintStream err) {
+        Path quarantine = options.quarantineDirectory();
+        try {
+            if (!QuarantineLocation.isInside(options.dataDirectory(), quarantine)) {
+                return OptionalInt.empty();
+            }
+            err.println("The quarantine directory " + quarantine + " resolves to "
+                + QuarantineLocation.canonical(quarantine) + ", inside the data directory "
+                + QuarantineLocation.canonical(options.dataDirectory()) + ". Files moved there "
+                + "would still be in the directory being checked, so nothing was checked. Name "
+                + "one outside it with --quarantine-dir=<path>.");
+            return OptionalInt.of(FsckExit.USAGE);
+        } catch (IOException e) {
+            err.println("Could not tell whether the quarantine directory " + quarantine
+                + " lies inside the data directory " + options.dataDirectory()
+                + ", so nothing was checked: " + e);
+            return OptionalInt.of(FsckExit.FAILED);
+        }
     }
 
     /**

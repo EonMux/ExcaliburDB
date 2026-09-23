@@ -147,11 +147,10 @@ class LexicalErasureSweepTest {
         @DisplayName("tells a compaction in flight to stop, without interrupting it")
         void signalsTheCompactionInFlight() throws Exception {
             StoppableIndex index = new StoppableIndex(true);
-            LexicalErasureSweep sweep = new LexicalErasureSweep(index, key -> null, 0, 60_000,
-                Duration.ofSeconds(30));
+            LexicalErasureSweep sweep = new LexicalErasureSweep(index, key -> null, 0, 60_000);
             index.entered.await();
 
-            assertThat(sweep.drain()).as("the compaction acted on the stop and ended").isTrue();
+            assertThat(sweep.drain(Duration.ofSeconds(30))).as("the compaction acted on the stop and ended").isTrue();
             assertThat(index.sawStop.get()).isTrue();
             assertThat(index.interrupted.get())
                 .as("an interrupt would close the channels the index shares with queries")
@@ -164,12 +163,16 @@ class LexicalErasureSweepTest {
         @DisplayName("reports a compaction that outlives the wait, so storage is left open")
         void reportsACompactionStillRunning() throws Exception {
             StoppableIndex index = new StoppableIndex(false);
-            LexicalErasureSweep sweep = new LexicalErasureSweep(index, key -> null, 0, 60_000,
-                Duration.ofMillis(1));
+            LexicalErasureSweep sweep = new LexicalErasureSweep(index, key -> null, 0, 60_000);
             index.entered.await();
+            Duration wait = Duration.ofMillis(300);
 
+            long began = System.nanoTime();
             try {
-                assertThat(sweep.drain()).isFalse();
+                assertThat(sweep.drain(wait)).isFalse();
+                assertThat(Duration.ofNanos(System.nanoTime() - began))
+                    .as("the compaction was given all of the wait the drain was handed")
+                    .isGreaterThanOrEqualTo(wait);
             } finally {
                 index.release.countDown();
             }
@@ -183,9 +186,9 @@ class LexicalErasureSweepTest {
         @DisplayName("an idle sweep drains at once")
         void idleSweepDrains() {
             LexicalErasureSweep sweep = new LexicalErasureSweep(new RecordingIndex(0),
-                key -> null, 60_000, 60_000, Duration.ofSeconds(30));
+                key -> null, 60_000, 60_000);
 
-            assertThat(sweep.drain()).isTrue();
+            assertThat(sweep.drain(Duration.ofSeconds(30))).isTrue();
         }
     }
 

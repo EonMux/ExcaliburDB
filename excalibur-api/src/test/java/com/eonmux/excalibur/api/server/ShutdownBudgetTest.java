@@ -99,16 +99,6 @@ class ShutdownBudgetTest {
         }
 
         @Test
-        @DisplayName("an unbounded budget leaves every step its own wait")
-        void unboundedLeavesWaitsAlone() {
-            ShutdownBudget unbounded = ShutdownBudget.unbounded();
-
-            assertThat(unbounded.isBounded()).isFalse();
-            assertThat(unbounded.bound(Duration.ofSeconds(60))).isEqualTo(Duration.ofSeconds(60));
-            assertThat(unbounded.forDrains()).isGreaterThan(Duration.ofDays(1));
-        }
-
-        @Test
         @DisplayName("a total no larger than the reserve is refused")
         void aTotalInsideTheReserveIsRefused() {
             assertThatThrownBy(() -> new ShutdownBudget(ShutdownBudget.DURABILITY_RESERVE,

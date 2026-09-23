@@ -18,6 +18,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -83,14 +84,8 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ReindexEndpoint.class);
 
-    /**
-     * How long {@link #drain()} waits for the reindexes it has asked to stop to end.
-     *
-     * <p>A stopped run finishes the document it is writing and writes out what it got through,
-     * so this bounds one document's fetch, embedding and writes plus a registry write - not the
-     * rest of the crawl.</p>
-     */
-    private static final int SHUTDOWN_TIMEOUT_SECONDS = 60;
+    /** What {@link #close()} waits for: whatever it asked to stop, for as long as that takes. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     private final SourceRegistry sourceRegistry;
     private final ReindexStatusRegistry reindexStatusRegistry;
@@ -562,9 +557,16 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
      * each finishes the document it is on and writes out what it got through, so the next
      * reindex picks up where it left off.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, so a longer budget is a longer wait. A stopped run finishes one document's fetch,
+     * embedding and writes plus a registry write, not the rest of the crawl.</p>
+     *
+     * @param wait How long to wait for the runs asked to stop to end
      * @return true if no reindex is still running
+     * @throws NullPointerException if wait is null
      */
-    public boolean drain() {
+    public boolean drain(Duration wait) {
+        Objects.requireNonNull(wait, "wait must not be null");
         coordinator.stopAccepting();
         if (reindexExecutor != null) {
             reindexExecutor.shutdown();
@@ -573,18 +575,22 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         if (asked > 0) {
             LOGGER.info("Asked {} running reindex(es) to stop for shutdown", asked);
         }
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SHUTDOWN_TIMEOUT_SECONDS);
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds, which the
+        // subtraction in remainingNanos undoes: the difference is still the wait.
+        long deadline = System.nanoTime() + wait.toNanos();
         try {
-            boolean idle = coordinator.awaitIdle(remainingMillis(deadline));
+            // Rounded up, so the run is never given less than the wait it was promised.
+            boolean idle = coordinator.awaitIdle(
+                Math.ceilDiv(remainingNanos(deadline), TimeUnit.MILLISECONDS.toNanos(1)));
             boolean terminated = reindexExecutor == null
-                || reindexExecutor.awaitTermination(remainingMillis(deadline),
-                    TimeUnit.MILLISECONDS);
+                || reindexExecutor.awaitTermination(remainingNanos(deadline),
+                    TimeUnit.NANOSECONDS);
             if (idle && terminated) {
                 return true;
             }
-            LOGGER.error("{} reindex(es) still running {}s after being asked to stop; the "
+            LOGGER.error("{} reindex(es) still running {}ms after being asked to stop; the "
                     + "storage they write into must stay open", coordinator.inFlightCount(),
-                SHUTDOWN_TIMEOUT_SECONDS);
+                wait.toMillis());
             return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -593,18 +599,20 @@ public class ReindexEndpoint implements HttpHandler, AutoCloseable {
         }
     }
 
-    /** Milliseconds left before a deadline read from {@link System#nanoTime()}, never negative. */
-    private static long remainingMillis(long deadline) {
-        return Math.max(0, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()));
+    /** Nanoseconds left before a deadline read from {@link System#nanoTime()}, never negative. */
+    private static long remainingNanos(long deadline) {
+        return Math.max(0, deadline - System.nanoTime());
     }
 
     /**
-     * As {@link #drain()}, for a caller with no use for the answer.
+     * As {@link #drain(Duration)}, waiting for as long as the runs take to stop, for an owner
+     * with no deadline and no use for the answer - the way {@code ExecutorService.close} waits.
      */
     @Override
     public void close() {
-        drain();
+        drain(UNTIL_STOPPED);
     }
+
 
     // ==================== Inner Classes ====================
 

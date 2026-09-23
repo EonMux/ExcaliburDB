@@ -9,6 +9,7 @@ import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.erasure.ServedArtifactEraser;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.ingest.graph.StagedWithdrawals;
 import com.eonmux.excalibur.retrieval.build.GraphDirectoryBuilder;
 import com.eonmux.excalibur.retrieval.lexical.DerivedArtifactEraser;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -83,17 +84,20 @@ public final class GraphTenant implements AutoCloseable {
     private final NamespaceId id;
     private final Path directory;
     private final GraphStagingStore staging;
+    private final StagedWithdrawals withdrawals;
     private final ErasureLog erasureLog;
     private final GraphRagHolder holder;
     private final GraphBuildService buildService;
     private final GraphErasureService erasureService;
 
     private GraphTenant(NamespaceId id, Path directory, GraphStagingStore staging,
-                        ErasureLog erasureLog, GraphRagHolder holder,
-                        GraphBuildService buildService, GraphErasureService erasureService) {
+                        StagedWithdrawals withdrawals, ErasureLog erasureLog,
+                        GraphRagHolder holder, GraphBuildService buildService,
+                        GraphErasureService erasureService) {
         this.id = id;
         this.directory = directory;
         this.staging = staging;
+        this.withdrawals = withdrawals;
         this.erasureLog = erasureLog;
         this.holder = holder;
         this.buildService = buildService;
@@ -106,7 +110,8 @@ public final class GraphTenant implements AutoCloseable {
      * <p>Staging and the erasure log are opened either way: a tenant has to be able to accumulate
      * facts and accept obligations before its first build, and both must survive the builds that
      * replace the store directory wholesale - which is why they live beside it rather than in
-     * it.</p>
+     * it. So is the record of the withdrawals staging still owes, and whatever it holds is made
+     * before the tenant is handed out.</p>
      *
      * @param id        The namespace
      * @param directory Where its graph is served from
@@ -130,6 +135,11 @@ public final class GraphTenant implements AutoCloseable {
         try {
             GraphStagingStore staging = GraphStagingStore.open(stagingDirectory);
             opened.push(staging);
+
+            StagedWithdrawals withdrawals = StagedWithdrawals.open(
+                staging, stagingDirectory.resolve(StagedWithdrawals.LOG_FILE));
+            opened.push(withdrawals);
+            retryWithdrawals(id, withdrawals);
 
             ErasureLog erasureLog = ErasureLog.open(stagingDirectory.resolve(ERASURE_LOG));
             opened.push(erasureLog);
@@ -176,8 +186,8 @@ public final class GraphTenant implements AutoCloseable {
                 id, directory, staging.stagedCount(), holder.isPresent() ? "present"
                     : erasureService.servingWithheld() ? "withheld until an interrupted erasure "
                     + "is applied" : "not built");
-            return new GraphTenant(id, directory, staging, erasureLog, holder, buildService,
-                erasureService);
+            return new GraphTenant(id, directory, staging, withdrawals, erasureLog, holder,
+                buildService, erasureService);
         } catch (IOException | RuntimeException e) {
             // Everything opened so far, released in reverse. A half-opened tenant would leave
             // mappings and file handles behind on a failure the caller is going to retry.
@@ -254,6 +264,25 @@ public final class GraphTenant implements AutoCloseable {
             LOGGER.error("graph tenant {} could not apply its outstanding erasure(s), so its "
                 + "graph is not served until a later compaction does: {}", id, e.toString());
         }
+    }
+
+    /**
+     * Makes the withdrawals a tenant's staging still owes, logging what is left.
+     *
+     * <p>Never fails the caller: what is not made now stays owed and is tried again.</p>
+     *
+     * @param id          The namespace, for the log line
+     * @param withdrawals What its staging owes
+     * @return How many are still owed
+     */
+    static int retryWithdrawals(NamespaceId id, StagedWithdrawals withdrawals) {
+        int owed = withdrawals.retry();
+        if (owed > 0) {
+            LOGGER.warn("graph tenant {} still owes {} withdrawal(s) of staged facts; they are "
+                + "retried by the sweep, before every build and when the tenant next opens",
+                id, owed);
+        }
+        return owed;
     }
 
     /**
@@ -476,6 +505,10 @@ public final class GraphTenant implements AutoCloseable {
         Objects.requireNonNull(cancelRequested, "cancelRequested must not be null");
         // Scoped to this thread and closed here, so the pool thread that runs the next build
         // does not inherit a signal set for this one.
+        // First, because a build publishes whatever staging holds: a withdrawal still owed is
+        // what a document used to say, and building before it is made serves that for as long
+        // as the build does.
+        retryWithdrawals(id, withdrawals);
         try (BuildCancellation.Scope ignored = BuildCancellation.scope(cancelRequested)) {
             return buildService.build();
         }
@@ -499,11 +532,22 @@ public final class GraphTenant implements AutoCloseable {
         return staging;
     }
 
+    /**
+     * The withdrawals from this tenant's staging that are owed, and how ingestion makes them.
+     *
+     * @return The withdrawals, over {@link #staging()}
+     */
+    public StagedWithdrawals withdrawals() {
+        return withdrawals;
+    }
+
     @Override
     public void close() {
         closeQuietly(holder, "graph stack");
         closeQuietly(erasureLog, "erasure log");
+        closeQuietly(withdrawals, "record of owed withdrawals");
         closeQuietly(staging, "staging store");
+
         LOGGER.debug("graph tenant {} closed", id);
     }
 

@@ -17,7 +17,8 @@ import java.nio.file.Path;
  * <p>Two different claims are made here, and the difference between them is the point.
  * {@code erasure.log} has a public, non-mutating inspection that replays every record
  * against its CRC and refuses damage with sound records behind it, so that file is
- * genuinely verified. The other four have no such entry point - their open paths write the
+ * genuinely verified, and so is {@code withdrawals.log}, which is written in the same format.
+ * The other four have no such entry point - their open paths write the
  * header, truncate partial records and migrate old versions in place - so all this can do
  * is confirm the sixteen-byte header, and the verdict says exactly that rather than
  * implying the records were read.</p>
@@ -44,6 +45,14 @@ public final class GraphStagingCheck {
      */
     public static final String ERASURE_LOG = "erasure.log";
 
+    /**
+     * Name of the log of withdrawals of staged facts still owed, inside a staging directory.
+     *
+     * <p>Stated here for the reason {@link #ERASURE_LOG} is: the constant that decides it
+     * belongs to the ingest module, which this tool does not depend on.</p>
+     */
+    public static final String WITHDRAWAL_LOG = "withdrawals.log";
+
     private GraphStagingCheck() {
         throw new AssertionError("Utility class");
     }
@@ -59,7 +68,8 @@ public final class GraphStagingCheck {
             || GraphStagingStore.RELATION_LABELS.equals(fileName)
             || GraphStagingStore.TRIPLE_LOG.equals(fileName)
             || GraphStagingStore.ENTITY_TEXT_LOG.equals(fileName)
-            || ERASURE_LOG.equals(fileName);
+            || ERASURE_LOG.equals(fileName)
+            || WITHDRAWAL_LOG.equals(fileName);
     }
 
     /**
@@ -72,7 +82,11 @@ public final class GraphStagingCheck {
     public static FileCheck check(Path file, String relative) {
         String name = file.getFileName().toString();
         if (ERASURE_LOG.equals(name)) {
-            return erasureLog(file, relative);
+            return replayed(file, relative, "graph erasure log", "erasure requests");
+        }
+        if (WITHDRAWAL_LOG.equals(name)) {
+            return replayed(file, relative, "graph withdrawal log",
+                "withdrawals of staged facts");
         }
         if (GraphStagingStore.ENTITY_TEXT_LOG.equals(name)) {
             return header(file, relative, new LogFormat("graph entity text log",
@@ -116,18 +130,19 @@ public final class GraphStagingCheck {
     }
 
     /**
-     * Replays the graph erasure log against its record checksums.
+     * Replays a log in the erasure log's format against its record checksums.
      *
      * @param file     The log file
      * @param relative Its path relative to the data directory
+     * @param format   Name of the log
+     * @param owed     What its outstanding records are, for the verdict
      * @return The verdict
      */
-    private static FileCheck erasureLog(Path file, String relative) {
-        String format = "graph erasure log";
-        LogFormat erasure = new LogFormat(format, ErasureLog.MAGIC, ErasureLog.VERSION,
+    private static FileCheck replayed(Path file, String relative, String format, String owed) {
+        LogFormat accepted = new LogFormat(format, ErasureLog.MAGIC, ErasureLog.VERSION,
             ErasureLog.VERSION);
         long size = sizeOf(file);
-        FileCheck refused = unsupportedVersion(file, relative, erasure, size);
+        FileCheck refused = unsupportedVersion(file, relative, accepted, size);
         if (refused != null) {
             return refused;
         }
@@ -135,8 +150,9 @@ public final class GraphStagingCheck {
             ErasureLog.Pending pending = ErasureLog.inspect(file);
             return new FileCheck(file, relative, format, "v" + ErasureLog.VERSION,
                 CheckStatus.INTACT,
-                "every record matched its checksum; " + pending.count()
-                    + " erasure requests are still outstanding", size);
+                "every record matched its checksum; " + pending.count() + " " + owed
+                    + " are still outstanding", size);
+
         } catch (IOException e) {
             return new FileCheck(file, relative, format, null, CheckStatus.CORRUPT,
                 "the log could not be replayed: " + e.getMessage(), size);

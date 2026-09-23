@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -42,6 +43,9 @@ class GraphBuildRunnerTest {
         new GraphBuildService.BuildOutcome(true, 12, 5, 2, 5, 0, 12);
 
     /** A build that blocks until it is released, so the state in between can be read. */
+    /** Far longer than any build here takes to act on its stop. */
+    private static final Duration DRAIN_WAIT = Duration.ofSeconds(10);
+
     private static final class Gate implements GraphBuildRunner.Build {
 
         private final CountDownLatch entered = new CountDownLatch(1);
@@ -278,7 +282,7 @@ class GraphBuildRunnerTest {
             runner.start(ACME);
             await(entered);
 
-            assertThat(runner.drain())
+            assertThat(runner.drain(DRAIN_WAIT))
                 .as("the build ended within the drain, so the tenants may close")
                 .isTrue();
             assertThat(interrupted).as("the build's thread was never interrupted").isFalse();
@@ -348,12 +352,37 @@ class GraphBuildRunnerTest {
             });
             releaser.start();
 
-            assertThat(runner.drain())
+            assertThat(runner.drain(DRAIN_WAIT))
                 .as("closing the tenants under a build that is still mapping files is how a "
                     + "shutdown takes the process down instead")
                 .isTrue();
             assertThat(gate.signal.get().getAsBoolean())
                 .as("a drain asks the build to stop rather than only waiting for it")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("a drain waits out the whole of the wait it is given before reporting a build")
+        void drainWaitsAsLongAsItIsGiven() {
+            Gate gate = new Gate();
+            GraphBuildRunner runner = new GraphBuildRunner(gate);
+            runner.start(ACME);
+            gate.awaitEntry();
+            Duration wait = Duration.ofMillis(300);
+
+            long began = System.nanoTime();
+            try {
+                assertThat(runner.drain(wait))
+                    .as("the build is inside a step it cannot leave until released")
+                    .isFalse();
+                assertThat(Duration.ofNanos(System.nanoTime() - began))
+                    .as("the drain gave the build all of the wait it was handed")
+                    .isGreaterThanOrEqualTo(wait);
+            } finally {
+                gate.release();
+            }
+            assertThat(runner.drain(DRAIN_WAIT))
+                .as("given longer, the drain sees the build end")
                 .isTrue();
         }
 

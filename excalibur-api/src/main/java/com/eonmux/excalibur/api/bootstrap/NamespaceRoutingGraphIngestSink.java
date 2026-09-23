@@ -61,6 +61,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * inside the same borrow as the staging that follows it. A document removed outright borrows for
  * the same reason, to withdraw and stage nothing.</p>
  *
+ * <p>A withdrawal is asked for once and never again - a removed document is not reported a second
+ * time, nor is an unchanged one - so one that cannot be made is not dropped. Made through the
+ * tenant's {@link com.eonmux.excalibur.ingest.graph.StagedWithdrawals}, a withdrawal that fails is
+ * recorded there and retried until it succeeds. When the tenant itself will not open, the
+ * withdrawal is left with {@link GraphTenants#oweWithdrawal}, which hands it to the tenant once
+ * it does.</p>
+ *
  * <h2>Why an unresolved source is not staged into the shared namespace</h2>
  * <p>A document whose source this node no longer holds - deregistered while its crawl was
  * finishing - has no namespace to name. Staging it into the shared namespace would move one
@@ -257,11 +264,31 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     private void stageInto(NamespaceId namespace, String documentKey, String text,
                            long lastModifiedMillis, List<ExtractedTriple> extracted,
                            Change change) {
-        try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
+        NamespaceRegistry.Lease<GraphTenant> borrowed;
+        try {
+            borrowed = tenants.borrow(namespace);
+        } catch (RuntimeException e) {
+            // Opening a tenant can fail - a directory that will not create, a staging log that
+            // will not open - and one namespace failing must not stop the next document, in this
+            // namespace or in any other.
+            tenantFailures.incrementAndGet();
+            if (change.withdraws()) {
+                tenants.oweWithdrawal(namespace, documentKey);
+                LOGGER.error("Could not open namespace {} to withdraw what was staged from {}; "
+                    + "the withdrawal is owed and made when the namespace next opens, which the "
+                    + "erasure sweep keeps trying - a restart before then leaves those facts "
+                    + "staged: {}", namespace, documentKey, e.toString());
+            } else {
+                LOGGER.warn("Could not open namespace {} to stage {}: {}", namespace,
+                    documentKey, e.toString());
+            }
+            return;
+        }
+        try (NamespaceRegistry.Lease<GraphTenant> lease = borrowed) {
             // Handed what was already extracted, so the staging sink stages the facts and the
             // entity text they mention without calling the model a second time.
             StagingGraphIngestSink sink = new StagingGraphIngestSink(
-                lease.resource().staging(), (key, body) -> extracted);
+                lease.resource().withdrawals(), (key, body) -> extracted);
             switch (change) {
                 case PUBLISHED -> sink.onDocumentPublished(documentKey, text, lastModifiedMillis);
                 case REPLACED -> sink.onDocumentReplaced(documentKey, text, lastModifiedMillis);
@@ -271,9 +298,8 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
             recordsWithdrawn.addAndGet(sink.recordsWithdrawn());
             withdrawalFailures.addAndGet(sink.withdrawalFailures());
         } catch (RuntimeException e) {
-            // Opening a tenant can fail - a directory that will not create, a staging log that
-            // will not open - and one namespace failing must not stop the next document, in this
-            // namespace or in any other.
+            // The staging sink counts and absorbs its own failures, so what arrives here is the
+            // tenant failing underneath it: a store an eviction closed, for one.
             tenantFailures.incrementAndGet();
             LOGGER.warn("Could not {} {} in namespace {}: {}",
                 change == Change.REMOVED ? "withdraw" : "stage", documentKey, namespace,
@@ -378,10 +404,13 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     }
 
     /**
-     * How many replaced or removed documents' earlier facts it could not withdraw.
+     * How many times a replaced or removed document's earlier facts could not be withdrawn when
+     * it was reported.
      *
-     * <p>Each one leaves what the document used to say staged, for the next build to publish:
-     * beside what it says now, or in place of a document that is gone.</p>
+     * <p>Each withdrawal is owed from then on and retried until it is made, and nothing newer is
+     * staged for the document meanwhile; a build before it is made publishes what the document
+     * used to say. Counted per attempt that found it still owed, so a figure that keeps climbing
+     * means the staging logs are refusing to be rewritten.</p>
      *
      * @return The count
      */

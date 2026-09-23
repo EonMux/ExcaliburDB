@@ -346,9 +346,13 @@ chunk index's buffer, which is the tail of an ingestion run. Next it forces stag
 the document registry to disk, and finally closes the storage engine. The whole sequence runs
 against one deadline, `excalibur.api.shutdown-timeout-seconds` (30 by default). The drains run in
 parallel and share that deadline minus its last 10 seconds. Those 10 seconds are kept for the
-writes, so a slow drain cannot use them up. A reindex, compaction or graph build still running when
-the drains' share runs out is reported and left alone. Nothing it is using is closed underneath it,
-and the next start recovers from its write log.
+writes, so a slow drain cannot use them up. A reindex, an ingestion run, a compaction, a graph
+build and the lexical erasure sweep are each asked to stop and then given whatever is left of that
+share, with no shorter limit of their own; the graph erasure sweep is given whatever is left of the
+whole deadline once the writes are done. Raising the deadline therefore gives a slow one longer to
+finish. One still running when its time runs out is reported, with the time it was given, and left
+alone. Nothing it is using is closed underneath it, and the next start
+recovers from its write log.
 
 Set the supervisor's stop timeout to **the configured deadline plus 10 seconds**. The margin covers
 the JVM reaching its hook and the storage engine's own close. With the default, that is
@@ -445,9 +449,14 @@ it from its key table and the stored text.
 
 Damaged files are moved into a timestamped directory beside the data directory unless
 `--quarantine-dir=<path>` names another. It takes the `--flag=value` form only. The default needs
-the data directory's parent to be writable; a quarantine on another filesystem works too, by a
-copy that is forced and compared before the original is removed, since a rename cannot cross — a
-lexical segment's directory included, copied whole and compared file by file.
+the data directory's parent to be writable; a data directory named through a symbolic link gets
+its default beside the directory the link points at. A quarantine on another filesystem works too,
+by a copy that is forced and compared before the original is removed, since a rename cannot cross —
+a lexical segment's directory included, copied whole and compared file by file. A quarantine inside
+the data directory, or the data directory itself, is refused with exit code `2` before anything is
+read, check or repair alike. Symbolic links and `..` are followed as the filesystem follows them,
+so a path that only reads as outside is refused too. A data directory at a filesystem root has
+nothing beside it, so there the quarantine has to be named.
 
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself
 failed, so nothing is known about the directory — which is not the same claim as `0`.

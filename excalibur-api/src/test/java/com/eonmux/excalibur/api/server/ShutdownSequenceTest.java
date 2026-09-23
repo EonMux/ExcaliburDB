@@ -13,15 +13,18 @@ import com.eonmux.excalibur.shard.IndexOrchestrator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -57,6 +60,12 @@ class ShutdownSequenceTest {
     private QueryPipeline pipeline;
     private EndpointRegistrar.Endpoints endpoints;
 
+    /** A node's default budget, started now: far more than any drain here needs. */
+    private static ShutdownBudget budget() {
+        return ShutdownBudget.startingNow(
+            Duration.ofSeconds(ShutdownBudget.DEFAULT_TIMEOUT_SECONDS));
+    }
+
     @BeforeEach
     void setUp() {
         wiring = mock(ServerWiring.class);
@@ -69,15 +78,15 @@ class ShutdownSequenceTest {
         pipeline = mock(QueryPipeline.class);
         when(wiring.queryPipeline()).thenReturn(pipeline);
         when(pipeline.shutdown()).thenReturn(true);
-        when(ingestion.shutdown()).thenReturn(true);
+        when(ingestion.shutdown(any())).thenReturn(true);
         when(indexOrchestrator.shutdown()).thenReturn(true);
 
         reindex = mock(ReindexEndpoint.class);
         compaction = mock(CompactionRunner.class);
         graphBuild = mock(GraphBuildRunner.class);
-        when(reindex.drain()).thenReturn(true);
-        when(compaction.drain()).thenReturn(CompactionRunner.Drained.CLEAN);
-        when(graphBuild.drain()).thenReturn(true);
+        when(reindex.drain(any())).thenReturn(true);
+        when(compaction.drain(any())).thenReturn(CompactionRunner.Drained.CLEAN);
+        when(graphBuild.drain(any())).thenReturn(true);
         query = mock(QueryEndpoint.class);
         when(query.shutdown()).thenReturn(true);
         endpoints = new EndpointRegistrar.Endpoints(query, reindex, compaction, graphBuild, null);
@@ -86,16 +95,16 @@ class ShutdownSequenceTest {
     @Test
     @DisplayName("everything drained reads as clean")
     void aCleanDrain() {
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
     }
 
     @Test
     @DisplayName("a node that never registered its endpoints still drains what it wired")
     void withoutEndpoints() {
-        assertThat(ShutdownSequence.drain(null, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(null, wiring, null, GRACE, budget()))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
-        verify(ingestion).shutdown();
+        verify(ingestion).shutdown(any());
         verify(indexOrchestrator).close();
     }
 
@@ -105,27 +114,27 @@ class ShutdownSequenceTest {
         // Every document a run publishes is staged into its namespace's graph, and the report
         // cannot fail the document: tenants closed under a run still going lose those facts
         // with nothing but a log line to show for it.
-        when(ingestion.shutdown()).thenReturn(false);
+        when(ingestion.shutdown(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, false, false));
     }
 
     @Test
     @DisplayName("a reindex still running holds storage and the chunk index")
     void reindexStillRunning() {
-        when(reindex.drain()).thenReturn(false);
+        when(reindex.drain(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, false, true));
     }
 
     @Test
     @DisplayName("a compaction holding only the chunk index leaves storage free")
     void compactionHoldingOnlyTheIndex() {
-        when(compaction.drain()).thenReturn(new CompactionRunner.Drained(true, false));
+        when(compaction.drain(any())).thenReturn(new CompactionRunner.Drained(true, false));
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
             .isEqualTo(new ShutdownSequence.Drained(true, false, true));
     }
 
@@ -134,7 +143,7 @@ class ShutdownSequenceTest {
     void queryWorkStillRunning() {
         when(query.shutdown()).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, false, true));
     }
 
@@ -143,7 +152,7 @@ class ShutdownSequenceTest {
     void segmentSearchStillRunning() {
         when(pipeline.shutdown()).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, true, true));
     }
 
@@ -152,7 +161,7 @@ class ShutdownSequenceTest {
     void segmentWorkersStillRunning() {
         when(indexOrchestrator.shutdown()).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
             .isEqualTo(new ShutdownSequence.Drained(false, true, true));
         verify(indexOrchestrator, never()).close();
     }
@@ -160,23 +169,25 @@ class ShutdownSequenceTest {
     @Test
     @DisplayName("a graph build still running holds the graph tenants alone")
     void graphBuildStillRunning() {
-        when(graphBuild.drain()).thenReturn(false);
+        when(graphBuild.drain(any())).thenReturn(false);
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget()))
             .isEqualTo(new ShutdownSequence.Drained(true, true, false));
     }
 
     @Test
     @DisplayName("a step that throws does not skip the rest, and is rethrown")
     void aThrowingStepStillRunsTheRest() {
-        doThrow(new IllegalStateException("reindex executor is wedged")).when(reindex).drain();
+        doThrow(new IllegalStateException("reindex executor is wedged"))
+            .when(reindex).drain(any());
 
-        assertThatThrownBy(() -> ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThatThrownBy(() -> ShutdownSequence.drain(endpoints, wiring, null, GRACE,
+                budget()))
             .isInstanceOf(IllegalStateException.class)
             .hasMessageContaining("reindex executor is wedged");
-        verify(compaction).drain();
-        verify(graphBuild).drain();
-        verify(ingestion).shutdown();
+        verify(compaction).drain(any());
+        verify(graphBuild).drain(any());
+        verify(ingestion).shutdown(any());
         verify(indexOrchestrator).close();
     }
 
@@ -184,11 +195,12 @@ class ShutdownSequenceTest {
     @DisplayName("a compaction drain that throws is taken to hold everything")
     void aThrowingCompactionDrainHoldsEverything() {
         // The throw is rethrown, and the server keeps its pessimistic flags; the rest still ran.
-        when(compaction.drain()).thenThrow(new IllegalStateException("drain failed"));
+        when(compaction.drain(any())).thenThrow(new IllegalStateException("drain failed"));
 
-        assertThatThrownBy(() -> ShutdownSequence.drain(endpoints, wiring, null, GRACE))
+        assertThatThrownBy(() -> ShutdownSequence.drain(endpoints, wiring, null, GRACE,
+                budget()))
             .hasMessageContaining("drain failed");
-        verify(ingestion).shutdown();
+        verify(ingestion).shutdown(any());
     }
 
     @Test
@@ -208,7 +220,8 @@ class ShutdownSequenceTest {
         assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
 
         try {
-            assertThat(ShutdownSequence.drain(endpoints, wiring, requests, Duration.ofMillis(1)))
+            assertThat(ShutdownSequence.drain(endpoints, wiring, requests, Duration.ofMillis(1),
+                budget()))
                 .isEqualTo(new ShutdownSequence.Drained(false, false, false));
             assertThat(requests.isShutdown()).as("no new request is dispatched").isTrue();
         } finally {
@@ -222,7 +235,7 @@ class ShutdownSequenceTest {
     void finishedRequestsDrain() {
         ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor();
 
-        assertThat(ShutdownSequence.drain(endpoints, wiring, requests, GRACE))
+        assertThat(ShutdownSequence.drain(endpoints, wiring, requests, GRACE, budget()))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
         assertThat(requests.isTerminated()).isTrue();
     }
@@ -234,14 +247,15 @@ class ShutdownSequenceTest {
         // the other, the reindex would wait out its whole bound first and report itself still
         // running; run together, both finish.
         CountDownLatch graphBuildStarted = new CountDownLatch(1);
-        when(reindex.drain()).thenAnswer(call -> graphBuildStarted.await(10, TimeUnit.SECONDS));
-        when(graphBuild.drain()).thenAnswer(call -> {
+        when(reindex.drain(any()))
+            .thenAnswer(call -> graphBuildStarted.await(10, TimeUnit.SECONDS));
+        when(graphBuild.drain(any())).thenAnswer(call -> {
             graphBuildStarted.countDown();
             return true;
         });
 
         assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE,
-            ShutdownBudget.unbounded()))
+            budget()))
             .isEqualTo(ShutdownSequence.Drained.CLEAN);
     }
 
@@ -250,7 +264,7 @@ class ShutdownSequenceTest {
         + "reported so, without holding up the rest")
     void aDrainPastTheBudgetIsReportedNotWaitedOut() {
         CountDownLatch release = new CountDownLatch(1);
-        when(reindex.drain()).thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        when(reindex.drain(any())).thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
         // One second for the drains, the rest held back for the durable writes.
         ShutdownBudget budget = ShutdownBudget.startingNow(
             ShutdownBudget.DURABILITY_RESERVE.plusSeconds(1));
@@ -297,6 +311,41 @@ class ShutdownSequenceTest {
             release.countDown();
         }
         assertThat(requests.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+    }
+
+    @Test
+    @DisplayName("each drain is handed what the budget leaves the drains, however long that is")
+    void eachDrainWaitsWhatTheBudgetAllows() {
+        // A clock that stands still, so what the drains are handed is exactly the budget less
+        // its reserve: a hundred-second budget gives each ninety, past any wait of its own.
+        Duration total = Duration.ofSeconds(100);
+        ShutdownBudget budget = new ShutdownBudget(total, () -> 0L);
+        Duration forDrains = total.minus(ShutdownBudget.DURABILITY_RESERVE);
+
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget))
+            .isEqualTo(ShutdownSequence.Drained.CLEAN);
+
+        verify(reindex).drain(forDrains);
+        verify(compaction).drain(forDrains);
+        verify(graphBuild).drain(forDrains);
+        verify(ingestion).shutdown(forDrains);
+    }
+
+    @Test
+    @DisplayName("a drain that starts late is handed only what is left")
+    void aLateDrainIsHandedWhatIsLeft() {
+        // Each read of the clock moves it a second on, so every drain reads a budget that has
+        // already been spent into; none is handed the whole share.
+        AtomicLong now = new AtomicLong();
+        ShutdownBudget budget = new ShutdownBudget(Duration.ofSeconds(100),
+            () -> now.getAndAdd(TimeUnit.SECONDS.toNanos(1)));
+        Duration whole = Duration.ofSeconds(100).minus(ShutdownBudget.DURABILITY_RESERVE);
+        ArgumentCaptor<Duration> handed = ArgumentCaptor.forClass(Duration.class);
+
+        ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget);
+
+        verify(reindex).drain(handed.capture());
+        assertThat(handed.getValue()).isPositive().isLessThan(whole);
     }
 
     @Test

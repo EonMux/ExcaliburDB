@@ -11,6 +11,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -58,14 +59,8 @@ public final class GraphBuildRunner implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GraphBuildRunner.class);
 
-    /**
-     * How long {@link #drain()} waits for a build in progress after asking it to stop.
-     *
-     * <p>The same budget the reindex drain uses, because it is the same class of work: a
-     * rewrite of what the node serves, which cannot be abandoned cheaply. A build reads the stop
-     * at its own boundaries, and the longest stretch between two is one model request.</p>
-     */
-    private static final long SHUTDOWN_TIMEOUT_SECONDS = 60;
+    /** What {@link #close()} waits for: a build it asked to stop, for as long as that takes. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     /**
      * How many namespaces' last builds are remembered.
@@ -494,13 +489,20 @@ public final class GraphBuildRunner implements AutoCloseable {
      * closing the Lucene directories it indexes into - so false is the answer it has to act on,
      * by leaving them open.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains. A build reads the stop at its own boundaries, and the longest stretch between two
+     * is one model request.</p>
+     *
+     * @param wait How long to wait for a build asked to stop to end
      * @return true if no build is still in progress, false if one outlived the wait
+     * @throws NullPointerException if wait is null
      */
-    public boolean drain() {
+    public boolean drain(Duration wait) {
+        Objects.requireNonNull(wait, "wait must not be null");
         cancelRequested.set(true);
         executor.shutdown();
         try {
-            if (executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            if (executor.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
                 return true;
             }
         } catch (InterruptedException e) {
@@ -509,17 +511,18 @@ public final class GraphBuildRunner implements AutoCloseable {
                 return true;
             }
         }
-        LOGGER.error("a graph build is still running {}s after being asked to stop; the graph "
-            + "tenants it writes into must stay open", SHUTDOWN_TIMEOUT_SECONDS);
+        LOGGER.error("a graph build is still running {}ms after being asked to stop; the graph "
+            + "tenants it writes into must stay open", wait.toMillis());
         return false;
     }
 
     /**
-     * As {@link #drain()}, for a caller with no use for the answer; one that outlives the wait
-     * is logged there.
+     * As {@link #drain(Duration)}, waiting for as long as the build takes to stop, for an owner
+     * with no deadline and no use for the answer - the way {@code ExecutorService.close} waits.
      */
     @Override
     public void close() {
-        drain();
+        drain(UNTIL_STOPPED);
     }
+
 }

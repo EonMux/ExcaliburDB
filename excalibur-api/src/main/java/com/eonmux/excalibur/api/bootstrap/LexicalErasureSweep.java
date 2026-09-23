@@ -45,7 +45,8 @@ import java.util.function.Function;
  * about to close. It is told to stop through the cooperative signal the index reads between
  * segment groups and between chunks, never by an interrupt: an interrupt reaching a thread inside
  * file I/O closes the channel it was using, and the index shares its channels with every query.
- * A stopped rewrite publishes nothing and leaves every segment as it was. {@link #drain()} says
+ * A stopped rewrite publishes nothing and leaves every segment as it was.
+ * {@link #drain(Duration)} says
  * whether the sweep actually ended, because a shutdown that closed storage under one that had not
  * would crash the process rather than fail it.</p>
  *
@@ -70,16 +71,15 @@ public final class LexicalErasureSweep implements AutoCloseable {
     /** Shortest gap between sweeps, so a small configured bound cannot turn into a spin. */
     static final long MIN_SWEEP_INTERVAL_MS = 1_000L;
 
-    /** How long {@link #drain()} waits for a compaction in flight to act on the stop. */
-    private static final Duration SHUTDOWN_WAIT = Duration.ofSeconds(30);
+    /** What {@link #close()} waits for: a compaction in flight, for as long as it takes to stop. */
+    private static final Duration UNTIL_STOPPED = Duration.ofNanos(Long.MAX_VALUE);
 
     private final ChunkIndex index;
     private final Function<String, String> storedText;
     private final ScheduledExecutorService scheduler;
-    private final Duration shutdownWait;
 
     /**
-     * Set once by {@link #drain()}: read by a compaction in flight at its next boundary, and by
+     * Set once by {@link #drain(Duration)}: read by a compaction in flight at its next boundary, and by
      * every later {@link #sweep()} before it starts one.
      */
     private volatile boolean stopping;
@@ -95,29 +95,27 @@ public final class LexicalErasureSweep implements AutoCloseable {
     public LexicalErasureSweep(ChunkIndex index, Function<String, String> storedText,
                                long maxLatencySeconds) {
         this(index, storedText, sweepIntervalMillis(maxLatencySeconds),
-            sweepIntervalMillis(maxLatencySeconds), SHUTDOWN_WAIT);
+            sweepIntervalMillis(maxLatencySeconds));
         LOGGER.info("lexical erasure deadline swept every {}ms against a bound of {}s",
             sweepIntervalMillis(maxLatencySeconds), maxLatencySeconds);
     }
 
     /**
-     * Starts sweeping on a schedule and a shutdown budget of the caller's choosing.
+     * Starts sweeping on a schedule of the caller's choosing.
      *
-     * <p>Package-private so a test can have the first sweep start at once and a drain give up
-     * quickly, and observe both without waiting out the production intervals.</p>
+     * <p>Package-private so a test can have the first sweep start at once and observe it
+     * without waiting out the production intervals.</p>
      *
      * @param index          The chunk index whose obligations are being discharged
      * @param storedText     Reads a chunk's text back, which a rewrite needs
      * @param initialDelayMs How long before the first sweep
      * @param intervalMs     The gap between one sweep ending and the next starting
-     * @param shutdownWait   How long {@link #drain()} waits for a sweep in flight
-     * @throws NullPointerException if index, storedText or shutdownWait is null
+     * @throws NullPointerException if index or storedText is null
      */
     LexicalErasureSweep(ChunkIndex index, Function<String, String> storedText,
-                        long initialDelayMs, long intervalMs, Duration shutdownWait) {
+                        long initialDelayMs, long intervalMs) {
         this.index = Objects.requireNonNull(index, "index must not be null");
         this.storedText = Objects.requireNonNull(storedText, "storedText must not be null");
-        this.shutdownWait = Objects.requireNonNull(shutdownWait, "shutdownWait must not be null");
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "lexical-erasure-sweep");
@@ -202,15 +200,8 @@ public final class LexicalErasureSweep implements AutoCloseable {
      * compaction is still running - one that had not reached a boundary within the wait, or an
      * index that cannot stop mid-rewrite - and whatever it reads must be left open.</p>
      *
-     * @return true if no sweep is still running
-     */
-    public boolean drain() {
-        return drain(shutdownWait);
-    }
-
-    /**
-     * As {@link #drain()}, waiting no longer than {@code wait} - for a shutdown whose budget has
-     * less left than this sweep's own wait.
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, so a longer budget is a longer wait.</p>
      *
      * @param wait How long to wait for a compaction in flight to act on the stop
      * @return true if no sweep is still running
@@ -218,15 +209,14 @@ public final class LexicalErasureSweep implements AutoCloseable {
      */
     public boolean drain(Duration wait) {
         Objects.requireNonNull(wait, "wait must not be null");
-        Duration bounded = wait.compareTo(shutdownWait) < 0 ? wait : shutdownWait;
         stopping = true;
         scheduler.shutdown();
         try {
-            if (scheduler.awaitTermination(bounded.toMillis(), TimeUnit.MILLISECONDS)) {
+            if (scheduler.awaitTermination(wait.toNanos(), TimeUnit.NANOSECONDS)) {
                 return true;
             }
             LOGGER.error("the lexical erasure sweep was still compacting {}ms after being asked "
-                + "to stop", bounded.toMillis());
+                + "to stop", wait.toMillis());
             return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -234,9 +224,14 @@ public final class LexicalErasureSweep implements AutoCloseable {
         }
     }
 
-    /** As {@link #drain()}, for a caller with no use for the answer. */
+    /**
+     * As {@link #drain(Duration)}, waiting for as long as a compaction takes to stop, for an
+     * owner with no deadline and no use for the answer - the way {@code ExecutorService.close}
+     * waits.
+     */
     @Override
     public void close() {
-        drain();
+        drain(UNTIL_STOPPED);
     }
+
 }

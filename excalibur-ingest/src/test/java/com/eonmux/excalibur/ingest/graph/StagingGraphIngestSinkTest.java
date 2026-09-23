@@ -159,7 +159,7 @@ class StagingGraphIngestSinkTest {
     }
 
     @Test
-    @DisplayName("a withdrawal that fails is counted, and the new version is staged regardless")
+    @DisplayName("a withdrawal that fails is counted and owed, and the new version waits for it")
     void aFailedWithdrawalIsCounted() throws IOException {
         GraphStagingStore store = mock(GraphStagingStore.class);
         doThrow(new IOException("log unreadable")).when(store).erase(any(StagedErasure.class));
@@ -171,7 +171,42 @@ class StagingGraphIngestSinkTest {
         sink.onDocumentRemoved("docs:babbage.md");
 
         assertThat(sink.withdrawalFailures()).isEqualTo(2);
-        assertThat(sink.factsStaged()).isEqualTo(1);
+        assertThat(sink.factsStaged())
+            .as("the owed withdrawal is by document, so a retry would take these with the old")
+            .isZero();
         assertThat(sink.withdraw("docs:ada.md")).isEqualTo(-1);
+
+        sink.onDocumentPublished("docs:babbage.md", "Babbage runs Initech", 3L);
+        assertThat(sink.factsStaged())
+            .as("published again while its removal is still owed: nothing is staged beside it")
+            .isZero();
+        assertThat(sink.withdrawalFailures()).isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("a refused withdrawal is made once the store takes it, and the next version "
+        + "stages")
+    void aRefusedWithdrawalIsMadeLater(@TempDir Path dir) throws IOException {
+        try (GraphStagingStore staging = GraphStagingStore.open(dir);
+             StagedWithdrawals withdrawals =
+                 StagedWithdrawals.open(staging, dir.resolve(StagedWithdrawals.LOG_FILE))) {
+            StagingGraphIngestSink sink = new StagingGraphIngestSink(withdrawals, lineExtractor());
+            sink.onDocumentPublished("docs:ada.md", "Ada runs Acme", 1L);
+            Path blocker = dir.resolve(GraphStagingStore.TRIPLE_LOG + ".erasing");
+            java.nio.file.Files.createDirectories(blocker.resolve("held"));
+
+            sink.onDocumentRemoved("docs:ada.md");
+            assertThat(stagedFacts(staging)).containsExactly("Ada Acme");
+
+            java.nio.file.Files.delete(blocker.resolve("held"));
+            java.nio.file.Files.delete(blocker);
+            sink.onDocumentPublished("docs:ada.md", "Ada runs Globex", 2L);
+
+            assertThat(stagedFacts(staging))
+                .as("the removed version withdrawn first, then the new one staged")
+                .containsExactly("Ada Globex");
+            assertThat(sink.withdrawalFailures()).isEqualTo(1);
+            assertThat(sink.recordsWithdrawn()).isPositive();
+        }
     }
 }

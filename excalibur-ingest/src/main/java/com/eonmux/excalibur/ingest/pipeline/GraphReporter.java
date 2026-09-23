@@ -247,9 +247,14 @@ final class GraphReporter {
         } catch (RuntimeException e) {
             long failed = failures.incrementAndGet();
             if (publication.removal()) {
-                LOGGER.error("The graph did not withdraw the facts of {}, which is removed; they "
-                    + "stay staged until the document is erased with /v1/erasure ({} such "
-                    + "report(s) so far): {}", documentKey, failed, e.toString(), e);
+                // A sink that stages withdraws through something that owes what it cannot
+                // withdraw, and absorbs the failure there. One that throws instead has broken its
+                // contract, and nothing here can put the obligation anywhere: the document has no
+                // registry entry left for an erasure to name, and is not reported again.
+                LOGGER.error("The graph sink threw withdrawing the facts of {}, which is removed; "
+                    + "nothing will ask for them again, so they stay staged for every later build "
+                    + "to publish ({} such report(s) so far): {}", documentKey, failed,
+                    e.toString(), e);
             } else {
                 LOGGER.error("The graph did not take the facts of {}, which is published and will "
                     + "not be extracted again unless it changes ({} such report(s) so far): {}",
