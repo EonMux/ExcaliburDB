@@ -62,11 +62,12 @@ import java.nio.file.StandardOpenOption;
  * coincidence rather than the single bit flip the version field alone costs.</p>
  *
  * <h2>Version 2 and version 1</h2>
- * <p>Read as before, at their own header size, and reported as unprotected. They are not
- * upgraded where they lie: the layout move from 56 to 128 relocates the bucket directory and
- * every absolute offset stored in it, and a checksum written over bytes nothing has attested
- * to would attest to nothing. Such a file becomes a version 3 file when the index is
- * rebuilt.</p>
+ * <p>A version 2 file is read as before, at its own header size, and reported as unprotected.
+ * It is not upgraded where it lies: the layout move from 56 to 128 relocates the bucket
+ * directory and every absolute offset stored in it, and a checksum written over bytes nothing
+ * has attested to would attest to nothing. Such a file becomes a version 3 file when the index
+ * is rebuilt. A version 1 file is no longer opened at all, so it is reported unreadable rather
+ * than unprotected: the verdict follows what the engine does with the file.</p>
  */
 final class LshHashTableIntegrity {
 
@@ -229,11 +230,30 @@ final class LshHashTableIntegrity {
                     + "it would read the bucket directory at " + LshHashTable.HEADER_SIZE_V2
                     + " instead of " + LshHashTable.HEADER_SIZE + " and answer every query "
                     + "empty while still reporting the full entry count")
-                : IntegrityReport.legacy(path, FORMAT, version);
+                : legacyVerdict(path, version);
         }
         return IntegrityReport.corrupt(path, FORMAT, "the header claims format version "
             + version + ", which this format has never had; the only versions ever written "
             + "are " + OLDEST_VERSION + " to " + LshHashTable.VERSION);
+    }
+
+    /**
+     * Judges a genuine unchecksummed file by whether the engine still opens it.
+     *
+     * <p>Both unchecksummed versions were written, but only version 2 is still read: the
+     * engine refuses a version 1 table on open. Calling that file legacy would pass a table
+     * the node will not serve from, so it is reported unreadable instead.</p>
+     *
+     * @param path    The file being judged, or null
+     * @param version A version between {@link #OLDEST_VERSION} and the last unchecksummed one
+     * @return Legacy for a version the engine opens, unreadable for one it refuses
+     */
+    private static IntegrityReport legacyVerdict(Path path, int version) {
+        if (LshTableHeader.isSupportedVersion(version)) {
+            return IntegrityReport.legacy(path, FORMAT, version);
+        }
+        return IntegrityReport.unsupportedVersion(path, FORMAT, version,
+            LshHashTable.VERSION_WITHOUT_CHECKSUM, LshHashTable.VERSION);
     }
 
     /** Reports whether a mapped table carries the version 3 format tag. */

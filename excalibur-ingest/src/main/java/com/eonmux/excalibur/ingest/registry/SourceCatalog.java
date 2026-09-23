@@ -108,22 +108,40 @@ public final class SourceCatalog {
     /** Suffix of the sibling a rewrite is assembled in before it is published. */
     private static final String REPLACEMENT_SUFFIX = ".tmp";
 
-    /** Opens the last line, which states how many records precede it. */
-    private static final String END_MARKER = "\\#end";
+    /**
+     * Opens the last line, which states how many records precede it.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final String END_MARKER = "\\#end";
 
-    /** Opens the first line, which names the format the rest of the file is in. */
-    private static final String HEADER_MARKER = "\\#source-catalog";
+    /**
+     * Opens the first line, which names the format the rest of the file is in.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final String HEADER_MARKER = "\\#source-catalog";
 
-    /** The format this build writes. */
-    static final int FORMAT_VERSION = 2;
+    /**
+     * The format this build writes, and the newest it reads.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final int FORMAT_VERSION = 2;
 
     /**
      * The oldest format this build still reads.
      *
      * <p>Also what a file with no header at all is read as: the build that wrote one of those
      * wrote version 1 records, it simply had no version to declare yet.</p>
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
      */
-    static final int OLDEST_READABLE_VERSION = 1;
+    public static final int OLDEST_READABLE_VERSION = 1;
 
     /** The version that first carried a namespace field. */
     private static final int FIRST_NAMESPACED_VERSION = 2;

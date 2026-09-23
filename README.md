@@ -395,16 +395,28 @@ for proof rather than the absence of doubt. It also checks
 across files — a catalog row naming a segment that is not there, an index with no segment, a
 staged file a rename never published.
 
-Two derived files are judged by what the node does with them rather than by their name alone. A
+A file is judged against the format versions the node reads, not only the layout this build
+writes. One whose header names a version outside them — written by a newer build, or with its
+version field altered — is `UNREADABLE`: the node refuses to open it, so it fails the run, and it
+is put to an operator rather than moved aside, since nothing shows its bytes are damaged. An HNSW
+node mapping, for instance, is read at versions 1 to 3 — its entries name each node's document at
+versions 1 and 2 and its chunk at version 3 — and a version 4 mapping is reported unreadable, not
+checked as if it were version 3.
+
+Two files are judged by what the node does with them rather than by their name alone. A
 segment's term sketch, `segment_<N>.tfs`, is the one derived file the node rebuilds by itself: a
 sketch that fails its checksum is reported `CORRUPT` but not counted as damage, so it neither sets
 exit code `1` nor fails `--strict`, and the repair plan moves it aside (the node would rebuild it
 anyway). Only corruption is excused: a sketch the operating system will not read — an I/O error, a
 permission refused — is `UNREADABLE`, and fails the run like any file the device refuses. The
-source status history, `source-status`, is excused the same way for a different reason: it is not
-rebuilt, but the node reads one it cannot trust as no history and reports each source from its next
-run, so a damaged one costs how the last crawls ended and nothing the node serves. Every other derived file — a graph, a mapping, a codebook, an LSH table — is rebuilt only
-by a reindex or a retrain, and its damage fails the run. A `segment_<N>.hnsw.compact.docmap` is
+source status history, `source-status`, is excused the same way for a different reason. It is not
+derived: how each source's last crawl ended is recorded nowhere else, and the node restores it on
+restart, so losing it loses that history, though never any of the corpus. But nothing the node
+serves depends on it, and the node reads one it will not take — cut short, without its header, or
+at a version it does not read — as no history and reports each source from its next run, so such a
+file is reported `CORRUPT` and not counted as damage. Every derived file but the sketch — a graph, a
+mapping, a codebook, an LSH table — is rebuilt only by a reindex or a retrain, and its damage fails
+the run. A `segment_<N>.hnsw.compact.docmap` is
 the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the compaction never
 swapped, both are staging leftovers, and the mapping is moved aside first; alone, the graph swap
 completed and it is the mapping the node installs on its next open, so it is verified, reported
@@ -460,13 +472,14 @@ already there when it was copied verifies faithfully:
 | Format | Checked by | Proven means |
 |---|---|---|
 | segments, `catalog.dat` | the storage engine, on a scratch copy | every entry's checksum, and the header and record CRCs |
-| HNSW graphs and their node-to-chunk mappings, quantiser codebooks, LSH tables | the vector and filter modules, on a scratch copy | the seal a clean close writes |
+| HNSW graphs and their node mappings, quantiser codebooks, LSH tables | the vector and filter modules, on a scratch copy | the seal a clean close writes. A mapping names each node's chunk at version 3 and its document at versions 1 and 2; one at a version the node does not read fails the image |
 | a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
 | write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
 | graph staging logs | `excalibur-fsck`, read-only | the erasure ledger: every record against its CRC. The triple, entity and label logs: only their header, because their one open path writes |
 | the lexical store | `excalibur-fsck`, read-only, as one structure | every column of every segment its manifest names |
 | segment term sketches (`segment_<N>.tfs`) | `excalibur-fsck`, read-only | a CRC32C over the header and one over the body. A damaged sketch is reported and does not fail the image: a node restored from it rebuilds the sketch when it opens the segment. One that cannot be read at all fails it |
-| `routing.dir`, the document registry and source catalog, the in-flight journal, lexical sidecars | `excalibur-fsck`, read-only | nothing — these formats carry no checksum, so they are well-formed at best |
+| the document registry, the source catalog and the source status history | `excalibur-fsck`, read-only | nothing — these formats carry no checksum. Each is held to what its reader requires — a header version it reads and a trailing record count that matches its lines — so one the node would refuse fails the image; a status history the node would only discard does not |
+| `routing.dir`, the in-flight journal, lexical sidecars | `excalibur-fsck`, read-only | nothing — these formats carry no checksum, so they are well-formed at best |
 
 The engine's own checkers run on a scratch copy because several of them repair what they open;
 `excalibur-fsck`'s are the ones it surveys a live directory with, so the two tools cannot disagree
@@ -2817,12 +2830,14 @@ progress and counts, when it finished, and its `last_error` — so `GET /v1/inge
 restart reports that run rather than zeros stamped with the moment the node came up. Only finished
 runs are written (`idle` or `unconfigured`); a crawl the restart cut short comes back `idle` with
 `last_error` saying that the run in progress when the node stopped did not finish, never still
-claiming to run. The file is written the way the catalog is — a `\#source-status|1` header, one
+claiming to run. The file is written the way the catalog is — a `\#source-status|2` header, one
 line per source, a `\#end|<count>` marker, forced to disk and published by an atomic rename — but
 unlike the catalog, one that cannot be read does not fail the start. It is a report, not state the
 store depends on: the node logs it, treats the history as empty, and each source reports from its
 next run. A data directory from a build without the file needs nothing; it is written when the
-first run ends.
+first run ends. A version 1 file, written before a crawl counted the pages `robots.txt` kept it
+from, is still read, with each source's `entries_disallowed` as 0, and the next run to end rewrites
+it at version 2.
 
 ### Visibility and Consistency
 

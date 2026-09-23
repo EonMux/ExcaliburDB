@@ -113,18 +113,42 @@ public final class DocumentRegistry {
     private static final char ESCAPE_CHAR = '\\';
 
     /**
-     * The format this build writes and the only versioned one it reads.
+     * The format this build writes, and the newest it reads.
      *
      * <p>Still 1 with the entity tag, which is an optional trailing field that version-1 readers
      * ignore; see the class documentation for why it is not a version of its own.</p>
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
      */
-    static final int FORMAT_VERSION = 1;
+    public static final int FORMAT_VERSION = 1;
 
-    /** Opens the first line, which names the format the rest of the file is in. */
-    private static final String HEADER_MARKER = "\\#document-registry";
+    /**
+     * The oldest versioned format this build reads, which is the only one there has been.
+     *
+     * <p>A file with no header at all is older still and is read too; see the class
+     * documentation.</p>
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final int OLDEST_READABLE_VERSION = 1;
 
-    /** Opens the last line, which states how many records precede it. */
-    private static final String END_MARKER = "\\#end";
+    /**
+     * Opens the first line, which names the format the rest of the file is in.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final String HEADER_MARKER = "\\#document-registry";
+
+    /**
+     * Opens the last line, which states how many records precede it.
+     *
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final String END_MARKER = "\\#end";
 
     /** What {@link #declaredVersion(String)} reports for a file written before the header. */
     private static final int NO_HEADER = -1;
@@ -671,7 +695,7 @@ public final class DocumentRegistry {
                 throw new RegistryLoadException(path,
                     "its first line names no format version this build can read: " + first);
             }
-            if (version != FORMAT_VERSION) {
+            if (version < OLDEST_READABLE_VERSION || version > FORMAT_VERSION) {
                 throw new RegistryLoadException(path, "it declares format version " + version
                     + " and this build reads version " + FORMAT_VERSION);
             }

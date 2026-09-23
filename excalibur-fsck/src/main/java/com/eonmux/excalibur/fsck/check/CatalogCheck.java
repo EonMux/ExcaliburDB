@@ -22,6 +22,10 @@ import java.util.zip.CRC32;
  * and record layout is restated here against that class's own public constants, and the
  * arithmetic is pinned by a test that writes a catalog with {@link CatalogFile} and reads it
  * back with this.</p>
+ *
+ * <p>The versions it takes are the opener's too: a checksummed header slot naming any version
+ * other than the two that class reads is a file the node refuses to open, and is reported
+ * unreadable here rather than read with this build's layout.</p>
  */
 public final class CatalogCheck {
 
@@ -65,6 +69,11 @@ public final class CatalogCheck {
             return new CatalogInspection(shortFile(file, relative, bytes), List.of());
         }
         ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        Integer refused = refusedVersion(buffer);
+        if (refused != null) {
+            return new CatalogInspection(unsupportedVersion(file, relative, size, refused),
+                List.of());
+        }
         HeaderSlot header = bestHeader(buffer);
         if (header == null) {
             return new CatalogInspection(noHeader(file, relative, bytes), List.of());
@@ -234,6 +243,110 @@ public final class CatalogCheck {
     }
 
     /**
+     * Finds a version the catalog's opener refuses the file for, by the opener's own rule.
+     *
+     * <p>That rule reads every header slot, not only the one in effect: a slot whose CRC
+     * vouches for a version this build does not know is proof a newer build wrote the file,
+     * whatever the other slot says, and the opener refuses it - unless the file is a version 1
+     * catalog, which the opener migrates before it looks. Judging only the slot in effect would
+     * pass a file the node will not open whenever the older slot happened to be the newer
+     * generation.</p>
+     *
+     * @param buffer The whole file
+     * @return The refused version, or null when the opener would go on to read the file
+     */
+    private static Integer refusedVersion(ByteBuffer buffer) {
+        if (firstMagicVersion(buffer) == CatalogFile.VERSION_V1
+                && !hasChecksummedVersion(buffer, CatalogFile.VERSION)) {
+            return null;
+        }
+        for (int slot = 0; slot < 2; slot++) {
+            Integer version = checksummedVersion(buffer, slot);
+            if (version != null && version != CatalogFile.VERSION
+                    && version != CatalogFile.VERSION_V1) {
+                return version;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Reports whether either header slot vouches for a version.
+     *
+     * @param buffer  The whole file
+     * @param version The version
+     * @return true if a slot with a matching CRC names it
+     */
+    private static boolean hasChecksummedVersion(ByteBuffer buffer, int version) {
+        for (int slot = 0; slot < 2; slot++) {
+            Integer found = checksummedVersion(buffer, slot);
+            if (found != null && found == version) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Reads the version of the first slot that carries the magic number, checksum or not,
+     * which is what the opener decides a version 1 migration on.
+     *
+     * @param buffer The whole file
+     * @return The version, or -1 if neither slot carries the magic number
+     */
+    private static int firstMagicVersion(ByteBuffer buffer) {
+        for (int slot = 0; slot < 2; slot++) {
+            int base = slot * CatalogFile.HEADER_SLOT_SIZE;
+            if (base + CatalogFile.HEADER_SLOT_SIZE <= buffer.capacity()
+                    && buffer.getInt(base) == CatalogFile.MAGIC_NUMBER) {
+                return buffer.getInt(base + 4);
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Reads the version of a header slot whose CRC vouches for it, whatever its count says.
+     *
+     * @param buffer The whole file
+     * @param slot   Index of the slot, 0 or 1
+     * @return The version, or null if the slot has no magic number or fails its CRC
+     */
+    private static Integer checksummedVersion(ByteBuffer buffer, int slot) {
+        int base = slot * CatalogFile.HEADER_SLOT_SIZE;
+        if (base + CatalogFile.HEADER_SLOT_SIZE > buffer.capacity()
+                || buffer.getInt(base) != CatalogFile.MAGIC_NUMBER) {
+            return null;
+        }
+        CRC32 crc = new CRC32();
+        crc.update(buffer.array(), base, 28);
+        return buffer.getInt(base + 28) == (int) crc.getValue() ? buffer.getInt(base + 4) : null;
+    }
+
+    /**
+     * Phrases the verdict on a catalog a newer build wrote.
+     *
+     * <p>Unreadable, not corrupt: nothing shows the bytes are damaged, and the rows are not
+     * read at all, since their layout is the unknown version's. Reading them as this build's
+     * would hand the cross-file checks rows to plan repairs from that the file may not
+     * hold.</p>
+     *
+     * @param file     The catalog file
+     * @param relative Its path relative to the data directory
+     * @param size     The file's size
+     * @param version  The version a checksummed header slot names
+     * @return The verdict
+     */
+    private static FileCheck unsupportedVersion(Path file, String relative, long size,
+                                                int version) {
+        return new FileCheck(file, relative, FORMAT, "v" + version, CheckStatus.UNREADABLE,
+            "a header slot whose CRC matches names format version " + version + ", and this "
+                + "build reads versions " + CatalogFile.VERSION_V1 + " and "
+                + CatalogFile.VERSION + ": a newer build wrote it. The node refuses to open it "
+                + "and leaves it untouched, and its rows were not read", size);
+    }
+
+    /**
      * Finds the newest header slot that passes its own CRC.
      *
      * @param buffer The whole file
@@ -258,23 +371,17 @@ public final class CatalogCheck {
      * @return The slot, or null if it has no magic number or fails its CRC
      */
     private static HeaderSlot readHeaderSlot(ByteBuffer buffer, int slot) {
+        Integer version = checksummedVersion(buffer, slot);
+        if (version == null) {
+            return null;
+        }
         int base = slot * CatalogFile.HEADER_SLOT_SIZE;
-        if (base + CatalogFile.HEADER_SLOT_SIZE > buffer.capacity()) {
-            return null;
-        }
-        if (buffer.getInt(base) != CatalogFile.MAGIC_NUMBER) {
-            return null;
-        }
-        int version = buffer.getInt(base + 4);
         int count = buffer.getInt(base + 8);
+        if (count < 0 || count > CatalogFile.MAX_SEGMENTS) {
+            return null;
+        }
         long timestamp = buffer.getLong(base + 12);
         long generation = buffer.getLong(base + 20);
-        int stored = buffer.getInt(base + 28);
-        CRC32 crc = new CRC32();
-        crc.update(buffer.array(), base, 28);
-        if (stored != (int) crc.getValue() || count < 0 || count > CatalogFile.MAX_SEGMENTS) {
-            return null;
-        }
         return new HeaderSlot(slot, version, count, timestamp, generation);
     }
 

@@ -2,11 +2,13 @@ package com.eonmux.excalibur.fsck;
 
 import com.eonmux.excalibur.fsck.check.CatalogCheck;
 import com.eonmux.excalibur.fsck.check.CheckStatus;
+import com.eonmux.excalibur.fsck.check.CountMarkedFormat;
 import com.eonmux.excalibur.fsck.check.CountMarkedTextCheck;
 import com.eonmux.excalibur.fsck.check.GraphStagingCheck;
 import com.eonmux.excalibur.fsck.check.RoutingDirectoryCheck;
 import com.eonmux.excalibur.fsck.check.SegmentDataCheck;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
+import com.eonmux.excalibur.graph.staging.EntityTextLog;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.LabelInterner;
 import com.eonmux.excalibur.store.RoutingDirectory;
@@ -20,8 +22,11 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.zip.CRC32;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Each format reader against the damage it is supposed to name.
@@ -191,7 +196,7 @@ class FormatCheckTest {
             """);
 
         var result = CountMarkedTextCheck.check(
-            file, "document-registry", "document registry", "\\#document-registry");
+            file, "document-registry", CountMarkedFormat.DOCUMENT_REGISTRY);
 
         assertThat(result.status()).isEqualTo(CheckStatus.CORRUPT);
         assertThat(result.detail()).contains("declares 4 records and holds 1");
@@ -207,7 +212,7 @@ class FormatCheckTest {
             """);
 
         var result = CountMarkedTextCheck.check(
-            file, "document-registry", "document registry", "\\#document-registry");
+            file, "document-registry", CountMarkedFormat.DOCUMENT_REGISTRY);
 
         assertThat(result.status()).isEqualTo(CheckStatus.LEGACY_UNPROTECTED);
         assertThat(result.version()).isEqualTo("v1");
@@ -215,15 +220,18 @@ class FormatCheckTest {
     }
 
     @Test
-    void registryWithNoCountMarkerIsUnchecked(@TempDir Path dir) throws IOException {
+    void registryWithAHeaderAndNoCountMarkerIsCorrupt(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("source-catalog");
         Files.writeString(file, "\\#source-catalog|2\nfile|a|ns|k=v\n");
 
         var result = CountMarkedTextCheck.check(
-            file, "source-catalog", "source catalog", "\\#source-catalog");
+            file, "source-catalog", CountMarkedFormat.SOURCE_CATALOG);
 
-        assertThat(result.status()).isEqualTo(CheckStatus.UNCHECKED);
-        assertThat(result.detail()).contains("no trailing record count");
+        assertThat(result.status())
+            .as("a header is written with the count, so a file with one and not the other lost "
+                + "its tail, and the catalog's reader refuses it")
+            .isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.detail()).contains("does not end with a record count");
     }
 
     @Test
@@ -232,7 +240,7 @@ class FormatCheckTest {
         Files.writeString(file, "\\#source-catalog|2\nfile|a|ns\n\\#end|many\n");
 
         var result = CountMarkedTextCheck.check(
-            file, "source-catalog", "source catalog", "\\#source-catalog");
+            file, "source-catalog", CountMarkedFormat.SOURCE_CATALOG);
 
         assertThat(result.status()).isEqualTo(CheckStatus.CORRUPT);
         assertThat(result.detail()).contains("names no number");
@@ -244,7 +252,7 @@ class FormatCheckTest {
         Files.write(file, new byte[0]);
 
         var result = CountMarkedTextCheck.check(
-            file, "document-registry", "document registry", "\\#document-registry");
+            file, "document-registry", CountMarkedFormat.DOCUMENT_REGISTRY);
 
         assertThat(result.status()).isEqualTo(CheckStatus.UNCHECKED);
         assertThat(result.detail()).contains("empty");
@@ -261,6 +269,94 @@ class FormatCheckTest {
         assertThat(result.status()).isEqualTo(CheckStatus.UNCHECKED);
         assertThat(result.version()).isEqualTo("v" + LabelInterner.VERSION);
         assertThat(result.detail()).contains("records themselves were not read");
+    }
+
+    @Test
+    void stagingLogAtAVersionItsReaderRefusesIsUnreadable(@TempDir Path dir) throws IOException {
+        Path labels = dir.resolve(GraphStagingStore.ENTITY_LABELS);
+        Files.write(labels, stagingHeader(LabelInterner.MAGIC, LabelInterner.VERSION + 1));
+        Path triples = dir.resolve(GraphStagingStore.TRIPLE_LOG);
+        Files.write(triples, stagingHeader(GraphStagingStore.MAGIC, 0));
+        Path entities = dir.resolve(GraphStagingStore.ENTITY_TEXT_LOG);
+        Files.write(entities, stagingHeader(EntityTextLog.MAGIC, EntityTextLog.VERSION + 1));
+
+        for (var result : List.of(
+                GraphStagingCheck.check(labels, "shared-staging/entities.labels"),
+                GraphStagingCheck.check(triples, "shared-staging/triples.log"),
+                GraphStagingCheck.check(entities, "shared-staging/entity_text.log"))) {
+            assertThat(result.status()).as(result.relative()).isEqualTo(CheckStatus.UNREADABLE);
+            assertThat(result.detail()).contains("refuses to open it");
+        }
+    }
+
+    @Test
+    void stagingLogAtAnOlderVersionItsReaderMigratesIsStillAccepted(@TempDir Path dir)
+            throws IOException {
+        Path file = dir.resolve(GraphStagingStore.TRIPLE_LOG);
+        Files.write(file, stagingHeader(GraphStagingStore.MAGIC,
+            GraphStagingStore.VERSION_WITHOUT_STATED_ON));
+
+        var result = GraphStagingCheck.check(file, "shared-staging/triples.log");
+
+        assertThat(result.status()).isEqualTo(CheckStatus.UNCHECKED);
+        assertThat(result.version()).isEqualTo("v" + GraphStagingStore.VERSION_WITHOUT_STATED_ON);
+    }
+
+    @Test
+    void erasureLogAtANewerVersionIsUnreadableRatherThanCorrupt(@TempDir Path dir)
+            throws IOException {
+        Path file = dir.resolve(GraphStagingCheck.ERASURE_LOG);
+        Files.write(file, stagingHeader(ErasureLog.MAGIC, ErasureLog.VERSION + 1));
+
+        var result = GraphStagingCheck.check(file, "shared-staging/erasure.log");
+
+        assertThat(result.status())
+            .as("corrupt would have a repair move aside the erasures a newer build still owes")
+            .isEqualTo(CheckStatus.UNREADABLE);
+        assertThat(result.version()).isEqualTo("v" + (ErasureLog.VERSION + 1));
+    }
+
+    @Test
+    void catalogWhoseHeaderNamesANewerVersionIsUnreadableAndYieldsNoRows(@TempDir Path dir)
+            throws IOException {
+        Path file = writtenCatalog(dir);
+        byte[] bytes = Files.readAllBytes(file);
+        restampCatalogVersion(bytes, CatalogFile.VERSION + 1);
+        Files.write(file, bytes);
+
+        var result = CatalogCheck.check(file, "catalog.dat");
+
+        assertThat(result.check().status()).isEqualTo(CheckStatus.UNREADABLE);
+        assertThat(result.check().detail()).contains("version " + (CatalogFile.VERSION + 1));
+        assertThat(result.records())
+            .as("rows laid out by a build this one does not know are not rows to act on")
+            .isEmpty();
+        assertThatThrownBy(() -> new CatalogFile(file).close())
+            .isInstanceOf(IOException.class)
+            .hasMessageContaining("cannot read");
+    }
+
+    @Test
+    void catalogIsRefusedForANewerVersionInTheSlotNotInEffect(@TempDir Path dir)
+            throws IOException {
+        Path file = writtenCatalog(dir);
+        byte[] bytes = Files.readAllBytes(file);
+        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        int slotSize = CatalogFile.HEADER_SLOT_SIZE;
+        assertThat(buffer.getInt(0)).isEqualTo(CatalogFile.MAGIC_NUMBER);
+        assertThat(buffer.getInt(slotSize)).isEqualTo(CatalogFile.MAGIC_NUMBER);
+        int older = buffer.getLong(20) < buffer.getLong(slotSize + 20) ? 0 : 1;
+        byte[] olderSlotOnly = bytes.clone();
+        restampCatalogVersion(olderSlotOnly, CatalogFile.VERSION + 1, older);
+        Files.write(file, olderSlotOnly);
+
+        var result = CatalogCheck.check(file, "catalog.dat");
+
+        assertThat(result.check().status())
+            .as("the opener refuses a file any checksummed slot of which names a version it "
+                + "does not know, not only the slot in effect")
+            .isEqualTo(CheckStatus.UNREADABLE);
+        assertThatThrownBy(() -> new CatalogFile(file).close()).isInstanceOf(IOException.class);
     }
 
     @Test
@@ -342,6 +438,38 @@ class FormatCheckTest {
     private static byte[] stagingHeader(long magic, int version) {
         return ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN)
             .putLong(magic).putInt(version).putInt(0).array();
+    }
+
+    /**
+     * Rewrites the version of every header slot a catalog carries, and the CRC over it, so each
+     * slot vouches for the new version the way a newer build's writer would have made it.
+     *
+     * @param bytes   The whole catalog, changed in place
+     * @param version The version to name
+     */
+    private static void restampCatalogVersion(byte[] bytes, int version) {
+        for (int slot = 0; slot < 2; slot++) {
+            restampCatalogVersion(bytes, version, slot);
+        }
+    }
+
+    /**
+     * Rewrites one header slot's version and the CRC over it, if the slot carries a header.
+     *
+     * @param bytes   The whole catalog, changed in place
+     * @param version The version to name
+     * @param slot    Index of the slot, 0 or 1
+     */
+    private static void restampCatalogVersion(byte[] bytes, int version, int slot) {
+        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        int base = slot * CatalogFile.HEADER_SLOT_SIZE;
+        if (buffer.getInt(base) != CatalogFile.MAGIC_NUMBER) {
+            return;
+        }
+        buffer.putInt(base + 4, version);
+        CRC32 crc = new CRC32();
+        crc.update(bytes, base, 28);
+        buffer.putInt(base + 28, (int) crc.getValue());
     }
 
     /**

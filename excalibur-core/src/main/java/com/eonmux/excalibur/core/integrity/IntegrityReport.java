@@ -69,6 +69,34 @@ public record IntegrityReport(Path file, String format, IntegrityStatus status, 
     }
 
     /**
+     * Reports a file whose header names a format version this build does not read.
+     *
+     * <p>Unreadable rather than legacy or intact: the version decides where every field after
+     * it sits, so a verifier that went on would be checking bytes against a layout they were
+     * never written in, and the loading path refuses the same file outright. A verifier that
+     * judged it by the newest layout it knows would call a file sound that the node will not
+     * open. Nor is it corrupt: nothing shows the bytes are damaged, only that this build cannot
+     * tell.</p>
+     *
+     * @param file     The file inspected
+     * @param format   The format's name
+     * @param version  The format version found in the file
+     * @param oldest   The oldest version this build reads
+     * @param newest   The newest version this build reads, the one it writes
+     * @return An unreadable report naming the version found and the range that is read
+     */
+    public static IntegrityReport unsupportedVersion(Path file, String format, int version,
+                                                     int oldest, int newest) {
+        String readable = oldest == newest
+            ? "version " + newest : "versions " + oldest + " to " + newest;
+        return new IntegrityReport(file, format, IntegrityStatus.UNREADABLE,
+            "written at format version " + version + ", which this build does not read - it "
+                + "reads " + readable + ". A newer build wrote it, or its version field was "
+                + "altered; the node refuses to open it either way, and nothing behind the "
+                + "version was checked");
+    }
+
+    /**
      * Reports a file whose checksum did not match the bytes it covers.
      *
      * @param file   The file inspected

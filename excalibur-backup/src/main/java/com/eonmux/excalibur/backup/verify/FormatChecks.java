@@ -41,15 +41,17 @@ import java.util.Optional;
  * them: {@link Segment#verifyIntegrity()} walks every occupied slot of a segment and compares
  * each entry's stored checksum; {@link HnswGraph#verifyIntegrity(Path)} and
  * {@link NodeDocumentMapping#verifyIntegrity(Path)} check the seal a clean close writes on a
- * graph and its document mapping; {@link PQCodebookFile#verifyIntegrity(Path)} and
+ * graph and its node mapping, which names each node's chunk, or its document in a file an
+ * older build wrote; {@link PQCodebookFile#verifyIntegrity(Path)} and
  * {@link LshHashTable#verifyIntegrity(Path)} do the same for their sidecars; and
  * {@link CatalogFile} validates its own header and record CRCs as it opens.</p>
  *
  * <p>{@code excalibur-fsck}'s, through {@link FileInspector}, for everything else: the
  * write-ahead logs, whose records are replayed and their checksums compared; the routing
  * directory; the segments' term sketches, whose checker reads without writing and so needs
- * no scratch copy; the document registry and source catalog, which are checked against the
- * record count they end with; the graph staging logs; and the native lexical store, which is
+ * no scratch copy; the document registry, the source catalog and the source status history,
+ * which are checked against the header version and the record count their readers require; the
+ * graph staging logs; and the native lexical store, which is
  * checked as a whole by {@link #withLexicalStore} because its manifest and the segments it
  * names are one structure. The same dispatch is what {@code excalibur-fsck} surveys a live
  * directory with, so the two tools cannot disagree about which checker a file belongs to.</p>
