@@ -208,6 +208,29 @@ class MetricsEndpointTest {
         }
 
         @Test
+        @DisplayName("exposes chunks no query can reach, and the segments holding them")
+        void exposesUnsearchableChunks() throws IOException {
+            // live + erased + unsearchable is everything on disk, so a dashboard summing the
+            // family sees the corpus whole and one charting live sees what keyword search has.
+            com.eonmux.excalibur.ingest.lexical.ChunkIndex index =
+                mock(com.eonmux.excalibur.ingest.lexical.ChunkIndex.class);
+            when(index.stats()).thenReturn(new com.eonmux.excalibur.ingest.lexical.ChunkIndexStats(
+                "native", 10L, 3, 7L, 1L, 0, java.util.Optional.empty(), true, 0L,
+                java.util.List.of(new com.eonmux.excalibur.ingest.lexical.ChunkIndexStats
+                    .UnreadableSegment("seg-1", 2, true, "damaged")), 4));
+            collector.withLexicalIndex(index);
+
+            String body = send("GET").body();
+            assertThat(body)
+                .contains("excalibur_lexical_chunks{state=\"live\"} 7")
+                .contains("excalibur_lexical_chunks{state=\"unsearchable\"} 2")
+                .contains("# TYPE excalibur_lexical_unreadable_segments gauge")
+                .contains("excalibur_lexical_unreadable_segments 1")
+                .contains("# TYPE excalibur_lexical_outdated_segments gauge")
+                .contains("excalibur_lexical_outdated_segments 4");
+        }
+
+        @Test
         @DisplayName("omits the query cache entirely on a node that has none")
         void omitsAnAbsentQueryCache() throws IOException {
             assertThat(send("GET").body()).doesNotContain("excalibur_query_cache");

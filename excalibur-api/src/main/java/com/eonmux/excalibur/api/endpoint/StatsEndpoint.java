@@ -14,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 
@@ -82,7 +83,10 @@ import java.util.function.Supplier;
  *     "erasureRequests": 3,
  *     "oldestErasureAgeMs": 412000,
  *     "compactionDue": false,
- *     "unreadableChunksDropped": 0
+ *     "unreadableChunksDropped": 0,
+ *     "unsearchableChunks": 0,
+ *     "unreadableSegments": 0,
+ *     "outdatedSegments": 0
  *   },
  *   "queryCache": {
  *     "hits": 1204,
@@ -141,6 +145,16 @@ import java.util.function.Supplier;
  * wants looking at. A read that failed for any other reason is not counted - its group is
  * abandoned whole and retried by the next compaction.</p>
  *
+ * <h2>Lexical segments that could not be opened</h2>
+ * <p>A native-index segment that fails its checksums is kept out of every query rather than
+ * answered from, so its chunks are counted in {@code lexical.unsearchableChunks} and not in
+ * {@code liveChunks}: {@code liveChunks} stays what a query can match. {@code unreadableSegments}
+ * counts such segments and {@code unreadable} names each, with its chunk count, whether the next
+ * compaction can rebuild it from stored text, and what is wrong with it. The node keeps serving
+ * through this, as it does through the three partial failures below, so it is reported here and
+ * not in readiness. {@code outdatedSegments} counts segments still in an older format, which
+ * compaction rewrites a few at a time.</p>
+ *
  * <h2>The three blocks that report a partial failure</h2>
  * <p>{@code workers}, {@code vectorIndex} and {@code breakers} describe states this node keeps
  * serving through, and each of them is invisible in every other field. A dead index
@@ -176,6 +190,15 @@ public class StatsEndpoint implements HttpHandler {
      * describes.</p>
      */
     private static final int MAX_REPORTED_VECTOR_FAILURES = 32;
+
+    /**
+     * Unreadable lexical segments named individually before the list is cut short.
+     *
+     * <p>The same bound as the vector failures, for the same reason: past a few dozen, the
+     * operator's next step is the log and the disk rather than the list, and the count beside it
+     * is always the whole figure.</p>
+     */
+    private static final int MAX_REPORTED_UNREADABLE_SEGMENTS = 32;
 
     private final NodeStatsCollector collector;
 
@@ -666,6 +689,50 @@ public class StatsEndpoint implements HttpHandler {
                 .orElse("null")).append(", ")
             .append("\"compactionDue\": ").append(lexical.compactionDue()).append(", ")
             .append("\"unreadableChunksDropped\": ").append(lexical.unreadableChunksDropped())
-            .append("}");
+            .append(", ")
+            // Chunks the index holds and no query can match, and the segments holding them:
+            // without these a node missing part of its keyword corpus reports a smaller one.
+            .append("\"unsearchableChunks\": ").append(lexical.unsearchableDocuments())
+            .append(", ")
+            .append("\"unreadableSegments\": ").append(lexical.unreadableSegments().size())
+            .append(", ")
+            .append("\"outdatedSegments\": ").append(lexical.outdatedSegments());
+        appendUnreadableSegments(sb, lexical.unreadableSegments());
+        sb.append("}");
+    }
+
+    /**
+     * Names each lexical segment that could not be opened, when there is any.
+     *
+     * <p>Absent rather than empty on a healthy index, so the common response stays the shape it
+     * was. Each entry says whether the next compaction can rebuild the segment, because that
+     * decides whether an operator waits or restores.</p>
+     *
+     * @param sb         The body being built
+     * @param unreadable The segments, in the index's order
+     */
+    private static void appendUnreadableSegments(
+            StringBuilder sb, List<ChunkIndexStats.UnreadableSegment> unreadable) {
+        if (unreadable.isEmpty()) {
+            return;
+        }
+        sb.append(", \"unreadable\": [");
+        int written = 0;
+        for (ChunkIndexStats.UnreadableSegment segment : unreadable) {
+            if (written == MAX_REPORTED_UNREADABLE_SEGMENTS) {
+                break;
+            }
+            sb.append(written == 0 ? "" : ", ")
+                .append("{\"segment\": \"").append(JsonText.escape(segment.name()))
+                .append("\", \"chunks\": ").append(segment.chunks())
+                .append(", \"rebuildable\": ").append(segment.rebuildable())
+                .append(", \"reason\": \"").append(JsonText.escape(segment.reason()))
+                .append("\"}");
+            written++;
+        }
+        sb.append("]");
+        if (unreadable.size() > MAX_REPORTED_UNREADABLE_SEGMENTS) {
+            sb.append(", \"unreadableTruncated\": true");
+        }
     }
 }

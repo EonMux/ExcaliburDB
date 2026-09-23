@@ -25,6 +25,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
@@ -233,6 +234,55 @@ class StatsEndpointTest {
                 "native", 10L, 1, 8L, 2L, 0, Optional.empty(), false, 2L)));
 
             assertThat(response).contains("\"unreadableChunksDropped\": 2");
+        }
+
+        @Test
+        @DisplayName("a healthy index reports nothing unsearchable and lists no segment")
+        void healthyIndexHasNothingUnsearchable() throws IOException {
+            String response = responseOf(new ReportingIndex(new ChunkIndexStats(
+                "native", 10L, 1, 10L, 0L, 0, Optional.empty(), false)));
+
+            assertThat(response).contains("\"unsearchableChunks\": 0");
+            assertThat(response).contains("\"unreadableSegments\": 0");
+            assertThat(response).contains("\"outdatedSegments\": 0");
+            assertThat(response).doesNotContain("\"unreadable\":");
+        }
+
+        @Test
+        @DisplayName("segments that cannot be opened are named, with the chunks no query can reach")
+        void unreadableSegmentsAreNamed() throws IOException {
+            // Without this the node reports a healthy chunk count while keyword search misses
+            // every chunk in those segments, and nothing says which or whether it will recover.
+            String response = responseOf(new ReportingIndex(new ChunkIndexStats(
+                "native", 0L, 3, 7L, 0L, 0, Optional.empty(), true, 0L, List.of(
+                    new ChunkIndexStats.UnreadableSegment("seg-1", 2, true,
+                        "post.dat fails its \"checksum\""),
+                    new ChunkIndexStats.UnreadableSegment("seg-4", 1, false, "torn")), 1)));
+
+            assertThat(response).contains("\"liveChunks\": 7");
+            assertThat(response).contains("\"unsearchableChunks\": 3");
+            assertThat(response).contains("\"unreadableSegments\": 2");
+            assertThat(response).contains("\"outdatedSegments\": 1");
+            assertThat(response).contains("\"unreadable\": [{\"segment\": \"seg-1\", \"chunks\": 2, "
+                + "\"rebuildable\": true, \"reason\": \"post.dat fails its \\\"checksum\\\"\"}, "
+                + "{\"segment\": \"seg-4\", \"chunks\": 1, \"rebuildable\": false, "
+                + "\"reason\": \"torn\"}]");
+        }
+
+        @Test
+        @DisplayName("a long list of unreadable segments is cut short, and says so")
+        void unreadableListIsBounded() throws IOException {
+            List<ChunkIndexStats.UnreadableSegment> many = new java.util.ArrayList<>();
+            for (int i = 0; i < 40; i++) {
+                many.add(new ChunkIndexStats.UnreadableSegment("seg-" + i, 1, true, "damaged"));
+            }
+            String response = responseOf(new ReportingIndex(new ChunkIndexStats(
+                "native", 0L, 40, 0L, 0L, 0, Optional.empty(), true, 0L, many, 0)));
+
+            assertThat(response).contains("\"unreadableSegments\": 40");
+            assertThat(response).contains("\"unsearchableChunks\": 40");
+            assertThat(response).contains("\"seg-31\"").doesNotContain("\"seg-32\"");
+            assertThat(response).contains("\"unreadableTruncated\": true");
         }
 
         @Test

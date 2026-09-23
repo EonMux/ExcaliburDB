@@ -121,6 +121,52 @@ final class SegmentKeys implements AutoCloseable {
     }
 
     /**
+     * Says what, if anything, stops these names from being read back one per document.
+     *
+     * <p>The names carry no checksum, so this cannot prove they are the ones written; what it
+     * proves is that every document has exactly one name a rewrite can carry forward. That is the
+     * question a rebuild asks before it relies on them, because a rewrite trusts its key table
+     * completely: a count that disagrees with the manifest would renumber every document after
+     * the gap, and a name the key rules refuse would fail every rewrite of the segment rather
+     * than only this one. A name whose bytes changed but still read as a name is not caught, and
+     * costs only that document: its text is asked for under a name storage does not hold, and it
+     * is dropped.</p>
+     *
+     * @param expected How many documents the manifest records for the segment
+     * @return A description of the damage, or null when every document has a usable name
+     */
+    String damage(int expected) {
+        if (count != expected) {
+            return "its key table names " + count + " document(s) where the manifest records "
+                + expected;
+        }
+        long length = names.size();
+        int start = offsets.readInt(0);
+        if (start != 0) {
+            return "its key table's first name starts at byte " + start + " rather than 0";
+        }
+        for (int doc = 0; doc < count; doc++) {
+            int end = offsets.readInt((long) (doc + 1) * Integer.BYTES);
+            // Every name is at least one byte and ends with the newline that separates it.
+            if (end <= start + 1 || end > length || names.readByte(end - 1) != '\n') {
+                return "its key table's entry for document " + doc + " does not delimit a name";
+            }
+            try {
+                DocumentKeys.require(at(doc));
+            } catch (IllegalArgumentException e) {
+                return "its key table's name for document " + doc + " is not one a key can be: "
+                    + e.getMessage();
+            }
+            start = end;
+        }
+        if (start != length) {
+            return "its key table's names file runs " + (length - start) + " byte(s) past the "
+                + "last name";
+        }
+        return null;
+    }
+
+    /**
      * The name of one document.
      *
      * @param docId The segment-local document id

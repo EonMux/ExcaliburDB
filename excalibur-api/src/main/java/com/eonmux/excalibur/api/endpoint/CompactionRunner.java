@@ -199,12 +199,16 @@ public final class CompactionRunner implements AutoCloseable {
      *                          surviving chunk's text could not be read back; non-zero means the
      *                          rewrite was partial, or did not happen at all when
      *                          {@code performed} is false
+     * @param segmentsRebuilt   of the segments rewritten, those that could not be opened and are
+     *                          searchable again
+     * @param segmentsUpgraded  of the segments rewritten, those written in an older format and
+     *                          now in the current one
      * @param reason            why it ran or did not, or null when it failed
      * @param error             why it failed, or null
      */
     public record LexicalOutcome(boolean performed, int segmentsRewritten, int segmentsProduced,
-                                 int chunksRemoved, int groupsAbandoned, String reason,
-                                 String error) {
+                                 int chunksRemoved, int groupsAbandoned, int segmentsRebuilt,
+                                 int segmentsUpgraded, String reason, String error) {
 
         /**
          * The outcome of a compaction the index carried out, or declined.
@@ -215,7 +219,7 @@ public final class CompactionRunner implements AutoCloseable {
         static LexicalOutcome of(CompactionResult result) {
             return new LexicalOutcome(result.performed(), result.segmentsRewritten(),
                 result.segmentsProduced(), result.documentsRemoved(), result.groupsAbandoned(),
-                result.reason(), null);
+                result.segmentsRebuilt(), result.segmentsUpgraded(), result.reason(), null);
         }
 
         /**
@@ -225,7 +229,7 @@ public final class CompactionRunner implements AutoCloseable {
          * @return The outcome
          */
         static LexicalOutcome skipped(String reason) {
-            return new LexicalOutcome(false, 0, 0, 0, 0, reason, null);
+            return new LexicalOutcome(false, 0, 0, 0, 0, 0, 0, reason, null);
         }
 
         /**
@@ -235,7 +239,7 @@ public final class CompactionRunner implements AutoCloseable {
          * @return The outcome
          */
         static LexicalOutcome failed(String error) {
-            return new LexicalOutcome(false, 0, 0, 0, 0, null, error);
+            return new LexicalOutcome(false, 0, 0, 0, 0, 0, 0, null, error);
         }
     }
 

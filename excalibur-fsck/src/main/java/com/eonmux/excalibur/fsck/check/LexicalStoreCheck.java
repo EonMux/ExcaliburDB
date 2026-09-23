@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.core.integrity.IntegrityReport;
 import com.eonmux.excalibur.retrieval.lexical.native_.PostingsIndex;
 import com.eonmux.excalibur.retrieval.lexical.native_.SegmentManifest;
 
@@ -105,10 +106,31 @@ public final class LexicalStoreCheck {
         for (SegmentManifest.Entry entry : parsed.entries()) {
             Path segment = directory.resolve(entry.name());
             String segmentRelative = relative + "/" + entry.name();
-            checks.add(IntegrityReports.from(PostingsIndex.verifyIntegrity(segment),
-                segment, segmentRelative, null, -1));
+            IntegrityReport report = PostingsIndex.verifyIntegrity(segment);
+            checks.add(IntegrityReports.from(namingTheFile(report, segment), segment,
+                segmentRelative, null, -1));
         }
         return checks;
+    }
+
+    /**
+     * Puts the name of the file a verdict is about into its detail.
+     *
+     * <p>A segment is reported as one directory, because it is written, verified and repaired
+     * as one; the verifier's own verdict is about the column or metadata file that failed, and
+     * without its name the report would say a segment is damaged without saying where.</p>
+     *
+     * @param report  The verifier's verdict
+     * @param segment The segment directory the verdict will be reported under
+     * @return The verdict, its detail prefixed with the file's name inside the segment
+     */
+    private static IntegrityReport namingTheFile(IntegrityReport report, Path segment) {
+        Path file = report.file();
+        if (file == null || file.equals(segment) || !file.startsWith(segment)) {
+            return report;
+        }
+        return new IntegrityReport(file, report.format(), report.status(),
+            segment.relativize(file) + ": " + report.detail());
     }
 
     /**

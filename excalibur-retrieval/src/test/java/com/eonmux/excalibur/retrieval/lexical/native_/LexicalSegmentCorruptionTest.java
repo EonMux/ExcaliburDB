@@ -184,10 +184,12 @@ class LexicalSegmentCorruptionTest {
 
             try (LexicalStore reopened = LexicalStore.open(dir)) {
                 assertThat(reopened.unreadableSegments()).hasSize(1);
-                // Still named by the manifest and still counted, so nothing deletes the bytes
-                // somebody may yet recover and nothing reports the documents as gone.
+                // Still named by the manifest, so nothing deletes the bytes somebody may yet
+                // recover; counted as unsearchable rather than live, so the documents are
+                // reported neither as gone nor as findable.
                 assertThat(reopened.segments()).hasSize(2);
-                assertThat(reopened.liveDocuments(9)).isEqualTo(2);
+                assertThat(reopened.liveDocuments(9)).isEqualTo(1);
+                assertThat(reopened.unsearchableDocuments(9)).isEqualTo(1);
             }
         }
     }

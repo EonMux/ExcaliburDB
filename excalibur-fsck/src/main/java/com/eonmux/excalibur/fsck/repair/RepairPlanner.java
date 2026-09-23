@@ -9,6 +9,7 @@ import com.eonmux.excalibur.fsck.check.DataDirectoryScan;
 import com.eonmux.excalibur.fsck.check.FileCheck;
 import com.eonmux.excalibur.fsck.check.FileClassifier;
 import com.eonmux.excalibur.fsck.check.FileKind;
+import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
 import com.eonmux.excalibur.store.RoutingDirectory;
 
 import java.nio.file.Path;
@@ -23,9 +24,13 @@ import java.util.List;
  */
 public final class RepairPlanner {
 
-    /** The two files a repair never moves aside on its own judgement. */
+    /** The lexical store's manifest, relative to the data directory. */
+    private static final String LEXICAL_MANIFEST =
+        FileClassifier.LEXICAL_STORE_DIRECTORY + "/" + LexicalStoreCheck.MANIFEST;
+
+    /** The files a repair never moves aside on its own judgement. */
     private static final List<String> IRREPLACEABLE =
-        List.of(CatalogCheck.FILE_NAME, RoutingDirectory.FILE_NAME);
+        List.of(CatalogCheck.FILE_NAME, RoutingDirectory.FILE_NAME, LEXICAL_MANIFEST);
 
     private RepairPlanner() {
         throw new AssertionError("Utility class");
@@ -114,6 +119,18 @@ public final class RepairPlanner {
      * @return What to weigh
      */
     private static String irreplaceableAdvice(FileCheck file) {
+        if (LEXICAL_MANIFEST.equals(file.relative())) {
+            // Moving it aside is worse than leaving it: a store with no manifest opens as a new,
+            // empty one, and an empty manifest is a complete one, so the node would then delete
+            // every segment it does not name - which is all of them.
+            return LEXICAL_MANIFEST + " is damaged: " + file.detail() + ". This is not moved "
+                + "aside automatically: the node refuses to open a manifest it cannot show to "
+                + "be whole, but a store without one opens as a new, empty index and deletes "
+                + "every segment the empty manifest does not name. Every segment is still on "
+                + "disk; restore the manifest from a backup, or remove the whole "
+                + FileClassifier.LEXICAL_STORE_DIRECTORY + " directory and rebuild the keyword "
+                + "index by reindexing";
+        }
         if (CatalogCheck.FILE_NAME.equals(file.relative())) {
             return "catalog.dat is damaged: " + file.detail() + ". This is not moved aside "
                 + "automatically. The segment files are rediscovered from the directory on "
@@ -175,7 +192,13 @@ public final class RepairPlanner {
     private static RepairAction quarantineCorrupt(DataDirectoryScan scan, FileCheck file) {
         FileKind kind = FileClassifier.classify(file.relative());
         boolean primary = kind == FileKind.SEGMENT_DATA;
-        String rationale = kind.rebuiltOnOpen()
+        String rationale = isLexicalSegment(kind, file.relative())
+            ? "Every byte is preserved under the quarantine directory. The node keeps a "
+                + "lexical segment it cannot open out of every query whether or not it is "
+                + "moved, and names it in /v1/stats; while the segment's key table beside it "
+                + "is intact, the next compaction rebuilds it from the chunk text in storage, "
+                + "and /v1/stats says whether it can"
+            : kind.rebuiltOnOpen()
             ? "Every byte is preserved under the quarantine directory. The node would rebuild "
                 + "this file from the segment's live entries on its next open whether or not "
                 + "it is moved; moving it aside only means the damaged copy is no longer read "
@@ -193,6 +216,25 @@ public final class RepairPlanner {
             "move " + file.relative() + " out of " + scan.dataDirectory()
                 + " into the quarantine directory, deleting nothing",
             rationale);
+    }
+
+    /**
+     * Reports whether a verdict is about one of the lexical store's segment directories.
+     *
+     * <p>The scan reports each segment as its directory, and the files beside it - the key
+     * table, tombstones, the manifest - under their own names, which all carry a suffix or are
+     * the manifest.</p>
+     *
+     * @param kind     What the file was classified as
+     * @param relative Its path relative to the data directory
+     * @return true for a segment directory
+     */
+    private static boolean isLexicalSegment(FileKind kind, String relative) {
+        if (kind != FileKind.LEXICAL_STORE_PART || LEXICAL_MANIFEST.equals(relative)) {
+            return false;
+        }
+        String name = relative.substring(relative.lastIndexOf('/') + 1);
+        return name.indexOf('.') < 0;
     }
 
     /**

@@ -80,6 +80,24 @@ public final class LexicalStore implements AutoCloseable {
     public record Staged(String name, int docCount) { }
 
     /**
+     * A segment the manifest names that this store could not open.
+     *
+     * @param name          The segment
+     * @param reason        What is wrong with it
+     * @param liveDocuments Documents it holds that are not erased - each one missing from every
+     *                      answer until the segment is rebuilt or restored
+     * @param rebuildable   Whether its key table is sound, so a compaction can rebuild it from the
+     *                      text it is given; false means only restoring its files brings it back
+     */
+    public record DamagedSegment(String name, String reason, int liveDocuments,
+                                 boolean rebuildable) {
+        public DamagedSegment {
+            Objects.requireNonNull(name, "name must not be null");
+            Objects.requireNonNull(reason, "reason must not be null");
+        }
+    }
+
+    /**
      * One group's replacement segment, built and waiting to be published.
      *
      * @param replaced  The segments it replaces, exactly as the manifest held them when it was
@@ -158,10 +176,20 @@ public final class LexicalStore implements AutoCloseable {
     /**
      * Segments the manifest names that this store could not open, and why.
      *
-     * <p>Filled once at open and never afterwards, because a segment's files do not change while
-     * the store holds them.</p>
+     * <p>Filled at open, because a segment's files do not change while the store holds them; an
+     * entry leaves only when a compaction replaces its segment.</p>
      */
     private final Map<String, String> unreadable = new LinkedHashMap<>();
+
+    /** Of {@link #unreadable}, the segments whose key table is sound enough to rebuild from. */
+    private final Set<String> rebuildable = new HashSet<>();
+
+    /**
+     * Segments that opened but were written in an older format: readable, exact, and without the
+     * column checksums that would let damage to them be detected. Filled at open, and emptied by
+     * the compactions that rewrite them.
+     */
+    private final Set<String> outdated = new HashSet<>();
     private final java.util.concurrent.atomic.AtomicLong nextSegment =
         new java.util.concurrent.atomic.AtomicLong();
 
@@ -256,9 +284,23 @@ public final class LexicalStore implements AutoCloseable {
      * where it is, with its entry in the manifest, which is what keeps
      * {@link #removeUnreferenced()} from deleting the bytes somebody may yet recover; it is kept
      * out of every query, because half a segment is a wrong answer rather than a partial one;
-     * and it is reported, in the log at open and through {@link #unreadableSegments()}, so that
-     * a store answering from four segments out of five says so. Restoring or rebuilding the
-     * files makes it searchable again at the next open, with nothing to undo.</p>
+     * and it is reported, in the log at open and through {@link #damagedSegments()}, so that a
+     * store answering from four segments out of five says so. Restoring the files makes it
+     * searchable again at the next open, with nothing to undo.</p>
+     *
+     * <h2>Why a damaged segment can usually be rebuilt</h2>
+     * <p>A rewrite never reads a segment's postings: it reads the segment's names and asks the
+     * caller for each one's text, which is how every compaction already works. So a segment
+     * whose postings are damaged and whose key table is sound can be rebuilt exactly, and the
+     * next compaction does so without being asked - see {@link #requiredRewrites()}. The key
+     * table is checked here, while the store is deciding what it holds, because a rebuild
+     * trusts it completely.</p>
+     *
+     * <h2>Older formats</h2>
+     * <p>A segment written before its format carried column checksums opens and answers exactly,
+     * and is noted so that compaction rewrites it into the current format in time. Nothing is
+     * upgraded in place: a checksum written now would vouch for bytes nothing has vouched
+     * for.</p>
      */
     private void inspectSegments() throws IOException {
         for (SegmentManifest.Entry entry : manifest.entries()) {
@@ -270,28 +312,108 @@ public final class LexicalStore implements AutoCloseable {
                 }
                 SegmentGeometry.verify(segment, meta);
                 LexicalSegmentIntegrity.requireIntact(segment, meta);
+                if (!meta.checksummed()) {
+                    outdated.add(entry.name());
+                }
             } catch (Bm25MismatchException e) {
                 throw e;
             } catch (IOException e) {
-                unreadable.put(entry.name(), e.getMessage());
-                LOGGER.error("Segment {} of the lexical store at {} cannot be opened, so the {} "
-                    + "document(s) it holds will not be found by any query until it is restored "
-                    + "or rebuilt; its files are left untouched: {}",
-                    entry.name(), directory, entry.liveCount(), e.getMessage());
+                quarantine(entry, e.getMessage());
             }
         }
+        if (!outdated.isEmpty()) {
+            LOGGER.warn("{} segment(s) of the lexical store at {} were written in an older format "
+                + "and carry no column checksums; they answer exactly, and compaction rewrites "
+                + "them into the current format a few at a time", outdated.size(), directory);
+        }
+    }
+
+    /**
+     * Keeps a segment that could not be opened out of every query, and works out whether it can
+     * be rebuilt.
+     */
+    private void quarantine(SegmentManifest.Entry entry, String why) {
+        String keyDamage;
+        try {
+            keyDamage = openKeys(entry.name()).damage(entry.docCount());
+        } catch (IOException | RuntimeException e) {
+            keyDamage = String.valueOf(e.getMessage());
+        }
+        if (keyDamage == null) {
+            unreadable.put(entry.name(), why);
+            rebuildable.add(entry.name());
+            LOGGER.error("Segment {} of the lexical store at {} cannot be opened, so the {} "
+                + "document(s) it holds will not be found by any query until it is rebuilt; its "
+                + "key table is sound, so the next compaction rebuilds it from stored text: {}",
+                entry.name(), directory, entry.liveCount(), why);
+            return;
+        }
+        unreadable.put(entry.name(), why + "; its key table cannot be relied on either, so it "
+            + "cannot be rebuilt: " + keyDamage);
+        LOGGER.error("Segment {} of the lexical store at {} cannot be opened, so the {} "
+            + "document(s) it holds will not be found by any query until its files are restored "
+            + "or its documents reindexed; its key table is damaged too, so no compaction can "
+            + "rebuild it, and its files are left untouched: {}; key table: {}",
+            entry.name(), directory, entry.liveCount(), why, keyDamage);
     }
 
     /**
      * Segments the manifest names that could not be opened, mapped to what is wrong with them.
      *
-     * <p>Empty for a healthy store. A caller that reports on this store should surface it: the
-     * documents in these segments are still counted by {@link #liveDocuments(long)} and are
-     * still on disk, and they are the difference between what the store contains and what it can
-     * answer with.</p>
+     * <p>Empty for a healthy store. {@link #damagedSegments()} says the same with the counts and
+     * the prognosis a report needs.</p>
      */
     public Map<String, String> unreadableSegments() {
         return java.util.Collections.unmodifiableMap(new LinkedHashMap<>(unreadable));
+    }
+
+    /**
+     * Every segment the manifest names that could not be opened, in manifest order.
+     *
+     * <p>Empty for a healthy store. A caller that reports on this store should surface it: these
+     * documents are still on disk and are not in {@link #liveDocuments(long)}, and they are the
+     * difference between what the store contains and what it can answer with.</p>
+     */
+    public List<DamagedSegment> damagedSegments() {
+        if (unreadable.isEmpty()) {
+            return List.of();
+        }
+        List<DamagedSegment> damaged = new ArrayList<>(unreadable.size());
+        for (SegmentManifest.Entry entry : manifest.entries()) {
+            String why = unreadable.get(entry.name());
+            if (why != null) {
+                damaged.add(new DamagedSegment(entry.name(), why, entry.liveCount(),
+                    rebuildable.contains(entry.name())));
+            }
+        }
+        return List.copyOf(damaged);
+    }
+
+    /**
+     * Segments written in an older format and not yet rewritten, in manifest order.
+     *
+     * <p>Each answers exactly; what it lacks is the column checksums, and before version 2 the
+     * block bounds that let a query skip what cannot reach the top results.</p>
+     */
+    public List<String> outdatedSegments() {
+        if (outdated.isEmpty()) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>(outdated.size());
+        for (SegmentManifest.Entry entry : manifest.entries()) {
+            if (outdated.contains(entry.name())) {
+                names.add(entry.name());
+            }
+        }
+        return List.copyOf(names);
+    }
+
+    /** What compaction has to rewrite whatever its policy decides. */
+    private CompactionPlanner.RequiredRewrites requiredRewrites() {
+        if (rebuildable.isEmpty() && outdated.isEmpty()) {
+            return CompactionPlanner.RequiredRewrites.NONE;
+        }
+        return new CompactionPlanner.RequiredRewrites(rebuildable, outdated);
     }
 
     /** The entries a query may actually read, which is all of them on a healthy store. */
@@ -759,13 +881,14 @@ public final class LexicalStore implements AutoCloseable {
     }
 
     /**
-     * What a compaction would do now, or nothing when the policy declines.
+     * What a compaction would do now, or nothing when the policy declines and no segment has to
+     * be rebuilt or upgraded.
      *
      * @param floorEpoch The oldest epoch any live reader may still query at
      */
     public Optional<CompactionPlan> planCompaction(long floorEpoch) {
         return planner.plan(manifest.entries(), erasureLog.oldestOutstanding(), clock.instant(),
-            floorEpoch);
+            floorEpoch, requiredRewrites());
     }
 
     /**
@@ -813,7 +936,7 @@ public final class LexicalStore implements AutoCloseable {
      * @param floorEpoch The epoch below which segments may be merged with each other
      */
     public CompactionPlan forcedPlan(long floorEpoch) {
-        return planner.forcedPlan(manifest.entries(), floorEpoch);
+        return planner.forcedPlan(manifest.entries(), floorEpoch, requiredRewrites());
     }
 
     /**
@@ -1133,6 +1256,8 @@ public final class LexicalStore implements AutoCloseable {
         int rewritten = 0;
         int produced = 0;
         int discarded = 0;
+        int rebuilt = 0;
+        int upgraded = 0;
         List<String> retired = new ArrayList<>();
         boolean changed = false;
         for (PreparedGroup group : prepared.groups()) {
@@ -1156,6 +1281,13 @@ public final class LexicalStore implements AutoCloseable {
                 produced++;
             }
             retired.addAll(names);
+            for (String name : names) {
+                if (unreadable.containsKey(name)) {
+                    rebuilt++;
+                } else if (outdated.contains(name)) {
+                    upgraded++;
+                }
+            }
             rewritten += names.size();
             removed += group.before() - group.survivors();
             changed = true;
@@ -1165,9 +1297,14 @@ public final class LexicalStore implements AutoCloseable {
         }
 
         // Only after the new manifest is in place: until then the old segments are what a reader
-        // is using, and deleting them first would unmap the store out from under one.
+        // is using, and deleting them first would unmap the store out from under one. A damaged
+        // segment's bytes go too: its replacement was built from the same names and the text
+        // behind them, so they hold nothing the store still needs.
         for (String old : retired) {
             deleteSegment(old);
+            unreadable.remove(old);
+            rebuildable.remove(old);
+            outdated.remove(old);
         }
         settleErasureLog();
         if (discarded > 0) {
@@ -1186,12 +1323,14 @@ public final class LexicalStore implements AutoCloseable {
             LOGGER.warn("Compaction published nothing; {}", why);
             return new CompactionResult(false, 0, 0, 0, abandoned, why);
         }
-        LOGGER.info("Compacted {} segment(s) into {}, physically removing {} document(s){} ({})",
-            rewritten, produced, removed,
+        LOGGER.info("Compacted {} segment(s) into {}, physically removing {} document(s){}{}{} "
+            + "({})", rewritten, produced, removed,
+            rebuilt > 0 ? "; rebuilt " + rebuilt + " damaged segment(s)" : "",
+            upgraded > 0 ? "; upgraded " + upgraded + " segment(s) from an older format" : "",
             abandoned > 0 ? "; " + abandoned + " group(s) abandoned and left as they were" : "",
             prepared.reason());
-        return new CompactionResult(true, rewritten, produced, removed, abandoned,
-            abandoned > 0
+        return new CompactionResult(true, rewritten, produced, removed, abandoned, rebuilt,
+            upgraded, abandoned > 0
                 ? "partial: " + abandoned + " group(s) abandoned because stored text could not "
                     + "be read back (" + prepared.reason() + ")"
                 : prepared.reason());
@@ -1290,11 +1429,34 @@ public final class LexicalStore implements AutoCloseable {
         return manifest.entries();
     }
 
-    /** Documents readable at an epoch. */
+    /**
+     * Documents a query at an epoch can match.
+     *
+     * <p>Not those in a segment this store could not open: they are still held, and still on
+     * disk, but counting them here would report a corpus that answers for documents no query can
+     * find. {@link #unsearchableDocuments(long)} counts them instead.</p>
+     */
     public int liveDocuments(long epoch) {
         int total = 0;
-        for (SegmentManifest.Entry entry : manifest.visibleAt(epoch)) {
+        for (SegmentManifest.Entry entry : readable(manifest.visibleAt(epoch))) {
             total += entry.liveCount();
+        }
+        return total;
+    }
+
+    /**
+     * Documents visible at an epoch that no query can match, because the segment holding them
+     * could not be opened.
+     */
+    public int unsearchableDocuments(long epoch) {
+        if (unreadable.isEmpty()) {
+            return 0;
+        }
+        int total = 0;
+        for (SegmentManifest.Entry entry : manifest.visibleAt(epoch)) {
+            if (unreadable.containsKey(entry.name())) {
+                total += entry.liveCount();
+            }
         }
         return total;
     }

@@ -37,7 +37,8 @@ import java.util.Objects;
  *   "graphs_skipped": 2,
  *   "graphs_failed": 0,
  *   "lexical": {"performed": true, "segments_rewritten": 5, "segments_produced": 1,
- *               "chunks_removed": 1840, "groups_abandoned": 0,
+ *               "chunks_removed": 1840, "groups_abandoned": 0, "segments_rebuilt": 0,
+ *               "segments_upgraded": 0,
  *               "reason": "due: 1840 of 7200 document(s) tombstoned across 12 segment(s)"}
  * }
  * }</pre>
@@ -56,7 +57,10 @@ import java.util.Objects;
  * of segments the rewrite left exactly as they were because storage could not read a surviving
  * chunk's text back: with {@code performed} true the rewrite was partial, and with it false
  * nothing was published at all - a forced rewrite that reports that has not succeeded, and any
- * erasure in those segments is still owed.</p>
+ * erasure in those segments is still owed. {@code segments_rebuilt} and
+ * {@code segments_upgraded} are the rewritten segments that were chosen for what they were
+ * rather than what they held: ones that could not be opened and are searchable again, and ones
+ * written in an older format and now in the current one.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe; it reads an immutable snapshot.</p>
@@ -134,6 +138,8 @@ public final class CompactionStatusEndpoint implements HttpHandler {
                 .append(", \"segments_produced\": ").append(lexical.segmentsProduced())
                 .append(", \"chunks_removed\": ").append(lexical.chunksRemoved())
                 .append(", \"groups_abandoned\": ").append(lexical.groupsAbandoned())
+                .append(", \"segments_rebuilt\": ").append(lexical.segmentsRebuilt())
+                .append(", \"segments_upgraded\": ").append(lexical.segmentsUpgraded())
                 .append(", \"reason\": \"").append(JsonText.escape(lexical.reason()))
                 .append('"');
         }
