@@ -15,6 +15,15 @@ import java.util.List;
  * because a fact staged for a document whose publication then failed would be a fact about
  * something the corpus does not contain.</p>
  *
+ * <h2>Replacing a version</h2>
+ * <p>A document published over a version this node already held is reported through
+ * {@link #onDocumentReplaced} rather than {@link #onDocumentPublished}. Everything staged from a
+ * document carries the same source id whatever version it was extracted from, so the earlier
+ * version's facts and snippets stay staged beside the new ones unless they are withdrawn - and
+ * the next graph build then publishes what the document used to say as though it still said it.
+ * Two methods rather than a flag, so a sink that stages anything has to say what replacing a
+ * version means to it.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Implementations must be safe for concurrent use: one virtual thread per document.</p>
  *
@@ -44,6 +53,23 @@ public interface GraphIngestSink {
     void onDocumentPublished(String documentKey, String text, long lastModifiedMillis);
 
     /**
+     * Records a published document that replaced a version this node already held.
+     *
+     * <p>Withdraws whatever was staged from the earlier version, then records this one as
+     * {@link #onDocumentPublished} would. The earlier version's facts are withdrawn whether or not
+     * any are found in the new one: they describe text the corpus no longer holds.</p>
+     *
+     * <p>Must not throw, for the reason {@link #onDocumentPublished} must not. The caller calls
+     * this for one document at a time and in the order its versions were published, so the
+     * withdrawal cannot remove a later version's facts.</p>
+     *
+     * @param documentKey        The source-qualified document key
+     * @param text               The new version's text
+     * @param lastModifiedMillis When the new version was last modified, or 0 when unknown
+     */
+    void onDocumentReplaced(String documentKey, String text, long lastModifiedMillis);
+
+    /**
      * Records a published document whose date is unknown.
      *
      * @param documentKey The source-qualified document key
@@ -70,7 +96,25 @@ public interface GraphIngestSink {
 
     /** A sink for a deployment that indexes text and does not build a graph. */
     static GraphIngestSink none() {
-        return (documentKey, text, lastModifiedMillis) -> { };
+        return NoGraph.INSTANCE;
+    }
+
+    /** Stages nothing, so a replaced version has nothing to withdraw. */
+    enum NoGraph implements GraphIngestSink {
+        /** The one instance. */
+        INSTANCE;
+
+        @Override
+        public void onDocumentPublished(String documentKey, String text,
+                                        long lastModifiedMillis) {
+            // No graph is built, so nothing is staged.
+        }
+
+        @Override
+        public void onDocumentReplaced(String documentKey, String text,
+                                       long lastModifiedMillis) {
+            // Nothing was staged from the earlier version, so there is nothing to withdraw.
+        }
     }
 
     /**

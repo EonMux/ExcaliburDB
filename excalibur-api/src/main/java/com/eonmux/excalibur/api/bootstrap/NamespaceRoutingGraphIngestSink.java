@@ -55,6 +55,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * extraction is a chat-model call: made inside the lease, it would pin the namespace against
  * eviction for the length of a network round trip.</p>
  *
+ * <p>A document that replaced a version this node already held is the exception: it borrows
+ * whether or not the new version yields facts, because what was staged from the earlier version
+ * has to be withdrawn either way - see {@link StagingGraphIngestSink}, which does the withdrawing
+ * inside the same borrow as the staging that follows it.</p>
+ *
  * <h2>Why an unresolved source is not staged into the shared namespace</h2>
  * <p>A document whose source this node no longer holds - deregistered while its crawl was
  * finishing - has no namespace to name. Staging it into the shared namespace would move one
@@ -104,6 +109,8 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     private final AtomicLong unresolvedDocuments = new AtomicLong();
     private final AtomicLong tenantFailures = new AtomicLong();
     private final AtomicLong extractionFailures = new AtomicLong();
+    private final AtomicLong recordsWithdrawn = new AtomicLong();
+    private final AtomicLong withdrawalFailures = new AtomicLong();
 
     /**
      * Creates a routing sink.
@@ -135,7 +142,39 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
      */
     @Override
     public void onDocumentPublished(String documentKey, String text, long lastModifiedMillis) {
-        if (documentKey == null || documentKey.isBlank() || text == null || text.isBlank()) {
+        route(documentKey, text, lastModifiedMillis, false);
+    }
+
+    /**
+     * Withdraws what was staged from a document's earlier version, in its source's namespace,
+     * and stages the new version's facts there.
+     *
+     * <p>Never throws, for the reason {@link #onDocumentPublished} does not.</p>
+     *
+     * @param documentKey        The source-qualified document key
+     * @param text               The new version's text
+     * @param lastModifiedMillis The new version's date, or 0 when its source does not say
+     */
+    @Override
+    public void onDocumentReplaced(String documentKey, String text, long lastModifiedMillis) {
+        route(documentKey, text, lastModifiedMillis, true);
+    }
+
+    /**
+     * Finds a published document's namespace and stages into it.
+     *
+     * @param documentKey        The source-qualified document key
+     * @param text               The document's text
+     * @param lastModifiedMillis The document's own date, or 0 when unknown
+     * @param replacing          Whether an earlier version's staged records must be withdrawn
+     */
+    private void route(String documentKey, String text, long lastModifiedMillis,
+                       boolean replacing) {
+        if (documentKey == null || documentKey.isBlank()) {
+            return;
+        }
+        boolean hasText = text != null && !text.isBlank();
+        if (!hasText && !replacing) {
             return;
         }
         documentsSeen.incrementAndGet();
@@ -148,39 +187,58 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
                 + "which every tenant reads", documentKey);
             return;
         }
-        stageInto(namespace.get(), documentKey, text, lastModifiedMillis);
+        List<ExtractedTriple> extracted = hasText ? extract(documentKey, text) : List.of();
+        if (extracted.isEmpty() && !replacing) {
+            return;
+        }
+        stageInto(namespace.get(), documentKey, text, lastModifiedMillis, extracted, replacing);
     }
 
     /**
-     * Extracts one document's facts and stages them into one namespace, for the length of a
-     * borrow.
+     * Asks the extractor for a document's facts, outside any borrow.
+     *
+     * @param documentKey The document
+     * @param text        Its text
+     * @return The facts, empty when there are none or the extractor failed
+     */
+    private List<ExtractedTriple> extract(String documentKey, String text) {
+        try {
+            List<ExtractedTriple> triples = extractor.extract(documentKey, text);
+            return triples == null ? List.of() : List.copyOf(triples);
+        } catch (RuntimeException e) {
+            extractionFailures.incrementAndGet();
+            LOGGER.warn("Could not extract facts from {}: {}", documentKey, e.toString());
+            return List.of();
+        }
+    }
+
+    /**
+     * Stages one document's facts into one namespace, for the length of a borrow, withdrawing
+     * its earlier version's first when it replaced one.
      *
      * @param namespace          Where the facts belong
      * @param documentKey        The document
      * @param text               Its text
      * @param lastModifiedMillis The document's own date, or 0 when unknown
+     * @param extracted          Its facts, already extracted
+     * @param replacing          Whether an earlier version's staged records must be withdrawn
      */
     private void stageInto(NamespaceId namespace, String documentKey, String text,
-                           long lastModifiedMillis) {
-        List<ExtractedTriple> triples;
-        try {
-            triples = extractor.extract(documentKey, text);
-        } catch (RuntimeException e) {
-            extractionFailures.incrementAndGet();
-            LOGGER.warn("Could not extract facts from {}: {}", documentKey, e.toString());
-            return;
-        }
-        if (triples == null || triples.isEmpty()) {
-            return;
-        }
-        List<ExtractedTriple> extracted = List.copyOf(triples);
+                           long lastModifiedMillis, List<ExtractedTriple> extracted,
+                           boolean replacing) {
         try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
             // Handed what was already extracted, so the staging sink stages the facts and the
             // entity text they mention without calling the model a second time.
             StagingGraphIngestSink sink = new StagingGraphIngestSink(
                 lease.resource().staging(), (key, body) -> extracted);
-            sink.onDocumentPublished(documentKey, text, lastModifiedMillis);
+            if (replacing) {
+                sink.onDocumentReplaced(documentKey, text, lastModifiedMillis);
+            } else {
+                sink.onDocumentPublished(documentKey, text, lastModifiedMillis);
+            }
             factsStaged.addAndGet(sink.factsStaged());
+            recordsWithdrawn.addAndGet(sink.recordsWithdrawn());
+            withdrawalFailures.addAndGet(sink.withdrawalFailures());
         } catch (RuntimeException e) {
             // Opening a tenant can fail - a directory that will not create, a staging log that
             // will not open - and one namespace failing must not stop the next document, in this
@@ -278,6 +336,27 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     }
 
     /**
+     * How many staged facts and snippets it withdrew because their document was replaced.
+     *
+     * @return The count
+     */
+    public long recordsWithdrawn() {
+        return recordsWithdrawn.get();
+    }
+
+    /**
+     * How many replaced documents' earlier facts it could not withdraw.
+     *
+     * <p>Each one leaves what an earlier version said staged beside what the document says now,
+     * for the next build to publish.</p>
+     *
+     * @return The count
+     */
+    public long withdrawalFailures() {
+        return withdrawalFailures.get();
+    }
+
+    /**
      * How many documents it could not open a namespace's graph for.
      *
      * @return The count
@@ -301,7 +380,9 @@ public final class NamespaceRoutingGraphIngestSink implements GraphIngestSink {
     @Override
     public String toString() {
         return "NamespaceRoutingGraphIngestSink[" + documentsSeen() + " documents, "
-            + factsStaged() + " facts, " + unresolvedDocuments() + " unresolved, "
-            + tenantFailures() + " tenant failures]";
+            + factsStaged() + " facts, " + recordsWithdrawn() + " withdrawn, "
+            + unresolvedDocuments() + " unresolved, "
+            + tenantFailures() + " tenant failures, "
+            + withdrawalFailures() + " withdrawal failures]";
     }
 }

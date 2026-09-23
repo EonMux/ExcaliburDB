@@ -1,6 +1,9 @@
 package com.eonmux.excalibur.ingest.graph;
 
+import com.eonmux.excalibur.graph.erasure.ErasureScope;
+import com.eonmux.excalibur.graph.erasure.ScopedStagedErasure;
 import com.eonmux.excalibur.graph.provenance.Provenance;
+import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 
@@ -25,6 +28,21 @@ import java.util.concurrent.atomic.AtomicLong;
  * searchable. Both failures are logged and counted rather than raised: the document they describe
  * is already published and searchable by vector, and failing it here would report a loss that did
  * not happen.</p>
+ *
+ * <h2>Replacing a version</h2>
+ * <p>A replaced document's earlier facts and snippets are withdrawn from staging exactly as an
+ * erasure of the document withdraws them: by the source-scoped match on
+ * {@link LlmRelationExtractor#sourceIdOf} of its key, which is the id every fact and snippet
+ * extracted from it carries. They are withdrawn before the new version's facts are staged,
+ * because those carry the same id and a withdrawal after them would take them too. Entity labels
+ * stay: a label is a name other documents' facts may share. The served graph keeps what it was
+ * built with until the next build, which replays staging and so no longer holds the earlier
+ * version.</p>
+ *
+ * <p>The withdrawal rewrites the staging logs, reading them whole, and holds the staging store's
+ * append lock while it does. That is paid once per replaced document that had facts staged -
+ * a log with nothing to remove is scanned and left alone - and never for a document seen for the
+ * first time.</p>
  *
  * <h2>What is counted</h2>
  * <p>Failures are counted rather than only logged, because the interesting failure is the steady
@@ -52,6 +70,8 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
     private final AtomicLong extractionFailures = new AtomicLong();
     private final AtomicLong stagingFailures = new AtomicLong();
     private final AtomicLong indexFailures = new AtomicLong();
+    private final AtomicLong recordsWithdrawn = new AtomicLong();
+    private final AtomicLong withdrawalFailures = new AtomicLong();
 
     /**
      * Creates a sink.
@@ -71,6 +91,53 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
         }
         documentsSeen.incrementAndGet();
         stageFacts(documentKey, text, lastModifiedMillis);
+    }
+
+    /**
+     * Withdraws what was staged from the document's earlier version, then stages this one.
+     *
+     * <p>A failed withdrawal is counted and logged and the new version is staged regardless:
+     * its facts are true of the published document, and leaving them out would add a missing
+     * fact to the stale one.</p>
+     *
+     * @param documentKey        The source-qualified document key
+     * @param text               The new version's text
+     * @param lastModifiedMillis The new version's date, or 0 when unknown
+     */
+    @Override
+    public void onDocumentReplaced(String documentKey, String text, long lastModifiedMillis) {
+        if (documentKey == null || documentKey.isBlank()) {
+            return;
+        }
+        withdraw(documentKey);
+        onDocumentPublished(documentKey, text, lastModifiedMillis);
+    }
+
+    /**
+     * Removes every staged fact and snippet extracted from a document, whatever its version.
+     *
+     * @param documentKey The document
+     * @return How many records were removed, or -1 when the withdrawal failed
+     */
+    public long withdraw(String documentKey) {
+        try {
+            GraphStagingStore.EraseResult result = staging.erase(ScopedStagedErasure.of(
+                new ErasureScope.Source(SourceType.DOCUMENT,
+                    LlmRelationExtractor.sourceIdOf(documentKey))));
+            recordsWithdrawn.addAndGet(result.removed());
+            if (result.removed() > 0) {
+                LOGGER.debug("withdrew {} fact(s) and {} snippet(s) staged from the previous "
+                    + "version of {}", result.factsRemoved(), result.snippetsRemoved(),
+                    documentKey);
+            }
+            return result.removed();
+        } catch (IOException | RuntimeException e) {
+            withdrawalFailures.incrementAndGet();
+            LOGGER.warn("could not withdraw the facts staged from the previous version of {}; "
+                + "the next graph build will publish them beside the new version's: {}",
+                documentKey, e.toString());
+            return -1;
+        }
     }
 
     @Override
@@ -254,11 +321,34 @@ public final class StagingGraphIngestSink implements GraphIngestSink.Staging {
         return indexFailures.get();
     }
 
+    /**
+     * How many staged facts and snippets were withdrawn because their document was replaced.
+     *
+     * @return The count
+     */
+    public long recordsWithdrawn() {
+        return recordsWithdrawn.get();
+    }
+
+    /**
+     * How many replaced documents' earlier facts could not be withdrawn.
+     *
+     * <p>Each one leaves what an earlier version said staged beside what the document says now,
+     * for the next build to publish.</p>
+     *
+     * @return The count
+     */
+    public long withdrawalFailures() {
+        return withdrawalFailures.get();
+    }
+
     @Override
     public String toString() {
         return "StagingGraphIngestSink[" + documentsSeen() + " documents, " + factsStaged()
-            + " facts, " + extractionFailures() + " extraction failures, "
+            + " facts, " + recordsWithdrawn() + " withdrawn, "
+            + extractionFailures() + " extraction failures, "
             + stagingFailures() + " staging failures, "
-            + indexFailures() + " index failures]";
+            + indexFailures() + " index failures, "
+            + withdrawalFailures() + " withdrawal failures]";
     }
 }

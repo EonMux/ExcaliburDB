@@ -214,22 +214,32 @@ final class DocumentIngestor {
         // and the document being registered would delete chunks no entry names yet, and the
         // registration would then put an entry back for content that has gone; the opposite
         // order leaves the chunks with no entry at all, which no later erasure can find.
-        DocumentOutcome outcome = DocumentLocks.shared().inDocument(documentKey,
+        Written written = DocumentLocks.shared().inDocument(documentKey,
             () -> writeAndPublish(sourceId, documentId, documentKey, doc, chunks, embeddings));
-        if (outcome.dropped()) {
-            return outcome;
+        if (written.publication() == null) {
+            return written.outcome();
         }
 
         // Outside the lock: it neither reads nor writes the registry, the visibility entry or
-        // the chunks, and the graph sink may be slow.
-        graphReporter.report(documentKey, doc);
-        return outcome;
+        // the chunks, and the graph sink may be slow. The publication was numbered under the
+        // lock, which is what keeps a slow report of this version from undoing a later one's.
+        graphReporter.report(written.publication(), doc);
+        return written.outcome();
+    }
+
+    /**
+     * What writing a document produced, and the publication to report when it was published.
+     *
+     * @param outcome     What became of the document
+     * @param publication Its publication, or null when it was not published
+     */
+    private record Written(DocumentOutcome outcome, GraphReporter.Publication publication) {
     }
 
     /** Writes every chunk and publishes the document, undoing the writes if anything fails. */
-    private DocumentOutcome writeAndPublish(String sourceId, String documentId, String documentKey,
-                                            FetchedDocument doc, List<TextChunk> chunks,
-                                            Map<Integer, float[]> embeddings) {
+    private Written writeAndPublish(String sourceId, String documentId, String documentKey,
+                                    FetchedDocument doc, List<TextChunk> chunks,
+                                    Map<Integer, float[]> embeddings) {
         List<String> writtenKeys = new ArrayList<>(chunks.size());
         // Read under the lock and before anything is written: this is the version the new one
         // replaces, and it decides which of its chunks become surplus on success and which of
@@ -247,11 +257,14 @@ final class DocumentIngestor {
             publishDocument(sourceId, documentId, documentKey, doc, chunks);
         } catch (Exception e) {
             rollbackChunks(sourceId, documentId, documentKey, previous, writtenKeys, e);
-            return DocumentOutcome.DROPPED;
+            return new Written(DocumentOutcome.DROPPED, null);
         }
         lexicalSideIndex.addDocument(documentKey, lexicalChunks(documentKey, chunks));
         retireSupersededVersion(documentKey, previous, writtenKeys);
-        return DocumentOutcome.published(chunks.size());
+        // A previous version means facts may have been staged from it, which the report of this
+        // one has to withdraw before staging its own.
+        return new Written(DocumentOutcome.published(chunks.size()),
+            graphReporter.published(documentKey, previous != null));
     }
 
     /**

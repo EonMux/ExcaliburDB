@@ -1096,6 +1096,7 @@ class IngestionPipelineTest {
                 implements com.eonmux.excalibur.ingest.graph.GraphIngestSink {
             final Path registryFile;
             final List<String> published = new CopyOnWriteArrayList<>();
+            final List<String> replaced = new CopyOnWriteArrayList<>();
             final List<Boolean> registryOnDiskAtSync = new CopyOnWriteArrayList<>();
 
             RegistryWatchingSink(Path registryFile) {
@@ -1109,9 +1110,37 @@ class IngestionPipelineTest {
             }
 
             @Override
+            public void onDocumentReplaced(String documentKey, String text,
+                                           long lastModifiedMillis) {
+                replaced.add(documentKey + "=" + text);
+            }
+
+            @Override
             public void sync() {
                 registryOnDiskAtSync.add(java.nio.file.Files.exists(registryFile));
             }
+        }
+
+        @Test
+        @DisplayName("a document published over a version it already held is reported as a "
+            + "replacement, so what was staged from that version is withdrawn")
+        void aReplacedVersionIsReportedAsOne() {
+            Path registryFile = tempDir.resolve("replaced-registry.dat");
+            com.eonmux.excalibur.ingest.registry.DocumentRegistry documents =
+                new com.eonmux.excalibur.ingest.registry.DocumentRegistry(registryFile);
+            IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
+                embeddings, storage, index, registry,
+                new com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker(documents));
+            RegistryWatchingSink sink = new RegistryWatchingSink(registryFile);
+            orchestrator.setGraphSink(sink);
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "Ada runs Acme")));
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "Ada left Acme")));
+
+            assertThat(sink.published)
+                .as("the first version replaced nothing, so there is nothing to withdraw")
+                .containsExactly("docs:a.txt");
+            assertThat(sink.replaced).containsExactly("docs:a.txt=Ada left Acme");
         }
 
         @Test

@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.api.bootstrap;
 
+import com.eonmux.excalibur.ingest.graph.LlmRelationExtractor;
 import com.eonmux.excalibur.ingest.graph.RelationExtractor;
 
 import com.eonmux.excalibur.config.Config;
@@ -261,6 +262,99 @@ class NamespaceRoutingGraphIngestSinkTest {
             sink.onDocumentPublished("   ", "Ada knows Babbage.");
 
             assertThat(sink.documentsSeen()).isZero();
+            assertThat(tenants.shared().staging().stagedCount()).isZero();
+        }
+    }
+
+    /**
+     * Finds "Ada works-at X" in a text naming X, with the provenance the LLM extractor gives a
+     * document; finds nothing in a text that says "nothing", and fails on one that says "fail".
+     */
+    private static RelationExtractor employer() {
+        return (documentKey, text) -> {
+            if (text.equals("fail")) {
+                throw new IllegalStateException("the model is refusing calls");
+            }
+            if (text.equals("nothing")) {
+                return List.of();
+            }
+            return List.of(ExtractedTriple.alwaysValid("Ada", "works-at", text,
+                Provenance.of(SourceType.DOCUMENT, LlmRelationExtractor.sourceIdOf(documentKey),
+                    0.9, 1)));
+        };
+    }
+
+    /** The objects of the facts a namespace has staged, in staging order. */
+    private static List<String> employers(GraphTenants tenants, NamespaceId namespace)
+            throws IOException {
+        try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
+            var staging = lease.resource().staging();
+            Map<Integer, String> names = new HashMap<>();
+            for (String label : List.of("Acme", "Globex", "Initech")) {
+                names.put(staging.entityIdOf(label), label);
+            }
+            List<String> objects = new java.util.ArrayList<>();
+            staging.forEach((subject, relation, object, from, to, provenance) ->
+                objects.add(names.get(object)));
+            return objects;
+        }
+    }
+
+    @Test
+    @DisplayName("a replaced document's earlier facts are withdrawn from its namespace")
+    void aReplacementWithdrawsTheEarlierVersion(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs:other", "Initech", 1L);
+
+            sink.onDocumentReplaced("docs:ada", "Globex", 2L);
+
+            assertThat(employers(tenants, acme))
+                .as("the next build must not publish where the document used to say Ada worked")
+                .containsExactly("Initech", "Globex");
+            assertThat(sink.recordsWithdrawn()).isPositive();
+            assertThat(sink.withdrawalFailures()).isZero();
+            assertThat(sink.toString()).contains("withdrawn").contains("0 withdrawal failures");
+        }
+    }
+
+    @Test
+    @DisplayName("a replacement withdraws even when the new version yields no facts")
+    void aReplacementWithNoFactsStillWithdraws(@TempDir Path root) throws IOException {
+        NamespaceId acme = NamespaceId.of("acme");
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", acme)), employer());
+            sink.onDocumentPublished("docs:ada", "Acme", 1L);
+            sink.onDocumentPublished("docs:bob", "Initech", 1L);
+
+            sink.onDocumentReplaced("docs:ada", "nothing", 2L);
+            sink.onDocumentReplaced("docs:bob", "fail", 2L);
+
+            assertThat(employers(tenants, acme))
+                .as("what the earlier versions said is not true of the published documents")
+                .isEmpty();
+            assertThat(sink.extractionFailures()).isEqualTo(1);
+            assertThat(sink.factsStaged()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    @DisplayName("a replacement is ignored without a key, and declined without a namespace")
+    void aReplacementWithoutAKeyOrNamespace(@TempDir Path root) throws IOException {
+        try (GraphTenants tenants = tenants(root, 4)) {
+            NamespaceRoutingGraphIngestSink sink = new NamespaceRoutingGraphIngestSink(
+                tenants, registered(Map.of("docs", NamespaceId.SHARED)), employer());
+
+            sink.onDocumentReplaced(null, "Acme", 1L);
+            sink.onDocumentReplaced(" ", "Acme", 1L);
+            assertThat(sink.documentsSeen()).isZero();
+
+            sink.onDocumentReplaced("gone:ada", "Acme", 1L);
+            assertThat(sink.unresolvedDocuments()).isEqualTo(1);
             assertThat(tenants.shared().staging().stagedCount()).isZero();
         }
     }

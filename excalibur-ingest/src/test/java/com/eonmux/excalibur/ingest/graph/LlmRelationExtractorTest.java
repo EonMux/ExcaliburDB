@@ -472,6 +472,7 @@ class LlmRelationExtractorTest {
         void theNoneSinkDoesNothing() {
             GraphIngestSink.none().onDocumentPublished("docs:ada", "text");
             GraphIngestSink.none().onDocumentPublished("docs:ada", "text", 1L);
+            GraphIngestSink.none().onDocumentReplaced("docs:ada", "text", 1L);
         }
 
         @Test
