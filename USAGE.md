@@ -2844,12 +2844,16 @@ the copy verifies faithfully without it:
   though each is in a format the engine checks: while both are there the compaction never
   swapped, the node discards the pair on open, and a torn pair is a leftover that does not fail
   the image; a staged mapping alone is the one the swapped graph matches, and is verified.
-- Some formats carry nothing to prove them by: `routing.dir`; the document registry, the source
-  catalog and the source status history, each held to what its reader requires — a header version
-  it reads and a record count that matches its lines — though their contents are not checked; the
-  in-flight journal; the lexical store's sidecars; and the graph triple, entity and label logs,
-  whose only open path writes. A registry or catalog its reader would refuse fails the image; a
-  status history the node would only discard does not.
+- The document registry, the source catalog and the source status history are proven against the
+  CRC32C their closing line carries, over every byte before it, and held to what their reader
+  requires — a header version it reads and a record count that matches their lines. The in-flight
+  journal is proven line by line, each against the CRC32C it ends with; a last line cut short is an
+  append that never finished, which the node skips, and does not fail the image. A registry,
+  catalog or journal its reader would refuse fails the image; a status history the node would only
+  discard does not. A file of any of these written before its format carried a checksum is held to
+  its count and header alone, and reported unproven.
+- Some formats carry nothing to prove them by: `routing.dir`; the lexical store's sidecars; and
+  the graph triple, entity and label logs, whose only open path writes.
 
 The report counts the structures proven and lists every one that was not, with why, rather than
 leaving them out, which would read as though nothing went unverified.
@@ -2978,8 +2982,8 @@ Three files are judged by what the node does with them rather than by name alone
 - **`source-status`, how each source's last crawl ended**, is not derived and nothing rebuilds it,
   but nothing the node serves depends on it either: a node that cannot trust it logs that, treats
   the history as empty, and reports each source from its next run. So a `source-status` its
-  reader will not take — a record count that disagrees with its records, no header, or a version
-  it does not read — is reported `CORRUPT`, counted with the sketches under
+  reader will not take — a record count that disagrees with its records, a checksum that does not
+  match its bytes, no header, or a version it does not read — is reported `CORRUPT`, counted with the sketches under
   `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair plan — what is lost
   either way is the history, never indexed data. As with a sketch, one the operating system will
   not read is `UNREADABLE` and fails the run.
@@ -3048,7 +3052,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | `/v1/erasure` reports `documents_not_found` for a document you can query | Its registry entry is gone, so the chunk ids it named are unknown; the chunks are still in storage | Reindex the source, which re-registers the document, then erase it |
 | A source stops being re-crawled after a restart, and `/v1/ingest/status` does not list it | Its target is no longer allow-listed, so restoring it was refused; the startup log names it | Put the root or host back on `excalibur.ingest.allowed-roots` / `excalibur.ingest.allowed-hosts`, or `DELETE /v1/ingest` if the source is finished |
 | A re-crawl reingests everything and tombstones nothing | `<data dir>/document-registry` is missing, so change detection reads every document as new | Restore the data directory whole; the registry belongs with the segments it describes |
-| Node fails to start with `RegistryLoadException` naming a record count | `<data dir>/document-registry` was cut short by a crash, so it omits documents the node is still serving. It is refused rather than loaded, because a shorter registry silently makes those documents unerasable and unreindexable | `excalibur-backup restore` from the last image. Deleting the registry also starts the node, at the cost of a full reingest on the next crawl |
+| Node fails to start with `RegistryLoadException` naming a record count or saying its checksum does not match | `<data dir>/document-registry` was cut short by a crash, so it omits documents the node is still serving, or its bytes were altered after it was written. It is refused rather than loaded, because a shorter or altered registry silently makes documents unerasable and unreindexable | `excalibur-backup restore` from the last image. Deleting the registry also starts the node, at the cost of a full reingest on the next crawl |
 | A node refuses to start after a crash or a full disk, naming a file | Something under the data directory is damaged. Which file and how badly is the question, and guessing at it is how a recoverable node gets deleted | Stop the node and run `excalibur-fsck <data dir>`. Without `--repair` it only reads, and names what is damaged. `--repair` then writes: it quarantines what can be moved aside safely, marks purged a catalog row whose segment file is gone, and clears the opcode of a torn last log record — and leaves a damaged catalog or routing directory for you |
 | A directory you restored by hand serves wrong or missing results | A partial copy: a `.hnsw` without its `.docmap`, a `*.compact` without its pair, or a sparse copy that dropped a file | `excalibur-fsck <data dir>` names the orphans and the mismatches. Take images with `excalibur-backup` instead, which classifies every file and can verify the result |
 | A `WARN` at startup naming documents that "were being ingested when this node last stopped" | Those documents were half written when the node died, and their chunks are hidden until the ingest is redone. Not an error: it is the crash being cleaned up after | Nothing — the next crawl of that source re-ingests them and they become visible again. `POST /v1/erasure` removes them instead |
@@ -3060,7 +3064,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | `/v1/stats` reports `cuckoo.saturated: true` | The membership filter is full. A level that cannot record a term is no longer trusted to say what its segment lacks, so queries order segments by their term sketches alone. Answers are unaffected; a query that runs out of time may have spent it on less likely segments first | Raise `excalibur.filter.corpus-capacity` past your term count and restart |
 | Node refuses to start: `Refusing to create segment N in <dir>: <other dir> already holds segment_N.dat` | Two volumes hold a file for the same segment index, usually from a volume set that changed between runs on an older build | Move or delete the stale copy — the one whose directory the catalog does not name — then restart |
 | Node refuses to start naming two `excalibur.shard.volumes` entries that resolve to one directory | A symlink, a relative path or a `..` in the list makes two entries the same directory, which would give it two shares of the ring | Drop one of the two spellings |
-| Node fails to start with `CatalogLoadException` | `<data dir>/source-catalog` was written by a build older than the end marker, or was cut short by a crash | [Upgrading a data directory](#upgrading-a-data-directory-written-by-an-older-build) — append the marker, or delete the file and re-register the sources |
+| Node fails to start with `CatalogLoadException` | `<data dir>/source-catalog` was written by a build older than the end marker, was cut short by a crash, or its checksum does not match because its bytes were altered after it was written | [Upgrading a data directory](#upgrading-a-data-directory-written-by-an-older-build) — append the marker, or delete the file and re-register the sources |
 | A `WARN` at start counting lexical segments written in an older format | They predate `index.meta` version 3, so they carry no column checksums; one older than version 2 also prunes against a looser bound and is read more slowly. Results are exact | Nothing: compaction upgrades a few on each pass, and the warning stops when none are left. `POST /v1/compact` with `{"force": true}` upgrades all of them at once |
 | `--enable-preview` error | Wrong Java version | Java 21 exactly — a preview class file is refused by any other JDK |
 | `--enable-native-access=ALL-UNNAMED` warning | Missing flag | Required for Panama FFM API |
@@ -3069,7 +3073,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 
 ### Upgrading a data directory written by an older build
 
-Four on-disk formats differ from those older builds wrote. A node reads the old and the current form of each, but one of them needs a manual step.
+Several on-disk formats differ from those older builds wrote. A node reads the old and the current form of each, but one of them needs a manual step.
 
 **`<data dir>/source-catalog` — a manual step is required.** The catalog of registered ingestion
 sources ends with a marker line, `\#end|<count>`, written after the records are forced to
@@ -3091,19 +3095,43 @@ absence is what identifies them, since a crash takes the tail of a file and neve
 Such a catalog loads, its count is still checked, and the next registration rewrites it with a
 version.
 
+The catalog is version 3, whose marker, `\#end|<count>|<crc>`, adds a CRC32C of every byte before
+it, so a record altered after it was written fails the start with a message saying the checksum
+did not match. A version 1 or 2 catalog, and one with no header, carries no checksum; it is read
+as before, `excalibur-fsck` reports it *legacy, unprotected*, and the next registration or removal
+of a source rewrites it at version 3. An older build refuses a version 3 catalog and does not
+start, so once this build has saved the catalog the node cannot go back without restoring an image
+taken before the upgrade.
+
 **`<data dir>/document-registry` — no step required.** The registry carries the same header and
 end marker, for the same reason: without them a registry cut short by a crash is a file of whole
 records that quietly omits documents, leaving their chunks in storage where no erasure or reindex
 can name them. A registry from an older build has neither line, is read as the older format, and is
-rewritten with a version and a count as the node starts, without waiting for something to be
-ingested; if that save fails, the start continues with a `WARN` and the next save retries it. From
-then on a short registry fails the start instead of loading, and the message names the count it
-expected.
+rewritten with a version, a count and a checksum as the node starts, without waiting for something
+to be ingested; if that save fails, the start continues with a `WARN` and the next save retries it.
+From then on a short registry fails the start instead of loading, and the message names the count
+it expected.
 
-The `ETag` a record keeps for an HTTP document is an optional last field, and the format stays
-version 1 with it: the previous build reads the first seven fields of a record and ignores the rest,
-so rolling back to it keeps the registry and loses only the tags. A document whose record has no
-tag gains one the first time a re-crawl finds it unchanged.
+The registry is version 2, whose closing line, `\#end|<count>|<crc>`, adds a CRC32C of every byte
+before it: a record altered in place fails the start with a message saying the checksum did not
+match, where a count alone would have let it load. A version 1 registry, which carries only the
+count, is read as before and rewritten at version 2 as the node starts, the same way a headerless
+one is. An older build refuses a version 2 registry — it names the version it read and the one it
+reads — and does not start, so a node that has run this build cannot go back without restoring an
+image taken before the upgrade.
+
+The `ETag` a record keeps for an HTTP document is an optional last field. A document whose record
+has no tag gains one the first time a re-crawl finds it unchanged.
+
+**`<data dir>/document-registry.in-flight` — no step required.** The in-flight journal is version
+2, in which every line, its header included, ends with a CRC32C of its own bytes; a complete line
+that fails it stops the start, because it may be the mark hiding a half-written document. The
+journal exists only while documents are being ingested, and is deleted when nothing is in flight,
+so a node that stopped with nothing in flight has none. One an older build left behind — version
+1, with no checksums — is read as before and rewritten at version 2 as the node starts. An older
+build refuses a version 2 journal and does not start; a node this build stopped with nothing in
+flight leaves none for it to refuse, and otherwise rolling back needs an image taken before the
+upgrade.
 
 **The native lexical index — no step required.** `index.meta` is version 3, which adds a length
 and a CRC32C for every column; a segment written by an older build keeps opening and keeps
@@ -3141,9 +3169,15 @@ node refuses to open it. An older build refuses a
 version 3 mapping, so a node that has run this build cannot go back without restoring an image
 taken before the upgrade.
 
-**`<data dir>/source-status` — no step required.** A new file rather than a changed one: an
-older build never wrote it, so a directory it left has none, and every source reports from its
-next run exactly as it did before the upgrade. The file appears when the first run ends.
+**`<data dir>/source-status` — no step required.** A build older than the file never wrote it,
+so a directory it left has none, and every source reports from its next run exactly as it did
+before the upgrade; the file appears when the first run ends. The file is version 3, whose marker,
+`\#end|<count>|<crc>`, adds a CRC32C of every byte before it; a history whose checksum does not
+match is logged and treated as empty, as any history the node cannot read is. Versions 1 and 2
+carry no checksum, are read as before, and are rewritten at version 3 when the next run ends. An
+older build does not read version 3: it logs the file as unreadable and starts with no history, so
+rolling back loses the record of each source's last run, never indexed data, unless a
+pre-upgrade image is restored.
 
 ### Enabling debug logging
 
