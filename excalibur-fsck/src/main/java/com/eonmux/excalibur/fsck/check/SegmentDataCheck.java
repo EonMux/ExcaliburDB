@@ -6,6 +6,7 @@ import com.eonmux.excalibur.store.SegmentIntegrityReport;
 import com.eonmux.excalibur.store.format.SegmentDataHeader;
 import com.eonmux.excalibur.store.format.SegmentFormat;
 import com.eonmux.excalibur.store.format.SegmentLayout;
+import com.eonmux.excalibur.store.format.UnsupportedSegmentFormatException;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -82,7 +83,12 @@ public final class SegmentDataCheck {
             return new FileCheck(file, relative, FORMAT, null, CheckStatus.CORRUPT,
                 "a slot table of " + slotTableSize + " bytes does not fit in " + size, size);
         }
-        SegmentFormat format = SegmentDataHeader.detect(mapping.segment(), slotTableSize);
+        SegmentFormat format;
+        try {
+            format = SegmentDataHeader.detect(mapping.segment(), slotTableSize);
+        } catch (UnsupportedSegmentFormatException refused) {
+            return unsupportedVersion(file, relative, size, refused);
+        }
         SegmentIntegrityReport report = SegmentIntegrityChecker.verify(
             mapping.segment(), slotCount, slotTableSize, format, file);
         String version = "v" + format.version();
@@ -172,6 +178,30 @@ public final class SegmentDataCheck {
             + "although their own bytes may be sound";
         return entryFaults == 0 ? slots : slots + ", and " + entryFaults + " entries are "
             + "damaged in themselves";
+    }
+
+    /**
+     * Phrases the verdict on a segment a newer build wrote.
+     *
+     * <p>Unreadable, not corrupt: the header's checksum matches, so nothing shows the bytes are
+     * damaged, and the entries are not walked at all, since their layout is the unknown
+     * version's. Walking them at this build's widths would report damage that is not there,
+     * and a corrupt verdict would offer to move aside a file that is sound.</p>
+     *
+     * @param file     The segment file
+     * @param relative Its path relative to the data directory
+     * @param size     The file's size
+     * @param refused  What the header named
+     * @return The verdict
+     */
+    private static FileCheck unsupportedVersion(Path file, String relative, long size,
+                                                UnsupportedSegmentFormatException refused) {
+        return new FileCheck(file, relative, FORMAT, "v" + refused.version(),
+            CheckStatus.UNREADABLE, "a data region header whose CRC matches names format "
+                + "version " + refused.version() + ", and this build reads versions "
+                + refused.oldest() + " to " + refused.newest() + ": a newer build wrote it. The "
+                + "node refuses to open it and leaves it untouched, and its entries were not "
+                + "walked", size);
     }
 
     /**

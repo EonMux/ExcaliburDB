@@ -3,6 +3,7 @@ package com.eonmux.excalibur.store;
 import com.eonmux.excalibur.store.format.SegmentDataHeader;
 import com.eonmux.excalibur.store.format.SegmentFormat;
 import com.eonmux.excalibur.store.format.SlotChecksum;
+import com.eonmux.excalibur.store.format.UnsupportedSegmentFormatException;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -158,6 +159,8 @@ final class SegmentFile {
      * @param arena               Arena owning the mapping
      * @param loadFactorThreshold Fraction of slots that may be occupied, in (0, 1)
      * @return The opened segment, with its entry counts and write offset recovered
+     * @throws UnsupportedSegmentFormatException if a newer build wrote the file; it is left
+     *                                           untouched
      * @throws java.io.IOException if the file cannot be opened
      */
     static Segment openExisting(Path path, Arena arena, double loadFactorThreshold)
@@ -205,7 +208,12 @@ final class SegmentFile {
             MemorySegment segment =
                 fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, fileSize, arena);
 
-            SegmentFormat format = detectFormat(segment, slotCount, slotTableSize);
+            SegmentFormat format;
+            try {
+                format = detectFormat(segment, slotCount, slotTableSize);
+            } catch (UnsupportedSegmentFormatException refused) {
+                throw refused.in(path);
+            }
 
             // Create a Segment instance using private constructor pattern
             // We need to recover the state from the file
@@ -296,9 +304,12 @@ final class SegmentFile {
      * @param slotCount     Number of slots in the slot table
      * @param slotTableSize Offset at which the data region begins
      * @return The format the file is to be read and written in
+     * @throws UnsupportedSegmentFormatException if the file is written in a format newer than
+     *                                           this build reads; nothing is written to it
      */
     static SegmentFormat detectFormat(MemorySegment mapped, int slotCount,
-                                              long slotTableSize) {
+                                              long slotTableSize)
+            throws UnsupportedSegmentFormatException {
         SegmentFormat detected = SegmentDataHeader.detect(mapped, slotTableSize);
         if (detected.hasChecksum()) {
             return detected;

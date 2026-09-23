@@ -74,16 +74,23 @@ public final class SegmentDataHeader {
     /**
      * Reads the format of a mapped segment file from its data region header.
      *
-     * <p>A header is believed only if all four of its fields agree: the magic number, a
-     * version this build knows, a zero reserved field and a matching CRC. Anything else -
-     * including a file too small to hold a header - is a file written before the header
-     * existed, and is reported as {@link SegmentFormat#V1}.</p>
+     * <p>A header is believed only if its magic number, zero reserved field and CRC all
+     * agree. Anything else - including a file too small to hold a header - is a file written
+     * before the header existed, and is reported as {@link SegmentFormat#V1}.</p>
+     *
+     * <p>A believed header naming a version this build does not know is refused, not read as
+     * the legacy format. A version 1 file cannot present a sound header (see the class
+     * description), so such a header proves a newer build wrote the file, and reading its
+     * records at this build's widths would misread every one of them.</p>
      *
      * @param mapped         The mapped segment file
      * @param dataRegionBase Absolute offset at which the data region begins
      * @return The format the file is written in, never null
+     * @throws UnsupportedSegmentFormatException if a sound header names a version this build
+     *                                           does not read
      */
-    public static SegmentFormat detect(MemorySegment mapped, long dataRegionBase) {
+    public static SegmentFormat detect(MemorySegment mapped, long dataRegionBase)
+            throws UnsupportedSegmentFormatException {
         if (dataRegionBase < 0 || dataRegionBase + SIZE > mapped.byteSize()) {
             return SegmentFormat.V1;
         }
@@ -99,7 +106,10 @@ public final class SegmentDataHeader {
             return SegmentFormat.V1;
         }
         SegmentFormat format = SegmentFormat.forVersion(version);
-        return format == null || !format.hasChecksum() ? SegmentFormat.V1 : format;
+        if (format == null) {
+            throw new UnsupportedSegmentFormatException(version);
+        }
+        return format.hasChecksum() ? format : SegmentFormat.V1;
     }
 
     /**

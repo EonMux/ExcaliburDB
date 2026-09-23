@@ -354,6 +354,8 @@ public class Segment implements AutoCloseable {
      * @param path  Path to the existing segment file (must exist)
      * @param arena Arena for memory management (must not be null)
      * @return The opened segment, with its state recovered
+     * @throws com.eonmux.excalibur.store.format.UnsupportedSegmentFormatException
+     *                                  if a newer build wrote the file; it is left untouched
      * @throws IOException              if the file cannot be opened or is invalid
      * @throws IllegalArgumentException if path or arena is null, or the file does not exist
      */
@@ -373,6 +375,8 @@ public class Segment implements AutoCloseable {
      * @param arena               Arena owning the mapping
      * @param loadFactorThreshold Fraction of slots that may be occupied, in (0, 1)
      * @return The opened segment
+     * @throws com.eonmux.excalibur.store.format.UnsupportedSegmentFormatException
+     *                     if a newer build wrote the file; it is left untouched
      * @throws IOException if the file cannot be opened
      */
     public static Segment openExisting(Path path, Arena arena, double loadFactorThreshold)
