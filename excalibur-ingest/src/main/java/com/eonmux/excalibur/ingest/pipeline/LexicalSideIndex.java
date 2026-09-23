@@ -8,8 +8,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
@@ -85,23 +85,28 @@ final class LexicalSideIndex {
     }
 
     /**
-     * Takes rolled-back chunks back out of the lexical index.
+     * Takes chunks storage is about to stop holding back out of the lexical index.
      *
-     * <p>A failed document is never added here, but its chunk identifiers may already be: a
-     * re-crawl writes a changed document under the identifiers its previous version held, and
-     * the rollback deletes what storage had under them. A search that went on returning the
-     * previous version would report hits whose text nothing can resolve.</p>
+     * <p>Two cases reach here: the chunks of a document that was rolled back, and the tail of a
+     * previous version that a shorter replacement no longer reaches. A failed document is never
+     * added here, but its chunk identifiers may already be, because a document ingested again is
+     * written under the identifiers its previous version held. Either way a search that went on
+     * returning these chunks would report hits whose text nothing can resolve.</p>
+     *
+     * @param chunkIds The chunks to retire
+     * @return How many the index reports removing, zero when it keeps none or refused
      */
-    void erase(List<String> chunkIds) {
+    int retire(Collection<String> chunkIds) {
         ChunkIndex target = this.index;
         if (target == null || chunkIds.isEmpty()) {
-            return;
+            return 0;
         }
         try {
-            target.erase(new LinkedHashSet<>(chunkIds));
+            return target.erase(new LinkedHashSet<>(chunkIds));
         } catch (IOException e) {
-            LOGGER.warn("Rolled-back chunks of a failed document remain lexically searchable: {}",
-                e.getMessage());
+            LOGGER.warn("{} retired chunk(s) remain lexically searchable: {}",
+                chunkIds.size(), e.getMessage());
+            return 0;
         }
     }
 

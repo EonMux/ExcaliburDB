@@ -7,6 +7,7 @@ import com.eonmux.excalibur.ingest.registry.DocumentLocks;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
+import com.eonmux.excalibur.ingest.source.DocumentLimits;
 import com.eonmux.excalibur.ingest.source.DocumentValidators;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 
@@ -62,9 +63,6 @@ import java.util.Objects;
 final class DocumentReindexStep {
 
     private static final Logger LOG = LoggerFactory.getLogger(DocumentReindexStep.class);
-
-    /** The largest document body this step will chunk, guarding against a runaway fetch. */
-    static final int MAX_CONTENT_LENGTH = 100 * 1024 * 1024;
 
     /**
      * Stores one chunk, wherever this step's target happens to be.
@@ -196,7 +194,8 @@ final class DocumentReindexStep {
      * @param fetched    What the source handed back
      * @param stop       The run's stop signal
      * @return The outcome, carrying the chunk ids the new version consists of
-     * @throws IllegalArgumentException if content exceeds maximum length
+     * @throws IllegalArgumentException if the content or its chunk count exceeds
+     *                                  {@link DocumentLimits}
      */
     DocumentResult reindex(String sourceId, String documentId, FetchedDocument fetched,
                            StopSignal stop) {
@@ -209,9 +208,9 @@ final class DocumentReindexStep {
                 System.currentTimeMillis() - startTime);
         }
 
-        if (content.length > MAX_CONTENT_LENGTH) {
-            throw new IllegalArgumentException(
-                "Content length " + content.length + " exceeds maximum " + MAX_CONTENT_LENGTH);
+        if (content.length > DocumentLimits.MAX_DOCUMENT_BYTES) {
+            throw new IllegalArgumentException("Content length " + content.length
+                + " exceeds maximum " + DocumentLimits.MAX_DOCUMENT_BYTES);
         }
 
         // The same gate the first crawl applies. Without it a re-crawl is the way binary
@@ -229,6 +228,13 @@ final class DocumentReindexStep {
         if (chunks.isEmpty()) {
             return DocumentResult.skipped(documentId, DocumentResult.SkipReason.NO_CHUNKS,
                 System.currentTimeMillis() - startTime);
+        }
+        // The bound the first crawl applies. Without it, a document the first crawl refused is
+        // "new" to every re-crawl after it, and the re-crawl indexes it whole.
+        if (chunks.size() > DocumentLimits.MAX_CHUNKS_PER_DOCUMENT) {
+            throw new IllegalArgumentException("Document produced " + chunks.size()
+                + " chunks, over the per-document limit of "
+                + DocumentLimits.MAX_CHUNKS_PER_DOCUMENT);
         }
 
         if (atomic != null) {

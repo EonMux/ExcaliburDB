@@ -8,6 +8,8 @@ import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.security.IngestTargetValidator;
 import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
+import com.eonmux.excalibur.ingest.source.DocumentLimits;
+import com.eonmux.excalibur.ingest.source.FilesystemSource;
 import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 import com.eonmux.excalibur.ingest.source.Source;
@@ -486,6 +488,56 @@ class IngestEndpointTest {
             assertThat(response.status()).isEqualTo(400);
             assertThat(response.body()).contains("max_depth").contains("1000");
             assertThat(registry.isRegistered("docs")).isFalse();
+        }
+
+        @Test
+        @DisplayName("a bounded setting sent as null takes its default, not its minimum")
+        void explicitNullIsTheDefault(@TempDir Path root) throws IOException {
+            // Null means "not set" everywhere else in the API. Read as a number, it became the
+            // bound's floor: a walk one level deep that reads no file larger than one byte.
+            Response response = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"max_depth\": null, \"max_file_bytes\": null, \"timeout_seconds\": null}}");
+
+            assertThat(response.status()).isEqualTo(200);
+            FilesystemSource source = (FilesystemSource) registry.get("docs");
+            FilesystemSource defaults = FilesystemSource.builder()
+                .sourceId("defaults").rootPath(root).build();
+            assertThat(source.getMaxDepth()).isEqualTo(defaults.getMaxDepth());
+            assertThat(source.getMaxFileSize()).isEqualTo(defaults.getMaxFileSize());
+        }
+
+        @Test
+        @DisplayName("a file size bound past what ingestion can index is refused")
+        void fileSizeStopsAtTheEngineLimit(@TempDir Path root) throws IOException {
+            // A walk told to read further than the engine indexes reads the file into memory
+            // only for ingestion to discard it, and reports a failure for a file the setting
+            // said would be read.
+            long limit = DocumentLimits.MAX_DOCUMENT_BYTES;
+            Response refused = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"max_file_bytes\": " + (limit + 1) + "}}");
+            assertThat(refused.status()).isEqualTo(400);
+            assertThat(refused.body()).contains("max_file_bytes").contains(Long.toString(limit));
+
+            Response accepted = post(root, null, "{\"source_type\": \"filesystem\", "
+                + "\"config\": {\"source_id\": \"docs\", \"root_path\": \"" + root + "\", "
+                + "\"max_file_bytes\": " + limit + "}}");
+            assertThat(accepted.status()).isEqualTo(200);
+        }
+
+        @Test
+        @DisplayName("a response size bound past what ingestion can index is refused")
+        void responseSizeStopsAtTheEngineLimit(@TempDir Path root) throws IOException {
+            long limit = DocumentLimits.MAX_DOCUMENT_BYTES;
+            Response response = post(root, null, "{\"source_type\": \"http\", "
+                + "\"config\": {\"source_id\": \"site\", "
+                + "\"base_url\": \"https://example.com/docs\", "
+                + "\"max_response_bytes\": " + (limit + 1) + "}}");
+
+            assertThat(response.status()).isEqualTo(400);
+            assertThat(response.body()).contains("max_response_bytes")
+                .contains(Long.toString(limit));
         }
 
         @Test

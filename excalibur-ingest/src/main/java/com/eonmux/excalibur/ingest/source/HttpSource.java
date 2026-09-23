@@ -59,12 +59,14 @@ import java.util.stream.Stream;
  * than silently returning another host's body under an in-policy document id.</p>
  *
  * <p>Response bodies are read through a bounded stream, so {@code maxResponseSize} caps what
- * is allocated rather than being checked after the whole body is already on the heap.</p>
+ * is allocated rather than being checked after the whole body is already on the heap. The
+ * bound may not exceed {@link DocumentLimits#MAX_DOCUMENT_BYTES}: a larger body could not be
+ * indexed, and a larger bound would only let one be held before it failed.</p>
  *
  * <h2>Domain Correctness</h2>
  * <ul>
  *   <li>Base URL must be a valid HTTP or HTTPS URL</li>
- *   <li>Maximum response size: 10MB (configurable), enforced while reading</li>
+ *   <li>Maximum response size: 10 MiB (configurable up to 100 MiB), enforced while reading</li>
  *   <li>Maximum documents per crawl: 10,000 (configurable)</li>
  *   <li>Maximum redirect hops: 5, each re-checked against the URL filters</li>
  *   <li>Request timeout: 30 seconds (configurable)</li>
@@ -230,7 +232,8 @@ public class HttpSource implements Source {
             : Set.copyOf(normalizeContentTypes(builder.includedContentTypes));
         this.maxDepth = Math.max(0, builder.maxDepth);
         this.maxDocuments = Math.max(1, builder.maxDocuments);
-        this.maxResponseSize = Math.max(1, builder.maxResponseSize);
+        this.maxResponseSize = Math.max(1,
+            DocumentLimits.requireIndexable(builder.maxResponseSize, "maxResponseSize"));
         this.timeout = builder.timeout != null ? builder.timeout : DEFAULT_TIMEOUT;
         this.crawlDelay = builder.crawlDelay != null ? builder.crawlDelay : DEFAULT_CRAWL_DELAY;
         this.userAgent = builder.userAgent != null ? builder.userAgent : DEFAULT_USER_AGENT;
@@ -594,9 +597,9 @@ public class HttpSource implements Source {
      */
     private byte[] readBoundedBody(HttpResponse<InputStream> response, String url)
             throws SourceException, IOException {
-        // Clamp before adding the extra byte: maxResponseSize is a long and a caller may set it
-        // near Long.MAX_VALUE, where the increment would wrap into a negative read length.
-        int limit = (int) Math.min(maxResponseSize, Integer.MAX_VALUE - 1L) + 1;
+        // One byte past the bound tells a body at the limit from one over it. The builder holds
+        // maxResponseSize to DocumentLimits.MAX_DOCUMENT_BYTES, so the sum fits an int.
+        int limit = (int) maxResponseSize + 1;
 
         InputStream body = response.body();
         // The request timeout does not reach here. With a streaming body handler the client
@@ -1322,6 +1325,14 @@ public class HttpSource implements Source {
             return this;
         }
 
+        /**
+         * Sets the largest response body a fetch holds; a larger one fails the document.
+         *
+         * @param maxBytes The bound, 10 MiB by default and at most
+         *                 {@link DocumentLimits#MAX_DOCUMENT_BYTES}; {@link #build()} refuses a
+         *                 larger one
+         * @return This builder
+         */
         public Builder maxResponseSize(long maxBytes) {
             this.maxResponseSize = maxBytes;
             return this;

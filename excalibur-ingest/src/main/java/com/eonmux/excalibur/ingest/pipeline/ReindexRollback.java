@@ -110,7 +110,7 @@ final class ReindexRollback {
         // ranked is simply unreachable.
         lexical.retire(orphans);
         int removed = upsertHandler.tombstoneChunks(orphans);
-        LOG.warn("Reindex of {}:{} failed after writing {} chunk(s); {} of them were named by no "
+        LOG.warn("Replacing {}:{} failed after writing {} chunk(s); {} of them were named by no "
                 + "registry entry and have been removed", sourceId, documentId,
             writtenChunkIds.size(), removed);
         return removed;

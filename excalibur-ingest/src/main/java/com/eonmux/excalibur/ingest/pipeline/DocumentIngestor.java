@@ -7,6 +7,8 @@ import com.eonmux.excalibur.ingest.erasure.DocumentErasureService;
 import com.eonmux.excalibur.ingest.registry.DocumentLocks;
 import com.eonmux.excalibur.ingest.registry.DocumentMetadata;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
+import com.eonmux.excalibur.ingest.registry.UpsertHandler;
+import com.eonmux.excalibur.ingest.source.DocumentLimits;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
@@ -15,6 +17,7 @@ import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
 import com.eonmux.excalibur.core.codec.ChunkPayloadCodec;
 import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.core.util.StopSignal;
+import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.llm.LLMException;
 import com.eonmux.excalibur.store.StorageEngine;
 import org.slf4j.Logger;
@@ -54,25 +57,6 @@ final class DocumentIngestor {
      */
     static final int EMBED_BATCH_SIZE = 16;
 
-    /**
-     * Upper bound on the byte size of a single fetched document.
-     *
-     * <p>A source can report an arbitrary file size (FilesystemSource allows up to 2GB), and a
-     * document is held several times over while it is processed: the fetched byte array, its
-     * defensive copy, the decoded String, and one substring per chunk. Every chunk also costs
-     * one embedding call. Documents above this bound are skipped with a recorded error rather
-     * than being allowed to exhaust the heap. Matches DocumentReindexer's limit.</p>
-     */
-    static final int MAX_DOCUMENT_CONTENT_BYTES = 100 * 1024 * 1024;
-
-    /**
-     * Upper bound on the number of chunks accepted from a single document.
-     *
-     * <p>Each chunk is one embedding request and one storage write; a document is only published
-     * once all of them succeed. This bounds the work a single document can schedule.</p>
-     */
-    static final int MAX_CHUNKS_PER_DOCUMENT = 10_000;
-
     private final TextChunker textChunker;
     private final EmbeddingClient embeddingClient;
     private final StorageEngine storageEngine;
@@ -84,6 +68,12 @@ final class DocumentIngestor {
      * Null when no visibility tracker is configured.
      */
     private final DocumentRegistry documentRegistry;
+
+    /**
+     * Tombstones what a document's previous version held and its new version does not, or null
+     * when there is no registry to say what a previous version held.
+     */
+    private final UpsertHandler upsertHandler;
 
     private final LexicalSideIndex lexicalSideIndex;
     private final SegmentTermRecorder termRecorder;
@@ -116,6 +106,10 @@ final class DocumentIngestor {
         this.storageEngine = Objects.requireNonNull(storageEngine, "StorageEngine cannot be null");
         this.visibilityTracker = visibilityTracker; // may be null
         this.documentRegistry = documentRegistry; // may be null
+        // Over the same registry and the same storage the reindex path tombstones through, so a
+        // document replaced here retires its previous version exactly as a re-crawl would.
+        this.upsertHandler = documentRegistry == null ? null
+            : new UpsertHandler(documentRegistry, (CuckooFilter) null, this::tombstone);
         this.lexicalSideIndex = Objects.requireNonNull(lexicalSideIndex);
         this.termRecorder = Objects.requireNonNull(termRecorder);
         this.graphReporter = Objects.requireNonNull(graphReporter);
@@ -166,9 +160,12 @@ final class DocumentIngestor {
             throws SourceException {
         FetchedDocument doc = stop.interruptibly(() -> source.fetch(documentId));
 
-        if (doc.getContentLength() > MAX_DOCUMENT_CONTENT_BYTES) {
+        // The sources this node builds never read past this bound, so a document reaching it
+        // here came from a source that does not know the limit. It is already in memory by now,
+        // which is why the sources check first; this is what keeps it from going further.
+        if (doc.getContentLength() > DocumentLimits.MAX_DOCUMENT_BYTES) {
             LOGGER.warn("Skipping document {}: {} bytes exceeds the {} byte ingest limit",
-                documentId, doc.getContentLength(), MAX_DOCUMENT_CONTENT_BYTES);
+                documentId, doc.getContentLength(), DocumentLimits.MAX_DOCUMENT_BYTES);
             return DocumentOutcome.DROPPED;
         }
 
@@ -193,9 +190,9 @@ final class DocumentIngestor {
             LOGGER.debug("Document {} produced no chunks", documentId);
             return DocumentOutcome.EMPTY;
         }
-        if (chunks.size() > MAX_CHUNKS_PER_DOCUMENT) {
+        if (chunks.size() > DocumentLimits.MAX_CHUNKS_PER_DOCUMENT) {
             LOGGER.warn("Skipping document {}: {} chunks exceeds the per-document limit of {}",
-                documentId, chunks.size(), MAX_CHUNKS_PER_DOCUMENT);
+                documentId, chunks.size(), DocumentLimits.MAX_CHUNKS_PER_DOCUMENT);
             return DocumentOutcome.DROPPED;
         }
 
@@ -231,6 +228,11 @@ final class DocumentIngestor {
                                             FetchedDocument doc, List<TextChunk> chunks,
                                             Map<Integer, float[]> embeddings) {
         List<String> writtenKeys = new ArrayList<>(chunks.size());
+        // Read under the lock and before anything is written: this is the version the new one
+        // replaces, and it decides which of its chunks become surplus on success and which of
+        // this attempt's writes are orphans on failure.
+        DocumentMetadata previous =
+            documentRegistry == null ? null : documentRegistry.get(sourceId, documentId);
         try {
             // Marked in flight before the first chunk reaches storage. This is what the
             // atomicity filter excludes on: a chunk written but not yet published is reachable
@@ -241,11 +243,51 @@ final class DocumentIngestor {
             writeChunks(documentKey, chunks, embeddings, writtenKeys);
             publishDocument(sourceId, documentId, documentKey, doc, chunks);
         } catch (Exception e) {
-            rollbackChunks(documentKey, writtenKeys, e);
+            rollbackChunks(sourceId, documentId, documentKey, previous, writtenKeys, e);
             return DocumentOutcome.DROPPED;
         }
         lexicalSideIndex.addDocument(documentKey, lexicalChunks(documentKey, chunks));
+        retireSupersededVersion(documentKey, previous, writtenKeys);
         return DocumentOutcome.published(chunks.size());
+    }
+
+    /**
+     * Retires what the previous version held past the end of the one just published.
+     *
+     * <p>A client posting a document id again, and the first crawl of a source registered again
+     * after its registration was removed, both publish here over a version this node already
+     * holds. The registry entry now names only the new chunk ids, and it is the only map from a
+     * document to its chunks, so the previous version's surplus tail would otherwise stay stored
+     * and lexically searchable with nothing able to name it - not a re-crawl, not an erasure.
+     * Retired as a reindex retires a changed document, after publication, and here under the
+     * document's lock, so a query sees one version or the other and never neither.</p>
+     */
+    private void retireSupersededVersion(String documentKey, DocumentMetadata previous,
+                                         List<String> publishedChunkIds) {
+        if (previous == null) {
+            return;
+        }
+        int retired = SupersededVersion.retire(previous.getChunkIds(), publishedChunkIds,
+            lexicalSideIndex::retire, upsertHandler);
+        if (retired > 0) {
+            LOGGER.debug("Document {} replaced: {} chunk(s) of its previous version retired",
+                documentKey, retired);
+        }
+    }
+
+    /**
+     * Tombstones one chunk in storage, reporting rather than throwing a refusal.
+     *
+     * @return true if storage held the chunk and released it
+     */
+    private boolean tombstone(byte[] key) {
+        try {
+            return storageEngine.delete(key);
+        } catch (RuntimeException e) {
+            LOGGER.warn("Failed to tombstone chunk {}: {}",
+                new String(key, StandardCharsets.UTF_8), e.getMessage());
+            return false;
+        }
     }
 
     /**
@@ -325,8 +367,8 @@ final class DocumentIngestor {
      * embedding model to be able to see across chunk boundaries at all.</p>
      *
      * <p>Bounded rather than one request per document: a document may hold up to
-     * {@code MAX_CHUNKS_PER_DOCUMENT} chunks, and a single request carrying all of them would be
-     * a multi-megabyte body whose failure costs the whole document.</p>
+     * {@link DocumentLimits#MAX_CHUNKS_PER_DOCUMENT} chunks, and a single request carrying all of
+     * them would be a multi-megabyte body whose failure costs the whole document.</p>
      *
      * @return The embeddings keyed by chunk index, or null if any chunk failed
      */
@@ -455,8 +497,16 @@ final class DocumentIngestor {
 
     /**
      * Removes chunks written for a document that failed to publish.
+     *
+     * <p>A document with no previous version loses everything this attempt wrote, graph nodes
+     * included. One that replaces a published version keeps it: the ids the surviving registry
+     * entry names are content the corpus is expected to have, so only the writes past them are
+     * undone, as a failed reindex undoes them - see {@link ReindexRollback}. Its graph nodes stay
+     * too, because they are attributed to the document and the document is still published.</p>
      */
-    private void rollbackChunks(String documentKey, List<String> writtenKeys, Exception cause) {
+    private void rollbackChunks(String sourceId, String documentId, String documentKey,
+                                DocumentMetadata previous, List<String> writtenKeys,
+                                Exception cause) {
         LOGGER.error("Rolling back document {} after publication failure: {}",
             documentKey, cause.getMessage(), cause);
 
@@ -466,14 +516,15 @@ final class DocumentIngestor {
             visibilityTracker.abortIngestion(documentKey);
         }
 
-        for (String chunkId : writtenKeys) {
-            try {
-                storageEngine.delete(chunkId.getBytes(StandardCharsets.UTF_8));
-            } catch (Exception e) {
-                LOGGER.warn("Failed to roll back chunk {}: {}", chunkId, e.getMessage());
-            }
+        if (previous != null) {
+            new ReindexRollback(documentRegistry, upsertHandler, lexicalSideIndex::retire)
+                .undo(sourceId, documentId, writtenKeys);
+            return;
         }
-        lexicalSideIndex.erase(writtenKeys);
+        for (String chunkId : writtenKeys) {
+            tombstone(chunkId.getBytes(StandardCharsets.UTF_8));
+        }
+        lexicalSideIndex.retire(writtenKeys);
         retireVectors(documentKey);
     }
 

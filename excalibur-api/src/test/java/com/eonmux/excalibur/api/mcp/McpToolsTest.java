@@ -916,16 +916,16 @@ class McpToolsTest {
     }
 
     @Test
-    @DisplayName("max_file_bytes reaches the node's 2 GiB ceiling, past what an int holds")
-    void ingestCarriesAFileSizeBeyondIntRange() throws IOException {
+    @DisplayName("max_file_bytes reaches the node's ceiling unchanged")
+    void ingestCarriesTheFileSizeCeiling() throws IOException {
         try (StubNode node = StubNode.start()) {
             new McpTools(node.client(Map.of())).call(McpTools.INGEST_DOCUMENTS, Map.of(
                 "source_id", "docs", "root_path", "/srv/docs",
                 "max_file_bytes", SourceFactory.FILE_BYTES_LIMIT));
 
             assertThat(sentConfig(node.onlyRequest()))
-                .as("the node accepts up to 2 GiB; refusing it here would make the ceiling "
-                    + "one only the HTTP API could reach")
+                .as("the node accepts up to its ceiling; refusing it here would make the "
+                    + "ceiling one only the HTTP API could reach")
                 .containsEntry("max_file_bytes", SourceFactory.FILE_BYTES_LIMIT);
         }
     }

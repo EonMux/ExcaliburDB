@@ -94,9 +94,9 @@ final class ToolArguments {
      * Reads a whole-number argument that may exceed {@code int} range, or null when the model
      * sent none.
      *
-     * <p>For a quantity whose ceiling on the node is past what an {@code int} holds - a file
-     * size the node accepts up to 2 GiB is one. Reading it as an {@code int} would refuse the
-     * top of the range the HTTP API allows, and a limit only one of the two surfaces can reach
+     * <p>For a quantity measured in bytes, whose range belongs to the node rather than to this
+     * process: reading it as an {@code int} here would answer a large value with a different
+     * refusal than the one the HTTP API gives, and a limit the two surfaces state differently
      * is not a limit a model can be told about. The same tolerance as {@link #wholeNumber}
      * applies: a quoted number is read, a fractional one is refused.</p>
      *

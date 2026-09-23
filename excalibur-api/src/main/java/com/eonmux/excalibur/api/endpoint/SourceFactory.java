@@ -1,11 +1,15 @@
 package com.eonmux.excalibur.api.endpoint;
 
 import com.eonmux.excalibur.api.security.IngestTargetValidator;
+import com.eonmux.excalibur.ingest.source.DocumentLimits;
 import com.eonmux.excalibur.ingest.source.FilesystemSource;
 import com.eonmux.excalibur.ingest.source.HttpSource;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 import com.eonmux.excalibur.config.IngestConfig;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.nio.charset.Charset;
@@ -28,6 +32,8 @@ import java.util.Set;
  * <p>Immutable and thread-safe; the validator it holds is too.</p>
  */
 public final class SourceFactory {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SourceFactory.class);
 
     /** Configuration key naming a filesystem source's directory. */
     public static final String ROOT_PATH = "root_path";
@@ -83,14 +89,20 @@ public final class SourceFactory {
     /** Deepest a crawl may be asked to descend. */
     public static final int MAX_CRAWL_DEPTH = 1000;
 
-    /** Largest single file a filesystem crawl may be asked to read, 2 GiB. */
-    public static final long FILE_BYTES_LIMIT = 2L * 1024 * 1024 * 1024;
+    /**
+     * Largest single file a filesystem crawl may be asked to read: the largest document ingestion
+     * indexes, since a larger file would be read whole only to be refused.
+     */
+    public static final long FILE_BYTES_LIMIT = DocumentLimits.MAX_DOCUMENT_BYTES;
 
     /** Most pages one crawl may be asked to fetch. */
     public static final int DOCUMENTS_LIMIT = 10_000_000;
 
-    /** Largest single response body a crawl may be asked to hold, 256 MiB. */
-    public static final long RESPONSE_BYTES_LIMIT = 256L * 1024 * 1024;
+    /**
+     * Largest single response body a crawl may be asked to hold: the largest document ingestion
+     * indexes, for the same reason as {@link #FILE_BYTES_LIMIT}.
+     */
+    public static final long RESPONSE_BYTES_LIMIT = DocumentLimits.MAX_DOCUMENT_BYTES;
 
     /** Longest one HTTP request may be given, ten minutes. */
     public static final int TIMEOUT_SECONDS_LIMIT = 600;
@@ -188,7 +200,7 @@ public final class SourceFactory {
         if (includeHidden != null) {
             builder.includeHidden(includeHidden);
         }
-        Long fileBytes = longValue(descriptor, MAX_FILE_BYTES, 1, FILE_BYTES_LIMIT);
+        Long fileBytes = sizeValue(descriptor, MAX_FILE_BYTES, FILE_BYTES_LIMIT);
         if (fileBytes != null) {
             builder.maxFileSize(fileBytes);
         }
@@ -225,7 +237,7 @@ public final class SourceFactory {
         if (documents != null) {
             builder.maxDocuments(documents);
         }
-        Long responseBytes = longValue(descriptor, MAX_RESPONSE_BYTES, 1, RESPONSE_BYTES_LIMIT);
+        Long responseBytes = sizeValue(descriptor, MAX_RESPONSE_BYTES, RESPONSE_BYTES_LIMIT);
         if (responseBytes != null) {
             builder.maxResponseSize(responseBytes);
         }
@@ -310,6 +322,25 @@ public final class SourceFactory {
     private static Integer intValue(SourceDescriptor descriptor, String key, int min, int max) {
         Long value = longValue(descriptor, key, min, max);
         return value == null ? null : value.intValue();
+    }
+
+    /**
+     * Reads a byte bound, lowering one above {@code max} to {@code max}.
+     *
+     * <p>A request carrying a larger value never reaches here - {@code POST /v1/ingest} answers
+     * it 400 - so a larger value is a registration recorded when the node accepted more. It is
+     * lowered rather than refused because refusing it would stop the whole crawl on restart over
+     * a setting that never let a larger document be indexed: such a file was read only to be
+     * discarded as a failure.</p>
+     */
+    private static Long sizeValue(SourceDescriptor descriptor, String key, long max) {
+        Long value = longValue(descriptor, key, 1, Long.MAX_VALUE);
+        if (value != null && value > max) {
+            LOG.warn("Source {}: config.{} {} exceeds the largest document that can be indexed; "
+                + "using {}", descriptor.sourceId(), key, value, max);
+            return max;
+        }
+        return value;
     }
 
     private static Long longValue(SourceDescriptor descriptor, String key, long min, long max) {

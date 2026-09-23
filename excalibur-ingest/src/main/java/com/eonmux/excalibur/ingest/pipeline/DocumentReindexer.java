@@ -662,7 +662,7 @@ public class DocumentReindexer {
      * @param documentId Document identifier
      * @param fetched The fetched document content
      * @return Result of re-indexing this document
-     * @throws IllegalArgumentException if content exceeds maximum length
+     * @throws IllegalArgumentException if the document exceeds the per-document limits
      * @see DocumentReindexStep
      */
     public DocumentResult reindexDocument(String sourceId, String documentId, FetchedDocument fetched) {

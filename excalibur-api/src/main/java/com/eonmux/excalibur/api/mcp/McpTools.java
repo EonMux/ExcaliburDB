@@ -244,9 +244,9 @@ public final class McpTools {
                     + "that the operating system marks hidden. Omit for the server's default, "
                     + "which skips them.", null),
                 ToolSchema.optional("max_file_bytes", "integer",
-                    "Largest single file to index, in bytes, from 1 to 2147483648 (2 GiB). A "
-                    + "larger file is skipped rather than truncated. Omit for the server's "
-                    + "default.", null),
+                    "Largest single file to index, in bytes, from 1 to 104857600 (100 MiB), "
+                    + "the largest document the server indexes. A larger file is skipped rather "
+                    + "than truncated. Omit for the server's default, which is that limit.", null),
                 ToolSchema.optional("charset", "string",
                     "The encoding the files are written in, for a directory that is not UTF-8, "
                     + "e.g. 'windows-1252', 'ISO-8859-1', 'UTF-16LE'. Applies only to a file "
@@ -486,7 +486,8 @@ public final class McpTools {
         putWholeNumber(args, sourceConfig, "max_depth");
         putFlag(args, sourceConfig, "follow_symlinks");
         putFlag(args, sourceConfig, "include_hidden");
-        // Read as a long: the node's ceiling is 2 GiB, one byte past what an int holds.
+        // Read as a long so any whole number reaches the node, which answers one past its
+        // ceiling with the 400 that names the limit.
         Long maxFileBytes = ToolArguments.wholeLong(args, "max_file_bytes");
         if (maxFileBytes != null) {
             sourceConfig.put("max_file_bytes", maxFileBytes);

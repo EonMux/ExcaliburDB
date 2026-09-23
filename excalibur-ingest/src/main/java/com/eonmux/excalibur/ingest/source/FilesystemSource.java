@@ -41,7 +41,8 @@ import java.util.stream.StreamSupport;
  * <ul>
  *   <li>Root path must be an existing, readable directory</li>
  *   <li>File extensions are case-insensitive (e.g., ".TXT" == ".txt")</li>
- *   <li>Maximum file size: 2GB (configurable)</li>
+ *   <li>Maximum file size: 100 MiB, the largest document ingestion indexes (configurable
+ *       downwards)</li>
  *   <li>Symlinks are not followed by default (configurable). When they are followed, a path
  *       whose real location lies outside the root is not part of the source</li>
  *   <li>Hidden files are excluded by default (configurable)</li>
@@ -68,7 +69,7 @@ public class FilesystemSource implements Source {
 
     private static final String SOURCE_TYPE = "filesystem";
 
-    private static final long DEFAULT_MAX_FILE_SIZE = 2L * 1024 * 1024 * 1024;
+    private static final long DEFAULT_MAX_FILE_SIZE = DocumentLimits.MAX_DOCUMENT_BYTES;
     private static final int DEFAULT_MAX_DEPTH = 100;
     private static final long MILLIS_PER_SECOND = 1000L;
 
@@ -154,7 +155,8 @@ public class FilesystemSource implements Source {
         this.excludedDirectories = Set.copyOf(normalizeNames(builder.excludedDirectories));
         this.followSymlinks = builder.followSymlinks;
         this.includeHidden = builder.includeHidden;
-        this.maxFileSize = Math.max(1, builder.maxFileSize);
+        this.maxFileSize = Math.max(1,
+            DocumentLimits.requireIndexable(builder.maxFileSize, "maxFileSize"));
         this.maxDepth = Math.max(1, builder.maxDepth);
         this.charset = builder.charset;
 
@@ -746,6 +748,13 @@ public class FilesystemSource implements Source {
             return this;
         }
 
+        /**
+         * Sets the largest file the walk lists; a larger one is never read.
+         *
+         * @param maxBytes The bound, at most {@link DocumentLimits#MAX_DOCUMENT_BYTES}, which
+         *                 is also the default; {@link #build()} refuses a larger one
+         * @return This builder
+         */
         public Builder maxFileSize(long maxBytes) {
             this.maxFileSize = maxBytes;
             return this;

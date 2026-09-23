@@ -21,9 +21,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -261,13 +259,7 @@ final class SourceReindexPass {
 
     /**
      * Tombstones whatever remains of a changed document's previous version once its replacement
-     * has been published.
-     *
-     * <p>Tombstoning before the replacement exists is what makes a failed re-embed destructive:
-     * the old chunks are gone and nothing re-inserts them. Doing it here, after publication, means
-     * a failed document simply keeps serving its previous version. Chunk ids are deterministic, so
-     * the new version has already overwritten the ids it reuses; only the surplus tail is
-     * removed.</p>
+     * has been published; see {@link SupersededVersion} for why only then and only the surplus.
      *
      * @param changed   The changed document, carrying the previous version's metadata
      * @param docResult The outcome of re-indexing it
@@ -279,11 +271,8 @@ final class SourceReindexPass {
                 changed.getDocumentId());
             return 0;
         }
-        List<String> obsolete = new ArrayList<>(changed.getOldMetadata().getChunkIds());
-        obsolete.removeAll(docResult.getChunkIds());
-        lexical.retire(obsolete);
-        return upsertHandler.tombstoneObsoleteChunks(
-            changed.getOldMetadata().getChunkIds(), docResult.getChunkIds());
+        return SupersededVersion.retire(changed.getOldMetadata().getChunkIds(),
+            docResult.getChunkIds(), lexical::retire, upsertHandler);
     }
 
     /**

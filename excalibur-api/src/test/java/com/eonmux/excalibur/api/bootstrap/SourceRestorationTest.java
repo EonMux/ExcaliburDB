@@ -5,6 +5,8 @@ import com.eonmux.excalibur.api.endpoint.SourceFactory;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.security.IngestTargetValidator;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
+import com.eonmux.excalibur.ingest.source.DocumentLimits;
+import com.eonmux.excalibur.ingest.source.FilesystemSource;
 import com.eonmux.excalibur.ingest.source.SourceDescriptor;
 import com.eonmux.excalibur.shard.worker.SegmentReindexScheduler;
 import com.eonmux.excalibur.tenancy.NamespaceId;
@@ -69,6 +71,25 @@ class SourceRestorationTest {
         assertThat(restored).isEqualTo(1);
         assertThat(registry.isRegistered("my-docs")).isTrue();
         verify(scheduler).registerSource("my-docs", 3_600_000L);
+    }
+
+    @Test
+    @DisplayName("a recorded file size past what can be indexed is restored at the limit")
+    void anOversizedFileBoundIsLowered(@TempDir Path tempDir) throws IOException {
+        // The record says what the caller asked for when a larger bound was accepted. Refusing
+        // it now would stop the crawl altogether, over a setting that never let a document past
+        // the engine's limit: a larger file was read only to be discarded.
+        Path corpus = Files.createDirectory(tempDir.resolve("corpus"));
+        SourceCatalog catalog = SourceCatalog.open(tempDir);
+        catalog.record(new SourceDescriptor("filesystem", "big-files",
+            Map.of("root_path", corpus.toString(), "max_file_bytes", "2147483648")));
+        InMemorySourceRegistry registry = registryWith(mock(SegmentReindexScheduler.class));
+
+        int restored = SourceRestoration.restore(catalog, factoryAllowing(corpus), registry);
+
+        assertThat(restored).isEqualTo(1);
+        assertThat(((FilesystemSource) registry.get("big-files")).getMaxFileSize())
+            .isEqualTo(DocumentLimits.MAX_DOCUMENT_BYTES);
     }
 
     @Test
