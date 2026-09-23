@@ -69,7 +69,12 @@ public enum FileKind {
     /** {@code document-registry}: which documents have been ingested. */
     DOCUMENT_REGISTRY,
 
-    /** {@code document-registry.in-flight}: ingestions that had not finished. */
+    /**
+     * {@code document-registry.in-flight}: ingestions that had not finished.
+     *
+     * <p>Append-only, so each line carries its own checksum rather than the file carrying one;
+     * see {@link InFlightJournalCheck}.</p>
+     */
     IN_FLIGHT_JOURNAL,
 
     /** {@code source-catalog}: which sources are registered. */
@@ -167,9 +172,9 @@ public enum FileKind {
      * <p>The other way damage can cost the node nothing but the file. The source status history
      * is not rebuilt - what each source's last crawl did is not derivable from anything else -
      * but nothing the node serves depends on it either: one its reader will not take - cut
-     * short, without a header, or at a version this build does not read - is logged and treated
-     * as empty, each source reports from its next run, and the file is
-     * rewritten when the first run ends. What is lost is the history, never data.</p>
+     * short, altered so its checksum no longer matches, without a header, or at a version this
+     * build does not read - is logged and treated as empty, each source reports from its next
+     * run, and the file is rewritten when the first run ends. What is lost is the history, never data.</p>
      *
      * @return true for a kind the node discards, rather than refuses to start on, when damaged
      */
