@@ -31,16 +31,22 @@ import java.util.Map;
  *
  * <h2>The one thing both paths must agree on</h2>
  * <p>The identifier. Vector search reports the {@code source:document:chunk:N} string ingestion
- * assigned and the lexical index reports the same one, which is what makes a document returned
- * by both fusible rather than counted twice. Nothing here reconciles two id spaces, because
- * there is only one.</p>
+ * assigned - each graph node is attributed to the chunk it embeds - and the lexical index
+ * reports the same one, which is what makes a chunk returned by both fusible rather than counted
+ * twice. Nothing here reconciles two id spaces, because there is only one.</p>
+ *
+ * <p>A segment whose graph still carries a mapping written by a build that attributed nodes to
+ * whole documents names its hits by document until that mapping is upgraded, which the
+ * segment's integration worker does before it integrates anything else. Such a hit fuses with
+ * nothing lexical, since no chunk is named by a bare document key; it is returned, and ranked
+ * on the one signal that found it.</p>
  *
  * <p>The exception is a vector result the pipeline could not name - a graph with no
- * node-document mapping, or a write-log entry with an empty key. Such a result has no external
- * identifier, only a node id, and node ids are per-segment: two of them can be the same number
- * and different documents. Those are keyed by segment and node instead, so that turning fusion
- * on never merges two answers vector search alone would have returned separately. They can
- * never match a lexical hit, which is correct - nothing knows what they are.</p>
+ * node-to-chunk mapping for the node. Such a result has no external identifier, only a node id,
+ * and node ids are per-segment: two of them can be the same number and different chunks. Those
+ * are keyed by segment and node instead, so that turning fusion on never merges two answers
+ * vector search alone would have returned separately. They can never match a lexical hit, which
+ * is correct - nothing knows what they are.</p>
  */
 public final class HybridFusion {
 

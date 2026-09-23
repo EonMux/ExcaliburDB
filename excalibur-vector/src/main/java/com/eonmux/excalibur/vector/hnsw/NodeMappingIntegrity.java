@@ -172,8 +172,8 @@ final class NodeMappingIntegrity {
             return "";
         }
         return "; written at version " + version + ", whose entries name documents rather than "
-            + "chunks - the node re-keys it to chunks from its segment the next time it opens "
-            + "the graph";
+            + "chunks - the node re-keys it to chunks from its segment's stored embeddings once "
+            + "it has the graph open, before integrating anything more into it";
     }
 
     /**

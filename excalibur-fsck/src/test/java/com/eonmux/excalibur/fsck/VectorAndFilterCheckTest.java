@@ -1,12 +1,16 @@
 package com.eonmux.excalibur.fsck;
 
+import com.eonmux.excalibur.core.integrity.IndexChecksum;
 import com.eonmux.excalibur.fsck.check.CheckStatus;
 import com.eonmux.excalibur.fsck.check.LshTableCheck;
 import com.eonmux.excalibur.fsck.check.VectorIndexCheck;
+import com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -49,6 +53,42 @@ class VectorAndFilterCheckTest {
         var result = VectorIndexCheck.documentMapping(file, "segment_0.hnsw.docmap");
 
         assertThat(result.status()).isEqualTo(CheckStatus.CORRUPT);
+    }
+
+    /** Writes a sealed mapping of two chunks, as this build writes one. */
+    private static Path chunkMapping(Path dir) throws IOException {
+        Path file = dir.resolve("segment_0.hnsw.docmap");
+        NodeDocumentMapping mapping = new NodeDocumentMapping(file);
+        mapping.register(0L, "docs:a.md:chunk:0");
+        mapping.register(1L, "docs:a.md:chunk:1");
+        mapping.persist();
+        return file;
+    }
+
+    @Test
+    void aChunkKeyedMappingIsIntact(@TempDir Path dir) throws IOException {
+        var result = VectorIndexCheck.documentMapping(chunkMapping(dir), "segment_0.hnsw.docmap");
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.INTACT);
+        assertThat(result.detail()).doesNotContain("name documents");
+    }
+
+    @Test
+    void aDocumentKeyedMappingFromAnOlderBuildIsIntactAndSaysSo(@TempDir Path dir)
+            throws IOException {
+        // The same sealed layout at the version an older build wrote, whose entries name
+        // documents: sound, and not a repair case, since the node re-keys it itself.
+        Path file = chunkMapping(dir);
+        byte[] bytes = Files.readAllBytes(file);
+        ByteBuffer header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        header.putInt(Long.BYTES, NodeDocumentMapping.VERSION_DOCUMENT_KEYED);
+        header.putLong(40, IndexChecksum.of(bytes, 0, 40));
+        Files.write(file, bytes);
+
+        var result = VectorIndexCheck.documentMapping(file, "segment_0.hnsw.docmap");
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.INTACT);
+        assertThat(result.detail()).contains("version 2", "name documents");
     }
 
     @Test
