@@ -32,6 +32,10 @@ dependencies {
 
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
+    // The graph staging logs a deep verify replays are written in tests by the classes that own
+    // their formats, so a verdict of sound is about bytes a node really writes. Only the tests
+    // need it: verify reaches those logs through excalibur-fsck's dispatch, never by name.
+    testImplementation(project(":excalibur-graph"))
 }
 
 // Two flags are not optional. --enable-preview because every class in this build is stamped

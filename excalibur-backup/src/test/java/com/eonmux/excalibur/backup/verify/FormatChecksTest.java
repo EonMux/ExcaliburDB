@@ -2,6 +2,10 @@ package com.eonmux.excalibur.backup.verify;
 
 import com.eonmux.excalibur.backup.testing.DataDirectoryFixture;
 import com.eonmux.excalibur.core.integrity.IndexChecksum;
+import com.eonmux.excalibur.graph.provenance.Provenance;
+import com.eonmux.excalibur.graph.provenance.SourceType;
+import com.eonmux.excalibur.graph.staging.ExtractedTriple;
+import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -398,5 +402,79 @@ class FormatChecksTest {
         List<ContentCheck> folded = FormatChecks.withLexicalStore(dataDir, List.of());
 
         assertThat(folded).anySatisfy(each -> assertThat(each.healthy()).isFalse());
+    }
+
+    /** Where the tenant's staging logs live in the image, relative to its payload root. */
+    private static final String STAGING = "shared/graph-staging/";
+
+    /** Stages facts and text through a real staging store, as ingestion does. */
+    private void stageFacts() throws IOException {
+        Provenance document = Provenance.of(SourceType.DOCUMENT, 42, 0.9, 3);
+        try (GraphStagingStore store = GraphStagingStore.open(dataDir.resolve(STAGING))) {
+            store.append(ExtractedTriple.alwaysValid("Ada", "employer", "Acme", document));
+            store.append(ExtractedTriple.alwaysValid("Grace", "employer", "Navy", document));
+            store.appendEntityText(0, "Ada wrote the first program", document);
+            store.appendEntityText(1, "Acme employed Ada", document);
+        }
+    }
+
+    @ParameterizedTest(name = "{0} is replayed record by record and proven")
+    @ValueSource(strings = {
+        GraphStagingStore.ENTITY_LABELS,
+        GraphStagingStore.RELATION_LABELS,
+        GraphStagingStore.TRIPLE_LOG,
+        GraphStagingStore.ENTITY_TEXT_LOG
+    })
+    void aStagingLogIsProven(String name) throws IOException {
+        stageFacts();
+        Path file = dataDir.resolve(STAGING + name);
+        String before = DataDirectoryFixture.digest(file);
+
+        ContentCheck check = check(STAGING + name);
+
+        assertThat(check.healthy()).as(check.detail()).isTrue();
+        assertThat(check.proven()).as(check.detail()).isTrue();
+        assertThat(check.detail()).contains("INTACT").contains("matched their checksums");
+        assertThat(DataDirectoryFixture.digest(file))
+            .as("the staging logs are read where they lie, so the check must not write")
+            .isEqualTo(before);
+    }
+
+    @ParameterizedTest(name = "a byte flipped inside {0}, under records after it, fails the image")
+    @ValueSource(strings = {
+        GraphStagingStore.ENTITY_LABELS,
+        GraphStagingStore.TRIPLE_LOG,
+        GraphStagingStore.ENTITY_TEXT_LOG
+    })
+    void aDamagedStagingLogFails(String name) throws IOException {
+        stageFacts();
+        Path file = dataDir.resolve(STAGING + name);
+        byte[] bytes = Files.readAllBytes(file);
+        // Past the header, inside a record every one of these logs has an intact record after.
+        bytes[16 + 21] ^= (byte) 0xFF;
+        Files.write(file, bytes);
+
+        ContentCheck check = check(STAGING + name);
+
+        assertThat(check.healthy())
+            .as("the node refuses the log, so an image holding it does not restore a node that "
+                + "builds: %s", check.detail())
+            .isFalse();
+        assertThat(check.detail()).contains("CORRUPT");
+    }
+
+    @Test
+    @DisplayName("a staging log ending in a write cut short is healthy and unproven: the node trims it")
+    void aTornStagingLogIsHealthyButUnproven() throws IOException {
+        stageFacts();
+        Path file = dataDir.resolve(STAGING + GraphStagingStore.TRIPLE_LOG);
+        byte[] bytes = Files.readAllBytes(file);
+        Files.write(file, Arrays.copyOf(bytes, bytes.length + 5));
+
+        ContentCheck check = check(STAGING + GraphStagingStore.TRIPLE_LOG);
+
+        assertThat(check.healthy()).as(check.detail()).isTrue();
+        assertThat(check.proven()).isFalse();
+        assertThat(check.detail()).contains("UNSEALED");
     }
 }
