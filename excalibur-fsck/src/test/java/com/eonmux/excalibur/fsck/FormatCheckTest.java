@@ -259,16 +259,16 @@ class FormatCheckTest {
     }
 
     @Test
-    void stagingLogHeaderIsConfirmedAndItsRecordsAreNotClaimed(@TempDir Path dir)
+    void stagingLogHoldingOnlyItsHeaderIsIntactAndEmpty(@TempDir Path dir)
             throws IOException {
         Path file = dir.resolve(GraphStagingStore.ENTITY_LABELS);
         Files.write(file, stagingHeader(LabelInterner.MAGIC, LabelInterner.VERSION));
 
         var result = GraphStagingCheck.check(file, "shared-staging/entities.labels");
 
-        assertThat(result.status()).isEqualTo(CheckStatus.UNCHECKED);
+        assertThat(result.status()).isEqualTo(CheckStatus.INTACT);
         assertThat(result.version()).isEqualTo("v" + LabelInterner.VERSION);
-        assertThat(result.detail()).contains("records themselves were not read");
+        assertThat(result.detail()).contains("no labels follow it");
     }
 
     @Test
@@ -298,8 +298,9 @@ class FormatCheckTest {
 
         var result = GraphStagingCheck.check(file, "shared-staging/triples.log");
 
-        assertThat(result.status()).isEqualTo(CheckStatus.UNCHECKED);
+        assertThat(result.status()).isEqualTo(CheckStatus.INTACT);
         assertThat(result.version()).isEqualTo("v" + GraphStagingStore.VERSION_WITHOUT_STATED_ON);
+        assertThat(result.detail()).contains("rewrites it to version " + GraphStagingStore.VERSION);
     }
 
     @Test

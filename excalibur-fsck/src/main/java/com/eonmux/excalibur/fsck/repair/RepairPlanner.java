@@ -9,7 +9,9 @@ import com.eonmux.excalibur.fsck.check.DataDirectoryScan;
 import com.eonmux.excalibur.fsck.check.FileCheck;
 import com.eonmux.excalibur.fsck.check.FileClassifier;
 import com.eonmux.excalibur.fsck.check.FileKind;
+import com.eonmux.excalibur.fsck.check.GraphStagingCheck;
 import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
+import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.store.RoutingDirectory;
 
 import java.nio.file.Path;
@@ -169,6 +171,9 @@ public final class RepairPlanner {
                 + "mappings together from a backup, or rebuild the segment's vector index by "
                 + "reindexing it";
         }
+        if (FileClassifier.classify(file.relative()) == FileKind.GRAPH_STAGING_LOG) {
+            return stagingLogAdvice(file);
+        }
         if (FileClassifier.classify(file.relative()) == FileKind.WRITE_AHEAD_LOG) {
             return file.relative() + " is damaged in a way no repair here can act on: "
                 + file.detail() + ". It is not moved aside automatically, and it must not be: "
@@ -184,6 +189,49 @@ public final class RepairPlanner {
             + "is still sound. Verify the file against a replica or a backup, and rebuild "
             + "or restore it rather than letting a compaction rewrite it - a rewrite copies "
             + "what the slot table reaches, so anything it no longer reaches is dropped";
+    }
+
+    /**
+     * Phrases the decision a damaged graph staging log forces on a human.
+     *
+     * <p>Every staging log is the only copy of what it holds - nothing rebuilds one the way a
+     * reindex rebuilds an index - and the node opens a missing one as empty rather than refusing
+     * to start. So moving one aside does not set damage apart for later; it tells the node the
+     * log was never written, and what that costs depends on which log it was.</p>
+     *
+     * @param file The verdict
+     * @return What to weigh
+     */
+    private static String stagingLogAdvice(FileCheck file) {
+        String relative = file.relative();
+        String name = relative.substring(relative.lastIndexOf('/') + 1);
+        String consequence = switch (name) {
+            case GraphStagingStore.ENTITY_LABELS, GraphStagingStore.RELATION_LABELS ->
+                "an id's label is its position in this file, so the node would hand the ids out "
+                    + "again from zero to whatever is interned next, while the published graph "
+                    + "and its label index still name entities by the old ones - one entity "
+                    + "served under another's name, with no error";
+            case GraphStagingStore.TRIPLE_LOG ->
+                "every graph is built from this log whole, so the next build would publish a "
+                    + "graph without any fact staged before it, and report success";
+            case GraphStagingStore.ENTITY_TEXT_LOG ->
+                "this is the text entities are ranked by and embedded from, so the next build "
+                    + "would rank every entity with none, and an erasure aimed at the prose in it "
+                    + "would find nothing to erase while the moved copy still held it";
+            case GraphStagingCheck.WITHDRAWAL_LOG ->
+                "it records the staged facts of replaced and removed documents that are still "
+                    + "to be withdrawn, so those facts would stay in the graph with nothing left "
+                    + "to retry their withdrawal";
+            default ->
+                "it records the erasures accepted and not yet applied, so the node would forget "
+                    + "them, and the data they were promised to destroy would stay on disk with "
+                    + "nothing left to report it as owed";
+        };
+        return relative + " is damaged: " + file.detail() + ". It is not moved aside "
+            + "automatically, and it must not be: nothing rebuilds a staging log, and the node "
+            + "opens a missing one as empty. Moved aside, " + consequence + ". Restore the "
+            + "namespace's staging directory from a backup, all of its logs together, since "
+            + "they refer to one another by id";
     }
 
     /**

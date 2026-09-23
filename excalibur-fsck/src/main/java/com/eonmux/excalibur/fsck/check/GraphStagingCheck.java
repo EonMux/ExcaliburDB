@@ -1,6 +1,8 @@
 package com.eonmux.excalibur.fsck.check;
 
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
+import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.staging.EntityTextLog;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.LabelInterner;
@@ -14,20 +16,37 @@ import java.nio.file.Path;
 /**
  * Checks the append-only logs a tenant's {@code graph-staging} directory holds.
  *
- * <p>Two different claims are made here, and the difference between them is the point.
- * {@code erasure.log} has a public, non-mutating inspection that replays every record
- * against its CRC and refuses damage with sound records behind it, so that file is
- * genuinely verified, and so is {@code withdrawals.log}, which is written in the same format.
- * The other four have no such entry point - their open paths write the
- * header, truncate partial records and migrate old versions in place - so all this can do
- * is confirm the sixteen-byte header, and the verdict says exactly that rather than
- * implying the records were read.</p>
+ * <h2>Every record is read, by the node's own code</h2>
+ * <p>Each of these logs has a read-only inspection beside the code that writes it:
+ * {@link ErasureLog#inspect} for {@code erasure.log} and {@code withdrawals.log}, which share a
+ * format; {@link LabelInterner#inspect} for the two label interners;
+ * {@link GraphStagingStore#inspectTripleLog} for the staged facts; and
+ * {@link EntityTextLog#inspect} for the text each entity was mentioned in. Every one of them walks
+ * the records with the replay the node opens, builds from or upgrades the log with, so what is
+ * called sound here is what the node reads as sound, and nothing here restates a record layout
+ * that could drift from the one written. None of them writes: opening any of these logs creates
+ * it, trims its tail or rewrites an earlier version in place, which is why the checker asks
+ * rather than opens.</p>
  *
- * <p>Confirming the header includes its version, against the range each log's reader opens.
- * A version outside it is a file the node refuses, whatever the records behind it look like,
- * so it is reported unreadable rather than as a well-formed header - and unreadable rather than
- * corrupt, because a newer build may have written it, and moving aside an erasure log a newer
- * build wrote would lose the erasures still outstanding in it.</p>
+ * <h2>Three verdicts, each the node's</h2>
+ * <p>A log whose every record matched its checksum is {@link CheckStatus#INTACT}, with the count
+ * that was proven. One that ends in bytes that do not read as a record, with nothing readable
+ * after them, is {@link CheckStatus#UNSEALED}: the node takes that for a write a crash cut short
+ * and cuts it off when it next opens the log, keeping every record before it, so it is neither
+ * damage nor proof - the same verdict a write-ahead log's torn tail gets, and like the node, the
+ * repair plan leaves it alone. And damage the node refuses - a record that fails its checksum
+ * with an intact record after it, or, in the fixed-width triple log, any whole record that fails
+ * its checksum - is {@link CheckStatus#CORRUPT}, and put to an operator rather than into the
+ * repair plan: every one of these logs is the only copy of what it holds, and the node opens a
+ * missing one as empty, so moving a damaged one aside would lose outstanding erasures, reassign
+ * entity ids or empty the next graph build rather than repair anything.</p>
+ *
+ * <h2>The header first</h2>
+ * <p>The version in the header is judged before the records are, against the range each log's
+ * reader opens. A version outside it is a file the node refuses, whatever the records behind it
+ * look like, so it is reported unreadable rather than corrupt, because a newer build may have
+ * written it. An earlier version the node rewrites on open is read in its own framing and
+ * reported at the version it is.</p>
  */
 public final class GraphStagingCheck {
 
@@ -89,17 +108,30 @@ public final class GraphStagingCheck {
                 "withdrawals of staged facts");
         }
         if (GraphStagingStore.ENTITY_TEXT_LOG.equals(name)) {
-            return header(file, relative, new LogFormat("graph entity text log",
+            return inspected(file, relative, new LogFormat("graph entity text log",
                 EntityTextLog.MAGIC, EntityTextLog.VERSION_WITHOUT_PROVENANCE,
-                EntityTextLog.VERSION));
+                EntityTextLog.VERSION), "entity text snippets", EntityTextLog::inspect);
         }
         if (GraphStagingStore.TRIPLE_LOG.equals(name)) {
-            return header(file, relative, new LogFormat("graph triple log",
+            return inspected(file, relative, new LogFormat("graph triple log",
                 GraphStagingStore.MAGIC, GraphStagingStore.VERSION_WITHOUT_STATED_ON,
-                GraphStagingStore.VERSION));
+                GraphStagingStore.VERSION), "staged facts", GraphStagingStore::inspectTripleLog);
         }
-        return header(file, relative, new LogFormat("graph label interner",
-            LabelInterner.MAGIC, LabelInterner.VERSION, LabelInterner.VERSION));
+        return inspected(file, relative, new LogFormat("graph label interner",
+            LabelInterner.MAGIC, LabelInterner.VERSION, LabelInterner.VERSION), "labels",
+            LabelInterner::inspect);
+    }
+
+    /** One log's read-only inspection, as its owning class declares it. */
+    @FunctionalInterface
+    private interface Inspector {
+
+        /**
+         * @param file The log
+         * @return What the walk found
+         * @throws IOException if the log cannot be read, or holds damage the node refuses
+         */
+        LogInspection inspect(Path file) throws IOException;
     }
 
     /**
@@ -154,8 +186,10 @@ public final class GraphStagingCheck {
                     + " are still outstanding", size);
 
         } catch (IOException e) {
+            // Put to an operator for the reason the class comment gives: moved aside, the log
+            // is opened as empty, and every erasure still outstanding in it is forgotten.
             return new FileCheck(file, relative, format, null, CheckStatus.CORRUPT,
-                "the log could not be replayed: " + e.getMessage(), size);
+                "the log could not be replayed: " + e.getMessage(), size, true);
         } catch (RuntimeException e) {
             return new FileCheck(file, relative, format, null, CheckStatus.UNREADABLE,
                 "the log could not be replayed: " + e, size);
@@ -194,14 +228,83 @@ public final class GraphStagingCheck {
     }
 
     /**
-     * Confirms a staging log's header and says that is all that was confirmed.
+     * Replays a staging log through its owner's read-only inspection and phrases the verdict.
+     *
+     * @param file      The log file
+     * @param relative  Its path relative to the data directory
+     * @param log       What its reader accepts at the front of the file
+     * @param records   What its records are, plural, for the verdict
+     * @param inspector The owning class's inspection
+     * @return The verdict
+     */
+    private static FileCheck inspected(Path file, String relative, LogFormat log, String records,
+                                       Inspector inspector) {
+        Header header = header(file, relative, log);
+        if (header.refused() != null) {
+            return header.refused();
+        }
+        String format = log.name();
+        String version = "v" + header.version();
+        long size = header.size();
+        LogInspection found;
+        try {
+            found = inspector.inspect(file);
+        } catch (LogCorruptionException e) {
+            // Refused by the node on the same terms, and nothing rebuilds the log: see the
+            // class comment for why this goes to an operator rather than into the repair plan.
+            return new FileCheck(file, relative, format, version, CheckStatus.CORRUPT,
+                e.getMessage(), size, true);
+        } catch (IOException e) {
+            return new FileCheck(file, relative, format, version, CheckStatus.UNREADABLE,
+                "the file could not be read: " + e, size);
+        } catch (RuntimeException e) {
+            return new FileCheck(file, relative, format, version, CheckStatus.UNREADABLE,
+                "the log could not be replayed: " + e, size);
+        }
+
+        String rewritten = found.version() < log.newest()
+            ? ". It was written at version " + found.version() + ", and the node rewrites it to "
+                + "version " + log.newest() + " when it next opens it"
+            : "";
+        if (found.hasTornTail()) {
+            return new FileCheck(file, relative, format, version, CheckStatus.UNSEALED,
+                "the log ends in " + found.tornBytes() + " bytes that do not read as a record, "
+                    + "with nothing readable after them: the shape a write cut short by a crash "
+                    + "leaves. The node cuts them off when it next opens the log, keeping the "
+                    + found.records() + " " + records + " before them, all of which matched "
+                    + "their checksums" + rewritten, size);
+        }
+        String proven = found.records() == 0
+            ? "the header is well-formed and no " + records + " follow it"
+            : "all " + found.records() + " " + records + " matched their checksums, and the "
+                + "log ends cleanly after the last of them";
+        return new FileCheck(file, relative, format, version, CheckStatus.INTACT,
+            proven + rewritten, size);
+    }
+
+    /**
+     * What the front of a staging log says, or why it cannot be read past.
+     *
+     * @param refused The verdict when the header is the whole answer, or null to read on
+     * @param version The version the header names, when it is one the reader opens
+     * @param size    The file's size
+     */
+    private record Header(FileCheck refused, int version, long size) {
+    }
+
+    /**
+     * Judges a staging log's header before its records are replayed.
+     *
+     * <p>Kept ahead of the replay, which refuses these cases too, because the verdict differs
+     * between them and the replay's refusal does not say which it was: a version this build
+     * does not read is a newer build's file, not a damaged one, and must not be moved aside.</p>
      *
      * @param file     The log file
      * @param relative Its path relative to the data directory
      * @param log      What its reader accepts
-     * @return The verdict
+     * @return The header's verdict, or its version when the records should be read
      */
-    private static FileCheck header(Path file, String relative, LogFormat log) {
+    private static Header header(Path file, String relative, LogFormat log) {
         String format = log.name();
         byte[] head;
         long size;
@@ -209,30 +312,26 @@ public final class GraphStagingCheck {
             size = Files.size(file);
             head = readHead(file);
         } catch (IOException e) {
-            return new FileCheck(file, relative, format, null, CheckStatus.UNREADABLE,
-                "the file could not be read: " + e, -1);
+            return new Header(new FileCheck(file, relative, format, null, CheckStatus.UNREADABLE,
+                "the file could not be read: " + e, -1), 0, -1);
         }
         if (head.length < HEADER_BYTES) {
-            return new FileCheck(file, relative, format, null, CheckStatus.CORRUPT,
+            return new Header(new FileCheck(file, relative, format, null, CheckStatus.CORRUPT,
                 "the file is " + size + " bytes, too short to hold its " + HEADER_BYTES
-                    + "-byte header", size);
+                    + "-byte header", size, true), 0, size);
         }
         // Written by DataOutputStream, so the header is big-endian even where the records
         // that follow it are not.
         ByteBuffer buffer = ByteBuffer.wrap(head).order(ByteOrder.BIG_ENDIAN);
         if (buffer.getLong(0) != log.magic()) {
-            return new FileCheck(file, relative, format, null, CheckStatus.CORRUPT,
-                "the file does not begin with this log's magic number", size);
+            return new Header(new FileCheck(file, relative, format, null, CheckStatus.CORRUPT,
+                "the file does not begin with this log's magic number", size, true), 0, size);
         }
         int version = buffer.getInt(8);
         if (!log.reads(version)) {
-            return log.unsupported(file, relative, version, size);
+            return new Header(log.unsupported(file, relative, version, size), version, size);
         }
-        return new FileCheck(file, relative, format, "v" + version, CheckStatus.UNCHECKED,
-            "the header is well-formed and " + (size - HEADER_BYTES) + " bytes of records "
-                + "follow it. Each record carries a CRC32, but this build exposes no "
-                + "read-only replay for this log - opening it writes - so the records "
-                + "themselves were not read", size);
+        return new Header(null, version, size);
     }
 
     /**
