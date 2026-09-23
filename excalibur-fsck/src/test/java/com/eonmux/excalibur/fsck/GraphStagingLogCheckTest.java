@@ -232,6 +232,19 @@ class GraphStagingLogCheckTest {
         assertThat(fingerprint(file)).isEqualTo(before);
     }
 
+    @Test
+    @DisplayName("an erasure log whose header write was cut short is unsealed: the node starts it anew")
+    void anErasureLogWithATornHeaderIsUnsealed() throws IOException {
+        Path file = staging.resolve(GraphStagingCheck.ERASURE_LOG);
+        Files.write(file, java.util.Arrays.copyOf(
+            ByteBuffer.allocate(Long.BYTES).putLong(ErasureLog.MAGIC).array(), 6));
+
+        FileCheck result = check(GraphStagingCheck.ERASURE_LOG);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.UNSEALED);
+        assertThat(result.detail()).contains("6 bytes").contains("0 erasure requests");
+    }
+
     @ParameterizedTest(name = "{0} at a version this build does not read is unreadable")
     @ValueSource(strings = {
         GraphStagingStore.ENTITY_LABELS,

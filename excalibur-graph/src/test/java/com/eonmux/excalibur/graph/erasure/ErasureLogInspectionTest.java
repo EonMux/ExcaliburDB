@@ -305,6 +305,27 @@ class ErasureLogInspectionTest {
                 .isInstanceOf(IOException.class);
         }
 
+        @Test
+        @DisplayName("a header cut short is a torn tail; anything else that short is refused")
+        void aShortFileIsJudgedAsTheOpenJudgesIt(@TempDir Path dir) throws IOException {
+            Path torn = dir.resolve("torn.log");
+            Files.write(torn, java.util.Arrays.copyOf(
+                ByteBuffer.allocate(Long.BYTES).putLong(ErasureLog.MAGIC).array(), 5));
+            Path foreign = dir.resolve("foreign.log");
+            Files.write(foreign, new byte[] {'n', 'o', 'p', 'e'});
+
+            ErasureLog.Inspection inspection = ErasureLog.inspectLog(torn);
+
+            assertThat(inspection.pending()).isEqualTo(ErasureLog.Pending.NONE);
+            assertThat(inspection.log().records()).isZero();
+            assertThat(inspection.log().tornBytes()).isEqualTo(5);
+            assertThatThrownBy(() -> ErasureLog.inspectLog(foreign))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("too short to be a torn one");
+            assertThatThrownBy(() -> ErasureLog.open(foreign).close())
+                .hasMessageContaining("too short to be a torn one");
+        }
+
         /** Keeps the CRC import honest: the damage test relies on the framing this computes. */
         @Test
         @DisplayName("the framing these tests damage is the framing the log writes")

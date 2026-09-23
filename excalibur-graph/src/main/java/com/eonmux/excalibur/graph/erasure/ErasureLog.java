@@ -352,19 +352,28 @@ public final class ErasureLog implements AutoCloseable {
      * {@link #inspect} refuses, with damage that has an intact record behind it raised as a
      * {@link LogCorruptionException}.</p>
      *
+     * <p>A file shorter than its header is judged as {@link #open} judges it. Bytes that are a
+     * prefix of this log's own header are a header write a crash cut short, which the open
+     * replaces with a fresh header; they are reported as a torn tail with nothing before it.
+     * Anything else that short is refused, as the open refuses it.</p>
+     *
      * @param file The log file
      * @return What it owes and what its records are
-     * @throws IOException if the file is absent, shorter than its header, not an erasure log of a
-     *                     version this build reads, holds an intact record this build cannot
-     *                     interpret, or cannot be read
+     * @throws IOException if the file is absent, too short to be even a torn one of these logs,
+     *                     not an erasure log of a version this build reads, holds an intact
+     *                     record this build cannot interpret, or cannot be read
      * @throws LogCorruptionException if damage has an intact record behind it
      * @throws NullPointerException if {@code file} is null
      */
     public static Inspection inspectLog(Path file) throws IOException {
         Objects.requireNonNull(file, "file must not be null");
-        if (Files.size(file) < HEADER_BYTES) {
-            throw new IOException("erasure log " + file + " is shorter than its "
-                + HEADER_BYTES + "-byte header");
+        long size = Files.size(file);
+        if (size < HEADER_BYTES) {
+            if (!isPrefixOfHeader(file)) {
+                throw new IOException("not an erasure log, and too short to be a torn one: "
+                    + file);
+            }
+            return new Inspection(Pending.NONE, new LogInspection(VERSION, 0, 0, size));
         }
         return examine(file);
     }
