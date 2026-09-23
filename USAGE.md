@@ -2835,8 +2835,9 @@ the copy verifies faithfully without it:
   document at versions 1 and 2; one at a version this build does not read fails the image.
 - Everything else goes to `excalibur-fsck`'s checkers, read-only, where the file lies — the same
   dispatch `excalibur-fsck` surveys a live directory with. Write-ahead logs have every record
-  replayed against its checksum; the lexical store is checked as one structure, every column of
-  every segment its manifest names; the graph erasure ledger has every record checked; a segment's
+  replayed against its checksum; `routing.dir` is checked against the CRC32C that ends it; the
+  lexical store is checked as one structure, its manifest against the CRC32C on its last line and
+  every column of every segment the manifest names; the graph erasure ledger has every record checked; a segment's
   term sketch (`segment_<N>.tfs`) has its header and body checked against their CRC32Cs. A damaged
   sketch is reported and does not fail the image, because a node restored from it rebuilds the
   sketch when it opens the segment; one that cannot be read at all does fail it. A compaction's
@@ -2844,7 +2845,9 @@ the copy verifies faithfully without it:
   though each is in a format the engine checks: while both are there the compaction never
   swapped, the node discards the pair on open, and a torn pair is a leftover that does not fail
   the image; a staged mapping alone is the one the swapped graph matches, and is verified.
-- Some formats carry nothing to prove them by: `routing.dir`; the document registry, the source
+- Some files carry nothing to prove them by: a `routing.dir` or a lexical `manifest` an older
+  build wrote, before those formats carried a checksum — held to their structure and record
+  count until the node rewrites them; the document registry, the source
   catalog and the source status history, each held to what its reader requires — a header version
   it reads and a record count that matches its lines — though their contents are not checked; the
   in-flight journal; the lexical store's sidecars; and the graph triple, entity and label logs,
@@ -3069,7 +3072,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 
 ### Upgrading a data directory written by an older build
 
-Four on-disk formats differ from those older builds wrote. A node reads the old and the current form of each, but one of them needs a manual step.
+Six on-disk formats differ from those older builds wrote. A node reads the old and the current form of each, but one of them needs a manual step.
 
 **`<data dir>/source-catalog` — a manual step is required.** The catalog of registered ingestion
 sources ends with a marker line, `\#end|<count>`, written after the records are forced to
@@ -3120,6 +3123,33 @@ compaction rewrites a few of them, oldest first, up to the merge fan-in — incl
 node's sweep asks for when nothing is being ingested — so they are upgraded without being asked
 for, and `segments_upgraded` on `/v1/compact/status` reports each pass. `POST /v1/compact` with
 `{"force": true}` upgrades all of them at once.
+
+**`chunk-index/manifest` — no step required, and no rollback.** The lexical store's manifest is
+version 3: its last line, `#end`, carries the number of segment lines and now also a CRC32C of
+every byte before it, as eight hexadecimal digits. The count proves no line was lost; only the
+checksum proves the lines that are there are the ones written — an altered segment name reads as a
+well-formed line naming nothing, and the segment it used to name would be deleted as unreferenced.
+A manifest that fails its checksum is refused exactly as one whose count disagrees: the store does
+not open, and nothing is deleted. A version 2 manifest is read as before, its count checked and
+trusted, and `excalibur-fsck` reports it *legacy, unprotected*; the first write of any kind —
+an ingest, an erasure, a compaction — rewrites it at version 3. A version 1 manifest, which has
+no count, is read and swept from by nothing, as before, and rewritten the same way. An older build
+refuses a version 3 manifest — the chunk lexical index does not open, and nothing is deleted — so
+a node that has written to its lexical store under this build cannot go back without restoring an
+image taken before the upgrade.
+
+**`<data dir>/routing.dir` — no step required; rollback depends on splits.** The routing directory
+is version 2, which ends with a CRC32C of every byte before it. Every slot value is a plausible
+segment number, so a damaged slot used to read as a valid directory and route part of the
+keyspace to a segment that does not hold it; now a directory that fails its checksum, or is not
+exactly as long as its width says, is treated as one that cannot be read — the store reconstructs
+it from the segment file names while at most one segment has ever split, and otherwise refuses to
+start, naming the file and saying the checksum did not match. A version 1 directory is read and
+applied exactly as before, reported *legacy, unprotected* by `excalibur-fsck`, and rewritten at
+version 2 the next time the directory changes — the next split, or a start that has to
+reconstruct it. An older build cannot read version 2 and treats the file as missing: a store at
+most one split old is reconstructed exactly and starts, and one split more than once refuses to
+start, so going back from such a store needs an image taken before the upgrade.
 
 **`segment_<N>.hnsw.docmap` — no step required, and no rollback.** A graph's node mapping is
 version 3, and names each node by the chunk it embeds, `source:document:chunk:N`. Versions 1 and 2

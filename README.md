@@ -485,10 +485,11 @@ already there when it was copied verifies faithfully:
 | a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
 | write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
 | graph staging logs | `excalibur-fsck`, read-only | the erasure ledger: every record against its CRC. The triple, entity and label logs: only their header, because their one open path writes |
-| the lexical store | `excalibur-fsck`, read-only, as one structure | every column of every segment its manifest names |
+| the lexical store | `excalibur-fsck`, read-only, as one structure | the manifest against the CRC32C on its end line, and every column of every segment it names. A manifest an older build wrote carries only a record count: it is held to the count and not proven |
 | segment term sketches (`segment_<N>.tfs`) | `excalibur-fsck`, read-only | a CRC32C over the header and one over the body. A damaged sketch is reported and does not fail the image: a node restored from it rebuilds the sketch when it opens the segment. One that cannot be read at all fails it |
 | the document registry, the source catalog and the source status history | `excalibur-fsck`, read-only | nothing — these formats carry no checksum. Each is held to what its reader requires — a header version it reads and a trailing record count that matches its lines — so one the node would refuse fails the image; a status history the node would only discard does not |
-| `routing.dir`, the in-flight journal, lexical sidecars | `excalibur-fsck`, read-only | nothing — these formats carry no checksum, so they are well-formed at best |
+| `routing.dir` | `excalibur-fsck`, read-only | a CRC32C over the whole file. One an older build wrote carries none and is well-formed at best, until the node next writes the directory |
+| the in-flight journal, lexical sidecars | `excalibur-fsck`, read-only | nothing — these formats carry no checksum, so they are well-formed at best |
 
 The engine's own checkers run on a scratch copy because several of them repair what they open;
 `excalibur-fsck`'s are the ones it surveys a live directory with, so the two tools cannot disagree
@@ -2789,7 +2790,7 @@ Under `<data dir>/chunk-index` when the native engine is configured:
 
 | Path | Contents |
 | --- | --- |
-| `manifest` | The segments the store consists of, one per line, with the epoch each became visible at and how many of its documents are tombstoned. A segment exists when this file names it and not before, so publication is one atomic rename |
+| `manifest` | The segments the store consists of, one per line, with the epoch each became visible at and how many of its documents are tombstoned. A segment exists when this file names it and not before, so publication is one atomic rename. The last line holds the number of segment lines and a CRC32C of every byte before it |
 | `erasure.log` | Obligations recorded but not yet applied to disk, each with the time it was promised. Forced to disk before an erase call returns |
 | `seg-N/` | One segment's postings: `index.meta`, `terms.dict`, `terms.hash`, `post.off`, `post.blk`, `post.dat`, `docs.len`, all memory-mapped and read through the page cache |
 | `seg-N.keys` | The caller's name for each document, UTF-8, one per line — for ingested text, the chunk id `source:document:chunk:N`, the same name a vector hit on that chunk carries. Text on purpose: this is what an operator opens to see what a segment holds |
@@ -2799,6 +2800,11 @@ Under `<data dir>/chunk-index` when the native engine is configured:
 
 Anything on disk the manifest does not name is deleted when the store is opened: a segment is
 written before it is published, so a crash in between leaves files no reader will ever consult.
+That makes the manifest the one file whose damage deletes data, so it is only believed whole: one
+whose count disagrees with its lines, or whose bytes do not match the checksum on its last line,
+stops the store from opening, and nothing is deleted on its authority. A manifest an older build
+wrote, with a count and no checksum, is read and trusted by its count as before, and rewritten
+with a checksum by the next write.
 
 Beside it, `<data dir>/document-registry` records which documents this node holds, the chunk ids
 each was written under, and the `ETag` and `Last-Modified` an HTTP source reported for it. It is
