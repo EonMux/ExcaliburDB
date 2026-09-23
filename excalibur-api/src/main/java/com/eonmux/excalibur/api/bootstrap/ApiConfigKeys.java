@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.api.security.ApiSecurityConfig;
 import com.eonmux.excalibur.api.security.TlsConfig;
 import com.eonmux.excalibur.api.server.ListenPort;
+import com.eonmux.excalibur.api.server.ShutdownBudget;
 import com.eonmux.excalibur.config.ConfigKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -73,7 +74,8 @@ public final class ApiConfigKeys {
      * the list against the template an operator copies.</p>
      */
     private static final Class<?>[] DECLARING =
-        {ApiSecurityConfig.class, TlsConfig.class, ListenPort.class, CoreComponents.class};
+        {ApiSecurityConfig.class, TlsConfig.class, ListenPort.class, ShutdownBudget.class,
+            CoreComponents.class};
 
     /** Every key the declaring classes read, under the prefixes this module answers for. */
     private static final Set<String> KNOWN = declaredKeys();

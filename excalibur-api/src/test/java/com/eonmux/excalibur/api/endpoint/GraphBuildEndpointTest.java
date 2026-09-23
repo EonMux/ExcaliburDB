@@ -392,13 +392,48 @@ class GraphBuildEndpointTest {
         }
 
         @Test
-        @DisplayName("a node that has not said still explains an empty build")
+        @DisplayName("a runner with no node behind it to say still explains an empty build")
         void anEmptyBuildWithoutAState() throws IOException {
+            useRunner(new GraphBuildRunner((id, cancelRequested) -> tenants.build(id,
+                cancelRequested)));
+
             call(build, "POST", null);
             Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
 
             assertThat(Json.at(json, "extraction")).isNull();
             assertThat(Json.stringAt(json, "message")).contains("LLM API key");
+        }
+
+        @Test
+        @DisplayName("a node whose ingestion was never wired still says what extraction is")
+        void anUnwiredNodeStillCarriesTheField() throws IOException {
+            // Ingestion wiring is what upgrades the state to active. A node that never got that
+            // far - its pipeline would not build - has to answer with the state it is in rather
+            // than leave the field out, which is the answer a caller cannot act on.
+            Object accepted = call(build, "POST", null).json();
+            Object idle = call(status, "GET", "acme").json();
+
+            assertThat(Json.stringAt(accepted, "extraction")).isEqualTo("disabled");
+            assertThat(Json.stringAt(idle, "extraction")).isEqualTo("disabled");
+        }
+
+        @Test
+        @DisplayName("extraction that could not be wired is warned about, with the reason to look")
+        void unavailableExtractionIsWarnedAbout() throws IOException {
+            tenants.close();
+            tenants = new GraphTenants(root, new Config(new HashMap<>(Map.of(
+                "excalibur.graph.ram-buffer-mb", "4.0",
+                "excalibur.graph.extraction-enabled", "true",
+                "excalibur.llm.api-key", "test-key"))), MappingBudget.detect(), 4);
+            useRunner(new GraphBuildRunner(tenants));
+
+            Object accepted = call(build, "POST", null).json();
+            Object json = awaitState(null, GraphBuildRunner.STATE_COMPLETED);
+
+            assertThat(Json.stringAt(accepted, "extraction")).isEqualTo("unavailable");
+            assertThat(Json.stringAt(accepted, "warning")).contains("startup log");
+            assertThat(Json.stringAt(json, "message")).contains("Nothing was staged")
+                .contains("startup log");
         }
 
         @Test

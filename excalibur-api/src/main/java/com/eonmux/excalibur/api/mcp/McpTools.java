@@ -514,8 +514,8 @@ public final class McpTools {
         body.put("source_id", ToolArguments.requiredString(args, "source_id"));
         // Refused here rather than sent on. The node would answer 400 anyway, and a round trip
         // to be told what this call already knows is a slower way to say the same thing.
-        List<Object> documents = ToolArguments.objectList(args, "documents");
-        if (documents.isEmpty()) {
+        List<Object> documents = ToolArguments.optionalList(args, "documents");
+        if (documents == null || documents.isEmpty()) {
             return ToolResult.error(
                 "'documents' is required and must carry at least one document.");
         }

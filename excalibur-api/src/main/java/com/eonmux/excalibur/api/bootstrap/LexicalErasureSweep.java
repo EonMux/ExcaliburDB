@@ -203,14 +203,28 @@ public final class LexicalErasureSweep implements AutoCloseable {
      * @return true if no sweep is still running
      */
     public boolean drain() {
+        return drain(shutdownWait);
+    }
+
+    /**
+     * As {@link #drain()}, waiting no longer than {@code wait} - for a shutdown whose budget has
+     * less left than this sweep's own wait.
+     *
+     * @param wait How long to wait for a compaction in flight to act on the stop
+     * @return true if no sweep is still running
+     * @throws NullPointerException if wait is null
+     */
+    public boolean drain(Duration wait) {
+        Objects.requireNonNull(wait, "wait must not be null");
+        Duration bounded = wait.compareTo(shutdownWait) < 0 ? wait : shutdownWait;
         stopping = true;
         scheduler.shutdown();
         try {
-            if (scheduler.awaitTermination(shutdownWait.toMillis(), TimeUnit.MILLISECONDS)) {
+            if (scheduler.awaitTermination(bounded.toMillis(), TimeUnit.MILLISECONDS)) {
                 return true;
             }
-            LOGGER.error("the lexical erasure sweep was still compacting {}s after being asked to "
-                + "stop", shutdownWait.toSeconds());
+            LOGGER.error("the lexical erasure sweep was still compacting {}ms after being asked "
+                + "to stop", bounded.toMillis());
             return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

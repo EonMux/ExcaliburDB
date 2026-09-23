@@ -335,8 +335,25 @@ front of the process terminates it — so the container ships with none of those
 default that listened on every interface unauthenticated is the one mistake that policy exists to
 prevent. `HEALTHCHECK` points at `/health/ready`, not `/health`: readiness answers 200 or 503 on
 whether this node can serve a query, where liveness answers 200 while it is still opening
-segments. Allow at least 30 seconds to stop — the shutdown hook publishes the chunk index's buffer,
-which is the tail of an ingestion run, and closes the storage engine.
+segments.
+
+### Stopping the node
+
+`SIGTERM` runs a shutdown hook that stops the listener and drains the node. It then publishes the
+chunk index's buffer, which is the tail of an ingestion run. Next it forces staged graph facts and
+the document registry to disk, and finally closes the storage engine. The whole sequence runs
+against one deadline, `excalibur.api.shutdown-timeout-seconds` (30 by default). The drains run in
+parallel and share that deadline minus its last 10 seconds. Those 10 seconds are kept for the
+writes, so a slow drain cannot use them up. A reindex, compaction or graph build still running when
+the drains' share runs out is reported and left alone. Nothing it is using is closed underneath it,
+and the next start recovers from its write log.
+
+Set the supervisor's stop timeout to **the configured deadline plus 10 seconds**. The margin covers
+the JVM reaching its hook and the storage engine's own close. With the default, that is
+`docker run --stop-timeout 40` or `docker stop --time 40`, `terminationGracePeriodSeconds: 40`, or
+systemd `TimeoutStopSec=40`. Raising the deadline means raising these to match. A SIGKILL that
+arrives before the hook finishes loses the unpublished buffer, and nothing reindexes those chunks
+afterwards.
 
 ## Operator tools
 
@@ -545,6 +562,7 @@ variable of the same name as the token it presents to the node — see
 | Property | Default | Description |
 |----------|---------|-------------|
 | `excalibur.api.port` | 8080 | Port to listen on; `EXCALIBUR_PORT` overrides it |
+| `excalibur.api.shutdown-timeout-seconds` | 30 | How long a stop may take, from the signal to the last file closed. Every drain shares this one deadline. The last 10 seconds are kept for publishing buffered chunks, forcing staged graph facts and persisting the registry. Work still running when the drains' share runs out is reported and left for the next start to recover. Set the supervisor's stop timeout to at least this plus 10 (see [Stopping the node](#stopping-the-node)). 15 to 3600; any other value stops startup |
 | `excalibur.visibility.epoch-tick-ms` | 100 | Visibility epoch tick interval (ms). 10 to 10000 |
 | `excalibur.visibility.query-timeout-ms` | 30000 | Query timeout (ms) for a request that names none. Must not exceed `excalibur.api.max-query-timeout-ms`, or the node refuses to start: every such request would be refused. 1000 to 300000 |
 | `excalibur.query.top-k-default` | 100 | Default number of results. Must not exceed `excalibur.api.max-top-k`, or the node refuses to start, for the same reason. 1 to 10000 |
@@ -1946,11 +1964,12 @@ curl -X POST http://localhost:8080/v1/graph/build
  "extraction": "active"}
 ```
 
-`extraction` says whether ingestion on this node extracts the facts a build publishes: `active`,
-`disabled` when `excalibur.graph.extraction-enabled` is off, or `missing_api_key` when it is on but
-no LLM API key is configured — the one case that also carries a `warning`, because nobody chose it
-and the build it answers publishes nothing ingestion staged since startup. The status route carries
-the same two fields.
+`extraction` says whether ingestion on this node extracts the facts a build publishes, and is on
+every answer from both routes: `active`, `disabled` when `excalibur.graph.extraction-enabled` is
+off, `missing_api_key` when it is on but no LLM API key is configured, or `unavailable` when both
+are set but the ingestion pipeline could not be set up — its failure is in the startup log. The
+last two also carry a `warning`, because nobody chose them and the build they answer publishes
+nothing ingestion staged since startup. The status route carries the same fields.
 
 `202`, not `200`. On a real corpus the build takes minutes — it replays every staged fact, embeds
 every entity and writes two Lucene indexes — so it runs behind the response and the request does
@@ -2164,13 +2183,20 @@ ext=v1}`, and that `N` is the one to send. To withdraw a document from the corpu
 once, use `POST /v1/erasure` with its `source_id` and `document_id` instead — it removes the chunks
 and submits this graph obligation for you, so nobody has to compute the hash.
 
-An entity id is internal and nothing this node serves hands one out, so `entity_name` is how
-"erase everything about this person" is actually asked. It is matched exactly, ignoring case and
-surrounding space, against the served entity dictionary and the staged labels it is built from -
-never against the `labels` index, whose whole value at query time is that "Lovelace" finds "Ada
-Lovelace" and whose whole danger here is the same thing. A name no entity has is a `404`; a name
-two entities share is a `409` listing their ids, so the caller repeats the request with the
-`entity_id` of the one they meant.
+An entity id is internal, and a graph answer does not carry one: its `answer` and `context` name
+entities by label. The node hands an id out in exactly two places, both where a name alone is not
+enough to say which entity is meant — a `needs_input` candidate for a name several entities share
+(`Ada #12`), and the `409` below. So `entity_name` is how "erase everything about this person" is
+ordinarily asked. It is matched exactly, ignoring case and surrounding space, against the served
+entity dictionary and the staged labels it is built from - never against the `labels` index, whose
+whole value at query time is that "Lovelace" finds "Ada Lovelace" and whose whole danger here is
+the same thing. A name no entity has is a `404`; a name two entities share is a `409` listing their
+ids in `candidates`, so the caller repeats the request with the `entity_id` of the one they meant.
+Resolving a name never creates the namespace it is looked up in: a namespace that does not exist
+holds nobody, so the answer is the same `404` a namespace that exists would give, and nothing is
+written. A request that records an obligation — a resolved name, an `entity_id`, a source or an
+extractor version — creates the namespace if it is new, which is how an erasure can be recorded
+against a tenant before its first build.
 
 The compaction rewrites the staged facts as well as the served store. Erasing only the store would
 leave every erased fact in the staging log, where the next `POST /v1/graph/build` would replay it
@@ -2302,18 +2328,25 @@ error.
 element a name, or an object `{"name", "grammar", "turn"}` whose `grammar` is `singular_person`,
 `singular_thing`, `plural` or `unknown` and whose `turn` is a whole number from 0, higher being more
 recent. Unlike the HTTP route, a model may mix the two - the tool sends every element as an object
-when any one is - so it need not rewrite the names it has no shape for. A shape outside the four, a
-negative or fractional turn, an object with no `name`, or a field other than those three is a tool
-error naming the element; the last because the node ignores a field it does not read, and a
-misspelt `"gramar"` would otherwise arrive as an entity of unknown shape.
+when any one is - so it need not rewrite the names it has no shape for. A shape outside the four
+(a blank one included), a negative or fractional turn, an object with no `name` or a blank one, a
+`null` element, or a field other than those three is a tool error naming the element; the last
+because the node ignores a field it does not read, and a misspelt `"gramar"` would otherwise
+arrive as an entity of unknown shape. An array of names is sent exactly as written, an empty one
+and blank names included; the node reads a blank name as mentioning nobody, so in a mixed array a
+blank name is left out rather than sent as an object the node would refuse.
 
 Arguments are checked before anything is sent. One of the wrong type - a number where a string is
 declared, a string where an array is - is returned as a tool error naming the argument rather than
 coerced or dropped, so a model learns what it got wrong. An integer argument accepts `5`, `5.0` or
 `"5"`, and refuses a fraction. A true/false argument accepts `true` or `"true"`, in any case, and
-refuses anything else - `1` and `"yes"` included - rather than guess which was meant. An empty
-array is forwarded, never dropped, exactly as the same body sent over HTTP would be: supplying a
-list replaces the node's default rather than adding to it, so an empty one clears it. An empty
+refuses anything else - `1` and `"yes"` included - rather than guess which was meant. An array is
+forwarded element for element, exactly as the same body sent over HTTP would be: an empty one is
+never dropped, and a blank or space-padded element is neither dropped nor trimmed - what it means
+is the node's to decide, and in a list setting the node trims each element and ignores a blank
+one, so `[""]` there means what `[]` does. A `null` element is a tool error, as it is a `400` over
+HTTP. Supplying a list replaces the node's default rather than adding to it, so an empty one
+clears it. An empty
 `excluded_directories` on `ingest_documents` walks every directory, `node_modules` and `target`
 included; an empty `included_extensions` reads every file, which is also what leaving it out does;
 and an empty `excluded_path_patterns` on `crawl_website` clears the crawl's default exclusions.
@@ -2881,11 +2914,21 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `LshHnswEntryIdContractTest` - The LSH pre-filter returns ids in the HNSW graph's id space, so stage 2 filters the right nodes
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
-- `EmbeddedUsageExampleTest` - The embedded ingestion and query example in [USAGE.md](USAGE.md) compiles, ingests through a stand-in embeddings endpoint, and answers
 - `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback
 
 ```bash
 ./gradlew :excalibur-integration:test
+```
+
+The embedded example in [USAGE.md](USAGE.md#programmatic-usage-jvm-embedded) runs in a source set
+of its own, `embeddedExample`. Its only dependencies are the seven coordinates USAGE.md lists, so
+it proves that list is enough. `check` runs it:
+
+- `EmbeddedUsageExampleTest` - The example compiles against those seven alone, ingests through a stand-in embeddings endpoint, and answers
+- `EmbeddedUsageDocumentationTest` - The code block in USAGE.md matches that test's method and helper token for token, and its imports are exactly the ones the example uses
+
+```bash
+./gradlew :excalibur-integration:embeddedExampleTest
 ```
 
 `RepositoryCompletenessTest` is the odd one out: it asks git rather than the filesystem. Every
@@ -3197,7 +3240,9 @@ and extracts nothing — so it says so everywhere you would look: a WARN at star
 settings, and `"extraction": "missing_api_key"` with a `warning` on the answer to
 `POST /v1/graph/build` and on `GET /v1/graph/build/status`. Set the key, restart, and re-ingest:
 documents ingested while extraction was inactive were never offered to the extractor, and a build
-cannot recover facts nobody extracted.
+cannot recover facts nobody extracted. With both set and `"extraction": "unavailable"`, the key is
+not the problem: the ingestion pipeline failed to set up at startup, and the WARN logged then says
+why.
 
 **How much memory does a build need?**
 The edge store is sorted in memory before it is written, so a namespace's build holds every staged

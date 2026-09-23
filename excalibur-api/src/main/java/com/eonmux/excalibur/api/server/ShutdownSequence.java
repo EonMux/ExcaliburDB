@@ -13,8 +13,12 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * The order everything behind the listener is stopped in, and why it is that order.
@@ -82,6 +86,9 @@ final class ShutdownSequence {
      * failed is still reading storage, and the answer has to say so. The first failure is
      * rethrown once every step has had its turn.</p>
      *
+     * <p>No deadline beyond each drain's own wait; a node's shutdown passes its budget to the
+     * form that takes one.</p>
+     *
      * @param endpoints    The endpoints that own executors, or null if {@code start()} never
      *                     reached the point of registering them
      * @param wiring       What the node is made of, for the pipelines and registries it owns
@@ -93,25 +100,87 @@ final class ShutdownSequence {
      */
     static Drained drain(EndpointRegistrar.Endpoints endpoints, ServerWiring wiring,
                          ExecutorService requests, Duration requestGrace) {
+        return drain(endpoints, wiring, requests, requestGrace, ShutdownBudget.unbounded());
+    }
+
+    /**
+     * Drains everything the node started, within a shutdown's budget.
+     *
+     * <h3>Together, then in order</h3>
+     * <p>The reindex, the query executors, a compaction, a graph build and ingestion each run on
+     * executors of their own and none of them waits on another, so they are all asked to stop at
+     * once and waited for together: the time this takes is the slowest of them, where one after
+     * another it was their sum. The segment workers follow, because until the endpoints and
+     * ingestion have stopped something can still hand them work; the request threads come last,
+     * because everything that can end one early has been delivered by then.</p>
+     *
+     * <h3>What the budget does</h3>
+     * <p>Every wait is cut to what the budget leaves the drains. A drain still going when that
+     * runs out is not waited for further and not interrupted - it has already been asked to stop,
+     * and goes on stopping on its own thread - but is reported as still running, so the caller
+     * leaves open what it uses. The budget's reserve is then still whole for the durable writes
+     * the caller makes next.</p>
+     *
+     * @param endpoints    The endpoints that own executors, or null if {@code start()} never
+     *                     reached the point of registering them
+     * @param wiring       What the node is made of, for the pipelines and registries it owns
+     * @param requests     The executor the listener dispatched requests on, or null
+     * @param requestGrace How long request threads still running once everything else has
+     *                     drained are given to end, before the budget cuts it
+     * @param budget       The shutdown's deadline
+     * @return What is still running, as storage, the chunk index and the graph tenants see it
+     * @throws NullPointerException if wiring, requestGrace or budget is null
+     */
+    static Drained drain(EndpointRegistrar.Endpoints endpoints, ServerWiring wiring,
+                         ExecutorService requests, Duration requestGrace,
+                         ShutdownBudget budget) {
         Objects.requireNonNull(wiring, "wiring cannot be null");
         Objects.requireNonNull(requestGrace, "requestGrace cannot be null");
+        Objects.requireNonNull(budget, "budget cannot be null");
 
-        Steps steps = new Steps();
-        boolean reindexDrained = steps.run(() -> drainReindex(endpoints));
-        boolean queriesDrained = steps.run(() -> drainQueryEndpoint(endpoints));
-        boolean pipelineDrained = steps.run(() -> drainQueryPipeline(wiring.queryPipeline()));
-        CompactionRunner.Drained compaction = steps.call(() -> drainCompaction(endpoints),
-            new CompactionRunner.Drained(false, false));
-        boolean graphBuildDrained = steps.run(() -> drainGraphBuild(endpoints));
-        boolean ingestionDrained = steps.run(() -> drainIngestion(wiring));
-        // After the listener has stopped and the endpoints have drained, so no new query or
-        // write can hand the workers anything more.
-        boolean orchestratorDrained = steps.run(() -> drainIndexOrchestrator(wiring));
+        Steps steps = new Steps(budget);
+        // One thread per drain, never interrupted and never waited for past the budget:
+        // shutdown() below refuses new tasks and leaves the ones running to finish.
+        ExecutorService drains = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("shutdown-drain-", 0).factory());
+        boolean reindexDrained;
+        boolean queriesDrained;
+        boolean pipelineDrained;
+        CompactionRunner.Drained compaction;
+        boolean graphBuildDrained;
+        boolean ingestionDrained;
+        boolean orchestratorDrained;
+        try {
+            Future<Boolean> reindex = drains.submit(() -> drainReindex(endpoints));
+            Future<Boolean> queries = drains.submit(() -> drainQueryEndpoint(endpoints));
+            Future<Boolean> pipeline =
+                drains.submit(() -> drainQueryPipeline(wiring.queryPipeline()));
+            Future<CompactionRunner.Drained> compacting =
+                drains.submit(() -> drainCompaction(endpoints));
+            Future<Boolean> graphBuild = drains.submit(() -> drainGraphBuild(endpoints));
+            Future<Boolean> ingestion = drains.submit(() -> drainIngestion(wiring));
+
+            reindexDrained = steps.await("the reindex", reindex, false);
+            queriesDrained = steps.await("the query executor", queries, false);
+            pipelineDrained = steps.await("the vector pipeline", pipeline, false);
+            compaction = steps.await("the compaction", compacting,
+                new CompactionRunner.Drained(false, false));
+            graphBuildDrained = steps.await("the graph build", graphBuild, false);
+            ingestionDrained = steps.await("ingestion", ingestion, false);
+
+            // After the listener has stopped and the endpoints have drained, so no new query or
+            // write can hand the workers anything more.
+            orchestratorDrained = steps.await("the segment workers",
+                drains.submit(() -> drainIndexOrchestrator(wiring)), false);
+        } finally {
+            drains.shutdown();
+        }
 
         // Last, so that everything that could end a request thread early - the stop asked of
         // synchronous ingestion, the drained query executor, the erasure's stop request - has
         // already been delivered.
-        boolean requestsDrained = steps.run(() -> drainRequests(requests, requestGrace));
+        boolean requestsDrained =
+            steps.run(() -> drainRequests(requests, budget.bound(requestGrace)));
 
         // Who holds what. A reindex, an ingestion run, a BM25 query and a request thread each
         // reach both storage and the chunk index; the vector pipeline and the segment workers
@@ -153,7 +222,12 @@ final class ShutdownSequence {
      */
     private static final class Steps {
 
+        private final ShutdownBudget budget;
         private RuntimeException failure;
+
+        Steps(ShutdownBudget budget) {
+            this.budget = budget;
+        }
 
         /** A step that answers whether it drained; a step that throws did not. */
         boolean run(java.util.function.BooleanSupplier step) {
@@ -165,13 +239,40 @@ final class ShutdownSequence {
             }
         }
 
-        /** A step that answers with a value; a step that throws answers {@code ifFailed}. */
-        <T> T call(java.util.function.Supplier<T> step, T ifFailed) {
+        /**
+         * Waits for a drain running on a thread of its own, for no longer than the budget leaves
+         * the drains.
+         *
+         * @param what     The drain, as the log should name it
+         * @param drain    Its result, when it has one
+         * @param ifNotEnd What to answer when it threw or is still going: the value that keeps
+         *                 open everything it uses
+         * @return What the drain answered, or {@code ifNotEnd}
+         */
+        <T> T await(String what, Future<T> drain, T ifNotEnd) {
             try {
-                return step.get();
-            } catch (RuntimeException e) {
-                record(e);
-                return ifFailed;
+                Duration wait = budget.forDrains();
+                return drain.get(wait.toNanos(), TimeUnit.NANOSECONDS);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                record(cause instanceof RuntimeException runtime
+                    ? runtime
+                    : new IllegalStateException("draining " + what + " failed", cause));
+                return ifNotEnd;
+            } catch (TimeoutException e) {
+                LOGGER.error("Draining {} had not finished when the shutdown budget for drains ran "
+                    + "out; it was asked to stop and is left to, and what it uses is left open "
+                    + "rather than closed underneath it", what);
+                return ifNotEnd;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                // Only an answer the drain has already given counts; anything else reads as
+                // still running, which is the safe way to be wrong.
+                try {
+                    return drain.resultNow();
+                } catch (IllegalStateException notAnswered) {
+                    return ifNotEnd;
+                }
             }
         }
 

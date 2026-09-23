@@ -15,8 +15,9 @@ import java.util.Optional;
  * reports instead: in its startup log, in the answer to {@code POST /v1/graph/build}, and in
  * {@code GET /v1/graph/build/status}.</p>
  *
- * <p>Decided once, at startup, from configuration. Neither setting changes while the node
- * runs.</p>
+ * <p>Decided once, at startup: from configuration, and from whether ingestion could actually be
+ * wired to deliver documents to the extractor. Neither setting changes while the node runs, and
+ * a pipeline that would not build at startup is not rebuilt later.</p>
  */
 public enum GraphExtraction {
 
@@ -33,12 +34,25 @@ public enum GraphExtraction {
     /**
      * Extraction was asked for, but no model can be called, so the request is not honoured.
      *
-     * <p>The one state worth a warning: nobody chose it. Every other setting on the node works,
-     * which is exactly why it goes unnoticed until a build publishes nothing.</p>
+     * <p>Worth a warning because nobody chose it. Every other setting on the node works, which
+     * is exactly why it goes unnoticed until a build publishes nothing.</p>
      */
     MISSING_API_KEY("excalibur.graph.extraction-enabled is true, but no LLM API key is "
         + "configured, so extraction is inactive and ingestion stages no facts. Set "
-        + "excalibur.llm.api-key, or EXCALIBUR_LLM_API_KEY, restart the node, and re-ingest.");
+        + "excalibur.llm.api-key, or EXCALIBUR_LLM_API_KEY, restart the node, and re-ingest."),
+
+    /**
+     * Extraction was asked for and a model can be called, but ingestion could not be set up to
+     * hand it documents - the pipeline failed to build, or built without an orchestrator.
+     *
+     * <p>Worth a warning for the same reason as {@link #MISSING_API_KEY}: both settings say
+     * extraction runs, so nothing in the configuration explains why no fact is ever staged. The
+     * cause is in the startup log, which is where this sends the operator.</p>
+     */
+    UNAVAILABLE("excalibur.graph.extraction-enabled is true and an LLM API key is configured, "
+        + "but the ingestion pipeline could not be set up on this node, so no document reaches "
+        + "the extractor and ingestion stages no facts. The startup log says why; fix that, "
+        + "restart the node, and re-ingest.");
 
     private final String nothingStaged;
 
@@ -47,17 +61,23 @@ public enum GraphExtraction {
     }
 
     /**
-     * Decides the state from the two settings.
+     * Decides the state from the two settings and whether ingestion was wired to the extractor.
      *
      * @param extractionEnabled Whether {@code excalibur.graph.extraction-enabled} is set
      * @param chatModel         Whether a chat model can be called, which is what a key means
+     * @param ingestionWired    Whether ingestion was set up to hand published documents to the
+     *                          extractor
      * @return The state
      */
-    public static GraphExtraction of(boolean extractionEnabled, boolean chatModel) {
+    public static GraphExtraction of(boolean extractionEnabled, boolean chatModel,
+                                     boolean ingestionWired) {
         if (!extractionEnabled) {
             return DISABLED;
         }
-        return chatModel ? ACTIVE : MISSING_API_KEY;
+        if (!chatModel) {
+            return MISSING_API_KEY;
+        }
+        return ingestionWired ? ACTIVE : UNAVAILABLE;
     }
 
     /**
@@ -81,12 +101,14 @@ public enum GraphExtraction {
     /**
      * What a caller asking for a build should be warned about before it runs.
      *
-     * <p>Only the state nobody chose has one. A build on a node with extraction off is a build
+     * <p>Only the states nobody chose have one. A build on a node with extraction off is a build
      * of whatever was staged before, which may be exactly what the operator wants.</p>
      *
      * @return The warning, or empty
      */
     public Optional<String> warning() {
-        return this == MISSING_API_KEY ? Optional.of(nothingStaged) : Optional.empty();
+        return this == MISSING_API_KEY || this == UNAVAILABLE
+            ? Optional.of(nothingStaged)
+            : Optional.empty();
     }
 }

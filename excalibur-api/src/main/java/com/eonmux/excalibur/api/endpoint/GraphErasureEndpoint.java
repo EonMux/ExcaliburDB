@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.SortedSet;
 import java.util.TreeSet;
 
@@ -47,11 +48,18 @@ import java.util.TreeSet;
  * </pre>
  *
  * <h3>Naming a person rather than an integer</h3>
- * <p>An entity id is an internal number. Nothing this node serves hands one out - a graph answer
- * carries names and prose - so requiring one meant "erase everything about this person" could
- * only be asked by someone who had already seen that person in an answer and read the id out of
- * the free text. {@code entity_name} closes that: it names the person the way the request that
- * created the obligation names them.
+ * <p>An entity id is an internal number. A graph answer carries names and prose, not ids; the
+ * node hands one out only where a name alone cannot say which entity is meant - a
+ * {@code needs_input} candidate for a shared name, and this endpoint's own 409. Requiring an id
+ * therefore meant "erase everything about this person" could ordinarily only be asked by someone
+ * who had read it out of one of those. {@code entity_name} closes that: it names the person the
+ * way the request that created the obligation names them.
+ *
+ * <p>A name is resolved against a namespace that already exists, never one created to look in.
+ * A namespace that does not exist holds nobody, so the answer is the same 404 an existing
+ * namespace gives, and the header naming it spends no directory and no open slot. Every other
+ * scope creates the namespace, because recording an obligation is one of the things that bring
+ * a namespace into being.
  *
  * <p>Resolved by exact match, ignoring case and surrounding space, against the entity names this
  * namespace knows - the served entity dictionary and the staged labels it is built from, which
@@ -121,7 +129,65 @@ public class GraphErasureEndpoint implements HttpHandler {
             return;
         }
 
-        try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(namespace)) {
+        try {
+            Optional<NamespaceRegistry.Lease<GraphTenant>> borrowed = leaseFor(namespace, requested);
+            if (borrowed.isEmpty()) {
+                // A namespace that was never created holds nobody, so the name resolves to no
+                // one - answered exactly as a name missing from a namespace that does exist, so
+                // the reply cannot be used to learn which namespaces other tenants have.
+                sendNotNamed(exchange, requested.entityName());
+                return;
+            }
+            accept(exchange, namespace, requested, compactNow, borrowed.get());
+        } catch (IOException | RuntimeException e) {
+            // RuntimeException is not defensive padding: a namespace that cannot be opened
+            // arrives here as an UncheckedIOException from the registry, and catching only
+            // IOException would let it escape the handler with no response sent at all.
+            //
+            // Logged with detail, answered without it: the message names the path the node
+            // failed on, which a client has no business seeing.
+            LOGGER.error("Erasure request failed", e);
+            ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
+        }
+    }
+
+    /**
+     * Borrows the namespace a request is about, creating it only when the request will record an
+     * obligation there whatever the namespace holds.
+     *
+     * <p>A scope named outright is always recorded, and recording one is what brings a namespace
+     * into being. A name is different: it has to be resolved first, and a namespace that does not
+     * exist cannot contain anybody, so creating it to find that out would write a directory and
+     * claim an open slot - evicting a real tenant - for a request that ends in a 404 with nothing
+     * recorded. The namespace arrives in a header, so that would be any caller spending all three
+     * on any name it chose.</p>
+     *
+     * @param namespace The namespace the header named
+     * @param requested What the body asked for
+     * @return The lease, or empty when a name was given for a namespace that does not exist
+     */
+    private Optional<NamespaceRegistry.Lease<GraphTenant>> leaseFor(NamespaceId namespace,
+                                                                    Requested requested) {
+        if (requested.scope() == null) {
+            return tenants.borrowIfPresent(namespace);
+        }
+        return Optional.of(tenants.borrow(namespace));
+    }
+
+    /**
+     * Resolves, records and answers one request against a namespace already borrowed.
+     *
+     * @param exchange   The request, answered here
+     * @param namespace  The namespace the lease is over
+     * @param requested  What the body asked for
+     * @param compactNow Whether the caller asked for the compaction to run now
+     * @param borrowed   The lease, closed here
+     * @throws IOException if the names cannot be read or the reply cannot be written
+     */
+    private void accept(HttpExchange exchange, NamespaceId namespace, Requested requested,
+                        boolean compactNow, NamespaceRegistry.Lease<GraphTenant> borrowed)
+            throws IOException {
+        try (NamespaceRegistry.Lease<GraphTenant> lease = borrowed) {
             ErasureScope scope = requested.scope();
             if (scope == null) {
                 // Resolved here rather than at parse time because it takes this namespace's
@@ -176,15 +242,6 @@ public class GraphErasureEndpoint implements HttpHandler {
                     + "\"namespace\": \"" + JsonText.escape(namespace.value()) + "\", "
                     + "\"detail\": \"" + JsonText.escape(outcome.reason()) + "\""
                     + "}");
-        } catch (IOException | RuntimeException e) {
-            // RuntimeException is not defensive padding: a namespace that cannot be opened
-            // arrives here as an UncheckedIOException from the registry, and catching only
-            // IOException would let it escape the handler with no response sent at all.
-            //
-            // Logged with detail, answered without it: the message names the path the node
-            // failed on, which a client has no business seeing.
-            LOGGER.error("Erasure request failed", e);
-            ResponseBody.sendJson(exchange, 500, "{\"error\": \"Internal Server Error\"}");
         }
     }
 
@@ -270,9 +327,7 @@ public class GraphErasureEndpoint implements HttpHandler {
             throws IOException {
         SortedSet<Long> ids = idsNamed(tenant, name);
         if (ids.isEmpty()) {
-            ResponseBody.sendJson(exchange, 404,
-                "{\"error\": \"no entity in this namespace is named \\\"" + JsonText.escape(name)
-                    + "\\\"; erasure resolves a name exactly rather than approximately\"}");
+            sendNotNamed(exchange, name);
             return null;
         }
         if (ids.size() > 1) {
@@ -286,6 +341,19 @@ public class GraphErasureEndpoint implements HttpHandler {
             return null;
         }
         return new ErasureScope.Entity(ids.first());
+    }
+
+    /**
+     * Answers that no entity in the namespace has the name.
+     *
+     * @param exchange The request to answer
+     * @param name     The name that resolved to nobody
+     * @throws IOException if the reply cannot be written
+     */
+    private static void sendNotNamed(HttpExchange exchange, String name) throws IOException {
+        ResponseBody.sendJson(exchange, 404,
+            "{\"error\": \"no entity in this namespace is named \\\"" + JsonText.escape(name)
+                + "\\\"; erasure resolves a name exactly rather than approximately\"}");
     }
 
     /**

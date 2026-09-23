@@ -167,9 +167,9 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=3 \
   CMD curl -fsS -o /dev/null "http://127.0.0.1:${EXCALIBUR_PORT:-8080}/health/ready" || exit 1
 
 # exec, so the JVM is pid 1 and SIGTERM reaches its shutdown hook; the hook closes the storage
-# engine and the chunk index, which is what publishes the tail of an ingestion run. Allow at
-# least ExcaliburApplication.SHUTDOWN_TIMEOUT_SECONDS (30) before SIGKILL: `docker run
-# --stop-timeout 40`, or terminationGracePeriodSeconds: 40.
+# engine and the chunk index, which is what publishes the tail of an ingestion run. The hook
+# finishes within excalibur.api.shutdown-timeout-seconds (30 by default); allow that plus 10
+# before SIGKILL: `docker run --stop-timeout 40`, or terminationGracePeriodSeconds: 40.
 # "$@" carries through, so `docker run <image> --config /etc/excalibur/excalibur.properties`
 # reaches the application's own argument parsing.
 ENTRYPOINT ["/bin/sh", "-c", \

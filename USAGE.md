@@ -178,9 +178,10 @@ Environment=EXCALIBUR_DATA_DIR=/var/lib/excalibur/data
 Environment=EXCALIBUR_API_AUTH_TOKEN=...
 WorkingDirectory=/var/lib/excalibur
 User=excalibur
-# The node drains in-flight queries and closes storage durably on SIGTERM; give it room to.
+# The node drains in-flight queries and closes storage durably on SIGTERM; give it room to:
+# excalibur.api.shutdown-timeout-seconds (30 by default) plus 10.
 KillSignal=SIGTERM
-TimeoutStopSec=60
+TimeoutStopSec=40
 Restart=on-failure
 
 [Install]
@@ -226,7 +227,7 @@ uid `10001`, with the jar owned by `root` and read-only to the process. Nothing 
 | Heap dumps | Written on an out-of-memory exit to `/var/lib/excalibur-diagnostics`, not the data directory. Mount a volume there to keep one past `docker rm` |
 | Operator tools | `excalibur-fsck` and `excalibur-backup` are on the `PATH`. Run them with the node stopped, against the same volume; a repair needs `/var/lib/excalibur-quarantine` mounted, and a snapshot `/var/lib/excalibur-backups` — see below |
 | Health | `HEALTHCHECK` polls `/health/ready` with a 90s start period, which covers segment recovery on a large data directory |
-| Stop | Allow at least 30 seconds. The JVM is pid 1, so `SIGTERM` reaches the shutdown hook that publishes the chunk index's buffer — the tail of an ingestion run — and closes the storage engine. `--stop-timeout 40`, or `terminationGracePeriodSeconds: 40` |
+| Stop | The JVM is pid 1, so `SIGTERM` reaches the shutdown hook. The hook publishes the chunk index's buffer, which is the tail of an ingestion run, and closes the storage engine. It does all of this within `excalibur.api.shutdown-timeout-seconds` (30 by default). Give it that plus 10: `--stop-timeout 40`, or `terminationGracePeriodSeconds: 40`, and more if you raise the setting |
 
 Bind-mounting a host directory instead of a named volume means `chown 10001:10001` on it first;
 the process does not run as root and will not be able to create its catalog otherwise. The same
@@ -2096,7 +2097,8 @@ curl http://localhost:8080/health
   "healthy": true,
   "epoch": 1234,
   "coverage": 1.0000,
-  "latencyMs": 5
+  "latencyMs": 5,
+  "indexerRunning": true
 }
 ```
 
@@ -2109,7 +2111,8 @@ curl http://localhost:8080/health
   "healthy": false,
   "epoch": 0,
   "coverage": 0.0000,
-  "latencyMs": 2
+  "latencyMs": 2,
+  "indexerRunning": true
 }
 ```
 
@@ -2119,7 +2122,7 @@ curl http://localhost:8080/health
 - `epoch` — current visibility epoch (monotonically increasing).
 - `coverage` — the share of this node's live segments that are in a state a query reads, in `[0.0, 1.0]`. Live means everything the catalog holds and has not retired, so a segment compaction folded into its successor is not counted as corpus this node is missing. **This is not a warm-up gauge.** A segment still absorbing its write log is searched, so it counts, and an empty segment counts as readily as a full one — on a node whose segments are all accounted for this reads `1.0000` from the first moment it starts. It falls when a segment is stranded in a state no query reads, and reads `0.0000` before the first segment exists, which is the cold start above. For how much of the corpus a *particular answer* came from, read `coverage.estimated_corpus_coverage` in the query response; for ingestion progress, read `entries.total` and `segments.active` from `/v1/stats`.
 - `latencyMs` — time taken to compute the health response. Exceeding `excalibur.health.max-latency-ms` (default `5000`) sets `healthy` to `false` by itself, whatever the coverage. `ready` is left on coverage alone: a probe that waited that long has already timed out, and a slow answer here is not a reason to stop serving traffic.
-- `indexerRunning` — whether the worker that drains the HNSW integration queue is alive. Reported beside the verdict rather than folded into it, because `live`, `ready` and `healthy` mean what they are documented to mean above and clients already parse them. If this is `false` the node is indexing nothing while everything else here still reads healthy; `/health/ready` is the route that turns that into a status code.
+- `indexerRunning` — whether the worker that drains the HNSW integration queue is alive. A node started by the application always carries it; it is left out only where the endpoint is embedded without an index orchestrator to ask. Reported beside the verdict rather than folded into it, because `live`, `ready` and `healthy` mean what they are documented to mean above and clients already parse them. If this is `false` the node is indexing nothing while everything else here still reads healthy; `/health/ready` is the route that turns that into a status code.
 
 ### Readiness check
 
@@ -2675,12 +2678,20 @@ restoring it is putting the directory back.
 ./gradlew :excalibur-backup:installDist
 B=excalibur-backup/build/install/excalibur-backup/bin/excalibur-backup
 
-# 1. Stop the node and wait for the process to exit. Match on the main class, not on the jar
-#    name: a node started through bin/excalibur-api or ./gradlew :excalibur-api:run has no
-#    "excalibur.jar" on its command line, so a pattern matching that silently selects nothing.
-pid="$(pgrep -f com.eonmux.excalibur.api.ExcaliburApplication)" || { echo "no node found"; exit 1; }
-kill -TERM "$pid"
-while kill -0 "$pid" 2>/dev/null; do sleep 1; done
+# 1. Stop the node and wait for the process to exit.
+#    Under a supervisor, stop it through the supervisor: `systemctl stop excalibur` and
+#    `docker stop excalibur` both return only once the process has exited, and a signal sent
+#    around them gets the node restarted under you.
+#    Started by hand, find it by either way it can be launched. bin/excalibur-api and
+#    ./gradlew :excalibur-api:run name the main class; `java -jar excalibur.jar` names only the
+#    jar. The MCP server is launched with `-cp excalibur.jar`, not `-jar`, so it never matches.
+#    No pid file is written, so exactly one match is required rather than guessed at.
+pids="$(pgrep -f -- 'com\.eonmux\.excalibur\.api\.ExcaliburApplication( |$)|-jar ([^ ]*/)?excalibur\.jar( |$)')"
+[ "$(printf '%s\n' "$pids" | grep -c .)" -eq 1 ] \
+  || { echo "expected one node, found: ${pids:-none}"; exit 1; }
+kill -TERM "$pids"
+#    Up to excalibur.api.shutdown-timeout-seconds (30 by default) while it drains and publishes.
+while kill -0 "$pids" 2>/dev/null; do sleep 1; done
 
 # 2. Take the image.
 $B snapshot --data-dir /var/lib/excalibur/data --out /backups/excalibur-$(date +%F)
@@ -3049,8 +3060,13 @@ dependencies {
 }
 ```
 
-Each is named directly because the example below uses a class from each, and the library modules
-declare their own dependencies as `implementation`, so none of them hands its types on.
+Each is named directly because the example below uses a class from each. Some of them would
+arrive anyway, since a few modules expose theirs as `api` (`excalibur-vector` hands on
+`excalibur-core`, for one). Most declare their dependencies as `implementation`, which a consumer
+sees at run time and not at compile time, so relying on what happens to be exposed would break
+when a module's internals change. These seven are also enough: `excalibur-integration`'s
+`embeddedExampleTest` compiles and runs the example against exactly this list, through the same
+variants these POMs give a consumer, and nothing else.
 
 Gradle substitutes each coordinate with the project in the included build. The consuming project
 must also compile and run on Java 21 with `--enable-preview`, for the reason in
@@ -3062,7 +3078,8 @@ The example opens a data directory, ingests three documents and queries them, as
 order the server's own bootstrap uses. It is not a sketch: it is the body of
 `EmbeddedUsageExampleTest.ingestAndQuery` in `excalibur-integration`, which compiles it against the
 current API and runs it on every build, against an in-process stand-in for the embeddings
-endpoint.
+endpoint. A test beside it compares the block below with that method, token for token, so neither
+can change without the other.
 
 ```java
 import com.eonmux.excalibur.core.memory.ForeignMemoryBootstrap;

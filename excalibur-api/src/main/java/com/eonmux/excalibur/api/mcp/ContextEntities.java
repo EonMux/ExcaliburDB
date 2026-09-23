@@ -73,21 +73,25 @@ final class ContextEntities {
      * Reads the argument into the value the node's body field takes.
      *
      * @param args The call's arguments
-     * @return A list of names, a list of objects, or null when there is nothing to send
+     * @return A list of names, a list of objects, or null when the argument is absent
      * @throws IllegalArgumentException if an element is neither a name nor an acceptable object
      */
     static List<Object> read(Map<String, Object> args) {
-        List<Object> elements = ToolArguments.objectList(args, FIELD);
-        List<Object> names = new ArrayList<>(elements.size());
+        List<Object> elements = ToolArguments.optionalList(args, FIELD);
+        if (elements == null) {
+            return null;
+        }
         List<Object> entities = new ArrayList<>(elements.size());
         boolean anyObject = false;
         for (int i = 0; i < elements.size(); i++) {
             Object element = elements.get(i);
             if (element instanceof String text) {
+                // In the object spelling a blank name is refused, while the node reads a blank
+                // plain name as mentioning nobody. Leaving it out is what keeps a name the tool
+                // rewrote as an object meaning what the plain name meant.
                 if (!text.isBlank()) {
-                    names.add(text.trim());
                     Map<String, Object> entity = Json.object();
-                    entity.put(NAME, text.trim());
+                    entity.put(NAME, text);
                     entities.add(entity);
                 }
             } else if (element instanceof Map<?, ?> map) {
@@ -98,8 +102,10 @@ final class ContextEntities {
                     + "'name', got: " + element);
             }
         }
-        List<Object> forwarded = anyObject ? entities : names;
-        return forwarded.isEmpty() ? null : List.copyOf(forwarded);
+        // An array of names goes as it came, empty and blank elements and all: the node is
+        // what decides what they mean, and the body it is sent is then the one the same request
+        // over HTTP would carry.
+        return anyObject ? List.copyOf(entities) : elements;
     }
 
     /**
@@ -122,10 +128,18 @@ final class ContextEntities {
         Map<String, Object> fields = (Map<String, Object>) map;
         try {
             Map<String, Object> entity = Json.object();
-            entity.put(NAME, ToolArguments.requiredString(fields, NAME));
-            String grammar = ToolArguments.optionalString(fields, GRAMMAR);
+            // The name itself, not a trimmed copy: the node reads names exactly as they came.
+            ToolArguments.requiredString(fields, NAME);
+            entity.put(NAME, fields.get(NAME));
+            // Present-but-blank is a shape the node refuses, not an absent one, so it is not
+            // read with optionalString, which folds blank into absent.
+            Object grammar = fields.get(GRAMMAR);
             if (grammar != null) {
-                entity.put(GRAMMAR, Grammar.parse(grammar).wireName());
+                if (!(grammar instanceof String shape)) {
+                    throw new IllegalArgumentException(
+                        "Argument '" + GRAMMAR + "' must be a string, got: " + grammar);
+                }
+                entity.put(GRAMMAR, Grammar.parse(shape).wireName());
             }
             Integer turn = ToolArguments.wholeNumber(fields, TURN);
             if (turn != null) {

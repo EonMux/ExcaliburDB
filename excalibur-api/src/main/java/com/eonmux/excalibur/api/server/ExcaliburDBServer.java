@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.server;
 
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsServer;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.endpoint.BuildInfo;
@@ -32,7 +33,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -684,9 +689,33 @@ public class ExcaliburDBServer {
      * <p>The server stops accepting new connections immediately but waits
      * for in-flight requests to complete before fully shutting down.</p>
      *
+     * <p>Each drain behind the listener waits as long as it does on its own; a caller with a
+     * deadline to keep uses {@link #stop(ShutdownBudget)}.</p>
+     *
      * @param timeoutSeconds Maximum time to wait for in-flight requests (0 for immediate)
      */
-    public synchronized void stop(int timeoutSeconds) {
+    public void stop(int timeoutSeconds) {
+        stop(timeoutSeconds, ShutdownBudget.unbounded());
+    }
+
+    /**
+     * Stops the API server within a shutdown's budget.
+     *
+     * <p>The listener is given {@link ShutdownBudget#listenerGraceSeconds()} for in-flight
+     * exchanges, and every drain after it is cut to what the budget leaves the drains. What has
+     * not stopped by then is reported through {@link #isStorageStillInUse()} and its two
+     * siblings, as a drain that timed out on its own always was, so the caller leaves it open.
+     * The budget's reserve is left for the caller's durable writes.</p>
+     *
+     * @param budget The shutdown's deadline
+     * @throws NullPointerException if budget is null
+     */
+    public void stop(ShutdownBudget budget) {
+        Objects.requireNonNull(budget, "budget cannot be null");
+        stop(budget.listenerGraceSeconds(), budget);
+    }
+
+    private synchronized void stop(int timeoutSeconds, ShutdownBudget budget) {
         if (!running.compareAndSet(true, false)) {
             return;
         }
@@ -712,7 +741,7 @@ public class ExcaliburDBServer {
         }
 
         ShutdownSequence.Drained drained = ShutdownSequence.drain(endpoints, wiring,
-            requestExecutor, REQUEST_DRAIN_GRACE);
+            requestExecutor, REQUEST_DRAIN_GRACE, budget);
         storageStillInUse = !drained.storageReleased();
         chunkIndexStillInUse = !drained.chunkIndexReleased();
         graphsStillInUse = !drained.graphsReleased();
@@ -788,6 +817,40 @@ public class ExcaliburDBServer {
             return -1;
         }
         return current.getAddress().getPort();
+    }
+
+    /**
+     * The URL the server is listening on: the scheme it serves and the address it is bound to.
+     *
+     * <p>Read from the bound socket rather than rebuilt from configuration, so it is the port
+     * actually taken - an ephemeral one for port 0 - and the interface actually bound, and says
+     * {@code https} exactly when the listener is a TLS one. A wildcard bind reports the wildcard
+     * address, because that is what the node listens on; no single host name would be true of
+     * it.</p>
+     *
+     * @return The base URL, without a trailing slash, or null if the server is not started
+     */
+    public String baseUrl() {
+        HttpServer current = server;
+        if (current == null) {
+            return null;
+        }
+        return urlOf(current instanceof HttpsServer, current.getAddress());
+    }
+
+    /**
+     * Spells a listening address as a URL.
+     *
+     * @param tls     Whether the listener serves TLS
+     * @param address The bound address
+     * @return {@code scheme://host:port}, an IPv6 host in brackets so its colons are not read as
+     *         the port separator
+     */
+    static String urlOf(boolean tls, InetSocketAddress address) {
+        InetAddress host = address.getAddress();
+        String literal = host.getHostAddress();
+        String spelled = host instanceof Inet6Address ? "[" + literal + "]" : literal;
+        return (tls ? "https" : "http") + "://" + spelled + ":" + address.getPort();
     }
 
     /**

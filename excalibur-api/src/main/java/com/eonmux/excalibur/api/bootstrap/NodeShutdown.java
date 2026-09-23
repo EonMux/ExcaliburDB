@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.bootstrap;
 
 import com.eonmux.excalibur.api.server.ExcaliburDBServer;
+import com.eonmux.excalibur.api.server.ShutdownBudget;
 import com.eonmux.excalibur.ingest.lexical.ChunkIndex;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.shard.IndexOrchestrator;
@@ -9,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.foreign.Arena;
+import java.time.Duration;
 import java.util.Objects;
 
 /**
@@ -33,8 +35,15 @@ import java.util.Objects;
  * hook. The underlying {@link ShutdownSequence} is itself idempotent, so a second call is inert
  * rather than a second teardown.</p>
  *
- * @param server                    The HTTP surface, stopped first so nothing new arrives
- * @param indexOrchestrator         Background indexing, drained before storage closes
+ * <h2>One deadline</h2>
+ * <p>Every wait in the sequence is cut from a single {@link ShutdownBudget} of
+ * {@code shutdownTimeout}, started when the sequence starts. Each drain used to carry its own
+ * fixed wait, and run one after another they added up to minutes - far past the stop timeout of
+ * any supervisor, whose SIGKILL then landed before the chunk index's buffer was published or the
+ * registry persisted. The budget keeps a reserve back for those durable writes: the drains share
+ * what is left, and whatever they leave unfinished is reported and left open rather than waited
+ * out.</p>
+ *
  * <h2>What a refusal leaves behind</h2>
  * <p>A drain that could not stop something - a compaction past its last boundary, an ingestion
  * run that did not reach its next document in time, a graph build between two of its own
@@ -49,6 +58,8 @@ import java.util.Objects;
  * never told about. The graph tenants' staged facts are forced to disk regardless too, for the
  * same reason: the registry already records the documents they were extracted from.</p>
  *
+ * @param server                    The HTTP surface, stopped first so nothing new arrives
+ * @param indexOrchestrator         Background indexing, drained before storage closes
  * @param lexicalErasureSweep       The chunk index's compaction timer, or null if none runs
  * @param chunkIndex                The BM25 index, or null if none opened
  * @param documentVisibilityTracker Holds the registry that says which documents this node has
@@ -56,7 +67,8 @@ import java.util.Objects;
  * @param storageEngine             Storage, closed after every reader has drained
  * @param arena                     The shared arena backing the mappings, or null on the
  *                                  ByteBuffer fallback
- * @param timeoutSeconds            How long the HTTP server is given to drain in-flight requests
+ * @param shutdownTimeout           The whole shutdown's deadline, from
+ *                                  {@link ShutdownBudget#configuredTimeout}
  * @author ExcaliburDB
  */
 public record NodeShutdown(ExcaliburDBServer server,
@@ -67,7 +79,7 @@ public record NodeShutdown(ExcaliburDBServer server,
                            GraphTenants graphTenants,
                            StorageEngine storageEngine,
                            Arena arena,
-                           int timeoutSeconds) {
+                           Duration shutdownTimeout) {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(NodeShutdown.class);
 
@@ -79,10 +91,17 @@ public record NodeShutdown(ExcaliburDBServer server,
      * would otherwise surface as a shutdown step that threw, which is reported as a node that
      * did not stop cleanly rather than as the wiring mistake it is.</p>
      *
-     * @throws NullPointerException if the server, orchestrator, tracker or storage is null
+     * @throws NullPointerException     if the server, orchestrator, tracker, storage or timeout is
+     *                                  null
+     * @throws IllegalArgumentException if the timeout leaves nothing beyond the durability reserve
      */
     public NodeShutdown {
         Objects.requireNonNull(server, "server cannot be null");
+        Objects.requireNonNull(shutdownTimeout, "shutdownTimeout cannot be null");
+        if (shutdownTimeout.compareTo(ShutdownBudget.DURABILITY_RESERVE) <= 0) {
+            throw new IllegalArgumentException("shutdownTimeout must exceed the "
+                + ShutdownBudget.DURABILITY_RESERVE.toSeconds() + "s kept for the durable writes");
+        }
         Objects.requireNonNull(indexOrchestrator, "indexOrchestrator cannot be null");
         Objects.requireNonNull(documentVisibilityTracker, "documentVisibilityTracker cannot be null");
         Objects.requireNonNull(storageEngine, "storageEngine cannot be null");
@@ -96,7 +115,7 @@ public record NodeShutdown(ExcaliburDBServer server,
      */
     public void run() {
         SweepState sweep = new SweepState(lexicalErasureSweep != null);
-        ShutdownSequence sequence = sequence(sweep);
+        ShutdownSequence sequence = sequence(sweep, ShutdownBudget.startingNow(shutdownTimeout));
         int failedSteps = sequence.stepNames().size() - sequence.run().size();
         reportOutcome(failedSteps, storageEngine.getCatalog().closeFailure());
     }
@@ -120,18 +139,19 @@ public record NodeShutdown(ExcaliburDBServer server,
     /**
      * Lists the teardown steps in the only order that is safe.
      *
-     * @param sweep What the sweep's drain reported, filled in by its step
+     * @param sweep  What the sweep's drain reported, filled in by its step
+     * @param budget The deadline every wait below is cut from
      * @return The sequence, built but not yet run
      */
-    private ShutdownSequence sequence(SweepState sweep) {
+    private ShutdownSequence sequence(SweepState sweep, ShutdownBudget budget) {
         return new ShutdownSequence()
-            .add("stop HTTP server and drain in-flight requests",
-                () -> server.stop(timeoutSeconds))
+            .add("stop HTTP server and drain in-flight requests", () -> server.stop(budget))
             .add("stop index orchestrator", indexOrchestrator::close)
             // Before the index: a sweep in flight is inside a compaction of it. Told to stop,
             // never interrupted, and what it answers decides whether what it reads may close.
+            // It waits only for what the drains have left, so the reserve stays intact.
             .addIfPresent("stop lexical erasure sweep", lexicalErasureSweep,
-                running -> sweep.running = !running.drain())
+                running -> sweep.running = !running.drain(budget.forDrains()))
             // Always, whatever is still running: every chunk reached storage before it reached
             // the index, and nothing reindexes one storage holds and the index lacks, so a buffer
             // left unpublished here is lost to lexical search for good. Publishing takes the
@@ -152,7 +172,8 @@ public record NodeShutdown(ExcaliburDBServer server,
                 () -> documentVisibilityTracker.getRegistry().persist())
             .addIfPresent("close graph tenants", graphTenants, tenants -> {
                 requireGraphsReleased();
-                tenants.close();
+                // After the durable writes, so this wait may spend what they left of the reserve.
+                tenants.close(budget.remaining());
             })
             .add("close storage engine", () -> {
                 requireStorageReleased(sweep, "the storage engine");

@@ -217,7 +217,7 @@ public final class GraphBuildRunner implements AutoCloseable {
      * @throws NullPointerException if tenants is null
      */
     public GraphBuildRunner(GraphTenants tenants) {
-        this(over(tenants), tenants::extraction);
+        this(over(tenants), () -> Optional.of(tenants.extraction()));
     }
 
     /**

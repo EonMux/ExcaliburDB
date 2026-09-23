@@ -62,6 +62,45 @@ class GraphTenantsTest {
     }
 
     @org.junit.jupiter.api.Nested
+    @DisplayName("Saying whether ingestion extracts facts before ingestion is wired")
+    class ExtractionBeforeWiring {
+
+        @Test
+        @DisplayName("extraction not asked for is disabled from the start")
+        void offIsDisabled(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 2)) {
+                assertThat(tenants.extraction()).isEqualTo(GraphExtraction.DISABLED);
+            }
+        }
+
+        @Test
+        @DisplayName("extraction asked for with no key is missing its key from the start")
+        void noKeyIsMissingTheKey(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 2,
+                    Map.of("excalibur.graph.extraction-enabled", "true"))) {
+                assertThat(tenants.extraction()).isEqualTo(GraphExtraction.MISSING_API_KEY);
+            }
+        }
+
+        @Test
+        @DisplayName("extraction that could run is unavailable until ingestion says it is wired")
+        void couldRunIsUnavailableUntilWired(@TempDir Path root) throws IOException {
+            try (GraphTenants tenants = tenants(root, 2, Map.of(
+                    "excalibur.graph.extraction-enabled", "true",
+                    "excalibur.llm.api-key", "test-key"))) {
+                assertThat(tenants.extraction())
+                    .as("active is a claim that documents reach the extractor, and nothing has "
+                        + "been wired to deliver them yet")
+                    .isEqualTo(GraphExtraction.UNAVAILABLE);
+
+                tenants.reportExtraction(GraphExtraction.ACTIVE);
+
+                assertThat(tenants.extraction()).isEqualTo(GraphExtraction.ACTIVE);
+            }
+        }
+    }
+
+    @org.junit.jupiter.api.Nested
     @DisplayName("Enforcing the erasure deadline")
     class ErasureSweep {
 

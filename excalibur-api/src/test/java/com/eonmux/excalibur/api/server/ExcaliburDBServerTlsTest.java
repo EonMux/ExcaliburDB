@@ -175,6 +175,38 @@ class ExcaliburDBServerTlsTest {
         server.start();
 
         assertThat(get(HttpClient.newHttpClient(), "http", "/health").statusCode()).isEqualTo(200);
+        assertThat(server.baseUrl()).isEqualTo("http://127.0.0.1:" + server.getPort());
+    }
+
+    @Test
+    @DisplayName("the address a TLS node reports is the https one it can actually be reached on")
+    void baseUrlNamesTheSchemeAndAddressServed(@TempDir Path dir) throws Exception {
+        // The startup log prints this for an operator to paste. An http URL for a TLS listener
+        // is refused by the first client that tries it, and "localhost" for a node bound to one
+        // interface names an address the node is not listening on.
+        Path keystore = TestKeystore.create(dir, "server.p12", "PKCS12", PASSWORD, "server");
+        start(tlsFor(keystore));
+
+        assertThat(server.baseUrl()).isEqualTo("https://127.0.0.1:" + server.getPort());
+    }
+
+    @Test
+    @DisplayName("a node not yet started has no address to report")
+    void baseUrlBeforeStartIsNull() {
+        server = new ExcaliburDBServer(0, indexOrchestrator, storageEngine, queryPipeline);
+
+        assertThat(server.baseUrl()).isNull();
+    }
+
+    @Test
+    @DisplayName("an IPv6 address is bracketed, so the port is not read as part of it")
+    void ipv6IsBracketed() throws Exception {
+        assertThat(ExcaliburDBServer.urlOf(true, new java.net.InetSocketAddress(
+            java.net.InetAddress.getByName("::1"), 8443)))
+            .isEqualTo("https://[0:0:0:0:0:0:0:1]:8443");
+        assertThat(ExcaliburDBServer.urlOf(false, new java.net.InetSocketAddress(
+            java.net.InetAddress.getByName("0.0.0.0"), 8080)))
+            .isEqualTo("http://0.0.0.0:8080");
     }
 
     private static TlsConfig tlsFor(Path keystore) {

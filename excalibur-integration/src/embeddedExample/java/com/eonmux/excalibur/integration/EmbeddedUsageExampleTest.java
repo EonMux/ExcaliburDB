@@ -50,7 +50,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@link #ingestAndQuery(Path, String)} is that example: the documentation reproduces it line for
  * line, so this test is what keeps the published snippet compiling against the current public
  * API and producing an answer. A change that breaks this test breaks every embedder who copied
- * the snippet, and the documentation has to change with it.</p>
+ * the snippet, and the documentation has to change with it; {@link EmbeddedUsageDocumentationTest}
+ * fails until it does.</p>
+ *
+ * <p>It lives in the {@code embeddedExample} source set rather than beside the other integration
+ * tests because that source set's classpath is only the seven coordinates USAGE.md tells an
+ * embedder to declare. Compiled there, it also proves that list is enough.</p>
  *
  * <p>The example uses only public constructors and methods of the library modules, assembled in
  * the order the server's own bootstrap uses:</p>

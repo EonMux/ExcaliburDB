@@ -156,18 +156,21 @@ public record IngestionWiring(Config config,
             logRetrievalMode(config, capabilities, chunkIndex != null);
 
             // Relation extraction is a chat call, so it turns on with the model rather than with
-            // the embedding pass.
-            GraphExtraction extraction = GraphExtraction.of(
-                config.graph().isExtractionEnabled(), capabilities.chatModel());
-            if (extraction == GraphExtraction.MISSING_API_KEY) {
+            // the embedding pass. The tenants already hold the state this node is in without
+            // ingestion; the only thing reported here is the step up to active, once a sink is
+            // actually in place to hand the extractor documents. Every way of not getting there -
+            // no orchestrator, or an exception anywhere above - leaves the state that says so.
+            boolean extractionEnabled = config.graph().isExtractionEnabled();
+            if (extractionEnabled && !capabilities.chatModel()) {
                 LOGGER.warn("excalibur.graph.extraction-enabled is true but excalibur.llm.api-key "
                     + "(EXCALIBUR_LLM_API_KEY) is not set - relation extraction is INACTIVE. "
                     + "Documents are ingested and searchable, but no facts are staged, so "
                     + "POST /v1/graph/build has nothing to publish. Set the key and restart to "
                     + "extract facts.");
-                graphTenants.reportExtraction(extraction);
-            } else if (!capabilities.chatModel() || configureGraphIngest(server, llmClientConfig)) {
-                graphTenants.reportExtraction(extraction);
+            } else if (capabilities.chatModel()) {
+                boolean wired = configureGraphIngest(server, llmClientConfig);
+                graphTenants.reportExtraction(
+                    GraphExtraction.of(extractionEnabled, true, wired));
             }
 
         } catch (Exception e) {

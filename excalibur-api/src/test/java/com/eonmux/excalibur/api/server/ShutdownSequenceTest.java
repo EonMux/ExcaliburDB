@@ -228,6 +228,78 @@ class ShutdownSequenceTest {
     }
 
     @Test
+    @DisplayName("independent drains wait together, so the slowest sets the time, not the sum")
+    void independentDrainsRunTogether() {
+        // The reindex's drain cannot finish until the graph build's has started. Run one after
+        // the other, the reindex would wait out its whole bound first and report itself still
+        // running; run together, both finish.
+        CountDownLatch graphBuildStarted = new CountDownLatch(1);
+        when(reindex.drain()).thenAnswer(call -> graphBuildStarted.await(10, TimeUnit.SECONDS));
+        when(graphBuild.drain()).thenAnswer(call -> {
+            graphBuildStarted.countDown();
+            return true;
+        });
+
+        assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE,
+            ShutdownBudget.unbounded()))
+            .isEqualTo(ShutdownSequence.Drained.CLEAN);
+    }
+
+    @Test
+    @DisplayName("a drain still going when the drains' share runs out is left running, and "
+        + "reported so, without holding up the rest")
+    void aDrainPastTheBudgetIsReportedNotWaitedOut() {
+        CountDownLatch release = new CountDownLatch(1);
+        when(reindex.drain()).thenAnswer(call -> release.await(60, TimeUnit.SECONDS));
+        // One second for the drains, the rest held back for the durable writes.
+        ShutdownBudget budget = ShutdownBudget.startingNow(
+            ShutdownBudget.DURABILITY_RESERVE.plusSeconds(1));
+        long started = System.nanoTime();
+
+        try {
+            assertThat(ShutdownSequence.drain(endpoints, wiring, null, GRACE, budget))
+                .as("the reindex still holds storage and the chunk index; the graph build ended")
+                .isEqualTo(new ShutdownSequence.Drained(false, false, true));
+            assertThat(Duration.ofNanos(System.nanoTime() - started))
+                .as("the drain's own minute is not waited out once the budget says stop")
+                .isLessThan(ShutdownBudget.DURABILITY_RESERVE);
+            assertThat(budget.remaining())
+                .as("the reserve is still there for the writes that follow")
+                .isPositive();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    @DisplayName("the request drain is cut to what the budget has left")
+    void theRequestDrainIsBounded() throws Exception {
+        ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor();
+        CountDownLatch release = new CountDownLatch(1);
+        requests.execute(() -> {
+            try {
+                release.await(60, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        ShutdownBudget budget = ShutdownBudget.startingNow(
+            ShutdownBudget.DURABILITY_RESERVE.plusSeconds(1));
+        long started = System.nanoTime();
+
+        try {
+            assertThat(ShutdownSequence.drain(endpoints, wiring, requests, Duration.ofMinutes(1),
+                budget))
+                .isEqualTo(new ShutdownSequence.Drained(false, false, false));
+            assertThat(Duration.ofNanos(System.nanoTime() - started))
+                .isLessThan(ShutdownBudget.DURABILITY_RESERVE);
+        } finally {
+            release.countDown();
+        }
+        assertThat(requests.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+    }
+
+    @Test
     @DisplayName("an erasure compacting on a request thread is asked to stop")
     void asksTheErasureToStop() {
         DocumentErasureService erasure = mock(DocumentErasureService.class);

@@ -177,12 +177,15 @@ public final class GraphTenants implements AutoCloseable {
     private final NamespaceRegistry.Lease<GraphTenant> sharedLease;
 
     /**
-     * Whether ingestion on this node extracts facts, as the ingestion wiring settled it.
+     * Whether ingestion on this node extracts facts.
      *
      * <p>Held here because this is the object every graph route is built over, and the build
-     * routes are where an operator finds out a build published nothing. Null until ingestion is
-     * wired, and on a node whose ingestion pipeline could not be built at all - in which case
-     * nothing is ingested and the reason is in the startup log.</p>
+     * routes are where an operator finds out a build published nothing. It starts as what the
+     * configuration allows <em>without</em> ingestion having been wired, and only the ingestion
+     * wiring raises it to {@link GraphExtraction#ACTIVE}, once it has actually handed the
+     * extractor a way to receive documents. Starting pessimistic is what keeps it accurate on a
+     * node whose pipeline failed to build: nothing has to remember to report that case, and the
+     * routes never have a state to leave out.</p>
      */
     private volatile GraphExtraction extraction;
 
@@ -211,6 +214,8 @@ public final class GraphTenants implements AutoCloseable {
             Duration.ofSeconds(config.graph().getErasureMaxLatencySeconds());
         this.maxOpen = maxOpen;
         this.models = GraphModelClients.forConfig(config);
+        this.extraction = GraphExtraction.of(config.graph().isExtractionEnabled(),
+            RetrievalCapabilities.from(config.llm()).chatModel(), false);
         // Never more than the registry can hold open: beyond that a pass is only evicting the
         // tenants it reopened earlier in the same pass.
         this.reopensPerSweep = Math.max(1, Math.min(MAX_REOPENS_PER_SWEEP, maxOpen));
@@ -1116,10 +1121,10 @@ public final class GraphTenants implements AutoCloseable {
     /**
      * Whether ingestion on this node extracts facts for the graph.
      *
-     * @return The state, or empty when ingestion has not been wired
+     * @return The state; before ingestion is wired, what the configuration allows without it
      */
-    public Optional<GraphExtraction> extraction() {
-        return Optional.ofNullable(extraction);
+    public GraphExtraction extraction() {
+        return extraction;
     }
 
     /**
@@ -1233,21 +1238,37 @@ public final class GraphTenants implements AutoCloseable {
      */
     @Override
     public void close() {
+        close(Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS));
+    }
+
+    /**
+     * As {@link #close()}, waiting for the sweep no longer than {@code sweepWait} - for a
+     * shutdown whose budget has less left than the sweep's own wait.
+     *
+     * @param sweepWait How long to wait for a sweep in flight to reach its next boundary
+     * @throws IllegalStateException if the sweep is still compacting when the wait runs out
+     * @throws NullPointerException  if sweepWait is null
+     */
+    public void close(Duration sweepWait) {
+        Objects.requireNonNull(sweepWait, "sweepWait must not be null");
+        Duration wait = sweepWait.compareTo(Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS)) < 0
+            ? sweepWait
+            : Duration.ofSeconds(SHUTDOWN_WAIT_SECONDS);
         closing = true;
         // shutdown, not shutdownNow: the periodic task is cancelled and a sweep in progress
         // runs to its next namespace boundary uninterrupted.
         erasureSweep.shutdown();
         boolean sweepEnded;
         try {
-            sweepEnded = erasureSweep.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS);
+            sweepEnded = erasureSweep.awaitTermination(wait.toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             sweepEnded = erasureSweep.isTerminated();
         }
         if (!sweepEnded) {
-            LOGGER.error("the graph erasure sweep was still compacting {}s after being asked to "
+            LOGGER.error("the graph erasure sweep was still compacting {}ms after being asked to "
                 + "stop; the graph tenants are left open rather than closed under it",
-                SHUTDOWN_WAIT_SECONDS);
+                wait.toMillis());
             throw new IllegalStateException("left the graph tenants open: the erasure sweep is "
                 + "still compacting a namespace");
         }

@@ -171,9 +171,15 @@ final class ToolArguments {
      * absent keeps its default, empty clears it. There is deliberately no reader that folds the
      * two together.</p>
      *
+     * <p>The elements are returned exactly as sent, blank ones included. Only the type is this
+     * reader's to check; what a blank or padded element means is the node's to decide, and
+     * deciding it here too would forward a body the model never wrote - {@code [""]} arriving as
+     * {@code []} - so the tool and the same request over HTTP could register different
+     * sources.</p>
+     *
      * @param args  The call's arguments
      * @param field The field name
-     * @return The non-blank elements, or null when the field is absent or null
+     * @return The elements as sent, or null when the field is absent or null
      * @throws IllegalArgumentException if it is present and is not a list of strings
      */
     static List<String> optionalStringList(Map<String, Object> args, String field) {
@@ -192,36 +198,38 @@ final class ToolArguments {
                     "Argument '" + field + "' must be an array of strings, got an element: "
                         + item);
             }
-            if (!text.isBlank()) {
-                out.add(text.trim());
-            }
+            out.add(text);
         }
         return List.copyOf(out);
     }
 
     /**
-     * Reads a list-of-objects argument.
+     * Reads a list argument whose elements the caller inspects, telling empty apart from absent.
+     *
+     * <p>A null element is refused rather than skipped. The node refuses the same array over
+     * HTTP, and a reader that skipped it would send a shorter list than the model wrote and
+     * report the call as having done what was asked.</p>
      *
      * @param args  The call's arguments
      * @param field The field name
-     * @return The elements, empty when the field is absent
-     * @throws IllegalArgumentException if it is present and is not a list
+     * @return The elements, in order, or null when the field is absent or null
+     * @throws IllegalArgumentException if it is present and is not a list, or holds a null
      */
-    static List<Object> objectList(Map<String, Object> args, String field) {
+    static List<Object> optionalList(Map<String, Object> args, String field) {
         Object value = args.get(field);
         if (value == null) {
-            return List.of();
+            return null;
         }
         if (!(value instanceof List<?> list)) {
             throw new IllegalArgumentException(
                 "Argument '" + field + "' must be an array, got: " + value);
         }
-        List<Object> items = new ArrayList<>(list.size());
-        for (Object element : list) {
-            if (element != null) {
-                items.add(element);
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i) == null) {
+                throw new IllegalArgumentException(
+                    "Argument '" + field + "' element " + i + " is null");
             }
         }
-        return List.copyOf(items);
+        return List.copyOf(list);
     }
 }
