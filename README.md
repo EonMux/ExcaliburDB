@@ -850,7 +850,9 @@ findable by one version of its text and never by both. Erasure is the opposite, 
 hiding has to be immediate or erasure is not erasure, so an erased chunk disappears from every
 query at once, including one that could still see an earlier copy. A compaction leaves a replaced
 copy on disk until no query can be reading from before its replacement, which is at most a query
-timeout.
+timeout: it rewrites a segment from the text in storage, which holds only the new version. An
+erasure owed in the same segment waits with it, and the next compaction — the erasure sweep's, on a
+quiet node — discharges it.
 
 **Erasure.** Two parts, deliberately. The obligation is appended to a log and forced to disk before
 the call returns, and the chunks are tombstoned so no query returns them. Physical removal happens
@@ -910,7 +912,9 @@ the promise while the document was readable again.
 **Reindexing.** A reindex is the one operation that removes content a query could still be matching:
 a deleted document's chunks, and the tail chunks a shortened document no longer has. Both are erased
 from the index as they are tombstoned in storage, and the reindex settles its own erasures at the end
-of its run rather than leaving them for whatever ingests next. A node that only ever reindexes still
+of its run rather than leaving them for whatever ingests next — except in a segment that also holds
+the previous copy of a document the same run re-published, which waits for readers to catch up as
+described under Reingestion, and is then settled by the sweep. A node that only ever reindexes still
 meets the erasure deadline.
 
 **Compaction.** Checked at the end of an ingestion run, at the end of a reindex, when an erasure
