@@ -3,6 +3,7 @@ package com.eonmux.excalibur.api.bootstrap;
 import com.eonmux.excalibur.config.Config;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
 import com.eonmux.excalibur.graph.erasure.ErasureScope;
+import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.tenancy.MappingBudget;
 import com.eonmux.excalibur.tenancy.NamespaceId;
 import com.eonmux.excalibur.tenancy.NamespaceRegistry;
@@ -85,11 +86,13 @@ class GraphErasureBacklogTest {
         try (GraphTenants tenants = tenants(root)) {
             createAndEvict(tenants, evicted);
             try (ErasureLog log = ErasureLog.open(erasureLog(root, evicted))) {
-                log.submit(new ErasureScope.Entity(1), LONG_AGO);
-                log.submit(new ErasureScope.Entity(2), LONG_AGO.plusSeconds(1));
+                log.submit(new ErasureScope.Source(SourceType.DOCUMENT, 1), LONG_AGO);
+                log.submit(new ErasureScope.Source(SourceType.DOCUMENT, 2),
+                    LONG_AGO.plusSeconds(1));
             }
             try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(open)) {
-                lease.resource().erasureService().submit(new ErasureScope.Entity(3));
+                lease.resource().erasureService()
+                    .submit(new ErasureScope.Source(SourceType.DOCUMENT, 3));
             }
 
             GraphTenants.ErasureBacklog backlog = tenants.erasureBacklog();

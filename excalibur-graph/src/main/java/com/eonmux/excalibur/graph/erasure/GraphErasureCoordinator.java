@@ -13,6 +13,7 @@ import java.util.Objects;
 import com.eonmux.excalibur.graph.erasure.CompactionPolicy.CompactionStats;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor.CompactionResult;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.graph.staging.ReferencedLabels;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
 
 import org.roaringbitmap.RoaringBitmap;
@@ -317,6 +318,91 @@ public final class GraphErasureCoordinator {
     public long submit(ErasureScope scope) throws IOException {
         Objects.requireNonNull(scope, "scope must not be null");
         return log.submit(scope, clock.instant());
+    }
+
+    /**
+     * Whether the staging store behind this coordinator has handed out an entity id.
+     *
+     * <p>Read without a lock, and safe to act on without one. The staging store's entity
+     * interner counts an id as assigned only once its label is forced to the device, and never
+     * gives one up while it is open - an erased entity's label is tombstoned, its id kept - so an
+     * id this answers true for names the same entity for as long as the store is open. An
+     * erasure accepted for it is ordered after the label that id was given to, and one refused
+     * because this answered false is ordered before it: nobody had been handed the id yet.</p>
+     *
+     * @param entityId The id
+     * @return true when the id is one staging has assigned; false with no staging behind this
+     */
+    public boolean stagedEntity(long entityId) {
+        return staging != null && entityId >= 0 && entityId < staging.entityCount();
+    }
+
+    /**
+     * Whether an entity id names anything in this namespace: staged, or in a graph published at
+     * {@code graphDirectory}.
+     *
+     * <p>The published graph is asked as well as staging because the two can disagree: a graph
+     * is built from staging, but staging may since have been restored from an older copy or
+     * started afresh while the graph it was built into is still served. The answer about the
+     * published graph holds only until the next build or compaction replaces it, so a caller
+     * that acts on it holds whatever lock those take.</p>
+     *
+     * @param entityId       The id
+     * @param graphDirectory Where the namespace's graph is served from; need not exist
+     * @return true when staging assigned the id or a served or displaced graph names it
+     * @throws IOException if a published dictionary cannot be read
+     * @throws NullPointerException if {@code graphDirectory} is null
+     */
+    public boolean entityAssigned(long entityId, Path graphDirectory) throws IOException {
+        Objects.requireNonNull(graphDirectory, "graphDirectory must not be null");
+        return stagedEntity(entityId)
+            || (entityId >= 0 && ReferencedLabels.publishedEntity(graphDirectory, entityId));
+    }
+
+    /**
+     * Discharges every outstanding entity-scoped request that names an id nothing assigned.
+     *
+     * <h3>Why such a request is discharged rather than kept</h3>
+     * <p>A request records an entity by id alone, and ids are handed out in order. One that names
+     * an id neither staging nor any published graph has assigned names no entity, and the only
+     * thing it can ever erase is whichever entity is next given that id - a stranger, whose
+     * erasure is irreversible. The node now refuses such a request at the door, but a log
+     * written before it did may hold them. Discharging one cannot leave anything on disk that it
+     * was accepted to remove: there is no label, no fact, no dictionary entry for it to have
+     * covered, and a compaction would already mark it satisfied as matching nothing. Keeping it
+     * risks the stranger; discharging it risks nothing.</p>
+     *
+     * <p>Run when a namespace is opened, before anything can intern a new label. The completion
+     * is forced before this returns, so a crash cannot bring back a request this has already
+     * reported discharged.</p>
+     *
+     * @param graphDirectory Where the namespace's graph is served from; need not exist
+     * @return The requests discharged, oldest first; empty when none named an unassigned id
+     * @throws IOException if a published dictionary cannot be read, or the completion cannot be
+     *                     recorded and forced
+     * @throws NullPointerException if {@code graphDirectory} is null
+     */
+    public List<ErasureRequest> dischargeUnassigned(Path graphDirectory) throws IOException {
+        Objects.requireNonNull(graphDirectory, "graphDirectory must not be null");
+        List<ErasureRequest> unassigned = new ArrayList<>();
+        for (ErasureRequest request : log.outstanding()) {
+            if (request.scope() instanceof ErasureScope.Entity entity
+                    && !entityAssigned(entity.entityId(), graphDirectory)) {
+                unassigned.add(request);
+            }
+        }
+        if (unassigned.isEmpty()) {
+            return List.of();
+        }
+        log.complete(idsOf(unassigned));
+        log.flush();
+        for (ErasureRequest request : unassigned) {
+            LOGGER.warn("erasure request {} names entity {}, which nothing in this namespace was "
+                + "ever given: no staged label and no published graph holds it. Discharged "
+                + "rather than left to erase whichever entity is given that id next",
+                request.id(), ((ErasureScope.Entity) request.scope()).entityId());
+        }
+        return List.copyOf(unassigned);
     }
 
     /**

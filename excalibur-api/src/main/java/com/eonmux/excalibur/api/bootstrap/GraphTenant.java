@@ -5,6 +5,7 @@ import com.eonmux.excalibur.graph.build.BuildCancellation;
 import com.eonmux.excalibur.graph.erasure.CompactionPolicy;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor;
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
+import com.eonmux.excalibur.graph.erasure.ErasureRequest;
 import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.erasure.ServedArtifactEraser;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
@@ -146,6 +147,34 @@ public final class GraphTenant implements AutoCloseable {
             ErasureLog erasureLog = ErasureLog.open(stagingDirectory.resolve(ERASURE_LOG));
             opened.push(erasureLog);
 
+            // One embedder for the tenant rather than one per collaborator: the two that need
+            // it are the build and the erasure rebuild, and they are producing the same vectors
+            // from the same endpoint - through the node's client, not one of the tenant's own.
+            GraphDirectoryBuilder.EntityEmbedder embedder = entityEmbedder(config, models);
+            int dimension = embeddingDimension(config);
+
+            GraphErasureCoordinator coordinator = new GraphErasureCoordinator(
+                erasureLog,
+                CompactionPolicy.standard(
+                    config.graph().getErasureTombstoneRatio(),
+                    Duration.ofSeconds(config.graph().getErasureMaxLatencySeconds()),
+                    Integer.MAX_VALUE),
+                Clock.systemUTC(),
+                // Erased alongside the served store. Removing an edge from the graph and
+                // leaving the fact it was built from staged means the next build restores
+                // exactly what the erasure removed.
+                staging,
+                servedArtifactErasers(config, staging, embedder, dimension));
+
+            // Before anything can intern a label, and before what is owed decides whether the
+            // graph is withheld: a request naming an id nothing was given would otherwise erase
+            // whoever is given that id next. See GraphErasureCoordinator#dischargeUnassigned.
+            List<ErasureRequest> discharged = coordinator.dischargeUnassigned(directory);
+            if (!discharged.isEmpty()) {
+                LOGGER.warn("graph tenant {} discharged {} erasure request(s) naming entity ids "
+                    + "nothing in the namespace holds", id, discharged.size());
+            }
+
             // A graph an erasure was part-way through replacing is not served until the
             // erasure has been applied to it; see erasureInterrupted. Otherwise openAt opens
             // what is there, and answers null when there is no graph.
@@ -155,30 +184,12 @@ public final class GraphTenant implements AutoCloseable {
                 directory, withhold ? null : GraphRagFactory.openAt(config, directory, models));
             opened.push(holder);
 
-            // One embedder for the tenant rather than one per collaborator: the two that need
-            // it are the build and the erasure rebuild, and they are producing the same vectors
-            // from the same endpoint - through the node's client, not one of the tenant's own.
-            GraphDirectoryBuilder.EntityEmbedder embedder = entityEmbedder(config, models);
-            int dimension = embeddingDimension(config);
-
             GraphBuildService buildService = new GraphBuildService(
                 staging, holder, config, models, config.graph().getSingleValuedRelations(),
                 embedder, dimension);
 
             GraphErasureService erasureService = new GraphErasureService(
-                new GraphErasureCoordinator(
-                    erasureLog,
-                    CompactionPolicy.standard(
-                        config.graph().getErasureTombstoneRatio(),
-                        Duration.ofSeconds(config.graph().getErasureMaxLatencySeconds()),
-                        Integer.MAX_VALUE),
-                    Clock.systemUTC(),
-                    // Erased alongside the served store. Removing an edge from the graph and
-                    // leaving the fact it was built from staged means the next build restores
-                    // exactly what the erasure removed.
-                    staging,
-                    servedArtifactErasers(config, staging, embedder, dimension)),
-                holder, config, models, withheldMarker);
+                coordinator, holder, config, models, withheldMarker);
 
             if (withhold) {
                 finishInterruptedErasure(id, erasureService);
@@ -307,7 +318,7 @@ public final class GraphTenant implements AutoCloseable {
      *
      * <p>The graph published from it, and the two logs of requests still to be applied to it -
      * erasures and withdrawals - which name entities by id. The staging store asks these before
-     * it lets an interner with a damaged last record give an id up, so an id any of them holds
+     * it lets an interner cut damage off and give ids up, so an id any of them holds
      * is never handed to a different label; see {@link ReferencedLabels}. {@code fsck} names the
      * same holders for the same question.</p>
      *

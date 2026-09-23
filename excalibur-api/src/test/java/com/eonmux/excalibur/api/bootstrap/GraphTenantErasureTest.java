@@ -192,6 +192,65 @@ class GraphTenantErasureTest {
     }
 
     @Test
+    @DisplayName("an obligation on disk naming an id nothing was given is discharged as the "
+        + "tenant opens, before that id can be handed to anybody")
+    void anObligationForAnUnassignedIdIsDischargedOnOpen(@TempDir Path root) throws IOException {
+        // A log written before the node refused such requests. Left in place, the request
+        // would erase whichever entity the interner gives id 42 to - somebody nobody asked about.
+        Path directory = root.resolve("graph");
+        int alice;
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            alice = tenant.staging().entityIdOf("Alice Quazzlethorpe");
+        }
+        Path erasures = GraphTenant.erasureLogOf(directory);
+        try (ErasureLog log = ErasureLog.open(erasures)) {
+            log.submit(new ErasureScope.Entity(alice), java.time.Instant.EPOCH);
+            log.submit(new ErasureScope.Entity(42), java.time.Instant.EPOCH);
+        }
+
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            assertThat(tenant.erasureService().outstandingCount())
+                .as("the request for an entity that exists is still owed")
+                .isEqualTo(1);
+        }
+        assertThat(ErasureLog.entitiesOwed(erasures))
+            .as("and the discharge is on disk")
+            .containsExactly((long) alice);
+    }
+
+    @Test
+    @DisplayName("an obligation for an id only the published graph names survives the open")
+    void anObligationThePublishedGraphHoldsSurvivesTheOpen(@TempDir Path root)
+            throws IOException {
+        // Staging started afresh beside a graph built from an earlier one: the graph still serves
+        // the entity, so the obligation is real and must be applied, not discharged.
+        Path directory = root.resolve("graph");
+        int bob;
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            stageAndBuild(tenant);
+            bob = tenant.staging().entityIdOf("Bob Ordinary");
+        }
+        Path staging = GraphTenant.stagingDirectoryOf(directory);
+        try (var files = Files.list(staging)) {
+            for (Path file : files.toList()) {
+                Files.delete(file);
+            }
+        }
+        try (ErasureLog log = ErasureLog.open(GraphTenant.erasureLogOf(directory))) {
+            log.submit(new ErasureScope.Entity(bob), java.time.Instant.EPOCH);
+        }
+
+        try (GraphTenant tenant = GraphTenant.open(NamespaceId.SHARED, directory, config(),
+                GraphModelClients.forConfig(config()))) {
+            assertThat(tenant.staging().entityCount()).isZero();
+            assertThat(tenant.erasureService().outstandingCount()).isEqualTo(1);
+        }
+    }
+
+    @Test
     @DisplayName("a graph restored after a crash between a swap's renames is erased before it "
         + "is served")
     void aRestoredGraphIsErasedBeforeItIsServed(@TempDir Path root) throws IOException {

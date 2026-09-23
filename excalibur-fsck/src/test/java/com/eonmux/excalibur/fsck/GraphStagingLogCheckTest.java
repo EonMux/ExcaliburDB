@@ -426,6 +426,59 @@ class GraphStagingLogCheckTest {
         }
     }
 
+    @Test
+    @DisplayName("an outstanding erasure naming an id nothing was given is reported, as the "
+        + "node discharges it on open, and the log is still sound")
+    void anErasureForAnUnassignedIdIsReported() throws IOException {
+        try (ErasureLog log = ErasureLog.open(staging.resolve(GraphStagingCheck.ERASURE_LOG))) {
+            log.submit(new ErasureScope.Entity(0), Instant.EPOCH);
+            log.submit(new ErasureScope.Entity(42), Instant.EPOCH);
+            log.submit(new ErasureScope.Source(SourceType.DOCUMENT, 42), Instant.EPOCH);
+        }
+
+        FileCheck result = check(GraphStagingCheck.ERASURE_LOG);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.INTACT);
+        assertThat(result.detail())
+            .contains("3 erasure requests are still outstanding")
+            .contains("1 of them name an entity id nothing in this namespace holds")
+            .contains("discharges those when it next opens the namespace");
+    }
+
+    @Test
+    @DisplayName("an outstanding erasure for an id only the published graph names is not "
+        + "reported: the node keeps it")
+    void anErasureThePublishedGraphHoldsIsNotReported() throws IOException {
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            com.eonmux.excalibur.graph.staging.GraphBuilder.build(store,
+                dataDir.resolve("shared/graph"));
+        }
+        Files.delete(staging.resolve(GraphStagingStore.ENTITY_LABELS));
+        try (ErasureLog log = ErasureLog.open(staging.resolve(GraphStagingCheck.ERASURE_LOG))) {
+            log.submit(new ErasureScope.Entity(3), Instant.EPOCH);
+        }
+
+        FileCheck result = check(GraphStagingCheck.ERASURE_LOG);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.INTACT);
+        assertThat(result.detail()).doesNotContain("nothing in this namespace holds");
+    }
+
+    @Test
+    @DisplayName("when the entity labels cannot be judged, the report says so rather than guess")
+    void unjudgedLabelsAreSaid() throws IOException {
+        try (ErasureLog log = ErasureLog.open(staging.resolve(GraphStagingCheck.ERASURE_LOG))) {
+            log.submit(new ErasureScope.Entity(0), Instant.EPOCH);
+        }
+        flip(staging.resolve(GraphStagingStore.ENTITY_LABELS),
+            LabelInterner.HEADER_BYTES + Integer.BYTES);
+
+        FileCheck result = check(GraphStagingCheck.ERASURE_LOG);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.INTACT);
+        assertThat(result.detail()).contains("cannot be judged");
+    }
+
     @ParameterizedTest(name = "{0} at a version this build does not read is unreadable")
     @ValueSource(strings = {
         GraphStagingStore.ENTITY_LABELS,

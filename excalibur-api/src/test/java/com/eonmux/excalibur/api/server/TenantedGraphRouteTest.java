@@ -85,7 +85,8 @@ class TenantedGraphRouteTest {
             .isNotEqualTo(404);
         assertThat(send("POST", "/v1/graph/build", "").status()).isNotEqualTo(404);
         assertThat(send("POST", "/v1/graph/erasure",
-            "{\"scope\":\"entity\",\"entity_id\":1}").status()).isNotEqualTo(404);
+            "{\"scope\":\"source\",\"source_type\":\"DOCUMENT\",\"source_id\":1}")
+            .status()).isNotEqualTo(404);
         assertThat(send("GET", "/v1/graph/namespaces", null).status()).isEqualTo(200);
     }
 

@@ -47,7 +47,9 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent use. Compactions are serialised against each other; a caller that submits
- * while one is running is not blocked, because recording the obligation is what must not wait.</p>
+ * while one is running is not blocked, because recording the obligation is what must not wait -
+ * with one exception, an entity id staging has not assigned, which has to be judged against the
+ * published graph while nothing can replace it; see {@link #submit}.</p>
  *
  * @author ExcaliburDB
  */
@@ -131,16 +133,96 @@ public final class GraphErasureService {
     }
 
     /**
+     * An entity-scoped erasure named an id nothing in the namespace holds.
+     *
+     * <p>Unchecked, and distinct from every other failure of {@link #submit}, because it is the
+     * caller's to answer: nothing was recorded, and the request can be corrected rather than
+     * retried.</p>
+     */
+    public static final class UnknownEntityException extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        /** The id the request named. */
+        private final long entityId;
+
+        /**
+         * @param entityId The id the request named
+         */
+        public UnknownEntityException(long entityId) {
+            super("no entity in this namespace has id " + entityId);
+            this.entityId = entityId;
+        }
+
+        /**
+         * The id the request named.
+         *
+         * @return The id
+         */
+        public long entityId() {
+            return entityId;
+        }
+    }
+
+    /**
      * Records an obligation to erase, durably, before returning.
+     *
+     * <h3>An entity-scoped request must name an entity</h3>
+     * <p>A request records an entity by id alone, and ids are handed out in order, so one
+     * accepted for an id nobody holds yet would erase whichever entity is given that id next -
+     * irreversibly, and with nothing on record saying anybody asked. An entity id is accepted
+     * only when staging has assigned it or a graph this namespace serves, or is about to restore,
+     * names it; anything else is refused with {@link UnknownEntityException} and nothing is
+     * recorded. Scopes that select by provenance name no id and are recorded as they are.</p>
+     *
+     * <h3>How the check is ordered against what changes the answer</h3>
+     * <p>Two things can. Staging assigns new ids, and it never takes one back: an id is counted
+     * only once its label is forced to the device, and an erased entity's label is tombstoned
+     * with its id kept. So a staged id is accepted without a lock, ordered after the label it
+     * names; one staging has not yet assigned is refused, ordered before it - nobody had been
+     * given the id. A build or a compaction replaces the published graph, and can drop an id
+     * only the published graph names; so such an id is judged and recorded under the replacement
+     * lock those hold for their whole run, and the request is ordered before the replacement,
+     * which then applies it. That makes a request for an id staging has not assigned wait out a
+     * build or compaction already running.</p>
      *
      * @param scope What to erase
      * @return The request id
-     * @throws IOException if the obligation cannot be recorded
+     * @throws UnknownEntityException if an entity-scoped request names an id nothing holds
+     * @throws IOException if the obligation cannot be recorded, or a published dictionary
+     *                     cannot be read to decide whether it may be
+     * @throws NullPointerException if {@code scope} is null
      */
     public long submit(ErasureScope scope) throws IOException {
-        long id = coordinator.submit(scope);
+        Objects.requireNonNull(scope, "scope must not be null");
+        long id = scope instanceof ErasureScope.Entity entity
+                && !coordinator.stagedEntity(entity.entityId())
+            ? submitUnstaged(entity)
+            : coordinator.submit(scope);
         LOGGER.info("erasure request {} accepted: {}", id, scope);
         return id;
+    }
+
+    /**
+     * Records an entity-scoped request whose id staging has not assigned, if anything else holds
+     * it.
+     *
+     * @param entity The request
+     * @return The request id
+     * @throws UnknownEntityException if nothing holds the id
+     * @throws IOException if a dictionary cannot be read or the request cannot be recorded
+     */
+    private long submitUnstaged(ErasureScope.Entity entity) throws IOException {
+        ReentrantLock replacement = holder.replacementLock();
+        replacement.lock();
+        try {
+            if (!coordinator.entityAssigned(entity.entityId(), holder.directory())) {
+                throw new UnknownEntityException(entity.entityId());
+            }
+            return coordinator.submit(entity);
+        } finally {
+            replacement.unlock();
+        }
     }
 
     /**

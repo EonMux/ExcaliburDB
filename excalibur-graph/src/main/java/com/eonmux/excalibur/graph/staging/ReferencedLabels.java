@@ -153,6 +153,32 @@ public interface ReferencedLabels {
     }
 
     /**
+     * Whether a graph published at {@code graphDirectory} names an entity id.
+     *
+     * <p>Asked of the same graphs {@link #publishedIn} reads - the served one and any a publish or
+     * a compaction set aside - because an erasure accepted for an entity only one of them names
+     * is still owed by that graph, which recovery may be about to restore.</p>
+     *
+     * @param graphDirectory Where the graph is served from; need not exist
+     * @param entityId       The id
+     * @return true when one of those graphs' entity dictionaries has an entry for it
+     * @throws IOException if a dictionary is present and cannot be read
+     * @throws NullPointerException if {@code graphDirectory} is null
+     */
+    static boolean publishedEntity(Path graphDirectory, long entityId) throws IOException {
+        Objects.requireNonNull(graphDirectory, "graphDirectory must not be null");
+        for (Path graph : GraphBuilder.servedOrDisplaced(graphDirectory)) {
+            try (LabelDictionary dictionary = LabelDictionary.openIfPresent(graph,
+                    GraphBuilder.ENTITY_DICTIONARY, "E")) {
+                if (dictionary != null && dictionary.contains(entityId)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * The outstanding entity-scoped requests of an erasure log, or of any log in its format.
      *
      * @param obligationLog The log; need not exist

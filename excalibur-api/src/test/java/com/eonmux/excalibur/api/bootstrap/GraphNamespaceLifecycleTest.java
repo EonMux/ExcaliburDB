@@ -228,7 +228,9 @@ class GraphNamespaceLifecycleTest {
             try (GraphTenants tenants = tenants(root, 4)) {
                 NamespaceId acme = NamespaceId.of("acme");
                 try (NamespaceRegistry.Lease<GraphTenant> lease = tenants.borrow(acme)) {
-                    lease.resource().erasureService().submit(new ErasureScope.Entity(3));
+                    GraphTenant tenant = lease.resource();
+                    tenant.erasureService().submit(
+                        new ErasureScope.Entity(tenant.staging().entityIdOf("Ada")));
                 }
 
                 GraphTenants.Dropped dropped = tenants.drop(acme).orElseThrow();

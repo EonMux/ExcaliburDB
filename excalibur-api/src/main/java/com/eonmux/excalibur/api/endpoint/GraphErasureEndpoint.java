@@ -57,9 +57,7 @@ import java.util.TreeSet;
  *
  * <p>A name is resolved against a namespace that already exists, never one created to look in.
  * A namespace that does not exist holds nobody, so the answer is the same 404 an existing
- * namespace gives, and the header naming it spends no directory and no open slot. Every other
- * scope creates the namespace, because recording an obligation is one of the things that bring
- * a namespace into being.
+ * namespace gives, and the header naming it spends no directory and no open slot.
  *
  * <p>Resolved by exact match, ignoring case and surrounding space, against the entity names this
  * namespace knows - the served entity dictionary and the staged labels it is built from, which
@@ -72,6 +70,19 @@ import java.util.TreeSet;
  *
  * <p>A name no entity has is a 404, and a name two entities share is a 409 listing their ids,
  * because guessing which of two people to erase is not a decision this endpoint may take.
+ *
+ * <h3>An id must name an entity</h3>
+ * <p>An {@code entity_id} is accepted only when something in the namespace holds it: the staged
+ * labels, or a graph the namespace serves. Anything else is a 404 and nothing is recorded. The
+ * request records the id and nothing else, and ids are handed out in order, so an obligation
+ * accepted for an id nobody holds yet would erase whichever entity is given it next. Like a name,
+ * an id is looked for only in a namespace that already exists, and a namespace that does not is
+ * answered with the same 404. How the check is ordered against a label being assigned and a
+ * graph being replaced is {@link GraphErasureService#submit}'s to say.
+ *
+ * <p>The scopes that select by provenance - a source, an extractor version - name no entity.
+ * They are recorded whatever the namespace holds, and create it, because recording an obligation
+ * is one of the things that bring a namespace into being.
  *
  * <p>Optionally {@code "compact": true} to run the compaction immediately rather than leaving it to
  * the policy - for a caller under a deadline that must be able to say the data is gone.</p>
@@ -132,13 +143,15 @@ public class GraphErasureEndpoint implements HttpHandler {
         try {
             Optional<NamespaceRegistry.Lease<GraphTenant>> borrowed = leaseFor(namespace, requested);
             if (borrowed.isEmpty()) {
-                // A namespace that was never created holds nobody, so the name resolves to no
-                // one - answered exactly as a name missing from a namespace that does exist, so
+                // A namespace that was never created holds nobody, so the name or id resolves to
+                // no one - answered exactly as one missing from a namespace that does exist, so
                 // the reply cannot be used to learn which namespaces other tenants have.
-                sendNotNamed(exchange, requested.entityName());
+                sendNotFound(exchange, requested);
                 return;
             }
             accept(exchange, namespace, requested, compactNow, borrowed.get());
+        } catch (GraphErasureService.UnknownEntityException e) {
+            sendNotFound(exchange, requested);
         } catch (IOException | RuntimeException e) {
             // RuntimeException is not defensive padding: a namespace that cannot be opened
             // arrives here as an UncheckedIOException from the registry, and catching only
@@ -155,20 +168,20 @@ public class GraphErasureEndpoint implements HttpHandler {
      * Borrows the namespace a request is about, creating it only when the request will record an
      * obligation there whatever the namespace holds.
      *
-     * <p>A scope named outright is always recorded, and recording one is what brings a namespace
-     * into being. A name is different: it has to be resolved first, and a namespace that does not
-     * exist cannot contain anybody, so creating it to find that out would write a directory and
-     * claim an open slot - evicting a real tenant - for a request that ends in a 404 with nothing
-     * recorded. The namespace arrives in a header, so that would be any caller spending all three
-     * on any name it chose.</p>
+     * <p>A source or extractor scope is always recorded, and recording one is what brings a
+     * namespace into being. An entity is different, by name or by id: it has to be found first,
+     * and a namespace that does not exist cannot contain anybody, so creating it to find that out
+     * would write a directory and claim an open slot - evicting a real tenant - for a request
+     * that ends in a 404 with nothing recorded. The namespace arrives in a header, so that would
+     * be any caller spending all three on any name or id it chose.</p>
      *
      * @param namespace The namespace the header named
      * @param requested What the body asked for
-     * @return The lease, or empty when a name was given for a namespace that does not exist
+     * @return The lease, or empty when an entity was named in a namespace that does not exist
      */
     private Optional<NamespaceRegistry.Lease<GraphTenant>> leaseFor(NamespaceId namespace,
                                                                     Requested requested) {
-        if (requested.scope() == null) {
+        if (requested.scope() == null || requested.scope() instanceof ErasureScope.Entity) {
             return tenants.borrowIfPresent(namespace);
         }
         return Optional.of(tenants.borrow(namespace));
@@ -198,6 +211,8 @@ public class GraphErasureEndpoint implements HttpHandler {
                 }
             }
             GraphErasureService erasureService = lease.resource().erasureService();
+            // Refuses an entity id nothing in the namespace holds, recording nothing; the
+            // handler answers that 404.
             long id = erasureService.submit(scope);
 
             // Past here the obligation is durable, so the request has been accepted whatever
@@ -341,6 +356,25 @@ public class GraphErasureEndpoint implements HttpHandler {
             return null;
         }
         return new ErasureScope.Entity(ids.first());
+    }
+
+    /**
+     * Answers that no entity in the namespace is the one the request named, by name or by id.
+     *
+     * @param exchange  The request to answer
+     * @param requested What the body asked for: a name, or an entity scope
+     * @throws IOException if the reply cannot be written
+     */
+    private static void sendNotFound(HttpExchange exchange, Requested requested)
+            throws IOException {
+        if (requested.scope() instanceof ErasureScope.Entity entity) {
+            ResponseBody.sendJson(exchange, 404,
+                "{\"error\": \"" + JsonText.escape(
+                    new GraphErasureService.UnknownEntityException(entity.entityId())
+                        .getMessage()) + "\"}");
+            return;
+        }
+        sendNotNamed(exchange, requested.entityName());
     }
 
     /**

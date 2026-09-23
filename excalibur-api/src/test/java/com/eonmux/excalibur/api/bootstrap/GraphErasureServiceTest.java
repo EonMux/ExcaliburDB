@@ -28,6 +28,7 @@ import java.time.Duration;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * What an erasure attempt costs the node when there is nothing to erase.
@@ -107,12 +108,11 @@ class GraphErasureServiceTest {
         @Test
         @DisplayName("the served graph is closed around the attempt, because one may rewrite it")
         void closesAroundTheAttempt(@TempDir Path root) throws IOException {
-            // Past its deadline, so the policy says run; and naming an entity the store does not
-            // hold, so the attempt finds nothing to rewrite and the reopened stack is the one
-            // this test started with. What is being checked is that the close happened at all.
+            // Past its deadline, so the policy says run. What is being checked is that the close
+            // happened at all: the reopened stack is a different pipeline.
             GraphErasureService service = serviceOver(root, Duration.ZERO);
             GraphRagPipeline before = served(holder).orElseThrow();
-            service.submit(new ErasureScope.Entity(UNKNOWN_ENTITY));
+            service.submit(new ErasureScope.Entity(BABBAGE));
 
             service.compactIfDue();
 
@@ -127,6 +127,97 @@ class GraphErasureServiceTest {
             assertThat(service.outstandingCount()).isZero();
             service.submit(new ErasureScope.Entity(ADA));
             assertThat(service.outstandingCount()).isEqualTo(1);
+        }
+    }
+
+    @Nested
+    @DisplayName("Which entities an erasure may name")
+    class Existence {
+
+        @Test
+        @DisplayName("an id nothing in the namespace was given is refused, and nothing recorded")
+        void anUnassignedIdIsRefused(@TempDir Path root) throws IOException {
+            GraphErasureService service = serviceOver(root);
+
+            assertThatThrownBy(() -> service.submit(new ErasureScope.Entity(UNKNOWN_ENTITY)))
+                .isInstanceOf(GraphErasureService.UnknownEntityException.class)
+                .hasMessage("no entity in this namespace has id " + UNKNOWN_ENTITY)
+                .extracting(e -> ((GraphErasureService.UnknownEntityException) e).entityId())
+                .isEqualTo((long) UNKNOWN_ENTITY);
+            assertThat(service.outstandingCount()).isZero();
+        }
+
+        @Test
+        @DisplayName("scopes that select by provenance are recorded whatever the graph holds")
+        void otherScopesAreNotChecked(@TempDir Path root) throws IOException {
+            GraphErasureService service = serviceOver(root);
+
+            service.submit(new ErasureScope.Source(SourceType.DOCUMENT, 404));
+            service.submit(new ErasureScope.ExtractorVersion(404));
+
+            assertThat(service.outstandingCount()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("an id only the served graph names waits out a build or compaction, which "
+            + "could replace that graph with one that does not name it")
+        void aServedOnlyIdWaitsForAReplacement(@TempDir Path root) throws Exception {
+            GraphErasureService service = serviceOver(root);
+            java.util.concurrent.ExecutorService other =
+                java.util.concurrent.Executors.newSingleThreadExecutor();
+            java.util.concurrent.locks.ReentrantLock replacement = holder.replacementLock();
+            replacement.lock();
+            java.util.concurrent.Future<Long> submitted;
+            try {
+                submitted = other.submit(() -> service.submit(new ErasureScope.Entity(ADA)));
+                Thread.sleep(200);
+                assertThat(submitted.isDone())
+                    .as("judged and recorded under the lock a replacement holds")
+                    .isFalse();
+            } finally {
+                replacement.unlock();
+            }
+            try {
+                assertThat(submitted.get(10, java.util.concurrent.TimeUnit.SECONDS)).isNotNull();
+                assertThat(service.outstandingCount()).isEqualTo(1);
+            } finally {
+                other.shutdownNow();
+            }
+        }
+
+        @Test
+        @DisplayName("a staged id is accepted without waiting on a replacement")
+        void aStagedIdDoesNotWait(@TempDir Path root) throws Exception {
+            Path graph = root.resolve("graph");
+            buildGraph(graph);
+            Config config = new Config(Map.of());
+            holder = new GraphRagHolder(graph, null);
+            try (com.eonmux.excalibur.graph.staging.GraphStagingStore staging =
+                     com.eonmux.excalibur.graph.staging.GraphStagingStore.open(
+                         root.resolve("graph-staging"));
+                 ErasureLog log = ErasureLog.open(root.resolve("erasure.log"))) {
+                GraphErasureService service = new GraphErasureService(
+                    new GraphErasureCoordinator(log,
+                        CompactionPolicy.standard(0.2, Duration.ofSeconds(3600),
+                            Integer.MAX_VALUE),
+                        Clock.systemUTC(), staging),
+                    holder, config, GraphModelClients.forConfig(config));
+                int hypatia = staging.entityIdOf("Hypatia");
+                java.util.concurrent.ExecutorService other =
+                    java.util.concurrent.Executors.newSingleThreadExecutor();
+                java.util.concurrent.locks.ReentrantLock replacement = holder.replacementLock();
+                replacement.lock();
+                try {
+                    assertThat(other.submit(() -> service.submit(new ErasureScope.Entity(hypatia)))
+                        .get(10, java.util.concurrent.TimeUnit.SECONDS))
+                        .as("a staged id is never given up, so nothing a replacement does can "
+                            + "change the answer")
+                        .isNotNull();
+                } finally {
+                    replacement.unlock();
+                    other.shutdownNow();
+                }
+            }
         }
     }
 

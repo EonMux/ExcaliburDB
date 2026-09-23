@@ -83,6 +83,20 @@ class GraphErasureEndpointTest {
         return call("POST", body, null);
     }
 
+    /** Gives a label an id in the shared namespace, as ingesting a fact about it would. */
+    private int staged(String label) throws IOException {
+        return tenants.shared().staging().entityIdOf(label);
+    }
+
+    /** An entity-scoped request body naming {@code id}. */
+    private static String entity(long id) {
+        return "{\"scope\": \"entity\", \"entity_id\": " + id + "}";
+    }
+
+    /** A source-scoped request body: recorded in any namespace, which it creates. */
+    private static final String SOURCE =
+        "{\"scope\": \"source\", \"source_type\": \"DOCUMENT\", \"source_id\": 1}";
+
     private Response call(String method, String body, String namespace) throws IOException {
         HttpExchange exchange = mock(HttpExchange.class);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -112,7 +126,7 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("an entity-scoped request is accepted and given an id")
         void entityScopeIsAccepted() throws IOException {
-            Response response = post("{\"scope\": \"entity\", \"entity_id\": 42}");
+            Response response = post(entity(staged("Ada Quazzlethorpe")));
 
             assertThat(response.status())
                 .as("202: recorded, not necessarily yet carried out")
@@ -146,7 +160,8 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("scope names are matched without regard to case or surrounding space")
         void scopeNamesAreNormalised() throws IOException {
-            assertThat(post("{\"scope\": \"  ENTITY \", \"entity_id\": 1}").status())
+            assertThat(post("{\"scope\": \"  ENTITY \", \"entity_id\": " + staged("Ada")
+                + "}").status())
                 .isEqualTo(202);
             assertThat(post("{\"scope\": \"Source\", \"source_type\": \"document\", "
                 + "\"source_id\": 1}").status()).isEqualTo(202);
@@ -155,10 +170,8 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("every request is counted as outstanding until a compaction satisfies it")
         void obligationsAccumulate() throws IOException {
-            long first = (Long) Json.at(post(
-                "{\"scope\": \"entity\", \"entity_id\": 1}").json(), "outstanding");
-            long second = (Long) Json.at(post(
-                "{\"scope\": \"entity\", \"entity_id\": 2}").json(), "outstanding");
+            long first = (Long) Json.at(post(entity(staged("Ada"))).json(), "outstanding");
+            long second = (Long) Json.at(post(entity(staged("Grace"))).json(), "outstanding");
 
             assertThat(second)
                 .as("an accepted obligation that is not yet carried out stays counted")
@@ -168,10 +181,8 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("request ids are distinct, so a client can refer to its own request")
         void requestIdsAreDistinct() throws IOException {
-            Object a = Json.at(post("{\"scope\": \"entity\", \"entity_id\": 1}").json(),
-                "request_id");
-            Object b = Json.at(post("{\"scope\": \"entity\", \"entity_id\": 2}").json(),
-                "request_id");
+            Object a = Json.at(post(entity(staged("Ada"))).json(), "request_id");
+            Object b = Json.at(post(entity(staged("Grace"))).json(), "request_id");
 
             assertThat(a).isNotEqualTo(b);
         }
@@ -189,8 +200,8 @@ class GraphErasureEndpointTest {
             // Leaving it outstanding instead would make the latency condition fire on every
             // sweep from here to the end of time, which is the same reason the built path marks
             // a request that matched no edge satisfied rather than carrying it forever.
-            Response response = post(
-                "{\"scope\": \"entity\", \"entity_id\": 42, \"compact\": true}");
+            Response response = post("{\"scope\": \"entity\", \"entity_id\": "
+                + staged("Ada Quazzlethorpe") + ", \"compact\": true}");
 
             assertThat(response.status()).isEqualTo(202);
             assertThat(Json.at(response.json(), "accepted")).isEqualTo(Boolean.TRUE);
@@ -277,7 +288,7 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("the numeric fields are numbers, not quoted strings")
         void numericFieldsAreNumbers() throws IOException {
-            Object json = post("{\"scope\": \"entity\", \"entity_id\": 42}").json();
+            Object json = post(entity(staged("Ada"))).json();
 
             assertThat(Json.at(json, "request_id")).isInstanceOf(Long.class);
             assertThat(Json.at(json, "edges_removed")).isInstanceOf(Long.class);
@@ -295,7 +306,7 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("without compact:true the policy decides, and the answer says which happened")
         void compactionIsReportedEitherWay() throws IOException {
-            Response response = post("{\"scope\": \"entity\", \"entity_id\": 42}");
+            Response response = post(entity(staged("Ada")));
 
             assertThat(Json.at(response.json(), "compacted")).isInstanceOf(Boolean.class);
         }
@@ -417,7 +428,7 @@ class GraphErasureEndpointTest {
             // connection close rather than a status.
             Files.writeString(root.resolve("acme"), "not a directory");
 
-            Response response = call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}", "acme");
+            Response response = call("POST", SOURCE, "acme");
 
             assertThat(response.status()).isEqualTo(500);
             assertThat(Json.stringAt(response.json(), "error"))
@@ -444,7 +455,7 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("no header means the shared namespace")
         void noHeaderIsShared() throws IOException {
-            Response response = call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}", null);
+            Response response = call("POST", entity(staged("Ada")), null);
 
             assertThat(response.status()).isEqualTo(202);
             assertThat(Json.stringAt(response.json(), "namespace"))
@@ -454,9 +465,9 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("a request is erased from the namespace it names, and no other")
         void obligationsAreScopedToTheirNamespace() throws IOException {
-            call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}", "tenant-a");
-            call("POST", "{\"scope\": \"entity\", \"entity_id\": 2}", "tenant-a");
-            Response b = call("POST", "{\"scope\": \"entity\", \"entity_id\": 3}", "tenant-b");
+            call("POST", SOURCE, "tenant-a");
+            call("POST", SOURCE, "tenant-a");
+            Response b = call("POST", SOURCE, "tenant-b");
 
             assertThat(Json.stringAt(b.json(), "namespace")).isEqualTo("tenant-b");
             assertThat(Json.at(b.json(), "outstanding"))
@@ -485,7 +496,7 @@ class GraphErasureEndpointTest {
         @DisplayName("a name missing from an absent namespace is answered exactly as one missing "
             + "from a namespace that exists")
         void anAbsentNamespaceIsIndistinguishable() throws IOException {
-            call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}", "tenant-real");
+            call("POST", SOURCE, "tenant-real");
 
             Response real = call("POST",
                 "{\"scope\": \"entity\", \"entity_name\": \"Nobody\"}", "tenant-real");
@@ -500,7 +511,7 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("a name that resolves in an existing namespace records the obligation there")
         void aNameInAnExistingNamespaceIsRecorded() throws IOException {
-            call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}", "tenant-c");
+            call("POST", SOURCE, "tenant-c");
             try (var lease = tenants.borrow(NamespaceId.of("tenant-c"))) {
                 lease.resource().staging().entityIdOf("Ada Quazzlethorpe");
                 lease.resource().staging().flush();
@@ -514,6 +525,23 @@ class GraphErasureEndpointTest {
         }
 
         @Test
+        @DisplayName("an id looked up in a namespace that does not exist is a 404 that creates "
+            + "nothing, answered as an existing namespace answers an id it never gave out")
+        void anIdInAnAbsentNamespaceCreatesNothing() throws IOException {
+            call("POST", SOURCE, "tenant-real");
+
+            Response absent = call("POST", entity(0), "tenant-new");
+            Response real = call("POST", entity(0), "tenant-real");
+
+            assertThat(absent.status()).isEqualTo(404);
+            assertThat(absent).isEqualTo(real);
+            assertThat(NamespaceId.of("tenant-new").directoryUnder(root))
+                .as("no directory for a namespace nothing was recorded against")
+                .doesNotExist();
+            assertThat(tenants.openNamespaces()).doesNotContain(NamespaceId.of("tenant-new"));
+        }
+
+        @Test
         @DisplayName("an unusable namespace is refused rather than silently shared")
         void invalidNamespaceIsRefused() throws IOException {
             Response response = call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}",
@@ -522,6 +550,55 @@ class GraphErasureEndpointTest {
             assertThat(response.status())
                 .as("a namespace that could escape its directory must not fall back to shared")
                 .isEqualTo(400);
+        }
+    }
+
+    @Nested
+    @DisplayName("an id must name an entity")
+    class UnassignedIds {
+
+        @Test
+        @DisplayName("an id nothing in the namespace was given is a 404, and nothing is recorded")
+        void anUnassignedIdIsNotFound() throws IOException {
+            // Recording it would leave an obligation that erases whichever entity is given the
+            // id next: ids are handed out in order, and the request carries nothing but the id.
+            staged("Ada");
+
+            Response response = post(entity(1));
+
+            assertThat(response.status()).isEqualTo(404);
+            assertThat(Json.stringAt(response.json(), "error"))
+                .isEqualTo("no entity in this namespace has id 1");
+            assertThat(tenants.shared().erasureService().outstandingCount()).isZero();
+            assertThat(staged("Grace"))
+                .as("the id is handed out afterwards, to an entity nobody asked to erase")
+                .isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("an id is accepted from the moment it is handed out")
+        void anIdIsAcceptedOnceAssigned() throws IOException {
+            assertThat(post(entity(0)).status()).isEqualTo(404);
+            int ada = staged("Ada");
+
+            assertThat(post(entity(ada)).status()).isEqualTo(202);
+        }
+
+        @Test
+        @DisplayName("an id the served graph names is accepted, and erased from it")
+        void aBuiltEntityIsAccepted() throws IOException {
+            GraphStagingStore staging = tenants.shared().staging();
+            int ada = staging.entityIdOf("Ada Quazzlethorpe");
+            staging.append(ExtractedTriple.alwaysValid("Ada Quazzlethorpe", "knows",
+                "Bob Ordinary", new Provenance(SourceType.DOCUMENT, 42, 90, 1)));
+            staging.flush();
+            assertThat(tenants.shared().buildService().build().published()).isTrue();
+
+            Response response = post("{\"scope\": \"entity\", \"entity_id\": " + ada
+                + ", \"compact\": true}");
+
+            assertThat(response.status()).isEqualTo(202);
+            assertThat(Json.at(response.json(), "edges_removed")).isEqualTo(1L);
         }
     }
 

@@ -258,6 +258,19 @@ public final class LabelDictionary
     }
 
     /**
+     * Whether a name is recorded for an id.
+     *
+     * <p>{@link #apply} answers every id, synthesising a name for one it does not hold, so it
+     * cannot say whether the graph this dictionary was published with has the id at all.</p>
+     *
+     * @param id The entity or relation id
+     * @return true when the dictionary has an entry for it
+     */
+    public boolean contains(long id) {
+        return search(id) >= 0;
+    }
+
+    /**
      * The name for an id, or {@code <prefix><id>} when none is recorded.
      *
      * @param id The entity or relation id

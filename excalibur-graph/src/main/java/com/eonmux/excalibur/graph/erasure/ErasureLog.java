@@ -394,15 +394,33 @@ public final class ErasureLog implements AutoCloseable {
      * @throws NullPointerException if {@code file} is null
      */
     public static long highestEntityOwed(Path file) throws IOException {
+        return entitiesOwed(file).stream().mapToLong(Long::longValue).max().orElse(-1);
+    }
+
+    /**
+     * The entity id each outstanding entity-scoped request names, read from the file without
+     * opening it.
+     *
+     * <p>For an offline checker asking whether any of them names an id nothing was ever given,
+     * which the node discharges when it next opens the namespace; see
+     * {@link GraphErasureCoordinator#dischargeUnassigned}.</p>
+     *
+     * @param file The log file; need not exist
+     * @return The ids, in the order the requests were accepted; an id named twice appears twice
+     * @throws IOException if the file exists and is not an erasure log this build can read
+     * @throws LogCorruptionException if damage has an intact record behind it
+     * @throws NullPointerException if {@code file} is null
+     */
+    public static List<Long> entitiesOwed(Path file) throws IOException {
         Objects.requireNonNull(file, "file must not be null");
         if (!Files.exists(file)) {
-            return -1;
+            return List.of();
         }
         if (Files.size(file) < HEADER_BYTES) {
             // A torn creation owes nothing; anything else that short is refused as the open
             // refuses it.
             inspectLog(file);
-            return -1;
+            return List.of();
         }
         Replay replay = replay(file);
         TailIntegrity.requireTornTail(file, "erasure log", replay.contents(),
@@ -410,9 +428,8 @@ public final class ErasureLog implements AutoCloseable {
         return replay.outstanding().values().stream()
             .map(ErasureRequest::scope)
             .filter(ErasureScope.Entity.class::isInstance)
-            .mapToLong(scope -> ((ErasureScope.Entity) scope).entityId())
-            .max()
-            .orElse(-1);
+            .map(scope -> ((ErasureScope.Entity) scope).entityId())
+            .toList();
     }
 
     /**

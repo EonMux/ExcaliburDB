@@ -111,8 +111,9 @@ class GraphTenantsTest {
                     Map.of("excalibur.graph.erasure-max-latency-seconds", "1"))) {
                 try (NamespaceRegistry.Lease<GraphTenant> lease =
                          tenants.borrow(NamespaceId.of("acme"))) {
-                    lease.resource().erasureService()
-                        .submit(new ErasureScope.Entity(7));
+                    GraphTenant tenant = lease.resource();
+                    tenant.erasureService().submit(
+                        new ErasureScope.Entity(tenant.staging().entityIdOf("Ada")));
                 }
 
                 // Nothing has been built, so no store can be rewritten - but the sweep must

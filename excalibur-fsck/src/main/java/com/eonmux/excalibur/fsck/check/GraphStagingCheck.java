@@ -14,6 +14,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 /**
  * Checks the append-only logs a tenant's {@code graph-staging} directory holds.
@@ -58,6 +59,17 @@ import java.nio.file.Path;
  * {@link CheckStatus#CORRUPT} here, asked of the same holders the node's tenant names; the
  * {@link CheckStatus#UNSEALED} verdict says how many intact labels the open would cut off with the
  * damage.</p>
+ *
+ * <h2>Erasures naming an entity nothing was given</h2>
+ * <p>An outstanding entity-scoped erasure records an id and nothing else. The node refuses one for
+ * an id nothing in the namespace holds, and discharges any such request already in the log when it
+ * next opens the namespace, since the only entity it could ever erase is whichever is given that
+ * id next. The check names how many outstanding requests are of that kind, judged as the node
+ * judges them: an id is held when the entity labels hold it, as the node would open them, or when
+ * the graph published beside the staging directory, or one a publish set aside, names it. They do
+ * not change the verdict - every record matched its checksum, and the node's open deals with
+ * them - but a log that will lose requests when the node next opens it is worth being told
+ * about.</p>
  *
  * <h2>A file shorter than its header</h2>
  * <p>Each log is created by writing its header, so a file shorter than one whose bytes begin the
@@ -164,13 +176,85 @@ public final class GraphStagingCheck {
         ReferencedLabels owed = ReferencedLabels.all(
             ReferencedLabels.owedIn(staging.resolve(ERASURE_LOG)),
             ReferencedLabels.owedIn(staging.resolve(WITHDRAWAL_LOG)));
+        Path graph = graphBeside(staging);
+        return graph == null ? owed : ReferencedLabels.all(ReferencedLabels.publishedIn(graph), owed);
+    }
+
+    /**
+     * The graph directory a staging directory's graph is published to.
+     *
+     * @param staging The staging directory
+     * @return The graph directory, which need not exist, or null when the staging directory is
+     *         not named after one
+     */
+    private static Path graphBeside(Path staging) {
         String name = staging.getFileName().toString();
         if (!name.endsWith(DIRECTORY_SUFFIX) || name.length() == DIRECTORY_SUFFIX.length()) {
-            return owed;
+            return null;
         }
-        Path graph = staging.resolveSibling(
+        return staging.resolveSibling(
             name.substring(0, name.length() - DIRECTORY_SUFFIX.length()));
-        return ReferencedLabels.all(ReferencedLabels.publishedIn(graph), owed);
+    }
+
+    /**
+     * Says how many outstanding entity-scoped requests in a log name an id nothing holds.
+     *
+     * <p>See the class comment. Judged against the entity labels as the node would open them and
+     * the graph published beside the staging directory; when the labels cannot be judged, that is
+     * said instead, since which requests the node would discharge then depends on what an
+     * operator does about them.</p>
+     *
+     * @param log A log in the erasure log's format, already replayed without error
+     * @return A clause to append to the verdict, or an empty string when there is nothing to say
+     * @throws IOException if the log or a published dictionary cannot be read
+     */
+    private static String unassignedEntities(Path log) throws IOException {
+        List<Long> owed = ErasureLog.entitiesOwed(log);
+        if (owed.isEmpty()) {
+            return "";
+        }
+        long unassigned;
+        try {
+            unassigned = unassignedAmong(owed, log.toAbsolutePath().getParent());
+        } catch (IOException | RuntimeException e) {
+            return "; whether the " + owed.size() + " entity id(s) they name were ever handed out "
+                + "cannot be judged, because the entity labels or the published graph beside the "
+                + "log cannot be read: " + e.getMessage();
+        }
+        if (unassigned == 0) {
+            return "";
+        }
+        return "; " + unassigned + " of them name an entity id nothing in this namespace holds - "
+            + "no staged label, and no published graph - and the node discharges those when it "
+            + "next opens the namespace rather than let them erase whichever entity is given the "
+            + "id next";
+    }
+
+    /**
+     * Counts the ids that neither the entity labels nor a published graph hold.
+     *
+     * @param owed    The ids outstanding requests name
+     * @param staging The staging directory the log is in
+     * @return How many are held by nothing
+     * @throws IOException if the labels or a published dictionary cannot be read, or the labels
+     *                     hold damage the node refuses
+     */
+    private static long unassignedAmong(List<Long> owed, Path staging)
+            throws IOException {
+        Path interner = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+        long assigned = Files.exists(interner)
+            ? GraphStagingStore.inspectLabels(interner, labelHolders(interner)).records()
+            : 0;
+        Path graph = graphBeside(staging);
+        long unassigned = 0;
+        for (long entityId : owed) {
+            boolean held = entityId < assigned
+                || (graph != null && ReferencedLabels.publishedEntity(graph, entityId));
+            if (!held) {
+                unassigned++;
+            }
+        }
+        return unassigned;
     }
 
     /** One log's read-only inspection, as its owning class declares it. */
@@ -233,7 +317,7 @@ public final class GraphStagingCheck {
             ErasureLog.Inspection inspection = ErasureLog.inspectLog(file);
             LogInspection log = inspection.log();
             String outstanding = inspection.pending().count() + " " + owed
-                + " are still outstanding";
+                + " are still outstanding" + unassignedEntities(file);
             if (log.hasTornTail()) {
                 return new FileCheck(file, relative, format, "v" + ErasureLog.VERSION,
                     CheckStatus.UNSEALED,

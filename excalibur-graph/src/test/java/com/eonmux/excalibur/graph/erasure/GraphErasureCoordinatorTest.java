@@ -816,4 +816,86 @@ class GraphErasureCoordinatorTest {
             writer.build(graphDir, staging.entityCount());
         }
     }
+
+    @Nested
+    @DisplayName("which entity ids exist")
+    class AssignedEntities {
+
+        @Test
+        @DisplayName("an id is staged once the interner has handed it out, and never before")
+        void stagedIdsAreTheInternersOwn(@TempDir Path dir) throws IOException {
+            try (com.eonmux.excalibur.graph.staging.GraphStagingStore staging =
+                     com.eonmux.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"));
+                 ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+
+                assertThat(coordinator.stagedEntity(0)).isFalse();
+                int alice = staging.entityIdOf("alice");
+
+                assertThat(coordinator.stagedEntity(alice)).isTrue();
+                assertThat(coordinator.stagedEntity(alice + 1)).isFalse();
+                assertThat(coordinator.stagedEntity(-1)).isFalse();
+                assertThat(new GraphErasureCoordinator(log, ALWAYS, CLOCK).stagedEntity(alice))
+                    .as("a coordinator with no staging behind it has staged nothing")
+                    .isFalse();
+            }
+        }
+
+        @Test
+        @DisplayName("an id only the published graph names exists, served or displaced")
+        void publishedIdsExist(@TempDir Path dir) throws IOException {
+            Path graphDir = dir.resolve("graph");
+            try (com.eonmux.excalibur.graph.staging.GraphStagingStore staging =
+                     com.eonmux.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"))) {
+                staging.append(new com.eonmux.excalibur.graph.staging.ExtractedTriple(
+                    "alice", "knows", "bob", Integer.MIN_VALUE, TemporalFilter.OPEN,
+                    new Provenance(SourceType.DOCUMENT, 555, 90, 1)));
+                staging.flush();
+                com.eonmux.excalibur.graph.staging.GraphBuilder.build(staging, graphDir);
+            }
+            try (ErasureLog log = ErasureLog.open(dir.resolve("requests.log"))) {
+                GraphErasureCoordinator coordinator = new GraphErasureCoordinator(log, ALWAYS, CLOCK);
+
+                assertThat(coordinator.entityAssigned(1, graphDir)).isTrue();
+                assertThat(coordinator.entityAssigned(2, graphDir)).isFalse();
+
+                Files.move(graphDir,
+                    com.eonmux.excalibur.graph.staging.GraphBuilder.previousFor(graphDir));
+                assertThat(coordinator.entityAssigned(1, graphDir))
+                    .as("a graph a publish set aside is restored on open, so it still counts")
+                    .isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("an outstanding request naming an id nothing assigned is discharged, "
+            + "durably, and every other request is left alone")
+        void unassignedRequestsAreDischarged(@TempDir Path dir) throws IOException {
+            Path requests = dir.resolve("requests.log");
+            try (com.eonmux.excalibur.graph.staging.GraphStagingStore staging =
+                     com.eonmux.excalibur.graph.staging.GraphStagingStore.open(dir.resolve("staging"));
+                 ErasureLog log = ErasureLog.open(requests)) {
+                int alice = staging.entityIdOf("alice");
+                log.submit(new ErasureScope.Entity(alice), NOW);
+                long stray = log.submit(new ErasureScope.Entity(42), NOW);
+                log.submit(new ErasureScope.Source(SourceType.DOCUMENT, 42), NOW);
+                GraphErasureCoordinator coordinator =
+                    new GraphErasureCoordinator(log, ALWAYS, CLOCK, staging);
+
+                List<ErasureRequest> discharged =
+                    coordinator.dischargeUnassigned(dir.resolve("graph"));
+
+                assertThat(discharged).extracting(ErasureRequest::id).containsExactly(stray);
+                assertThat(coordinator.outstandingCount()).isEqualTo(2);
+                assertThat(coordinator.dischargeUnassigned(dir.resolve("graph")))
+                    .as("nothing is left to discharge")
+                    .isEmpty();
+            }
+            assertThat(ErasureLog.inspect(requests).count())
+                .as("the completion is on disk, not only in memory")
+                .isEqualTo(2);
+            assertThat(ErasureLog.entitiesOwed(requests)).containsExactly(0L);
+        }
+    }
 }
