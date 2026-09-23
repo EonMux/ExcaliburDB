@@ -62,19 +62,4 @@ public record QueryAnswer(ResultPassages passages, ResultPage page, ResultTotal 
     public QueryAnswer ignoring(List<String> fields) {
         return new QueryAnswer(passages, page, total, explanation, fields);
     }
-
-    /**
-     * The answer of a search that produced nothing and cannot claim it looked everywhere.
-     *
-     * <p>For the timed-out and cancelled exits. They return no results and must still return
-     * the same envelope, because a client that has to test for the page block on some answers
-     * cannot use it on any.</p>
-     *
-     * @param limit The page size the request asked for
-     * @return The answer
-     */
-    public static QueryAnswer nothing(int limit) {
-        return new QueryAnswer(null, ResultPage.of(0, limit, 0),
-            new ResultTotal(0, ResultTotal.AT_LEAST), null);
-    }
 }

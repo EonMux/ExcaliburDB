@@ -213,6 +213,9 @@ public final class QueryRequestParser {
                 .llmThreshold(llmThreshold)
                 .oversamplingFactor(oversamplingFactor)
                 .correlationId(correlationId)
+                // A client can only use a result it can name: the node id a result falls back
+                // to without one is renumbered by compaction and names nothing it can fetch.
+                .requireNamedResults(true)
                 .build();
         }
     }

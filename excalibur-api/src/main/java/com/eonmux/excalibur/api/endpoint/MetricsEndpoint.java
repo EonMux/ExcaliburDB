@@ -142,6 +142,12 @@ public final class MetricsEndpoint implements HttpHandler {
         }
         text.counter("excalibur_queries_executed_total", "Queries executed",
                 Metrics.getQueriesExecuted())
+            // A counter, because each drop recurs on every query that reaches the same graph
+            // nodes until their segments' graphs are restored or reindexed; any increase means a
+            // node-to-document mapping is missing entries.
+            .counter("excalibur_query_unnamed_results_dropped_total",
+                "Query results dropped because they carried no document identity",
+                Metrics.getUnnamedResultsDropped())
             .counter("excalibur_entries_ingested_total", "Entries ingested",
                 Metrics.getEntriesIngested())
             .gauge("excalibur_ingestion_rate_entries_per_second",
