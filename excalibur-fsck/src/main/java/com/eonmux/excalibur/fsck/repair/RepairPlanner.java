@@ -455,12 +455,17 @@ public final class RepairPlanner {
                         + "preserved under the quarantine directory - which matters most for "
                         + "a write-ahead log, whose unintegrated records are the only copy "
                         + "of themselves left");
-            case "staging-leftover" ->
-                quarantineByRelative(scan, finding.subject(), actions,
-                    RepairKind.QUARANTINE_STAGING_LEFTOVER,
-                    "Nothing reads a staged file: it becomes state only by being renamed over "
-                        + "its destination, and it was not. Every byte is preserved under the "
-                        + "quarantine directory");
+            case "staging-leftover" -> {
+                // A graph staging rewrite is left for the node, which deletes it on open: it
+                // may hold what an erasure removed, and quarantine would keep every byte.
+                if (!GraphStagingCheck.isUnfinishedRewrite(finding.subject())) {
+                    quarantineByRelative(scan, finding.subject(), actions,
+                        RepairKind.QUARANTINE_STAGING_LEFTOVER,
+                        "Nothing reads a staged file: it becomes state only by being renamed "
+                            + "over its destination, and it was not. Every byte is preserved "
+                            + "under the quarantine directory");
+                }
+            }
             case "routing-names-missing-segment", "lexical-segment-missing",
                  "lexical-column-missing" ->
                 operator.add(finding.subject() + ": " + finding.detail());

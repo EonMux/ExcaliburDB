@@ -157,8 +157,13 @@ public final class FileInspector {
                     + "not be. The key tables, tombstones and erasure log of the segments the "
                     + "manifest names are verified with the store; this was not");
             case STAGING_LEFTOVER -> unverifiable(file, relative, "staging leftover",
-                "this is a half-finished write, not state: nothing reads it, and it is here "
-                    + "because the operation that staged it did not finish");
+                GraphStagingCheck.isUnfinishedRewrite(relative)
+                    ? "a rewrite of a graph staging log that did not finish: nothing reads it, "
+                    + "and the log it was replacing is intact. The node deletes it when the "
+                    + "namespace next opens; it may hold what an erasure has since removed, so "
+                    + "leave it for the node to delete rather than moving it anywhere"
+                    : "this is a half-finished write, not state: nothing reads it, and it is "
+                    + "here because the operation that staged it did not finish");
             case DIAGNOSTIC_DUMP -> diagnosticDump(file, relative);
             case UNRECOGNISED -> unverifiable(file, relative, "unrecognised",
                 "nothing in this build recognises this file, so it was not read at all. It is "

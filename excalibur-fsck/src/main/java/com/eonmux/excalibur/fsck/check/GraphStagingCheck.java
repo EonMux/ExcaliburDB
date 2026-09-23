@@ -126,6 +126,30 @@ public final class GraphStagingCheck {
     }
 
     /**
+     * Reports whether a file is a rewrite of a staging log that did not finish.
+     *
+     * <p>The node builds each rewrite beside the log it replaces and renames it over that log,
+     * so one that is still here was never published and the log it was replacing is intact.
+     * Being a copy of that log less what was being removed, it can hold what an erasure has
+     * since removed; the store deletes it when it next opens, and nothing should move it
+     * anywhere that would keep it.</p>
+     *
+     * @param relative The file's path relative to the data directory, using "/" separators
+     * @return true for one of {@link GraphStagingStore#UNFINISHED_REWRITES} directly in a
+     *         graph staging directory
+     */
+    public static boolean isUnfinishedRewrite(String relative) {
+        int slash = relative.lastIndexOf('/');
+        if (slash < 0) {
+            return false;
+        }
+        String parent = relative.substring(0, slash);
+        String directory = parent.substring(parent.lastIndexOf('/') + 1);
+        return directory.endsWith(DIRECTORY_SUFFIX)
+            && GraphStagingStore.UNFINISHED_REWRITES.contains(relative.substring(slash + 1));
+    }
+
+    /**
      * Reports whether a file name is one of the staging logs.
      *
      * @param fileName The file's name

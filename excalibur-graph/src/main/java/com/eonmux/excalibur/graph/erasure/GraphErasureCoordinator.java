@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.graph.erasure;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.Collection;
@@ -13,6 +14,7 @@ import java.util.Objects;
 import com.eonmux.excalibur.graph.erasure.CompactionPolicy.CompactionStats;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor.CompactionResult;
 import com.eonmux.excalibur.graph.file.GraphCorruptionException;
+import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.ReferencedLabels;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
@@ -585,14 +587,23 @@ public final class GraphErasureCoordinator {
      * could fail to reach; the withheld cases that remain are the ones staging itself reports,
      * such as snippets carrying no recorded origin.
      *
-     * @param consultPolicy Whether the policy decides, as it does for the served store. With no
-     *                      edges there is no tombstone ratio and no segment count, so the only
-     *                      condition that can fire is the latency bound - which is the one that
-     *                      belongs here, since the obligation is the whole of what is waiting
+     * <p>No graph is served, but a build that crashed may have left its scratch beside where one
+     * would be, assembled from staging before this erased it; it is removed before anything is
+     * discharged. See {@link #removeUnservedCopies}.</p>
+     *
+     * @param graphDirectory Where the namespace's graph would be served from; nothing is there
+     * @param consultPolicy  Whether the policy decides, as it does for the served store. With no
+     *                       edges there is no tombstone ratio and no segment count, so the only
+     *                       condition that can fire is the latency bound - which is the one that
+     *                       belongs here, since the obligation is the whole of what is waiting
      * @return What it did; {@code ran} is always false, because no store was rewritten
-     * @throws IOException if the staging logs cannot be rewritten or the completions recorded
+     * @throws IOException if the staging logs cannot be rewritten, a copy beside the graph
+     *                     directory cannot be removed, or the completions recorded
+     * @throws NullPointerException if {@code graphDirectory} is null
      */
-    public CompactionOutcome eraseStagedOnly(boolean consultPolicy) throws IOException {
+    public CompactionOutcome eraseStagedOnly(Path graphDirectory, boolean consultPolicy)
+            throws IOException {
+        Objects.requireNonNull(graphDirectory, "graphDirectory must not be null");
         synchronized (compactionLock) {
             List<ErasureRequest> requests = log.outstanding();
             if (requests.isEmpty()) {
@@ -609,6 +620,9 @@ public final class GraphErasureCoordinator {
                 }
             }
 
+            // Before staging is touched: nothing reads a copy nothing serves, and a displaced
+            // graph that refuses the pass is better found while staging still matches it.
+            removeUnservedCopies(graphDirectory);
             GraphStagingStore.EraseResult staged = eraseStaged(requests);
             // No served directory exists, so nothing is unreached: a request that staging could
             // answer has been answered in full.
@@ -680,6 +694,9 @@ public final class GraphErasureCoordinator {
                 if (compaction.rewritten()) {
                     ours = false;
                 }
+                if (!requests.isEmpty()) {
+                    removeUnservedCopies(graphDirectory);
+                }
 
                 // Completed after the rewrite, never before. A crash in this gap repeats an
                 // erasure that has already removed everything it names, which costs a scan; the
@@ -708,6 +725,57 @@ public final class GraphErasureCoordinator {
                 if (ours) {
                     store.close();
                 }
+            }
+        }
+    }
+
+    /**
+     * Removes every copy of the graph beside {@code graphDirectory} that nothing will serve,
+     * durably, before a request is discharged.
+     *
+     * <h3>Why an erasure has to</h3>
+     * <p>An erasure promises that what it covers no longer exists on disk, and staging and the
+     * served graph are not the only places it can. A build that crashed leaves its scratch
+     * directory - a whole graph assembled from staging as it then was - until the next build
+     * clears it; a compaction that crashed leaves its own; and a publish that crashed after both
+     * of its renames leaves the graph it replaced beside the new one. None is ever served, and
+     * each may hold exactly what this erasure removed from staging, so each is removed here, in
+     * the gap between applying the requests and recording them discharged.</p>
+     *
+     * <h3>Why this may remove the compaction's scratch</h3>
+     * <p>A node reads a compaction's scratch as a sign that an erasure was interrupted and the
+     * graph may still hold what it erases. That sign has done its work by now: a node that found
+     * it withholds the graph and records a marker before it compacts, and a compaction that
+     * erases staging has its guard record the same marker first. The requests it signalled have
+     * just been applied, which is what the sign was asking for.</p>
+     *
+     * <p>A graph set aside with nothing served in its place is not removed: it is the graph,
+     * which recovery restores. The caller recovers an interrupted publish before compacting; one
+     * still found here is refused rather than discharged over.</p>
+     *
+     * @param graphDirectory Where the namespace's graph is served from
+     * @throws IOException if a copy cannot be removed or its removal forced, or a displaced graph
+     *                     is waiting to be restored
+     */
+    private static void removeUnservedCopies(Path graphDirectory) throws IOException {
+        boolean served = Files.isDirectory(graphDirectory);
+        if (!served && GraphBuilder.hasDisplacedGraph(graphDirectory)) {
+            throw new IOException("a graph a publish set aside is beside " + graphDirectory
+                + " with nothing served in its place; it may hold what the outstanding erasures "
+                + "cover, so they are not discharged until recovery has restored it and they "
+                + "have been applied to it");
+        }
+        List<Path> copies = new ArrayList<>(List.of(GraphBuilder.scratchFor(graphDirectory),
+            EdgeStoreCompactor.scratchFor(graphDirectory)));
+        if (served) {
+            copies.add(GraphBuilder.previousFor(graphDirectory));
+            copies.add(GraphBuilder.retiredFor(graphDirectory));
+        }
+        for (Path copy : copies) {
+            if (Files.exists(copy)) {
+                GraphBuilder.discard(copy);
+                LOGGER.info("removed {}, which nothing serves and which may hold what the "
+                    + "erasure being discharged covers", copy);
             }
         }
     }

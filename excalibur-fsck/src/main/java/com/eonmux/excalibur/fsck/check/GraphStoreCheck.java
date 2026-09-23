@@ -374,10 +374,13 @@ public final class GraphStoreCheck {
         /** A displaced copy beside the graph that supersedes it, which the node deletes. */
         DELETED_ON_OPEN,
 
-        /** A build's scratch, which the next build deletes before writing. */
+        /** A build's scratch, which the node deletes on open and before discharging an erasure. */
         BUILD_SCRATCH,
 
-        /** An erasure compaction's scratch, whose presence the node reads on open. */
+        /**
+         * An erasure compaction's scratch, whose presence the node reads on open as the sign of
+         * an interrupted erasure while one is owed, and deletes otherwise.
+         */
         COMPACTION_SCRATCH;
 
         /**
@@ -405,13 +408,17 @@ public final class GraphStoreCheck {
                     + "facts an erasure has since removed, so leave it for the node to delete "
                     + "rather than moving it anywhere";
                 case BUILD_SCRATCH -> "scratch of a graph build that did not finish. Nothing "
-                    + "reads it, and the next build deletes the directory before it writes "
-                    + "anything";
+                    + "reads it, and the node deletes it when the namespace next opens, and "
+                    + "again before it discharges an erasure; it may hold facts an erasure has "
+                    + "since removed, so leave it for the node to delete rather than moving it "
+                    + "anywhere";
                 case COMPACTION_SCRATCH -> "scratch of an erasure compaction that did not "
-                    + "finish. Nothing reads its contents, but its presence tells the node on "
-                    + "open that an erasure may have been interrupted, and the node applies what "
-                    + "is still owed before it serves the graph; leave it for the next "
-                    + "compaction to delete";
+                    + "finish. Nothing reads its contents, but while erasures are outstanding "
+                    + "against the graph its presence tells the node on open that an erasure "
+                    + "may have been interrupted, and the node applies what is owed before it "
+                    + "serves the graph, deleting this before it discharges them; with nothing "
+                    + "owed, the node deletes it when the namespace next opens. Leave it for "
+                    + "the node rather than moving it anywhere";
             };
         }
     }

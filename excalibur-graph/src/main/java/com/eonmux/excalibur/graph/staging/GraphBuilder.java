@@ -486,7 +486,14 @@ public final class GraphBuilder {
             .toList();
     }
 
-    private static Path retiredFor(Path target) {
+    /**
+     * Where an erasure compaction's swap once set the served graph aside; see
+     * {@link #RETIRED_SUFFIX}.
+     *
+     * @param target Where the graph is served from
+     * @return The sibling that may hold such a graph
+     */
+    public static Path retiredFor(Path target) {
         return target.resolveSibling(target.getFileName() + RETIRED_SUFFIX);
     }
 

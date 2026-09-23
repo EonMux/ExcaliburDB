@@ -530,7 +530,7 @@ public final class GraphErasureService {
                 // discharged only if a graph were ever built, and silently never on a namespace
                 // that is not. The staging pass is the whole of what this namespace holds.
                 GraphErasureCoordinator.CompactionOutcome outcome =
-                    coordinator.eraseStagedOnly(!force);
+                    coordinator.eraseStagedOnly(directory, !force);
                 // Nothing on disk is left to withhold.
                 if (withheld) {
                     withheldForErasure = false;
@@ -607,7 +607,8 @@ public final class GraphErasureService {
      *
      * <p>Called with the replacement lock held and the served stack withdrawn. The compaction's
      * scratch is removed with the graph: a compaction that fails clears its own, and one left by
-     * an earlier crash may hold a partial rewrite of the same damaged graph.</p>
+     * an earlier crash may hold a partial rewrite of the same damaged graph. So is any copy a
+     * publish set aside beside it, which the graph superseded.</p>
      *
      * @param directory The graph directory
      * @param damage    What the compaction refused
@@ -622,8 +623,13 @@ public final class GraphErasureService {
             + "applied to staging alone; POST /v1/graph/build publishes it again from what they "
             + "leave", directory, damage.getMessage());
         GraphBuilder.discard(EdgeStoreCompactor.scratchFor(directory));
+        // Superseded by the graph being discarded, so deleted first: left behind it, either
+        // would read as a graph a publish set aside with nothing in its place.
+        GraphBuilder.discard(GraphBuilder.previousFor(directory));
+        GraphBuilder.discard(GraphBuilder.retiredFor(directory));
         GraphBuilder.discard(directory);
-        GraphErasureCoordinator.CompactionOutcome outcome = coordinator.eraseStagedOnly(!force);
+        GraphErasureCoordinator.CompactionOutcome outcome =
+            coordinator.eraseStagedOnly(directory, !force);
         return new ErasureOutcome(outcome.ran(), outcome.edgesRemoved(),
             outcome.requestsSatisfied(), outcome.requestsWithheld(),
             "the served graph was damaged (" + damage.file() + ") and has been discarded; "

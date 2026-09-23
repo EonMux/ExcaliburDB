@@ -124,7 +124,7 @@ public final class LabelInterner implements AutoCloseable {
     public static final int MAX_LABEL_BYTES = 4096;
 
     /** Suffix of the whole-file replacement a tombstoning rewrite builds before swapping it in. */
-    private static final String REWRITE_SUFFIX = ".rewriting";
+    static final String REWRITE_SUFFIX = ".rewriting";
 
     /** What this log is called in messages. */
     private static final String WHAT = "label interner";
