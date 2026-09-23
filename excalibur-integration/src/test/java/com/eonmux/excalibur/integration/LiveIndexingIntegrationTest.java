@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.integration;
 
 import com.eonmux.excalibur.ingest.pipeline.DocumentBatchBuffer;
-import com.eonmux.excalibur.ingest.pipeline.DocumentBatchPublisher;
 import com.eonmux.excalibur.ingest.processor.TextChunk;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTrackerAdapter;
@@ -51,10 +50,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
  * Integration tests for Phase 10 Feature 85: Live Indexing.
@@ -105,7 +102,6 @@ class LiveIndexingIntegrationTest {
     private WriteLog writeLog;
     private AtomicDocumentWriter documentWriter;
     private DocumentRegistry documentRegistry;
-    private DocumentBatchPublisher publisher;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -129,14 +125,6 @@ class LiveIndexingIntegrationTest {
         // Create ingestion infrastructure
         documentWriter = new AtomicDocumentWriter(writeLog);
         documentRegistry = new DocumentRegistry();
-        publisher = new DocumentBatchPublisher(
-            visibilityTracker,
-            documentRegistry,
-            // com.eonmux.excalibur.store.WriteLog fsyncs inside every append, so the publisher's
-            // durability barrier is already satisfied before the adapter runs.
-            () -> { },
-            new ReentrantLock()
-        );
     }
 
     @AfterEach
@@ -225,10 +213,12 @@ class LiveIndexingIntegrationTest {
         AtomicInteger exceptionCount = new AtomicInteger(0);
         List<String> exceptionMessages = Collections.synchronizedList(new ArrayList<>());
 
-        // (b) Progressive improvement
+        // (b) Progressive improvement. Each reader's own queries run one after another, so its
+        // first and last result counts are ordered in time; counts from different readers are
+        // not, whatever order they reach a shared list in.
         AtomicInteger totalQueries = new AtomicInteger(0);
         AtomicInteger queriesWithResults = new AtomicInteger(0);
-        List<Integer> resultCountSnapshots = Collections.synchronizedList(new ArrayList<>());
+        List<int[]> firstAndLastResultCounts = Collections.synchronizedList(new ArrayList<>());
 
         // (c) Epoch isolation - no torn reads. The chunk ids of each published document are
         // the writer's own knowledge; whether they are VISIBLE is the tracker's answer.
@@ -243,6 +233,13 @@ class LiveIndexingIntegrationTest {
         CountDownLatch startLatch = new CountDownLatch(1);
         CountDownLatch writersDone = new CountDownLatch(numWriterThreads);
         AtomicBoolean writersFinished = new AtomicBoolean(false);
+
+        // Raised by the readers the first time they check a published document's chunks and
+        // the first time a query returns results. Each writer holds after its first document
+        // until both have happened, so the readers make those observations while ingestion is
+        // still under way, not only when the scheduler happens to run them in time.
+        CountDownLatch readersCheckedChunks = new CountDownLatch(1);
+        CountDownLatch readersSawResults = new CountDownLatch(1);
 
         // ==================== WRITER TASKS ====================
         Runnable writerTask = () -> {
@@ -270,6 +267,11 @@ class LiveIndexingIntegrationTest {
                     documentChunkIds.put(documentId, List.copyOf(batch.getChunkIds()));
                     atomicityTracker.registerDocument(documentId, batch.getChunkIds(), commitEpoch);
 
+                    if (d == 0) {
+                        awaitReaders(readersCheckedChunks, "check a published document's chunks");
+                        awaitReaders(readersSawResults, "get results from a query");
+                    }
+
                     Thread.sleep(2); // Small delay to allow readers
                 }
             } catch (Exception e) {
@@ -282,10 +284,15 @@ class LiveIndexingIntegrationTest {
 
         // ==================== READER TASKS ====================
         Runnable readerTask = () -> {
+            int firstResultCount = -1;
+            int lastResultCount = -1;
             try {
                 startLatch.await();
 
-                while (!writersFinished.get()) {
+                // One more pass after the writers finish, so every reader queries the whole corpus
+                boolean finalPass;
+                do {
+                    finalPass = writersFinished.get();
                     try {
                         long queryEpoch = visibilityTracker.captureEpoch();
 
@@ -307,7 +314,11 @@ class LiveIndexingIntegrationTest {
 
                         if (resultCount > 0) {
                             queriesWithResults.incrementAndGet();
-                            resultCountSnapshots.add(resultCount);
+                            readersSawResults.countDown();
+                            if (firstResultCount < 0) {
+                                firstResultCount = resultCount;
+                            }
+                            lastResultCount = resultCount;
                         }
 
                         // ==================== (c) EPOCH ISOLATION - TORN READ CHECK ====================
@@ -331,6 +342,7 @@ class LiveIndexingIntegrationTest {
                             if (visibleChunks != chunkIds.size()) {
                                 tornReadCount.incrementAndGet();
                             }
+                            readersCheckedChunks.countDown();
                         }
 
                         // ==================== (d) DOCUMENT ATOMICITY CHECK ====================
@@ -375,9 +387,13 @@ class LiveIndexingIntegrationTest {
                         exceptionCount.incrementAndGet();
                         exceptionMessages.add("Reader: " + e.getClass().getSimpleName() + " - " + e.getMessage());
                     }
-                }
+                } while (!finalPass);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            } finally {
+                if (firstResultCount >= 0) {
+                    firstAndLastResultCounts.add(new int[] {firstResultCount, lastResultCount});
+                }
             }
         };
 
@@ -391,15 +407,12 @@ class LiveIndexingIntegrationTest {
 
         startLatch.countDown();
 
-        // Wait for writers
-        writersDone.await(120, TimeUnit.SECONDS);
+        boolean writersCompleted = writersDone.await(120, TimeUnit.SECONDS);
         writersFinished.set(true);
 
-        // Give readers time to finish final queries
-        Thread.sleep(200);
-
+        // Each reader finishes the pass it is in and makes one more over the whole corpus
         executor.shutdown();
-        executor.awaitTermination(15, TimeUnit.SECONDS);
+        boolean readersCompleted = executor.awaitTermination(60, TimeUnit.SECONDS);
 
         // ==================== VERIFICATION ====================
 
@@ -417,12 +430,10 @@ class LiveIndexingIntegrationTest {
         System.out.println("\n(b) PROGRESSIVE IMPROVEMENT:");
         System.out.println("    Total queries: " + totalQueries.get());
         System.out.println("    Queries with results: " + queriesWithResults.get());
-        System.out.println("    Result count snapshots: " + resultCountSnapshots.size());
-        if (!resultCountSnapshots.isEmpty()) {
-            System.out.println("    First 5 snapshots: " +
-                resultCountSnapshots.stream().limit(5).toList());
-            System.out.println("    Last 5 snapshots: " +
-                resultCountSnapshots.stream().skip(Math.max(0, resultCountSnapshots.size() - 5)).toList());
+        synchronized (firstAndLastResultCounts) {
+            for (int[] counts : firstAndLastResultCounts) {
+                System.out.println("    Reader result counts: first " + counts[0] + ", last " + counts[1]);
+            }
         }
 
         System.out.println("\n(c) EPOCH ISOLATION (No Torn Reads):");
@@ -438,9 +449,13 @@ class LiveIndexingIntegrationTest {
 
         // ==================== ASSERTIONS ====================
 
+        assertThat(writersCompleted).as("The writers must finish within the timeout").isTrue();
+        assertThat(readersCompleted).as("The readers must finish within the timeout").isTrue();
+
         // (a) No exceptions
         assertThat(exceptionCount.get())
-            .as("(a) No exceptions: All concurrent operations must complete without throwing")
+            .as("(a) No exceptions: All concurrent operations must complete without throwing: %s",
+                exceptionMessages)
             .isEqualTo(0);
 
         // (b) Progressive improvement - verify queries were executed
@@ -453,14 +468,16 @@ class LiveIndexingIntegrationTest {
             .as("(b) Progressive improvement: Some queries should have returned results")
             .isGreaterThan(0);
 
-        // (b) Progressive improvement - verify non-decreasing results (check at least first/last)
-        if (resultCountSnapshots.size() >= 2) {
-            int first = resultCountSnapshots.get(0);
-            int last = resultCountSnapshots.get(resultCountSnapshots.size() - 1);
-            assertThat(last)
+        // (b) Progressive improvement - each reader's last query, made over the whole corpus,
+        // returns at least as much as its first did
+        assertThat(firstAndLastResultCounts)
+            .as("(b) Progressive improvement: every reader must have had results")
+            .hasSize(numReaderThreads);
+        for (int[] counts : firstAndLastResultCounts) {
+            assertThat(counts[1])
                 .as("(b) Progressive improvement: Final result count (%d) should be >= initial count (%d)",
-                    last, first)
-                .isGreaterThanOrEqualTo(first);
+                    counts[1], counts[0])
+                .isGreaterThanOrEqualTo(counts[0]);
         }
 
         // (c) Epoch isolation - no torn reads
@@ -584,7 +601,7 @@ class LiveIndexingIntegrationTest {
             startLatch.countDown();
 
             executor.shutdown();
-            executor.awaitTermination(120, TimeUnit.SECONDS);
+            boolean completed = executor.awaitTermination(120, TimeUnit.SECONDS);
 
             System.out.println("Exception test: " + exceptionCount.get() + " exceptions out of " +
                 (numThreads * operationsPerThread) + " operations");
@@ -592,6 +609,7 @@ class LiveIndexingIntegrationTest {
                 System.out.println("Exceptions: " + exceptions);
             }
 
+            assertThat(completed).as("Every operation must finish within the timeout").isTrue();
             assertThat(exceptionCount.get())
                 .as("No exceptions should occur during concurrent operations. Exceptions: " + exceptions)
                 .isEqualTo(0);
@@ -717,18 +735,6 @@ class LiveIndexingIntegrationTest {
             visibilityTracker.registerSegment(segmentId, visibilityTracker.currentEpoch());
             visibilityTracker.advanceEpoch();
 
-            // Query pipeline
-            QueryPipeline.HnswGraphProvider graphProvider = segId -> {
-                if (segId == segmentId) return graph;
-                return null;
-            };
-            QueryPipeline pipeline = new QueryPipeline(
-                storageEngine,
-                visibilityTracker,
-                graphProvider,
-                distanceFunction
-            );
-
             int numDocuments = 30;
             int chunksPerDocument = 5;
 
@@ -743,6 +749,9 @@ class LiveIndexingIntegrationTest {
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch writerDone = new CountDownLatch(1);
             AtomicBoolean writersFinished = new AtomicBoolean(false);
+            // The writer holds after its first document until a reader has checked one, so
+            // checks happen while ingestion is still under way
+            CountDownLatch readersChecked = new CountDownLatch(1);
 
             // Writer
             Runnable writer = () -> {
@@ -763,6 +772,10 @@ class LiveIndexingIntegrationTest {
                         documentChunkIds.put(documentId, List.copyOf(batch.getChunkIds()));
                         atomicityTracker.registerDocument(documentId, batch.getChunkIds(), commitEpoch);
 
+                        if (d == 0) {
+                            awaitReaders(readersChecked, "check a published document's chunks");
+                        }
+
                         Thread.sleep(3);
                     }
                 } catch (Exception e) {
@@ -779,7 +792,9 @@ class LiveIndexingIntegrationTest {
                 try {
                     startLatch.await();
 
-                    while (!writersFinished.get()) {
+                    boolean finalPass;
+                    do {
+                        finalPass = writersFinished.get();
                         long queryEpoch = visibilityTracker.captureEpoch();
 
                         for (String documentId : atomicityTracker.getVisibleDocuments(queryEpoch)) {
@@ -799,10 +814,11 @@ class LiveIndexingIntegrationTest {
                             if (visibleChunks != chunkIds.size()) {
                                 tornReadCount.incrementAndGet();
                             }
+                            readersChecked.countDown();
                         }
 
                         Thread.sleep(2);
-                    }
+                    } while (!finalPass);
                 } catch (Exception e) {
                     workerFailures.add(e);
                 }
@@ -816,13 +832,15 @@ class LiveIndexingIntegrationTest {
             startLatch.countDown();
             boolean writerCompleted = writerDone.await(60, TimeUnit.SECONDS);
 
+            // Each reader finishes the pass it is in and makes one more after the last document
             executor.shutdown();
-            executor.awaitTermination(10, TimeUnit.SECONDS);
+            boolean readersCompleted = executor.awaitTermination(60, TimeUnit.SECONDS);
 
             System.out.println("Torn read test: " + tornReadCount.get() + " torn reads out of " +
                 totalChecks.get() + " checks");
 
             assertThat(writerCompleted).as("The writer must finish within the timeout").isTrue();
+            assertThat(readersCompleted).as("The readers must finish within the timeout").isTrue();
             assertThat(workerFailures).as("No worker may fail: " + workerFailures).isEmpty();
 
             assertThat(tornReadCount.get())
@@ -888,12 +906,16 @@ class LiveIndexingIntegrationTest {
             AtomicInteger partialDocumentCount = new AtomicInteger(0);
             AtomicInteger totalQueries = new AtomicInteger(0);
             AtomicInteger resultsInspected = new AtomicInteger(0);
+            AtomicInteger atomicityChecks = new AtomicInteger(0);
             List<Throwable> workerFailures = Collections.synchronizedList(new ArrayList<>());
 
             ExecutorService executor = Executors.newFixedThreadPool(4);
             CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch writerDone = new CountDownLatch(1);
             AtomicBoolean writersFinished = new AtomicBoolean(false);
+            // The writer holds after its first document until a reader has checked a query
+            // result for atomicity, so results are checked while ingestion is still under way
+            CountDownLatch readersChecked = new CountDownLatch(1);
 
             // Writer
             Runnable writer = () -> {
@@ -919,6 +941,10 @@ class LiveIndexingIntegrationTest {
                         documentChunkIds.put(documentId, List.copyOf(batch.getChunkIds()));
                         atomicityTracker.registerDocument(documentId, batch.getChunkIds(), commitEpoch);
 
+                        if (d == 0) {
+                            awaitReaders(readersChecked, "check a query result for atomicity");
+                        }
+
                         Thread.sleep(5);
                     }
                 } catch (Exception e) {
@@ -934,7 +960,9 @@ class LiveIndexingIntegrationTest {
                 try {
                     startLatch.await();
 
-                    while (!writersFinished.get()) {
+                    boolean finalPass;
+                    do {
+                        finalPass = writersFinished.get();
                         long queryEpoch = visibilityTracker.captureEpoch();
 
                         QueryRequest request = QueryRequest.builder()
@@ -976,10 +1004,12 @@ class LiveIndexingIntegrationTest {
                             if (visibleChunks != chunkIds.size()) {
                                 partialDocumentCount.incrementAndGet();
                             }
+                            atomicityChecks.incrementAndGet();
+                            readersChecked.countDown();
                         }
 
                         Thread.sleep(10);
-                    }
+                    } while (!finalPass);
                 } catch (Exception e) {
                     workerFailures.add(e);
                 }
@@ -993,14 +1023,17 @@ class LiveIndexingIntegrationTest {
             startLatch.countDown();
             boolean writerCompleted = writerDone.await(60, TimeUnit.SECONDS);
 
+            // Each reader finishes the pass it is in and makes one more after the last document
             executor.shutdown();
-            executor.awaitTermination(10, TimeUnit.SECONDS);
+            boolean readersCompleted = executor.awaitTermination(60, TimeUnit.SECONDS);
 
             System.out.println("Document atomicity test: " + partialDocumentCount.get() +
                 " partial documents out of " + totalQueries.get() + " queries (" +
-                resultsInspected.get() + " results inspected)");
+                resultsInspected.get() + " results inspected, " + atomicityChecks.get() +
+                " checked for atomicity)");
 
             assertThat(writerCompleted).as("The writer must finish within the timeout").isTrue();
+            assertThat(readersCompleted).as("The readers must finish within the timeout").isTrue();
             assertThat(workerFailures).as("No worker may fail: " + workerFailures).isEmpty();
 
             assertThat(partialDocumentCount.get())
@@ -1016,6 +1049,9 @@ class LiveIndexingIntegrationTest {
             assertThat(resultsInspected.get())
                 .as("Queries must have returned published documents for atomicity to be checked")
                 .isGreaterThan(0);
+            assertThat(atomicityChecks.get())
+                .as("Results committed by their query's epoch must have been checked for atomicity")
+                .isGreaterThan(0);
 
             graph.close();
         }
@@ -1024,6 +1060,32 @@ class LiveIndexingIntegrationTest {
     // =====================================================================================
     // HELPER METHODS
     // =====================================================================================
+
+    /**
+     * How long a writer holds for the readers' first observation of a published document.
+     * Generous, because it is only ever reached when that observation never comes.
+     */
+    private static final long READER_OBSERVATION_DEADLINE_SECONDS = 30;
+
+    /**
+     * Holds a writer until the readers have made the observation {@code observed} stands for.
+     *
+     * <p>The tests prove their guarantees by what concurrent readers observe while documents
+     * are being published. Left to scheduling, a writer can publish everything before a reader
+     * has looked, and the proof is empty; holding the writer until a reader has seen a
+     * published document makes the observation happen mid-ingestion every run.</p>
+     *
+     * @param observed Counted down by a reader when it makes the observation
+     * @param what What the readers were to do, for the failure message
+     * @throws IllegalStateException if the readers do not make it within the deadline
+     */
+    private static void awaitReaders(CountDownLatch observed, String what)
+            throws InterruptedException {
+        if (!observed.await(READER_OBSERVATION_DEADLINE_SECONDS, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("no reader managed to " + what + " within "
+                + READER_OBSERVATION_DEADLINE_SECONDS + "s of the first document being published");
+        }
+    }
 
     private float[] createRandomVector(int dimension) {
         float[] vector = new float[dimension];
