@@ -1,5 +1,8 @@
 package com.eonmux.excalibur.retrieval.lexical.native_;
 
+import com.eonmux.excalibur.core.integrity.IndexChecksum;
+import com.eonmux.excalibur.core.integrity.IntegrityReport;
+import com.eonmux.excalibur.core.integrity.IntegrityStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,13 +53,28 @@ import java.util.Set;
  * between the promise and its application - are replayed.</p>
  *
  * <h2>Format</h2>
- * <p>Version 2, after the header line: {@code P<tab>millis<tab>key} for a promise not yet
- * confirmed as applied, {@code A<tab>millis<tab>key} for one that has been, and
- * {@code D<tab>key} confirming every earlier promise of that key - the line an application
- * appends, so confirming costs an append rather than a rewrite. A version 1 log, which records
- * {@code millis<tab>key} and nothing about application, is read with every promise unapplied,
- * which is the only safe reading of it, and rewritten as version 2 before anything is appended to
- * it.</p>
+ * <p>Version 3, after the header line: {@code P<tab>millis<tab>key<tab>crc} for a promise not yet
+ * confirmed as applied, {@code A<tab>millis<tab>key<tab>crc} for one that has been, and
+ * {@code D<tab>key<tab>crc} confirming every earlier promise of that key - the line an
+ * application appends, so confirming costs an append rather than a rewrite. The {@code crc} is
+ * the CRC32C of the UTF-8 bytes of the line before its last tab, as eight lowercase hexadecimal
+ * digits; a key never holds a tab, so the last tab always begins it.</p>
+ *
+ * <h2>Why every line carries a checksum</h2>
+ * <p>The log is appended to, not replaced, so there is no one moment to seal it at; each line is
+ * sealed as it is written instead. A changed byte in a key is otherwise a well-formed promise
+ * about some other name: the erasure the caller asked for is never applied, and the store
+ * discharges the promise at the next compaction because the name it now holds names nothing. A
+ * line whose checksum does not match is refused, as a malformed one always has been, and the
+ * store does not open until the log is restored: guessing which promises it held could only
+ * make one of them lapse.</p>
+ *
+ * <h2>Older versions</h2>
+ * <p>A version 2 log, which is version 3 without the checksums, is read as it always was. A
+ * version 1 log, which records {@code millis<tab>key} and nothing about application, is read
+ * with every promise unapplied, which is the only safe reading of it. Either is rewritten as
+ * version 3 before anything is appended to it. A log whose header names a later version was
+ * written by a newer build and is refused.</p>
  */
 public final class DocumentErasureLog {
 
@@ -86,9 +104,20 @@ public final class DocumentErasureLog {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(DocumentErasureLog.class);
 
-    private static final String FILE = "erasure.log";
-    private static final String HEADER_V1 = "excalibur-lexical-erasure v1";
-    private static final String HEADER = "excalibur-lexical-erasure v2";
+    /** The log's file name inside the store directory. */
+    public static final String FILE = "erasure.log";
+
+    /** Name used when a damaged log is refused or reported. */
+    public static final String FORMAT = "lexical erasure log";
+
+    /** The version this build writes. */
+    public static final int VERSION = 3;
+
+    /** The oldest version this build reads. */
+    public static final int OLDEST_VERSION = 1;
+
+    private static final String HEADER_PREFIX = "excalibur-lexical-erasure v";
+    private static final String HEADER = HEADER_PREFIX + VERSION;
 
     private static final String PROMISED = "P";
     private static final String APPLIED = "A";
@@ -106,34 +135,174 @@ public final class DocumentErasureLog {
         this.current = current;
     }
 
+    /**
+     * A log written at a version this build does not read.
+     */
+    public static final class UnsupportedVersionException extends IOException {
+
+        private static final long serialVersionUID = 1L;
+
+        private final int version;
+
+        UnsupportedVersionException(Path file, int version) {
+            super(file + " is erasure log version " + version + ", which this build does not "
+                + "read - it reads versions " + OLDEST_VERSION + " to " + VERSION + "; a newer "
+                + "build wrote it");
+            this.version = version;
+        }
+
+        /**
+         * Returns the version the log declares.
+         *
+         * @return The version
+         */
+        public int version() {
+            return version;
+        }
+    }
+
+    /** What reading a log's file found. */
+    private record Contents(List<Record> records, int version, int lines) {
+    }
+
     /** Opens the log for a store directory, reading back anything already owed. */
     public static DocumentErasureLog open(Path directory) throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
         Path file = directory.resolve(FILE);
+        Contents contents = readFile(file);
+        return new DocumentErasureLog(file, contents.records(),
+            contents.version() == VERSION);
+    }
+
+    /**
+     * Reaches a verdict on a log without changing anything.
+     *
+     * <p>The log is read exactly as the store reads it, so what the store would refuse is
+     * corrupt here and what it would read is not: intact at the current version, whose every
+     * line matched its checksum; unprotected at the versions before it, whose lines are
+     * well-formed and nothing more.</p>
+     *
+     * @param file The log
+     * @return The verdict
+     * @throws NullPointerException if file is null
+     */
+    public static IntegrityReport inspect(Path file) {
+        Objects.requireNonNull(file, "file must not be null");
+        Contents contents;
+        try {
+            contents = readFile(file);
+        } catch (UnsupportedVersionException e) {
+            return IntegrityReport.unsupportedVersion(file, FORMAT, e.version(), OLDEST_VERSION,
+                VERSION);
+        } catch (IOException e) {
+            return IntegrityReport.corrupt(file, FORMAT, e.getMessage());
+        }
+        if (contents.lines() == 0) {
+            return IntegrityReport.intact(file, FORMAT, "empty, which the store reads as owing "
+                + "nothing: it is what a crash between creating the log and writing its first "
+                + "line leaves");
+        }
+        String owed = contents.records().size() + " promise(s) outstanding";
+        if (contents.version() < VERSION) {
+            return new IntegrityReport(file, FORMAT, IntegrityStatus.LEGACY_UNPROTECTED,
+                "every line is well-formed, " + owed + "; this version carries no checksums, so "
+                    + "the keys and times themselves are not verified. The store rewrites it "
+                    + "with them before it next records or settles an erasure");
+        }
+        return IntegrityReport.intact(file, FORMAT, "every one of its " + contents.lines()
+            + " line(s) matched its checksum, " + owed);
+    }
+
+    /**
+     * Reads a log file into its records, refusing anything the store must not guess at.
+     *
+     * @param file The log
+     * @return The records, the version, and how many record lines there were
+     * @throws UnsupportedVersionException if a newer build wrote it
+     * @throws IOException if a line is malformed or does not match its checksum
+     */
+    private static Contents readFile(Path file) throws IOException {
         List<Record> records = new ArrayList<>();
         if (!Files.exists(file) || Files.size(file) == 0) {
-            return new DocumentErasureLog(file, records, true);
+            return new Contents(records, VERSION, 0);
         }
         List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-        String header = lines.get(0);
-        boolean versionOne = HEADER_V1.equals(header);
-        if (!versionOne && !HEADER.equals(header)) {
-            // Checked rather than assumed. If the first line is not a header it is a record, and
-            // skipping it would silently discharge a promise nobody agreed to discharge.
-            throw new IOException("Not an erasure log, first line is: " + header);
-        }
+        int version = versionOf(file, lines.get(0));
+        int read = 0;
         for (int i = 1; i < lines.size(); i++) {
             String line = lines.get(i);
             if (line.isEmpty()) {
                 continue;
             }
-            if (versionOne) {
+            read++;
+            if (version == OLDEST_VERSION) {
                 records.add(versionOneRecord(line));
             } else {
-                readLine(line, records);
+                readLine(version == VERSION ? verified(file, i + 1, line) : line, records);
             }
         }
-        return new DocumentErasureLog(file, records, !versionOne);
+        return new Contents(records, version, read);
+    }
+
+    /**
+     * Reads the version a header line declares.
+     *
+     * <p>Checked rather than assumed. If the first line is not a header it is a record, and
+     * skipping it would silently discharge a promise nobody agreed to discharge.</p>
+     */
+    private static int versionOf(Path file, String header) throws IOException {
+        if (header.startsWith(HEADER_PREFIX)) {
+            int version;
+            try {
+                version = Integer.parseInt(header.substring(HEADER_PREFIX.length()));
+            } catch (NumberFormatException e) {
+                version = -1;
+            }
+            if (version > VERSION) {
+                throw new UnsupportedVersionException(file, version);
+            }
+            if (version >= OLDEST_VERSION) {
+                return version;
+            }
+        }
+        throw new IOException("Not an erasure log, first line is: " + header);
+    }
+
+    /**
+     * Checks a version 3 line against its checksum and returns the line without it.
+     *
+     * @param file   The log, for the message
+     * @param number The line's number in the file, counting the header as 1
+     * @param line   The line as read
+     * @return The line up to its last tab
+     * @throws IOException if the line carries no checksum or does not match it
+     */
+    private static String verified(Path file, int number, String line) throws IOException {
+        int tab = line.lastIndexOf('\t');
+        String stored = tab < 0 ? "" : line.substring(tab + 1);
+        if (stored.length() != 8) {
+            throw new IOException(file + " line " + number + " does not end with a checksum, so "
+                + "it was cut short or overwritten: " + line);
+        }
+        String body = line.substring(0, tab);
+        String actual = checksumOf(body);
+        if (!actual.equals(stored)) {
+            throw new IOException(file + " line " + number + " failed its integrity check: the "
+                + "checksum did not match. It records " + stored + " and the line digests to "
+                + actual + ", so the promise it holds cannot be relied on: " + body);
+        }
+        return body;
+    }
+
+    /** The checksum a version 3 line carries: CRC32C of its UTF-8 bytes, as eight hex digits. */
+    private static String checksumOf(String body) {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        return String.format("%08x", IndexChecksum.of(bytes, 0, bytes.length));
+    }
+
+    /** Appends one line, sealed with its checksum. */
+    private static void appendSealed(StringBuilder sb, String body) {
+        sb.append(body).append('\t').append(checksumOf(body)).append('\n');
     }
 
     /** A version 1 line: a promise, with nothing recorded about whether it was applied. */
@@ -234,7 +403,7 @@ public final class DocumentErasureLog {
         }
         StringBuilder sb = new StringBuilder();
         for (String key : pending) {
-            sb.append(CONFIRMED).append('\t').append(key).append('\n');
+            appendSealed(sb, CONFIRMED + '\t' + key);
         }
         appendLines(sb);
         confirm(records, pending);
@@ -243,8 +412,8 @@ public final class DocumentErasureLog {
     /** Appends lines in the current format, forcing them to disk before returning. */
     private void appendLines(StringBuilder lines) throws IOException {
         if (!current) {
-            // A version 1 file cannot take a version 2 line, so it is rewritten first - with
-            // every promise it held still unapplied, which is all a version 1 log could say.
+            // An older file cannot take a current line, so it is rewritten first - a version 1
+            // log with every promise it held still unapplied, which is all it could say.
             rewrite(records);
             current = true;
         }
@@ -266,9 +435,8 @@ public final class DocumentErasureLog {
     }
 
     private static void appendRecord(StringBuilder sb, Record record) {
-        sb.append(record.applied() ? APPLIED : PROMISED).append('\t')
-          .append(record.requestedAt().toEpochMilli()).append('\t')
-          .append(record.key()).append('\n');
+        appendSealed(sb, (record.applied() ? APPLIED : PROMISED) + '\t'
+            + record.requestedAt().toEpochMilli() + '\t' + record.key());
     }
 
     /**

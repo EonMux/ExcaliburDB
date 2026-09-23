@@ -496,7 +496,7 @@ class CompactionPolicyTest {
             log.confirmApplied(List.of("old"));
 
             assertThat(Files.readAllLines(dir.resolve("erasure.log")).get(0))
-                .isEqualTo("excalibur-lexical-erasure v2");
+                .isEqualTo("excalibur-lexical-erasure v" + DocumentErasureLog.VERSION);
             DocumentErasureLog reopened = DocumentErasureLog.open(dir);
             assertThat(reopened.outstandingKeys()).containsExactly("old", "new");
             assertThat(reopened.unappliedKeys()).containsExactly("new");

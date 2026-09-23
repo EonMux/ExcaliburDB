@@ -62,14 +62,80 @@ class FormatCheckTest {
     }
 
     @Test
-    void routingDirectoryWithAnUnknownVersionIsCorrupt(@TempDir Path dir) throws IOException {
+    void routingDirectoryFromANewerBuildIsUnreadableRatherThanCorrupt(@TempDir Path dir)
+            throws IOException {
         Path file = dir.resolve("routing.dir");
-        Files.write(file, routing(RoutingDirectory.VERSION + 7, 4));
+        int newer = RoutingDirectory.VERSION + 7;
+        Files.write(file, routing(newer, 4));
+
+        var result = RoutingDirectoryCheck.check(file, "routing.dir");
+
+        assertThat(result.check().status()).isEqualTo(CheckStatus.UNREADABLE);
+        assertThat(result.check().version()).isEqualTo("v" + newer);
+        assertThat(result.check().detail()).contains("format version " + newer)
+            .contains("versions " + RoutingDirectory.UNCHECKSUMMED_VERSION + " to "
+                + RoutingDirectory.VERSION);
+        assertThat(result.slots()).isEmpty();
+    }
+
+    @Test
+    void routingDirectoryAtAVersionNoBuildWritesIsCorrupt(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("routing.dir");
+        Files.write(file, routing(0, 4));
 
         var result = RoutingDirectoryCheck.check(file, "routing.dir");
 
         assertThat(result.check().status()).isEqualTo(CheckStatus.CORRUPT);
-        assertThat(result.check().detail()).contains("format version");
+        assertThat(result.check().detail()).contains("format version 0");
+    }
+
+    @Test
+    void routingDirectoryWhoseChecksumMatchesIsIntact(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("routing.dir");
+        Files.write(file, routing(RoutingDirectory.VERSION, 4));
+
+        var result = RoutingDirectoryCheck.check(file, "routing.dir");
+
+        assertThat(result.check().status()).isEqualTo(CheckStatus.INTACT);
+        assertThat(result.check().version()).isEqualTo("v" + RoutingDirectory.VERSION);
+        assertThat(result.slots()).hasSize(4);
+    }
+
+    @Test
+    void routingDirectoryWithAFlippedSlotIsCorruptAndLeftToAnOperator(@TempDir Path tempDir)
+            throws IOException {
+        Path dataDir = tempDir.resolve("data");
+        DataDirectoryFixture.createStore(dataDir, 8);
+        Path file = dataDir.resolve("routing.dir");
+        byte[] bytes = Files.readAllBytes(file);
+        bytes[RoutingDirectory.HEADER_BYTES + 5 * Integer.BYTES] ^= 1;
+        Files.write(file, bytes);
+
+        var result = RoutingDirectoryCheck.check(file, "routing.dir");
+
+        assertThat(result.check().status()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.check().detail()).contains("checksum did not match");
+        assertThat(result.slots()).isEmpty();
+
+        var plan = com.eonmux.excalibur.fsck.repair.RepairPlanner.plan(
+            new com.eonmux.excalibur.fsck.check.DataDirectoryScanner(dataDir).scan());
+        assertThat(plan.actions())
+            .as("the routing directory is never moved aside: nothing can rebuild it")
+            .noneSatisfy(action -> assertThat(action.relative()).isEqualTo("routing.dir"));
+        assertThat(plan.needsOperator()).anySatisfy(advice ->
+            assertThat(advice).contains("routing.dir").contains("checksum did not match"));
+    }
+
+    @Test
+    void routingDirectoryCutShortIsCorrupt(@TempDir Path dir) throws IOException {
+        byte[] full = routing(RoutingDirectory.VERSION, 8);
+        Path file = dir.resolve("routing.dir");
+        Files.write(file, java.util.Arrays.copyOf(full, full.length - 2));
+
+        var result = RoutingDirectoryCheck.check(file, "routing.dir");
+
+        assertThat(result.check().status()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.check().detail()).contains("cut short");
     }
 
     @Test
@@ -97,14 +163,15 @@ class FormatCheckTest {
     }
 
     @Test
-    void wellFormedRoutingDirectoryIsUnprotectedRatherThanIntact(@TempDir Path dir)
+    void routingDirectoryFromBeforeTheChecksumIsUnprotectedRatherThanIntact(@TempDir Path dir)
             throws IOException {
         Path file = dir.resolve("routing.dir");
-        Files.write(file, routing(RoutingDirectory.VERSION, 4));
+        Files.write(file, routing(RoutingDirectory.UNCHECKSUMMED_VERSION, 4));
 
         var result = RoutingDirectoryCheck.check(file, "routing.dir");
 
         assertThat(result.check().status()).isEqualTo(CheckStatus.LEGACY_UNPROTECTED);
+        assertThat(result.check().version()).isEqualTo("v" + RoutingDirectory.UNCHECKSUMMED_VERSION);
         assertThat(result.check().detail()).contains("no checksum");
         assertThat(result.slots()).hasSize(4);
     }
@@ -412,19 +479,29 @@ class FormatCheckTest {
     }
 
     /**
-     * Writes a routing directory header with a chosen version and width.
+     * Writes a routing directory with a chosen version and width.
+     *
+     * <p>A version from the checksummed one on carries the trailing CRC32C its writer appends;
+     * the version before it carries none, as that build wrote it.</p>
      *
      * @param version The version field
      * @param width   The width field, and how many slot entries follow
      * @return The file's bytes
      */
     private static byte[] routing(int version, int width) {
+        boolean checksummed = version >= RoutingDirectory.VERSION;
         ByteBuffer buffer = ByteBuffer
-            .allocate(RoutingDirectory.HEADER_BYTES + width * Integer.BYTES)
+            .allocate(RoutingDirectory.HEADER_BYTES + width * Integer.BYTES
+                + (checksummed ? RoutingDirectory.CHECKSUM_BYTES : 0))
             .order(ByteOrder.LITTLE_ENDIAN);
         buffer.putLong(RoutingDirectory.MAGIC).putInt(version).putInt(width);
         for (int i = 0; i < width; i++) {
             buffer.putInt(0);
+        }
+        if (checksummed) {
+            java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
+            crc.update(buffer.array(), 0, buffer.position());
+            buffer.putInt((int) crc.getValue());
         }
         return buffer.array();
     }

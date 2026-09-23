@@ -95,6 +95,15 @@ public enum FileKind {
     /** A file inside the native lexical store directory. */
     LEXICAL_STORE_PART,
 
+    /**
+     * {@code chunk-index/seg-N.keymap}: a lexical segment's lookup table from name to document.
+     *
+     * <p>Derived entirely from the segment's names; the store rebuilds one that is missing, the
+     * wrong size or fails the checksum recorded for it before the segment serves anything. See
+     * {@link #rebuiltOnOpen()}.</p>
+     */
+    LEXICAL_KEY_LOOKUP,
+
     /** A half-finished write some operation left behind. */
     STAGING_LEFTOVER,
 
@@ -158,12 +167,13 @@ public enum FileKind {
      * reindex or a retrain, so a damaged one leaves the node serving less until an operator
      * acts, and it fails the run like any other damage. A term sketch is recomputed from the
      * segment's live entries before the segment serves, whenever the file is missing, stale or
-     * fails its checksum, so a damaged one costs a rebuild at start-up and nothing else.</p>
+     * fails its checksum, and a lexical segment's lookup table from its names the same way, so a
+     * damaged one costs a rebuild at start-up and nothing else.</p>
      *
      * @return true for a kind whose damage the node repairs by itself on open
      */
     public boolean rebuiltOnOpen() {
-        return this == TERM_SKETCH;
+        return this == TERM_SKETCH || this == LEXICAL_KEY_LOOKUP;
     }
 
     /**

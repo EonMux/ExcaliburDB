@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.fsck.check;
 
+import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
+
 import java.nio.file.Path;
 
 /**
@@ -34,7 +36,8 @@ public final class FileClassifier {
             return FileKind.STAGING_LEFTOVER;
         }
         if (relative.startsWith(LEXICAL_STORE_DIRECTORY + "/")) {
-            return FileKind.LEXICAL_STORE_PART;
+            return name.endsWith(LexicalSidecars.LOOKUP_TABLE)
+                ? FileKind.LEXICAL_KEY_LOOKUP : FileKind.LEXICAL_STORE_PART;
         }
         if (relative.contains(GraphStagingCheck.DIRECTORY_SUFFIX + "/")
                 && GraphStagingCheck.matches(name)) {

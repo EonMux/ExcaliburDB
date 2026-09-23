@@ -141,7 +141,7 @@ class FileInspectorTest {
     }
 
     @Test
-    void theLexicalStoreCoversItsManifestAndItsSegmentsButNotItsSidecars(
+    void theLexicalStoreCoversWhatItNamesAndNothingElse(
             @TempDir Path tempDir) throws IOException {
         Path dataDir = tempDir.resolve("data");
         Path store = Files.createDirectories(dataDir.resolve(
@@ -157,13 +157,22 @@ class FileInspectorTest {
         assertThat(lexical.covers("chunk-index/manifest")).isTrue();
         assertThat(lexical.covers("chunk-index/seg-0/postings")).isTrue();
         assertThat(lexical.covers("chunk-index/seg-0.keys"))
-            .as("a sidecar beside a segment is not inside it")
+            .as("a named segment's key table is judged with the store")
+            .isTrue();
+        assertThat(lexical.covers("chunk-index/seg-7.keys"))
+            .as("a sidecar of a segment the manifest does not name is not")
             .isFalse();
         assertThat(lexical.covers("chunk-index/seg-01/postings"))
             .as("a segment whose name merely begins with another's is not that segment")
             .isFalse();
         assertThat(lexical.verdicts()).extracting(FileCheck::relative)
-            .containsExactly("chunk-index/manifest", "chunk-index/seg-0");
+            .containsExactly("chunk-index/manifest", "chunk-index/seg-0",
+                "chunk-index/seg-0.keys", "chunk-index/seg-0.keyidx",
+                "chunk-index/seg-0.keymap");
+        assertThat(lexical.sidecars()).extracting(FileCheck::status)
+            .as("a named segment's missing names are missing, not merely unproven")
+            .containsExactly(CheckStatus.MISSING, CheckStatus.MISSING,
+                CheckStatus.LEGACY_UNPROTECTED);
     }
 
     @Test

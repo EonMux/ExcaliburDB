@@ -2835,8 +2835,11 @@ the copy verifies faithfully without it:
   document at versions 1 and 2; one at a version this build does not read fails the image.
 - Everything else goes to `excalibur-fsck`'s checkers, read-only, where the file lies — the same
   dispatch `excalibur-fsck` surveys a live directory with. Write-ahead logs have every record
-  replayed against its checksum; the lexical store is checked as one structure, every column of
-  every segment its manifest names; the graph erasure ledger has every record checked; a segment's
+  replayed against its checksum; `routing.dir` is checked against the CRC32C that ends it; the
+  lexical store is checked as one structure — its manifest against the CRC32C on its last line,
+  every column of every segment the manifest names, each named segment's key table against
+  `seg-N.keysum` and its tombstones against their CRC32C, and every line of `erasure.log`
+  against its own; the graph erasure ledger has every record checked; a segment's
   term sketch (`segment_<N>.tfs`) has its header and body checked against their CRC32Cs. A damaged
   sketch is reported and does not fail the image, because a node restored from it rebuilds the
   sketch when it opens the segment; one that cannot be read at all does fail it. A compaction's
@@ -2852,8 +2855,10 @@ the copy verifies faithfully without it:
   catalog or journal its reader would refuse fails the image; a status history the node would only
   discard does not. A file of any of these written before its format carried a checksum is held to
   its count and header alone, and reported unproven.
-- Some formats carry nothing to prove them by: `routing.dir`; the lexical store's sidecars; and
-  the graph triple, entity and label logs, whose only open path writes.
+- Some files carry nothing to prove them by: a `routing.dir`, a lexical `manifest`, key table,
+  tombstone file or `erasure.log` an older build wrote, before those formats carried a checksum —
+  held to their structure and record count until the node rewrites them — and a file in
+  `chunk-index` beside no segment the manifest names.
 
 The report counts the structures proven and lists every one that was not, with why, rather than
 leaving them out, which would read as though nothing went unverified.
@@ -2985,18 +2990,27 @@ opens and builds from it with, so the verdict is the node's:
   text log when it opens them, and a corrupt `triples.log` fails every graph build and erasure.
 - A header naming a version this build does not read: `UNREADABLE`, as for any other file.
 
-Three files are judged by what the node does with them rather than by name alone:
+Four files are judged by what the node does with them rather than by name alone:
 
-- **`segment_<N>.tfs`, a segment's term sketch**, is the one derived file the node rebuilds by
+- **`segment_<N>.tfs`, a segment's term sketch**, is one of two derived files the node rebuilds by
   itself, from the segment's live entries, whenever it opens the segment and finds the sketch
   missing, stale or damaged. A sketch that fails its checksum is reported `CORRUPT` and not
   counted as damage: it does not set exit code `1` or fail `--strict`, the summary counts it
   separately (`corruptRebuiltOnOpen` in `--json`, where each file also carries `damage`), and the
   repair plan moves it aside. Only corruption is excused: a sketch the operating system will not
   read — an I/O error, a permission refused — is `UNREADABLE` and fails the run, because that says
-  something about the device rather than about one derived file. Every other derived file is
-  rebuilt only by a reindex or a retrain, so its damage fails the run. A sketch whose segment is gone is an orphaned index like any other,
+  something about the device rather than about one derived file. Every derived file but this and
+  the lexical lookup table below is rebuilt only by a reindex or a retrain, so its damage fails the
+  run. A sketch whose segment is gone is an orphaned index like any other,
   and a stranded `segment_<N>.tfs.<id>.tmp` is a staging leftover.
+- **`chunk-index/seg-N.keymap`, a lexical segment's lookup table**, is the other: the store
+  rebuilds it from the segment's names when it is missing, the wrong size, or does not match the
+  checksum in `seg-N.keysum`. One that fails is reported `CORRUPT`, counted under
+  `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair plan. The rest of
+  the key table — `seg-N.keys`, `seg-N.keyidx`, `seg-N.keysum` — and `seg-N.tomb` and
+  `erasure.log` are the opposite: damage to any of them fails the run and goes to an operator,
+  never into the quarantine, because a tombstone file or erasure log moved aside reads as nothing
+  ever having been erased, and the names are the one part of a segment nothing reconstructs.
 - **`source-status`, how each source's last crawl ended**, is not derived and nothing rebuilds it,
   but nothing the node serves depends on it either: a node that cannot trust it logs that, treats
   the history as empty, and reports each source from its next run. So a `source-status` its
@@ -3167,6 +3181,67 @@ compaction rewrites a few of them, oldest first, up to the merge fan-in — incl
 node's sweep asks for when nothing is being ingested — so they are upgraded without being asked
 for, and `segments_upgraded` on `/v1/compact/status` reports each pass. `POST /v1/compact` with
 `{"force": true}` upgrades all of them at once.
+
+**`chunk-index/manifest` — no step required, and no rollback.** The lexical store's manifest is
+version 3: its last line, `#end`, carries the number of segment lines and now also a CRC32C of
+every byte before it, as eight hexadecimal digits. The count proves no line was lost; only the
+checksum proves the lines that are there are the ones written — an altered segment name reads as a
+well-formed line naming nothing, and the segment it used to name would be deleted as unreferenced.
+A manifest that fails its checksum is refused exactly as one whose count disagrees: the store does
+not open, and nothing is deleted. A version 2 manifest is read as before, its count checked and
+trusted, and `excalibur-fsck` reports it *legacy, unprotected*; the first write of any kind —
+an ingest, an erasure, a compaction — rewrites it at version 3. A version 1 manifest, which has
+no count, is read and swept from by nothing, as before, and rewritten the same way. An older build
+refuses a version 3 manifest — the chunk lexical index does not open, and nothing is deleted — so
+a node that has written to its lexical store under this build cannot go back without restoring an
+image taken before the upgrade.
+
+**`chunk-index/seg-N.tomb` — no step required, and no rollback.** A segment's tombstones are
+version 2: a header with a magic number, the version and the segment's document count, the marks,
+and a CRC32C of every byte before it. Version 1 was the marks alone, and a cleared bit in it —
+an erased document readable again — looked like any other set of marks. A version 1 file is read
+as before, reported *legacy, unprotected* by `excalibur-fsck`, counted in
+`lexical.outdatedSegments`, and rewritten at version 2 the next time a document in that segment is
+erased or replaced, or gone once compaction rewrites the segment. A file that fails its checksum
+keeps its segment out of every query, and the segment is never rebuilt, since which of its
+documents are gone is what cannot be trusted. An older build reads a version 2 file as marks from
+its first byte — the header would mark the wrong documents and hide the real marks — which is why
+the manifest is rewritten at version 3 before the first version 2 tombstone file is written: an
+older build refuses that manifest and does not open the store at all. Going back therefore needs
+an image taken before the upgrade.
+
+**`chunk-index/seg-N.keysum` — no step required.** Every segment written by this build has a
+fourth key-table file recording the length and CRC32C of its names (`seg-N.keys`), their offsets
+(`seg-N.keyidx`) and its lookup table (`seg-N.keymap`); the three files themselves are unchanged.
+A segment with names or offsets that fail keeps out of every query and is not rebuilt, since a
+rebuild reads the names; a lookup table that fails is rebuilt from the names. A segment written by
+an older build has no such file: it is served exactly as before, its key table held to its
+structure and reported *legacy, unprotected* by `excalibur-fsck`, and it is counted in
+`lexical.outdatedSegments`, so compaction rewrites it with one. An older build ignores the file,
+so it alone does not stand in the way of rolling back.
+
+**`chunk-index/erasure.log` — no step required, and no rollback.** The lexical erasure log is
+version 3, which ends every promise and confirmation line with a tab and the CRC32C of the line
+before it, as eight hexadecimal digits. A changed byte in a key otherwise reads as a promise about
+another name, which the store would discharge at the next compaction because it names nothing. A
+line that fails its checksum stops the lexical store from opening, as a malformed line always has.
+A version 1 or 2 log is read exactly as before, reported *legacy, unprotected* by `excalibur-fsck`,
+and rewritten at version 3 before anything is next appended to it or settled from it. An older
+build refuses a version 3 log, so the lexical store it would open does not; going back from a node
+that has recorded or settled an erasure under this build needs an image taken before the upgrade.
+
+**`<data dir>/routing.dir` — no step required; rollback depends on splits.** The routing directory
+is version 2, which ends with a CRC32C of every byte before it. Every slot value is a plausible
+segment number, so a damaged slot used to read as a valid directory and route part of the
+keyspace to a segment that does not hold it; now a directory that fails its checksum, or is not
+exactly as long as its width says, is treated as one that cannot be read — the store reconstructs
+it from the segment file names while at most one segment has ever split, and otherwise refuses to
+start, naming the file and saying the checksum did not match. A version 1 directory is read and
+applied exactly as before, reported *legacy, unprotected* by `excalibur-fsck`, and rewritten at
+version 2 the next time the directory changes — the next split, or a start that has to
+reconstruct it. An older build cannot read version 2 and treats the file as missing: a store at
+most one split old is reconstructed exactly and starts, and one split more than once refuses to
+start, so going back from such a store needs an image taken before the upgrade.
 
 **`segment_<N>.hnsw.docmap` — no step required, and no rollback.** A graph's node mapping is
 version 3, and names each node by the chunk it embeds, `source:document:chunk:N`. Versions 1 and 2

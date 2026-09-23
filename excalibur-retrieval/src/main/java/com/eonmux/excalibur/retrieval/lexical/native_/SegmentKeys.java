@@ -40,6 +40,12 @@ import java.util.function.IntConsumer;
  * a segment written by a build that had no table, or interrupted while writing one, repairs itself
  * rather than being unreadable.</p>
  *
+ * <h2>Checksums</h2>
+ * <p>None of the three files has room for a checksum of its own without giving up what makes it
+ * worth having - text an operator can read, a count no header can contradict - so the writer
+ * digests all three once they are complete and records the digests in a fourth file,
+ * {@link KeyChecksums}. The store checks them when it opens; nothing here reads them.</p>
+ *
  * <h2>Layout</h2>
  * <ul>
  *   <li>{@code <segment>.keys} - the names, UTF-8, one per line. Text on purpose: this is the file
@@ -51,6 +57,8 @@ import java.util.function.IntConsumer;
  *       one, then a fingerprint of the name's hash. Zero is an empty slot, which is why the id is
  *       stored offset by one and why a freshly created file needs no initialising pass. Capacity
  *       is at least twice the document count, so a probe always meets an empty slot.</li>
+ *   <li>{@code <segment>.keysum} - the length and CRC32C of each of the other three, written
+ *       with them and never changed; see {@link KeyChecksums}.</li>
  * </ul>
  */
 final class SegmentKeys implements AutoCloseable {
@@ -123,8 +131,9 @@ final class SegmentKeys implements AutoCloseable {
     /**
      * Says what, if anything, stops these names from being read back one per document.
      *
-     * <p>The names carry no checksum, so this cannot prove they are the ones written; what it
-     * proves is that every document has exactly one name a rewrite can carry forward. That is the
+     * <p>This cannot prove the names are the ones written - that is what their checksums are
+     * for, where the segment has them; what it proves is that every document has exactly one
+     * name a rewrite can carry forward. That is the
      * question a rebuild asks before it relies on them, because a rewrite trusts its key table
      * completely: a count that disagrees with the manifest would renumber every document after
      * the gap, and a name the key rules refuse would fail every rewrite of the segment rather
@@ -245,6 +254,9 @@ final class SegmentKeys implements AutoCloseable {
         Files.deleteIfExists(directory.resolve(segment + INDEX_SUFFIX));
         Files.deleteIfExists(directory.resolve(segment + MAP_SUFFIX));
         Files.deleteIfExists(directory.resolve(segment + MAP_SUFFIX + ".tmp"));
+        Files.deleteIfExists(KeyChecksums.of(directory, segment));
+        Files.deleteIfExists(directory.resolve(segment + KeyChecksums.SUFFIX
+            + Durability.REPLACEMENT_SUFFIX));
     }
 
     /** Slots for a document count: a power of two, at least twice as many as there are documents. */
@@ -372,12 +384,13 @@ final class SegmentKeys implements AutoCloseable {
         }
 
         /**
-         * Closes the name files and builds the lookup table over them.
+         * Closes the name files, builds the lookup table over them, and records the checksums
+         * of all three.
          *
          * <p>The table is built here rather than as names arrive because its size depends on how
          * many there turn out to be, which a streaming writer only knows once it is done. Reading
          * the names back is one sequential pass over a file that was just written, so it is still
-         * in the page cache.</p>
+         * in the page cache, and so is digesting all three afterwards.</p>
          */
         @Override
         public void close() throws IOException {
@@ -398,6 +411,7 @@ final class SegmentKeys implements AutoCloseable {
                  MappedFile indexFile = MappedFile.open(directory.resolve(segment + INDEX_SUFFIX))) {
                 writeMap(directory.resolve(segment + MAP_SUFFIX), keyFile, indexFile, written);
             }
+            KeyChecksums.write(directory, segment, written);
             Durability.FILE_SYSTEM.forceDirectory(directory);
         }
     }

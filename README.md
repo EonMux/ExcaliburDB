@@ -421,11 +421,12 @@ node mapping, for instance, is read at versions 1 to 3 — its entries name each
 versions 1 and 2 and its chunk at version 3 — and a version 4 mapping is reported unreadable, not
 checked as if it were version 3.
 
-Two files are judged by what the node does with them rather than by their name alone. A
-segment's term sketch, `segment_<N>.tfs`, is the one derived file the node rebuilds by itself: a
+Three files are judged by what the node does with them rather than by their name alone. A
+segment's term sketch, `segment_<N>.tfs`, is one of two derived files the node rebuilds by itself: a
 sketch that fails its checksum is reported `CORRUPT` but not counted as damage, so it neither sets
 exit code `1` nor fails `--strict`, and the repair plan moves it aside (the node would rebuild it
-anyway). Only corruption is excused: a sketch the operating system will not read — an I/O error, a
+anyway). A lexical segment's lookup table, `chunk-index/seg-N.keymap`, is the other, rebuilt from
+the segment's names, and is treated the same way. Only corruption is excused: a sketch the operating system will not read — an I/O error, a
 permission refused — is `UNREADABLE`, and fails the run like any file the device refuses. The
 source status history, `source-status`, is excused the same way for a different reason. It is not
 derived: how each source's last crawl ended is recorded nowhere else, and the node restores it on
@@ -433,7 +434,7 @@ restart, so losing it loses that history, though never any of the corpus. But no
 serves depends on it, and the node reads one it will not take — cut short, without its header, or
 at a version it does not read, or altered so its checksum no longer matches — as no history and
 reports each source from its next run, so such a file is reported `CORRUPT` and not counted as
-damage. Every derived file but the sketch — a graph, a
+damage. Every other derived file — a graph, a
 mapping, a codebook, an LSH table — is rebuilt only by a reindex or a retrain, and its damage fails
 the run. A `segment_<N>.hnsw.compact.docmap` is
 the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the compaction never
@@ -461,8 +462,10 @@ write-ahead log that ends in a torn record — an append that never completed �
 opcode cleared, the same one-byte write the log itself makes when an append fails its fsync, so
 the log reads as ending before it. What it will not attempt matters as much as what it will: a
 damaged `catalog.dat`, a damaged `routing.dir`, a routing slot pointing at a missing segment, a
-write-ahead log damaged in the middle, a damaged lexical store `manifest`, or a damaged graph
-staging log are all reported under *needs an operator* and left alone. Which hash slot belongs to which segment after a split is not
+write-ahead log damaged in the middle, a damaged lexical store `manifest`, damaged lexical key
+tables, tombstones or `erasure.log`, or a damaged graph staging log are all reported under *needs
+an operator* and left alone — a tombstone file or erasure log moved out of the way reads as nothing
+ever having been erased. Which hash slot belongs to which segment after a split is not
 recoverable from file names — that is why the directory is written down — and the records behind
 damage in a log were fsynced and acknowledged, so trimming past them would destroy committed
 writes. A log damaged in the middle is not moved aside either, for the same reason: setting the
@@ -513,11 +516,12 @@ already there when it was copied verifies faithfully:
 | a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
 | write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
 | graph staging logs | `excalibur-fsck`, read-only | every record of the label, triple, entity text, erasure and withdrawal logs against its CRC, walked by the graph module's own replay without opening the log. One ending in a write cut short is healthy and unproven: the node trims it on open. Damage the node refuses fails the image |
-| the lexical store | `excalibur-fsck`, read-only, as one structure | every column of every segment its manifest names |
+| the lexical store | `excalibur-fsck`, read-only, as one structure | the manifest against the CRC32C on its end line; every column of every segment it names; each named segment's key table against the checksums in `seg-N.keysum` and its tombstones against their trailing CRC32C; and every line of `erasure.log` against its own CRC32C. A manifest an older build wrote carries only a record count, and a key table, tombstone file or erasure log it wrote carries nothing: each is held to its structure and not proven |
 | segment term sketches (`segment_<N>.tfs`) | `excalibur-fsck`, read-only | a CRC32C over the header and one over the body. A damaged sketch is reported and does not fail the image: a node restored from it rebuilds the sketch when it opens the segment. One that cannot be read at all fails it |
 | the document registry, the source catalog and the source status history | `excalibur-fsck`, read-only | the CRC32C on the closing line, over every byte before it, and the record count beside it. Each is held to what its reader requires, so one the node would refuse fails the image; a status history the node would only discard does not. A file written before the format carried a checksum has only its count checked, and is reported unproven |
 | the in-flight journal | `excalibur-fsck`, read-only | every line against the CRC32C it ends with. A complete line that fails its checksum fails the image, since the node refuses to start on it; a last line cut short is an append that never finished, and does not. A version 1 journal carries no checksum and is reported unproven |
-| `routing.dir`, lexical sidecars | `excalibur-fsck`, read-only | nothing — these formats carry no checksum, so they are well-formed at best |
+| `routing.dir` | `excalibur-fsck`, read-only | a CRC32C over the whole file. One an older build wrote carries none and is well-formed at best, until the node next writes the directory |
+| a lexical store file beside no segment the manifest names | `excalibur-fsck`, read-only | nothing — nothing names it, so it is well-formed at best |
 
 The engine's own checkers run on a scratch copy because several of them repair what they open;
 `excalibur-fsck`'s are the ones it surveys a live directory with, so the two tools cannot disagree
@@ -2818,16 +2822,34 @@ Under `<data dir>/chunk-index` when the native engine is configured:
 
 | Path | Contents |
 | --- | --- |
-| `manifest` | The segments the store consists of, one per line, with the epoch each became visible at and how many of its documents are tombstoned. A segment exists when this file names it and not before, so publication is one atomic rename |
-| `erasure.log` | Obligations recorded but not yet applied to disk, each with the time it was promised. Forced to disk before an erase call returns |
+| `manifest` | The segments the store consists of, one per line, with the epoch each became visible at and how many of its documents are tombstoned. A segment exists when this file names it and not before, so publication is one atomic rename. The last line holds the number of segment lines and a CRC32C of every byte before it |
+| `erasure.log` | Obligations recorded but not yet applied to disk, each with the time it was promised. Forced to disk before an erase call returns. Every line ends with a CRC32C of the line before it |
 | `seg-N/` | One segment's postings: `index.meta`, `terms.dict`, `terms.hash`, `post.off`, `post.blk`, `post.dat`, `docs.len`, all memory-mapped and read through the page cache |
 | `seg-N.keys` | The caller's name for each document, UTF-8, one per line — for ingested text, the chunk id `source:document:chunk:N`, the same name a vector hit on that chunk carries. Text on purpose: this is what an operator opens to see what a segment holds |
 | `seg-N.keyidx` | Byte offsets into `seg-N.keys`, so a name is a mapped read rather than heap |
-| `seg-N.keymap` | An open-addressed table from the hash of a name to its document, so erasing or republishing a name is a couple of probes rather than a pass over every name in the store. Derived data: rebuilt on open when it is missing or the wrong size |
-| `seg-N.tomb` | A bit per document, set when it has been erased and not yet rewritten out |
+| `seg-N.keymap` | An open-addressed table from the hash of a name to its document, so erasing or republishing a name is a couple of probes rather than a pass over every name in the store. Derived data: rebuilt on open when it is missing, the wrong size, or does not match its checksum |
+| `seg-N.keysum` | The length and CRC32C of `seg-N.keys`, `seg-N.keyidx` and `seg-N.keymap`, written with them and never changed |
+| `seg-N.tomb` | A bit per document, set when it has been erased or replaced and not yet rewritten out, behind a header naming the document count and followed by a CRC32C. Absent while nothing in the segment is marked |
 
 Anything on disk the manifest does not name is deleted when the store is opened: a segment is
 written before it is published, so a crash in between leaves files no reader will ever consult.
+That makes the manifest the one file whose damage deletes data, so it is only believed whole: one
+whose count disagrees with its lines, or whose bytes do not match the checksum on its last line,
+stops the store from opening, and nothing is deleted on its authority. A manifest an older build
+wrote, with a count and no checksum, is read and trusted by its count as before, and rewritten
+with a checksum by the next write.
+
+The key table and the tombstones beside each segment are checked against their checksums when the
+store opens, because neither looks damaged when it is: a changed name still reads as a name, and
+a cleared tombstone bit is a document readable again. A segment whose names or tombstones fail is
+kept out of every query and is never rebuilt — a rebuild reads the names to fetch each document's
+text and drops what the tombstones mark, so it would need exactly what cannot be trusted — and
+`/v1/stats` lists it under `unreadable` as one no compaction can rebuild; an erasure recorded later
+removes it whole, for the reason given under the erasure deadline below. A lookup table that fails
+its checksum is rebuilt from the names. A line of `erasure.log` that fails its checksum stops the
+store from opening, as a malformed line always has: guessing which promises the log held could
+only let one of them lapse. A tombstone file, key checksum file or erasure log written by a newer
+build stops it opening too, and nothing is deleted.
 
 Beside it, `<data dir>/document-registry` records which documents this node holds, the chunk ids
 each was written under, and the `ETag` and `Last-Modified` an HTTP source reported for it. It is

@@ -71,7 +71,6 @@ public final class LexicalStore implements AutoCloseable {
 
     private static final String SEGMENT_PREFIX = "seg-";
     private static final String SCRATCH_PREFIX = ".compact-";
-    private static final String TOMBSTONE_SUFFIX = ".tomb";
 
     /** One result: the caller's key, and the score. */
     public record Hit(String key, double score) { }
@@ -207,8 +206,8 @@ public final class LexicalStore implements AutoCloseable {
 
     /**
      * Segments that opened but were written in an older format: readable, exact, and without the
-     * column checksums that would let damage to them be detected. Filled at open, and emptied by
-     * the compactions that rewrite them.
+     * checksums - on the columns, the key table or the tombstones - that would let damage to them
+     * be detected. Filled at open, and emptied by the compactions that rewrite them.
      */
     private final Set<String> outdated = new HashSet<>();
     private final java.util.concurrent.atomic.AtomicLong nextSegment =
@@ -323,66 +322,196 @@ public final class LexicalStore implements AutoCloseable {
      * table is checked here, while the store is deciding what it holds, because a rebuild
      * trusts it completely.</p>
      *
+     * <h2>The files beside the segment</h2>
+     * <p>The key table and the tombstones are checked here too, against the checksums written
+     * with them, and damage to either is worse than damage to the postings: it cannot be
+     * rebuilt. A rebuild reads the names to ask for each document's text, so names that are not
+     * the ones written leave nothing to ask with; and it drops every tombstoned document, so
+     * marks that cannot be trusted leave it unable to tell an erased document from a live one -
+     * rebuilding from them would make erased documents readable again. Either keeps the segment
+     * out of every query exactly as damaged postings do, and it is never rebuilt; an owed
+     * erasure removes it, for the reason {@link #removeUnrecoverable} gives. The key lookup table
+     * is the exception: it is derived from the names, so one that does not match its checksum is
+     * rebuilt from them, which reproduces the bytes the checksum was taken over.</p>
+     *
      * <h2>Older formats</h2>
-     * <p>A segment written before its format carried column checksums opens and answers exactly,
-     * and is noted so that compaction rewrites it into the current format in time. Nothing is
-     * upgraded in place: a checksum written now would vouch for bytes nothing has vouched
-     * for.</p>
+     * <p>A segment written before its format carried column checksums, before its key table
+     * carried checksums, or whose tombstones were written without a header opens and answers
+     * exactly, and is noted so that compaction rewrites it into the current format in time.
+     * Nothing is upgraded in place: a checksum written now would vouch for bytes nothing has
+     * vouched for. Tombstones are the one exception, because they change: the next erasure or
+     * replacement in the segment writes them at the current version.</p>
+     *
+     * @throws Bm25MismatchException if a segment was built with a different BM25 pair
+     * @throws IOException if a segment's tombstones or key table checksums were written by a
+     *                     newer build: nothing here can read them, and treating them as damage
+     *                     would let an owed erasure remove a segment that is not damaged
      */
     private void inspectSegments() throws IOException {
         for (SegmentManifest.Entry entry : manifest.entries()) {
-            Path segment = directory.resolve(entry.name());
-            try {
-                IndexMeta meta = IndexMeta.read(segment);
-                if (!meta.bm25().equals(bm25)) {
-                    throw new Bm25MismatchException(segment, meta.bm25(), bm25);
-                }
-                SegmentGeometry.verify(segment, meta);
-                LexicalSegmentIntegrity.requireIntact(segment, meta);
-                if (!meta.checksummed()) {
+            SegmentInspection found = inspectSegment(entry);
+            if (found.sound()) {
+                if (!found.current()) {
                     outdated.add(entry.name());
                 }
-            } catch (Bm25MismatchException e) {
-                throw e;
-            } catch (IOException e) {
-                quarantine(entry, e.getMessage());
+            } else {
+                quarantine(entry, found);
             }
         }
         if (!outdated.isEmpty()) {
             LOGGER.warn("{} segment(s) of the lexical store at {} were written in an older format "
-                + "and carry no column checksums; they answer exactly, and compaction rewrites "
-                + "them into the current format a few at a time", outdated.size(), directory);
+                + "and carry no checksums on their columns, key table or tombstones; they answer "
+                + "exactly, and compaction rewrites them into the current format a few at a time",
+                outdated.size(), directory);
         }
+    }
+
+    /**
+     * What checking one segment found.
+     *
+     * @param damage    Why its postings cannot be served, or null
+     * @param lostNames Why its names cannot be trusted, or null
+     * @param lostMarks Why its tombstones cannot be trusted, or null
+     * @param current   Whether everything checked carries the current format's checksums
+     */
+    private record SegmentInspection(String damage, String lostNames, String lostMarks,
+                                     boolean current) {
+
+        boolean sound() {
+            return damage == null && lostNames == null && lostMarks == null;
+        }
+    }
+
+    /** Checks one segment's columns, key table and tombstones, changing nothing but the lookup table. */
+    private SegmentInspection inspectSegment(SegmentManifest.Entry entry) throws IOException {
+        Path segment = directory.resolve(entry.name());
+        String damage = null;
+        boolean current = true;
+        try {
+            IndexMeta meta = IndexMeta.read(segment);
+            if (!meta.bm25().equals(bm25)) {
+                throw new Bm25MismatchException(segment, meta.bm25(), bm25);
+            }
+            SegmentGeometry.verify(segment, meta);
+            LexicalSegmentIntegrity.requireIntact(segment, meta);
+            current = meta.checksummed();
+        } catch (Bm25MismatchException e) {
+            throw e;
+        } catch (IOException e) {
+            damage = e.getMessage();
+        }
+        String lostNames = null;
+        try {
+            KeyChecksums.Recorded sums = KeyChecksums.read(directory, entry.name());
+            if (sums == null) {
+                current = false;
+            } else {
+                lostNames = verifyKeyTable(entry, sums);
+            }
+        } catch (KeyChecksums.UnsupportedVersionException e) {
+            throw e;
+        } catch (IOException e) {
+            // The digests themselves are gone, which says nothing about the names: they are held
+            // to what their structure can show, as a segment written before checksums is, and a
+            // rebuild writes the segment again with digests of its own.
+            damage = damage == null ? e.getMessage() : damage + "; " + e.getMessage();
+        }
+        String lostMarks = null;
+        try {
+            TombstoneFile.Marks marks = TombstoneFile.read(
+                TombstoneFile.of(directory, entry.name()), entry.docCount());
+            if (marks.version() != TombstoneFile.VERSION) {
+                current = false;
+            }
+        } catch (TombstoneFile.UnsupportedVersionException e) {
+            throw e;
+        } catch (IOException e) {
+            lostMarks = e.getMessage();
+        }
+        return new SegmentInspection(damage, lostNames, lostMarks, current);
+    }
+
+    /**
+     * Checks a segment's key table against the checksums written with it.
+     *
+     * <p>A lookup table that does not match is rebuilt from the names, which are checked first,
+     * and checked again: the table is a pure function of the names, so the rebuilt one matches
+     * unless the names or the rebuild are at fault.</p>
+     *
+     * @return Why the names cannot be trusted, or null when they are the ones written
+     */
+    private String verifyKeyTable(SegmentManifest.Entry entry, KeyChecksums.Recorded sums)
+            throws IOException {
+        String name = entry.name();
+        if (sums.docCount() != entry.docCount()) {
+            return "its key table's checksums were recorded for " + sums.docCount()
+                + " name(s) where the manifest records " + entry.docCount();
+        }
+        for (String suffix : List.of(SegmentKeys.KEYS_SUFFIX, SegmentKeys.INDEX_SUFFIX)) {
+            String wrong = KeyChecksums.mismatch(directory, name, sums, suffix);
+            if (wrong != null) {
+                return wrong;
+            }
+        }
+        String table = KeyChecksums.mismatch(directory, name, sums, SegmentKeys.MAP_SUFFIX);
+        if (table == null) {
+            return null;
+        }
+        Files.deleteIfExists(directory.resolve(name + SegmentKeys.MAP_SUFFIX));
+        openKeys(name);
+        String rebuilt = KeyChecksums.mismatch(directory, name, sums, SegmentKeys.MAP_SUFFIX);
+        if (rebuilt != null) {
+            return "its key lookup table did not match its checksum, and the one rebuilt from "
+                + "its names does not either: " + rebuilt;
+        }
+        LOGGER.warn("Rebuilt the key lookup table of segment {} of the lexical store at {} from "
+            + "its names, because it did not match the checksum written with it: {}", name,
+            directory, table);
+        return null;
     }
 
     /**
      * Keeps a segment that could not be opened out of every query, and works out whether it can
      * be rebuilt.
      */
-    private void quarantine(SegmentManifest.Entry entry, String why) {
-        String keyDamage;
-        try {
-            keyDamage = openKeys(entry.name()).damage(entry.docCount());
-        } catch (IOException | RuntimeException e) {
-            keyDamage = String.valueOf(e.getMessage());
-        }
+    private void quarantine(SegmentManifest.Entry entry, SegmentInspection found) {
+        String keyDamage = found.lostNames();
         if (keyDamage == null) {
-            unreadable.put(entry.name(), why);
+            try {
+                keyDamage = openKeys(entry.name()).damage(entry.docCount());
+            } catch (IOException | RuntimeException e) {
+                keyDamage = String.valueOf(e.getMessage());
+            }
+        }
+        if (keyDamage == null && found.lostMarks() == null) {
+            unreadable.put(entry.name(), found.damage());
             rebuildable.add(entry.name());
             LOGGER.error("Segment {} of the lexical store at {} cannot be opened, so the {} "
                 + "document(s) it holds will not be found by any query until it is rebuilt; its "
                 + "key table is sound, so the next compaction rebuilds it from stored text: {}",
-                entry.name(), directory, entry.liveCount(), why);
+                entry.name(), directory, entry.liveCount(), found.damage());
             return;
         }
-        unreadable.put(entry.name(), why + "; its key table cannot be relied on either, so it "
-            + "cannot be rebuilt: " + keyDamage);
-        LOGGER.error("Segment {} of the lexical store at {} cannot be opened, so the {} "
+        List<String> reasons = new ArrayList<>(3);
+        if (found.damage() != null) {
+            reasons.add(found.damage());
+        }
+        if (keyDamage != null) {
+            reasons.add("its key table cannot be relied on" + (reasons.isEmpty() ? "" : " either")
+                + ", so it cannot be rebuilt: " + keyDamage);
+        }
+        if (found.lostMarks() != null) {
+            reasons.add("its tombstones cannot be relied on, so which of its documents were "
+                + "erased or replaced is unknown and it can be neither served nor rebuilt: "
+                + found.lostMarks());
+        }
+        String why = String.join("; ", reasons);
+        unreadable.put(entry.name(), why);
+        LOGGER.error("Segment {} of the lexical store at {} cannot be served, so the {} "
             + "document(s) it holds will not be found by any query until its files are restored "
-            + "or its documents reindexed; its key table is damaged too, so no compaction can "
-            + "rebuild it, and its files are left untouched until an erasure is owed, which "
-            + "removes it: {}; key table: {}",
-            entry.name(), directory, entry.liveCount(), why, keyDamage);
+            + "or its documents reindexed; no compaction can rebuild it, and its files are left "
+            + "untouched until an erasure is owed, which removes it: {}",
+            entry.name(), directory, entry.liveCount(), why);
     }
 
     /**
@@ -1048,11 +1177,19 @@ public final class LexicalStore implements AutoCloseable {
      * exceptions are forgotten once the floor has passed them, since the floor is the caller's
      * promise that no reader is further behind.</p>
      *
+     * <p>Never a segment that can be neither served nor rebuilt: see {@link #quarantine}. A
+     * damaged segment that can be rebuilt is planned like any other.</p>
+     *
      * @param floorEpoch The oldest epoch any live reader may still query at
      */
     private List<SegmentManifest.Entry> compactableEntries(long floorEpoch) {
         List<SegmentManifest.Entry> entries = new ArrayList<>(manifest.entries().size());
         for (SegmentManifest.Entry entry : manifest.entries()) {
+            if (unrecoverable(entry.name())) {
+                // Nothing can rewrite it: a rewrite reads its names and drops its tombstoned
+                // documents, and one of the two is what cannot be trusted.
+                continue;
+            }
             Map<Integer, Long> replaced = replacedAt.get(entry.name());
             if (replaced != null) {
                 replaced.values().removeIf(from -> from <= floorEpoch);
@@ -1558,7 +1695,10 @@ public final class LexicalStore implements AutoCloseable {
     private void settleErasureLog() throws IOException {
         Set<String> owed = new HashSet<>();
         for (SegmentManifest.Entry entry : manifest.entries()) {
-            if (entry.tombstoned() == 0) {
+            // An unrecoverable segment has nothing to show: its names or its marks cannot be
+            // read. It is only ever here while nothing is owed, because an owed erasure removes
+            // it before anything is settled.
+            if (entry.tombstoned() == 0 || unrecoverable(entry.name())) {
                 continue;
             }
             SegmentKeys segmentKeys = openKeys(entry.name());
@@ -1706,37 +1846,41 @@ public final class LexicalStore implements AutoCloseable {
         return cached;
     }
 
+    /**
+     * A segment's marks, read once and then kept.
+     *
+     * <p>Refused rather than read leniently when the file does not match its checksum: every
+     * segment's marks were verified when the store opened, so this fails only for a file damaged
+     * since, and failing the operation that needed it is the one outcome that cannot make an
+     * erased document readable.</p>
+     */
     private boolean[] loadTombstones(String name, int docCount) throws IOException {
         boolean[] cached = tombstones.get(name);
         if (cached != null) {
             return cached;
         }
-        boolean[] marks = new boolean[docCount];
-        Path file = directory.resolve(name + TOMBSTONE_SUFFIX);
-        if (Files.exists(file)) {
-            byte[] bits = Files.readAllBytes(file);
-            for (int i = 0; i < docCount; i++) {
-                int index = i >>> 3;
-                if (index < bits.length && ((bits[index] >>> (i & 7)) & 1) != 0) {
-                    marks[i] = true;
-                }
-            }
-        }
+        boolean[] marks = TombstoneFile.read(TombstoneFile.of(directory, name), docCount).marks();
         tombstones.put(name, marks);
         return marks;
     }
 
+    /**
+     * Replaces a segment's marks with these, at the current version.
+     *
+     * <p>A manifest an older build could read is rewritten first. That build reads a tombstone
+     * file as marks from its first byte, so it would take this file's header for marks and its
+     * marks for the wrong documents; it refuses the current manifest outright, so no store it
+     * opens can hold tombstones it would misread.</p>
+     */
     private void writeTombstones(String name, boolean[] marks) throws IOException {
-        byte[] bits = new byte[(marks.length + 7) / 8];
-        for (int i = 0; i < marks.length; i++) {
-            if (marks[i]) {
-                bits[i >>> 3] |= (byte) (1 << (i & 7));
-            }
+        if (manifest.version() < SegmentManifest.VERSION) {
+            manifest.write(directory);
         }
         // Forced, not merely renamed: an erasure is confirmed as applied once its tombstones are
         // written, and a confirmation resting on bytes still in the page cache is one a power cut
         // turns into a document readable again with nothing left to say it was owed.
-        Durability.FILE_SYSTEM.replace(directory.resolve(name + TOMBSTONE_SUFFIX), bits);
+        Durability.FILE_SYSTEM.replace(TombstoneFile.of(directory, name),
+            TombstoneFile.encode(marks));
         tombstones.put(name, marks);
     }
 
@@ -1753,8 +1897,10 @@ public final class LexicalStore implements AutoCloseable {
         replacedAt.remove(name);
         deleteRecursively(directory.resolve(name));
         SegmentKeys.delete(directory, name);
-        Files.deleteIfExists(directory.resolve(name + TOMBSTONE_SUFFIX));
-        Files.deleteIfExists(directory.resolve(name + TOMBSTONE_SUFFIX + ".tmp"));
+        Path marks = TombstoneFile.of(directory, name);
+        Files.deleteIfExists(marks);
+        Files.deleteIfExists(marks.resolveSibling(marks.getFileName()
+            + Durability.REPLACEMENT_SUFFIX));
     }
 
     private static void deleteRecursively(Path path) throws IOException {
