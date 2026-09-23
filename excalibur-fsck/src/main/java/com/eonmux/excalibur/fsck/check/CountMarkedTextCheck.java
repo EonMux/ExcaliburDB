@@ -9,8 +9,8 @@ import java.util.List;
 /**
  * Checks the line-oriented registries that end with a record count.
  *
- * <p>{@code document-registry} and {@code source-catalog} are UTF-8 text, and neither
- * carries a checksum of any kind. What they do carry is a trailing {@code \#end|count}
+ * <p>{@code document-registry}, {@code source-catalog} and {@code source-status} are UTF-8 text,
+ * and none carries a checksum of any kind. What they do carry is a trailing {@code \#end|count}
  * line, which is the only thing that can distinguish a whole file from one whose tail a
  * failed write took with it. Checking that count is therefore the strongest statement this
  * tool can make about them, and it is a weaker statement than "intact" - a line altered in

@@ -18,6 +18,7 @@ import com.eonmux.excalibur.ingest.pipeline.IngestionOrchestrator;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.SourceCatalog;
+import com.eonmux.excalibur.ingest.registry.SourceStatusFile;
 import com.eonmux.excalibur.ingest.source.SourceResolver;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.llm.embedding.EmbeddingClient;
@@ -76,7 +77,7 @@ final class ServerWiring {
     private final Config config;
     private final QueryRegistry queryRegistry;
     private final ReindexEndpoint.ReindexStatusRegistry reindexStatusRegistry;
-    private final IngestStatusEndpoint.IngestionStatusRegistry ingestionStatusRegistry;
+    private final IngestStatusEndpoint.InMemoryIngestionStatusRegistry ingestionStatusRegistry;
 
     /**
      * The single mutual exclusion for reindexing, shared by {@code POST /v1/reindex}
@@ -323,6 +324,20 @@ final class ServerWiring {
     /** @param catalog Where source registrations are recorded across restarts, or null */
     void withSourceCatalog(SourceCatalog catalog) {
         this.sourceCatalog = catalog;
+    }
+
+    /**
+     * Makes what each source's last run ended with outlast the process.
+     *
+     * <p>Handed to the status registry now, before the endpoints are built, because the catalog's
+     * sources are restored while they are - and a restored source takes its status from what this
+     * file held.</p>
+     *
+     * @param statusFile Where each source's last finished run is written
+     * @throws NullPointerException if the file is null
+     */
+    void withSourceStatus(SourceStatusFile statusFile) {
+        ingestionStatusRegistry.persistTo(statusFile);
     }
 
     /**

@@ -268,9 +268,10 @@ public class InMemorySourceRegistry implements SourceRegistry {
      * Brings back a source a previous run registered.
      *
      * <p>Everything registration starts except the crawl. The source takes its place in the
-     * registry, in {@code /v1/ingest/status} and in the re-crawl schedule, and the schedule is
-     * what crawls it next - one interval from now, which is what a source registered before the
-     * restart was already waiting for.</p>
+     * registry, in {@code /v1/ingest/status} - reporting the last run it finished before the
+     * restart, where the status registry keeps a history - and in the re-crawl schedule, and the
+     * schedule is what crawls it next - one interval from now, which is what a source registered
+     * before the restart was already waiting for.</p>
      *
      * <p>Re-ingesting on the way up would be the wrong default: it re-fetches and re-hashes the
      * whole corpus every time the node is bounced, to discover what the next scheduled re-crawl
@@ -378,12 +379,16 @@ public class InMemorySourceRegistry implements SourceRegistry {
     private void start(Source source, Crawl crawl) {
         String sourceId = source.getSourceId();
 
-        // Create initial status entry if status registry is configured
-        // This ensures /v1/ingest/status returns data even without orchestrator
+        // A status entry either way, so /v1/ingest/status answers for the source even on a node
+        // with no ingestion pipeline. A fresh registration starts idle and empty; a restored one
+        // reports the last run it finished before the restart, because zeros stamped with the
+        // moment the node came up would say the source had never been crawled.
         IngestStatusEndpoint.IngestionStatus initialStatus = null;
-        if (statusRegistry != null) {
+        if (statusRegistry != null && crawl == Crawl.NO) {
+            initialStatus = statusRegistry.restore(sourceId);
+            LOGGER.debug("Restored the status entry for source: {}", sourceId);
+        } else if (statusRegistry != null) {
             initialStatus = statusRegistry.getOrCreate(sourceId);
-            // Initialize with idle state, will be updated by orchestrator if present
             initialStatus.update("idle", 0.0, 0, 0);
             LOGGER.debug("Created initial status entry for source: {}", sourceId);
         }

@@ -381,7 +381,10 @@ segment's term sketch, `segment_<N>.tfs`, is the one derived file the node rebui
 sketch that fails its checksum is reported `CORRUPT` but not counted as damage, so it neither sets
 exit code `1` nor fails `--strict`, and the repair plan moves it aside (the node would rebuild it
 anyway). Only corruption is excused: a sketch the operating system will not read — an I/O error, a
-permission refused — is `UNREADABLE`, and fails the run like any file the device refuses. Every other derived file — a graph, a mapping, a codebook, an LSH table — is rebuilt only
+permission refused — is `UNREADABLE`, and fails the run like any file the device refuses. The
+source status history, `source-status`, is excused the same way for a different reason: it is not
+rebuilt, but the node reads one it cannot trust as no history and reports each source from its next
+run, so a damaged one costs how the last crawls ended and nothing the node serves. Every other derived file — a graph, a mapping, a codebook, an LSH table — is rebuilt only
 by a reindex or a retrain, and its damage fails the run. A `segment_<N>.hnsw.compact.docmap` is
 the mapping an HNSW compaction stages: beside its `segment_<N>.hnsw.compact` the compaction never
 swapped, both are staging leftovers, and the mapping is moved aside first; alone, the graph swap
@@ -1574,6 +1577,12 @@ indexes nothing at all, and reporting that as a completed run would make a broke
 like a healthy one. A missing API key is *not* this state: that node has a pipeline and indexes
 lexically.
 
+The status outlives a restart. Each source's last finished run is kept in
+`<data dir>/source-status`, so a source the node brings back reports that run — counts, error and
+`last_updated_ms` unchanged — until its next run replaces it. A run the restart interrupted is
+never reported as still running: it comes back `idle`, with `last_error` saying the run in
+progress when the node stopped did not finish.
+
 | Count | What it counts |
 |-------|----------------|
 | `entries_ingested` | Chunks written and published by this run |
@@ -2583,6 +2592,18 @@ catalog cut short is a file of whole, well-formed records — indistinguishable 
 sources were never registered in, so the node would come back silently having forgotten them. A
 catalog written by a build older than the marker fails the start; see
 [Upgrading a data directory](USAGE.md#upgrading-a-data-directory-written-by-an-older-build).
+
+`<data dir>/source-status` records how each registered source's last run ended — its state, its
+progress and counts, when it finished, and its `last_error` — so `GET /v1/ingest/status` after a
+restart reports that run rather than zeros stamped with the moment the node came up. Only finished
+runs are written (`idle` or `unconfigured`); a crawl the restart cut short comes back `idle` with
+`last_error` saying that the run in progress when the node stopped did not finish, never still
+claiming to run. The file is written the way the catalog is — a `\#source-status|1` header, one
+line per source, a `\#end|<count>` marker, forced to disk and published by an atomic rename — but
+unlike the catalog, one that cannot be read does not fail the start. It is a report, not state the
+store depends on: the node logs it, treats the history as empty, and each source reports from its
+next run. A data directory from a build without the file needs nothing; it is written when the
+first run ends.
 
 ### Visibility and Consistency
 

@@ -411,8 +411,8 @@ public final class SourceCatalog {
                 Files.move(replacement, target, StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.ATOMIC_MOVE);
             } catch (AtomicMoveNotSupportedException e) {
-                LOGGER.warn("This filesystem cannot rename atomically; the source catalog is "
-                    + "published with a plain replace and a crash during it can truncate it");
+                LOGGER.warn("This filesystem cannot rename atomically; {} is published with a "
+                    + "plain replace and a crash during it can truncate it", target);
                 Files.move(replacement, target, StandardCopyOption.REPLACE_EXISTING);
             }
         }
@@ -422,9 +422,9 @@ public final class SourceCatalog {
             try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
                 channel.force(true);
             } catch (IOException e) {
-                LOGGER.warn("Could not force the directory entry for the source catalog at {}; "
-                    + "a host crash immediately after a registration can lose the rename that "
-                    + "published it: {}", directory, e.getMessage());
+                LOGGER.warn("Could not force the directory entry at {}; a host crash "
+                    + "immediately after a write can lose the rename that published it: {}",
+                    directory, e.getMessage());
             }
         }
     }
@@ -656,9 +656,10 @@ public final class SourceCatalog {
     /**
      * Escapes the characters that carry structure in a record.
      *
-     * <p>{@code \\} first, so unescaping is unambiguous.</p>
+     * <p>{@code \\} first, so unescaping is unambiguous. Shared with {@link SourceStatusFile},
+     * whose records are escaped the same way so the two files read alike.</p>
      */
-    private static String escape(String value) {
+    static String escape(String value) {
         StringBuilder escaped = new StringBuilder(value.length());
         for (int i = 0; i < value.length(); i++) {
             char c = value.charAt(i);
@@ -677,7 +678,7 @@ public final class SourceCatalog {
     /**
      * Reverses {@link #escape(String)}.
      */
-    private static String unescape(String value) {
+    static String unescape(String value) {
         if (value.indexOf(ESCAPE) < 0) {
             return value;
         }
@@ -707,7 +708,7 @@ public final class SourceCatalog {
      * <p>A plain {@code String.split} would cut inside an escaped value and turn one source into
      * two malformed ones.</p>
      */
-    private static List<String> splitEscaped(String value, char delimiter) {
+    static List<String> splitEscaped(String value, char delimiter) {
         List<String> parts = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         for (int i = 0; i < value.length(); i++) {

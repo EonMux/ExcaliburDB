@@ -846,6 +846,13 @@ progress. Without it an `idle` source reads the same whether it was crawled a mi
 before a restart three weeks back, and "is the index still following the source?" cannot be
 answered from the API at all.
 
+The whole response survives a restart. The node writes each source's last finished run to
+`<data dir>/source-status`, and a source it brings back reports that run — the same counts, error
+and `last_updated_ms` — until its next run replaces it. A run the restart cut short is not
+reported as still running: it comes back `idle`, with `last_error` reading `The run in progress
+when the node stopped did not finish`. A `source-status` the node cannot read is logged and
+ignored rather than failing the start; each source then reports from its next run.
+
 `entries_skipped` is how many of the files the crawl listed were not text and so had nothing in
 them to index — images, archives, compiled output, anything whose decoded bytes carry a U+0000 or
 run a third or more replacement characters. It is reported apart from `last_error` on purpose: a
@@ -2529,8 +2536,8 @@ Logback is pre-configured with JSON structured logging via logstash-encoder. Poi
 ### Backups
 
 Every byte of a node's state lives under its data directory — segments, write logs, the segment
-catalog, the routing directory, the chunk index, the graph, the document registry and the source
-catalog. Nothing is kept anywhere else, so backing the node up is copying that one directory and
+catalog, the routing directory, the chunk index, the graph, the document registry, the source
+catalog and the source status history. Nothing is kept anywhere else, so backing the node up is copying that one directory and
 restoring it is putting the directory back.
 
 `excalibur-backup` does that copy and, unlike `cp`, can prove afterwards that it worked.
@@ -2712,6 +2719,13 @@ Two derived files are judged by what the node does with them rather than by name
   something about the device rather than about one derived file. Every other derived file is
   rebuilt only by a reindex or a retrain, so its damage fails the run. A sketch whose segment is gone is an orphaned index like any other,
   and a stranded `segment_<N>.tfs.<id>.tmp` is a staging leftover.
+- **`source-status`, how each source's last crawl ended**, is not derived and nothing rebuilds it,
+  but nothing the node serves depends on it either: a node that cannot trust it logs that, treats
+  the history as empty, and reports each source from its next run. So a `source-status` whose
+  record count disagrees with its records is reported `CORRUPT`, counted with the sketches under
+  `corruptRebuiltOnOpen` rather than as damage, and moved aside by the repair plan — what is lost
+  either way is the history, never indexed data. As with a sketch, one the operating system will
+  not read is `UNREADABLE` and fails the run.
 - **`segment_<N>.hnsw.compact.docmap`, a compaction's staged mapping**, means one of two things.
   Beside `segment_<N>.hnsw.compact`, the compaction never swapped its graph in: both are staging
   leftovers the node would discard, and the repair moves the mapping aside before the graph —
@@ -2831,6 +2845,10 @@ the ingredients instead and computes the bound at query time, against the statis
 use. An older segment is read with block pruning disabled — correct, and slower — and logs a
 `WARN` naming itself at open. Expect that warning after the upgrade; it is not data loss. A
 compaction rewrites the segment into the new format and the warning stops.
+
+**`<data dir>/source-status` — no step required.** A new file rather than a changed one: an
+older build never wrote it, so a directory it left has none, and every source reports from its
+next run exactly as it did before the upgrade. The file appears when the first run ends.
 
 ### Enabling debug logging
 

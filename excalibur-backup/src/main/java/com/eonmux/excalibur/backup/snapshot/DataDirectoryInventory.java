@@ -17,8 +17,9 @@ import java.util.Objects;
  * {@code segment_N.hnsw}, {@code segment_N.hnsw.docmap} and {@code segment_N.tfs} per
  * segment, with {@code segment_N.hnsw.compact.docmap} beside a graph whose compaction was
  * interrupted; {@code routing.dir}; {@code document-registry}; {@code source-catalog};
- * {@code chunk-index/}; and a directory per tenant namespace holding {@code graph-staging/}
- * and, once a build has run, {@code graph/}.</p>
+ * {@code source-status}, how each source's last crawl ended, which exists nowhere else and so is
+ * kept like the catalog beside it; {@code chunk-index/}; and a directory per tenant namespace
+ * holding {@code graph-staging/} and, once a build has run, {@code graph/}.</p>
  *
  * <h2>Why the classification is a table and not a filter</h2>
  * <p>An unrecognised file is kept, not dropped. A build newer than this tool will write
