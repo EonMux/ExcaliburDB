@@ -138,6 +138,10 @@ class TailScanHandoffIntegrationTest {
             .as("the graph has absorbed nothing, so the write log is the only place these "
                 + "chunks exist to be scored from")
             .contains(SOURCE + ":alpha.md", SOURCE + ":beta.md");
+        assertThat(tail)
+            .as("each hit names the chunk it scored, as a graph hit does")
+            .allSatisfy(hit -> assertThat(hit.result().documentId())
+                .startsWith(SOURCE + ":").contains(":chunk:"));
     }
 
     @Test
@@ -146,7 +150,7 @@ class TailScanHandoffIntegrationTest {
         ingest(corpus());
 
         Hit alpha = scanEverySegment(vectorFor("anything at all")).stream()
-            .filter(hit -> (SOURCE + ":alpha.md").equals(hit.result().documentId()))
+            .filter(hit -> (SOURCE + ":alpha.md").equals(documentOf(hit)))
             .findFirst()
             .orElseThrow(() -> new AssertionError("no tail hit for alpha.md"));
         String text = alpha.text();
@@ -214,13 +218,18 @@ class TailScanHandoffIntegrationTest {
         return hits;
     }
 
+    /** The document a hit's chunk belongs to. */
+    private static String documentOf(Hit hit) {
+        return ChunkIdentifiers.documentKeyOfChunk(hit.result().documentId());
+    }
+
     private static List<String> documentIds(List<Hit> tail) {
-        return tail.stream().map(hit -> hit.result().documentId()).toList();
+        return tail.stream().map(TailScanHandoffIntegrationTest::documentOf).toList();
     }
 
     private static long hitsFor(List<Hit> tail, String documentKey) {
         return tail.stream()
-            .filter(hit -> documentKey.equals(hit.result().documentId()))
+            .filter(hit -> documentKey.equals(documentOf(hit)))
             .count();
     }
 

@@ -237,9 +237,16 @@ public final class ChunkAttributionUpgrade {
             graph.lock.writeLock().unlock();
         }
 
-        LOGGER.info("Re-keyed the node attribution of {} from documents to chunks: {} node(s) "
-            + "attributed to their chunk, {} retired because no live chunk holds their vector",
-            graph.path(), rekeyed.size(), retired);
+        // An upgraded data directory has a mapping for every segment, most of them empty; one
+        // line per segment that held nothing would bury the ones that did.
+        if (rekeyed.isEmpty() && retired == 0) {
+            LOGGER.debug("Re-keyed the empty node attribution of {} from documents to chunks",
+                graph.path());
+        } else {
+            LOGGER.info("Re-keyed the node attribution of {} from documents to chunks: {} "
+                + "node(s) attributed to their chunk, {} retired because no live chunk holds "
+                + "their vector", graph.path(), rekeyed.size(), retired);
+        }
         return new Outcome(true, false, rekeyed.size(), retired);
     }
 }
