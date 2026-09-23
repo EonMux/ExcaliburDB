@@ -174,6 +174,27 @@ public final class LexicalStore implements AutoCloseable {
     private final Map<String, boolean[]> tombstones = new LinkedHashMap<>();
 
     /**
+     * Per segment, the documents a republished copy replaced, mapped to the epoch that copy
+     * became visible at.
+     *
+     * <p>A replaced copy is tombstoned the moment its replacement is published, and a tombstone
+     * holds at every epoch, while the replacement is visible only from its own. A reader still
+     * behind that epoch would otherwise find neither copy - the chunk matching no query at all,
+     * for as long as the reader lags. So the tombstone is written as it always was, and this
+     * records the exception to it: a reader before the replacement's epoch still sees the copy
+     * it replaced, and a reader at or after it sees only the replacement. Never both.</p>
+     *
+     * <p>Held in memory only. What it describes ends once no reader precedes the replacement,
+     * and a node that restarts resumes its epoch past every epoch this store has published at,
+     * so no reader after a restart precedes one; the tombstone on disk is then the whole truth.
+     * Entries leave once the reader floor passes them - see {@link #compactableEntries} - and
+     * with their segment. Concurrent maps, because a search reads them under the caller's
+     * shared lock while planning prunes them.</p>
+     */
+    private final Map<String, Map<Integer, Long>> replacedAt =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
      * Segments the manifest names that this store could not open, and why.
      *
      * <p>Filled at open, because a segment's files do not change while the store holds them; an
@@ -586,7 +607,7 @@ public final class LexicalStore implements AutoCloseable {
                 targets.add(entry);
             }
         }
-        int replaced = supersede(staged, targets);
+        int replaced = supersede(staged, targets, epoch);
 
         int documents = 0;
         for (Staged segment : staged) {
@@ -612,9 +633,14 @@ public final class LexicalStore implements AutoCloseable {
      * previous version of a document that is still present, and demanding a compaction deadline
      * for it would make every re-crawl an erasure obligation.</p>
      *
+     * <p>Each copy retired here stays visible to a reader before {@code epoch}, which cannot see
+     * the batch replacing it; see {@link #replacedAt}. It is recorded there before it is marked,
+     * so no reader can find it marked and not yet excepted.</p>
+     *
+     * @param epoch The epoch the batch becomes visible at
      * @return How many documents were retired
      */
-    private int supersede(List<Staged> staged, List<SegmentManifest.Entry> targets)
+    private int supersede(List<Staged> staged, List<SegmentManifest.Entry> targets, long epoch)
             throws IOException {
         if (targets.isEmpty()) {
             return 0;
@@ -626,7 +652,9 @@ public final class LexicalStore implements AutoCloseable {
             targetKeys.add(openKeys(entry.name()));
             boolean[] marks = loadTombstones(entry.name(), entry.docCount());
             targetMarks.add(marks);
-            retired.add(new Retired(marks));
+            Map<Integer, Long> replaced = replacedAt.computeIfAbsent(entry.name(),
+                name -> new java.util.concurrent.ConcurrentHashMap<>());
+            retired.add(new Retired(marks, doc -> replaced.put(doc, epoch)));
         }
 
         for (Staged segment : staged) {
@@ -683,16 +711,29 @@ public final class LexicalStore implements AutoCloseable {
      */
     private static final class Retired implements IntConsumer {
 
+        private static final IntConsumer NOTHING = doc -> { };
+
         private final boolean[] marks;
+        private final IntConsumer beforeMarking;
         private int count;
 
         Retired(boolean[] marks) {
+            this(marks, NOTHING);
+        }
+
+        /**
+         * @param marks         The segment's tombstones, set in place
+         * @param beforeMarking Told of each document about to be marked, before it is
+         */
+        Retired(boolean[] marks, IntConsumer beforeMarking) {
             this.marks = marks;
+            this.beforeMarking = beforeMarking;
         }
 
         @Override
         public void accept(int doc) {
             if (!marks[doc]) {
+                beforeMarking.accept(doc);
                 marks[doc] = true;
                 count++;
             }
@@ -726,7 +767,8 @@ public final class LexicalStore implements AutoCloseable {
         PostingsIndex.Stats stats = collectionStats(visible, terms);
         List<Hit> merged = new ArrayList<>();
         for (SegmentManifest.Entry entry : visible) {
-            if (entry.liveCount() == 0) {
+            Map<Integer, Long> replaced = replacedAt.get(entry.name());
+            if (entry.liveCount() == 0 && stillVisible(replaced, epoch) == 0) {
                 continue;
             }
             PostingsIndex index = openSegment(entry.name());
@@ -735,14 +777,33 @@ public final class LexicalStore implements AutoCloseable {
             // The tombstones are handed to the scorer rather than applied to what it returns. A
             // segment's best matches are often exactly the documents that were erased, and
             // filtering afterwards would then leave the page short of live documents the segment
-            // still holds.
-            IntPredicate live = erased == null ? null : doc -> !erased[doc];
+            // still holds. A copy whose replacement this reader cannot see yet is live to it.
+            IntPredicate live = erased == null ? null
+                : replaced == null || replaced.isEmpty() ? doc -> !erased[doc]
+                : doc -> !erased[doc] || replaced.getOrDefault(doc, Long.MIN_VALUE) > epoch;
             for (PostingsIndex.Hit hit : index.search(terms, weights, limit, stats, live)) {
                 merged.add(new Hit(segmentKeys.at(hit.docId()), hit.score()));
             }
         }
         merged.sort(Comparator.comparingDouble(Hit::score).reversed());
         return merged.size() > limit ? merged.subList(0, limit) : merged;
+    }
+
+    /**
+     * How many of a segment's replaced copies a reader at an epoch still sees, because their
+     * replacements became visible after it.
+     */
+    private static int stillVisible(Map<Integer, Long> replaced, long epoch) {
+        if (replaced == null) {
+            return 0;
+        }
+        int visible = 0;
+        for (long from : replaced.values()) {
+            if (from > epoch) {
+                visible++;
+            }
+        }
+        return visible;
     }
 
     /**
@@ -889,8 +950,15 @@ public final class LexicalStore implements AutoCloseable {
             SegmentKeys segmentKeys = openKeys(entry.name());
             boolean[] marks = loadTombstones(entry.name(), entry.docCount());
             Retired retired = new Retired(marks);
+            // An erased copy is gone for every reader at once, including one that could not yet
+            // see the copy replacing it: erasure is retroactive, supersession is not.
+            Map<Integer, Long> replaced = replacedAt.get(entry.name());
+            IntConsumer erase = replaced == null ? retired : doc -> {
+                replaced.remove(doc);
+                retired.accept(doc);
+            };
             for (String key : documentKeys) {
-                segmentKeys.find(key.getBytes(StandardCharsets.UTF_8), retired);
+                segmentKeys.find(key.getBytes(StandardCharsets.UTF_8), erase);
             }
             if (retired.count() > 0) {
                 writeTombstones(entry.name(), marks);
@@ -965,8 +1033,37 @@ public final class LexicalStore implements AutoCloseable {
      * @param floorEpoch The oldest epoch any live reader may still query at
      */
     public Optional<CompactionPlan> planCompaction(long floorEpoch) {
-        return planner.plan(manifest.entries(), erasureLog.oldestOutstanding(), clock.instant(),
-            floorEpoch, requiredRewrites());
+        return planner.plan(compactableEntries(floorEpoch), erasureLog.oldestOutstanding(),
+            clock.instant(), floorEpoch, requiredRewrites());
+    }
+
+    /**
+     * The segments a compaction planned now may rewrite.
+     *
+     * <p>Every segment, less those still holding a replaced copy some reader needs: one whose
+     * replacement became visible after the reader floor. A rewrite drops every tombstoned
+     * document, and dropping that copy would take away the only one a reader behind its
+     * replacement can see - the gap {@link #replacedAt} exists to close. Such a segment waits
+     * for the floor to pass, which is a reader timeout at most. Planning is also where those
+     * exceptions are forgotten once the floor has passed them, since the floor is the caller's
+     * promise that no reader is further behind.</p>
+     *
+     * @param floorEpoch The oldest epoch any live reader may still query at
+     */
+    private List<SegmentManifest.Entry> compactableEntries(long floorEpoch) {
+        List<SegmentManifest.Entry> entries = new ArrayList<>(manifest.entries().size());
+        for (SegmentManifest.Entry entry : manifest.entries()) {
+            Map<Integer, Long> replaced = replacedAt.get(entry.name());
+            if (replaced != null) {
+                replaced.values().removeIf(from -> from <= floorEpoch);
+                if (!replaced.isEmpty()) {
+                    continue;
+                }
+                replacedAt.remove(entry.name(), replaced);
+            }
+            entries.add(entry);
+        }
+        return entries;
     }
 
     /**
@@ -1014,7 +1111,8 @@ public final class LexicalStore implements AutoCloseable {
      * @param floorEpoch The epoch below which segments may be merged with each other
      */
     public CompactionPlan forcedPlan(long floorEpoch) {
-        return planner.forcedPlan(manifest.entries(), floorEpoch, requiredRewrites());
+        return planner.forcedPlan(compactableEntries(floorEpoch), floorEpoch,
+            requiredRewrites());
     }
 
     /**
@@ -1027,7 +1125,7 @@ public final class LexicalStore implements AutoCloseable {
      * @param floorEpoch The epoch below which segments may be merged with each other
      */
     public CompactionPlan fullPlan(long floorEpoch) {
-        return planner.fullPlan(manifest.entries(), floorEpoch);
+        return planner.fullPlan(compactableEntries(floorEpoch), floorEpoch);
     }
 
     /**
@@ -1517,7 +1615,7 @@ public final class LexicalStore implements AutoCloseable {
     public int liveDocuments(long epoch) {
         int total = 0;
         for (SegmentManifest.Entry entry : readable(manifest.visibleAt(epoch))) {
-            total += entry.liveCount();
+            total += entry.liveCount() + stillVisible(replacedAt.get(entry.name()), epoch);
         }
         return total;
     }
@@ -1652,6 +1750,7 @@ public final class LexicalStore implements AutoCloseable {
             names.close();
         }
         tombstones.remove(name);
+        replacedAt.remove(name);
         deleteRecursively(directory.resolve(name));
         SegmentKeys.delete(directory, name);
         Files.deleteIfExists(directory.resolve(name + TOMBSTONE_SUFFIX));

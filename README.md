@@ -843,11 +843,14 @@ few thousand probes rather than a pass over every identifier in the store. A rep
 counted as dead weight for compaction but is owed to nobody: it is a previous version, not a
 promise, and giving every re-crawl an erasure deadline would make routine indexing urgent.
 
-Retiring a copy is not epoch-scoped, because the mechanism it shares with erasure is deliberately
-not: hiding has to be immediate or erasure is not erasure. So a query already running when a chunk
-is republished sees neither version of it — the old one is retired and the new one is published at a
-later epoch than the query is reading at. That costs one chunk from one in-flight query for the
-length of that query, which is the price of erasure taking effect the moment it is asked for.
+Retiring a copy is epoch-scoped where erasing one is not. The new copy is published at a later
+epoch than a query already running is reading at, so a query before that epoch goes on matching the
+old copy and a query at or after it matches only the new one — a republished chunk is always
+findable by one version of its text and never by both. Erasure is the opposite, deliberately:
+hiding has to be immediate or erasure is not erasure, so an erased chunk disappears from every
+query at once, including one that could still see an earlier copy. A compaction leaves a replaced
+copy on disk until no query can be reading from before its replacement, which is at most a query
+timeout.
 
 **Erasure.** Two parts, deliberately. The obligation is appended to a log and forced to disk before
 the call returns, and the chunks are tombstoned so no query returns them. Physical removal happens
