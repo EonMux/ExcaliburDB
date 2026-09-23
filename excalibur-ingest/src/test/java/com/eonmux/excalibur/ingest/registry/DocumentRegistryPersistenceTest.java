@@ -98,12 +98,11 @@ class DocumentRegistryPersistenceTest {
 
         // In among the records rather than after the end marker: a line past the marker is a
         // file that did not end where it says it does, which is truncation's signature and is
-        // refused. The count is corrected with it, because what is under test here is a record
-        // this build cannot parse, not a file that lost its tail.
+        // refused. The count and the checksum are corrected with it, because what is under test
+        // here is a record this build cannot parse, not a file that lost its tail or was altered.
         List<String> lines = new java.util.ArrayList<>(Files.readAllLines(file, StandardCharsets.UTF_8));
         lines.add(lines.size() - 1, "this is not a record");
-        lines.set(lines.size() - 1, "\\#end|2");
-        Files.write(file, lines, StandardCharsets.UTF_8);
+        Sealed.write(file, lines.subList(0, lines.size() - 1), DocumentRegistry.END_MARKER, 2);
 
         DocumentRegistry reloaded = new DocumentRegistry(file);
 

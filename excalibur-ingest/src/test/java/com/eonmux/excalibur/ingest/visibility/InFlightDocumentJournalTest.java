@@ -122,6 +122,128 @@ class InFlightDocumentJournalTest {
         assertThat(journal(dataDir).recover()).containsExactly("docs:paper.md");
     }
 
+    @Test
+    @DisplayName("every line carries the checksum of its own bytes")
+    void everyLineIsChecksummed(@TempDir Path dataDir) throws IOException {
+        InFlightDocumentJournal journal = journal(dataDir);
+        journal.begin("docs:paper.md");
+        journal.end("docs:paper.md");
+        journal.begin("docs:other.md");
+
+        List<String> lines = Files.readAllLines(journal.path(), StandardCharsets.UTF_8);
+
+        assertThat(InFlightJournalFormat.FORMAT_VERSION).isEqualTo(2);
+        assertThat(lines).containsExactly(
+            sealed("\\#in-flight|2"),
+            sealed("+|docs:paper.md"),
+            sealed("-|docs:paper.md"),
+            sealed("+|docs:other.md"));
+        assertThat(journal(dataDir).recover()).containsExactly("docs:other.md");
+    }
+
+    @Test
+    @DisplayName("a complete record altered in place is refused, naming the checksum")
+    void aFlippedByteIsRefused(@TempDir Path dataDir) throws IOException {
+        InFlightDocumentJournal journal = journal(dataDir);
+        journal.begin("docs:paper.md");
+        journal.begin("docs:other.md");
+        byte[] bytes = Files.readAllBytes(journal.path());
+        int record = new String(bytes, StandardCharsets.UTF_8).indexOf("+|docs:paper.md");
+        bytes[record + 3] ^= 0x01;
+        Files.write(journal.path(), bytes);
+
+        assertThatThrownBy(() -> journal(dataDir).recover())
+            .isInstanceOf(InFlightJournalException.class)
+            .hasMessageContaining(journal.path().toString())
+            .hasMessageContaining("checksum");
+    }
+
+    @Test
+    @DisplayName("a header altered in place is refused")
+    void aDamagedHeaderIsRefused(@TempDir Path dataDir) throws IOException {
+        InFlightDocumentJournal journal = journal(dataDir);
+        journal.begin("docs:paper.md");
+        List<String> lines = Files.readAllLines(journal.path(), StandardCharsets.UTF_8);
+        String header = lines.get(0);
+        Files.write(journal.path(), List.of(header.substring(0, header.length() - 1)
+            + (header.endsWith("0") ? "1" : "0"), lines.get(1)), StandardCharsets.UTF_8);
+
+        assertThatThrownBy(() -> journal(dataDir).recover())
+            .isInstanceOf(InFlightJournalException.class)
+            .hasMessageContaining("checksum");
+    }
+
+    @Test
+    @DisplayName("an append cut short is skipped, and the next append starts on a line of its own")
+    void aTornAppendIsSkippedAndSealedOff(@TempDir Path dataDir) throws IOException {
+        InFlightDocumentJournal journal = journal(dataDir);
+        journal.begin("docs:paper.md");
+        String torn = sealed("+|docs:torn.md");
+        Files.writeString(journal.path(), torn.substring(0, torn.length() - 3),
+            StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.APPEND);
+
+        InFlightDocumentJournal restarted = journal(dataDir);
+        assertThat(restarted.recover()).containsExactly("docs:paper.md");
+        restarted.begin("docs:next.md");
+
+        assertThat(journal(dataDir).recover())
+            .as("a record appended after a torn one must not be welded onto it")
+            .containsExactlyInAnyOrder("docs:paper.md", "docs:next.md");
+    }
+
+    @Test
+    @DisplayName("a whole last record whose terminator never landed is still applied")
+    void aWholeUnterminatedRecordIsApplied(@TempDir Path dataDir) throws IOException {
+        Path file = dataDir.resolve("document-registry" + InFlightJournalFormat.SUFFIX);
+        Files.writeString(file, sealed("\\#in-flight|2") + "\n" + sealed("+|docs:a.md"),
+            StandardCharsets.UTF_8);
+
+        assertThat(journal(dataDir).recover()).containsExactly("docs:a.md");
+        assertThat(Files.readString(file, StandardCharsets.UTF_8)).endsWith("\n");
+    }
+
+    @Test
+    @DisplayName("a version 1 journal is read as it always was, and rewritten in version 2")
+    void aVersionOneJournalIsUpgraded(@TempDir Path dataDir) throws IOException {
+        Path file = dataDir.resolve("document-registry" + InFlightJournalFormat.SUFFIX);
+        Files.writeString(file, "\\#in-flight|1\n+|docs:a.md\n+|docs:b.md\n-|docs:a.md\n?\n",
+            StandardCharsets.UTF_8);
+
+        assertThat(journal(dataDir).recover()).containsExactly("docs:b.md");
+        assertThat(Files.readAllLines(file, StandardCharsets.UTF_8))
+            .containsExactly(sealed("\\#in-flight|2"), sealed("+|docs:b.md"));
+    }
+
+    @Test
+    @DisplayName("a version above the newest is refused, checksum or not")
+    void aNewerVersionIsRefused(@TempDir Path dataDir) throws IOException {
+        Path file = dataDir.resolve("document-registry" + InFlightJournalFormat.SUFFIX);
+        Files.writeString(file, sealed("\\#in-flight|3") + "\n" + sealed("+|docs:a.md") + "\n",
+            StandardCharsets.UTF_8);
+
+        assertThatThrownBy(() -> journal(dataDir).recover())
+            .isInstanceOf(InFlightJournalException.class)
+            .hasMessageContaining("format version 3");
+    }
+
+    @Test
+    @DisplayName("the seal is exactly the line, a bar, and eight hex digits of its CRC32C")
+    void theSealIsTheLinesOwnChecksum() {
+        String line = InFlightJournalFormat.seal("+|docs:a.md");
+        java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
+        crc.update("+|docs:a.md".getBytes(StandardCharsets.UTF_8));
+
+        assertThat(line).isEqualTo("+|docs:a.md|" + String.format("%08x", crc.getValue()));
+        assertThat(InFlightJournalFormat.unseal(line)).isEqualTo("+|docs:a.md");
+        assertThat(InFlightJournalFormat.unseal("+|docs:a.md")).isNull();
+        assertThat(InFlightJournalFormat.unseal("+|docs:b.md" + line.substring(11))).isNull();
+        assertThat(InFlightJournalFormat.unseal(line.toUpperCase())).isNull();
+    }
+
+    private static String sealed(String content) {
+        return InFlightJournalFormat.seal(content);
+    }
+
     private static InFlightDocumentJournal journal(Path dataDir) {
         return new InFlightDocumentJournal(dataDir.resolve("document-registry"));
     }

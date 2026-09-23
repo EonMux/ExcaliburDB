@@ -4,8 +4,6 @@ import com.eonmux.excalibur.store.hash.XxHash64;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -51,37 +49,39 @@ import java.util.stream.Collectors;
  *
  * <h2>Record format</h2>
  * <p>A first line, {@code \#document-registry|<version>}, names the format. One line per
- * document follows, and a last line, {@code \#end|count}, closes the file. The header cannot
- * collide with a record and neither can the marker: {@link #escape(String)} doubles every
- * backslash, so no formatted record begins with a single one.</p>
+ * document follows, and a last line, {@code \#end|<count>|<crc>}, closes the file: how many
+ * records precede it, and the CRC32C of every byte before it, header included, in eight
+ * lowercase hexadecimal digits (see {@link EndLine}). The header cannot collide with a record and
+ * neither can the closing line: {@link #escape(String)} doubles every backslash, so no formatted
+ * record begins with a single one.</p>
  *
  * <p>A record may carry the entity tag as a last field after the chunk ids. It is persisted
  * rather than held in memory because it is what a re-crawl sends back as {@code If-None-Match}: a
  * node that forgot it at every restart would transfer every unchanged page again on its first
- * re-crawl after one, which is exactly the crawl a restarted node runs.</p>
+ * re-crawl after one, which is exactly the crawl a restarted node runs. The field is optional
+ * rather than tied to a version: a record that ends at the chunk ids reads as a document without
+ * a tag, in every version.</p>
  *
- * <p>The field is optional within version 1 rather than a version of its own, and that is
- * deliberate. Every version-1 reader reads the first seven fields of a record and ignores any
- * after them, so a file with tags is one the previous build still opens - it loses the tags and
- * nothing else, and a rollback is a rollback. A version bump would buy nothing a reader needs,
- * since a record without the field already reads as a document without a tag, and it would make
- * the previous build refuse the registry outright: a downgrade that cannot start, or starts only
- * by deleting the registry and reingesting the corpus.</p>
- *
- * <p>Both lines earn their place against the same failure. A registry that lost its tail is a
+ * <p>Each part of the frame answers a different failure. A registry that lost its tail is a
  * registry of whole, well-formed records that simply omits documents, and those documents are
  * then neither erasable nor reindexable while their chunks stay in storage and stay queryable -
- * the count is what makes that detectable. The header is what tells a short file from an old
- * one: truncation takes the tail, so a header is present in every file this build wrote, and
- * its absence can only mean a build that wrote no header.</p>
+ * the count is what makes that detectable. A record altered in place is a different but equally
+ * well-formed record - another document's chunk ids, a content hash that makes a changed
+ * document look unchanged - and only the checksum sees it. The header is what tells a short file
+ * from an old one: truncation takes the tail, so a header is present in every file this build
+ * wrote, and its absence can only mean a build that wrote no header.</p>
  *
  * <h2>Reading an older or newer file</h2>
- * <p>A file with no header is read as one an older build wrote: its lines are records, there is
- * nothing to check them against, and it is loaded with a warning saying so and rewritten in the
- * current format at the next save. A file whose header names a version this build does not know
- * is refused rather than reinterpreted - guessing at an unknown layout is how a registry turns
- * into a shorter registry. A file carrying a header and no matching count was cut short by a
- * crash, and is refused for the same reason {@link RegistryLoadException} exists.</p>
+ * <p>Version 1 closed with {@code \#end|<count>} and no checksum; it is read as it always was,
+ * with its count checked and its records unverified. A file with no header at all is older still:
+ * its lines are records, there is nothing to check them against, and it is loaded with a warning
+ * saying so. Either is marked as owing a save, so the next save rewrites it in the current
+ * format - and the node's start-up makes that save at once rather than waiting for the first
+ * ingest or erasure. A file whose header names a version this build does not know is refused
+ * rather than reinterpreted - guessing at an unknown layout is how a registry turns into a
+ * shorter registry. A file carrying a header and no matching closing line was cut short by a
+ * crash, and one whose checksum does not match its bytes was altered after it was written; both
+ * are refused for the same reason {@link RegistryLoadException} exists.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>This class is fully thread-safe. All operations use ConcurrentHashMap and
@@ -115,16 +115,21 @@ public final class DocumentRegistry {
     /**
      * The format this build writes, and the newest it reads.
      *
-     * <p>Still 1 with the entity tag, which is an optional trailing field that version-1 readers
-     * ignore; see the class documentation for why it is not a version of its own.</p>
+     * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
+     * judge this file offline and must accept exactly what this class accepts.</p>
+     */
+    public static final int FORMAT_VERSION = 2;
+
+    /**
+     * The first version whose closing line carries a checksum.
      *
      * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
      * judge this file offline and must accept exactly what this class accepts.</p>
      */
-    public static final int FORMAT_VERSION = 1;
+    public static final int FIRST_CHECKSUMMED_VERSION = 2;
 
     /**
-     * The oldest versioned format this build reads, which is the only one there has been.
+     * The oldest versioned format this build reads.
      *
      * <p>A file with no header at all is older still and is read too; see the class
      * documentation.</p>
@@ -143,7 +148,8 @@ public final class DocumentRegistry {
     public static final String HEADER_MARKER = "\\#document-registry";
 
     /**
-     * Opens the last line, which states how many records precede it.
+     * Opens the last line, which states how many records precede it and, from {@link
+     * #FIRST_CHECKSUMMED_VERSION}, the checksum of every byte before it.
      *
      * <p>Public for {@code excalibur-fsck} and {@code excalibur-backup verify --deep}, which
      * judge this file offline and must accept exactly what this class accepts.</p>
@@ -601,30 +607,24 @@ public final class DocumentRegistry {
     }
 
     /**
-     * Writes the header, every record, and the end marker that proves the file is whole.
+     * Writes the header, every record, and the closing line that proves the file is whole.
      *
      * <p>The count is taken from the same pass that writes the records rather than from
-     * {@code documents.size()}, so it states what actually reached the file.</p>
+     * {@code documents.size()}, so it states what actually reached the file, and the checksum
+     * from the bytes as they were written.</p>
      */
     private void write(Path replacement) throws IOException {
-        try (BufferedWriter out = Files.newBufferedWriter(replacement,
+        try (ChecksummedTextWriter out = ChecksummedTextWriter.create(replacement,
                 StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-            out.write(HEADER_MARKER);
-            out.write(FIELD_SEPARATOR_CHAR);
-            out.write(Integer.toString(FORMAT_VERSION));
-            out.newLine();
+            out.writeLine(HEADER_MARKER + FIELD_SEPARATOR + FORMAT_VERSION);
 
             int written = 0;
             for (DocumentMetadata metadata : documents.values()) {
-                out.write(formatMetadata(metadata));
-                out.newLine();
+                out.writeLine(formatMetadata(metadata));
                 written++;
             }
 
-            out.write(END_MARKER);
-            out.write(FIELD_SEPARATOR_CHAR);
-            out.write(Integer.toString(written));
-            out.newLine();
+            out.writeEnd(END_MARKER, written);
         }
     }
 
@@ -672,10 +672,11 @@ public final class DocumentRegistry {
      *
      * @param path The path to load from
      * @throws RegistryLoadException if the file exists but cannot be read, names a format this
-     *                               build does not know, or is missing records it declares
+     *                               build does not know, is missing records it declares, or does
+     *                               not match its checksum
      */
     private void loadFromFile(Path path) {
-        try (BufferedReader reader = Files.newBufferedReader(path)) {
+        try (ChecksummedLineReader reader = ChecksummedLineReader.open(path)) {
             String first = reader.readLine();
             if (first == null) {
                 // Indistinguishable from a registry an older build wrote while holding nothing,
@@ -699,22 +700,29 @@ public final class DocumentRegistry {
                 throw new RegistryLoadException(path, "it declares format version " + version
                     + " and this build reads version " + FORMAT_VERSION);
             }
-            loadRecords(path, reader);
+            loadRecords(path, reader, version);
         } catch (IOException e) {
             throw new RegistryLoadException(path, e);
         }
     }
 
     /**
-     * Loads a file that names its format, checking it against the count it ends with.
+     * Loads a file that names its format, checking it against the line it closes with.
      *
-     * <p>Held one line behind, because the last line is the end marker rather than a record and
-     * a registry is too large to read into a list first only to drop its tail.</p>
+     * <p>Held one line behind, because the last line is the closing line rather than a record
+     * and a registry is too large to read into a list first only to drop its tail. The checksum
+     * the reader reports before the last line is the checksum of everything the closing line
+     * vouches for.</p>
+     *
+     * <p>A version this build no longer writes is marked as owing a save, so the next one
+     * rewrites it in the current format - with a checksum its records do not carry yet.</p>
      */
-    private void loadRecords(Path path, BufferedReader reader) throws IOException {
+    private void loadRecords(Path path, ChecksummedLineReader reader, int fileVersion)
+            throws IOException {
         int records = 0;
         int skipped = 0;
         String previous = reader.readLine();
+        long beforePrevious = reader.checksumBeforeLine();
         String line;
         while ((line = reader.readLine()) != null) {
             records++;
@@ -722,16 +730,28 @@ public final class DocumentRegistry {
                 skipped++;
             }
             previous = line;
+            beforePrevious = reader.checksumBeforeLine();
         }
 
-        int declared = declaredCount(previous);
-        if (declared < 0) {
-            throw new RegistryLoadException(path, "it does not end with a record count, so it was "
-                + "cut short before the save that published it finished");
+        boolean checksummed = fileVersion >= FIRST_CHECKSUMMED_VERSION;
+        EndLine end = EndLine.parse(previous, END_MARKER, checksummed);
+        if (end == null) {
+            throw new RegistryLoadException(path, "it does not end with a record count"
+                + (checksummed ? " and checksum" : "") + ", so it was cut short before the save "
+                + "that published it finished");
         }
-        if (declared != records) {
+        if (end.count() != records) {
             throw new RegistryLoadException(path,
-                "it declares " + declared + " record(s) and carries " + records);
+                "it declares " + end.count() + " record(s) and carries " + records);
+        }
+        if (checksummed && end.checksum() != beforePrevious) {
+            throw new RegistryLoadException(path, end.mismatch(beforePrevious));
+        }
+        if (!checksummed) {
+            version.incrementAndGet();
+            LOGGER.info("Document registry at {} is in format version {}, whose records carry no "
+                + "checksum; it will be rewritten in version {} at the next save", path,
+                fileVersion, FORMAT_VERSION);
         }
         reportSkipped(path, skipped);
     }
@@ -745,7 +765,7 @@ public final class DocumentRegistry {
      * and the registry is rewritten in the current format at the next save: the version counter
      * is bumped so the save actually happens, even if nothing is ingested or erased first.</p>
      */
-    private void loadWithoutHeader(Path path, String first, BufferedReader reader)
+    private void loadWithoutHeader(Path path, String first, ChecksummedLineReader reader)
             throws IOException {
         int records = 0;
         int skipped = 0;
@@ -799,24 +819,6 @@ public final class DocumentRegistry {
             return Integer.parseInt(line.substring(prefix.length()));
         } catch (NumberFormatException e) {
             return UNREADABLE_HEADER;
-        }
-    }
-
-    /**
-     * Reads the count out of a candidate end marker.
-     *
-     * @return The declared record count, or -1 if the line is not an end marker
-     */
-    private static int declaredCount(String line) {
-        String prefix = END_MARKER + FIELD_SEPARATOR;
-        if (line == null || !line.startsWith(prefix)) {
-            return -1;
-        }
-        try {
-            int count = Integer.parseInt(line.substring(prefix.length()));
-            return count < 0 ? -1 : count;
-        } catch (NumberFormatException e) {
-            return -1;
         }
     }
 

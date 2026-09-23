@@ -70,14 +70,14 @@ class SourceStatusFileTest {
     }
 
     @Test
-    @DisplayName("the file carries a versioned header and a record count")
+    @DisplayName("the file carries a versioned header, a record count and a checksum")
     void theFormatIsMarked(@TempDir Path dataDir) throws IOException {
         SourceStatusFile.open(dataDir).write(List.of(entry("docs", null)));
 
         List<String> lines =
             Files.readAllLines(dataDir.resolve(SourceStatusFile.FILE), StandardCharsets.UTF_8);
-        assertThat(lines.get(0)).isEqualTo("\\#source-status|2");
-        assertThat(lines.get(lines.size() - 1)).isEqualTo("\\#end|1");
+        assertThat(lines.get(0)).isEqualTo("\\#source-status|3");
+        assertThat(lines.get(lines.size() - 1)).matches("\\\\#end\\|1\\|[0-9a-f]{8}");
         assertThat(lines).hasSize(3);
     }
 

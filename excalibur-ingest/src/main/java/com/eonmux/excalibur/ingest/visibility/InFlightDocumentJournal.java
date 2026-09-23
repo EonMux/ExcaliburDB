@@ -1,5 +1,7 @@
 package com.eonmux.excalibur.ingest.visibility;
 
+import com.eonmux.excalibur.ingest.registry.ChecksummedLineReader;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,6 +18,15 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+
+import static com.eonmux.excalibur.ingest.visibility.InFlightJournalFormat.BEGAN;
+import static com.eonmux.excalibur.ingest.visibility.InFlightJournalFormat.ENDED;
+import static com.eonmux.excalibur.ingest.visibility.InFlightJournalFormat.FIRST_CHECKSUMMED_VERSION;
+import static com.eonmux.excalibur.ingest.visibility.InFlightJournalFormat.FORMAT_VERSION;
+import static com.eonmux.excalibur.ingest.visibility.InFlightJournalFormat.NO_HEADER;
+import static com.eonmux.excalibur.ingest.visibility.InFlightJournalFormat.OLDEST_READABLE_VERSION;
+import static com.eonmux.excalibur.ingest.visibility.InFlightJournalFormat.SEPARATOR;
+import static com.eonmux.excalibur.ingest.visibility.InFlightJournalFormat.UNREADABLE_VERSION;
 
 /**
  * The documents an ingest had started and not finished, on disk.
@@ -43,6 +54,22 @@ import java.util.Set;
  * {@value #COMPACTION_THRESHOLD} records, and deleted outright whenever nothing is in flight,
  * so steady-state ingestion does not accumulate a log at all.</p>
  *
+ * <h2>Checksums, and what a line that fails one means</h2>
+ * <p>Every line carries the CRC32C of its own bytes; {@link InFlightJournalFormat} has the layout.
+ * Where in the file a line that fails it sits decides what it is. A last line the file ends
+ * inside of - no terminator after it - is an append the process did not live to finish, which is
+ * the safe loss above; it is skipped, as a half-written last line always has been. A complete
+ * line whose checksum does not match was damaged after it was written, and the journal refuses to
+ * load: that line may be the {@code +} hiding a half-written document, and skipping it would
+ * serve exactly what the journal exists to hide. A header that fails its checksum is refused for
+ * the same reason a header naming no version is.</p>
+ *
+ * <p>A torn last line is not left in place either. The next append would be written straight
+ * after it, onto the same line, and the two would read back as one damaged record - so recovery
+ * rewrites the journal from what it read before anything is appended. The same rewrite brings a
+ * version 1 journal, whose lines carry no checksum and are read exactly as they always were, to
+ * the current version.</p>
+ *
  * <h2>Thread Safety</h2>
  * <p>Thread-safe. Every mutation holds the journal's lock for the append and its force, so two
  * documents beginning at once cannot interleave onto one line.</p>
@@ -50,24 +77,6 @@ import java.util.Set;
 final class InFlightDocumentJournal {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(InFlightDocumentJournal.class);
-
-    /** Appended to the registry's own name, so the two sit together in the data directory. */
-    static final String SUFFIX = ".in-flight";
-
-    /** Opens the first line, which names the format the rest of the file is in. */
-    private static final String HEADER_MARKER = "\\#in-flight";
-
-    /** The format this build writes. */
-    static final int FORMAT_VERSION = 1;
-
-    /** Opens the line that marks a document as being ingested. */
-    private static final char BEGAN = '+';
-
-    /** Opens the line that releases one. */
-    private static final char ENDED = '-';
-
-    /** Separates a line's kind from the document key it names. */
-    private static final char FIELD_SEPARATOR = '|';
 
     /** Introduces an escape sequence in a document key. */
     private static final char ESCAPE = '\\';
@@ -90,6 +99,16 @@ final class InFlightDocumentJournal {
     private int records;
 
     /**
+     * The version the lines appended to the existing file are written in.
+     *
+     * <p>The current one, except for a version 1 journal that recovery could not rewrite: lines
+     * appended to it stay in version 1, because a file mixing the two would be read under the
+     * rules of its header and have half its lines misread. The next compaction brings it
+     * forward.</p>
+     */
+    private int appendVersion = FORMAT_VERSION;
+
+    /**
      * Opens the journal that belongs beside a registry file.
      *
      * @param registryFile The document registry's path, which names the data directory
@@ -97,32 +116,70 @@ final class InFlightDocumentJournal {
      */
     InFlightDocumentJournal(Path registryFile) {
         Objects.requireNonNull(registryFile, "registryFile must not be null");
-        this.file = registryFile.resolveSibling(registryFile.getFileName() + SUFFIX);
+        this.file = registryFile.resolveSibling(
+            registryFile.getFileName() + InFlightJournalFormat.SUFFIX);
     }
 
     /**
      * Reads what a previous process left marked.
      *
      * <p>Called once, at open. The keys returned are documents whose ingest never reached a
-     * publish or a rollback, so their chunks may be in storage in part.</p>
+     * publish or a rollback, so their chunks may be in storage in part. A journal that ended in
+     * a torn line, or is in an older version, is rewritten from what was read before this
+     * returns; see the class documentation.</p>
      *
      * @return The document keys still in flight, in the order they were begun
-     * @throws InFlightJournalException if the file exists and cannot be read, or names a format
-     *                                  this build does not know
+     * @throws InFlightJournalException if the file exists and cannot be read, names a format this
+     *                                  build does not know, holds a complete line that fails its
+     *                                  checksum, or ended in a torn line that could not be
+     *                                  rewritten
      */
     Set<String> recover() {
         synchronized (lock) {
             if (!Files.exists(file)) {
                 return Set.of();
             }
-            List<String> lines;
+            ChecksummedLineReader.Lines read;
             try {
-                lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+                read = ChecksummedLineReader.readAll(file);
             } catch (IOException e) {
                 throw new InFlightJournalException(file, e);
             }
-            replay(lines);
+            if (read.lines().isEmpty()) {
+                return Set.of();
+            }
+            int version = replay(read);
+            rewriteIfNeeded(version, !read.lastLineTerminated());
             return Set.copyOf(inFlight);
+        }
+    }
+
+    /**
+     * Rewrites a recovered journal that ended in a torn line or is in an older version.
+     *
+     * @param version The version the file was read in
+     * @param torn    Whether its last line had no terminator
+     * @throws InFlightJournalException if a torn journal cannot be rewritten, since appending to
+     *                                  it would weld the next record onto the torn one
+     */
+    private void rewriteIfNeeded(int version, boolean torn) {
+        if (!torn && version == FORMAT_VERSION) {
+            return;
+        }
+        try {
+            compact();
+            if (version < FORMAT_VERSION) {
+                LOGGER.info("In-flight document journal at {} rewritten from format version {} "
+                    + "to {}", file, version, FORMAT_VERSION);
+            }
+        } catch (IOException e) {
+            if (torn) {
+                throw new InFlightJournalException(file, e);
+            }
+            appendVersion = version;
+            LOGGER.warn("Could not rewrite the in-flight document journal at {} in format version "
+                + "{}; it stays in version {} until it is next compacted: {}",
+                file, FORMAT_VERSION, version, e.getMessage());
         }
     }
 
@@ -199,7 +256,9 @@ final class InFlightDocumentJournal {
      * Appends one record and forces it, creating the file if this is the first mark.
      */
     private void append(char kind, String documentKey) throws IOException {
-        boolean created = !Files.exists(file);
+        // An empty file is what a crash can leave between creating the journal and writing its
+        // first line, and a record appended to it would be a journal with no header.
+        boolean created = !Files.exists(file) || Files.size(file) == 0;
         StringBuilder line = new StringBuilder();
         if (created) {
             // The first mark can precede the first registry save, so the directory the two share
@@ -208,10 +267,11 @@ final class InFlightDocumentJournal {
             if (directory != null) {
                 Files.createDirectories(directory);
             }
-            line.append(HEADER_MARKER).append(FIELD_SEPARATOR).append(FORMAT_VERSION).append('\n');
+            line.append(InFlightJournalFormat.header()).append('\n');
             records = 0;
+            appendVersion = FORMAT_VERSION;
         }
-        line.append(kind).append(FIELD_SEPARATOR).append(escape(documentKey)).append('\n');
+        line.append(record(kind, documentKey, appendVersion)).append('\n');
 
         try (FileChannel channel = FileChannel.open(file, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
@@ -226,6 +286,20 @@ final class InFlightDocumentJournal {
     }
 
     /**
+     * Formats one record in a given version.
+     *
+     * @param kind        {@link InFlightJournalFormat#BEGAN} or {@link InFlightJournalFormat#ENDED}
+     * @param documentKey The document
+     * @param version     The version the file it is appended to is in
+     * @return The line, without a terminator
+     */
+    private static String record(char kind, String documentKey, int version) {
+        String content = String.valueOf(kind) + SEPARATOR + escape(documentKey);
+        return version >= FIRST_CHECKSUMMED_VERSION
+            ? InFlightJournalFormat.seal(content) : content;
+    }
+
+    /**
      * Rewrites the log from the live set once it has grown past the threshold.
      */
     private void compactIfLong() throws IOException {
@@ -235,7 +309,7 @@ final class InFlightDocumentJournal {
     }
 
     /**
-     * Replaces the log with one record per document still in flight.
+     * Replaces the log with one record per document still in flight, in the current version.
      *
      * <p>An empty set deletes the file instead of writing an empty one, because the absence of
      * the file and a file that marks nothing say the same thing, and the steady state of a node
@@ -247,14 +321,15 @@ final class InFlightDocumentJournal {
                 forceDirectory();
             }
             records = 0;
+            appendVersion = FORMAT_VERSION;
             return;
         }
 
         Path replacement = file.resolveSibling(file.getFileName() + REPLACEMENT_SUFFIX);
         StringBuilder rewritten = new StringBuilder()
-            .append(HEADER_MARKER).append(FIELD_SEPARATOR).append(FORMAT_VERSION).append('\n');
+            .append(InFlightJournalFormat.header()).append('\n');
         for (String documentKey : inFlight) {
-            rewritten.append(BEGAN).append(FIELD_SEPARATOR).append(escape(documentKey)).append('\n');
+            rewritten.append(record(BEGAN, documentKey, FORMAT_VERSION)).append('\n');
         }
 
         try {
@@ -271,6 +346,7 @@ final class InFlightDocumentJournal {
         }
         forceDirectory();
         records = inFlight.size();
+        appendVersion = FORMAT_VERSION;
     }
 
     private static void force(Path path) throws IOException {
@@ -314,60 +390,107 @@ final class InFlightDocumentJournal {
     /**
      * Rebuilds the live set from the log.
      *
-     * <p>A line this build cannot read is skipped rather than failing the load: the last line of
-     * a log the power cut through can be half written, and the alternative to skipping it is
-     * refusing to start over a record that names no document.</p>
+     * @param read Every line of the log, and whether its last one was terminated
+     * @return The version the log was written in
+     * @throws InFlightJournalException if the header is not one this build reads, or a complete
+     *                                  line fails its checksum
      */
-    private void replay(List<String> lines) {
-        if (lines.isEmpty()) {
-            return;
-        }
-
+    private int replay(ChecksummedLineReader.Lines read) {
+        List<String> lines = read.lines();
         String header = lines.get(0);
-        String prefix = HEADER_MARKER + FIELD_SEPARATOR;
-        if (!header.startsWith(prefix)) {
+        if (lines.size() == 1 && !read.lastLineTerminated()) {
+            // The first append writes the header and the first record together, so a header the
+            // file ends inside of is that append torn: its record was never forced, and nothing
+            // it would have marked was written.
+            skip(header);
+            return FORMAT_VERSION;
+        }
+        int version = InFlightJournalFormat.declaredVersion(header);
+        if (version == NO_HEADER) {
             throw new InFlightJournalException(file,
                 "its first line names no format version: " + header);
         }
-        int version;
-        try {
-            version = Integer.parseInt(header.substring(prefix.length()));
-        } catch (NumberFormatException e) {
+        if (version == UNREADABLE_VERSION) {
             throw new InFlightJournalException(file,
                 "its first line names no format version this build can read: " + header);
         }
-        if (version != FORMAT_VERSION) {
+        if (version < OLDEST_READABLE_VERSION || version > FORMAT_VERSION) {
             throw new InFlightJournalException(file, "it declares format version " + version
-                + " and this build reads version " + FORMAT_VERSION);
+                + " and this build reads versions " + OLDEST_READABLE_VERSION + " to "
+                + FORMAT_VERSION);
+        }
+        if (!InFlightJournalFormat.headerIntact(header, version)) {
+            throw new InFlightJournalException(file, version < FIRST_CHECKSUMMED_VERSION
+                ? "its first line names no format version this build can read: " + header
+                : "its first line does not match its checksum, so it was altered after it was "
+                    + "written: " + header);
         }
 
-        records = replayRecords(lines);
+        records = replayRecords(lines, version, read.lastLineTerminated());
+        return version;
     }
 
     /**
-     * Applies every record after the header, returning how many were readable.
+     * Applies every record after the header, returning how many were applied.
+     *
+     * <p>In version 1 a line this build cannot read is skipped wherever it is, as that version
+     * has always been read. From version 2 only a torn last line is skipped; a complete line
+     * that fails its checksum is refused, for the reason the class documentation gives.</p>
      */
-    private int replayRecords(List<String> lines) {
+    private int replayRecords(List<String> lines, int version, boolean lastTerminated) {
+        boolean sealed = version >= FIRST_CHECKSUMMED_VERSION;
         int applied = 0;
-        for (String line : lines.subList(1, lines.size())) {
-            if (line.length() < 2 || line.charAt(1) != FIELD_SEPARATOR) {
-                LOGGER.warn("Skipping an unreadable record in the in-flight document journal at "
-                    + "{}: {}", file, line);
+        for (int index = 1; index < lines.size(); index++) {
+            String line = lines.get(index);
+            boolean torn = index == lines.size() - 1 && !lastTerminated;
+            String content = sealed ? InFlightJournalFormat.unseal(line) : line;
+            if (content == null) {
+                if (!torn) {
+                    throw new InFlightJournalException(file, "line " + (index + 1)
+                        + " does not match its checksum, so it was altered after it was written: "
+                        + line);
+                }
+                skip(line);
                 continue;
             }
-            String documentKey = unescape(line.substring(2));
-            if (line.charAt(0) == BEGAN) {
-                inFlight.add(documentKey);
-            } else if (line.charAt(0) == ENDED) {
-                inFlight.remove(documentKey);
-            } else {
-                LOGGER.warn("Skipping an unreadable record in the in-flight document journal at "
-                    + "{}: {}", file, line);
+            if (!apply(content)) {
+                if (sealed && !torn) {
+                    throw new InFlightJournalException(file, "line " + (index + 1)
+                        + " matches its checksum and is no record this build writes: " + line);
+                }
+                skip(line);
                 continue;
             }
             applied++;
         }
         return applied;
+    }
+
+    /**
+     * Applies one record's content to the live set.
+     *
+     * @param content The record, without a seal
+     * @return false if it is not a record
+     */
+    private boolean apply(String content) {
+        if (content.length() < 2 || content.charAt(1) != SEPARATOR) {
+            return false;
+        }
+        String documentKey = unescape(content.substring(2));
+        if (content.charAt(0) == BEGAN) {
+            inFlight.add(documentKey);
+            return true;
+        }
+        if (content.charAt(0) == ENDED) {
+            inFlight.remove(documentKey);
+            return true;
+        }
+        return false;
+    }
+
+    private void skip(String line) {
+        LOGGER.warn("Skipping an unreadable record in the in-flight document journal at {}: {}",
+            file, line);
     }
 
     /**
