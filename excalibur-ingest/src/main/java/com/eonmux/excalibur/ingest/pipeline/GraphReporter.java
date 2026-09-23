@@ -6,13 +6,27 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Tells the graph about documents ingestion has published, so facts can be extracted from them.
  *
  * <p>Optional throughout: a deployment that indexes text without extracting facts never sets a
  * sink, and every report is then a no-op.</p>
+ *
+ * <h2>One document's reports, in publication order</h2>
+ * <p>A report runs after the document's lock is released, because extraction may call a model
+ * and take seconds. Two versions of one document published close together can therefore reach
+ * the sink in either order, and a replacement withdraws everything staged from the document
+ * before staging its own facts - so a late report of the older version would withdraw the newer
+ * version's facts and stage stale ones in their place. Each publication is therefore numbered
+ * under the document's lock ({@link #published}), and its report ({@link #report}) runs under a
+ * per-document lock of this reporter's and is skipped outright when a later version has been
+ * published meanwhile: that version's own report replaces whatever this one would have
+ * staged. Reports of different documents never wait for each other.</p>
  */
 final class GraphReporter {
 
@@ -35,6 +49,63 @@ final class GraphReporter {
      */
     private final AtomicLong failures = new AtomicLong();
 
+    /** Numbers publications, so the latest version of a document can be told apart. */
+    private final AtomicLong publications = new AtomicLong();
+
+    /**
+     * The documents with a report outstanding.
+     *
+     * <p>An entry lives only while some publication of its document has not been reported, so
+     * the map is as large as the reports in flight rather than the corpus.</p>
+     */
+    private final ConcurrentHashMap<String, Reports> outstanding = new ConcurrentHashMap<>();
+
+    /**
+     * One document's outstanding reports.
+     *
+     * <p>A {@link ReentrantLock} rather than a monitor, because a report may block on a model
+     * call and ingestion runs one virtual thread per document: a virtual thread blocking inside
+     * {@code synchronized} pins its carrier.</p>
+     */
+    private static final class Reports {
+        final ReentrantLock lock = new ReentrantLock();
+        /** The number of the latest publication; written only inside {@code compute}. */
+        volatile long latest;
+        /** Publications not yet reported; read and written only inside {@code compute}. */
+        int pending;
+    }
+
+    /**
+     * A published document version waiting to be reported to the graph.
+     *
+     * <p>Obtained from {@link #published} under the document's lock, and handed to
+     * {@link #report} exactly once.</p>
+     */
+    static final class Publication {
+        private final String documentKey;
+        private final boolean replacedEarlierVersion;
+        private final long number;
+        private final Reports reports;
+
+        private Publication(String documentKey, boolean replacedEarlierVersion, long number,
+                            Reports reports) {
+            this.documentKey = documentKey;
+            this.replacedEarlierVersion = replacedEarlierVersion;
+            this.number = number;
+            this.reports = reports;
+        }
+
+        /** The source-qualified document key. */
+        String documentKey() {
+            return documentKey;
+        }
+
+        /** Whether this version replaced one the node already held. */
+        boolean replacedEarlierVersion() {
+            return replacedEarlierVersion;
+        }
+    }
+
     /**
      * Sets where published documents are reported so a graph can be built from them.
      *
@@ -50,6 +121,29 @@ final class GraphReporter {
     }
 
     /**
+     * Records that a version of a document has been published, for a report to follow.
+     *
+     * <p>Called under the document's lock, which is what makes the numbering the order the
+     * versions were published in. Every publication obtained here must be passed to
+     * {@link #report}, which releases it.</p>
+     *
+     * @param documentKey            The source-qualified document key
+     * @param replacedEarlierVersion Whether the node already held a version of the document
+     * @return The publication to report
+     */
+    Publication published(String documentKey, boolean replacedEarlierVersion) {
+        Objects.requireNonNull(documentKey, "documentKey must not be null");
+        long number = publications.incrementAndGet();
+        Reports reports = outstanding.compute(documentKey, (key, existing) -> {
+            Reports held = existing == null ? new Reports() : existing;
+            held.pending++;
+            held.latest = number;
+            return held;
+        });
+        return new Publication(documentKey, replacedEarlierVersion, number, reports);
+    }
+
+    /**
      * Tells the graph about a document that is now published.
      *
      * <p>After publication, deliberately. A fact staged for a document whose write then failed
@@ -57,18 +151,47 @@ final class GraphReporter {
      * retract it. Never throws: the document is already published and counted by the time this
      * runs, so failing here would report a loss that did not happen.</p>
      *
-     * @param documentKey The source-qualified document key
+     * <p>A version a later one has already superseded is not reported at all; see the class
+     * documentation.</p>
+     *
+     * @param publication What {@link #published} returned for this version
      * @param doc         The fetched document, decoded with the encoding its source declared
      */
-    void report(String documentKey, FetchedDocument doc) {
+    void report(Publication publication, FetchedDocument doc) {
+        Objects.requireNonNull(publication, "publication must not be null");
+        Reports reports = publication.reports;
+        reports.lock.lock();
+        try {
+            if (publication.number == reports.latest) {
+                deliver(publication, doc);
+            }
+        } finally {
+            reports.lock.unlock();
+            outstanding.computeIfPresent(publication.documentKey,
+                (key, held) -> --held.pending == 0 ? null : held);
+        }
+    }
+
+    /**
+     * Hands one publication to the sink.
+     *
+     * @param publication The version to report
+     * @param doc         Its fetched content
+     */
+    private void deliver(Publication publication, FetchedDocument doc) {
         GraphIngestSink sink = this.graphSink;
         if (sink == null) {
             return;
         }
+        String documentKey = publication.documentKey;
         try {
             // With the document's own date, which is what its facts are ordered by when a later
             // document gives a single-valued relation a different value.
-            sink.onDocumentPublished(documentKey, doc.getText(), doc.getLastModifiedMillis());
+            if (publication.replacedEarlierVersion) {
+                sink.onDocumentReplaced(documentKey, doc.getText(), doc.getLastModifiedMillis());
+            } else {
+                sink.onDocumentPublished(documentKey, doc.getText(), doc.getLastModifiedMillis());
+            }
         } catch (RuntimeException e) {
             long failed = failures.incrementAndGet();
             LOGGER.error("The graph did not take the facts of {}, which is published and will not "

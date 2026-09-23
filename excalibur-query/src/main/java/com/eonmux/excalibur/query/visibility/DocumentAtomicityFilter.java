@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.query.visibility;
 
+import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityChecker;
 import com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker;
 import com.eonmux.excalibur.query.QueryResultItem;
@@ -264,12 +265,15 @@ public final class DocumentAtomicityFilter {
     }
 
     /**
-     * Extracts the document ID from a query result.
+     * Extracts the document key from a query result.
      *
-     * <p>The document ID is the result's {@code documentIdStr}: the actual string
-     * document ID (e.g. {@code "doc1"}, {@code "source1:file1"}) from the ingestion
-     * pipeline, populated from the HNSW node-to-document mapping during search or
-     * decoded from the write-log entry key during a tail scan.</p>
+     * <p>A result is named by the chunk it is the vector of - {@code sourceId:documentId:chunk:N},
+     * from the graph's node attribution or the write-log entry key - while visibility is
+     * published per document, because a document becomes visible all at once. The document key
+     * is derived through {@link ChunkIdentifiers#documentKeyOfChunk(String)}, the one definition
+     * of that convention the ingest side registers visibility under; a name carrying no chunk
+     * marker, such as a graph an older build attributed by document, is already a document
+     * key and passes through unchanged.</p>
      *
      * <p>There is deliberately no fallback to the numeric ID. That value is the HNSW
      * node ID, which lives in a different namespace from document IDs and can never
@@ -278,10 +282,11 @@ public final class DocumentAtomicityFilter {
      * guaranteed false negative rather than a safety net.</p>
      *
      * @param result The query result
-     * @return The document ID string, or null if the result carries no document identity
+     * @return The document key, or null if the result carries no identity
      */
     private String extractDocumentId(QueryResultItem result) {
-        return result.documentIdStr();
+        String name = result.documentIdStr();
+        return name == null ? null : ChunkIdentifiers.documentKeyOfChunk(name);
     }
 
     /**

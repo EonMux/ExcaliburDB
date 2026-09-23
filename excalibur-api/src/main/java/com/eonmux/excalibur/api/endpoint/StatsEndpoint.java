@@ -112,7 +112,8 @@ import java.util.function.Supplier;
  *     },
  *     "ingest": {
  *       "documentsSeen": 1200, "factsStaged": 5400, "unresolvedDocuments": 0,
- *       "extractionFailures": 2, "tenantFailures": 0, "sinkRefusals": 0
+ *       "extractionFailures": 2, "tenantFailures": 0, "sinkRefusals": 0,
+ *       "withdrawalFailures": 0
  *     }
  *   }
  * }
@@ -459,7 +460,8 @@ public class StatsEndpoint implements HttpHandler {
             .append(", ")
             .append("\"extractionFailures\": ").append(ingest.extractionFailures()).append(", ")
             .append("\"tenantFailures\": ").append(ingest.tenantFailures()).append(", ")
-            .append("\"sinkRefusals\": ").append(ingest.sinkRefusals())
+            .append("\"sinkRefusals\": ").append(ingest.sinkRefusals()).append(", ")
+            .append("\"withdrawalFailures\": ").append(ingest.withdrawalFailures())
             .append("}");
     }
 

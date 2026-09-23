@@ -1025,9 +1025,23 @@ counted in `documents_failed` and the previous version stays registered and sear
 could not be embedded wrote nothing, and one that failed while being written has what it wrote
 past the previous version removed — the chunk positions the two share may already hold the new
 text, so post the document again to finish the replacement. The same holds for the first crawl of
-a source registered again after `DELETE /v1/ingest`, whose documents the node kept. Graph facts
-extracted from the previous version are not withdrawn by a replacement; `/v1/erasure` withdraws
-them.
+a source registered again after `DELETE /v1/ingest`, whose documents the node kept.
+
+The previous version's vectors go with it. Every graph node is attributed to the chunk it embeds,
+so a chunk position the new version rewrites is answered from its new vector alone once the node's
+integration worker reaches the write, and a position past the new version's end loses its vector
+before its chunk is tombstoned. Until the worker reaches a rewrite, the write log answers for that
+chunk — and only with its latest version.
+
+Graph facts go with it too. Every fact and snippet staged from a document carries the same source
+id whatever version it came from, so a replacement withdraws everything staged from the document —
+exactly as `/v1/erasure` does, labels excepted — before it stages what the new version says. The
+graph being served keeps what it was built from until the next `POST /v1/graph/build`, which no
+longer holds the earlier version's facts. A withdrawal rewrites the namespace's staging logs, so
+it is paid per replaced document that had facts staged; one that fails is logged and counted in
+`graph.ingest.withdrawalFailures` on `/v1/stats`, and the new facts are staged regardless. Two
+versions of one document published in quick succession are reported to the graph in the order
+they were published, and a version already superseded when its turn comes is skipped.
 
 **Error — `400 Bad Request`** — no `source_id`, no `documents`, more than 256 of them, a document
 with no `document_id`, no `text` or text that is not text, or the same `document_id` twice in one
@@ -1099,6 +1113,11 @@ curl -X POST http://localhost:8080/v1/reindex \
 **Error — `404 Not Found`** — no crawl is registered under that id. That includes a `source_id`
 used only with `POST /v1/documents`: supplied documents have no target to re-read, and are updated
 by posting them again.
+
+A reindex keeps the vector index and the lexical index in step with what it rewrites, the way a
+replacement does. It does not extract graph facts: the facts staged from a document are the ones
+its ingestion or its last replacement extracted, and a document a reindex found changed or removed
+keeps them until it is erased with `/v1/erasure`, which withdraws them.
 
 ```json
 {"error": "Source not found: unknown-source. Only a source registered with POST /v1/ingest can be reindexed; documents supplied with POST /v1/documents are replaced by posting them again"}
@@ -1565,7 +1584,7 @@ If you need custom embeddings (e.g., a local model, a different provider), chang
 Key fields:
 
 - **`query_id`** — Server-generated UUID for this query. Pass it to `DELETE /v1/query/{query_id}` to cancel mid-flight.
-- **`results`** — Each item has `document_id` (string), `score` (float, six decimal places) and `segment_id` (int). `document_id` is the identifier ingestion assigned, `sourceId:documentId:chunk:N`; it is always a JSON string, never a bare number, and it is never the HNSW node id, which compaction renumbers. A vector hit whose graph node has no document identity — its segment's node-to-document mapping is missing or damaged — is dropped before the page is cut, so the page is still filled from results that do have one; each drop sets `coverage.degraded`, counts in `excalibur_query_unnamed_results_dropped_total`, and names its segment in the node's log. Text is not returned unless the request asked for it — send `"include_text": true` and every result also carries `text` and `text_truncated`; add `"snippet": true` for the part of the passage the query matched, and `"explain": true` for why the result is there at all.
+- **`results`** — Each item has `document_id` (string), `score` (float, six decimal places) and `segment_id` (int). `document_id` is the identifier ingestion assigned, `sourceId:documentId:chunk:N` — the chunk that matched, for a vector hit exactly as for a BM25 one; it is always a JSON string, never a bare number, and it is never the HNSW node id, which compaction renumbers. A vector hit whose graph node has no chunk identity — its segment's node-to-chunk mapping is missing or damaged — is dropped before the page is cut, so the page is still filled from results that do have one; each drop sets `coverage.degraded`, counts in `excalibur_query_unnamed_results_dropped_total`, and names its segment in the node's log. Text is not returned unless the request asked for it — send `"include_text": true` and every result also carries `text` and `text_truncated`; add `"snippet": true` for the part of the passage the query matched, and `"explain": true` for why the result is there at all.
 - **`retrieval`** — Which signals answered: `"hybrid"`, `"vector"` or `"lexical"`. Always present, on every path. It also tells you how to read `score`, because the three have no common scale — see [Hybrid retrieval](#hybrid-retrieval--both-signals).
 - **`llm_scored`** — `true` when a relevancy model reordered this answer. `score` is then the model's judgement between 0 and 1 for each result it judged, and not a similarity or a rank sum. It is set on every route: a vector answer is scored before it leaves the pipeline, a hybrid answer after fusion, a lexical answer over its BM25 candidates. `false` when scoring was not asked for, the node has no chat model, or the model failed or ran out of time. In that last case `coverage.degraded` is `true` and the results are in retrieval order.
 - **`coverage.estimated_corpus_coverage`** — Fraction of the live corpus this query actually read. Segments it did not read (`segments_excluded`), that failed (`segments_with_errors`) or that did not answer in time (`segments_timed_out`) each reduce it, and each is counted once. < 1.0 during cold-start or heavy ingestion. Use this to decide whether to retry.
@@ -2370,7 +2389,8 @@ curl http://localhost:8080/v1/stats
     "erasure": {"namespacesOwing": 1, "outstanding": 2, "overdueNamespaces": 0,
                 "unreadableNamespaces": 0, "oldestAgeMs": 91000},
     "ingest": {"documentsSeen": 20412, "factsStaged": 131877, "unresolvedDocuments": 0,
-               "extractionFailures": 3, "tenantFailures": 0, "sinkRefusals": 0}
+               "extractionFailures": 3, "tenantFailures": 0, "sinkRefusals": 0,
+               "withdrawalFailures": 0}
   },
   "queryCache": {
     "hits": 8412, "misses": 2190, "evictions": 0, "invalidations": 1877,
@@ -2480,7 +2500,7 @@ across namespaces, never a row per namespace — which namespace owes what is
 - `budget` sets two shares against each limit. `graphMappings` and `graphDescriptors` are what eviction can give back; `processMappings` and `processDescriptors` are the whole process — segments, vector graphs, the chunk index and the JVM itself — which is what the kernel limit is measured against. Graph eviction starts when the whole process crosses `mappingHighWater`. A process figure is `null` where the platform cannot be asked, and `descriptorLimit` is `0` where no descriptor limit is enforced.
 - `builds` counts builds since startup by how they ended. A cancelled build is one somebody asked to stop, not a failure.
 - `erasure` is the graph's erasure backlog across every namespace on disk, resident or not. Compare `oldestAgeMs` against `excalibur.graph.erasure-max-latency-seconds`; `overdueNamespaces` is how many have already missed it. `unreadableNamespaces` are namespaces whose log could not be read, and so are in none of the other figures. `oldestAgeMs` is `null` when nothing is owed. The block is absent when the graph root cannot be listed, which is not the same as owing nothing.
-- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures`, `tenantFailures` and `sinkRefusals` are documents that were published and are searchable but whose facts never reached the graph. `sinkRefusals` counts documents the graph sink failed on outright rather than under one of the other three reasons; any non-zero value is worth a look in the log. None of these documents is offered to the graph again unless it changes. Nothing else shows that.
+- `ingest` is present only where ingestion stages facts into the graph (a chat model is configured). `unresolvedDocuments`, `extractionFailures`, `tenantFailures` and `sinkRefusals` are documents that were published and are searchable but whose facts never reached the graph. `sinkRefusals` counts documents the graph sink failed on outright rather than under one of the other three reasons; any non-zero value is worth a look in the log. None of these documents is offered to the graph again unless it changes. Nothing else shows that. `withdrawalFailures` counts replaced documents whose earlier version's staged facts could not be withdrawn, so the next build publishes them beside the new version's; the log names each one.
 
 ### Reclaim space now
 
@@ -2666,13 +2686,14 @@ Everything exported is a figure the node already measures; nothing here is estim
 | `excalibur_lexical_chunks{state="live"\|"erased"\|"unsearchable"}` | gauge | Chunks by state; the three sum to everything the index holds. `unsearchable` is held in a segment that could not be opened and matched by no query |
 | `excalibur_lexical_unreadable_segments`, `excalibur_lexical_outdated_segments` | gauge | Lexical segments that could not be opened, and segments in an older format awaiting rewrite. Above zero on the first is damage: alert on it |
 | `excalibur_lexical_unreadable_chunks_dropped_total` | counter | Chunks a compaction dropped from the native index because their stored text was corrupt. Any increase means a damaged storage segment; alert on it |
-| `excalibur_query_unnamed_results_dropped_total` | counter | Vector hits dropped from `/v1/query` answers because their graph node has no document identity. Any increase means a segment's node-to-document mapping is missing entries; alert on it |
+| `excalibur_query_unnamed_results_dropped_total` | counter | Vector hits dropped from `/v1/query` answers because their graph node has no chunk identity. Any increase means a segment's node-to-chunk mapping is missing entries; alert on it |
 | `excalibur_query_cache_lookups_total{result="hit"\|"miss"}`, `_evictions_total`, `_invalidations_total`, `excalibur_query_cache_entries`, `_capacity` | counter, gauge | Present only on a node with `excalibur.query.cache.enabled=true`. Hits and misses share one family so a hit ratio cannot be computed from a stale pairing. Evictions and invalidations are separate because they call for different actions: evictions mean the cache is too small for the traffic and `max-entries` is the answer, invalidations mean the corpus moved and no size would have helped |
 | `excalibur_graph_namespaces_open`, `_open_limit`, `excalibur_graph_namespace_evictions_total` | gauge, counter | Graph tenants open, the open bound, and evictions |
 | `excalibur_graph_build_running`, `excalibur_graph_builds_total{outcome="completed"\|"failed"\|"cancelled"}` | gauge, counter | Graph builds |
 | `excalibur_mappings{scope="graphs"\|"process"}`, `_high_water`, `_limit`; `excalibur_descriptors{scope=...}`, `_high_water`, `_limit` | gauge | The tenant budget. `scope="process"` is omitted where it cannot be measured, and the descriptor mark and limit where no limit is enforced |
 | `excalibur_graph_erasure_obligations`, `excalibur_graph_erasure_namespaces{state="owing"\|"overdue"\|"unreadable"}`, `excalibur_graph_erasure_oldest_age_seconds` | gauge | The graph erasure backlog, totalled across namespaces |
 | `excalibur_graph_ingest_documents_total`, `_facts_staged_total`, `excalibur_graph_ingest_failures_total{reason="unresolved_source"\|"extraction"\|"namespace_unavailable"\|"sink_refused"}` | counter | Documents whose facts did not reach the graph |
+| `excalibur_graph_ingest_withdrawal_failures_total` | counter | Replaced documents whose earlier version's staged facts could not be withdrawn |
 | `excalibur_node_draining`, `excalibur_uptime_seconds`, `excalibur_build_info{version,jvm}` | gauge | Whether an operator has drained the node, how long it has been up, and which build it is |
 
 Five alerts worth having, in ascending order of how quietly the condition fails:
@@ -2992,7 +3013,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | A `WARN` at startup naming documents that "were being ingested when this node last stopped" | Those documents were half written when the node died, and their chunks are hidden until the ingest is redone. Not an error: it is the crash being cleaned up after | Nothing — the next crawl of that source re-ingests them and they become visible again. `POST /v1/erasure` removes them instead |
 | `lexical.oldestErasureAgeMs` exceeds `lexical-max-latency-seconds` | The sweep that enforces the bound runs every tenth of it, so a reading just past the bound is ordinary; one far past it means the sweep is failing, and the node's log says why | Read the log for a failed compaction. Ingesting or reindexing anything also settles the backlog before the run finishes |
 | `lexical.unreadableChunksDropped` is above zero, or `excalibur_lexical_unreadable_chunks_dropped_total` rose | A compaction found chunks whose stored text fails its checksum or cannot be decoded, and dropped them from keyword search so the rest of their segments could be rewritten. The node's log names each chunk at ERROR | Check the disk under the data directory, run `excalibur-fsck` with the node stopped, and reindex the named chunks' documents from their source |
-| `excalibur_query_unnamed_results_dropped_total` rose, or query answers are `degraded` at full coverage with a WARN naming segments whose results "carry no document identity" | Those segments' `.docmap` is missing or damaged, so their graph nodes name no document and cannot be returned | Run `excalibur-fsck` with the node stopped to confirm which mapping is damaged. Nothing rebuilds a mapping in place, and a compaction only re-keys the one it finds: restore the graph and its mapping together from an `excalibur-backup` image, or reindex the sources whose documents that segment holds |
+| `excalibur_query_unnamed_results_dropped_total` rose, or query answers are `degraded` at full coverage with a WARN naming segments whose results "carry no document identity" | Those segments' `.docmap` is missing or damaged, so their graph nodes name no chunk and cannot be returned | Run `excalibur-fsck` with the node stopped to confirm which mapping is damaged. Nothing rebuilds a mapping in place, and a compaction only re-keys the one it finds: restore the graph and its mapping together from an `excalibur-backup` image, or reindex the sources whose documents that segment holds |
 | `lexical.unreadableSegments` is above zero, or `excalibur_lexical_unreadable_segments` is | A lexical segment failed its checksum or lost a file, so its chunks (`unsearchableChunks`) match no keyword query. The node's log names it at `ERROR` as it opens, with the reason | If `lexical.unreadable` says `rebuildable: true`, nothing: the next compaction rebuilds it, and `segments_rebuilt` on `/v1/compact/status` reports it. Otherwise its key table is damaged too — check the disk, and reindex the documents of the sources it served |
 | A re-crawled document appears twice in results | Not the chunk index — it replaces a chunk identifier rather than appending. Check whether the source is listing one document under two ids | Compare the `document_id` values on the two hits — that is the chunk identifier, `source:document:chunk:N`: identical means a bug, different means the source |
 | `/v1/stats` reports `cuckoo.saturated: true` | The membership filter is full. A level that cannot record a term is no longer trusted to say what its segment lacks, so queries order segments by their term sketches alone. Answers are unaffected; a query that runs out of time may have spent it on less likely segments first | Raise `excalibur.filter.corpus-capacity` past your term count and restart |
@@ -3007,7 +3028,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 
 ### Upgrading a data directory written by an older build
 
-Three on-disk formats differ from those older builds wrote. A node reads the old and the current form of each, but one of them needs a manual step.
+Four on-disk formats differ from those older builds wrote. A node reads the old and the current form of each, but one of them needs a manual step.
 
 **`<data dir>/source-catalog` — a manual step is required.** The catalog of registered ingestion
 sources ends with a marker line, `\#end|<count>`, written after the records are forced to
@@ -3058,6 +3079,24 @@ compaction rewrites a few of them, oldest first, up to the merge fan-in — incl
 node's sweep asks for when nothing is being ingested — so they are upgraded without being asked
 for, and `segments_upgraded` on `/v1/compact/status` reports each pass. `POST /v1/compact` with
 `{"force": true}` upgrades all of them at once.
+
+**`segment_<N>.hnsw.docmap` — no step required, and no rollback.** A graph's node mapping is
+version 3, and names each node by the chunk it embeds, `source:document:chunk:N`. Versions 1 and 2
+named the document, which left a vector hit answering with a document key no chunk is stored under
+— `include_text` came back `null`, hybrid retrieval could not fuse it with the BM25 hit on the same
+chunk — and gave nothing to retire when a chunk was overwritten, so a re-posted document went on
+ranking by every version it ever had. A node reads versions 1 and 2, and the integration worker
+re-keys each such mapping the first time it runs over the segment after start-up, before it
+integrates anything more into that graph: every node is matched to the live chunk in the same
+segment whose stored embedding equals the node's vector exactly, and a node no live chunk matches —
+the vector of a version that was overwritten or erased — is tombstoned. The mapping is written back
+at version 3, and a segment that held nodes logs one `INFO` line saying how many were attributed
+and how many retired. Until that pass, which the worker makes as soon as it starts, a segment's
+hits still name documents. `excalibur-fsck` and `excalibur-backup verify --deep` accept every
+version: a version 2 mapping is reported intact with a note that its entries name documents, and
+a version 1 mapping, which has no checksum, is reported legacy as before. An older build refuses a
+version 3 mapping, so a node that has run this build cannot go back without restoring an image
+taken before the upgrade.
 
 **`<data dir>/source-status` — no step required.** A new file rather than a changed one: an
 older build never wrote it, so a directory it left has none, and every source reports from its
@@ -3237,7 +3276,8 @@ static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoi
 
             try {
                 // Ingest: chunk, embed, write, publish. Returns once the documents are
-                // published; results are named "<sourceId>:<documentId>".
+                // published; results name the chunk that matched,
+                // "<sourceId>:<documentId>:chunk:<n>".
                 ingestion.ingestNow(InlineSource.of("handbook", List.of(
                     text("tiering.txt",
                         "Cold segments are moved to cheaper disks by the tiering policy."),
@@ -3299,10 +3339,11 @@ What each piece is for:
 The pipeline operates on vectors, so the caller embeds the question — with the **same**
 `EmbeddingClient`, model and width the corpus was ingested with; the HTTP API does this step
 itself. Results come back closest first. Read `documentIdStr()`, not `documentId()`: the string is
-the identifier ingestion assigned — `<sourceId>:<documentId>`, so `handbook:tiering.txt` here — and
-the one the HTTP API returns; `documentId()` is the numeric handle, which for a string-keyed result
-is the HNSW node id and matches nothing a caller can look up. A result whose graph node has no
-document identity carries an empty `documentIdStr()`; set `requireNamedResults(true)` on the
+the identifier ingestion assigned to the chunk that matched — `<sourceId>:<documentId>:chunk:<n>`,
+so `handbook:tiering.txt:chunk:0` here — and the one the HTTP API returns; the chunk's text is
+stored under it. `documentId()` is the numeric handle, which for a string-keyed result is the HNSW
+node id and matches nothing a caller can look up. A result whose graph node has no chunk identity
+carries an empty `documentIdStr()`; set `requireNamedResults(true)` on the
 `QueryRequest`, as the HTTP API does, to have such results dropped before the page is cut.
 
 Shut down in the reverse of the order things were started: the pipeline and the ingestion

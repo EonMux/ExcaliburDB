@@ -82,9 +82,11 @@ public final class QueryResponseJson {
         StringBuilder sb = new StringBuilder(256);
         appendQueryId(sb, response.queryId());
 
-        // document_id carries the document's own identifier - the string the ingestion pipeline
-        // assigned - not the HNSW node ID, which is an internal handle that compaction renumbers
-        // and that no client can look anything up by.
+        // document_id carries the chunk identifier ingestion assigned - source:document:chunk:N,
+        // the key the chunk is stored under - not the HNSW node ID, which is an internal handle
+        // that compaction renumbers and that no client can look anything up by. It is the same
+        // string a BM25 hit carries, which is what lets include_text and a snippet read the
+        // chunk the vector matched rather than the start of its document.
         sb.append("\"results\": [");
         for (int i = 0; i < page.size(); i++) {
             if (i > 0) {

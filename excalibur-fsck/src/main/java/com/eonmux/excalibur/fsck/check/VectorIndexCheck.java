@@ -35,7 +35,8 @@ public final class VectorIndexCheck {
     }
 
     /**
-     * Verifies an HNSW node-to-document mapping.
+     * Verifies an HNSW node-to-chunk mapping, or the node-to-document mapping an older build
+     * wrote in its place.
      *
      * @param file     The {@code .hnsw.docmap} file
      * @param relative Its path relative to the data directory

@@ -41,9 +41,8 @@ import java.util.stream.Stream;
  * <h2>Document Atomicity</h2>
  * <p>A document is published as a unit. Every chunk is embedded and written before the
  * visibility epoch is advanced, and the document is registered with the
- * {@link DocumentVisibilityTracker} under its {@code sourceId:documentId} key - the same key
- * excalibur-shard derives from the storage key and excalibur-query's atomicity filter asks
- * about. A document whose chunks could not all be embedded or written is rolled back and never
+ * {@link DocumentVisibilityTracker} under its {@code sourceId:documentId} key - the key
+ * excalibur-query's atomicity filter derives from a result's chunk id and asks about. A document whose chunks could not all be embedded or written is rolled back and never
  * registered, so a query can never observe half of it.</p>
  *
  * <h2>Stopping a run</h2>

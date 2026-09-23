@@ -36,8 +36,8 @@ import java.util.Objects;
  *
  * <p>Every chunk is embedded and written before the visibility epoch is advanced, and the
  * document is registered with the {@link DocumentVisibilityTracker} under its
- * {@code sourceId:documentId} key - the same key excalibur-shard derives from the storage key and
- * excalibur-query's atomicity filter asks about. A document whose chunks could not all be
+ * {@code sourceId:documentId} key - the key excalibur-query's atomicity filter derives from a
+ * result's chunk id and asks about. A document whose chunks could not all be
  * embedded or written is rolled back and left unregistered, so a query can never observe half of
  * it.</p>
  *
@@ -116,12 +116,15 @@ final class DocumentIngestor {
     }
 
     /**
-     * Retires a rolled back document's graph nodes, or null on a node that keeps no vector index.
+     * Retires a rolled back document's graph nodes, and a replaced version's surplus chunks'
+     * nodes, or null on a node that keeps no vector index.
      *
      * <p>The integration worker inserts asynchronously from the write that triggered it, so a
-     * document whose chunks were written and then rolled back may already be in a graph. The node
-     * carries no text, but a search that ranks it says the document matched - and nothing else
-     * can reach it, because a node is attributed to a document and not to a chunk id.</p>
+     * document whose chunks were written and then rolled back may already be in a graph. The
+     * rollback's tombstones retire those nodes when the worker replays them, and until then a
+     * query sets them aside only as far as its bounded tail scan reaches; retiring them here,
+     * under the document's lock, is what keeps a document this node decided not to publish out of
+     * every ranking however far integration has fallen behind.</p>
      */
     private volatile DocumentErasureService.VectorEraser vectorEraser;
 
@@ -211,22 +214,32 @@ final class DocumentIngestor {
         // and the document being registered would delete chunks no entry names yet, and the
         // registration would then put an entry back for content that has gone; the opposite
         // order leaves the chunks with no entry at all, which no later erasure can find.
-        DocumentOutcome outcome = DocumentLocks.shared().inDocument(documentKey,
+        Written written = DocumentLocks.shared().inDocument(documentKey,
             () -> writeAndPublish(sourceId, documentId, documentKey, doc, chunks, embeddings));
-        if (outcome.dropped()) {
-            return outcome;
+        if (written.publication() == null) {
+            return written.outcome();
         }
 
         // Outside the lock: it neither reads nor writes the registry, the visibility entry or
-        // the chunks, and the graph sink may be slow.
-        graphReporter.report(documentKey, doc);
-        return outcome;
+        // the chunks, and the graph sink may be slow. The publication was numbered under the
+        // lock, which is what keeps a slow report of this version from undoing a later one's.
+        graphReporter.report(written.publication(), doc);
+        return written.outcome();
+    }
+
+    /**
+     * What writing a document produced, and the publication to report when it was published.
+     *
+     * @param outcome     What became of the document
+     * @param publication Its publication, or null when it was not published
+     */
+    private record Written(DocumentOutcome outcome, GraphReporter.Publication publication) {
     }
 
     /** Writes every chunk and publishes the document, undoing the writes if anything fails. */
-    private DocumentOutcome writeAndPublish(String sourceId, String documentId, String documentKey,
-                                            FetchedDocument doc, List<TextChunk> chunks,
-                                            Map<Integer, float[]> embeddings) {
+    private Written writeAndPublish(String sourceId, String documentId, String documentKey,
+                                    FetchedDocument doc, List<TextChunk> chunks,
+                                    Map<Integer, float[]> embeddings) {
         List<String> writtenKeys = new ArrayList<>(chunks.size());
         // Read under the lock and before anything is written: this is the version the new one
         // replaces, and it decides which of its chunks become surplus on success and which of
@@ -244,11 +257,14 @@ final class DocumentIngestor {
             publishDocument(sourceId, documentId, documentKey, doc, chunks);
         } catch (Exception e) {
             rollbackChunks(sourceId, documentId, documentKey, previous, writtenKeys, e);
-            return DocumentOutcome.DROPPED;
+            return new Written(DocumentOutcome.DROPPED, null);
         }
         lexicalSideIndex.addDocument(documentKey, lexicalChunks(documentKey, chunks));
         retireSupersededVersion(documentKey, previous, writtenKeys);
-        return DocumentOutcome.published(chunks.size());
+        // A previous version means facts may have been staged from it, which the report of this
+        // one has to withdraw before staging its own.
+        return new Written(DocumentOutcome.published(chunks.size()),
+            graphReporter.published(documentKey, previous != null));
     }
 
     /**
@@ -268,7 +284,7 @@ final class DocumentIngestor {
             return;
         }
         int retired = SupersededVersion.retire(previous.getChunkIds(), publishedChunkIds,
-            lexicalSideIndex::retire, upsertHandler);
+            lexicalSideIndex::retire, vectorEraser, upsertHandler);
         if (retired > 0) {
             LOGGER.debug("Document {} replaced: {} chunk(s) of its previous version retired",
                 documentKey, retired);
@@ -457,8 +473,8 @@ final class DocumentIngestor {
     /**
      * Advances the visibility epoch and registers the document so queries can see it.
      *
-     * <p>Registration uses the {@code sourceId:documentId} key, which is what excalibur-shard
-     * derives from the storage key and what excalibur-query's atomicity filter looks up. It also
+     * <p>Registration uses the {@code sourceId:documentId} key, which is what excalibur-query's
+     * atomicity filter derives from a result's chunk id and looks up. It also
      * records the document in the {@link DocumentRegistry} so a later reindex can detect the
      * change and tombstone exactly these chunk ids.</p>
      */
@@ -501,8 +517,10 @@ final class DocumentIngestor {
      * <p>A document with no previous version loses everything this attempt wrote, graph nodes
      * included. One that replaces a published version keeps it: the ids the surviving registry
      * entry names are content the corpus is expected to have, so only the writes past them are
-     * undone, as a failed reindex undoes them - see {@link ReindexRollback}. Its graph nodes stay
-     * too, because they are attributed to the document and the document is still published.</p>
+     * undone, as a failed reindex undoes them - see {@link ReindexRollback}. Its graph nodes are
+     * left to follow storage through the write log: each node is attributed to its chunk, so the
+     * tombstones retire exactly the nodes of the undone writes, where retiring by document here
+     * would take the published version's nodes with them.</p>
      */
     private void rollbackChunks(String sourceId, String documentId, String documentKey,
                                 DocumentMetadata previous, List<String> writtenKeys,
@@ -532,10 +550,11 @@ final class DocumentIngestor {
      * Retires the graph nodes of a document that was rolled back.
      *
      * <p>The integration worker inserts from what storage received rather than from this call, so
-     * a chunk written and then deleted may already have become a node. A node carries no text,
-     * but a search that ranks one reports the document and a distance - a document this node
-     * decided not to publish - and nothing else can reach it, because the registry names chunks
-     * and a node is attributed to a document.</p>
+     * a chunk written and then deleted may already have become a node. A search that ranks one
+     * reports a chunk of a document this node decided not to publish. The tombstones retire it
+     * once the worker replays them; this retires it now, whatever the worker's lag. Only for a
+     * document with no previous
+     * version, because every node of the document is one this attempt produced.</p>
      */
     private void retireVectors(String documentKey) {
         DocumentErasureService.VectorEraser eraser = this.vectorEraser;

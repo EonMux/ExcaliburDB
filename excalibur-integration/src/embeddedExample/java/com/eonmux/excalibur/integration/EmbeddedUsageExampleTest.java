@@ -99,13 +99,13 @@ class EmbeddedUsageExampleTest {
             .as("the query shares most of its words with one document and nothing with another")
             .isNotEmpty();
         assertThat(results.getFirst().documentIdStr())
-            .as("the closest result is the document about tiering, named as ingestion named it")
-            .isEqualTo("handbook:tiering.txt");
+            .as("the closest result is the chunk about tiering, named as ingestion named it")
+            .isEqualTo("handbook:tiering.txt:chunk:0");
         assertThat(results)
             .extracting(QueryResultItem::documentIdStr)
-            .as("each document is returned once, under the identifier ingestion assigned")
+            .as("each chunk is returned once, under the identifier ingestion assigned")
             .doesNotHaveDuplicates()
-            .allSatisfy(id -> assertThat(id).startsWith("handbook:"));
+            .allSatisfy(id -> assertThat(id).startsWith("handbook:").contains(":chunk:"));
     }
 
     /**
@@ -185,7 +185,8 @@ class EmbeddedUsageExampleTest {
 
                 try {
                     // Ingest: chunk, embed, write, publish. Returns once the documents are
-                    // published; results are named "<sourceId>:<documentId>".
+                    // published; results name the chunk that matched,
+                    // "<sourceId>:<documentId>:chunk:<n>".
                     ingestion.ingestNow(InlineSource.of("handbook", List.of(
                         text("tiering.txt",
                             "Cold segments are moved to cheaper disks by the tiering policy."),

@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.PriorityQueue;
+import java.util.Set;
 
 /**
  * Performs brute-force scan over un-integrated write log entries.
@@ -54,18 +55,24 @@ import java.util.PriorityQueue;
  *
  * <h2>Result Identity</h2>
  * <p>Each result carries a synthetic node ID (tagged with the high bit so
- * {@link #isTailScanResult(long)} can recognise it) plus the document ID decoded from
- * the write-log entry key. Keys are written by the ingestion pipeline as
- * {@code sourceId:documentId:chunk:index}, and the HNSW integration worker registers
- * {@code sourceId:documentId} as the node's document ID, so a tail-scan hit and the
- * graph node it later becomes report the same document identity.</p>
+ * {@link #isTailScanResult(long)} can recognise it) plus the write-log entry key, which is the
+ * chunk id {@code sourceId:documentId:chunk:index}. The HNSW integration worker attributes the
+ * node the entry later becomes to the same chunk id, so a tail-scan hit and that node report one
+ * identity, and the document atomicity filter derives the document from either the same way.</p>
+ *
+ * <h2>Later Entries Win</h2>
+ * <p>The log holds every write in order, so a chunk rewritten or deleted since it was last
+ * integrated appears in the tail more than once. Only the key's last entry says what storage
+ * holds: a PUT ranks by its own vector, and a DELETE - or a PUT with no usable vector - ranks
+ * nothing. The scan therefore keeps one candidate per key, the latest, and ranks those. It also
+ * reports every key the tail touched ({@link TailScanOutcome#touchedKeys()}): for each of them,
+ * whatever node the graph holds is an older value than the tail's, which the caller must not rank
+ * in its place.</p>
  *
  * <h2>Chunk Text</h2>
- * <p>The entry's value is already in hand while it is being scanned, so the chunk text
- * trailing the embedding is decoded here and returned alongside the results
- * ({@link TailScanOutcome#payloads()}). Relevancy scoring therefore never has to read a
- * tail hit back out of storage - and could not, because the synthetic node ID carries no
- * chunk index.</p>
+ * <p>The chunk text trailing the embedding of each result kept is decoded here and returned
+ * alongside the results ({@link TailScanOutcome#payloads()}), so relevancy scoring reads the
+ * text of the very value the hit ranked by rather than going back to storage for it.</p>
  *
  * <h2>Corruption Handling</h2>
  * <p>An entry that cannot be parsed is resynchronised by advancing one byte at a time,
@@ -122,11 +129,6 @@ public class TailScanner {
      * advancing one byte at a time through the remainder of the tail.</p>
      */
     public static final int MAX_RESYNC_BYTES = 64 * 1024;
-
-    /**
-     * Marker separating the document ID from the chunk index in a write-log entry key.
-     */
-    private static final String CHUNK_MARKER = ":chunk:";
 
     /**
      * The maximum number of entries to scan before applying backpressure.
@@ -194,14 +196,12 @@ public class TailScanner {
      *
      * <p>This method:</p>
      * <ol>
-     *   <li>Reads all PUT entries from the write log between startOffset and endOffset</li>
-     *   <li>Extracts vectors from each entry's value field</li>
-     *   <li>Computes exact dissimilarities to the query vector</li>
-     *   <li>Returns the top-k results sorted by dissimilarity (closest first)</li>
+     *   <li>Reads every entry from the write log between startOffset and endOffset</li>
+     *   <li>Keeps, per key, only the latest: a PUT's exact dissimilarity to the query, or
+     *       nothing for a DELETE</li>
+     *   <li>Returns the top-k of those, sorted by dissimilarity (closest first), with the set
+     *       of keys the range touched</li>
      * </ol>
-     *
-     * <p><strong>Note:</strong> DELETE entries are skipped during tail scan since
-     * they don't contain vectors.</p>
      *
      * @param queryVector The query vector to compare against
      * @param writeLog The write log to scan
@@ -234,33 +234,78 @@ public class TailScanner {
 
         LOGGER.trace("Starting tail scan from offset {} to {}, k={}", startOffset, endOffset, k);
 
-        // Use a max-heap to track top-k results (furthest at the top for removal)
-        PriorityQueue<HnswSearchResult> topResults = new PriorityQueue<>(
-            Math.min(k, 1024),
-            Comparator.comparingDouble(HnswSearchResult::distance).reversed()
-        );
-
         ScanState state = new ScanState();
 
         // Ensure we don't read beyond the actual write log data
         long scanEnd = Math.min(endOffset, writeLog.writeOffset());
 
-        scanEntries(writeLog, startOffset, scanEnd, queryVector, distanceFunction, k,
-            topResults, state);
+        scanEntries(writeLog, startOffset, scanEnd, queryVector, distanceFunction, state);
 
         // Record tail scan metrics for JMX observability
         // This tracks: total scans performed, total entries scanned, max entries per scan
         Metrics.recordTailScanMetrics(state.entriesScanned, state.vectorEntriesFound);
 
-        // Convert max-heap to sorted list (closest first)
-        List<HnswSearchResult> results = new ArrayList<>(topResults);
-        results.sort(Comparator.comparingDouble(HnswSearchResult::distance));
+        List<Candidate> kept = closest(state, k);
+        List<HnswSearchResult> results = new ArrayList<>(kept.size());
+        Map<Long, byte[]> payloads = new HashMap<>();
+        for (Candidate candidate : kept) {
+            results.add(candidate.result());
+            byte[] text = textAt(writeLog, candidate.offset());
+            if (text != null && text.length > 0) {
+                payloads.put(candidate.result().nodeId(), text);
+            }
+        }
 
         logScanComplete(state, results.size());
 
         return new TailScanOutcome(
             results, state.entriesScanned, state.backpressureTriggered, state.cancelled,
-            state.payloads);
+            payloads, state.latestByKey.keySet());
+    }
+
+    /**
+     * Picks the k closest of the candidates still standing when the scan ended.
+     *
+     * @param state The finished scan
+     * @param k The maximum number to keep
+     * @return The candidates kept, closest first
+     */
+    private static List<Candidate> closest(ScanState state, int k) {
+        // A max-heap, furthest at its head, so each candidate costs O(log k)
+        Comparator<Candidate> byDistance =
+            Comparator.comparingDouble(candidate -> candidate.result().distance());
+        PriorityQueue<Candidate> top = new PriorityQueue<>(Math.min(k, 1024),
+            byDistance.reversed());
+        for (Candidate candidate : state.latestByKey.values()) {
+            if (candidate == null) {
+                continue;
+            }
+            if (top.size() < k) {
+                top.add(candidate);
+            } else if (candidate.result().distance() < top.peek().result().distance()) {
+                top.poll();
+                top.add(candidate);
+            }
+        }
+        List<Candidate> kept = new ArrayList<>(top);
+        kept.sort(byDistance);
+        return kept;
+    }
+
+    /**
+     * Reads back the chunk text of an entry the scan kept.
+     *
+     * <p>Read again rather than held from the pass, so the scan holds text for the k results it
+     * returns rather than for every candidate it measured. The log is append-only, so the entry
+     * at the offset is the one that was measured.</p>
+     *
+     * @param writeLog The log scanned
+     * @param offset The entry's offset
+     * @return The UTF-8 text bytes, or null when the entry carries none
+     */
+    private byte[] textAt(WriteLog writeLog, long offset) {
+        LogEntry entry = readEntryAtOffset(writeLog, offset);
+        return entry == null ? null : chunkText(entry.value());
     }
 
     /**
@@ -305,13 +350,11 @@ public class TailScanner {
      * @param scanEnd The offset to stop before
      * @param queryVector The query vector to compare against
      * @param distanceFunction The distance function to use for comparison
-     * @param k The maximum number of results to keep
-     * @param topResults The max-heap of results found so far
-     * @param state The counters and payloads for this scan
+     * @param state The counters and candidates for this scan
      */
     private void scanEntries(WriteLog writeLog, long startOffset, long scanEnd,
-                             float[] queryVector, DistanceFunction distanceFunction, int k,
-                             PriorityQueue<HnswSearchResult> topResults, ScanState state) {
+                             float[] queryVector, DistanceFunction distanceFunction,
+                             ScanState state) {
         long currentOffset = startOffset;
 
         while (currentOffset < scanEnd) {
@@ -335,7 +378,7 @@ public class TailScanner {
             }
 
             long nextOffset = scanOne(
-                writeLog, currentOffset, queryVector, distanceFunction, k, topResults, state);
+                writeLog, currentOffset, queryVector, distanceFunction, state);
 
             if (nextOffset < 0) {
                 break;
@@ -362,8 +405,8 @@ public class TailScanner {
     }
 
     /**
-     * Processes the entry at {@code offset}, adding it to {@code topResults} when it is
-     * a PUT carrying a vector of the expected dimension.
+     * Processes the entry at {@code offset}: a PUT becomes its key's candidate, measured when
+     * it carries a vector of the expected dimension, and a DELETE leaves its key none.
      *
      * @return The offset to continue from, or -1 to abort the scan
      */
@@ -372,8 +415,6 @@ public class TailScanner {
             long offset,
             float[] queryVector,
             DistanceFunction distanceFunction,
-            int k,
-            PriorityQueue<HnswSearchResult> topResults,
             ScanState state) {
 
         LogEntry entry;
@@ -390,35 +431,38 @@ public class TailScanner {
 
         state.entriesScanned++;
 
-        // Only process PUT entries with vector data
+        String key = chunkIdOf(entry.key());
+        Candidate candidate = null;
         if (entry.isPut() && entry.valueLength() > ChunkPayloadCodec.HEADER_BYTES) {
-            rankEntry(entry, offset, queryVector, distanceFunction, k, topResults, state);
+            candidate = measure(entry, offset, key, queryVector, distanceFunction, state);
+        }
+        if (entry.isPut() || entry.isDelete()) {
+            state.supersede(key, candidate);
         }
 
         return offset + entry.size();
     }
 
     /**
-     * Measures one write-log entry against the query and keeps it if it is close enough.
+     * Measures one write-log entry against the query.
      *
      * <p>An entry whose value holds no readable vector, or that measures to a value which
-     * cannot be ordered, is passed over without being counted as a vector found: the tail was
+     * cannot be ordered, yields no candidate and is not counted as a vector found: the tail was
      * still read past it, and the vector tally is what says how much of it was searchable.</p>
      *
      * @param entry The PUT entry to measure
      * @param offset The entry's offset, which its synthetic node ID is derived from
+     * @param key The entry's chunk id
      * @param queryVector The query vector to compare against
      * @param distanceFunction The distance function to use for comparison
-     * @param k The maximum number of results to keep
-     * @param topResults The max-heap of results found so far, furthest at its head
-     * @param state The counters and payloads for this scan
+     * @param state The counters for this scan
+     * @return The entry as a result, or null when it cannot be ranked
      */
-    private void rankEntry(LogEntry entry, long offset, float[] queryVector,
-                           DistanceFunction distanceFunction, int k,
-                           PriorityQueue<HnswSearchResult> topResults, ScanState state) {
+    private Candidate measure(LogEntry entry, long offset, String key, float[] queryVector,
+                              DistanceFunction distanceFunction, ScanState state) {
         float[] vector = extractVector(entry.value(), queryVector.length);
         if (vector == null) {
-            return;
+            return null;
         }
 
         // Exact dissimilarity: smaller is closer for every metric
@@ -427,7 +471,7 @@ public class TailScanner {
         if (!Float.isFinite(distance)) {
             LOGGER.debug("Skipping tail entry at offset {} with non-finite distance {}",
                 offset, distance);
-            return;
+            return null;
         }
 
         // Clamp on the metric's natural scale, then convert back to the
@@ -436,22 +480,10 @@ public class TailScanner {
         distance = ordering.toDistance(DistanceValidator.validateAndClamp(
             ordering.fromDistance(distance), distanceFunction));
 
-        // Synthetic node ID (high bit tagged) plus the real document identity
+        // Synthetic node ID (high bit tagged) plus the chunk the entry was written under
         long nodeId = encodeNodeId(offset, entry.lsn());
-        String documentId = extractDocumentId(entry.key());
-
-        HnswSearchResult result = new HnswSearchResult(nodeId, distance, documentId);
-
-        if (topResults.size() < k) {
-            topResults.add(result);
-            state.keepPayload(nodeId, chunkText(entry.value()));
-        } else if (distance < topResults.peek().distance()) {
-            state.dropPayload(topResults.poll().nodeId());
-            topResults.add(result);
-            state.keepPayload(nodeId, chunkText(entry.value()));
-        }
-
         state.vectorEntriesFound++;
+        return new Candidate(new HnswSearchResult(nodeId, distance, key), offset);
     }
 
     /**
@@ -475,10 +507,23 @@ public class TailScanner {
     }
 
     /**
-     * Mutable counters for a single scan.
+     * An entry measured against the query, and where to read its text back from.
+     *
+     * @param result The entry as a search result
+     * @param offset The entry's offset in the log
+     */
+    private record Candidate(HnswSearchResult result, long offset) {
+    }
+
+    /**
+     * Mutable counters and candidates for a single scan.
      */
     private static final class ScanState {
-        final Map<Long, byte[]> payloads = new HashMap<>();
+        /**
+         * Each key's latest entry so far: its candidate, or null when that entry ranks nothing
+         * (a DELETE, or a PUT with no usable vector). Every key the scan touched is present.
+         */
+        final Map<String, Candidate> latestByKey = new HashMap<>();
         int entriesScanned;
         int vectorEntriesFound;
         int resyncBytes;
@@ -486,19 +531,13 @@ public class TailScanner {
         boolean cancelled;
 
         /**
-         * Records the chunk text of a result that entered the top-k heap.
+         * Records an entry as its key's latest, displacing whatever the key had before.
+         *
+         * @param key The entry's chunk id
+         * @param candidate The entry as a result, or null when it ranks nothing
          */
-        void keepPayload(long nodeId, byte[] text) {
-            if (text != null && text.length > 0) {
-                payloads.put(nodeId, text);
-            }
-        }
-
-        /**
-         * Drops the chunk text of a result evicted from the top-k heap.
-         */
-        void dropPayload(long nodeId) {
-            payloads.remove(nodeId);
+        void supersede(String key, Candidate candidate) {
+            latestByKey.put(key, candidate);
         }
     }
 
@@ -512,17 +551,22 @@ public class TailScanner {
      * @param cancelled True if the scan stopped because its thread was interrupted
      * @param payloads The chunk text of each kept result, keyed by its synthetic node ID;
      *                 entries carrying no text are absent
+     * @param touchedKeys Every key an entry the scan read was written under, PUT or DELETE;
+     *                    the graph's node for any of them, if it has one, holds an older value
+     *                    than the tail does
      */
     public record TailScanOutcome(
         List<HnswSearchResult> results,
         int entriesScanned,
         boolean backpressureTriggered,
         boolean cancelled,
-        Map<Long, byte[]> payloads
+        Map<Long, byte[]> payloads,
+        Set<String> touchedKeys
     ) {
         public TailScanOutcome {
             results = results == null ? List.of() : List.copyOf(results);
             payloads = payloads == null ? Map.of() : Map.copyOf(payloads);
+            touchedKeys = touchedKeys == null ? Set.of() : Set.copyOf(touchedKeys);
             if (entriesScanned < 0) {
                 throw new IllegalArgumentException("entriesScanned must be non-negative: " + entriesScanned);
             }
@@ -532,7 +576,7 @@ public class TailScanner {
          * Returns an outcome describing a scan that did no work.
          */
         static TailScanOutcome empty() {
-            return new TailScanOutcome(List.of(), 0, false, false, Map.of());
+            return new TailScanOutcome(List.of(), 0, false, false, Map.of(), Set.of());
         }
 
         /**
@@ -631,39 +675,21 @@ public class TailScanner {
     }
 
     /**
-     * Extracts the document ID from a write-log entry key.
+     * Decodes the chunk id a write-log entry was written under.
      *
-     * <p>Keys are written by the ingestion pipeline as
-     * {@code sourceId:documentId:chunk:index}; the document identity registered against
-     * the HNSW node is {@code sourceId:documentId}. Decoding it here means a tail-scan
-     * hit and the graph node the same entry later becomes are reported under one
-     * identity, so they deduplicate against each other and the document atomicity
-     * filter can classify both.</p>
+     * <p>The key is reported whole, as the HNSW integration worker attributes the node the same
+     * entry later becomes, so a tail-scan hit and that node carry one identity: they deduplicate
+     * against each other, and the document atomicity filter derives the document from both the
+     * same way.</p>
+     *
+     * <p>Every entry has one: {@link LogEntry} refuses an empty key when it is written and when
+     * it is read back.</p>
      *
      * @param key The entry key bytes (UTF-8 encoded)
-     * @return The document ID, or null if it cannot be determined
+     * @return The chunk id
      */
-    private String extractDocumentId(byte[] key) {
-        if (key == null || key.length == 0) {
-            return null;
-        }
-
-        try {
-            String keyStr = new String(key, StandardCharsets.UTF_8);
-            int chunkMarker = keyStr.lastIndexOf(CHUNK_MARKER);
-            if (chunkMarker > 0) {
-                return keyStr.substring(0, chunkMarker);
-            }
-            // Legacy key format: documentId:chunkIndex
-            int lastColon = keyStr.lastIndexOf(':');
-            if (lastColon > 0) {
-                return keyStr.substring(0, lastColon);
-            }
-            return keyStr;
-        } catch (Exception e) {
-            LOGGER.trace("Failed to extract document ID from key: {}", e.getMessage());
-            return null;
-        }
+    private static String chunkIdOf(byte[] key) {
+        return new String(key, StandardCharsets.UTF_8);
     }
 
     /**

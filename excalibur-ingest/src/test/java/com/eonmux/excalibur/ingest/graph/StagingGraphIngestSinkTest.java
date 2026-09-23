@@ -2,12 +2,18 @@ package com.eonmux.excalibur.ingest.graph;
 
 import com.eonmux.excalibur.graph.staging.ExtractedTriple;
 import com.eonmux.excalibur.graph.provenance.Provenance;
+import com.eonmux.excalibur.graph.provenance.SourceType;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.graph.staging.StagedErasure;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -65,5 +71,87 @@ class StagingGraphIngestSinkTest {
         sink.stage(List.of(FACT));
 
         assertThat(sink.toString()).contains("1 staging failures");
+    }
+
+    /** Extracts one fact per line of "subject relation object", as the LLM extractor dates it. */
+    private static RelationExtractor lineExtractor() {
+        return (documentKey, text) -> {
+            Provenance origin = new Provenance(SourceType.DOCUMENT,
+                LlmRelationExtractor.sourceIdOf(documentKey), 80, 1);
+            List<ExtractedTriple> triples = new ArrayList<>();
+            for (String line : text.split("\n")) {
+                String[] parts = line.trim().split(" ");
+                triples.add(ExtractedTriple.alwaysValid(parts[0], parts[1], parts[2], origin));
+            }
+            return triples;
+        };
+    }
+
+    /** The staged facts as "subject relation object" lines, in staging order. */
+    private static List<String> stagedFacts(GraphStagingStore staging) throws IOException {
+        Map<Integer, String> names = new java.util.HashMap<>();
+        for (String label : List.of("Ada", "Acme", "Globex", "Babbage", "Initech")) {
+            names.put(staging.entityIdOf(label), label);
+        }
+        List<String> facts = new ArrayList<>();
+        staging.forEach((subject, relation, object, validFrom, validTo, provenance) ->
+            facts.add(names.get(subject) + " " + names.get(object)));
+        return facts;
+    }
+
+    @Test
+    @DisplayName("a replaced version's facts and snippets are withdrawn before the new ones are "
+        + "staged, and other documents' are left alone")
+    void aReplacementWithdrawsTheEarlierVersion(@TempDir Path dir) throws IOException {
+        try (GraphStagingStore staging = GraphStagingStore.open(dir)) {
+            StagingGraphIngestSink sink = new StagingGraphIngestSink(staging, lineExtractor());
+            sink.onDocumentPublished("docs:ada.md", "Ada runs Acme", 1L);
+            sink.onDocumentPublished("docs:babbage.md", "Babbage runs Initech", 1L);
+
+            sink.onDocumentReplaced("docs:ada.md", "Ada runs Globex", 2L);
+
+            assertThat(stagedFacts(staging))
+                .as("what the document used to say is gone, what it says now is staged")
+                .containsExactly("Babbage Initech", "Ada Globex");
+            List<String> snippets = new ArrayList<>();
+            staging.forEachEntityText((entityId, snippet) -> snippets.add(snippet));
+            assertThat(snippets).doesNotContain("Ada runs Acme")
+                .contains("Babbage runs Initech", "Ada runs Globex");
+            assertThat(sink.recordsWithdrawn())
+                .as("one fact and the snippet recorded against each of its two entities")
+                .isEqualTo(3);
+            assertThat(sink.withdrawalFailures()).isZero();
+            assertThat(sink.toString()).contains("3 withdrawn");
+        }
+    }
+
+    @Test
+    @DisplayName("a replacement with nothing to extract still withdraws the earlier version")
+    void aReplacementWithNoFactsStillWithdraws(@TempDir Path dir) throws IOException {
+        try (GraphStagingStore staging = GraphStagingStore.open(dir)) {
+            StagingGraphIngestSink sink = new StagingGraphIngestSink(staging, lineExtractor());
+            sink.onDocumentPublished("docs:ada.md", "Ada runs Acme", 1L);
+
+            new StagingGraphIngestSink(staging, RelationExtractor.none())
+                .onDocumentReplaced("docs:ada.md", "nothing to say", 2L);
+
+            assertThat(stagedFacts(staging)).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("a withdrawal that fails is counted, and the new version is staged regardless")
+    void aFailedWithdrawalIsCounted() throws IOException {
+        GraphStagingStore store = mock(GraphStagingStore.class);
+        doThrow(new IOException("log unreadable")).when(store).erase(any(StagedErasure.class));
+        StagingGraphIngestSink sink = new StagingGraphIngestSink(store, lineExtractor());
+
+        sink.onDocumentReplaced("docs:ada.md", "Ada runs Globex", 2L);
+        sink.onDocumentReplaced(null, "Ada runs Globex", 2L);
+        sink.onDocumentReplaced(" ", "Ada runs Globex", 2L);
+
+        assertThat(sink.withdrawalFailures()).isEqualTo(1);
+        assertThat(sink.factsStaged()).isEqualTo(1);
+        assertThat(sink.withdraw("docs:ada.md")).isEqualTo(-1);
     }
 }

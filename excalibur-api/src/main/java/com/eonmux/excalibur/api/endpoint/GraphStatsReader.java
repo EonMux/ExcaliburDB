@@ -120,6 +120,6 @@ public final class GraphStatsReader {
         }
         return new GraphStats.IngestStats(ingest.documentsSeen(), ingest.factsStaged(),
             ingest.unresolvedDocuments(), ingest.extractionFailures(), ingest.tenantFailures(),
-            sinkRefusals.getAsLong());
+            sinkRefusals.getAsLong(), ingest.withdrawalFailures());
     }
 }

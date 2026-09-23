@@ -27,11 +27,17 @@ public enum FileKind {
     /** {@code segment_N.hnsw}: a segment's vector graph. */
     HNSW_GRAPH,
 
-    /** {@code segment_N.hnsw.docmap}: node ids to document ids. */
+    /**
+     * {@code segment_N.hnsw.docmap}: each graph node to the chunk it embeds.
+     *
+     * <p>Version 3 names chunks. Versions 1 and 2, written by older builds, name documents; they
+     * verify the same way and are reported with a note, since the node re-keys them to chunks
+     * itself once it opens the graph.</p>
+     */
     HNSW_DOCUMENT_MAP,
 
     /**
-     * {@code segment_N.hnsw.compact.docmap}: the node-to-document mapping an HNSW compaction
+     * {@code segment_N.hnsw.compact.docmap}: the node-to-chunk mapping an HNSW compaction
      * staged in the compacted numbering.
      *
      * <p>One name, two meanings, and which one is decided by its neighbour. Beside

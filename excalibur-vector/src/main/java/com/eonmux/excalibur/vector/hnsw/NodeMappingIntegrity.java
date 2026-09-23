@@ -40,6 +40,14 @@ import java.nio.file.StandardOpenOption;
  * as unprotected. It is not upgraded in place, because a checksum written over it now would
  * attest to bytes nothing has ever attested to; it becomes a version 2 file the first time
  * the mapping is persisted.</p>
+ *
+ * <h2>Versions 2 and 3</h2>
+ * <p>Both carry this block, and differ only in what their entries name: documents at version 2,
+ * chunks at version 3. The checksum is the same either way, so both are verified here alike; a
+ * sound version 2 file is reported intact with a note that its entries still name documents,
+ * because that is what an operator reading the report needs to know about it - the node re-keys
+ * it from its segment the next time it opens the graph, and nothing about the file is
+ * damaged.</p>
  */
 final class NodeMappingIntegrity {
 
@@ -117,7 +125,7 @@ final class NodeMappingIntegrity {
      */
     static IntegrityReport inspect(Path path, FileChannel channel, ByteBuffer header, int version)
             throws IOException {
-        if (version < NodeDocumentMapping.VERSION) {
+        if (version < NodeDocumentMapping.FIRST_SEALED_VERSION) {
             return IntegrityReport.legacy(path, FORMAT, version);
         }
         int state = header.getInt(OFFSET_STATE);
@@ -149,7 +157,23 @@ final class NodeMappingIntegrity {
                 + " but they digest to 0x" + Long.toHexString(actualPayloadCrc)
                 + ", so at least one node is now attributed to a different document");
         }
-        return IntegrityReport.intact(path, FORMAT, covered + " bytes of entries verified");
+        return IntegrityReport.intact(path, FORMAT, covered + " bytes of entries verified"
+            + keyingNote(version));
+    }
+
+    /**
+     * Says what a sound file's entries name, when that is not what this build writes.
+     *
+     * @param version The file's version
+     * @return A clause to append to the verdict, empty for a chunk-keyed file
+     */
+    private static String keyingNote(int version) {
+        if (NodeDocumentMapping.keyingOf(version) == NodeDocumentMapping.Keying.CHUNK) {
+            return "";
+        }
+        return "; written at version " + version + ", whose entries name documents rather than "
+            + "chunks - the node re-keys it to chunks from its segment's stored embeddings once "
+            + "it has the graph open, before integrating anything more into it";
     }
 
     /**
@@ -190,7 +214,7 @@ final class NodeMappingIntegrity {
                 "the file does not start with the mapping magic number");
         }
         int version = probe.getInt(Long.BYTES);
-        if (version < NodeDocumentMapping.VERSION) {
+        if (version < NodeDocumentMapping.FIRST_SEALED_VERSION) {
             return IntegrityReport.legacy(path, FORMAT, version);
         }
         if (size < NodeDocumentMapping.HEADER_SIZE) {

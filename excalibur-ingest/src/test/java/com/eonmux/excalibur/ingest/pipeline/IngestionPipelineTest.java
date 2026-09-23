@@ -1,5 +1,6 @@
 package com.eonmux.excalibur.ingest.pipeline;
 
+import com.eonmux.excalibur.ingest.erasure.RecordingVectorEraser;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
@@ -1096,6 +1097,7 @@ class IngestionPipelineTest {
                 implements com.eonmux.excalibur.ingest.graph.GraphIngestSink {
             final Path registryFile;
             final List<String> published = new CopyOnWriteArrayList<>();
+            final List<String> replaced = new CopyOnWriteArrayList<>();
             final List<Boolean> registryOnDiskAtSync = new CopyOnWriteArrayList<>();
 
             RegistryWatchingSink(Path registryFile) {
@@ -1109,9 +1111,37 @@ class IngestionPipelineTest {
             }
 
             @Override
+            public void onDocumentReplaced(String documentKey, String text,
+                                           long lastModifiedMillis) {
+                replaced.add(documentKey + "=" + text);
+            }
+
+            @Override
             public void sync() {
                 registryOnDiskAtSync.add(java.nio.file.Files.exists(registryFile));
             }
+        }
+
+        @Test
+        @DisplayName("a document published over a version it already held is reported as a "
+            + "replacement, so what was staged from that version is withdrawn")
+        void aReplacedVersionIsReportedAsOne() {
+            Path registryFile = tempDir.resolve("replaced-registry.dat");
+            com.eonmux.excalibur.ingest.registry.DocumentRegistry documents =
+                new com.eonmux.excalibur.ingest.registry.DocumentRegistry(registryFile);
+            IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
+                embeddings, storage, index, registry,
+                new com.eonmux.excalibur.ingest.visibility.DocumentVisibilityTracker(documents));
+            RegistryWatchingSink sink = new RegistryWatchingSink(registryFile);
+            orchestrator.setGraphSink(sink);
+
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "Ada runs Acme")));
+            orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "Ada left Acme")));
+
+            assertThat(sink.published)
+                .as("the first version replaced nothing, so there is nothing to withdraw")
+                .containsExactly("docs:a.txt");
+            assertThat(sink.replaced).containsExactly("docs:a.txt=Ada left Acme");
         }
 
         @Test
@@ -1165,20 +1195,17 @@ class IngestionPipelineTest {
             // document rolled back after its chunks were written may already be in a graph -
             // rankable by name and distance, with no text behind it and nothing else able to
             // reach the node.
-            List<String> retired = new CopyOnWriteArrayList<>();
+            RecordingVectorEraser eraser = new RecordingVectorEraser(1);
             IngestionOrchestrator orchestrator = new IngestionOrchestrator(new TextChunker(),
                 embeddings, storage, index, registry, new RefusingTracker());
-            orchestrator.setVectorEraser(documentKey -> {
-                retired.add(documentKey);
-                return 1;
-            });
+            orchestrator.setVectorEraser(eraser);
 
             orchestrator.ingestNow(new FakeSource("docs", Map.of("a.txt", "some text")));
 
             assertThat(storedChunkExists("docs", "a.txt", 0))
                 .as("precondition: the rollback removed the chunks it had written")
                 .isFalse();
-            assertThat(retired)
+            assertThat(eraser.documents())
                 .as("a node outlives the chunk it was built from unless it is retired too")
                 .containsExactly("docs:a.txt");
         }

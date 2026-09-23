@@ -490,4 +490,68 @@ class SegmentQueryTaskTest {
                 .toList();
         }
     }
+
+    @Nested
+    @DisplayName("graph and tail over the same chunk")
+    class TailSupersession {
+
+        private static final String REWRITTEN = "src:doc:chunk:0";
+        private static final String ERASED = "src:doc:chunk:1";
+        private static final String UNTOUCHED = "src:doc:chunk:2";
+
+        private void put(String chunkId, float seed) {
+            segment.put(chunkId.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                com.eonmux.excalibur.core.codec.ChunkPayloadCodec.encode("text", vector(seed)));
+        }
+
+        /** Stands in for the integration worker: every entry so far is in the graph. */
+        private void integrateEverythingWrittenSoFar(Map<String, Float> chunks) {
+            chunks.forEach((chunkId, seed) ->
+                graph.attributeChunk(graph.insert(vector(seed)), chunkId));
+            graph.compareAndSetLastIntegratedOffset(segment.getWriteLogHead());
+        }
+
+        @Test
+        @DisplayName("the tail's later value or deletion displaces the graph's node for a chunk")
+        void theTailSupersedesTheGraph() throws Exception {
+            try (com.eonmux.excalibur.store.WriteLog log =
+                     new com.eonmux.excalibur.store.WriteLog(tempDir.resolve("segment.wal"))) {
+                segment.attachWriteLog(log);
+                put(REWRITTEN, 9f);
+                put(ERASED, 1.1f);
+                put(UNTOUCHED, 1.2f);
+                integrateEverythingWrittenSoFar(
+                    Map.of(REWRITTEN, 9f, ERASED, 1.1f, UNTOUCHED, 1.2f));
+
+                put(REWRITTEN, 1.0f);   // now the query's own vector
+                segment.delete(ERASED.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+                SegmentQueryTask.SegmentQueryResult result = task(10).call();
+
+                assertThat(result.results()).extracting(HnswSearchResult::documentId)
+                    .as("the erased chunk's node is not ranked, the rewritten one ranks once")
+                    .containsExactly(REWRITTEN, UNTOUCHED);
+                HnswSearchResult rewritten = result.results().get(0);
+                assertThat(TailScanner.isTailScanResult(rewritten.nodeId()))
+                    .as("ranked by the value storage holds now, not the graph's old node")
+                    .isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("a chunk found by both the graph and the tail is ranked once")
+        void aChunkInBothIsRankedOnce() throws Exception {
+            try (com.eonmux.excalibur.store.WriteLog log =
+                     new com.eonmux.excalibur.store.WriteLog(tempDir.resolve("segment.wal"))) {
+                segment.attachWriteLog(log);
+                put(UNTOUCHED, 1.0f);
+                // The worker absorbed the entry after the tail range was captured: the graph
+                // holds its node, and the tail still reads the entry.
+                graph.attributeChunk(graph.insert(vector(1.0f)), UNTOUCHED);
+
+                assertThat(task(10).call().results()).extracting(HnswSearchResult::documentId)
+                    .containsExactly(UNTOUCHED);
+            }
+        }
+    }
 }

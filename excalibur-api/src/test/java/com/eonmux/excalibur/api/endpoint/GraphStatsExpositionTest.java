@@ -95,6 +95,7 @@ class GraphStatsExpositionTest {
         when(sink.unresolvedDocuments()).thenReturn(3L);
         when(sink.extractionFailures()).thenReturn(9L);
         when(sink.tenantFailures()).thenReturn(2L);
+        when(sink.withdrawalFailures()).thenReturn(5L);
     }
 
     @Nested
@@ -116,7 +117,7 @@ class GraphStatsExpositionTest {
             assertThat(stats.erasure().unreadableNamespaces()).isEqualTo(1);
             assertThat(stats.erasure().oldestAgeMs().getAsLong())
                 .isGreaterThanOrEqualTo(Duration.ofMinutes(90).toMillis());
-            assertThat(stats.ingest()).isEqualTo(new GraphStats.IngestStats(100, 640, 3, 9, 2, 4));
+            assertThat(stats.ingest()).isEqualTo(new GraphStats.IngestStats(100, 640, 3, 9, 2, 4, 5));
         }
 
         @Test
@@ -219,6 +220,7 @@ class GraphStatsExpositionTest {
             assertThat(ingest.path("extractionFailures").asLong()).isEqualTo(9);
             assertThat(ingest.path("tenantFailures").asLong()).isEqualTo(2);
             assertThat(ingest.path("sinkRefusals").asLong()).isEqualTo(4);
+            assertThat(ingest.path("withdrawalFailures").asLong()).isEqualTo(5);
         }
 
         @Test
@@ -285,7 +287,8 @@ class GraphStatsExpositionTest {
                 "excalibur_graph_ingest_failures_total{reason=\"unresolved_source\"} 3",
                 "excalibur_graph_ingest_failures_total{reason=\"extraction\"} 9",
                 "excalibur_graph_ingest_failures_total{reason=\"namespace_unavailable\"} 2",
-                "excalibur_graph_ingest_failures_total{reason=\"sink_refused\"} 4");
+                "excalibur_graph_ingest_failures_total{reason=\"sink_refused\"} 4",
+                "excalibur_graph_ingest_withdrawal_failures_total 5");
             double age = body.lines()
                 .filter(line -> line.startsWith("excalibur_graph_erasure_oldest_age_seconds "))
                 .mapToDouble(line -> Double.parseDouble(line.split(" ")[1]))
@@ -387,7 +390,7 @@ class GraphStatsExpositionTest {
             .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new GraphStats.ErasureStats(0, 0, 0, 0, null))
             .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new GraphStats.IngestStats(0, 0, 0, -1, 0, 0))
+        assertThatThrownBy(() -> new GraphStats.IngestStats(0, 0, 0, -1, 0, 0, 0))
             .isInstanceOf(IllegalArgumentException.class);
     }
 

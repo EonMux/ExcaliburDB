@@ -84,7 +84,10 @@ final class SourceReindexPass {
     private final UpsertHandler upsertHandler;
     private final ReindexLexicalIndex lexical;
 
-    /** Retires a removed document's graph nodes, or null on a node with no vector index. */
+    /**
+     * Retires a removed document's graph nodes and a changed one's surplus chunks' nodes, or null
+     * on a node with no vector index.
+     */
     private final DocumentErasureService.VectorEraser vectorEraser;
 
     private final DocumentStep documentStep;
@@ -94,7 +97,7 @@ final class SourceReindexPass {
      *                      entire input
      * @param upsertHandler Tombstones what the source no longer lists
      * @param lexical       The lexical index to keep in step with storage
-     * @param vectorEraser  Retires a removed document's graph nodes, or null for none
+     * @param vectorEraser  Retires graph nodes of what this pass removes, or null for none
      * @param documentStep  Re-indexes one document
      * @throws NullPointerException if any argument other than the eraser is null
      */
@@ -283,20 +286,22 @@ final class SourceReindexPass {
             return 0;
         }
         return SupersededVersion.retire(changed.getOldMetadata().getChunkIds(),
-            docResult.getChunkIds(), lexical::retire, upsertHandler);
+            docResult.getChunkIds(), lexical::retire, vectorEraser, upsertHandler);
     }
 
     /**
      * Retires the graph nodes of every document the source has stopped listing.
      *
-     * <p>Beside the lexical erasure and for the same reason: storage tombstones the chunks and
-     * the registry stops naming them, but a graph node is attributed to a document rather than
-     * to a chunk, so nothing either of those does reaches it. Left behind, the document goes on
-     * being ranked by vector search - reported by name, with a distance, and with no text.</p>
+     * <p>Beside the lexical erasure and ahead of the storage tombstones. The tombstones reach the
+     * graph as well, as DELETEs the integration worker replays, but only once it gets to them,
+     * and until then a query sets the nodes aside only as far as its bounded tail scan reaches.
+     * Retiring here is what makes the removal hold however far integration has fallen
+     * behind.</p>
      *
-     * <p>A <em>changed</em> document's surplus tail is deliberately not retired here. Attribution
-     * is per document, so the only call available would retire the replacement's nodes as well as
-     * the previous version's, and the integration worker has no reason to insert them again.</p>
+     * <p>A <em>changed</em> document is not retired here: its replacement shares chunk ids with
+     * it, and retiring by document would take the replacement's own nodes. Its surplus chunks are
+     * retired by id once the replacement is published, and the ids it overwrote are superseded by
+     * the integration worker in log order; see {@link SupersededVersion}.</p>
      *
      * <p>Checked for cancellation per document, like the indexing loops and for the same
      * reason: a source that dropped a hundred thousand documents is exactly the run an operator

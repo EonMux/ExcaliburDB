@@ -103,7 +103,8 @@ final class HnswCompactor {
             // answers every query with the wrong documents.
             CompactedState compacted = buildCompactedGraph(compactPath);
             swapInCompactedGraph(compactPath, originalPath, compacted.pqCodes());
-            promoteCompactedMapping(compactPath, originalPath, compacted.documentMapping());
+            promoteCompactedMapping(compactPath, originalPath, compacted.documentMapping(),
+                compacted.keying());
 
             LOGGER.info("Compacted HNSW graph: removed {} tombstoned nodes", removed);
             return removed;
@@ -140,9 +141,13 @@ final class HnswCompactor {
 
         try (HnswGraph compacted = new HnswGraph(
                 compactPath, graph.config, graph.distanceFunction, graph.maxNodes)) {
-            // The replacement graph opens its own sidecar beside itself; document identity is
-            // re-registered into it below, against the new node IDs.
+            // The replacement graph opens its own sidecar beside itself; attribution is
+            // re-registered into it below, against the new node IDs, under the keying the
+            // original was written with - a mapping an older build keyed by document is still
+            // keyed by document after a compaction, and must not be persisted as naming chunks.
             NodeDocumentMapping compactedMapping = compacted.getNodeDocumentMapping();
+            NodeDocumentMapping.Keying keying = graph.attributionKeying();
+            compactedMapping.useKeying(keying);
 
             // Re-insert all active nodes with their original vectors
             Map<Long, Long> oldToNewId = new HashMap<>();
@@ -173,7 +178,7 @@ final class HnswCompactor {
             // Forces the graph's pages and writes the sidecar through its own
             // stage-force-rename.
             compacted.flush();
-            state = new CompactedState(compactedMapping.getAllMappings(),
+            state = new CompactedState(compactedMapping.getAllMappings(), keying,
                 rekeyPqCodes(oldPqCodes, oldToNewId));
         }
 
@@ -220,9 +225,12 @@ final class HnswCompactor {
      * @param documentMapping The node-to-document mapping, already staged on disk beside the
      *                        compacted graph; carried in memory too so the live graph can
      *                        adopt it without reading the file back
+     * @param keying What the mapping's keys name, which the adopted copy has to keep
      * @param pqCodes The product quantizer codes, empty when the segment has none
      */
-    private record CompactedState(Map<Long, String> documentMapping, Map<Long, byte[]> pqCodes) {}
+    private record CompactedState(Map<Long, String> documentMapping,
+                                  NodeDocumentMapping.Keying keying,
+                                  Map<Long, byte[]> pqCodes) {}
 
     /**
      * Renames the already-staged mapping over the live one and adopts it.
@@ -237,9 +245,11 @@ final class HnswCompactor {
      * @param compactPath      The staging path the compacted graph was built at
      * @param graphPath        The canonical path the graph is served from
      * @param compactedMapping The mapping in the compacted numbering
+     * @param keying           What its keys name
      */
     private void promoteCompactedMapping(Path compactPath, Path graphPath,
-                                         Map<Long, String> compactedMapping) {
+                                         Map<Long, String> compactedMapping,
+                                         NodeDocumentMapping.Keying keying) {
         Path stagedMapping = HnswSidecarPaths.documentMapping(compactPath);
         Path livePath = HnswSidecarPaths.documentMapping(graphPath);
         try {
@@ -254,6 +264,7 @@ final class HnswCompactor {
 
         NodeDocumentMapping installed = HnswGraphOpener.openDocumentMapping(graphPath, false);
         installed.clear();
+        installed.useKeying(keying);
         for (Map.Entry<Long, String> entry : compactedMapping.entrySet()) {
             installed.register(entry.getKey(), entry.getValue());
         }
@@ -465,6 +476,8 @@ final class HnswCompactor {
 
             try (HnswGraph compacted = new HnswGraph(
                     destPath, graph.config, graph.distanceFunction, graph.maxNodes)) {
+                // The copy names what the original names; see buildCompactedGraph.
+                compacted.getNodeDocumentMapping().useKeying(graph.attributionKeying());
                 // Copy all active nodes
                 for (long nodeId = 0; nodeId < graph.nodeCount; nodeId++) {
                     if (graph.isTombstoned(nodeId)) {

@@ -153,14 +153,19 @@ public record GraphStats(NamespaceStats namespaces, BudgetStats budget, BuildSta
      * @param tenantFailures      Documents whose namespace's graph could not be opened
      * @param sinkRefusals        Documents the sink threw on rather than counting under one of
      *                            the reasons above
+     * @param withdrawalFailures  Replaced documents whose earlier version's staged facts could
+     *                            not be withdrawn, so the next build publishes them beside the
+     *                            new version's
      */
     public record IngestStats(long documentsSeen, long factsStaged, long unresolvedDocuments,
-                              long extractionFailures, long tenantFailures, long sinkRefusals) {
+                              long extractionFailures, long tenantFailures, long sinkRefusals,
+                              long withdrawalFailures) {
 
         /** Validates that no count is negative. */
         public IngestStats {
             if (documentsSeen < 0 || factsStaged < 0 || unresolvedDocuments < 0
-                    || extractionFailures < 0 || tenantFailures < 0 || sinkRefusals < 0) {
+                    || extractionFailures < 0 || tenantFailures < 0 || sinkRefusals < 0
+                    || withdrawalFailures < 0) {
                 throw new IllegalArgumentException("ingest counts must not be negative");
             }
         }

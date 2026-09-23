@@ -93,6 +93,25 @@ class DocumentAtomicityFilterTest {
     }
 
     @Test
+    @DisplayName("a result named by its chunk is judged by the document the chunk belongs to")
+    void chunkNamedResultsAreJudgedByTheirDocument() {
+        // Visibility is published per document; a result names the chunk. Looking the chunk id
+        // up as though it were a document would find nothing tracked and wave every chunk of a
+        // half-published document through.
+        testChecker.setVisible("src:done.md", true);
+        testChecker.setVisible("src:half.md", false);
+
+        QueryResultItem ofPublished = new QueryResultItem("src:done.md:chunk:3", 0.9f, null, 0, 1);
+        QueryResultItem ofPartial = new QueryResultItem("src:half.md:chunk:0", 0.8f, null, 0, 2);
+        QueryResultItem documentNamed = new QueryResultItem("src:done.md", 0.7f, null, 0, 3);
+
+        assertTrue(filter.isResultVisible(ofPublished, 1L));
+        assertFalse(filter.isResultVisible(ofPartial, 1L));
+        assertTrue(filter.isResultVisible(documentNamed, 1L),
+            "a graph an older build attributed by document names the document itself");
+    }
+
+    @Test
     @DisplayName("DocumentAtomicityFilter should check result visibility")
     void testIsResultVisible() {
         testChecker.setVisible("1", true);

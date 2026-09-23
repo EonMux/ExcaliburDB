@@ -64,6 +64,25 @@ class FormatChecksTest {
         assertThat(check.proven()).as(check.detail()).isTrue();
     }
 
+    @Test
+    @DisplayName("a node-to-document mapping an older build wrote is proven, and named as such")
+    void aDocumentKeyedMappingIsProven() throws IOException {
+        Path mapping = dataDir.resolve(DataDirectoryFixture.DOCUMENT_MAPPING);
+        byte[] bytes = java.nio.file.Files.readAllBytes(mapping);
+        java.nio.ByteBuffer header =
+            java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        header.putInt(Long.BYTES,
+            com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping.VERSION_DOCUMENT_KEYED);
+        header.putLong(40, com.eonmux.excalibur.core.integrity.IndexChecksum.of(bytes, 0, 40));
+        java.nio.file.Files.write(mapping, bytes);
+
+        ContentCheck check = check(DataDirectoryFixture.DOCUMENT_MAPPING);
+
+        assertThat(check.healthy()).as(check.detail()).isTrue();
+        assertThat(check.proven()).as(check.detail()).isTrue();
+        assertThat(check.detail()).contains("name documents");
+    }
+
     @ParameterizedTest(name = "a flipped byte in {0} fails its format's checker")
     @ValueSource(strings = {
         DataDirectoryFixture.GRAPH,

@@ -12,9 +12,7 @@ import java.util.Objects;
 
 import com.eonmux.excalibur.graph.erasure.CompactionPolicy.CompactionStats;
 import com.eonmux.excalibur.graph.erasure.EdgeStoreCompactor.CompactionResult;
-import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
-import com.eonmux.excalibur.graph.staging.StagedErasure;
 import com.eonmux.excalibur.graph.store.MappedEdgeStore;
 
 import org.roaringbitmap.RoaringBitmap;
@@ -188,7 +186,11 @@ public final class GraphErasureCoordinator {
         if (staging == null || requests.isEmpty()) {
             return NOTHING_STAGED;
         }
-        GraphStagingStore.EraseResult result = staging.erase(new RequestBatch(requests));
+        List<ErasureScope> scopes = new ArrayList<>(requests.size());
+        for (ErasureRequest request : requests) {
+            scopes.add(request.scope());
+        }
+        GraphStagingStore.EraseResult result = staging.erase(ScopedStagedErasure.of(scopes));
         if (result.removed() > 0) {
             LOGGER.info("erased {} staged record(s) so the next build cannot republish them: "
                 + "{} fact(s), {} snippet(s), {} label(s)", result.removed(),
@@ -200,73 +202,6 @@ public final class GraphErasureCoordinator {
     /** What a coordinator with no staging behind it removed from staging. */
     private static final GraphStagingStore.EraseResult NOTHING_STAGED =
         new GraphStagingStore.EraseResult(0, 0, 0, 0);
-
-    /**
-     * One batch of requests, as the staging store asks about it.
-     *
-     * @param requests The batch
-     */
-    private record RequestBatch(Collection<ErasureRequest> requests) implements StagedErasure {
-
-        @Override
-        public boolean erasesFact(int subject, int relation, int object, int validFrom,
-                                  int validTo, Provenance provenance) {
-            for (ErasureRequest request : requests) {
-                if (coversStaged(request.scope(), subject, object, provenance)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        @Override
-        public boolean erasesSnippet(int entityId, Provenance provenance) {
-            for (ErasureRequest request : requests) {
-                if (coversStaged(request.scope(), entityId, entityId, provenance)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        @Override
-        public boolean erasesLabel(int entityId) {
-            for (ErasureRequest request : requests) {
-                // Only an entity scope replaces a name. A withdrawn document must not take the
-                // names of everyone it happened to mention with it: those people did not ask to
-                // be forgotten, and their ids are referenced by facts from other sources.
-                if (request.scope() instanceof ErasureScope.Entity entity
-                        && entity.entityId() == entityId) {
-                    return true;
-                }
-            }
-            return false;
-        }
-    }
-
-    /**
-     * Whether an erasure scope covers one staged record.
-     *
-     * @param scope      The scope
-     * @param subject    Subject entity id, or the entity a snippet belongs to
-     * @param object     Object entity id, or the entity a snippet belongs to
-     * @param provenance Where the record came from
-     * @return true when the record must be removed
-     */
-    private static boolean coversStaged(ErasureScope scope, int subject, int object,
-                                        Provenance provenance) {
-        return switch (scope) {
-            // Both endpoints, for the same reason the store's own matcher takes both: keeping
-            // the incoming edges leaves the erased entity reconstructible from its neighbours.
-            case ErasureScope.Entity entity ->
-                subject == entity.entityId() || object == entity.entityId();
-            case ErasureScope.Source source ->
-                provenance.sourceType() == source.sourceType()
-                    && provenance.sourceId() == source.sourceId();
-            case ErasureScope.ExtractorVersion version ->
-                provenance.extractorVersion() == version.version();
-        };
-    }
 
     /**
      * The requests this pass may honestly mark discharged.
