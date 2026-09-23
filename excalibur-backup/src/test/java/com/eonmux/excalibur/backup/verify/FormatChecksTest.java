@@ -2,6 +2,7 @@ package com.eonmux.excalibur.backup.verify;
 
 import com.eonmux.excalibur.backup.testing.DataDirectoryFixture;
 import com.eonmux.excalibur.core.integrity.IndexChecksum;
+import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
 import com.eonmux.excalibur.retrieval.lexical.native_.SegmentManifest;
 import com.eonmux.excalibur.store.RoutingDirectory;
 import com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping;
@@ -480,6 +481,85 @@ class FormatChecksTest {
         assertThat(check.healthy()).isFalse();
         assertThat(check.detail()).contains("UNREADABLE")
             .contains("format version " + (SegmentManifest.VERSION + 1));
+    }
+
+    @Test
+    @DisplayName("a lexical segment's key table is proven by the checksums written with it")
+    void aLexicalKeyTableIsProven() throws IOException {
+        String segment = firstLexicalSegment();
+
+        for (String suffix : List.of(LexicalSidecars.NAMES, LexicalSidecars.OFFSETS,
+                LexicalSidecars.LOOKUP_TABLE, LexicalSidecars.KEY_CHECKSUMS)) {
+            ContentCheck check = lexicalCheck(segment + suffix);
+            assertThat(check.healthy()).as(check.detail()).isTrue();
+            assertThat(check.proven()).as(check.detail()).isTrue();
+        }
+    }
+
+    @Test
+    @DisplayName("a lexical key table with a changed name fails its checksum")
+    void aLexicalKeyTableWithAFlippedByteFails() throws IOException {
+        String segment = firstLexicalSegment();
+        Path names = dataDir.resolve(segment + LexicalSidecars.NAMES);
+        byte[] bytes = Files.readAllBytes(names);
+        bytes[0] ^= 0x01;
+        Files.write(names, bytes);
+
+        ContentCheck check = lexicalCheck(segment + LexicalSidecars.NAMES);
+
+        assertThat(check.healthy()).isFalse();
+        assertThat(check.detail()).contains("CORRUPT").contains("checksum did not match");
+    }
+
+    @Test
+    @DisplayName("a lexical key table an older build wrote is healthy and not proven")
+    void anUnsealedLexicalKeyTableIsNotProven() throws IOException {
+        String segment = firstLexicalSegment();
+        Files.delete(dataDir.resolve(segment + LexicalSidecars.KEY_CHECKSUMS));
+
+        ContentCheck check = lexicalCheck(segment + LexicalSidecars.NAMES);
+
+        assertThat(check.healthy()).as(check.detail()).isTrue();
+        assertThat(check.proven()).isFalse();
+        assertThat(check.detail()).contains("LEGACY_UNPROTECTED");
+    }
+
+    @Test
+    @DisplayName("lexical key checksums from a newer build fail as unreadable")
+    void lexicalKeyChecksumsFromANewerBuildFail() throws IOException {
+        String segment = firstLexicalSegment();
+        Path sums = dataDir.resolve(segment + LexicalSidecars.KEY_CHECKSUMS);
+        byte[] bytes = Files.readAllBytes(sums);
+        ByteBuffer.wrap(bytes).putInt(Long.BYTES, 99);
+        Files.write(sums, bytes);
+
+        ContentCheck check = lexicalCheck(segment + LexicalSidecars.KEY_CHECKSUMS);
+
+        assertThat(check.healthy()).isFalse();
+        assertThat(check.detail()).contains("UNREADABLE").contains("format version 99");
+    }
+
+    /**
+     * Names the first segment the lexical store's manifest names.
+     *
+     * @return Its path relative to the data directory
+     */
+    private String firstLexicalSegment() throws IOException {
+        return "chunk-index/"
+            + SegmentManifest.read(dataDir.resolve("chunk-index")).entries().get(0).name();
+    }
+
+    /**
+     * Folds the lexical store over nothing and returns its verdict on one file.
+     *
+     * @param relative The file's path relative to the data directory
+     * @return The verdict
+     */
+    private ContentCheck lexicalCheck(String relative) {
+        return FormatChecks.withLexicalStore(dataDir, List.of()).stream()
+            .filter(each -> each.path().equals(relative))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("no verdict on " + relative));
     }
 
     /**

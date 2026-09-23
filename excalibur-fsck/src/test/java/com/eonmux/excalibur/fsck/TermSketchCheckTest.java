@@ -111,9 +111,9 @@ class TermSketchCheckTest {
     }
 
     @Test
-    void onlyTheSketchIsRebuiltByTheNodeOnOpen() {
+    void onlyTheSketchAndTheKeyLookupTableAreRebuiltByTheNodeOnOpen() {
         assertThat(Arrays.stream(FileKind.values()).filter(FileKind::rebuiltOnOpen))
-            .containsExactly(FileKind.TERM_SKETCH);
+            .containsExactly(FileKind.TERM_SKETCH, FileKind.LEXICAL_KEY_LOOKUP);
     }
 
     @Test

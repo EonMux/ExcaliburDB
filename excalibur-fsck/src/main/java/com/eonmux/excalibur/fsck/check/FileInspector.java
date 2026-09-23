@@ -131,11 +131,13 @@ public final class FileInspector {
                 "this journal carries neither a checksum nor a record count, by design: it is "
                     + "truncation-tolerant, because losing either half of a begin/end pair is "
                     + "safe. Nothing here can confirm its contents");
-            case LEXICAL_STORE_PART -> unverifiable(file, relative, "lexical store sidecar",
-                "this file sits beside the lexical segments rather than inside one - document "
-                    + "keys, their offsets, a tombstone bitmap or the erasure log - and none "
-                    + "of those formats carries a checksum or has a verifier here. The "
-                    + "segments the manifest names were checked; this was not");
+            case LEXICAL_STORE_PART, LEXICAL_KEY_LOOKUP -> unverifiable(file, relative,
+                "lexical store sidecar",
+                "this file sits in the lexical store directory and was not judged with the "
+                    + "store: it belongs to no segment the manifest names, the checksums it "
+                    + "would be checked against could not be read, or the manifest itself could "
+                    + "not be. The key tables, tombstones and erasure log of the segments the "
+                    + "manifest names are verified with the store; this was not");
             case STAGING_LEFTOVER -> unverifiable(file, relative, "staging leftover",
                 "this is a half-finished write, not state: nothing reads it, and it is here "
                     + "because the operation that staged it did not finish");

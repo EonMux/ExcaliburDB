@@ -54,7 +54,8 @@ import java.util.Optional;
  * which are checked against the header version and the record count their readers require; the
  * graph staging logs; and the native lexical store, which is
  * checked as a whole by {@link #withLexicalStore} because its manifest - verified against the
- * checksum on its end line - and the segments it names are one structure. The same dispatch is what {@code excalibur-fsck} surveys a live
+ * checksum on its end line - the segments it names, the key table and tombstones beside each,
+ * and its erasure log are one structure. The same dispatch is what {@code excalibur-fsck} surveys a live
  * directory with, so the two tools cannot disagree about which checker a file belongs to.</p>
  *
  * <p>That includes the pair an interrupted HNSW compaction stages,
@@ -68,10 +69,10 @@ import java.util.Optional;
  * pass the same directory - the disagreement one dispatch exists to rule out.</p>
  *
  * <h2>What "proven" means</h2>
- * <p>Some files carry nothing a checker could prove: a routing directory or lexical store
- * manifest an older build wrote before those formats carried a checksum, the in-flight ingest
- * journal, which is truncation-tolerant by design, the lexical store's sidecars, which have no
- * verifier. Those are reported as checked and unproven - healthy,
+ * <p>Some files carry nothing a checker could prove: a routing directory, lexical store
+ * manifest, key table, tombstone file or erasure log an older build wrote before those formats
+ * carried a checksum, the in-flight ingest journal, which is truncation-tolerant by design, and
+ * a file in the lexical store beside no segment its manifest names. Those are reported as checked and unproven - healthy,
  * because nothing wrong was found, and not proven, because nothing could have been - rather
  * than left out, which would read as though nothing in the image went unverified.</p>
  *
@@ -126,10 +127,12 @@ public final class FormatChecks {
      * store as a whole.
      *
      * <p>Every file under the store is, taken alone, a lexical store part with nothing to
-     * prove. The store is verified by reading its manifest and streaming every column of every
-     * segment the manifest names, so those verdicts speak for the manifest and for each
-     * segment directory, and supersede the per-file verdicts on the files inside them. A
-     * sidecar beside the segments is covered by none of them and keeps its own. A segment the
+     * prove. The store is verified by reading its manifest, streaming every column of every
+     * segment the manifest names, and checking each named segment's key table and tombstones
+     * and the erasure log against the checksums they were written with, so those verdicts speak
+     * for the manifest, each segment directory and each of those files, and supersede the
+     * per-file verdicts on them. A file under the store that none of them judged - one beside
+     * no segment the manifest names - keeps its own. A segment the
      * manifest names and the image does not hold is a verdict here and nowhere else, since no
      * per-file check can report a file that is not there.</p>
      *

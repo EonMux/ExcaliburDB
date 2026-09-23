@@ -10,6 +10,8 @@ import com.eonmux.excalibur.fsck.check.FileCheck;
 import com.eonmux.excalibur.fsck.check.FileClassifier;
 import com.eonmux.excalibur.fsck.check.FileKind;
 import com.eonmux.excalibur.fsck.check.LexicalStoreCheck;
+import com.eonmux.excalibur.retrieval.lexical.native_.DocumentErasureLog;
+import com.eonmux.excalibur.retrieval.lexical.native_.LexicalSidecars;
 import com.eonmux.excalibur.store.RoutingDirectory;
 
 import java.nio.file.Path;
@@ -169,6 +171,9 @@ public final class RepairPlanner {
                 + "mappings together from a backup, or rebuild the segment's vector index by "
                 + "reindexing it";
         }
+        if (FileClassifier.classify(file.relative()) == FileKind.LEXICAL_STORE_PART) {
+            return lexicalSidecarAdvice(file);
+        }
         if (FileClassifier.classify(file.relative()) == FileKind.WRITE_AHEAD_LOG) {
             return file.relative() + " is damaged in a way no repair here can act on: "
                 + file.detail() + ". It is not moved aside automatically, and it must not be: "
@@ -184,6 +189,44 @@ public final class RepairPlanner {
             + "is still sound. Verify the file against a replica or a backup, and rebuild "
             + "or restore it rather than letting a compaction rewrite it - a rewrite copies "
             + "what the slot table reaches, so anything it no longer reaches is dropped";
+    }
+
+    /**
+     * Phrases damage to a file beside the lexical segments that moving it aside would make worse.
+     *
+     * @param file The verdict
+     * @return What to weigh
+     */
+    private static String lexicalSidecarAdvice(FileCheck file) {
+        String relative = file.relative();
+        String damaged = relative + " is damaged: " + file.detail() + ". It is not moved aside "
+            + "automatically";
+        if (relative.endsWith(LexicalSidecars.TOMBSTONES)) {
+            return damaged + ", and it must not be: a segment with no tombstone file reads as "
+                + "one nothing was ever erased from, so every document erased or replaced in it "
+                + "would be served again. The node already keeps the segment out of every query "
+                + "and will not rebuild it, since which of its documents are gone is exactly what "
+                + "cannot be trusted; an erasure recorded later removes the segment whole. "
+                + "Restore the file from a backup, or reindex the sources the segment held";
+        }
+        if (relative.endsWith("/" + DocumentErasureLog.FILE)) {
+            return damaged + ", and it must not be: a store with no erasure log owes nothing, "
+                + "so every erasure it still holds would lapse. The keyword index does not open "
+                + "until the log reads cleanly. Restore it from a backup; every promise in it "
+                + "was forced to disk before its caller was told it was accepted";
+        }
+        if (relative.endsWith(LexicalSidecars.KEY_CHECKSUMS)) {
+            return damaged + ". The node keeps the segment out of every query; if its names "
+                + "and offsets hold up to their structure, the next compaction rebuilds the "
+                + "segment from the chunk text in storage and writes new checksums, and "
+                + "/v1/stats says whether it can. Restore the file from a backup to serve the "
+                + "segment sooner";
+        }
+        return damaged + ": these are the segment's names, the one part of it nothing can "
+            + "reconstruct, and a rebuild reads them to ask for each document's text. The node "
+            + "keeps the segment out of every query and will not rebuild it; an erasure recorded "
+            + "later removes it whole. Restore the key table from a backup, or reindex the "
+            + "sources the segment held";
     }
 
     /**
@@ -204,9 +247,10 @@ public final class RepairPlanner {
                 + "and /v1/stats says whether it can"
             : kind.rebuiltOnOpen()
             ? "Every byte is preserved under the quarantine directory. The node would rebuild "
-                + "this file from the segment's live entries on its next open whether or not "
-                + "it is moved; moving it aside only means the damaged copy is no longer read "
-                + "first and rejected"
+                + "this file from " + (kind == FileKind.LEXICAL_KEY_LOOKUP
+                    ? "the segment's names" : "the segment's live entries")
+                + " on its next open whether or not it is moved; moving it aside only means "
+                + "the damaged copy is no longer read first and rejected"
             : kind.discardedOnOpen()
             ? "Every byte is preserved under the quarantine directory. The node would read "
                 + "this history as empty on its next start whether or not it is moved, and "

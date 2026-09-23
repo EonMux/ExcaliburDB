@@ -285,6 +285,27 @@ class LexicalStoreSidecarTest {
     }
 
     @Nested
+    @DisplayName("as a checker sees them")
+    class Inspected {
+
+        @Test
+        @DisplayName("are every one intact as the store writes them, tombstones only where marked")
+        void intact(@TempDir Path dir) throws Exception {
+            twoSegmentsWithAMark(dir);
+            SegmentManifest manifest = SegmentManifest.read(dir);
+
+            var marked = LexicalSidecars.inspect(dir, manifest.entries().get(0));
+            var unmarked = LexicalSidecars.inspect(dir, manifest.entries().get(1));
+
+            assertThat(marked).hasSize(5).allSatisfy(report -> assertThat(report.status())
+                .isEqualTo(com.eonmux.excalibur.core.integrity.IntegrityStatus.INTACT));
+            assertThat(marked.get(4).file().getFileName().toString())
+                .endsWith(LexicalSidecars.TOMBSTONES);
+            assertThat(unmarked).hasSize(4);
+        }
+    }
+
+    @Nested
     @DisplayName("a key table written before checksums")
     class LegacyKeyTable {
 

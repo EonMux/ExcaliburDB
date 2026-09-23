@@ -261,10 +261,23 @@ class KeyChecksumsTest {
         }
 
         @Test
-        @DisplayName("is corrupt when its files are not there")
+        @DisplayName("is missing when its files are not there")
         void absent(@TempDir Path dir) {
-            assertThat(KeyChecksums.inspect(dir, SEGMENT, 1).get(0).detail())
-                .contains("not there");
+            assertThat(statuses(KeyChecksums.inspect(dir, SEGMENT, 1)))
+                .containsExactly(IntegrityStatus.MISSING, IntegrityStatus.MISSING,
+                    IntegrityStatus.LEGACY_UNPROTECTED);
+        }
+
+        @Test
+        @DisplayName("is corrupt when only its offsets are gone")
+        void halfAbsent(@TempDir Path dir) throws Exception {
+            writeNames(dir, "chunk:1");
+            Files.delete(KeyChecksums.of(dir, SEGMENT));
+            Files.delete(file(dir, SegmentKeys.INDEX_SUFFIX));
+
+            assertThat(statuses(KeyChecksums.inspect(dir, SEGMENT, 1)))
+                .containsExactly(IntegrityStatus.CORRUPT, IntegrityStatus.MISSING,
+                    IntegrityStatus.LEGACY_UNPROTECTED);
         }
     }
 }

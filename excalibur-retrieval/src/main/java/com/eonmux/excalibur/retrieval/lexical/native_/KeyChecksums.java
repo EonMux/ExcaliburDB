@@ -308,6 +308,13 @@ final class KeyChecksums {
         Path offsets = directory.resolve(segment + SegmentKeys.INDEX_SUFFIX);
         Path table = directory.resolve(segment + SegmentKeys.MAP_SUFFIX);
         List<IntegrityReport> reports = new ArrayList<>(SUFFIXES.size());
+        if (!Files.isRegularFile(names) || !Files.isRegularFile(offsets)) {
+            reports.add(present(names));
+            reports.add(present(offsets));
+            reports.add(new IntegrityReport(table, FORMAT, IntegrityStatus.LEGACY_UNPROTECTED,
+                "derived from the names, and rebuilt from them when they are there"));
+            return reports;
+        }
         String structure;
         try {
             structure = structuralDamage(names, offsets, docCount);
@@ -333,6 +340,14 @@ final class KeyChecksums {
         return reports;
     }
 
+    /** A verdict on one of a pair of files, one of which is missing. */
+    private static IntegrityReport present(Path file) {
+        return Files.isRegularFile(file)
+            ? IntegrityReport.corrupt(file, FORMAT, "the other half of the key table is not "
+                + "there, so nothing delimits these names")
+            : IntegrityReport.missing(file, FORMAT);
+    }
+
     /**
      * Says what, if anything, the structure of a key table written without checksums shows is
      * wrong with it: the number of names, and where the first and last of them begin and end.
@@ -341,9 +356,6 @@ final class KeyChecksums {
      */
     private static String structuralDamage(Path names, Path offsets, int docCount)
             throws IOException {
-        if (!Files.isRegularFile(names) || !Files.isRegularFile(offsets)) {
-            return "the names or their offsets are not there";
-        }
         long offsetBytes = Files.size(offsets);
         long expected = ((long) docCount + 1) * Integer.BYTES;
         if (offsetBytes != expected) {
