@@ -21,6 +21,7 @@ import java.lang.foreign.Arena;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -51,6 +52,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @DisplayName("Corpus version invalidation")
 class CorpusVersionInvalidationTest {
+
+    /** Far longer than any query here takes to finish. */
+    private static final Duration SHUTDOWN_WAIT = Duration.ofSeconds(10);
 
     private static final int DIMENSION = 8;
 
@@ -310,7 +314,7 @@ class CorpusVersionInvalidationTest {
                 assertThat(pipeline.corpusVersion())
                     .as("a segment a query can no longer read must move the fingerprint")
                     .isNotEqualTo(before);
-                pipeline.shutdown();
+                pipeline.shutdown(SHUTDOWN_WAIT);
             } finally {
                 graph.close();
                 engine.close();
@@ -319,7 +323,7 @@ class CorpusVersionInvalidationTest {
     }
 
     private static void close(Fixture fixture) throws Exception {
-        fixture.pipeline().shutdown();
+        fixture.pipeline().shutdown(SHUTDOWN_WAIT);
         fixture.graph().close();
         fixture.engine().close();
     }

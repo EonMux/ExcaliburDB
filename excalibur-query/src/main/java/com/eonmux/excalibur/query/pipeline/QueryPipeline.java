@@ -20,6 +20,7 @@ import com.eonmux.excalibur.vector.hnsw.HnswGraph;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -132,16 +133,7 @@ public class QueryPipeline {
     private final CorpusFingerprint corpusFingerprint;
 
     /**
-     * How long {@link #shutdown()} lets in-flight queries finish.
-     *
-     * <p>Short, because a node that is stopping has to stop, and the queries have deadlines of
-     * their own. Past it the queries are not interrupted but reported: {@code shutdown()}
-     * answers false and the caller keeps the storage they read through open.</p>
-     */
-    private static final long SHUTDOWN_GRACE_MILLIS = 5_000;
-
-    /**
-     * Whether {@link #shutdown()} has been called.
+     * Whether {@link #shutdown(Duration)} has been called.
      *
      * <p>A null executor was the only "not running" signal, and a pipeline that had served no
      * query shut down without ever creating one - so the next query created a fresh executor and
@@ -515,23 +507,35 @@ public class QueryPipeline {
     /**
      * Stops taking queries and waits for the ones already running.
      *
-     * <p>Queries are refused from the moment this is called. The pipeline's own threads and the
-     * dispatcher's segment searches are then each given {@link #SHUTDOWN_GRACE_MILLIS} to
-     * finish. Neither is interrupted: a query most of the way through has a partial answer worth
-     * returning, and interrupting every query at once cannot make a thread that is inside a
-     * mapped read leave any sooner - {@link ExecutorDrain} has the whole argument. What an
-     * interrupt is still used for is abandoning one query that failed or timed out, which
-     * {@code ResponseAssembler} does.</p>
+     * <p>Queries are refused from the moment this is called. The dispatcher's segment searches
+     * and then the pipeline's own threads are waited for, the two together for no longer than
+     * {@code wait}: one deadline, not one each, so a caller that hands this what its shutdown
+     * budget has left is never kept past it. Neither is interrupted: a query most of the way
+     * through has a partial answer worth returning, and interrupting every query at once cannot
+     * make a thread that is inside a mapped read leave any sooner - {@link ExecutorDrain} has the
+     * whole argument. What an interrupt is still used for is abandoning one query that failed or
+     * timed out, which {@code ResponseAssembler} does.</p>
      *
      * <p>Whoever calls this goes on to close the storage engine these threads read through, so
      * the answer is the point: false means a query is still reading and the engine must stay
      * open.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains, and an embedded caller passes what its own process can spare. Queries carry
+     * deadlines of their own, so a longer wait is only ever spent on one stalled inside a
+     * read.</p>
+     *
      * <p>Idempotent. A second call waits again for anything the first left running.</p>
      *
+     * @param wait How long to wait for the queries already running
      * @return true if every query thread this pipeline started has stopped
+     * @throws NullPointerException if wait is null
      */
-    public boolean shutdown() {
+    public boolean shutdown(Duration wait) {
+        Objects.requireNonNull(wait, "wait cannot be null");
+        // Wraps rather than saturates for a wait near Long.MAX_VALUE nanoseconds; the remainder
+        // below subtracts the current time first, which undoes it.
+        long deadline = System.nanoTime() + wait.toNanos();
         // Set first, and under the same lock the lazy creation takes, so a query racing this
         // either creates its executor before the stop below finds it or is refused outright.
         synchronized (this) {
@@ -540,14 +544,15 @@ public class QueryPipeline {
         boolean searchesStopped = true;
         try {
             if (dispatcher != null) {
-                searchesStopped = dispatcher.shutdown();
+                searchesStopped = dispatcher.shutdown(wait);
             }
         } finally {
             // In a finally, because the executor is the half that owns threads. Shutting the
             // dispatcher down first is the right order - it is what submits the work - but with
             // this outside a finally a dispatcher that failed on the way down left a pool of
             // pipeline threads running for the life of the process.
-            boolean pipelineStopped = stopPipelineExecutor();
+            boolean pipelineStopped =
+                stopPipelineExecutor(Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
             searchesStopped = searchesStopped && pipelineStopped;
         }
         return searchesStopped;
@@ -556,14 +561,15 @@ public class QueryPipeline {
     /**
      * Stops the executor queries run on, and waits for them.
      *
+     * @param wait What is left of the shutdown's wait
      * @return true if the executor was never created or has terminated
      */
-    private boolean stopPipelineExecutor() {
+    private boolean stopPipelineExecutor(Duration wait) {
         ExecutorService executor = pipelineExecutor;
         if (executor == null) {
             return true;
         }
-        boolean stopped = ExecutorDrain.drain(executor, SHUTDOWN_GRACE_MILLIS, "Query pipeline threads");
+        boolean stopped = ExecutorDrain.drain(executor, wait, "Query pipeline threads");
         if (stopped) {
             LOGGER.debug("QueryPipeline shutdown complete");
         }
@@ -573,9 +579,9 @@ public class QueryPipeline {
     /**
      * Whether this pipeline has been shut down and its threads have stopped.
      *
-     * @return true once {@link #shutdown()} has been called and the threads it owns have
-     *         terminated; false before it is called, and false if they outlasted the grace
-     *         period
+     * @return true once {@link #shutdown(Duration)} has been called and the threads it owns
+     *         have terminated; false before it is called, and false if they outlasted its
+     *         wait
      */
     public boolean isShutdown() {
         if (!shutdown.get()) {
@@ -583,7 +589,7 @@ public class QueryPipeline {
         }
         ExecutorService executor = pipelineExecutor;
         // isTerminated, not isShutdown: the latter is true the instant shutdown() is called,
-        // so a pipeline whose threads outlasted the grace period - which is logged as a
+        // so a pipeline whose threads outlasted the wait - which is logged as a
         // warning - would still report itself stopped while they were demonstrably running.
         return executor == null || executor.isTerminated();
     }

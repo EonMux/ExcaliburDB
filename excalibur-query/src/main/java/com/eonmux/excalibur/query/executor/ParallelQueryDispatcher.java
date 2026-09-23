@@ -58,9 +58,6 @@ public class ParallelQueryDispatcher {
      */
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
 
-    /** How long {@link #shutdown()} waits for segment searches already running. */
-    private static final long SHUTDOWN_WAIT_MILLIS = 5_000;
-
     private final SegmentCatalog catalog;
     private final Map<Long, Segment> segments;
     private final HnswGraphProvider graphProvider;
@@ -121,11 +118,17 @@ public class ParallelQueryDispatcher {
      * <p>The running searches are not interrupted; {@link ExecutorDrain} says why. A search
      * that outlives the wait is reported, not abandoned.</p>
      *
+     * <p>How long to wait is the caller's: a node's shutdown passes what its budget leaves the
+     * drains. A search ends by its query's own deadline, so a longer wait is only ever spent on
+     * one stalled inside a read.</p>
+     *
+     * @param wait How long to wait for the searches already running
      * @return true if no segment search is still running, false if one outlasted the wait and
      *         the storage it reads through must stay open
+     * @throws NullPointerException if wait is null
      */
-    public boolean shutdown() {
-        return ExecutorDrain.drain(executor, SHUTDOWN_WAIT_MILLIS, "Segment searches");
+    public boolean shutdown(Duration wait) {
+        return ExecutorDrain.drain(executor, wait, "Segment searches");
     }
 
     /**
