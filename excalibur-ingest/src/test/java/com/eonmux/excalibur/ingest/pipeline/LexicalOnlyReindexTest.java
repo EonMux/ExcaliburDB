@@ -4,6 +4,7 @@ import com.eonmux.excalibur.filter.CuckooFilter;
 import com.eonmux.excalibur.ingest.processor.TextChunker;
 import com.eonmux.excalibur.ingest.registry.DocumentRegistry;
 import com.eonmux.excalibur.ingest.registry.UpsertHandler;
+import com.eonmux.excalibur.ingest.source.FetchDisallowedException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
@@ -107,6 +108,25 @@ class LexicalOnlyReindexTest {
         assertThat(writer.textOf(SOURCE + ":doc-a:chunk:0")).contains("Replacement text");
     }
 
+    @Test
+    @DisplayName("a listed document its publisher forbids fetching is left out, not counted as an error")
+    void disallowedDocumentIsNotAnError() throws SourceException {
+        StubSource source = new StubSource();
+        source.add("doc-a", "The first document. ".repeat(50));
+        source.add("doc-private", DISALLOWED);
+
+        DocumentReindexer.ReindexResult result = lexicalOnly().reindexAll(source);
+
+        assertThat(result.getDocumentsIndexed()).isEqualTo(1);
+        assertThat(result.hasErrors())
+            .as("a site saying no is not a reindex that failed")
+            .isFalse();
+        assertThat(registry.contains(SOURCE, "doc-private")).isFalse();
+    }
+
+    /** Content that makes {@link StubSource} refuse the fetch as its publisher would. */
+    private static final String DISALLOWED = "!disallowed";
+
     /** A storage writer that keeps what it was handed, null embeddings included. */
     private static final class RecordingWriter
             implements DocumentReindexer.StorageWriter, UpsertHandler.StorageAdapter {
@@ -166,6 +186,9 @@ class LexicalOnlyReindexTest {
             String content = documents.get(documentId);
             if (content == null) {
                 throw new SourceException("Document not found: " + documentId);
+            }
+            if (DISALLOWED.equals(content)) {
+                throw new FetchDisallowedException(documentId, SOURCE, "robots.txt disallows it");
             }
             return document(documentId, content);
         }

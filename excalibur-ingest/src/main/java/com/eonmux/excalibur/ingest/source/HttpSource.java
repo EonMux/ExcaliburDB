@@ -83,6 +83,25 @@ import java.util.stream.Stream;
  * one left. The wait is taken outside the lock that reserves the slot, so a source's crawl never
  * pins the virtual thread it runs on, and a deployment that wants none sets the delay to zero.</p>
  *
+ * <h2>robots.txt</h2>
+ * <p>Honoured by default, as RFC 9309 specifies, and switched off only by a source built with
+ * {@code respectRobotsTxt(false)}. Every URL is judged against its origin's file before it is
+ * requested - the base URL, each link the walk finds, and each redirect hop - so a disallowed
+ * URL is never listed and never fetched, and a fetch redirected onto one fails with a
+ * {@link FetchDisallowedException} before the second request leaves. The file is read once per
+ * origin per run (see {@link RobotsPolicy}) through the same client, host policy, address check,
+ * timeout, pacing and redirect handling as any other request; only the path filters are not
+ * applied to it, because {@code /robots.txt} sits outside the base path of most crawls.</p>
+ *
+ * <p>A file the origin cannot serve - a 5xx answer, a network failure, or a redirect off the
+ * allowed hosts - stands, as the RFC requires, for a complete disallow. A crawl that meets one
+ * fails rather than listing what it could reach: a listing with an origin's pages missing
+ * because its server had a bad minute would read to change detection as a site that deleted
+ * them. A fetch that meets one fails as retryable, and the indexed version is kept. A
+ * {@code Crawl-delay} can only slow the crawl: the gap before a request to an origin is the
+ * larger of {@code crawlDelay} and the origin's own, which is held to
+ * {@link RobotsRules#MAX_CRAWL_DELAY}.</p>
+ *
  * <h2>Change Detection</h2>
  * <p>Per document, with a conditional GET. Every fetch records the {@code ETag} and
  * {@code Last-Modified} the server sent, the document registry keeps them beside the content
@@ -129,6 +148,12 @@ public class HttpSource implements Source {
      * Maximum number of redirect hops followed for a single request.
      */
     private static final int MAX_REDIRECTS = 5;
+
+    /** Where RFC 9309 puts an origin's crawling rules. */
+    private static final String ROBOTS_PATH = "/robots.txt";
+
+    /** What a robots.txt request asks for: the plain text the file is, and anything else. */
+    private static final String ROBOTS_ACCEPT = "text/plain,*/*;q=0.5";
 
     /** The answer to a conditional request whose version the server still holds. */
     private static final int NOT_MODIFIED = 304;
@@ -188,6 +213,15 @@ public class HttpSource implements Source {
     private final HttpClient httpClient;
     private final Map<String, String> requestHeaders;
 
+    /** Whether each origin's robots.txt is read and obeyed. */
+    private final boolean respectRobotsTxt;
+
+    /**
+     * The robots.txt rules of the current run, replaced when a crawl begins; null when this
+     * source does not respect robots.txt.
+     */
+    private volatile RobotsPolicy robots;
+
     private volatile boolean closed = false;
 
     /**
@@ -239,6 +273,9 @@ public class HttpSource implements Source {
         this.userAgent = builder.userAgent != null ? builder.userAgent : DEFAULT_USER_AGENT;
         this.requestHeaders = Map.copyOf(builder.requestHeaders);
         validateRequestHeaders(this.requestHeaders);
+        this.respectRobotsTxt = builder.respectRobotsTxt;
+        // A fetch made before any crawl has a run to judge it by too.
+        this.robots = newRobotsRun();
 
         // Redirects are followed by this class, not by the client, so that every hop passes
         // through isUrlAllowed. See the class javadoc.
@@ -272,6 +309,7 @@ public class HttpSource implements Source {
         ensureOpen();
 
         LOG.info("Starting crawl for source {}: {}", sourceId, baseUri);
+        robots = newRobotsRun();
 
         List<String> result = new ArrayList<>(crawlBreadthFirst());
         Collections.sort(result);
@@ -291,7 +329,8 @@ public class HttpSource implements Source {
      * before {@code visited} can grow without bound.</p>
      *
      * @return The in-policy document URLs discovered below the base URL
-     * @throws SourceException if the crawl is interrupted
+     * @throws SourceException if the crawl is interrupted, or an origin's robots.txt cannot be
+     *                         read
      */
     private Set<String> crawlBreadthFirst() throws SourceException {
         Set<String> visited = new HashSet<>();
@@ -310,6 +349,10 @@ public class HttpSource implements Source {
                 continue;
             }
 
+            if (!robotsAllowCrawling(target.url())) {
+                continue;
+            }
+
             if (target.depth() > 0 && !found.add(target.url())) {
                 continue;
             }
@@ -324,7 +367,17 @@ public class HttpSource implements Source {
                 continue;
             }
 
-            for (String link : extractLinks(target.url())) {
+            Set<String> links;
+            try {
+                links = extractLinks(target.url());
+            } catch (FetchDisallowedException e) {
+                // It redirects onto a URL robots.txt forbids, so fetching it later would too.
+                LOG.debug("Leaving {} out of the crawl: {}", target.url(), e.getMessage());
+                found.remove(target.url());
+                robots.recordDisallowed(target.url());
+                continue;
+            }
+            for (String link : links) {
                 String normalized = normalizeUrl(link);
                 if (visited.add(normalized)) {
                     frontier.add(new CrawlTarget(normalized, target.depth() + 1));
@@ -333,6 +386,153 @@ public class HttpSource implements Source {
         }
 
         return found;
+    }
+
+    /**
+     * Whether the walk may request a URL, recording it when robots.txt forbids it.
+     *
+     * @param url An in-policy, normalized URL
+     * @return false when its origin's robots.txt disallows it
+     * @throws SourceException if the origin's robots.txt cannot be read, which ends the crawl, or
+     *                         the crawl is interrupted
+     */
+    private boolean robotsAllowCrawling(String url) throws SourceException {
+        try {
+            robotsCheck(url, url);
+            return true;
+        } catch (FetchDisallowedException e) {
+            LOG.debug("Leaving {} out of the crawl: {}", url, e.getMessage());
+            robots.recordDisallowed(url);
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SourceException("Crawl interrupted", sourceId, true, e);
+        }
+    }
+
+    /**
+     * Starts the robots.txt cache for a run, or none when this source ignores robots.txt.
+     */
+    private RobotsPolicy newRobotsRun() {
+        return respectRobotsTxt ? new RobotsPolicy(this::loadRobots) : null;
+    }
+
+    /**
+     * Refuses a request robots.txt does not permit, and says how long to leave before it.
+     *
+     * @param documentId The document the request is made for, which is what a refusal names
+     * @param target     The URL about to be requested: the document, or a hop of its redirect
+     * @return The gap to leave before the request
+     * @throws FetchDisallowedException  if the origin's robots.txt disallows the target
+     * @throws RobotsUnreachableException if the origin's robots.txt cannot be read
+     * @throws InterruptedException      if the run is stopped while the file is being read
+     */
+    private Duration robotsCheck(String documentId, String target)
+            throws SourceException, InterruptedException {
+        RobotsPolicy run = robots;
+        if (run == null) {
+            return crawlDelay;
+        }
+        URI uri = URI.create(target);
+        String origin = RobotsPolicy.originOf(uri);
+        RobotsRules rules = run.rulesFor(origin);
+        if (!rules.isReachable()) {
+            throw new RobotsUnreachableException(rules.unreachableReason()
+                + "; RFC 9309 has a crawler treat a robots.txt it cannot read as disallowing "
+                + "everything, so nothing on " + origin + " is fetched this run", sourceId);
+        }
+        if (!rules.allows(RobotsPolicy.pathAndQuery(uri))) {
+            throw new FetchDisallowedException(documentId, sourceId,
+                "the robots.txt of " + origin + " disallows " + target);
+        }
+        return rules.crawlDelay().compareTo(crawlDelay) > 0 ? rules.crawlDelay() : crawlDelay;
+    }
+
+    /**
+     * Reads an origin's robots.txt, following redirects under the same host policy as a page.
+     *
+     * <p>Never throws over what the origin did: every outcome is a set of rules, as
+     * {@link RobotsRules#fromResponse} classifies it. A redirect off the allowed hosts is not
+     * followed - the file is then unreadable rather than absent, because the site did publish
+     * one - and a chain longer than {@code MAX_REDIRECTS} is read as no file, as RFC 9309 section
+     * 2.3.1.2 permits.</p>
+     *
+     * @param origin {@code scheme://host:port}
+     * @return The rules that apply to this crawler on that origin
+     * @throws InterruptedException if the run is stopped meanwhile
+     */
+    private RobotsRules loadRobots(String origin) throws InterruptedException {
+        String robotsUrl = normalizeUrl(origin + ROBOTS_PATH);
+        String target = robotsUrl;
+        for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
+            if (!isRequestable(target)) {
+                return RobotsRules.unreachable("robots.txt at " + robotsUrl + " could not be read: "
+                    + target + " is outside the source policy");
+            }
+            pace(crawlDelay);
+            HttpResponse<InputStream> response;
+            try {
+                response = httpClient.send(request(target, ROBOTS_ACCEPT).build(),
+                    HttpResponse.BodyHandlers.ofInputStream());
+            } catch (IOException e) {
+                return RobotsRules.unreachable("robots.txt at " + robotsUrl
+                    + " could not be fetched: " + describe(e));
+            }
+            int status = response.statusCode();
+            if (isRedirect(status)) {
+                closeQuietly(response.body());
+                String location = getHeader(response, "Location", null);
+                String next = location == null ? null : resolveUrl(target, location.trim());
+                if (next == null) {
+                    return RobotsRules.unreachable("robots.txt at " + robotsUrl
+                        + " answered a redirect with no usable Location");
+                }
+                target = normalizeUrl(next);
+                continue;
+            }
+            return robotsFromResponse(response, robotsUrl, target);
+        }
+        LOG.info("robots.txt at {} redirects more than {} times; reading it as absent, as RFC "
+            + "9309 permits, so nothing on {} is disallowed", robotsUrl, MAX_REDIRECTS, origin);
+        return RobotsRules.ALLOW_ALL;
+    }
+
+    /** Reads the final answer to a robots.txt request, bounded at {@link RobotsRules#MAX_BYTES}. */
+    private RobotsRules robotsFromResponse(HttpResponse<InputStream> response, String robotsUrl,
+                                           String target) {
+        int status = response.statusCode();
+        if (status < 200 || status >= 300) {
+            closeQuietly(response.body());
+            return RobotsRules.fromResponse(status, new byte[0], userAgent, robotsUrl);
+        }
+        try {
+            // One byte past the cap tells a file that fits from one that has to be cut.
+            byte[] body = readUpTo(response, target, RobotsRules.MAX_BYTES + 1);
+            return RobotsRules.fromResponse(status, body, userAgent, robotsUrl);
+        } catch (SourceException | IOException e) {
+            return RobotsRules.unreachable("robots.txt at " + robotsUrl
+                + " could not be read: " + describe(e));
+        }
+    }
+
+    private static String describe(Exception e) {
+        String message = e.getMessage();
+        return message == null || message.isBlank()
+            ? e.getClass().getSimpleName()
+            : e.getClass().getSimpleName() + ": " + message;
+    }
+
+    /**
+     * A robots.txt that could not be read, stopping a request to its origin.
+     *
+     * <p>Retryable, unlike {@link FetchDisallowedException}: the site has not said no, it has
+     * failed to say anything, and the next run asks again.</p>
+     */
+    private static final class RobotsUnreachableException extends SourceException {
+
+        RobotsUnreachableException(String message, String sourceId) {
+            super(message, sourceId, true);
+        }
     }
 
     /**
@@ -349,7 +549,9 @@ public class HttpSource implements Source {
      *
      * @param url An in-policy, normalized URL
      * @return The set of in-policy absolute URLs linked from the page
-     * @throws SourceException if the crawl was interrupted
+     * @throws FetchDisallowedException if the page redirects onto a URL robots.txt disallows
+     * @throws SourceException if the crawl was interrupted, or a robots.txt on the way could not
+     *                         be read
      */
     private Set<String> extractLinks(String url) throws SourceException {
         Set<String> links = new HashSet<>();
@@ -384,6 +586,10 @@ public class HttpSource implements Source {
                 }
             }
 
+        } catch (FetchDisallowedException | RobotsUnreachableException e) {
+            // Not "this page yielded no links": one is a page the crawl must not list, the other
+            // a crawl that can no longer list the whole site.
+            throw e;
         } catch (SourceException e) {
             LOG.debug("Failed to extract links from {}: {}", url, e.getMessage());
         } catch (IOException e) {
@@ -406,11 +612,13 @@ public class HttpSource implements Source {
      * from pinning the carrier thread its virtual thread runs on, which is what a sleep inside a
      * monitor would do on this runtime.</p>
      *
+     * @param gap The gap to leave after this request: {@code crawlDelay}, or an origin's longer
+     *            {@code Crawl-delay}
      * @throws InterruptedException if the wait is interrupted, which is how a stopped source
      *                              stops rather than finishing its delay first
      */
-    private void pace() throws InterruptedException {
-        long delayNanos = crawlDelay.toNanos();
+    private void pace(Duration gap) throws InterruptedException {
+        long delayNanos = gap.toNanos();
         if (delayNanos <= 0) {
             return;
         }
@@ -443,29 +651,29 @@ public class HttpSource implements Source {
      * lives elsewhere, and it is the server at the end of the chain that holds the version the
      * validators describe.</p>
      *
+     * <p>robots.txt is consulted per hop as well, before the hop is requested: a disallowed
+     * redirect target is refused without being asked for, like a disallowed document.</p>
+     *
      * @param url        The in-policy URL to request
      * @param accept     The {@code Accept} header value
      * @param conditions The validators to ask conditionally with; {@link DocumentValidators#NONE}
      *                   for an unconditional request
      * @return The first non-redirect response, and whether the request it answers carried a
      *         condition
-     * @throws SourceException if a redirect leaves the policy or the hop limit is exceeded
+     * @throws FetchDisallowedException if robots.txt disallows the URL or a hop of its redirect
+     * @throws SourceException if a redirect leaves the policy, the hop limit is exceeded, or a
+     *                         robots.txt on the way cannot be read
      */
     private Reply get(String url, String accept, DocumentValidators conditions)
             throws SourceException, IOException, InterruptedException {
         String target = url;
 
         for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
+            Duration gap = robotsCheck(url, target);
             // Per hop, not per call: a redirect is another request to the host, and a chain of
             // them issued back to back is exactly the burst the delay exists to prevent.
-            pace();
-            HttpRequest.Builder builder = HttpRequest.newBuilder()
-                .uri(URI.create(target))
-                .header("User-Agent", userAgent)
-                .header("Accept", accept)
-                .timeout(timeout)
-                .GET();
-            requestHeaders.forEach(builder::header);
+            pace(gap);
+            HttpRequest.Builder builder = request(target, accept);
             boolean conditional = addConditions(builder, conditions, url);
 
             HttpResponse<InputStream> response =
@@ -481,6 +689,24 @@ public class HttpSource implements Source {
 
         throw new SourceException(
             "Too many redirects (max " + MAX_REDIRECTS + ") starting at: " + url, sourceId, false);
+    }
+
+    /**
+     * Starts a GET carrying what every request from this source carries.
+     *
+     * @param target The URL to request
+     * @param accept The {@code Accept} header value
+     * @return The request, ready for conditions to be added
+     */
+    private HttpRequest.Builder request(String target, String accept) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+            .uri(URI.create(target))
+            .header("User-Agent", userAgent)
+            .header("Accept", accept)
+            .timeout(timeout)
+            .GET();
+        requestHeaders.forEach(builder::header);
+        return builder;
     }
 
     /**
@@ -599,8 +825,28 @@ public class HttpSource implements Source {
             throws SourceException, IOException {
         // One byte past the bound tells a body at the limit from one over it. The builder holds
         // maxResponseSize to DocumentLimits.MAX_DOCUMENT_BYTES, so the sum fits an int.
-        int limit = (int) maxResponseSize + 1;
+        byte[] content = readUpTo(response, url, (int) maxResponseSize + 1);
+        if (content.length > maxResponseSize) {
+            throw new SourceException(
+                "Response too large: exceeds " + maxResponseSize + " bytes: " + url,
+                sourceId,
+                false);
+        }
+        return content;
+    }
 
+    /**
+     * Reads at most {@code limit} bytes of a response body, under the request timeout.
+     *
+     * @param response The response whose body should be read; its stream is always closed
+     * @param url      The URL being read, for the error message
+     * @param limit    The most bytes to read; the rest of the body is abandoned
+     * @return The bytes read
+     * @throws SourceException if the body stops arriving for longer than the timeout
+     * @throws IOException     if reading fails
+     */
+    private byte[] readUpTo(HttpResponse<InputStream> response, String url, int limit)
+            throws SourceException, IOException {
         InputStream body = response.body();
         // The request timeout does not reach here. With a streaming body handler the client
         // completes send() as soon as the headers arrive, so a server that sends headers and
@@ -614,14 +860,7 @@ public class HttpSource implements Source {
         }, timeout.toMillis(), TimeUnit.MILLISECONDS);
 
         try (body) {
-            byte[] content = body.readNBytes(limit);
-            if (content.length > maxResponseSize) {
-                throw new SourceException(
-                    "Response too large: exceeds " + maxResponseSize + " bytes: " + url,
-                    sourceId,
-                    false);
-            }
-            return content;
+            return body.readNBytes(limit);
         } catch (IOException e) {
             if (timedOut.get()) {
                 throw new SourceException(
@@ -713,6 +952,8 @@ public class HttpSource implements Source {
      * @throws SourceException also when the server answered {@code 304} to a request that
      *         carried none - with no stored tag it could be sent, or no validators at all - since
      *         that names no version this crawl holds and gives it no body to index
+     * @throws FetchDisallowedException if robots.txt disallows the document or its redirect,
+     *         which is counted towards {@link #getDisallowedCount()}
      */
     private FetchedDocument fetchConditionally(String documentId, DocumentValidators conditions)
             throws SourceException, DocumentNotFoundException {
@@ -774,6 +1015,12 @@ public class HttpSource implements Source {
                 lastModifiedMillis, entityTag);
 
         } catch (DocumentNotFoundException e) {
+            throw e;
+        } catch (FetchDisallowedException e) {
+            RobotsPolicy run = robots;
+            if (run != null) {
+                run.recordDisallowed(documentId);
+            }
             throw e;
         } catch (IOException e) {
             throw new SourceException(
@@ -850,6 +1097,25 @@ public class HttpSource implements Source {
 
     public String getUserAgent() {
         return userAgent;
+    }
+
+    /**
+     * Whether this source reads each origin's robots.txt and leaves out what it disallows.
+     *
+     * @return true unless the source was built with {@code respectRobotsTxt(false)}
+     */
+    public boolean isRespectingRobotsTxt() {
+        return respectRobotsTxt;
+    }
+
+    /**
+     * The URLs robots.txt kept out of the current run: those the latest crawl did not list or
+     * request, and any fetch since refused.
+     */
+    @Override
+    public long getDisallowedCount() {
+        RobotsPolicy run = robots;
+        return run == null ? 0 : run.disallowedCount();
     }
 
     private void ensureOpen() throws SourceException {
@@ -951,21 +1217,41 @@ public class HttpSource implements Source {
         return isUrlAllowed(url);
     }
 
+    /**
+     * Whether a URL is one this source may request at all: an allowed scheme, an allow-listed
+     * host, and a host that resolves only to addresses this source may reach.
+     *
+     * <p>The part of {@link #isUrlAllowed} that is about where a request goes rather than which
+     * documents the crawl wants, and so the part a robots.txt request has to pass as well.</p>
+     */
+    private boolean isOriginAllowed(URI uri) {
+        String scheme = uri.getScheme();
+        if (scheme == null || !ALLOWED_SCHEMES.contains(scheme.toLowerCase(Locale.ROOT))) {
+            return false;
+        }
+
+        String host = uri.getHost();
+        if (host == null || !allowedDomains.contains(host.toLowerCase(Locale.ROOT))) {
+            return false;
+        }
+
+        return isAddressAllowed(host);
+    }
+
+    /** {@link #isOriginAllowed} for a URL that may not parse. */
+    private boolean isRequestable(String url) {
+        try {
+            return isOriginAllowed(URI.create(url).normalize());
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
     private boolean isUrlAllowed(String url) {
         try {
             URI uri = URI.create(url).normalize();
-            
-            String scheme = uri.getScheme();
-            if (scheme == null || !ALLOWED_SCHEMES.contains(scheme.toLowerCase(Locale.ROOT))) {
-                return false;
-            }
 
-            String host = uri.getHost();
-            if (host == null || !allowedDomains.contains(host.toLowerCase(Locale.ROOT))) {
-                return false;
-            }
-
-            if (!isAddressAllowed(host)) {
+            if (!isOriginAllowed(uri)) {
                 return false;
             }
 
@@ -1236,6 +1522,7 @@ public class HttpSource implements Source {
         private Duration crawlDelay = DEFAULT_CRAWL_DELAY;
         private String userAgent = DEFAULT_USER_AGENT;
         private Map<String, String> requestHeaders = Map.of();
+        private boolean respectRobotsTxt = true;
 
         public Builder sourceId(String sourceId) {
             this.sourceId = sourceId;
@@ -1373,6 +1660,21 @@ public class HttpSource implements Source {
             Map<String, String> newHeaders = new java.util.HashMap<>(this.requestHeaders);
             newHeaders.put(name, value);
             this.requestHeaders = Map.copyOf(newHeaders);
+            return this;
+        }
+
+        /**
+         * Sets whether each origin's robots.txt is read and obeyed.
+         *
+         * <p>On by default. Turning it off is for a site the operator speaks for - an intranet
+         * whose robots.txt keeps public crawlers out, say - and never a way to crawl faster:
+         * the crawl delay applies either way.</p>
+         *
+         * @param respect false to fetch without consulting robots.txt
+         * @return This builder
+         */
+        public Builder respectRobotsTxt(boolean respect) {
+            this.respectRobotsTxt = respect;
             return this;
         }
 

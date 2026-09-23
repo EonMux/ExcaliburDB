@@ -46,6 +46,7 @@ import java.util.function.Consumer;
  *   "entries_ingested": 450000,
  *   "entries_pending": 170000,
  *   "entries_skipped": 1204,
+ *   "entries_disallowed": 37,
  *   "last_updated_ms": 1730000000000,
  *   "last_error": null
  * }
@@ -56,6 +57,15 @@ import java.util.function.Consumer;
  * GET /v1/ingest/status
  * {"sources": [ ...the objects above... ]}
  * }</pre>
+ *
+ * <h2>Counts</h2>
+ * <p>{@code entries_skipped} is the documents the run listed and passed over because their bytes
+ * are not text. {@code entries_disallowed} is the documents it left alone because their publisher
+ * forbids fetching them - for a web crawl, the URLs the site's robots.txt disallows, whether the
+ * crawl met them as links or a fetch was redirected onto one. They are kept apart because they
+ * answer different questions: a skipped image is ordinary, while a disallowed page is one the
+ * site asked to be left out, which only its owner - or a registration made with
+ * {@code respect_robots_txt: false} - can change. Neither is an error.</p>
  *
  * <h2>States</h2>
  * <ul>
@@ -231,6 +241,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             "\"entries_ingested\": %d, " +
             "\"entries_pending\": %d, " +
             "\"entries_skipped\": %d, " +
+            "\"entries_disallowed\": %d, " +
             "\"last_updated_ms\": %d, " +
             "\"last_error\": %s" +
             "}",
@@ -240,6 +251,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             status.entriesIngested(),
             status.entriesPending(),
             status.entriesSkipped(),
+            status.entriesDisallowed(),
             status.lastUpdatedMs(),
             status.lastError() != null ? "\"" + JsonText.escape(status.lastError()) + "\"" : "null"
         );
@@ -268,6 +280,7 @@ public class IngestStatusEndpoint implements HttpHandler {
         private volatile long entriesIngested;
         private volatile long entriesPending;
         private volatile long entriesSkipped;
+        private volatile long entriesDisallowed;
         private volatile String lastError;
         private volatile long lastUpdatedMs;
 
@@ -284,6 +297,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesIngested = 0;
             this.entriesPending = 0;
             this.entriesSkipped = 0;
+            this.entriesDisallowed = 0;
             this.lastError = null;
             this.lastUpdatedMs = System.currentTimeMillis();
         }
@@ -294,6 +308,7 @@ public class IngestStatusEndpoint implements HttpHandler {
         public long entriesIngested() { return entriesIngested; }
         public long entriesPending() { return entriesPending; }
         public long entriesSkipped() { return entriesSkipped; }
+        public long entriesDisallowed() { return entriesDisallowed; }
         public String lastError() { return lastError; }
         public long lastUpdatedMs() { return lastUpdatedMs; }
 
@@ -332,7 +347,7 @@ public class IngestStatusEndpoint implements HttpHandler {
          */
         SourceStatusFile.Entry snapshot() {
             return new SourceStatusFile.Entry(sourceId, state, progress, entriesIngested,
-                entriesPending, entriesSkipped, lastUpdatedMs, lastError);
+                entriesPending, entriesSkipped, entriesDisallowed, lastUpdatedMs, lastError);
         }
 
         /**
@@ -352,6 +367,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             status.entriesIngested = entry.ingested();
             status.entriesPending = entry.pending();
             status.entriesSkipped = entry.skipped();
+            status.entriesDisallowed = entry.disallowed();
             status.lastError = entry.lastError();
             status.lastUpdatedMs = entry.lastUpdatedMs();
             if (!status.isSettled()) {
@@ -426,6 +442,22 @@ public class IngestStatusEndpoint implements HttpHandler {
         }
 
         /**
+         * Records how many of this run's documents were left alone because their publisher
+         * forbids fetching them.
+         *
+         * <p>Kept like {@link #setSkipped}: left alone by {@link #update} and {@link #setError},
+         * reported by the run it describes, and not an error.</p>
+         *
+         * @param entriesDisallowed Documents robots.txt, or its like, kept out of the run;
+         *                          negative is read as zero
+         */
+        public void setDisallowed(long entriesDisallowed) {
+            this.entriesDisallowed = Math.max(0, entriesDisallowed);
+            this.lastUpdatedMs = System.currentTimeMillis();
+            reportIfSettled();
+        }
+
+        /**
          * Sets an error state.
          */
         public void setError(String error) {
@@ -452,6 +484,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.progress = 0.0;
             this.entriesIngested = 0;
             this.entriesSkipped = 0;
+            this.entriesDisallowed = 0;
             this.entriesPending = Math.max(0, entriesPending);
             this.lastError = reason;
             this.lastUpdatedMs = System.currentTimeMillis();
@@ -467,6 +500,7 @@ public class IngestStatusEndpoint implements HttpHandler {
             this.entriesIngested = 0;
             this.entriesPending = 0;
             this.entriesSkipped = 0;
+            this.entriesDisallowed = 0;
             this.lastError = null;
             this.lastUpdatedMs = System.currentTimeMillis();
             reportIfSettled();

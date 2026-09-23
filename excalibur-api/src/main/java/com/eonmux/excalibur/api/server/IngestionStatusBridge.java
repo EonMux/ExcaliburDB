@@ -49,6 +49,11 @@ final class IngestionStatusBridge implements IngestionOrchestrator.StatusRegistr
             }
 
             @Override
+            public void setDisallowed(long entriesDisallowed) {
+                status.setDisallowed(entriesDisallowed);
+            }
+
+            @Override
             public void setError(String error) {
                 status.setError(error);
             }

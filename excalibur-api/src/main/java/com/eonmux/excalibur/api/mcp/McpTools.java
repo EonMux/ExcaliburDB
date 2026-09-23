@@ -281,7 +281,10 @@ public final class McpTools {
             "How far indexing has got, for one source or for all of them. 'idle' with no error "
             + "means the run finished and indexed everything it listed. 'idle' with an error "
             + "means the run finished without indexing all of it - 'last_error' says how many "
-            + "documents were dropped, and those documents are not searchable. 'unconfigured' "
+            + "documents were dropped, and those documents are not searchable. "
+            + "'entries_skipped' counts documents passed over because they are not text, and "
+            + "'entries_disallowed' pages a website's robots.txt asked to be left out; neither "
+            + "is an error. 'unconfigured' "
             + "means the server has no ingestion "
             + "pipeline and indexed nothing at all, with 'last_error' naming what has to be set - "
             + "in that case do not call build_graph, because there will be nothing to build.",
@@ -293,9 +296,11 @@ public final class McpTools {
             "Register a website as a source and start crawling and indexing it. The crawl stays "
             + "on the starting URL's host - redirects are followed with the same host policy "
             + "re-applied at every hop - and the host must be one the server allows, or the "
-            + "request is refused. Returns as soon as the source is registered; the crawl "
-            + "continues in the background, so poll " + INGESTION_STATUS + " until its state is "
-            + "'idle' before calling " + BUILD_GRAPH + ". This is " + INGEST_DOCUMENTS + " for "
+            + "request is refused. The site's robots.txt is obeyed unless respect_robots_txt is "
+            + "false, and a robots.txt the site cannot serve (a 5xx or no answer) fails the "
+            + "crawl with the reason in last_error. Returns as soon as the source is "
+            + "registered; the crawl continues in the background, so poll " + INGESTION_STATUS
+            + " until its state is 'idle' before calling " + BUILD_GRAPH + ". This is " + INGEST_DOCUMENTS + " for "
             + "content that is on the web rather than in a directory on the server; the two "
             + "take different settings and neither accepts the other's.",
             ToolSchema.object(
@@ -338,7 +343,14 @@ public final class McpTools {
                     + "for a host that should be crawled more gently than usual. The server "
                     + "has a minimum gap of its own and uses whichever is larger, so this can "
                     + "only slow a crawl down: 0 means no preference, not no pause. Omit for "
-                    + "the server's pace.", null))));
+                    + "the server's pace.", null),
+                ToolSchema.optional("respect_robots_txt", "boolean",
+                    "Whether the crawl reads the site's robots.txt and leaves out every URL it "
+                    + "disallows for this crawler's user agent, and waits at least its "
+                    + "Crawl-delay between requests. On unless set to false; turn it off only "
+                    + "for a site whose owner has agreed to be crawled regardless. Disallowed "
+                    + "pages are counted as 'entries_disallowed' in " + INGESTION_STATUS + ".",
+                    null))));
 
         tools.add(ToolSchema.tool(REINDEX_SOURCE,
             "Re-crawl a registered source and bring the index back into step with it: new "
@@ -555,6 +567,7 @@ public final class McpTools {
             sourceConfig.put("user_agent", userAgent);
         }
         putWholeNumber(args, sourceConfig, "crawl_delay_ms");
+        putFlag(args, sourceConfig, "respect_robots_txt");
 
         Map<String, Object> body = Json.object();
         body.put("source_type", "http");

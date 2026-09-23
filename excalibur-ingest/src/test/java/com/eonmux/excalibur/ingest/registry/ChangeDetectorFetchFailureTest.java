@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.ingest.registry;
 
 import com.eonmux.excalibur.ingest.source.DocumentNotFoundException;
+import com.eonmux.excalibur.ingest.source.FetchDisallowedException;
 import com.eonmux.excalibur.ingest.source.FetchedDocument;
 import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
@@ -50,6 +51,19 @@ class ChangeDetectorFetchFailureTest {
 
         assertThat(changeSet.getDeletedCount()).isEqualTo(1);
         assertThat(changeSet.getDeletedDocuments().get(0).getDocumentId()).isEqualTo(DOCUMENT_ID);
+        assertThat(changeSet.getChangedCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("a document its publisher now forbids fetching is reported as deleted")
+    void disallowedIsReportedAsDeleted() throws SourceException {
+        // The same outcome as a crawl that no longer lists it: a page robots.txt disallows
+        // before the walk reaches it is never listed, and one it disallows only through a
+        // redirect must not be kept serving for the lack of a listing to leave it out of.
+        ChangeSet changeSet = detector.detectChanges(new StubSource(() ->
+            new FetchDisallowedException(DOCUMENT_ID, SOURCE_ID, "robots.txt disallows it")));
+
+        assertThat(changeSet.getDeletedCount()).isEqualTo(1);
         assertThat(changeSet.getChangedCount()).isZero();
     }
 

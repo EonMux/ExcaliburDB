@@ -163,6 +163,10 @@ class EmbeddedUsageExampleTest {
                         }
 
                         @Override
+                        public void setDisallowed(long disallowed) {
+                        }
+
+                        @Override
                         public void setError(String error) {
                             System.err.println(sourceId + ": " + error);
                         }

@@ -142,7 +142,8 @@ curl 'http://localhost:8080/v1/ingest/status?source_id=my-docs'
 `state` runs `crawling` → `embedding` → `indexing` → `idle`. `unconfigured` means this node's
 ingestion pipeline failed to wire at startup; `last_error` says where the reason is.
 `entries_skipped` counts the files under the root that are not text — see
-[What gets indexed](#what-gets-indexed). Drop `?source_id=` to get every source instead, wrapped
+[What gets indexed](#what-gets-indexed); a web crawl also reports `entries_disallowed`, the pages
+the site's [robots.txt](#robotstxt) kept it out of. Drop `?source_id=` to get every source instead, wrapped
 in a `sources` array.
 
 ### 5. Query
@@ -1597,6 +1598,7 @@ rather than a silent clamp:
 | `timeout_seconds` | http | 1 – 600 | How long one request may take |
 | `user_agent` | http | ≤ 200 chars | What the crawl identifies itself as. Screened for header injection |
 | `crawl_delay_ms` | http | 0 – 60000 | The gap this crawl leaves between requests to its host. The node takes the larger of this and `excalibur.ingest.crawl-delay-ms`, so it can ask to be gentler than the deployment requires and never quicker |
+| `respect_robots_txt` | http | `true` / `false` | Whether the crawl reads each origin's `robots.txt` and obeys it; `true` when absent, including for a registration recorded before the field existed. `false` is for a site whose owner has agreed to be crawled regardless — see [robots.txt](#robotstxt) |
 | `max_depth` | both | 1 – 1000 filesystem, 0 – 1000 http | How far the crawl descends. Zero is a meaningful HTTP crawl — the one page named by `base_url` — and not a meaningful directory walk |
 
 An explicit `null` is the same as leaving the field out: the default applies.
@@ -1629,6 +1631,7 @@ curl 'http://localhost:8080/v1/ingest/status?source_id=my-docs'
   "entries_ingested": 450000,
   "entries_pending": 170000,
   "entries_skipped": 1204,
+  "entries_disallowed": 0,
   "last_updated_ms": 1730000042000,
   "last_error": null
 }
@@ -1645,10 +1648,10 @@ curl http://localhost:8080/v1/ingest/status
   "sources": [
     {"source_id": "my-docs", "state": "embedding", "progress": 0.7300,
      "entries_ingested": 450000, "entries_pending": 170000, "entries_skipped": 1204,
-     "last_updated_ms": 1730000042000, "last_error": null},
+     "entries_disallowed": 0, "last_updated_ms": 1730000042000, "last_error": null},
     {"source_id": "docs-site", "state": "idle", "progress": 1.0000,
      "entries_ingested": 12034, "entries_pending": 0, "entries_skipped": 0,
-     "last_updated_ms": 1729900000000, "last_error": null}
+     "entries_disallowed": 37, "last_updated_ms": 1729900000000, "last_error": null}
   ]
 }
 ```
@@ -1677,6 +1680,7 @@ progress when the node stopped did not finish.
 | `entries_ingested` | Chunks written and published by this run |
 | `entries_pending` | Documents the crawl listed and has not reached yet |
 | `entries_skipped` | Documents the crawl listed that are not text, so nothing was indexed from them. Not a failure, and deliberately not folded into `last_error`: a directory holding photographs beside its documents is the ordinary case, and calling those failures would leave every such source reading as broken. An empty file, or one that decodes to nothing worth a chunk, is not counted here by the first crawl or by any re-crawl |
+| `entries_disallowed` | Pages a web crawl left alone because the site's `robots.txt` disallows them — met as links, or reached through a redirect. Counted apart from `entries_skipped` because it answers a different question: a skipped photograph is ordinary, a disallowed page is one the site asked to be left out, which only its owner or a registration with `respect_robots_txt: false` can change. Not an error. Always 0 for a filesystem source. See [robots.txt](#robotstxt) |
 
 ### What gets indexed
 
@@ -1729,6 +1733,47 @@ to the run that wrote it, because a reindex reports how far it got through
 There are no format parsers. A PDF, a `.docx` or an image is skipped, not extracted; the node
 indexes documents you can already read as text. `included_extensions` is still worth setting on a
 mixed root, because it stops those files being read at all rather than read and discarded.
+
+#### robots.txt
+
+A web crawl obeys each site's `robots.txt` unless it was registered with
+`"respect_robots_txt": false`. It follows [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309):
+
+- **Read once per origin per run.** The origin is the scheme, host and port. The file is fetched
+  through the same client, host allow-list, public-address check, timeout, pacing and redirect
+  handling as any page, so it opens no way around them. The crawl's path filters do not apply to
+  it, because `/robots.txt` sits outside the base path of most crawls. The file is re-read by the
+  next crawl or re-crawl.
+- **Group.** The group is chosen by the product token of `user_agent` (`ExcaliburDB` by default),
+  compared case-insensitively. When no group names it, the crawl falls back to `*`.
+- **Rules.** Within the group, the longest matching rule wins and `Allow` wins a tie. `*` and a
+  trailing `$` are supported, and paths are compared after percent-encoding normalisation.
+  `/robots.txt` itself is always allowed.
+- **Size.** The first 512 KiB are read, which is more than RFC 9309's minimum of 500 KiB. A rule
+  cut in half at that point is dropped.
+- **4xx.** Any 4xx answer, 404 included, means nothing on that origin is disallowed. So does a
+  redirect chain longer than five hops.
+- **5xx, network failure, or a redirect off the allowed hosts.** Any of these stands for a
+  complete disallow, as the RFC requires. The crawl **fails**, and `last_error` names the origin
+  and the reason. It does not index what it could reach, because a listing with that site's pages
+  missing would read to change detection as a site that had deleted them, and they would be
+  tombstoned. The registration stays, and the next scheduled re-crawl tries again.
+- **Every URL is checked before it is requested.** That covers the base URL, every link the walk
+  finds, and every redirect hop, on the first crawl and on every re-crawl, conditional GETs
+  included.
+  - A URL disallowed during the walk is never listed or fetched.
+  - A fetch redirected onto a disallowed URL stops before that request leaves.
+  - Either way, the page is counted in `entries_disallowed`, not as a failure.
+  - A page that was indexed before the site disallowed it is removed at the next re-crawl, like a
+    page the site no longer links to.
+- **`Crawl-delay` can only slow a crawl.** Each request waits for the larger of the crawl's own
+  gap and the site's `Crawl-delay`. The site's value is capped at 60 seconds, the same ceiling as
+  `crawl_delay_ms`, so one absurd line cannot stall a crawl indefinitely.
+
+There is no node-level switch. Every host a crawl can reach is already one the operator put on
+`excalibur.ingest.allowed-hosts`, and turning robots.txt off is a decision about one site. So it
+belongs to the registration for that site, where it is recorded and shown by `GET /v1/ingest`,
+not to every crawl the node runs.
 
 ### How a re-crawl finds what changed
 
@@ -2314,9 +2359,9 @@ Registered with an MCP client, for example in `claude_desktop_config.json`:
 | Tool | Arguments | What it does |
 |------|-----------|--------------|
 | `ingest_documents` | **`source_id`**, **`root_path`**, `included_extensions`, `excluded_directories`, `max_depth`, `follow_symlinks`, `include_hidden`, `max_file_bytes`, `charset`, `namespace` | Registers a directory and starts indexing it. Every setting a filesystem registration accepts over HTTP is here, with the same meaning and bounds — see the config fields under [Ingest Example](#ingest-example). An optional `charset` names the encoding its files are read in when they carry no byte-order mark (UTF-8 when omitted); a file with a mark is read in the encoding the mark names, and the node refuses an encoding it does not know |
-| `crawl_website` | **`source_id`**, **`base_url`**, `max_depth`, `max_documents`, `max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns`, `user_agent`, `crawl_delay_ms`, `namespace` | Registers an HTTP source and starts crawling it. Every setting an HTTP registration accepts is here, with the same meaning and bounds; `crawl_delay_ms` can only slow a crawl below the node's own `excalibur.ingest.crawl-delay-ms` pace, never speed it up |
+| `crawl_website` | **`source_id`**, **`base_url`**, `max_depth`, `max_documents`, `max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns`, `user_agent`, `crawl_delay_ms`, `respect_robots_txt`, `namespace` | Registers an HTTP source and starts crawling it. Every setting an HTTP registration accepts is here, with the same meaning and bounds; `crawl_delay_ms` can only slow a crawl below the node's own `excalibur.ingest.crawl-delay-ms` pace, never speed it up, and `respect_robots_txt` (on unless `false`) obeys the site's [robots.txt](#robotstxt) |
 | `add_documents` | **`source_id`**, **`documents`** (each **`document_id`**, **`text`**) | Indexes documents sent in the call itself, for content the model is holding |
-| `ingestion_status` | `source_id` | How far indexing has got |
+| `ingestion_status` | `source_id` | How far indexing has got, with `entries_skipped` (not text) and `entries_disallowed` (kept out by robots.txt) counted apart from errors |
 | `reindex_source` | **`source_id`** | Re-reads a registered source and replaces what changed |
 | `reindex_status` | `source_id` | How far a reindex has got, and whether it finished, failed or was cancelled |
 | `deregister_source` | **`source_id`** | Stops a source being crawled again; the documents already indexed stay |

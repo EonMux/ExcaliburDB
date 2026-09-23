@@ -622,6 +622,7 @@ curl -X POST http://localhost:8080/v1/ingest \
 | `excluded_path_patterns` | array of string | `/api`, `/admin`, `/login`, `/logout` | A URL path containing one of these is skipped. Supplying this **replaces** the default list, and `[]` clears it |
 | `user_agent` | string | `ExcaliburDB/1.0` | How the crawl identifies itself. At most 200 characters and no control characters: a carriage return or newline would end the header and turn the rest of the value into headers this node never agreed to send |
 | `crawl_delay_ms` | integer | `excalibur.ingest.crawl-delay-ms` (200) | The gap left between two requests to the host, 0 to 60000. The node takes the larger of this and its own setting, so a registration can ask to be gentler than the deployment requires and never quicker; `0` therefore reads as "no preference", not "crawl flat out" |
+| `respect_robots_txt` | boolean | `true` | Whether the crawl reads each origin's `robots.txt` and leaves out what it disallows. `null` or absent is `true`, and so is a registration recorded before the field existed. Set `false` only for a site whose owner has agreed to be crawled regardless. See [robots.txt](#robotstxt) below |
 
 The walk is sequential and makes two requests per page — one to read its links, one to fetch it —
 and every one of them, redirect hops included, waits out the gap above. A crawl left unpaced asks
@@ -631,12 +632,55 @@ The crawl stays on the base URL's host regardless of any of these — redirects 
 crawler itself, with the host policy re-applied at every hop — and hosts resolving to loopback,
 private, link-local or multicast addresses are refused whatever the allow-list says.
 
+#### robots.txt
+
+Unless `respect_robots_txt` is `false`, the crawl follows each site's `robots.txt` as
+[RFC 9309](https://www.rfc-editor.org/rfc/rfc9309) describes it.
+
+- **When it is read.** The file is read once per origin (scheme, host and port) per run, whether
+  that run is the first crawl, a scheduled re-crawl or `POST /v1/reindex`, and it is kept for the
+  rest of that run.
+- **How it is fetched.** It goes through the same host allow-list, public-address check, timeout,
+  pacing, `user_agent` and redirect handling as any page. The path filters do not apply to it.
+- **Which rules apply.**
+  - The rules come from the group that names the product token of `user_agent`. That is
+    `ExcaliburDB` for the default `ExcaliburDB/1.0`, compared case-insensitively. When no group
+    names it, the `*` group applies.
+  - Within the group, the longest matching rule wins, and `Allow` wins a tie.
+  - `*` and a trailing `$` work as the RFC defines them, and percent-encoded paths are compared
+    after normalisation.
+  - The first 512 KiB of the file are read.
+- **Which URLs are checked.** Every URL is checked before it is requested: the base URL, each link
+  the walk finds, and each redirect hop, conditional re-crawl requests included.
+  - A disallowed URL is never listed or fetched.
+  - A page redirected onto one is not fetched.
+  - Both are counted in `entries_disallowed` on the source's status. They are not failures and
+    not `entries_skipped`.
+  - A page indexed before its site disallowed it is removed at the next re-crawl.
+- **What each answer means.**
+
+  | robots.txt answers | Meaning for that origin, for this run |
+  |---|---|
+  | `2xx` | Its rules apply |
+  | any `4xx`, `404` included, or more than five redirects | Nothing is disallowed |
+  | `5xx`, no answer, or a redirect off the allowed hosts | Everything is disallowed: the crawl fails, with `last_error` naming the origin and the reason |
+
+  A crawl that meets an unreadable `robots.txt` fails rather than indexing what it could reach.
+  A listing with that site's pages missing would otherwise be read as the site having deleted
+  them. The indexed documents stay as they were, and the next re-crawl tries again.
+- **`Crawl-delay` can only slow the crawl.** The gap before each request is the larger of this
+  registration's pace and the site's `Crawl-delay`. The site's value is capped at 60 seconds.
+
+The switch is per registration and there is no node-level one. The hosts a crawl may reach are
+already the operator's choice, through `excalibur.ingest.allowed-hosts`, and ignoring one site's
+robots.txt is a decision about that site. `GET /v1/ingest` shows it for a registration that set it.
+
 Settings that belong to the other source type are refused here with a `400` rather than accepted
 and ignored, in both directions: `included_extensions`, `excluded_directories`,
 `follow_symlinks`, `include_hidden`, `max_file_bytes` and `charset` on a crawl — whose
 responses each name their own encoding in `Content-Type` — and `max_documents`,
 `max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns`,
-`user_agent` and `crawl_delay_ms` on a filesystem walk. See [error responses](#error-responses). `max_depth` is the one
+`user_agent`, `crawl_delay_ms` and `respect_robots_txt` on a filesystem walk. See [error responses](#error-responses). `max_depth` is the one
 setting both understand.
 
 **Response — `200 OK`**
@@ -803,7 +847,8 @@ record. The keys it returns are `root_path`, `included_extensions`, `excluded_di
 `max_depth`, `follow_symlinks`, `include_hidden`, `max_file_bytes`, `charset`, `base_url`,
 `max_documents`,
 `max_response_bytes`, `timeout_seconds`, `included_path_patterns`, `excluded_path_patterns`,
-`user_agent` and `crawl_delay_ms` — each only when the registration stored it. Any other key is listed by name under `withheld` and its value is not returned. Nothing
+`user_agent`, `crawl_delay_ms` and `respect_robots_txt` — each only when the registration stored
+it; an HTTP source with no `respect_robots_txt` obeys robots.txt. Any other key is listed by name under `withheld` and its value is not returned. Nothing
 in a source's configuration is secret today, but a read-back that echoes whatever it finds
 becomes a way out for the first setting that is — a header, a cookie, a signed URL — and that
 change would be made in the registration code, not here.
@@ -828,6 +873,7 @@ curl http://localhost:8080/v1/ingest/status
       "entries_ingested": 450000,
       "entries_pending": 170000,
       "entries_skipped": 1204,
+      "entries_disallowed": 0,
       "last_updated_ms": 1730000042000,
       "last_error": null
     },
@@ -838,6 +884,7 @@ curl http://localhost:8080/v1/ingest/status
       "entries_ingested": 12034,
       "entries_pending": 0,
       "entries_skipped": 0,
+      "entries_disallowed": 37,
       "last_updated_ms": 1729900000000,
       "last_error": null
     }
@@ -861,6 +908,7 @@ curl "http://localhost:8080/v1/ingest/status?source_id=project-docs"
   "entries_ingested": 450000,
   "entries_pending": 170000,
   "entries_skipped": 1204,
+  "entries_disallowed": 0,
   "last_updated_ms": 1730000042000,
   "last_error": null
 }
@@ -893,6 +941,17 @@ can index, is passed over without being counted, on the first crawl and on every
 unchanged root reads the same number after either. The
 other counts on this response belong to the run that wrote them; a reindex reports its own
 progress through `GET /v1/reindex/status`.
+
+`entries_disallowed` is how many pages a web crawl left alone because the site's `robots.txt`
+disallows them: the links it met and did not follow, and the pages whose redirect led onto a
+disallowed URL. It is a separate count, not part of `entries_skipped`, because the two mean
+different things. A skipped file is not text. A disallowed page is one the site asked to be left
+out, and only the site's owner, or a registration with `respect_robots_txt: false`, can change
+that. It is not an error and is not in `last_error`.
+
+Like `entries_skipped`, it is rewritten by every run, re-crawls included, and it is always 0 for a
+filesystem source. A `robots.txt` the site cannot serve is a different case, reported through
+`last_error`: see [robots.txt](#robotstxt).
 
 **Response — `404 Not Found`** (unknown source)
 
@@ -3151,6 +3210,10 @@ static List<QueryResultItem> ingestAndQuery(Path dataDir, String embeddingEndpoi
 
                     @Override
                     public void setSkipped(long skipped) {
+                    }
+
+                    @Override
+                    public void setDisallowed(long disallowed) {
                     }
 
                     @Override
