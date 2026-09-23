@@ -465,6 +465,55 @@ class GraphErasureEndpointTest {
         }
 
         @Test
+        @DisplayName("a name looked up in a namespace that does not exist is a 404 that creates "
+            + "nothing")
+        void aNameInAnAbsentNamespaceCreatesNothing() throws IOException {
+            // The namespace comes from a header. Creating it to find out it holds nobody by that
+            // name would let any caller write a directory and claim an open slot per name it
+            // chose, with no obligation recorded to show for either.
+            Response response = call("POST",
+                "{\"scope\": \"entity\", \"entity_name\": \"Ada Quazzlethorpe\"}", "tenant-new");
+
+            assertThat(response.status()).isEqualTo(404);
+            assertThat(NamespaceId.of("tenant-new").directoryUnder(root))
+                .as("no directory for a namespace nothing was recorded against")
+                .doesNotExist();
+            assertThat(tenants.openNamespaces()).doesNotContain(NamespaceId.of("tenant-new"));
+        }
+
+        @Test
+        @DisplayName("a name missing from an absent namespace is answered exactly as one missing "
+            + "from a namespace that exists")
+        void anAbsentNamespaceIsIndistinguishable() throws IOException {
+            call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}", "tenant-real");
+
+            Response real = call("POST",
+                "{\"scope\": \"entity\", \"entity_name\": \"Nobody\"}", "tenant-real");
+            Response absent = call("POST",
+                "{\"scope\": \"entity\", \"entity_name\": \"Nobody\"}", "tenant-absent");
+
+            assertThat(absent)
+                .as("a different answer would say which namespaces other tenants have")
+                .isEqualTo(real);
+        }
+
+        @Test
+        @DisplayName("a name that resolves in an existing namespace records the obligation there")
+        void aNameInAnExistingNamespaceIsRecorded() throws IOException {
+            call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}", "tenant-c");
+            try (var lease = tenants.borrow(NamespaceId.of("tenant-c"))) {
+                lease.resource().staging().entityIdOf("Ada Quazzlethorpe");
+                lease.resource().staging().flush();
+            }
+
+            Response response = call("POST",
+                "{\"scope\": \"entity\", \"entity_name\": \"Ada Quazzlethorpe\"}", "tenant-c");
+
+            assertThat(response.status()).isEqualTo(202);
+            assertThat(Json.at(response.json(), "outstanding")).isEqualTo(2L);
+        }
+
+        @Test
         @DisplayName("an unusable namespace is refused rather than silently shared")
         void invalidNamespaceIsRefused() throws IOException {
             Response response = call("POST", "{\"scope\": \"entity\", \"entity_id\": 1}",
@@ -499,9 +548,9 @@ class GraphErasureEndpointTest {
         @Test
         @DisplayName("an entity named rather than numbered is erased from the served graph")
         void aNamedEntityIsErased() throws IOException {
-            // The id is internal and nothing hands one out, so requiring it meant "erase
-            // everything about this person" could only be asked by somebody who had already
-            // seen them in an answer and read the id out of its free text.
+            // The id is internal and a graph answer does not carry it, so requiring it meant
+            // "erase everything about this person" could ordinarily only be asked by somebody
+            // who had been handed one where a name was ambiguous.
             Path directory = tenants.shared().directory();
             buildSharedGraph();
             assertThat(anyFileContains(directory, NAME_TERM)).isTrue();

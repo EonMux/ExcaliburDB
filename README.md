@@ -2109,13 +2109,20 @@ ext=v1}`, and that `N` is the one to send. To withdraw a document from the corpu
 once, use `POST /v1/erasure` with its `source_id` and `document_id` instead — it removes the chunks
 and submits this graph obligation for you, so nobody has to compute the hash.
 
-An entity id is internal and nothing this node serves hands one out, so `entity_name` is how
-"erase everything about this person" is actually asked. It is matched exactly, ignoring case and
-surrounding space, against the served entity dictionary and the staged labels it is built from -
-never against the `labels` index, whose whole value at query time is that "Lovelace" finds "Ada
-Lovelace" and whose whole danger here is the same thing. A name no entity has is a `404`; a name
-two entities share is a `409` listing their ids, so the caller repeats the request with the
-`entity_id` of the one they meant.
+An entity id is internal, and a graph answer does not carry one: its `answer` and `context` name
+entities by label. The node hands an id out in exactly two places, both where a name alone is not
+enough to say which entity is meant — a `needs_input` candidate for a name several entities share
+(`Ada #12`), and the `409` below. So `entity_name` is how "erase everything about this person" is
+ordinarily asked. It is matched exactly, ignoring case and surrounding space, against the served
+entity dictionary and the staged labels it is built from - never against the `labels` index, whose
+whole value at query time is that "Lovelace" finds "Ada Lovelace" and whose whole danger here is
+the same thing. A name no entity has is a `404`; a name two entities share is a `409` listing their
+ids in `candidates`, so the caller repeats the request with the `entity_id` of the one they meant.
+Resolving a name never creates the namespace it is looked up in: a namespace that does not exist
+holds nobody, so the answer is the same `404` a namespace that exists would give, and nothing is
+written. A request that records an obligation — a resolved name, an `entity_id`, a source or an
+extractor version — creates the namespace if it is new, which is how an erasure can be recorded
+against a tenant before its first build.
 
 The compaction rewrites the staged facts as well as the served store. Erasing only the store would
 leave every erased fact in the staging log, where the next `POST /v1/graph/build` would replay it
