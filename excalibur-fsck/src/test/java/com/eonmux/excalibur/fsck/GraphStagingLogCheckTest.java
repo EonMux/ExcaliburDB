@@ -245,6 +245,117 @@ class GraphStagingLogCheckTest {
         assertThat(result.detail()).contains("6 bytes").contains("0 erasure requests");
     }
 
+    @ParameterizedTest(name = "{0} whose header write was cut short is unsealed: the node starts "
+        + "it anew")
+    @ValueSource(strings = {
+        GraphStagingStore.ENTITY_LABELS,
+        GraphStagingStore.RELATION_LABELS,
+        GraphStagingStore.TRIPLE_LOG,
+        GraphStagingStore.ENTITY_TEXT_LOG
+    })
+    void aTornHeaderIsUnsealed(String name) throws IOException {
+        // A namespace whose staging holds nothing yet, so no id is held that a fresh interner
+        // would hand out again.
+        staging = dataDir.resolve("fresh/graph-staging/");
+        Files.createDirectories(staging);
+        Path file = staging.resolve(name);
+        byte[] header = Files.readAllBytes(dataDir.resolve(STAGING).resolve(name));
+        Files.write(file, java.util.Arrays.copyOf(header, 11));
+
+        FileCheck result = GraphStagingCheck.check(file, "fresh/graph-staging/" + name);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.UNSEALED);
+        assertThat(result.detail()).contains("11 bytes").contains("starts it afresh");
+        assertThat(result.isDamage()).isFalse();
+    }
+
+    @ParameterizedTest(name = "{0} shorter than its header and not the start of one is corrupt")
+    @ValueSource(strings = {
+        GraphStagingStore.ENTITY_LABELS,
+        GraphStagingStore.TRIPLE_LOG,
+        GraphStagingStore.ENTITY_TEXT_LOG,
+        GraphStagingCheck.ERASURE_LOG
+    })
+    void shortJunkIsCorrupt(String name) throws IOException {
+        Path file = staging.resolve(name);
+        Files.write(file, "not a log".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+
+        FileCheck result = check(name);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.needsOperator()).isTrue();
+    }
+
+    @Test
+    @DisplayName("a damaged last label a staged fact refers to is corrupt: the node will not "
+        + "hand its id out again")
+    void aDamagedLastLabelAFactHoldsIsCorrupt() throws IOException {
+        Path file = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+        flip(file, Files.size(file) - Integer.BYTES - 1);
+        String before = fingerprint(file);
+
+        FileCheck result = check(GraphStagingStore.ENTITY_LABELS);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.needsOperator()).isTrue();
+        assertThat(result.detail()).contains("id 3 is held by").contains(GraphStagingStore.TRIPLE_LOG);
+        assertThat(fingerprint(file)).isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("a damaged last label only the published graph refers to is corrupt")
+    void aDamagedLastLabelThePublishedGraphHoldsIsCorrupt() throws IOException {
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            store.entityIdOf("Carol");
+            com.eonmux.excalibur.graph.staging.GraphBuilder.build(store,
+                dataDir.resolve("shared/graph"));
+        }
+        Path file = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+        flip(file, Files.size(file) - Integer.BYTES - 1);
+
+        FileCheck result = check(GraphStagingStore.ENTITY_LABELS);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.detail()).contains("published graph").contains("id 4 is held by");
+    }
+
+    @Test
+    @DisplayName("a damaged last label an outstanding erasure refers to is corrupt")
+    void aDamagedLastLabelAnErasureHoldsIsCorrupt() throws IOException {
+        int carol;
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            carol = store.entityIdOf("Carol");
+        }
+        try (ErasureLog log = ErasureLog.open(staging.resolve(GraphStagingCheck.ERASURE_LOG))) {
+            log.submit(new ErasureScope.Entity(carol), Instant.EPOCH);
+        }
+        Path file = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+        flip(file, Files.size(file) - Integer.BYTES - 1);
+
+        FileCheck result = check(GraphStagingStore.ENTITY_LABELS);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.CORRUPT);
+        assertThat(result.detail()).contains("outstanding erasure request");
+    }
+
+    @Test
+    @DisplayName("a damaged last label nothing refers to is unsealed, as the node trims it")
+    void aDamagedLastLabelNothingHoldsIsUnsealed() throws IOException {
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            store.entityIdOf("Carol");
+        }
+        Path file = staging.resolve(GraphStagingStore.ENTITY_LABELS);
+        flip(file, Files.size(file) - Integer.BYTES - 1);
+
+        FileCheck result = check(GraphStagingStore.ENTITY_LABELS);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.UNSEALED);
+        assertThat(result.detail()).contains("keeping the 4 labels");
+        try (GraphStagingStore store = GraphStagingStore.open(staging)) {
+            assertThat(store.entityCount()).isEqualTo(4);
+        }
+    }
+
     @ParameterizedTest(name = "{0} at a version this build does not read is unreadable")
     @ValueSource(strings = {
         GraphStagingStore.ENTITY_LABELS,
