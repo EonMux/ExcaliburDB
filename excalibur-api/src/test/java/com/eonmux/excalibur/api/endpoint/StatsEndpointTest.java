@@ -444,7 +444,7 @@ class StatsEndpointTest {
         }
 
         @Test
-        @DisplayName("reports that a full membership filter has stopped pruning")
+        @DisplayName("reports that a full membership filter can no longer speak for segments")
         void reportsFilterSaturation() throws IOException {
             // Saturation turns the pre-filter off rather than turning queries wrong, so it is
             // invisible in the results: the node just gets slower. Nothing else in this

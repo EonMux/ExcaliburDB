@@ -550,9 +550,9 @@ class DocumentReindexerTest {
          * <p>The filter holds one entry per <em>term</em>, never a chunk id, and a Cuckoo delete
          * clears the first slot whose fingerprint matches without comparing keys. Deleting a
          * chunk id therefore evicts whichever term collides with it, and the query pipeline
-         * treats a filter negative as ground truth - it would prune the segment for that term
-         * permanently, for every document. A surviving entry is only a false positive, which
-         * costs one scan that finds nothing.</p>
+         * trusts a covered level's negative as ground truth - it would search the segment last
+         * for that term, for every document, until its level is next rebuilt. A surviving entry is
+         * only a false positive, which at worst moves a segment ahead of others.</p>
          */
         @Test
         @DisplayName("Should leave the term filter untouched when a document changes")

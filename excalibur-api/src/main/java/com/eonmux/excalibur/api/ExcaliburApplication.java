@@ -136,7 +136,8 @@ public final class ExcaliburApplication {
 
     /**
      * Hierarchical Cuckoo filter for corpus → segment membership testing.
-     * Shared between ingestion (inserts) and maintenance worker (deletions).
+     * Shared between ingestion (inserts), the maintenance worker (deletions) and the query
+     * pipeline, which searches the segments holding a query's terms first.
      */
     private final HierarchicalCuckooFilter hierarchicalFilter;
 
@@ -819,6 +820,7 @@ public final class ExcaliburApplication {
      * <ul>
      *   <li>Ingestion pipeline - inserts entries during document ingestion</li>
      *   <li>CuckooMaintenanceWorker - propagates deletions through the hierarchy</li>
+     *   <li>Query pipeline - orders a query's segments, those holding its terms first</li>
      * </ul>
      *
      * <p>Use this to pass the same filter instance to ingestion components,

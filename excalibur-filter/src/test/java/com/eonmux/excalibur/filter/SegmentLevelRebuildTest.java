@@ -14,8 +14,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * Refilling a segment's level from the segment, and the coverage it withholds meanwhile.
  *
  * <p>A level filled only by writes stops describing its segment when entries arrive another way -
- * a split, a restart, a compaction. Stage 1 prunes on {@code coversSegment}, so between the moment
- * a level stops describing its segment and the moment it has been refilled, it must not claim to.</p>
+ * a split, a restart, a compaction. Stage 1 orders on {@code coversSegment}, trusting a level
+ * that claims coverage to speak for its segment, so between the moment a level stops describing
+ * its segment and the moment it has been refilled, it must not claim to.</p>
  */
 @DisplayName("Segment level rebuild")
 class SegmentLevelRebuildTest {

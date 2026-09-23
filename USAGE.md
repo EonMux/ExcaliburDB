@@ -2438,13 +2438,14 @@ corpus having moved under an entry, which no size would have helped. A node with
 same question comes back, and the cache is not the right tool for it.
 
 The other four `cuckoo` figures describe the per-segment membership filters that stage 3 of a
-query prunes with:
+query orders segments by, searching the segments that hold the question's terms first. Every
+segment is still searched: a question's nearest vectors need not share its words.
 
 - `avgFpRate` and `maxFpRate` are the mean and the worst estimated false-positive rate across the
   segment filters holding anything, computed from their current load when the request is served.
   They are printed as exact decimals rather than in exponent notation; `0` means no filter holds a
   term yet. A rising `maxFpRate` is one segment's filter filling up, and a false positive only
-  costs a search of a segment that turns out not to match.
+  moves a segment that holds none of the question's terms ahead of others.
 - `pendingDeletions` is the number of filter entries (one per distinct term a segment was filed
   under) still held for segments that have been tombstoned, and `totalDeletions` how many such
   entries have been removed since the process started. The maintenance worker removes them in
@@ -2453,9 +2454,10 @@ query prunes with:
 
 `cuckoo.saturated` is the membership filter having run out of room at the corpus level, and
 `saturatedSegments` counts the segments whose own filter did. Neither changes an answer: a level
-that has refused a term is no longer trusted to rule a segment out, so its scope is searched in
-full instead of being pruned. What they cost is latency, and nothing else in this response would
-show it. Raise `excalibur.filter.corpus-capacity` and restart.
+that has refused a term is no longer trusted to say what its segment lacks, so its scope is
+ordered by the segments' term sketches alone. What they cost is the ordering, which matters to a
+query that runs out of time, and nothing else in this response would show it. Raise
+`excalibur.filter.corpus-capacity` and restart.
 
 The `lexical` block is present only when this node keeps a chunk index; an absent block and an index
 reporting zeroes are different states. Within it:
@@ -2993,7 +2995,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | `excalibur_query_unnamed_results_dropped_total` rose, or query answers are `degraded` at full coverage with a WARN naming segments whose results "carry no document identity" | Those segments' `.docmap` is missing or damaged, so their graph nodes name no document and cannot be returned | Run `excalibur-fsck` with the node stopped to confirm which mapping is damaged. Nothing rebuilds a mapping in place, and a compaction only re-keys the one it finds: restore the graph and its mapping together from an `excalibur-backup` image, or reindex the sources whose documents that segment holds |
 | `lexical.unreadableSegments` is above zero, or `excalibur_lexical_unreadable_segments` is | A lexical segment failed its checksum or lost a file, so its chunks (`unsearchableChunks`) match no keyword query. The node's log names it at `ERROR` as it opens, with the reason | If `lexical.unreadable` says `rebuildable: true`, nothing: the next compaction rebuilds it, and `segments_rebuilt` on `/v1/compact/status` reports it. Otherwise its key table is damaged too — check the disk, and reindex the documents of the sources it served |
 | A re-crawled document appears twice in results | Not the chunk index — it replaces a chunk identifier rather than appending. Check whether the source is listing one document under two ids | Compare the `document_id` values on the two hits — that is the chunk identifier, `source:document:chunk:N`: identical means a bug, different means the source |
-| Queries slow down on a large corpus, and `/v1/stats` reports `cuckoo.saturated: true` | The membership filter is full. A level that cannot record a term is no longer trusted to rule a segment out, so pruning is off and every query scans every segment | Raise `excalibur.filter.corpus-capacity` past your term count and restart |
+| `/v1/stats` reports `cuckoo.saturated: true` | The membership filter is full. A level that cannot record a term is no longer trusted to say what its segment lacks, so queries order segments by their term sketches alone. Answers are unaffected; a query that runs out of time may have spent it on less likely segments first | Raise `excalibur.filter.corpus-capacity` past your term count and restart |
 | Node refuses to start: `Refusing to create segment N in <dir>: <other dir> already holds segment_N.dat` | Two volumes hold a file for the same segment index, usually from a volume set that changed between runs on an older build | Move or delete the stale copy — the one whose directory the catalog does not name — then restart |
 | Node refuses to start naming two `excalibur.shard.volumes` entries that resolve to one directory | A symlink, a relative path or a `..` in the list makes two entries the same directory, which would give it two shares of the ring | Drop one of the two spellings |
 | Node fails to start with `CatalogLoadException` | `<data dir>/source-catalog` was written by a build older than the end marker, or was cut short by a crash | [Upgrading a data directory](#upgrading-a-data-directory-written-by-an-older-build) — append the marker, or delete the file and re-register the sources |
@@ -3289,7 +3291,8 @@ What each piece is for:
 - **`QueryPipeline`** is built over the same engine and clock, and the document tracker's adapter,
   which hides a document until all of its chunks are published. This 5-argument constructor is
   the plain pipeline; the wider constructors add what the server adds on top — LLM relevancy
-  scoring and its coverage threshold, the hierarchical Cuckoo filter for segment pruning, the
+  scoring and its coverage threshold, the hierarchical Cuckoo filter that orders segments by the
+  question's terms, the
   epoch isolation validator and product-quantisation settings — and `withLlmScorer` adds the
   scorer to a pipeline already built.
 

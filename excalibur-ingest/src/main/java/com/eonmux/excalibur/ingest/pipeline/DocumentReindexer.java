@@ -150,7 +150,7 @@ public class DocumentReindexer {
          * <p>The same contract as
          * {@link OffsetAwareStorageWriter#writeChunk(String, String, List, float[])}: a writer
          * over a segmented store reports the segment the chunk landed in, so its terms can be
-         * filed there for pruning. The default is for writers that route by no segment, and
+         * filed there in the membership filter. The default is for writers that route by no segment, and
          * reports none.</p>
          *
          * @param chunkId   Unique chunk identifier
@@ -339,13 +339,13 @@ public class DocumentReindexer {
     }
 
     /**
-     * Points this reindexer at the membership filter the query pipeline prunes segments with.
+     * Points this reindexer at the membership filter the query pipeline orders segments by.
      *
      * <p>A reindex writes chunks exactly as a first ingest does, and once a segment's level is
-     * trusted the query pipeline rules the segment out for any term the level does not name. So
-     * every chunk written here has its terms filed under the segment its write landed in, as it
-     * is written; a reindexed-in term missing from that level would hide the chunk from every
-     * query for it until the segment's next rebuild.</p>
+     * trusted the query pipeline takes it as holding no term the level does not name. So every
+     * chunk written here has its terms filed under the segment its write landed in, as it is
+     * written; a reindexed-in term missing from that level would move the segment to the back of
+     * every query for it until the segment's next rebuild.</p>
      *
      * @param membershipFilter The filter, or null to keep none
      */

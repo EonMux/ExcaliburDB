@@ -26,15 +26,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * A segment's level in the membership filter holds exactly the terms of the entries the segment
  * holds, whatever produced the segment.
  *
- * <p>Stage 1 of the query pipeline drops a segment when the filter "covers" it and none of the
- * query's terms is in its level ({@code TermFilterCascade.survivesTermFilter}). Ingestion files
+ * <p>Stage 1 of the query pipeline searches a segment last when the filter "covers" it and none
+ * of the query's terms is in its level ({@code TermFilterCascade.mayHoldQueryTerms}). Ingestion files
  * a chunk's terms under the segment the write landed in, and nothing else ever fills a level. So
  * any segment that comes to hold entries without their writes passing through ingestion - the
  * right child of a split, a segment reopened after a restart - holds terms its level never saw,
  * and the first write that lands in it makes the level non-empty, which is all "covers" asks.
- * From then on a query for anything the segment held before is answered without it: no error,
- * just missing results. Each test reproduces one way a segment gets there and asks stage 1's own
- * question for every entry.</p>
+ * From then on a query for anything the segment held before searches the segment that holds it
+ * behind every other: no error, just the wrong order, and the wrong answer for a query that runs
+ * out of time. Each test reproduces one way a segment gets there and asks stage 1's own question
+ * for every entry.</p>
  */
 @DisplayName("Segment term filter levels after split, restart and compaction")
 class SegmentTermFilterRebuildTest {
@@ -76,10 +77,10 @@ class SegmentTermFilterRebuildTest {
         Chunk fresh = ingestInto(split.rightId(), CHUNKS);
         assertThat(fresh).isNotNull();
 
-        assertEveryChunkSurvivesStageOne(inRight, split.rightId());
+        assertEveryChunkInFrontAtStageOne(inRight, split.rightId());
         awaitCovered(split.rightId());
-        assertEveryChunkSurvivesStageOne(inRight, split.rightId());
-        assertThat(survivesStageOne(fresh.term(), split.rightId())).isTrue();
+        assertEveryChunkInFrontAtStageOne(inRight, split.rightId());
+        assertThat(inFrontAtStageOne(fresh.term(), split.rightId())).isTrue();
     }
 
     @Test
@@ -95,7 +96,7 @@ class SegmentTermFilterRebuildTest {
         List<Chunk> inRight = chunksIn(chunks, right);
 
         awaitCovered(split.leftId());
-        assertEveryChunkSurvivesStageOne(inLeft, split.leftId());
+        assertEveryChunkInFrontAtStageOne(inLeft, split.leftId());
         // Terms are unique per chunk, so a term that moved right is one the left child no longer
         // holds. A cuckoo filter may still answer yes for a few by fingerprint collision; a level
         // still carrying the parent's whole vocabulary answers yes for all of them.
@@ -118,10 +119,10 @@ class SegmentTermFilterRebuildTest {
         assertThat(sameSegment).as("earlier chunks in the segment the new write landed in")
             .isNotEmpty();
 
-        assertEveryChunkSurvivesStageOne(sameSegment, fresh.segmentId());
+        assertEveryChunkInFrontAtStageOne(sameSegment, fresh.segmentId());
         awaitCovered(fresh.segmentId());
-        assertEveryChunkSurvivesStageOne(sameSegment, fresh.segmentId());
-        assertThat(survivesStageOne(fresh.term(), fresh.segmentId())).isTrue();
+        assertEveryChunkInFrontAtStageOne(sameSegment, fresh.segmentId());
+        assertThat(inFrontAtStageOne(fresh.term(), fresh.segmentId())).isTrue();
     }
 
     @Test
@@ -151,7 +152,7 @@ class SegmentTermFilterRebuildTest {
             <= Math.max(1, deleted.size() / 20) && filter.coversSegment(key(segmentId)),
             "the compacted segment's level to be rebuilt");
 
-        assertEveryChunkSurvivesStageOne(kept, segmentId);
+        assertEveryChunkInFrontAtStageOne(kept, segmentId);
     }
 
     @Test
@@ -189,7 +190,7 @@ class SegmentTermFilterRebuildTest {
 
         assertThat(orchestrator.awaitTermFilterRebuilds(20, TimeUnit.SECONDS)).isTrue();
         assertThat(filter.coversSegment(key(parentId))).isTrue();
-        assertEveryChunkSurvivesStageOne(inParent, parentId);
+        assertEveryChunkInFrontAtStageOne(inParent, parentId);
         assertThat(filter.isSegmentStale(key(rightId)))
             .as("nothing serves the right index, so nothing vouches for it")
             .isTrue();
@@ -324,26 +325,26 @@ class SegmentTermFilterRebuildTest {
     // ==================== Stage 1's question ====================
 
     /**
-     * Whether stage 1 keeps a segment for a query consisting of one term.
+     * Whether stage 1 keeps a segment among those searched first, for a query of one term.
      *
-     * <p>The rule of {@code TermFilterCascade.survivesTermFilter}: the segment is searched when
-     * the filter names it for the term, or when the filter does not cover it.</p>
+     * <p>The rule of {@code TermFilterCascade.mayHoldQueryTerms}: the segment stays in front
+     * when the filter names it for the term, or when the filter does not cover it.</p>
      */
-    private boolean survivesStageOne(String term, long segmentId) {
+    private boolean inFrontAtStageOne(String term, long segmentId) {
         String segment = key(segmentId);
         return filter.findCandidateSegments(term.getBytes(StandardCharsets.UTF_8)).contains(segment)
             || !filter.coversSegment(segment);
     }
 
-    private void assertEveryChunkSurvivesStageOne(List<Chunk> chunks, long segmentId) {
-        List<String> pruned = new ArrayList<>();
+    private void assertEveryChunkInFrontAtStageOne(List<Chunk> chunks, long segmentId) {
+        List<String> movedBack = new ArrayList<>();
         for (Chunk chunk : chunks) {
-            if (!survivesStageOne(chunk.term(), segmentId)) {
-                pruned.add(chunk.term());
+            if (!inFrontAtStageOne(chunk.term(), segmentId)) {
+                movedBack.add(chunk.term());
             }
         }
-        assertThat(pruned)
-            .as("terms held by segment %s for which stage 1 would drop it", segmentId)
+        assertThat(movedBack)
+            .as("terms held by segment %s for which stage 1 would search it last", segmentId)
             .isEmpty();
     }
 

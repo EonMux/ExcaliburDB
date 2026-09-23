@@ -566,8 +566,8 @@ class CuckooFilterTest {
             // cancelled the doubling: capacity 1000 got 256 buckets, 1024 slots, and the filter
             // sat at 98% full at its own documented capacity. A cuckoo insert gives up after a
             // bounded displacement chain, so that is where inserts start being refused - and a
-            // filter that has refused a term stops being trusted to rule a segment out, which
-            // turns pruning off for the whole node.
+            // filter that has refused a term stops being trusted to speak for any segment,
+            // which turns term-based search ordering off for the whole node.
             int capacity = 1000;
             CuckooFilter filter = CuckooFilter.create(capacity);
 

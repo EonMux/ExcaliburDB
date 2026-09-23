@@ -29,10 +29,10 @@ import static org.mockito.Mockito.when;
  * A reindex, wired as the node wires it, over a real storage engine whose segments' levels in
  * the membership filter are trusted.
  *
- * <p>Stage 1 of the query pipeline rules a segment out when its level is trusted and names none
- * of the query's terms. The reindexer used to file every chunk's terms under segment "0",
+ * <p>Stage 1 of the query pipeline searches a segment last when its level is trusted and names
+ * none of the query's terms. The reindexer used to file every chunk's terms under segment "0",
  * whichever segment the engine routed the chunk to, so a query for a term a reindex brought in
- * skipped the segment that held it until that segment was next rebuilt.</p>
+ * searched the segment that held it last until that segment was next rebuilt.</p>
  */
 @DisplayName("Reindex term filing, end to end")
 class ReindexTermFilingIntegrationTest {
@@ -43,7 +43,7 @@ class ReindexTermFilingIntegrationTest {
     Path tempDir;
 
     @Test
-    @DisplayName("a term a reindex brings in is not pruned from the trusted segment holding it")
+    @DisplayName("a term a reindex brings in is not searched last in the trusted segment holding it")
     void aReindexedTermIsNotPruned() throws Exception {
         Path dataDir = Files.createDirectories(tempDir.resolve("data"));
         try (Arena arena = Arena.ofShared();
@@ -60,7 +60,7 @@ class ReindexTermFilingIntegrationTest {
 
             HierarchicalCuckooFilter filter = new HierarchicalCuckooFilter(100_000);
             trust(filter, slot, "harbour");
-            assertThat(pruned(filter, "zeppelin", slot))
+            assertThat(searchedLast(filter, "zeppelin", slot))
                 .as("the segment is trusted, and does not hold the term yet").isTrue();
 
             IndexOrchestrator orchestrator = mock(IndexOrchestrator.class);
@@ -78,10 +78,10 @@ class ReindexTermFilingIntegrationTest {
             assertThat(result.getSuccessfulChunks()).isEqualTo(1);
             assertThat(engine.getSegment(slot).get(chunkKey))
                 .as("the chunk is in the segment its key routes to").isNotNull();
-            assertThat(pruned(filter, "zeppelin", slot))
+            assertThat(searchedLast(filter, "zeppelin", slot))
                 .as("a query for the reindexed term reads the segment that holds it").isFalse();
             assertThat(filter.coversSegment(String.valueOf(slot)))
-                .as("and the segment stays trusted, so pruning still works for it").isTrue();
+                .as("and the segment stays trusted, so the filter still speaks for it").isTrue();
             for (long other : engine.getSegments().keySet()) {
                 if (other != slot && filter.getSegmentFilter(String.valueOf(other)) != null) {
                     assertThat(filter.mightContainInSegment(key("zeppelin"),
@@ -105,8 +105,9 @@ class ReindexTermFilingIntegrationTest {
         assertThat(filter.completeSegmentRebuild(key, generation)).isTrue();
     }
 
-    /** Whether stage 1 would rule the segment out for the term. */
-    private static boolean pruned(HierarchicalCuckooFilter filter, String term, long segmentId) {
+    /** Whether stage 1 would search the segment last for the term. */
+    private static boolean searchedLast(
+            HierarchicalCuckooFilter filter, String term, long segmentId) {
         String key = String.valueOf(segmentId);
         return filter.coversSegment(key)
             && !filter.mightContainInSegment(term.getBytes(StandardCharsets.UTF_8), key);

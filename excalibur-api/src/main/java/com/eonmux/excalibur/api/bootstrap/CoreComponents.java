@@ -236,9 +236,9 @@ public record CoreComponents(Arena arena,
     /**
      * Creates the hierarchical Cuckoo filter for corpus → segment membership.
      *
-     * <p>The hierarchical filter enables efficient segment pruning during queries
-     * and proper deletion propagation through all filter levels when documents
-     * are tombstoned.</p>
+     * <p>The hierarchical filter tells a query which segments hold its terms, so they are
+     * searched first, and propagates deletions through all filter levels when segments are
+     * tombstoned.</p>
      *
      * <h3>Domain Constraints</h3>
      * <ul>
@@ -295,9 +295,9 @@ public record CoreComponents(Arena arena,
      *
      * <p>Separate from the corpus capacity because the two answer different questions: the
      * corpus level holds every term on the node, a segment level holds one segment's
-     * vocabulary. A segment that outgrows its level keeps answering correctly and stops being
-     * pruned, which shows up as {@code cuckoo.saturatedSegments} on {@code /v1/stats} and as
-     * latency. This is the knob that responds to it.</p>
+     * vocabulary. A segment that outgrows its level keeps answering correctly and is no longer
+     * ordered by its terms, which shows up as {@code cuckoo.saturatedSegments} on
+     * {@code /v1/stats}. This is the knob that responds to it.</p>
      *
      * @param config The application configuration
      * @return The configured capacity, or {@link #DEFAULT_SEGMENT_CAPACITY}
@@ -481,9 +481,9 @@ public record CoreComponents(Arena arena,
      * Registers every segment opened at startup with the IndexOrchestrator.
      *
      * <p>Registration is what schedules a segment's refill in the term membership filter, and
-     * a level no refill has vouched for is never trusted to rule its segment out of a query. A
-     * segment left unregistered here would stay searched in full until something else happened
-     * to register it, and would be integrated into no graph, compacted by nobody and invisible
+     * a level no refill has vouched for is never trusted to say what its segment lacks. A
+     * segment left unregistered here would go unordered by its terms until something else
+     * happened to register it, and would be integrated into no graph, compacted by nobody and invisible
      * to epoch-based visibility for the same time. So every segment is registered, as the
      * orchestrator's own reconciliation with the directory does; one without an HNSW graph or
      * tail tracker is registered with none, and the HNSW workers are simply not told of it.</p>

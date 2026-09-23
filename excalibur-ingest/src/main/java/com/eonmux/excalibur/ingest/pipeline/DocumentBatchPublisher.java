@@ -42,7 +42,7 @@ import java.util.concurrent.locks.Lock;
  * </ol>
  *
  * <h2>What this does not file</h2>
- * <p>The per-segment membership filter the query pipeline prunes segments with is not written
+ * <p>The per-segment membership filter the query pipeline orders segments by is not written
  * here. A document's chunks are routed by key across the storage engine's segments, so no one
  * segment id describes a batch; each chunk's terms are filed under the segment its own write
  * landed in, as it is written, by the writer's caller - see {@link DocumentReindexStep}. The

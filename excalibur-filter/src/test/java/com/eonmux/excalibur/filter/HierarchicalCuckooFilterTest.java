@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *   <li>Deletion from hierarchy removes from both levels (segment, corpus)</li>
  *   <li>No stale false positives after deletion</li>
  *   <li>Segment registration creates one filter per segment, and nothing between them</li>
- *   <li>Candidate segment search prunes using hierarchy</li>
+ *   <li>Candidate segment search orders using hierarchy</li>
  * </ul>
  */
 class HierarchicalCuckooFilterTest {
@@ -512,8 +512,8 @@ class HierarchicalCuckooFilterTest {
         @DisplayName("a segment rebuilt from scratch is trusted again")
         void aRebuiltSegmentIsTrustedAgain() {
             // A split replaces a segment with children, and a reindex re-registers one. The new
-            // filter has refused nothing, so carrying the old mark would disable pruning for a
-            // segment id forever.
+            // filter has refused nothing, so carrying the old mark would leave the level silent
+            // about that segment id forever.
             HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(1_000_000, 13, 8);
             small.registerSegment(SEGMENT_1);
             assertThat(fillUntilRefused(small, SEGMENT_1, 4096)).isNotNegative();
@@ -601,7 +601,7 @@ class HierarchicalCuckooFilterTest {
         void aCollisionSurvivesTheOtherTermsDelete() {
             // The corpus level stores a fingerprint once. Two different terms that land on the
             // same fingerprint and buckets there share that entry, so deleting it for one would
-            // leave the other denied at the corpus level and its segment pruned.
+            // leave the other denied at the corpus level and its segment searched last.
             HierarchicalCuckooFilter small = new HierarchicalCuckooFilter(8, 8, 8);
             small.registerSegment(SEGMENT_1);
             small.registerSegment(SEGMENT_2);

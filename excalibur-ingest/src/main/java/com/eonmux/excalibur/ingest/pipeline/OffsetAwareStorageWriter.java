@@ -67,7 +67,7 @@ public interface OffsetAwareStorageWriter {
      * one it picked.</p>
      *
      * <p>The default is for writers that route by no segment: the terms are ignored and the
-     * placement carries no segment, so nothing is filed for pruning.</p>
+     * placement carries no segment, so nothing is filed in the membership filter.</p>
      *
      * @param chunkId   Unique chunk identifier
      * @param content   Chunk text content

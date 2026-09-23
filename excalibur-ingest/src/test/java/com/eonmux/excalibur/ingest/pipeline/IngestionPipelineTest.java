@@ -399,11 +399,12 @@ class IngestionPipelineTest {
         }
 
         @Test
-        @DisplayName("a crawled chunk's terms reach the membership filter, which prunes only once rebuilt")
+        @DisplayName("a crawled chunk's terms reach the membership filter, trusted only once rebuilt")
         void crawledTermsPopulateTheMembershipFilter() {
-            // Stage 1 of the query pipeline prunes segments that cannot hold a query's terms.
-            // It was fed only by the reindex path, which targets a segment it chose itself, so
-            // a node that ingested and never reindexed ran every query against every segment.
+            // Stage 1 of the query pipeline orders segments by whether a trusted level names a
+            // query's terms. It was fed only by the reindex path, which targets a segment it
+            // chose itself, so a node that ingested and never reindexed had no trusted level to
+            // order by, and searched every segment in sketch order alone.
             com.eonmux.excalibur.filter.HierarchicalCuckooFilter membership =
                 new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(1_000_000);
             IngestionOrchestrator orchestrator = orchestrator();
@@ -430,7 +431,7 @@ class IngestionPipelineTest {
             // for it, so until one has, the segment is searched for every query.
             assertThat(membership.isSegmentStale(segment)).isTrue();
             assertThat(membership.coversSegment(segment))
-                .as("ingest alone must not make the segment prunable")
+                .as("ingest alone must not make the segment trusted")
                 .isFalse();
 
             // The refill a rebuild performs: every entry the segment holds, read back from
@@ -445,7 +446,7 @@ class IngestionPipelineTest {
             assertThat(membership.completeSegmentRebuild(segment, generation)).isTrue();
 
             assertThat(membership.coversSegment(segment))
-                .as("a completed rebuild is what makes the segment prunable")
+                .as("a completed rebuild is what makes the segment trusted")
                 .isTrue();
             assertThat(membership.findCandidateSegments(
                 "lovelace".getBytes(StandardCharsets.UTF_8))).containsExactly(segment);
@@ -455,8 +456,8 @@ class IngestionPipelineTest {
         @DisplayName("the frequency sketch and the membership filter are given the same terms")
         void theSketchAndTheFilterSeeTheSameTerms() {
             // Both are fed from the one tokenisation of each chunk. Were they tokenised apart,
-            // a change to either would let pruning and query ordering disagree about what a
-            // segment holds.
+            // a change to either would let the sketch and the filter disagree about what a
+            // segment holds, and the query ordering each feeds would no longer agree.
             com.eonmux.excalibur.filter.HierarchicalCuckooFilter membership =
                 new com.eonmux.excalibur.filter.HierarchicalCuckooFilter(1_000_000);
             IngestionOrchestrator orchestrator = orchestrator();

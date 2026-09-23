@@ -303,9 +303,9 @@ public record IngestionWiring(Config config,
     /**
      * Gives the new orchestrator the two things it cannot discover for itself.
      *
-     * <p>Stage 1 of the query pipeline prunes on the membership filter, and without this only the
-     * reindex path fills it - so a node that crawled its corpus once read every segment on every
-     * query. The vector eraser is the rollback counterpart: an ingestion that is rolled back
+     * <p>Stage 1 of the query pipeline orders segments by the membership filter, and without this
+     * only the reindex path fills it - so a node that crawled its corpus once had no term to order
+     * any query by. The vector eraser is the rollback counterpart: an ingestion that is rolled back
      * deletes the chunks it wrote, and without it the graph nodes built from them stay behind and
      * a vector query keeps returning a name and a distance for content that is no longer there.
      * </p>

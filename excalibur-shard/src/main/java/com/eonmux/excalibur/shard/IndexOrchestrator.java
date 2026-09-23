@@ -1204,7 +1204,7 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *
      * <p>Each child holds a share of its parent's entries that no write ever filed under it. The
      * right child's first write would otherwise leave its level non-empty and missing everything
-     * it inherited, and stage 1 of the query pipeline would rule it out for those terms from
+     * it inherited, and stage 1 of the query pipeline would search it last for those terms from
      * then until something noticed - a window that opens the moment routing reaches the child,
      * before {@link #onSplitComplete} is called. The rebuilds that clear these marks are queued
      * when the children are registered.</p>
@@ -1238,9 +1238,9 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
     /**
      * Waits until every queued refill of a segment's term filter level has finished.
      *
-     * <p>A segment whose level is being refilled is searched in full, so nothing waits on this
-     * for correctness. It is for callers that want the pruning back before they measure - a
-     * benchmark after bootstrap, or a test.</p>
+     * <p>A segment whose level is being refilled is one the filter says nothing about, so
+     * nothing waits on this for correctness. It is for callers that want the filter's ordering
+     * back before they measure - a benchmark after bootstrap, or a test.</p>
      *
      * @param timeout How long to wait
      * @param unit    The unit of the timeout
@@ -1397,8 +1397,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *
      * <p><strong>CRITICAL:</strong> This method also registers all existing segments
      * with the new filter. This ensures that segments registered before the filter
-     * was configured are properly included in the hierarchical filter cascade for
-     * Stage 1 query pruning.</p>
+     * was configured are properly included in the hierarchical filter cascade that
+     * Stage 1 of a query orders segments by.</p>
      *
      * @param filter The hierarchical Cuckoo filter (may be null)
      */
@@ -1413,7 +1413,8 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      *
      * <p>The hierarchical filter is used for:</p>
      * <ul>
-     *   <li>Efficient query pruning via Stage 1 Cuckoo filter cascade</li>
+     *   <li>Ordering a query's segments, those holding its terms first, in the Stage 1
+     *       Cuckoo filter cascade</li>
      *   <li>Proper deletion propagation when segments are tombstoned</li>
      * </ul>
      *

@@ -35,20 +35,21 @@ import java.util.function.Supplier;
  * storage engine reports its write landed in, and that is the only way terms ever reach a level. Entries also reach segments without being written there: a split
  * hands each child a share of its parent's entries, a restart reopens segments whose levels a
  * fresh process has never filled, and a compaction rewrites a segment whose level still counts
- * the entries it dropped. Stage 1 of the query pipeline rules a segment out when its level is
- * non-empty and names none of the query's terms, so the first write after any of those makes the
- * level look authoritative while it misses everything the segment held before - and every query
- * for those entries silently skips the segment that holds them. The Count-Min term sketch has
+ * the entries it dropped. Stage 1 of the query pipeline searches a segment last when its level
+ * is trusted and names none of the query's terms, so the first write after any of those makes
+ * the level look authoritative while it misses everything the segment held before - and every
+ * query for those entries puts the segment that holds them behind every other. The Count-Min term sketch has
  * the same problem and solves it the same way: it is rebuilt from the live entries.</p>
  *
  * <h2>How a rebuild stays correct under writes</h2>
- * <p>The caller marks the level stale first, synchronously, so from that moment it cannot rule
- * the segment out. The rebuild then empties the level in place and reads the text of every live
+ * <p>The caller marks the level stale first, synchronously, so from that moment it says nothing
+ * about the segment. The rebuild then empties the level in place and reads the text of every live
  * entry under the segment's read lock - one consistent snapshot, taken after the emptying. A
  * write recorded before the level was emptied was stored before the snapshot, so the snapshot
  * holds it; a write stored after the snapshot is recorded after it too, into the emptied level
  * itself. A value deleted or overwritten after the snapshot leaves its terms behind, which only
- * costs the segment a search it did not need; nothing the segment holds is left out. Only the
+ * costs the segment a place ahead of others it did not need; nothing the segment holds is left
+ * out. Only the
  * rebuild that began after the latest mark may clear it, so a split or compaction that changes
  * the segment meanwhile leaves it stale for the rebuild scheduled on its behalf.</p>
  *
@@ -57,28 +58,29 @@ import java.util.function.Supplier;
  * level must hold, not when. So the read lock - which holds every writer to the segment off -
  * is kept only while the entries' text bytes are copied out, a memory copy bounded by the
  * segment's data region. Decoding, tokenising and inserting the terms, which cost far more per
- * byte, happen after it is released, while the level is still stale and so still cannot rule the
- * segment out. The walk cannot drop and retake the lock part-way instead: a write in between
+ * byte, happen after it is released, while the level is still stale and so still says nothing about
+ * the segment. The walk cannot drop and retake the lock part-way instead: a write in between
  * can move entries across the slot order, and the walk would miss them.</p>
  *
  * <h2>A damaged entry keeps the level stale</h2>
  * <p>An entry that fails verification cannot be read, so its terms cannot be filed, and a level
- * missing them would rule its segment out of queries the entry answers. The rebuild still files
- * every entry it can read - there is no reason to throw that work away - but does not vouch for
- * the level, which stays searched in full until a later rebuild reads the segment whole. The
+ * missing them would send its segment to the back of queries the entry answers. The rebuild
+ * still files every entry it can read - there is no reason to throw that work away - but does
+ * not vouch for the level, which stays silent until a later rebuild reads the segment whole. The
  * damage itself is reported where the entry is read and by an integrity check of the segment.</p>
  *
  * <h2>Why one thread, off the caller's</h2>
  * <p>A rebuild reads the whole segment, and its callers cannot wait for that: a compaction swap
  * runs holding the old segment's write lock, a split's bookkeeping runs after publication with
  * writes already arriving, and bootstrap would otherwise read every byte on the node before
- * serving. The segment is searched in full while it waits, which is slower and never wrong.
+ * serving. While it waits the filter says nothing about the segment, which costs the query only
+ * the ordering the level would have given.
  * Rebuilds run one at a time, in the order they were asked for, and each resolves the segment
  * registered under the id when it starts - so two rebuilds of one id never interleave, and the
  * last one reads the segment that is actually serving.</p>
  *
- * <p>A rebuild that fails leaves the level stale, which keeps the segment searched in full until
- * the next event that schedules one. A segment in the catalog as tombstoned is not rebuilt: no
+ * <p>A rebuild that fails leaves the level stale, which keeps the filter silent about the segment
+ * until the next event that schedules one. A segment in the catalog as tombstoned is not rebuilt: no
  * query reads it, and the maintenance worker is removing its terms.</p>
  *
  * <h2>A segment being split is not read</h2>
@@ -96,8 +98,8 @@ import java.util.function.Supplier;
  * once the parent is back in service - or once the id resolves to the child. A split that has
  * completed never puts its parent back, so a rebuild that finds one is dropped with the level
  * left stale: registering the child under the id schedules the rebuild that reads it, and until
- * then - for good, if the split's bookkeeping failed before it - the segment is searched in
- * full. Retrying there instead would keep a rebuild pending for as long as the parent stayed
+ * then - for good, if the split's bookkeeping failed before it - the filter says nothing about
+ * the segment. Retrying there instead would keep a rebuild pending for as long as the parent stayed
  * registered, and {@link #awaitIdle} waiting on it. Deferred rebuilds of one id are coalesced
  * into one retry: it resolves the id afresh and begins after every mark made meanwhile, which is
  * all the later ones would have done.</p>
@@ -199,8 +201,8 @@ final class TermFilterRebuilds implements AutoCloseable {
     /**
      * Declares a segment's level stale and queues its refill from the segment.
      *
-     * <p>Returns at once. The mark is made before this returns, so the segment is searched in
-     * full from now until the refill completes.</p>
+     * <p>Returns at once. The mark is made before this returns, so the filter says nothing about
+     * the segment from now until the refill completes.</p>
      *
      * @param segmentId The segment's id
      */
@@ -218,7 +220,7 @@ final class TermFilterRebuilds implements AutoCloseable {
         } catch (RejectedExecutionException e) {
             finished();
             LOGGER.debug("Term filter rebuild for segment {} not queued: the shard is closing; "
-                + "the segment stays searched in full", segmentId);
+                + "the level stays stale", segmentId);
         }
     }
 
@@ -368,8 +370,8 @@ final class TermFilterRebuilds implements AutoCloseable {
         try {
             snapshot = snapshot(segment);
         } catch (RuntimeException e) {
-            LOGGER.warn("Rebuilding the term filter of segment {} could not read the segment; it "
-                + "is searched in full until its next rebuild: {}", segmentId, e.toString());
+            LOGGER.warn("Rebuilding the term filter of segment {} could not read the segment; its "
+                + "level stays stale until its next rebuild: {}", segmentId, e.toString());
             return;
         }
         if (snapshot == null) {
@@ -387,15 +389,15 @@ final class TermFilterRebuilds implements AutoCloseable {
             }
         } catch (RuntimeException e) {
             LOGGER.warn("Rebuilding the term filter of segment {} stopped after {} of {} "
-                + "entries; the segment is searched in full until its next rebuild: {}",
+                + "entries; its level stays stale until its next rebuild: {}",
                 segmentId, filed, snapshot.entries(), e.toString());
             return;
         }
 
         if (snapshot.damaged() > 0) {
             LOGGER.warn("Term filter of segment {} was refilled from {} live entries, leaving out "
-                + "{} that fail verification; the segment stays searched in full rather than be "
-                + "ruled out by a level missing their terms", segmentId, snapshot.entries(),
+                + "{} that fail verification; the level stays stale rather than vouch for a "
+                + "segment while missing their terms", segmentId, snapshot.entries(),
                 snapshot.damaged());
         } else if (registered.apply(segmentId) != segment) {
             LOGGER.debug("Segment {} was replaced under its id during its term filter rebuild; "

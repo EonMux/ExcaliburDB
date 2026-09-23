@@ -30,8 +30,8 @@ import org.slf4j.LoggerFactory;
  * segments whose filter rejects a term lets a lookup skip the whole group without asking each
  * segment. Storage places documents by the hash of their key, so every segment holds a uniform
  * sample of the vocabulary and any group of segments holds nearly all of it - a group filter
- * would answer "maybe" for almost every term that the corpus filter already let through, prune
- * nothing, and cost a second corpus-sized filter to do it. It would also widen what one refused
+ * would answer "maybe" for almost every term that the corpus filter already let through, rule
+ * nothing out, and cost a second corpus-sized filter to do it. It would also widen what one refused
  * insert disables, from one segment to the whole group. A grouping level becomes worth having
  * only when placement groups related documents, and then it belongs here with the placement
  * that justifies it.</p>
@@ -66,12 +66,13 @@ import org.slf4j.LoggerFactory;
  *
  * <h2>When a level runs out of room</h2>
  * <p>A cuckoo filter refuses an insert once its buckets are exhausted, and a refused term is one
- * the filter does not hold and will answer "absent" for. A reader that prunes on that answer
- * drops documents that are sitting in storage - the one failure a membership filter must never
- * cause, and a silent one. So a level that has refused a term records it and stops claiming to
- * speak for its scope: {@link #coversSegment(String)} returns false, the caller searches the
- * segment, and pruning costs latency instead of answers. The mark is sticky until the filter is
- * rebuilt, because freeing space elsewhere does not record the term that was refused.</p>
+ * the filter does not hold and will answer "absent" for. A reader that takes that answer as the
+ * segment's lacking the term is told something false about a document sitting in storage - the
+ * one thing a membership filter must never say, and silently. So a level that has refused a term
+ * records it and stops claiming to speak for its scope: {@link #coversSegment(String)} returns
+ * false, and the reader treats the segment as one the filter knows nothing about. The mark is
+ * sticky until the filter is rebuilt, because freeing space elsewhere does not record the term
+ * that was refused.</p>
  *
  * <h2>When a level stops describing its segment</h2>
  * <p>A level is filled by the writes that reach its segment, so it describes the segment only
@@ -79,8 +80,8 @@ import org.slf4j.LoggerFactory;
  * hands each child a share of its parent's entries, a restart reopens segments whose levels this
  * process never filled, a compaction rewrites a segment without the entries its level still
  * counts. The first write to land afterwards makes the level non-empty and it would read as
- * covering the segment while missing everything the segment held before, so a reader pruning on
- * it drops documents that are in storage. The owner of the segment therefore declares the level
+ * covering the segment while missing everything the segment held before, so a reader trusting
+ * it is told the segment lacks terms it holds. The owner of the segment therefore declares the level
  * {@linkplain #markSegmentStale(String) stale} before the segment can take such a write, refills
  * it from the segment's entries between {@link #beginSegmentRebuild(String)} and
  * {@link #completeSegmentRebuild(String, long)}, and {@link #coversSegment(String)} answers
@@ -95,18 +96,18 @@ import org.slf4j.LoggerFactory;
  * {@linkplain #registerSegment(String) created here} or {@linkplain #registerSegment(String,
  * CuckooFilter) supplied by a caller} - is born stale, and only a
  * {@linkplain #completeSegmentRebuild(String, long) completed rebuild} makes it trusted. A
- * segment whose owner never schedules one is searched in full on every query: slower, never
- * wrong. Failing open instead would let the first ingested write turn a reopened segment's
- * empty level into a verdict against everything the segment held before the restart.</p>
+ * segment whose owner never schedules one is one the filter never speaks for. Failing open
+ * instead would let the first ingested write turn a reopened segment's empty level into a
+ * verdict against everything the segment held before the restart.</p>
  *
- * <h2>Asking "may this segment be pruned" across several lookups</h2>
- * <p>A reader decides to prune a segment from two answers taken at different moments: whether
+ * <h2>Asking "does this segment lack every term" across several lookups</h2>
+ * <p>A reader judges a segment from two answers taken at different moments: whether
  * the level covers the segment, and whether the level holds any of the query's terms. A rebuild
  * can complete between them - a lookup that ran against the half-refilled level misses a term
  * the segment holds, and the coverage asked afterwards says trusted. So coverage is also
  * offered as a {@linkplain #coverageStamp(String) stamp} that changes on every transition into
- * or out of trust: a reader takes it before its lookups and again after, and prunes only when
- * both are the same covering stamp, which means the level was trusted, and was the same level,
+ * or out of trust: a reader takes it before its lookups and again after, and trusts a miss only
+ * when both are the same covering stamp, which means the level was trusted, and was the same level,
  * for the whole of every lookup in between.</p>
  *
  * <p>The alternative - one read section under the hierarchy lock around the coverage read and
@@ -139,7 +140,7 @@ public class HierarchicalCuckooFilter {
 
     // Levels that have refused a term. A cuckoo filter that cannot accept an item does not hold
     // it, and every later question about that item gets "no" from a level that was never told.
-    // A reader that prunes on such an answer drops documents that are sitting in storage, so a
+    // A reader that trusts such an answer is told a segment lacks a term it holds, so a
     // level records the refusal and stops claiming to know what it holds. Sticky until the
     // filter is rebuilt: freeing space elsewhere does not record the term that was refused.
     private final Set<String> saturatedSegments;
@@ -282,7 +283,7 @@ public class HierarchicalCuckooFilter {
             return existing;
         }
         // A segment id can come back after a split or a reindex, holding a filter that has
-        // refused nothing. Carrying the old mark would disable pruning for that id forever.
+        // refused nothing. Carrying the old mark would silence the level for that id forever.
         saturatedSegments.remove(segmentId);
         CuckooFilter created =
             CuckooFilter.create(segmentCapacity, fingerprintBits, corpusFilter.seed());
@@ -411,8 +412,9 @@ public class HierarchicalCuckooFilter {
                 rollBack(segmentFilter, item, segmentResult);
                 if (!corpusSaturated) {
                     corpusSaturated = true;
-                    LOGGER.warn("Corpus filter is full at {} entries; segment pruning is off and "
-                        + "every query now searches every segment. Raise "
+                    LOGGER.warn("Corpus filter is full at {} entries; it no longer tells a "
+                        + "query which segments hold its terms, so segments are searched in "
+                        + "sketch order alone. Raise "
                         + "excalibur.filter.corpus-capacity past the corpus term count and "
                         + "restart", corpusFilter.count());
                 }
@@ -485,9 +487,9 @@ public class HierarchicalCuckooFilter {
      * The entries the corpus level was sized to hold.
      *
      * <p>Exposed because this level is what decides whether a term is looked for at all: once it
-     * is full it cannot record a new term, and a term it has no record of prunes every segment.
-     * The result is an empty answer for documents that are sitting in storage, which is
-     * indistinguishable from "nothing matched" unless the sizing can be read back.</p>
+     * is full it cannot record a new term, and a term it has no record of reads as held by no
+     * segment. The filter stops speaking for any segment once that happens, which is invisible
+     * from a query's answer unless the sizing can be read back.</p>
      *
      * @return The corpus-level capacity, at least the value the filter was constructed with
      */
@@ -621,8 +623,8 @@ public class HierarchicalCuckooFilter {
      *
      * <p>The corpus level holds each item once however many segments contain it, so removing one
      * segment's copy must not remove the shared entry while another segment still has the item
-     * - that would make the corpus filter answer "absent" for something present, and the query
-     * path prunes on exactly that answer.
+     * - that would make the corpus filter answer "absent" for something present, and a reader
+     * of a covered level trusts exactly that answer.
      *
      * <p>The checks are deliberately conservative. {@code mightContain} can be a false positive,
      * so the entry is sometimes kept when it could have gone; the cost of that is a candidate
@@ -691,7 +693,8 @@ public class HierarchicalCuckooFilter {
      * <p>As in {@link #deleteFromHierarchy(byte[], String)}, an item is removed from the
      * corpus filter only when the segment filter held it. Deleting an item that
      * was never inserted would evict a fingerprint-colliding item belonging to another
-     * segment from the shared corpus filter, which the query path then hard-prunes.</p>
+     * segment from the shared corpus filter, which then answers "absent" for an item that
+     * other segment holds.</p>
      *
      * @param items The items to delete
      * @param segmentId The segment ID
@@ -746,10 +749,10 @@ public class HierarchicalCuckooFilter {
     }
 
     /**
-     * Whether this filter may be used to rule a segment out.
+     * Whether this filter's silence about a term may be read as the segment lacking it.
      *
-     * <p>A pre-filter earns the right to exclude a segment only by holding everything that
-     * segment holds. Five things take that right away, and all five are silent: no rebuild may
+     * <p>A pre-filter earns the right to say a segment lacks a term only by holding everything
+     * that segment holds. Five things take that right away, and all five are silent: no rebuild may
      * have vouched for the level yet, so it holds whatever writes happened to reach it; the
      * segment may hold nothing yet, so the filter has looked at nothing rather than looked and
      * found nothing; a level may have refused a term for want of room, so the term is absent from
@@ -759,13 +762,13 @@ public class HierarchicalCuckooFilter {
      * first one consulted - may be full, which makes every segment's verdict worthless at
      * once.</p>
      *
-     * <p>When this returns false the caller must search the segment. Pruning is an optimisation;
-     * answering a query with nothing while the documents sit in storage is not a slow answer but
-     * a wrong one.</p>
+     * <p>When this returns false the caller must treat the segment as one the filter knows
+     * nothing about. The query pipeline, which only orders segments by the filter's answer,
+     * then leaves the segment among those it searches first.</p>
      *
      * <p>A reader that combines this with lookups made at other moments wants
-     * {@link #coverageStamp(String)} instead; see "Asking "may this segment be pruned" across
-     * several lookups".</p>
+     * {@link #coverageStamp(String)} instead; see "Asking "does this segment lack every term"
+     * across several lookups".</p>
      *
      * @param segmentId The segment's id
      * @return true when the filter's silence about a term genuinely means the segment lacks it
@@ -913,9 +916,9 @@ public class HierarchicalCuckooFilter {
     /**
      * Whether the corpus level has run out of room.
      *
-     * <p>Once it has, no segment can be ruled out by this filter and every query pays the full
-     * scan. Sized by {@code excalibur.filter.corpus-capacity}; an operator seeing this wants to
-     * raise it and restart rather than to keep running without pruning.</p>
+     * <p>Once it has, the filter speaks for no segment and queries order segments by their
+     * sketches alone. Sized by {@code excalibur.filter.corpus-capacity}; an operator seeing this
+     * wants to raise it and restart.</p>
      *
      * @return true when a term has been refused by the corpus filter
      */
@@ -924,7 +927,7 @@ public class HierarchicalCuckooFilter {
     }
 
     /**
-     * Segments this filter can no longer rule out because a term was refused for them.
+     * Segments this filter no longer speaks for because a term was refused for them.
      *
      * <p>For reporting. A growing count is the signal that {@code segmentCapacity} is too small
      * for the vocabulary the segments actually hold.</p>

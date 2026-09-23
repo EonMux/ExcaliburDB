@@ -416,7 +416,8 @@ class HierarchicalDeletionPropagationIntegrationTest {
             // shared entry per segment so deletion could be exact -- put the same fingerprint in
             // the same bucket pair once per segment, so a term in nine segments failed to insert
             // on the ninth and the rollback took the segment's own entry with it. A term the
-            // segment contained stopped being findable.
+            // segment held would then be denied by its own segment's level, searched last as
+            // though it held nothing.
             assertThat(corpusFPs)
                 .as("stale corpus entries are rare, and cost a wasted candidate rather than a "
                     + "missing document")

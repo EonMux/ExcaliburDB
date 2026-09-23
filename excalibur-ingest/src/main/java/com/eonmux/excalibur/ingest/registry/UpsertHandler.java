@@ -41,10 +41,10 @@ import java.util.Set;
  *       a term is almost always present in other live documents of the same segment, and the
  *       filter has no reference counts.</li>
  * </ol>
- * <p>An entry left behind is a false positive, which costs one extra segment scan that finds
- * nothing. An entry wrongly removed is a false negative, and the query pipeline treats filter
- * negatives as ground truth - it prunes the segment and returns no results for that term, for
- * every document, permanently. The storage tombstone is the source of truth; segment filters are
+ * <p>An entry left behind is a false positive, which at worst moves a segment ahead of others in
+ * the order a query searches them. An entry wrongly removed is a false negative, which a trusted
+ * level reports as the segment lacking a term it holds - wrong for every document, until the
+ * level is next rebuilt. The storage tombstone is the source of truth; segment filters are
  * rebuilt when the segment is compacted.</p>
  *
  * <h2>Why Tombstoning Does Not Touch the Vector Pre-Filter</h2>

@@ -13,10 +13,10 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 /**
  * What filing a written chunk's terms leaves the membership filter saying about its segment.
  *
- * <p>The filter prunes a segment for a term only while its level is trusted. A filing that fails
- * part-way through a trusted level has recorded some of the chunk's terms and not the others, and
- * the segment has to stop being pruned until a rebuild refills it - otherwise a query for one of
- * the terms that were not recorded skips the segment that holds it.</p>
+ * <p>The filter can only vouch for a segment on a term while its level is trusted. A filing that
+ * fails part-way through a trusted level has recorded some of the chunk's terms and not the
+ * others, and the segment has to stop being trusted until a rebuild refills it - otherwise a
+ * query for one of the terms that were not recorded searches the segment that holds it last.</p>
  */
 @DisplayName("Segment term recorder")
 class SegmentTermRecorderTest {
@@ -51,7 +51,7 @@ class SegmentTermRecorderTest {
     }
 
     @Test
-    @DisplayName("a filing that fails part-way takes the segment out of pruning")
+    @DisplayName("a filing that fails part-way stops the level from vouching for the segment")
     void aFailedFilingDistrustsTheSegment() {
         Refusing filter = new Refusing("cormorant");
         trust(filter);
@@ -68,7 +68,7 @@ class SegmentTermRecorderTest {
             .as("the refused term is not in the level")
             .isFalse();
         assertThat(filter.coversSegment(SEGMENT))
-            .as("so the level may no longer rule the segment out")
+            .as("so the level can no longer answer for the segment")
             .isFalse();
         assertThat(filter.isSegmentStale(SEGMENT)).isTrue();
     }

@@ -255,9 +255,10 @@ class IndexOrchestratorSwapTest {
 
         orchestrator.syncSegmentsFromStorage();
 
-        // Stage 1 treats a filter miss as ground truth. Whatever the re-registration does to
-        // the level, stage 1 must never be able to rule segment 0 out for a term it holds: the
-        // level either names it or does not claim to cover it.
+        // Stage 1 treats a covered level's miss as ground truth and searches the segment last
+        // on it. Whatever the re-registration does to the level, it must never leave segment 0
+        // covered and denying a term it holds: the level either names it or does not claim to
+        // cover it.
         assertThat(filter.findCandidateSegments(term).contains("0") || !filter.coversSegment("0"))
             .isTrue();
         assertThat(orchestrator.awaitTermFilterRebuilds(10, java.util.concurrent.TimeUnit.SECONDS))

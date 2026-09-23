@@ -402,8 +402,8 @@ public class CuckooMaintenanceWorker {
      * deleted or replaced without its segment being tombstoned, but the terms it contributed
      * are usually shared with other documents in the same segment, and nothing counts how many
      * of them still hold each one. Deleting a term on that basis would make the filter deny a
-     * segment that still contains it, and Stage 1 of the query pipeline takes a denial as
-     * final. A whole tombstoned segment has no such problem: nothing in it is live.</p>
+     * segment that still contains it, and Stage 1 of the query pipeline takes a denial from a
+     * trusted level as the segment lacking the term. A whole tombstoned segment has no such problem: nothing in it is live.</p>
      *
      * @return Entries held by tombstoned segments awaiting cleanup; 0 when none are waiting
      */

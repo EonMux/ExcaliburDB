@@ -16,10 +16,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * shared filters above the segments were given one entry per (term, segment) pair, and a cuckoo filter
  * stores a fingerprint in one of two buckets holding a fixed handful of entries each — so the
  * ninth segment's insert failed, and the rollback removed the term from that segment's own
- * filter as well. The segment stopped being a candidate for a term it contains.
+ * filter as well. The segment could no longer be named as holding a term it actually contains.
  *
  * <p>A false negative is the one answer a membership filter must never give: the query path
- * prunes segments on it, so the documents simply stop being findable.
+ * searches a segment the filter denies last, so a false negative here moves a segment that holds
+ * the term behind every segment the filter could not rule in.
  */
 @DisplayName("Hierarchical filter, shared terms")
 class HierarchicalFilterSharedTermTest {
@@ -59,7 +60,9 @@ class HierarchicalFilterSharedTermTest {
     @DisplayName("a failed insert never removes a term the segment already had")
     void insertDoesNotDamageWhatIsAlreadyThere() {
         // The rollback was the damaging half: a shared-level failure took the segment's own
-        // entry with it, so a term that was successfully stored became unfindable.
+        // entry with it, so a term that was successfully stored could be denied by its own
+        // segment's filter, pushing that segment to the back of the search order for a term
+        // it actually has.
         HierarchicalCuckooFilter filter = filter(32);
         for (int i = 0; i < 32; i++) {
             filter.insert(TERM, String.valueOf(i));

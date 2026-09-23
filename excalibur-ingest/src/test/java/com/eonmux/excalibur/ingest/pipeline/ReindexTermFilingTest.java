@@ -27,9 +27,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Where a reindex files the terms of the chunks it writes.
  *
  * <p>Under the segment each chunk's write landed in, as the writer reports it - the premise
- * stage 1 of the query pipeline prunes on. A reindex that filed every chunk's terms under one
+ * stage 1 of the query pipeline orders on. A reindex that filed every chunk's terms under one
  * fixed segment, or none, left a trusted level missing a reindexed-in term, and every query for
- * that term skipped the segment holding it until the segment was next rebuilt.</p>
+ * that term searched the segment holding it last until the segment was next rebuilt.</p>
  */
 @DisplayName("Reindex term filing")
 class ReindexTermFilingTest {
@@ -81,8 +81,8 @@ class ReindexTermFilingTest {
         assertThat(filter.completeSegmentRebuild(key, generation)).isTrue();
     }
 
-    /** Whether stage 1 would rule a segment out for a term. */
-    private boolean pruned(String term, long segmentId) {
+    /** Whether stage 1 would search a segment last for a term. */
+    private boolean searchedLast(String term, long segmentId) {
         String key = String.valueOf(segmentId);
         return filter.coversSegment(key)
             && !filter.mightContainInSegment(term.getBytes(StandardCharsets.UTF_8), key);
@@ -112,18 +112,18 @@ class ReindexTermFilingTest {
     }
 
     @Test
-    @DisplayName("a reindexed-in term is not pruned from a trusted segment that holds it")
+    @DisplayName("a reindexed-in term does not leave its trusted segment searched last")
     void aTrustedSegmentIsNotPrunedForAReindexedTerm() {
         trust(11L);
         trust(12L);
-        assertThat(pruned("zeppelin", 11L))
+        assertThat(searchedLast("zeppelin", 11L))
             .as("trusted, and without the term before the reindex").isTrue();
 
         SpreadingWriter writer = new SpreadingWriter();
         publishing(writer, writer).reindexDocument(SOURCE, "doc-1", document("doc-1"));
 
         for (long segment : writer.segments.values()) {
-            assertThat(pruned("zeppelin", segment))
+            assertThat(searchedLast("zeppelin", segment))
                 .as("segment %s holds a chunk with the term", segment).isFalse();
         }
     }
@@ -141,7 +141,7 @@ class ReindexTermFilingTest {
             reindexer.reindexDocument(SOURCE, "doc-1", document("doc-1"));
 
         assertThat(result.getFailedChunks()).isZero();
-        assertThat(pruned("zeppelin", 9L)).isFalse();
+        assertThat(searchedLast("zeppelin", 9L)).isFalse();
         assertThat(filter.mightContainInSegment(bytes("cormorant"), "9")).isTrue();
     }
 

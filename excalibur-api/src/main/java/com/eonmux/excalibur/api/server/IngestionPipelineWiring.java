@@ -115,7 +115,7 @@ final class IngestionPipelineWiring {
     }
 
     /**
-     * Attaches a pipeline and the vector pre-filter stage 2 of a query prunes with.
+     * Attaches a pipeline and the LSH index stage 2 of a query names candidates from.
      *
      * <p>The visibility tracker is the caller's, and it is expected to sit on the persisted
      * document registry: the tracker records which chunks make up each document, and one over

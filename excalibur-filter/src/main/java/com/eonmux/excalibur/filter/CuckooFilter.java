@@ -292,8 +292,8 @@ public class CuckooFilter {
         // slots are full, because an insert that cannot find a free slot displaces an occupant
         // and gives up after a bounded chain of displacements. Sized to exactly the capacity,
         // a filter asked to hold its documented capacity sits near 98% full and starts refusing
-        // terms - and a filter that has refused a term is no longer trusted to rule a segment
-        // out, so pruning switches off and every query scans everything.
+        // terms - and a filter that has refused a term is no longer trusted to speak for its
+        // segment at all.
         long numBuckets = bucketsFor(capacity);
 
         // Cache-line aligned bucket storage: 8 bytes per bucket

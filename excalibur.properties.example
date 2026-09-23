@@ -40,23 +40,25 @@ excalibur.ingest.chunk-target-tokens=512
 excalibur.ingest.chunk-overlap-tokens=64
 
 # Membership Filter
-# Entries the hierarchical Cuckoo filter is sized for. SIZE THIS TO YOUR CORPUS. The filter is
-# what prunes segments that cannot hold a query's terms, and a filter with no room left cannot
-# record a new term. A level that has refused one is no longer trusted to rule anything out, so
-# pruning switches off for its scope and every query scans it: results stay correct and queries
-# get slower. /v1/stats reports it as cuckoo.saturated. The only cost of over-sizing is memory.
+# Entries the hierarchical Cuckoo filter is sized for. SIZE THIS TO YOUR CORPUS. The filter tells
+# a query which segments hold its terms, so those are searched first; every segment is searched
+# either way. A filter with no room left cannot record a new term, and a level that has refused
+# one is no longer trusted to say what its segments lack, so they are ordered by their term
+# sketches alone: results are unaffected and a query that runs out of time loses the ordering.
+# /v1/stats reports it as cuckoo.saturated. The only cost of over-sizing is memory.
 # About twice this many slots are allocated, rounded up to a power of two: a cuckoo filter
 # refuses inserts before its slots are full, so a filter sized to exactly its capacity would
 # saturate at the corpus it was configured for.
 excalibur.filter.corpus-capacity=10000000
 # Distinct terms one segment's own level is sized for. Separate from the corpus capacity: that
 # level holds every term on the node, this one holds a single segment's vocabulary. A segment
-# that outgrows it stops being pruned, which /v1/stats counts as cuckoo.saturatedSegments.
+# that outgrows it is no longer ordered by its terms, which /v1/stats counts as
+# cuckoo.saturatedSegments.
 excalibur.filter.segment-capacity=10000
 # Bits of each term the filter keeps. This is the accuracy-for-memory trade it makes: every extra
-# bit halves the chance two unrelated terms look alike, and so halves the segments a query opens
-# for nothing, at one more bit per slot. 4 to 16; below that the filter stops ruling anything out,
-# above it a fingerprint no longer fits the slot the format gives it.
+# bit halves the chance two unrelated terms look alike, and so halves the segments a query moves
+# ahead of others for nothing, at one more bit per slot. 8 to 16; below that the slot format holds
+# too little to tell terms apart, above it a fingerprint no longer fits the slot it is given.
 excalibur.filter.fingerprint-bits=13
 
 # API Server Configuration

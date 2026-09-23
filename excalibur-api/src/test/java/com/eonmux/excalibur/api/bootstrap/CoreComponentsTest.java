@@ -89,10 +89,11 @@ class CoreComponentsTest {
 
         // This value was read from System.getProperty rather than from the configuration, so it
         // answered to neither the properties file nor the environment while looking exactly like
-        // every key that does. Sizing it too small costs every query a full scan, because a
-        // level that has refused a term stops being trusted to rule anything out. These tests
-        // pin the channel, because a capacity that does not reach the filter is invisible from
-        // the outside.
+        // every key that does. Sizing it too small costs every query its ordering, because a
+        // level that has refused a term stops being trusted to speak for its segment, and an
+        // untrusted segment is searched as if it might hold anything. These tests pin the
+        // channel, because a capacity that does not reach the filter is invisible from the
+        // outside.
 
         @Test
         @DisplayName("comes from the properties, not from a system property")
@@ -122,9 +123,10 @@ class CoreComponentsTest {
         @Test
         @DisplayName("the per-segment level is sizeable too")
         void readsTheConfiguredSegmentCapacity(@TempDir Path dataDir) {
-            // A segment level that runs out of room stops pruning that segment, which is safe
-            // and slow. Without a knob an operator watching cuckoo.saturatedSegments climb has
-            // nothing to turn: the corpus capacity does not size this level.
+            // A segment level that runs out of room stops speaking for that segment, so queries
+            // no longer order it by their terms, which costs ordering and never an answer.
+            // Without a knob an operator watching cuckoo.saturatedSegments climb has nothing to
+            // turn: the corpus capacity does not size this level.
             Map<String, String> props = new HashMap<>();
             props.put("excalibur.query.vector-dimensions", "128");
             props.put(CoreComponents.KEY_SEGMENT_CAPACITY, "250000");

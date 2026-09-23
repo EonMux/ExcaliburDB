@@ -23,7 +23,7 @@ import java.util.Objects;
  * passed to it rather than in the call itself. Each of the last four arguments is a filter that
  * is inert when omitted and silently wrong when omitted by accident: without the atomicity
  * checker a query can see half an ingested document, without the membership filter Stage 1
- * prunes nothing and every segment is read, and without the epoch validator a long-running query
+ * cannot put the segments holding a query's terms first, and without the epoch validator a long-running query
  * can return graph nodes written after the snapshot it captured. None of those has a symptom an
  * operator would recognise as a missing argument, so the assembly is written down in one place
  * where it can be read against that list.</p>
@@ -48,7 +48,7 @@ public final class QueryPipelineFactory {
      * @param storageEngine             Storage holding the segments and their HNSW graphs
      * @param indexOrchestrator         Supplies the visibility clock and the epoch validator
      * @param documentVisibilityChecker The document atomicity filter, shared with ingestion
-     * @param hierarchicalFilter        The membership filter Stage 1 prunes on
+     * @param hierarchicalFilter        The membership filter Stage 1 orders segments by
      * @return A pipeline ready to answer queries
      * @throws NullPointerException if any argument is null
      */
@@ -81,7 +81,7 @@ public final class QueryPipelineFactory {
             distanceFunction,
             llmScorer(config),  // LLM scorer with query-specific timeout
             QueryPipeline.DEFAULT_COVERAGE_THRESHOLD,
-            hierarchicalFilter,  // CRITICAL: Pass the hierarchical filter for Stage 1 pruning
+            hierarchicalFilter,  // Stage 1 searches the segments holding the query's terms first
             // Node-level epoch filtering. Omitting it leaves the pipeline unable to exclude graph
             // nodes written after the query's snapshot epoch, so a long-running query can return
             // vectors that did not exist when it started. The orchestrator maintains the

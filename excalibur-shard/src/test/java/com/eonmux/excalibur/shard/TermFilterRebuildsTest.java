@@ -267,7 +267,7 @@ class TermFilterRebuildsTest {
 
         assertThat(rebuilds.awaitIdle(BOUND_SECONDS, TimeUnit.SECONDS)).isTrue();
         assertThat(filter.isSegmentStale("0"))
-            .as("the segment is searched in full rather than trusted from the parent").isTrue();
+            .as("the filter says nothing about the segment inherited from the parent").isTrue();
     }
 
     @Test

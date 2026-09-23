@@ -9,7 +9,7 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 ### Key Features
 
 - **HNSW (Hierarchical Navigable Small World) graphs** for approximate nearest neighbor search with configurable efConstruction and efSearch parameters
-- **Cuckoo filters** for probabilistic set membership testing with deletion support
+- **Cuckoo filters** for probabilistic set membership testing with deletion support: a corpus-and-segment hierarchy that tells a query which segments hold its terms, so those are searched first. It orders and never excludes: a vector query's nearest neighbours need not share its words
 - **LSH (Locality-Sensitive Hashing)** for vector candidate generation beside the HNSW search: a query's bucket-mates are measured exactly and ranked in with the graph's results, never used to exclude or confine a search. Built per segment on a node that embeds its corpus. A lexical-only node writes none: it would be dead weight on every write, keyed by node ids nothing assigns
 - **Epoch-based visibility tracking** for consistent query snapshots during concurrent ingestion
 - **LLM integration** for semantic relevancy scoring, with a circuit breaker on each of the chat and embedding paths and a fallback when either is open
@@ -610,9 +610,9 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.ingest.chunk-overlap-tokens` | 64 | Tokens a chunk repeats from the one before it, so an answer that straddles a boundary is not split across two chunks holding half of it each. Must be less than the target, or chunking would never advance; the node refuses the pair at startup rather than failing on the first document |
 | `excalibur.ingest.bm25-k1` | 1.2 | Where a repeated term stops earning more score. 0 reduces term frequency to a yes-or-no. Under `lexical-engine=native` this is **recorded in the index** and an index built under one value refuses to open under another — not because the bytes depend on it, but because changing it changes every score the corpus can produce, and with it every ranking and every threshold a deployment has calibrated. Changing it means reingesting. Under `lexical-engine=lucene` it is applied at query time and nothing is recorded, so a change takes effect on the next query. At least 0 |
 | `excalibur.ingest.bm25-b` | 0.75 | How much a match is discounted for the length of the chunk it was found in. 1 normalises fully by length, 0 not at all. Recorded, or not, on the same terms as `bm25-k1`. 0 to 1 |
-| `excalibur.filter.corpus-capacity` | 10000000 | Entries the membership filter is sized for. **Size this to your corpus.** A filter with no room left cannot record a term, and a level that has refused one stops being trusted to rule anything out: pruning switches off, `/v1/stats` reports `cuckoo.saturated`, and every query scans every segment. Results stay correct; an undersized value costs latency, not answers. The filter allocates about twice this many slots, rounded up to a power of two: a cuckoo filter refuses inserts well before its slots are full, so one sized to exactly its capacity would saturate at the corpus it was configured for. At least 1 |
-| `excalibur.filter.segment-capacity` | 10000 | Distinct terms one segment's level of the membership filter is sized for. A segment that outgrows it stops being pruned rather than answering wrongly; `/v1/stats` counts those under `cuckoo.saturatedSegments`. 1 to 2147483647, and at most `excalibur.filter.corpus-capacity` |
-| `excalibur.filter.fingerprint-bits` | 13 | Bits of each term the filter keeps, 8 to 16. Each extra bit halves the chance two unrelated terms look alike — and so halves the segments a query opens for nothing — at one more bit per slot |
+| `excalibur.filter.corpus-capacity` | 10000000 | Entries the membership filter is sized for. **Size this to your corpus.** A filter with no room left cannot record a term, and a level that has refused one stops being trusted to say what its segments lack: `/v1/stats` reports `cuckoo.saturated`, and queries order segments by their term sketches alone. Results are unaffected; an undersized value costs the ordering, which matters to a query that runs out of time. The filter allocates about twice this many slots, rounded up to a power of two: a cuckoo filter refuses inserts well before its slots are full, so one sized to exactly its capacity would saturate at the corpus it was configured for. At least 1 |
+| `excalibur.filter.segment-capacity` | 10000 | Distinct terms one segment's level of the membership filter is sized for. A segment that outgrows it is no longer ordered by its terms rather than being ordered wrongly; `/v1/stats` counts those under `cuckoo.saturatedSegments`. 1 to 2147483647, and at most `excalibur.filter.corpus-capacity` |
+| `excalibur.filter.fingerprint-bits` | 13 | Bits of each term the filter keeps, 8 to 16. Each extra bit halves the chance two unrelated terms look alike — and so halves the segments a query moves ahead of others for nothing — at one more bit per slot |
 | `excalibur.llm.api-key` | _(none)_ | Key for the OpenAI-compatible endpoint. Supply as `EXCALIBUR_LLM_API_KEY`, not in this file. Without it the corpus is still chunked, stored and term-indexed; only the vector signal is missing |
 | `excalibur.llm.base-url` | https://api.openai.com/v1 | API root. The clients append `/v1/embeddings` and `/v1/chat/completions` themselves; a trailing `/v1` is stripped, so `https://api.openai.com` and `https://api.openai.com/v1` mean the same thing |
 | `excalibur.llm.chat-model` | gpt-4o-mini | Chat model for relevancy scoring |
@@ -2026,7 +2026,7 @@ an entity. The two embedding breakers are separate even though they call the sam
 model: an open build breaker costs a build's entities their vectors until the next build, an open
 question breaker costs one query its vector rerank, and neither should decide the other.
 `cuckoo.saturated` and `cuckoo.saturatedSegments` say
-whether the membership filter still has room to prune with. `cuckoo.avgFpRate` and `maxFpRate` are
+whether the membership filter still has room to order a query's segments by. `cuckoo.avgFpRate` and `maxFpRate` are
 the false-positive rates of the per-segment filters as they stand now, printed as exact decimals;
 the deletion figures count filter entries (one per distinct term per segment), not documents. See [the stats section of USAGE.md](USAGE.md#stats) for what
 every field means.
@@ -2507,7 +2507,7 @@ Queries execute through a 7-stage pipeline:
 
 1. **Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
 2. **Segment Prioritisation** - Order the candidate segments by estimated selectivity
-3. **Cuckoo Filter Cascade** - Eliminate segments that cannot contain relevant terms, checking a corpus-wide filter and then each segment's own. There is no level between them: documents are placed by key hash, so a group of segments holds nearly the whole vocabulary and could rule nothing out
+3. **Cuckoo Filter Cascade** - Move the segments that hold none of the query text's terms behind the ones that may, checking a corpus-wide filter and then each segment's own. Excludes no segment. There is no level between them: documents are placed by key hash, so a group of segments holds nearly the whole vocabulary and could tell nothing apart
 4. **LSH Candidates** - Name each segment's entries that share the query's hash buckets, for stage 5 to measure beside its graph search. Excludes no segment and confines no search
 5. **HNSW Vector Search** - Precise ANN search, with stage 4's candidates measured and ranked in, and a tail scan for unindexed entries
 6. **Full Vector Rerank** - Exact distance computation on candidates
@@ -2541,7 +2541,21 @@ the shares.
   and reports a damaged one without counting it as damage, and `excalibur-backup` copies it as
   derived state that `--exclude-derived` leaves out.
 
-Stage 3 prunes only where the term filter can speak for a segment. Both write paths fill it:
+Stage 3 orders and never excludes, for the same reason stage 4 never does. Every query the
+pipeline runs is a nearest-neighbour search over an embedding, and `POST /v1/query` hands it the
+question's text beside that embedding. The embedding is there because the words a question is
+phrased in need not be the words of the documents that answer it — the semantic expansion example
+above turns `out of RAM` into `OOM killer` for exactly that reason — so a segment holding none of
+the question's terms can hold its nearest neighbours, and dropping it would lose them without
+saying so. What the filter's answer does say is where the question's words are, and a segment
+holding them is the likelier one to answer. Stage 3 therefore moves the segments the filter vouches
+hold none of the terms behind the others, keeping stage 2's order within each group, and every
+segment is searched. As with stage 2, what the ordering buys is that a query which runs out of
+time has spent it on the segments most likely to answer. The two signals differ: stage 2's
+estimate multiplies each term's share of a segment and over-counts, while the filter asks whether
+any one term is present at all.
+
+Stage 3 moves a segment back only where the term filter can speak for it. Both write paths fill it:
 `POST /v1/reindex` through the batch publisher, which targets a segment it chose itself, and
 `POST /v1/ingest` through the storage engine, which reports the segment each chunk routed to.
 Entries also reach a segment without being written to it, and each such segment's level is refilled
@@ -2550,11 +2564,12 @@ node starts (the filter is in memory only), both children of a split, and the re
 compaction installs — which also drops the terms of the entries the compaction removed. A level is
 marked stale before the segment can take a write that would make it look complete — for a split,
 before either child is routed to — and a stale level is not trusted until its refill finishes, so
-a segment is searched in full meanwhile rather than pruned on a partial level. Four things make a
-segment unprunable rather than excluded — the filter holding nothing for it, its level waiting to
-be refilled, a level having refused a term for want of room, and no filter being configured at all
-— and in each case stage 3 passes the segment through. Pruning is an optimisation; the filter never
-costs a result.
+a segment keeps its place meanwhile rather than being moved back on a partial level. Four things
+leave the filter with nothing to say about a segment — the filter holding nothing for it, its
+level waiting to be refilled, a level having refused a term for want of room, and no filter being
+configured at all — and in each case stage 3 leaves the segment among those searched first. The
+filter decides only the order; it never costs a result. `QueryPipelineRecallGateTest` holds the
+pipeline to that with query text present.
 
 Stage 4 adds candidates and never removes any. A query asks for the k nearest vectors, and every
 non-empty segment has k nearest vectors however far away they are; an LSH bucket says which entries
@@ -2923,12 +2938,15 @@ this system's stated guarantees that no task in the build could execute.
 HNSW recall is measured on the graph alone, which says nothing about the stages in front of it. So
 `excalibur-query` gates the answer a caller actually gets: `QueryPipelineRecallGateTest` runs the
 whole query pipeline over 20,000 clustered 64-dimensional vectors spread across eight segments,
-each with a fully integrated graph and an LSH index of the default shape, and asserts that its
-recall@10 against brute force is at least 0.95 and no more than 0.01 below that of the same graphs
-searched directly and merged. The 0.01 absorbs ties at the tenth distance and nothing else: the
-pipeline searches every graph at least as widely, and its LSH candidates can displace a result only
-with a closer one. `QueryPipelineVectorRecallTest` makes the same comparison on a smaller corpus in
-the ordinary `test` task. The aggregate task is
+each with a fully integrated graph, an LSH index of the default shape and a trusted term filter
+level, and asserts that its recall@10 against brute force is at least 0.95 and no more than 0.01
+below that of the same graphs searched directly and merged. It measures twice: with vector-only
+queries, and with every query also carrying text that only one segment's documents share while its
+nearest vectors lie in all eight, which is how `POST /v1/query` runs every query. The 0.01 absorbs
+ties at the tenth distance and nothing else: the pipeline searches every graph at least as widely,
+the term filter only orders the segments, and its LSH candidates can displace a result only with a
+closer one. `QueryPipelineVectorRecallTest` makes both comparisons on a smaller corpus in the
+ordinary `test` task. The aggregate task is
 derived from the module list rather than written out, because a list goes stale the moment a
 module is added and a gate run that skips a module reports a pass over assertions it never ran.
 
@@ -3267,13 +3285,14 @@ are the old model's output and the old width. Change the model and the two width
 clear the data directory or reindex every source, and expect the startup check to stop you if the
 widths no longer agree.
 
-**Queries got much slower after a large ingestion.**
-Read `cuckoo.saturated` and `cuckoo.saturatedSegments` on `/v1/stats`. The membership filter is
-what prunes segments that cannot hold a query's terms, and once a level is full it cannot record a
-new term. A filter holding *some* of a segment's terms would answer "not here" for the ones it
-never got, so a level that has refused a term stops being consulted and its scope is searched in
-full. Raise `excalibur.filter.corpus-capacity` past your term count and restart; the only cost of
-over-sizing is memory.
+**`/v1/stats` reports `cuckoo.saturated` or a growing `cuckoo.saturatedSegments`.**
+The membership filter is what tells a query which segments hold its terms, so they are searched
+first, and once a level is full it cannot record a new term. A filter holding *some* of a
+segment's terms would answer "not here" for the ones it never got, so a level that has refused a
+term stops being consulted and its segments are ordered by their term sketches alone. Results are
+unaffected; what is lost is the ordering, which matters to queries that run out of time. Raise
+`excalibur.filter.corpus-capacity` (or `segment-capacity`) past your term count and restart; the
+only cost of over-sizing is memory.
 
 **How do I take a node out of rotation before restarting it?**
 `POST /v1/drain`. `/health/ready` then answers 503 for as long as the drain is in force, so a load

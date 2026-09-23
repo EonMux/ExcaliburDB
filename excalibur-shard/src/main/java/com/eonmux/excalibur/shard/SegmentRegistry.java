@@ -43,7 +43,7 @@ final class SegmentRegistry {
 
     /**
      * Hierarchical Cuckoo filter for corpus -> segment membership testing.
-     * Used to register segments in the hierarchy and enable efficient query pruning.
+     * Used to register segments in the hierarchy the query pipeline orders segments by.
      * May be null if not configured.
      */
     private volatile HierarchicalCuckooFilter hierarchicalFilter;
@@ -198,9 +198,10 @@ final class SegmentRegistry {
      * <p>An ID that is about to be re-registered with a different {@link Segment}
      * instance - a compacted replacement, or the left child of a split, which inherits
      * its parent's index - must keep its hierarchical Cuckoo filter. That filter holds
-     * every term the segment contributed, and Stage 1 of the query pipeline treats a
-     * filter miss as ground truth, so dropping and recreating it turns those terms into
-     * empty query results until the data is ingested again.</p>
+     * every term the segment contributed, and Stage 1 of the query pipeline takes a miss in
+     * a trusted level as the segment lacking the term, so dropping and recreating it would
+     * send the segment to the back of every query for those terms until the data is ingested
+     * again.</p>
      *
      * @param segmentId           The segment ID
      * @param dropHierarchyEntry  Whether to remove the segment from the filter hierarchy
@@ -417,10 +418,10 @@ final class SegmentRegistry {
     /**
      * Installs the hierarchical Cuckoo filter and puts every known segment into it.
      *
-     * <p><strong>CRITICAL:</strong> the back-fill is not a convenience. Stage 1 of the query
-     * pipeline treats a filter miss as ground truth, so a segment registered before the filter
+     * <p>The back-fill is not a convenience. Stage 1 of the query pipeline takes a miss in a
+     * trusted level as the segment lacking the term, so a segment registered before the filter
      * arrived - which is every segment on a node that configures the filter after boot - would
-     * be pruned out of every query it should have answered.</p>
+     * be searched last by every query it should have answered first.</p>
      *
      * <p>Each back-filled segment is re-pointed at its level, in the registration and in the
      * maintenance and metrics workers, for the reason {@link #resolveFilter} gives: the level

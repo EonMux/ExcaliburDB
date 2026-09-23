@@ -150,7 +150,7 @@ public class IngestionOrchestrator {
     /** The BM25 index kept beside the chunks written here, if the node keeps one. */
     private final LexicalSideIndex lexicalSideIndex;
 
-    /** Files written terms under their segment, so queries can prune segments that cannot match. */
+    /** Files written terms under their segment, so queries search the segments holding theirs first. */
     private final SegmentTermRecorder termRecorder = new SegmentTermRecorder();
 
     /** Reports published documents onwards, so a graph can be built from them. */
@@ -341,12 +341,11 @@ public class IngestionOrchestrator {
     }
 
     /**
-     * Points ingestion at the membership filter the query pipeline prunes with.
+     * Points ingestion at the membership filter the query pipeline orders segments by.
      *
      * <p>Set after construction, like the lexical index: the filter is built by the API layer's
      * bootstrap alongside the index orchestrator. Without one, stage 1 of the query pipeline
-     * has nothing to say about anything this node crawled and every query reads every
-     * segment.</p>
+     * has nothing to say about anything this node crawled.</p>
      *
      * @param membershipFilter The filter, or null to keep none
      */

@@ -22,7 +22,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * Integrity tests for a serialized Cuckoo filter image.
  *
  * <p>A membership filter that has rotted answers "no" for terms a segment really holds, which
- * prunes the segment out of the query and makes the corpus look as though it has lost
+ * misleads any reader that trusts it - the lexical index is one such reader, and prunes a
+ * segment out of the query on that answer, making the corpus look as though it has lost
  * documents. No image this engine writes can rot that way - the lexical index rebuilds its
  * filter from the terms column on every open - so these cover {@code writeTo}/{@code readFrom}
  * as a format, for the callers that serialize a filter themselves and for whatever starts
