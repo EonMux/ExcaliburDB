@@ -136,15 +136,16 @@ curl 'http://localhost:8080/v1/ingest/status?source_id=my-docs'
 ```json
 {"source_id": "my-docs", "state": "embedding", "progress": 0.7300,
  "entries_ingested": 450, "entries_pending": 170, "entries_skipped": 12,
- "last_error": null}
+ "entries_disallowed": 0, "last_updated_ms": 1730000042000, "last_error": null}
 ```
 
 `state` runs `crawling` → `embedding` → `indexing` → `idle`. `unconfigured` means this node's
 ingestion pipeline failed to wire at startup; `last_error` says where the reason is.
 `entries_skipped` counts the files under the root that are not text — see
-[What gets indexed](#what-gets-indexed); a web crawl also reports `entries_disallowed`, the pages
-the site's [robots.txt](#robotstxt) kept it out of. Drop `?source_id=` to get every source instead, wrapped
-in a `sources` array.
+[What gets indexed](#what-gets-indexed), and `entries_disallowed` the pages a web crawl left alone
+because the site's [robots.txt](#robotstxt) disallows them (always 0 for a directory).
+`last_updated_ms` is when the status last changed, in epoch milliseconds. Drop `?source_id=` to get
+every source instead, wrapped in a `sources` array.
 
 ### 5. Query
 
@@ -459,7 +460,7 @@ already there when it was copied verifies faithfully:
 | Format | Checked by | Proven means |
 |---|---|---|
 | segments, `catalog.dat` | the storage engine, on a scratch copy | every entry's checksum, and the header and record CRCs |
-| HNSW graphs and document mappings, quantiser codebooks, LSH tables | the vector and filter modules, on a scratch copy | the seal a clean close writes |
+| HNSW graphs and their node-to-chunk mappings, quantiser codebooks, LSH tables | the vector and filter modules, on a scratch copy | the seal a clean close writes |
 | a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
 | write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
 | graph staging logs | `excalibur-fsck`, read-only | the erasure ledger: every record against its CRC. The triple, entity and label logs: only their header, because their one open path writes |
@@ -897,11 +898,11 @@ which is one document's fetch, embedding and writes — because it finishes the 
 when asked to stop, and a document that landed after an erasure had looked would put back what
 the erasure removed.
 
-It stops short of the vector indexes, which are reclaimed per segment rather than per entry: until
-the segment holding an erased chunk is compacted, a vector query can still rank it — without
-content, since that is resolved from storage and storage no longer has it, but under its chunk id.
-That is the same residue a source-driven deletion leaves, and the response does not claim
-otherwise.
+It reaches the vector indexes too. Every HNSW node of an erased document is retired in each
+segment's graph as part of the request, before the response is sent, so from then on no vector query
+ranks it. What waits is only disk: a retired node keeps its place in the graph file until that
+graph is compacted. A reindex that finds a document gone from its source retires the document's
+nodes the same way.
 
 The log is also what the tombstones are checked against on open. Tombstone files are written by
 atomic rename, which orders them but does not force them, so a crash can leave a promise recorded
@@ -909,8 +910,10 @@ and unapplied; anything the log still owes is marked again as the store opens. W
 compaction would discharge the log entry on the grounds that it names nothing tombstoned — forgetting
 the promise while the document was readable again.
 
-**Reindexing.** A reindex is the one operation that removes content a query could still be matching:
-a deleted document's chunks, and the tail chunks a shortened document no longer has. Both are erased
+**Reindexing.** A reindex removes content a query could still be matching: a deleted document's
+chunks, and the tail chunks a shortened document no longer has. (A document posted again through
+`POST /v1/documents` sheds such a tail too: once the new version is published, the previous
+version's chunks past its end are removed the same way, under the document's lock.) Both are erased
 from the index as they are tombstoned in storage, and the reindex settles its own erasures at the end
 of its run rather than leaving them for whatever ingests next — except in a segment that also holds
 the previous copy of a document the same run re-published, which waits for readers to catch up as
@@ -1511,7 +1514,7 @@ The HTTP API does not accept pre-computed vectors. Embedding consistency between
 `document_id` is always a JSON string, never a bare number: it is the identifier ingestion
 assigned, `sourceId:documentId:chunk:N`, which is what a client can actually look something up by.
 The HNSW node id is deliberately not exposed — compaction renumbers it — so a vector hit whose
-graph node has no document identity, because its segment's mapping is damaged, is dropped rather
+graph node has no chunk identity, because its segment's mapping is damaged, is dropped rather
 than returned under that number, and the answer is marked degraded. `segment_id` says which
 segment answered, which is what makes a result traceable back to storage.
 
@@ -1557,9 +1560,10 @@ field exists to prevent.
 
 The server-generated `query_id` can be used to cancel the query mid-flight via
 `DELETE /v1/query/{query_id}`. When that call answers `"cancelled": true`, the query answers `200`
-with `cancelled: true` and no results, on every route and even if its search had already finished:
-a withdrawn question is not answered. `cancelled` is the only thing separating that from a query
-that searched everything and matched nothing.
+with `cancelled: true`, no results, and coverage claiming nothing — `degraded: true`,
+`estimated_corpus_coverage: 0` — on every route and even if its search had already finished: a
+withdrawn question is not answered. `cancelled` is what separates that from a query that ran out
+of time, which is degraded too but reports `timed_out: true` instead and may carry what it found.
 
 ### Ingest Example
 
@@ -1751,7 +1755,8 @@ A web crawl obeys each site's `robots.txt` unless it was registered with
   through the same client, host allow-list, public-address check, timeout, pacing and redirect
   handling as any page, so it opens no way around them. The crawl's path filters do not apply to
   it, because `/robots.txt` sits outside the base path of most crawls. The file is re-read by the
-  next crawl or re-crawl.
+  next crawl or re-crawl, and within a run once a reading is 24 hours old — the longest RFC 9309
+  lets a crawler rely on one, and a slow crawl of a large site can outlast it.
 - **Group.** The group is chosen by the product token of `user_agent` (`ExcaliburDB` by default),
   compared case-insensitively. When no group names it, the crawl falls back to `*`.
 - **Rules.** Within the group, the longest matching rule wins and `Allow` wins a tie. `*` and a
@@ -1983,7 +1988,8 @@ curl http://localhost:8080/v1/stats
     "purged": 0
   },
   "entries": {"total": 15000000},
-  "volumes": {"count": 1, "totalBytes": 5368709120, "usedBytes": 3221225472},
+  "volumes": {"count": 1, "totalBytes": 5368709120, "usedBytes": 3221225472,
+              "availableBytes": 2147483648},
   "hnsw": {"queueDepth": 50000, "queueDepthLimit": 100000, "vectorsIntegrated": 14000000},
   "cuckoo": {"pendingDeletions": 0, "totalDeletions": 212,
              "avgFpRate": 0.0000070547, "maxFpRate": 0.0000137324,
@@ -2020,8 +2026,8 @@ curl http://localhost:8080/v1/stats
 
 The `lexical` block is present only on a node that keeps a chunk index, and `graph` only on a node
 that serves a graph. `breakers` holds one entry per circuit breaker the node has — `embedding`,
-`llmRelevancy` for stage-5 re-ranking, `queryExpansion` for the chat call that widens a lexical
-query, `graphExtraction` for the chat call that finds a document's facts, `graphRerank` for the
+`llmRelevancy` for stage 5's relevancy scoring, `queryExpansion` for the chat call that widens a
+lexical query, `graphExtraction` for the chat call that finds a document's facts, `graphRerank` for the
 chat call `POST /v1/graph/query` reranks its candidates with, `graphQueryEmbedding` for the
 embedding call that lets a graph built with entity vectors rerank them exactly, and
 `graphBuildEmbedding` for the embedding call a graph build makes to produce those entity vectors —
@@ -2512,19 +2518,20 @@ key plus `excalibur.graph.extraction-enabled=true`.
 
 ### Query Pipeline
 
-Queries execute through a 7-stage pipeline:
+Queries execute through a pipeline of seven stages, numbered here as the code and its log lines
+(`Stage 1: ...`, `Stage 4: ...`) number them:
 
-1. **Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
-2. **Segment Prioritisation** - Order the candidate segments by estimated selectivity
-3. **Cuckoo Filter Cascade** - Move the segments that hold none of the query text's terms behind the ones that may, checking a corpus-wide filter and then each segment's own. Excludes no segment. There is no level between them: documents are placed by key hash, so a group of segments holds nearly the whole vocabulary and could tell nothing apart
-4. **LSH Candidates** - Name each segment's entries that share the query's hash buckets, for stage 5 to measure beside its graph search. Excludes no segment and confines no search
-5. **HNSW Vector Search** - Precise ANN search, with stage 4's candidates measured and ranked in, and a tail scan for unindexed entries
-6. **Full Vector Rerank** - Exact distance computation on candidates
-7. **LLM Relevancy Scoring** - Optional semantic relevancy scoring
+- **Stage 0 — Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
+- **Stage 0b — Segment Prioritisation** - Order the candidate segments by estimated selectivity
+- **Stage 1 — Cuckoo Filter Cascade** - Move the segments that hold none of the query text's terms behind the ones that may, checking a corpus-wide filter and then each segment's own. Excludes no segment. There is no level between them: documents are placed by key hash, so a group of segments holds nearly the whole vocabulary and could tell nothing apart
+- **Stage 2 — LSH Candidates** - Name each segment's entries that share the query's hash buckets, for stage 3 to measure beside its graph search. Excludes no segment and confines no search
+- **Stage 3 — HNSW Vector Search** - Precise ANN search, with stage 2's candidates measured and ranked in, and a tail scan for unindexed entries
+- **Stage 4 — Full Vector Rerank** - Exact distance computation on candidates
+- **Stage 5 — LLM Relevancy Scoring** - Optional semantic relevancy scoring
 
 Each stage checks for cancellation and timeout, allowing queries to return partial results if time-constrained.
 
-Stage 2 orders and never excludes. The estimate comes from a Count-Min sketch, which over-counts,
+Stage 0b orders and never excludes. The estimate comes from a Count-Min sketch, which over-counts,
 and a segment dropped on an over-count loses results that are in the corpus; a segment with no
 sketch is given the highest estimate rather than the lowest. What the ordering buys is that the
 stage after it, and a query that runs out of time, spend what time there is on the segments most
@@ -2550,23 +2557,23 @@ the shares.
   and reports a damaged one without counting it as damage, and `excalibur-backup` copies it as
   derived state that `--exclude-derived` leaves out.
 
-Stage 3 orders and never excludes, for the same reason stage 4 never does. Every query the
+Stage 1 orders and never excludes, for the same reason stage 2 never does. Every query the
 pipeline runs is a nearest-neighbour search over an embedding, and `POST /v1/query` hands it the
 question's text beside that embedding. The embedding is there because the words a question is
 phrased in need not be the words of the documents that answer it — the semantic expansion example
 above turns `out of RAM` into `OOM killer` for exactly that reason — so a segment holding none of
 the question's terms can hold its nearest neighbours, and dropping it would lose them without
 saying so. What the filter's answer does say is where the question's words are, and a segment
-holding them is the likelier one to answer. Stage 3 therefore moves the segments the filter vouches
-hold none of the terms behind the others, keeping stage 2's order within each group, and every
-segment is searched. As with stage 2, what the ordering buys is that a query which runs out of
-time has spent it on the segments most likely to answer. The two signals differ: stage 2's
+holding them is the likelier one to answer. Stage 1 therefore moves the segments the filter vouches
+hold none of the terms behind the others, keeping stage 0b's order within each group, and every
+segment is searched. As with stage 0b, what the ordering buys is that a query which runs out of
+time has spent it on the segments most likely to answer. The two signals differ: stage 0b's
 estimate multiplies each term's share of a segment and over-counts, while the filter asks whether
 any one term is present at all.
 
-Stage 3 moves a segment back only where the term filter can speak for it. Both write paths fill it:
-`POST /v1/reindex` through the batch publisher, which targets a segment it chose itself, and
-`POST /v1/ingest` through the storage engine, which reports the segment each chunk routed to.
+Stage 1 moves a segment back only where the term filter can speak for it. Every write path fills
+it the same way: `POST /v1/ingest`, `POST /v1/documents` and `POST /v1/reindex` file each chunk's
+terms under the segment the storage engine reports the chunk routed to.
 Entries also reach a segment without being written to it, and each such segment's level is refilled
 from the entries it holds, on a background thread, one segment at a time: every segment when the
 node starts (the filter is in memory only), both children of a split, and the replacement a
@@ -2576,17 +2583,17 @@ before either child is routed to — and a stale level is not trusted until its 
 a segment keeps its place meanwhile rather than being moved back on a partial level. Four things
 leave the filter with nothing to say about a segment — the filter holding nothing for it, its
 level waiting to be refilled, a level having refused a term for want of room, and no filter being
-configured at all — and in each case stage 3 leaves the segment among those searched first. The
+configured at all — and in each case stage 1 leaves the segment among those searched first. The
 filter decides only the order; it never costs a result. `QueryPipelineRecallGateTest` holds the
 pipeline to that with query text present.
 
-Stage 4 adds candidates and never removes any. A query asks for the k nearest vectors, and every
+Stage 2 adds candidates and never removes any. A query asks for the k nearest vectors, and every
 non-empty segment has k nearest vectors however far away they are; an LSH bucket says which entries
 hashed alongside the query, a likelihood that falls off with distance, and bounds nothing about the
 distance of what it leaves out. An empty answer therefore means "nothing within the radius the hash
 shape favours", not "no neighbours here", and a short answer is some likely neighbours rather than
-the only ones. So stage 4 excludes no segment and confines no search: it hands stage 5, per
-segment, the node ids that share the query's buckets, and stage 5 measures those nodes exactly and
+the only ones. So stage 2 excludes no segment and confines no search: it hands stage 3, per
+segment, the node ids that share the query's buckets, and stage 3 measures those nodes exactly and
 ranks them together with what the graph search returned. A named node enters the answer only by
 being closer than a result the graph search found, so the answer is never worse than the graph
 search alone, and is better wherever the graph's beam walked past a near neighbour the buckets
@@ -2603,13 +2610,13 @@ the wrong vectors, and contribute nothing but wasted measurements.
 
 A candidate set names a scattering of nodes drawn from wherever the pre-filter's buckets fell, not a
 connected region of the graph, so the graph's edges are used to reach named nodes and never to
-decide which of them may be measured. Stage 5 measures a set one of two ways, whichever does less
+decide which of them may be measured. Stage 3 measures a set one of two ways, whichever does less
 work: it reads every named node when the set is small, which is exact at one node read per name, or
 it runs a second graph search that keeps only named nodes. Reading reads `|C|` nodes; a search that
 keeps a `|C| / nodeCount` fraction of what it visits reads on the order of `ef * nodeCount / |C|`
 before its beam is full, so reading is both the cheaper and the exact answer while
 `|C|² <= ef * nodeCount` - which for a hundred-thousand-node segment at `ef = 200` covers every
-candidate set the default shape realistically produces. That is the whole cost of stage 4 to a
+candidate set the default shape realistically produces. That is the whole cost of stage 2 to a
 query: a probe of each table, plus those reads.
 
 Because it is keyed by node id, a pre-filter is only meaningful beside the graph it was built
@@ -2621,7 +2628,7 @@ which replaces the file but not the graph.
 Since the candidates can only add to an answer, an index that disagrees with its graph costs work
 and nothing else: one that has not yet seen every node names fewer of them, an id naming no live
 node is skipped when it is measured, and no index has ever seen the un-integrated write-log tail,
-which stage 5 scans directly from the log regardless. `QueryPipelineRecallGateTest` holds the whole
+which stage 3 scans directly from the log regardless. `QueryPipelineRecallGateTest` holds the whole
 pipeline to its graphs' recall against brute force - see [Running Benchmarks](#running-benchmarks).
 
 ### Segment Identity
@@ -3060,7 +3067,7 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `HierarchicalDeletionPropagationIntegrationTest` - A delete reaches the corpus and segment levels of the hierarchical filter, including under concurrency
 - `DocumentErasureIntegrationTest` - An erased document leaves storage, the lexical index's files and vector search, through the node's own erasure wiring
 - `GraphRouteIntegrationTest` - A document ingested from a directory, with extraction against a stand-in OpenAI-compatible chat endpoint, is built into the graph and answered from over HTTP as of a date after its fact began, and declined as of one before
-- `LshHnswEntryIdContractTest` - The LSH index returns ids in the HNSW graph's id space, so the candidates stage 5 measures are the nodes the buckets describe
+- `LshHnswEntryIdContractTest` - The LSH index returns ids in the HNSW graph's id space, so the candidates stage 3 measures are the nodes the buckets describe
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
 - `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback

@@ -639,7 +639,9 @@ Unless `respect_robots_txt` is `false`, the crawl follows each site's `robots.tx
 
 - **When it is read.** The file is read once per origin (scheme, host and port) per run, whether
   that run is the first crawl, a scheduled re-crawl or `POST /v1/reindex`, and it is kept for the
-  rest of that run.
+  rest of that run or for 24 hours, whichever ends first: a run still crawling an origin a day
+  after reading its file reads it again, since RFC 9309 lets a crawler rely on one reading for no
+  longer than that.
 - **How it is fetched.** It goes through the same host allow-list, public-address check, timeout,
   pacing, `user_agent` and redirect handling as any page. The path filters do not apply to it.
 - **Which rules apply.**
@@ -960,7 +962,19 @@ filesystem source. A `robots.txt` the site cannot serve is a different case, rep
 ```
 
 `state` is one of `idle`, `crawling`, `embedding`, `indexing`, or `unconfigured`. `progress` is
-`[0.0, 1.0]`. `last_error` is `null` unless the most recent ingestion cycle failed.
+`[0.0, 1.0]`. `last_error` describes the most recent ingestion run, and is cleared when the next
+one starts. It is `null` for a run that ingested every document it listed, and set when the run:
+
+- failed outright — the crawl or the ingestion broke, and the message says how;
+- finished but left documents behind — `N of M documents were not ingested; each failure is
+  logged separately`, with the source still `idle` and what did land searchable;
+- was stopped before it finished, as a shutdown stops it — `Ingestion stopped`;
+- was cut short by a restart — `The run in progress when the node stopped did not finish`, as
+  above;
+- could not run because the node is `unconfigured`, below — or, on such a node, could not even
+  read the source to count what it holds.
+
+A reindex of the source reports on `GET /v1/reindex/status` instead and leaves this field alone.
 
 `unconfigured` means this node's ingestion pipeline failed to wire at startup. The source was still
 crawled, so the documents that exist are counted into `entries_pending` and none were indexed, and
@@ -1419,7 +1433,7 @@ The removals are counted separately because either can fall short:
 
 - `chunks_erased` left storage, which is the only place a chunk's text and vector live.
 - `chunks_unindexed` were erased from the lexical index, which stops them matching immediately.
-- `vectors_hidden` were retired from the graph, so no entity search ranks the document again. It counts graph nodes, not vectors in a segment's HNSW index — those are reclaimed with the segment, as below.
+- `vectors_hidden` counts the HNSW nodes this request retired across every segment's vector graph — the vectors of the documents' chunks, including those of versions the documents replaced — so no vector query ranks them again. A node already retired, by an earlier erasure or by the node replaying the chunk's deletion, is not counted again, so a repeated request reports `0`. The nodes' disk space is reclaimed when their graph is compacted.
 - `compacted` is true only when nothing is owed afterwards: the index was rewritten and `outstanding` is zero. A compaction that ran but had to leave some of its segments as they were — because a chunk's text could not be read back from storage just then — reports `false`, and the erasure stays owed until a later compaction discharges it. `chunks_reclaimed` is how many chunks the rewrite took off disk. `outstanding` is what the node still owes; watch it on `GET /v1/stats` under `lexical`.
 - `documents_not_found` is reported rather than folded into success: a caller under an obligation needs to know this node never held the document instead of assuming it was removed.
 - The `graph_*` fields are the graph half, below. `graph_erasure_complete` is the one to read: while it is `false` the reply is a `202`, not a `200`.
@@ -1480,10 +1494,10 @@ kept for exactly the documents that fell short, so the repeat can still name the
 caller looping a source erasure until `documents_remaining` reaches zero **must also watch
 `documents_incomplete`**, or it will loop forever over documents the node keeps failing to erase.
 
-What it does not cover: the vector indexes are reclaimed per segment rather than per entry, so until
-the segment holding an erased chunk is compacted a vector query can still rank it — without content,
-which is resolved from storage and no longer there, but under its chunk id. The membership filter is
-also left alone deliberately: it indexes terms, which are shared with documents that remain.
+The vector indexes are covered as well: each erased document's HNSW nodes are retired in every
+segment's graph before the response is sent, so no vector query ranks them afterwards; only the disk
+space they occupy waits for the graph's compaction. What it does not cover is the membership filter,
+left alone deliberately: it indexes terms, which are shared with documents that remain.
 
 Nor can it reach the source. A document erased here and still present in the directory or website it
 was crawled from comes back on the next re-crawl — which is why a source-scoped erasure deregisters
@@ -1599,7 +1613,7 @@ Key fields:
 - **`coverage.estimated_corpus_coverage`** — Fraction of the live corpus this query actually read. Segments it did not read (`segments_excluded`), that failed (`segments_with_errors`) or that did not answer in time (`segments_timed_out`) each reduce it, and each is counted once. < 1.0 during cold-start or heavy ingestion. Use this to decide whether to retry.
 - **`coverage.segments_excluded`** — Live segments this query did not read for a reason that is not a failure. Two things land here: segments held back because `include_partial_segments` was `false`, which is your own choice; and segments with no vector index to search, which is the node's — their entries are in storage and no graph speaks for them. If you sent `include_partial_segments: true` and this is not zero, it is the second, and the node's log says which segments and why.
 - **`coverage.tail_scan_entries`** — How many entries this query read straight from segment write-log tails, i.e. entries that are already stored and searchable but not yet built into an HNSW graph. It is a freshness signal, not a fault: a steady non-zero value under ingestion is normal, and a large one means the tail scan is doing work the graph would otherwise do faster. If a tail scan has to stop early, `degraded` says so.
-- **`coverage.degraded`** — `true` when this answer is not what a fully healthy node would have returned. Four things set it: `estimated_corpus_coverage` below the node's threshold; a segment that errored; a segment that did not answer in time; and a segment whose write-log tail scan stopped early, which is the one case the counts above cannot show you — it is neither an error nor a timeout, its results are kept, and `segments_searched` still counts it, so without this flag the response would claim the whole corpus was read. It is also set when `enable_llm_scoring` was honoured and the relevancy model failed or ran out of time, so the answer kept its retrieval order; when a result was dropped for having no document identity; and on every lexical answer, which came from one signal — see [the lexical answer](#degraded-retrieval--lexical-answers). `degraded` never means the results are wrong; it means they are partial or ranked by a weaker signal, so retrying is worth considering.
+- **`coverage.degraded`** — `true` when this answer is not what a fully healthy node would have returned. Four things set it: `estimated_corpus_coverage` below the node's threshold; a segment that errored; a segment that did not answer in time; and a segment whose write-log tail scan stopped early, which is the one case the counts above cannot show you — it is neither an error nor a timeout, its results are kept, and `segments_searched` still counts it, so without this flag the response would claim the whole corpus was read. It is also set when `enable_llm_scoring` was honoured and the relevancy model failed or ran out of time, so the answer kept its retrieval order; when a result was dropped for having no chunk identity; and on every lexical answer, which came from one signal — see [the lexical answer](#degraded-retrieval--lexical-answers). `degraded` never means the results are wrong; it means they are partial or ranked by a weaker signal, so retrying is worth considering.
 - **`ignored_fields`** — the fields you sent that this answer accepted and did not act on. It is on every answer, empty included, on every route. See [the lexical answer](#degraded-retrieval--lexical-answers) and [hybrid retrieval](#hybrid-retrieval--both-signals) for which fields each route can leave unacted on.
 - **`timed_out`** — `true` if the timeout was hit. Partial results may still be returned (best-effort).
 - **`cancelled`** — `true` exactly when `DELETE /v1/query/{query_id}` withdrew this query, which is
@@ -2159,7 +2173,8 @@ curl -X DELETE http://localhost:8080/v1/query/b3d9f4a0-1e2c-4a7b-9c3d-5e6f7a8b9c
 Use the `query_id` returned in the original query response. Cancellation is cooperative and
 propagates through all query pipeline stages, both signals of a hybrid query, and the relevancy
 model. The two answers agree: when this route answers `"cancelled": true`, the query's own response
-is `200` with `"cancelled": true`, no results, and `coverage.degraded: true` — on the vector, hybrid
+is `200` with `"cancelled": true`, no results, `coverage.degraded: true` and
+`coverage.estimated_corpus_coverage` of `0` — on the vector, hybrid
 and lexical routes alike, and even when the search had already finished, because the query's answer
 is written only once it can no longer be withdrawn. When this route answers `"cancelled": false` or
 `404`, the query was not withdrawn and answers as it would have. A query that misses its deadline
@@ -2466,7 +2481,7 @@ corpus having moved under an entry, which no size would have helped. A node with
 `hitRatio` and near-zero `evictions` is not under-sized — it is being written to faster than the
 same question comes back, and the cache is not the right tool for it.
 
-The other four `cuckoo` figures describe the per-segment membership filters that stage 3 of a
+The other four `cuckoo` figures describe the per-segment membership filters that stage 1 of a
 query orders segments by, searching the segments that hold the question's terms first. Every
 segment is still searched: a question's nearest vectors need not share its words.
 
@@ -2681,7 +2696,7 @@ Everything exported is a figure the node already measures; nothing here is estim
 | Family | Type | What it answers |
 |---|---|---|
 | `excalibur_query_latency_milliseconds{quantile=...}` | summary | p50, p90, p95, p99, p99.9 and `_count`. No `_sum`: the histogram reconstructs its mean from bucket positions, and an estimate published as an exact total is worse than an absent one |
-| `excalibur_http_responses_total{class="2xx".."5xx"}` | counter | Request rate and error rate. Counted where every response body is written, so a route added later is instrumented by existing |
+| `excalibur_http_responses_total{class="1xx".."5xx"}` | counter | Request rate and error rate. Counted where every response body is written, so a route added later is instrumented by existing |
 | `excalibur_http_rejections_total{reason="throttled"\|"unauthenticated"}` | counter | Rate-limit and capacity refusals, and authentication failures, counted rather than left to the log |
 | `excalibur_queries_executed_total`, `excalibur_entries_ingested_total`, `excalibur_ingestion_rate_entries_per_second` | counter, gauge | Query and ingestion throughput |
 | `excalibur_queries_active`, `_registered_total`, `_cancelled_total` | gauge, counter | What is running now; the same figures `/v1/query/status` serves |
@@ -2809,7 +2824,7 @@ its format, which is what turns "these bytes are unaltered" into "these segments
 open" — a checksum proves only that a file is the one that was copied, so damage already there at
 the copy verifies faithfully without it:
 
-- Segments and `catalog.dat`, HNSW graphs and their document mappings, quantiser codebooks and
+- Segments and `catalog.dat`, HNSW graphs and their node-to-chunk mappings, quantiser codebooks and
   LSH tables go to the engine's own checkers, on a scratch copy, because several of them repair
   what they open. Proven means every entry's checksum, the catalog's header and record CRCs, or
   the seal a clean close writes.
@@ -2869,7 +2884,7 @@ copy loses is whatever the catalog and the segments disagree about, not the corp
 `--exclude-derived` leaves out what something will rebuild — the lexical chunk index, a tenant's
 built edge store, the quantiser codebooks, the segments' term sketches — at the cost of a reindex
 and a graph build on the far side; the sketches the node rebuilds by itself as it opens each
-segment. The HNSW graphs and their document mappings are never left out, derived though they
+segment. The HNSW graphs and their node-to-chunk mappings are never left out, derived though they
 are, because nothing rebuilds them: deleting a `.hnsw` gives an empty graph attached to a
 populated segment, not a repopulated one. A mapping an interrupted compaction staged
 (`segment_<N>.hnsw.compact.docmap`) is kept with them for the reason below. The write-ahead logs
@@ -2894,8 +2909,8 @@ do not:
   graph still present means the swap never started and both are discarded, and a staged mapping
   alone means the graph was already replaced and the mapping rename has to be finished. A filter
   that excludes `*.compact` but keeps `*.compact.docmap` turns a recoverable interruption into a
-  graph whose node numbering and document mapping disagree, which answers with the wrong
-  document rather than failing.
+  graph whose node numbering and node-to-chunk mapping disagree, which answers with the wrong
+  chunk rather than failing.
 
 ### Checking a data directory
 
@@ -3009,7 +3024,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | `hnsw.queueDepth` keeps growing | Integration worker falling behind | Check logs for errors; slow down ingestion; increase hardware |
 | All LLM calls failing | A circuit breaker tripped. Embeddings, relevancy scoring, query expansion, relation extraction, the graph rerank, the graph question embedding and the graph build's entity embedding each have their own, so check which on `breakers` in `/v1/stats`: relevancy scoring stopping while ingestion continues is `llmRelevancy`, the reverse is `embedding`, queries losing their expansions is `queryExpansion`, a graph that stopped growing is `graphExtraction`, graph answers no longer reranked by the model is `graphRerank` (or `graphQueryEmbedding` for the vector rerank), and a build that published entities without vectors is `graphBuildEmbedding` | Wait for the cooldown (default 60s), after which one probe is admitted. Confirm API key/endpoint. Queries still work without LLM scoring. |
 | Queries return nothing on a fresh node, but `coverage` reads `1.0000` | Not a cold-start indicator. `/health` coverage counts the segments a query reads, and an empty segment is read as readily as a full one, so it reads `1.0000` and `/health` reports `ready` and `healthy` | Look at `/v1/stats` instead: `entries.total` and `segments.active` are `0` until something is indexed |
-| A node answers `200` to everything but its results are getting worse | A circuit breaker has opened: the embedding one drops retrieval to lexical-only, the relevancy one bypasses stage-5 re-ranking, the query-expansion one searches every query as typed, and on the graph route the rerank one keeps the BM25 order and the question-embedding one skips the vector rerank; the graph build-embedding one publishes a build's entities without vectors | `breakers` on `/v1/stats`, or `excalibur_circuit_breaker_state` on `/metrics`. Alert on `> 0` for any `breaker` label |
+| A node answers `200` to everything but its results are getting worse | A circuit breaker has opened: the embedding one drops retrieval to lexical-only, the relevancy one bypasses stage 5's relevancy scoring, the query-expansion one searches every query as typed, and on the graph route the rerank one keeps the BM25 order and the question-embedding one skips the vector rerank; the graph build-embedding one publishes a build's entities without vectors | `breakers` on `/v1/stats`, or `excalibur_circuit_breaker_state` on `/metrics`. Alert on `> 0` for any `breaker` label |
 | `hnsw.queueDepth` grows without bound while `coverage` stays `1.0000` and `/health` stays healthy | The index orchestrator is dead | `workers.indexOrchestratorRunning` on `/v1/stats`, `indexerRunning` on `/health`, and `/health/ready` answers `503` with `indexer` in `failed` |
 | Vector search returns fewer results than the corpus should hold, with no error | One or more segments came up without their vector index and are serving key-value data only | `vectorIndex.segmentsWithoutIndex` on `/v1/stats` names each segment and why |
 | A rolling restart drops in-flight requests | The load balancer was still choosing the node when it stopped | `POST /v1/drain`, wait for in-flight work to finish, then restart. `/health/ready` answers `503` for the duration |
@@ -3024,7 +3039,7 @@ Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3`
 | A `WARN` at startup naming documents that "were being ingested when this node last stopped" | Those documents were half written when the node died, and their chunks are hidden until the ingest is redone. Not an error: it is the crash being cleaned up after | Nothing — the next crawl of that source re-ingests them and they become visible again. `POST /v1/erasure` removes them instead |
 | `lexical.oldestErasureAgeMs` exceeds `lexical-max-latency-seconds` | The sweep that enforces the bound runs every tenth of it, so a reading just past the bound is ordinary; one far past it means the sweep is failing, and the node's log says why | Read the log for a failed compaction. Ingesting or reindexing anything also settles the backlog before the run finishes |
 | `lexical.unreadableChunksDropped` is above zero, or `excalibur_lexical_unreadable_chunks_dropped_total` rose | A compaction found chunks whose stored text fails its checksum or cannot be decoded, and dropped them from keyword search so the rest of their segments could be rewritten; or an erasure was owed while a lexical segment could be neither read nor rebuilt, and the segment was removed. The node's log names each chunk or segment at ERROR | Check the disk under the data directory, run `excalibur-fsck` with the node stopped, and reindex the named chunks' documents from their source |
-| `excalibur_query_unnamed_results_dropped_total` rose, or query answers are `degraded` at full coverage with a WARN naming segments whose results "carry no document identity" | Those segments' `.docmap` is missing or damaged, so their graph nodes name no chunk and cannot be returned | Run `excalibur-fsck` with the node stopped to confirm which mapping is damaged. Nothing rebuilds a mapping in place, and a compaction only re-keys the one it finds: restore the graph and its mapping together from an `excalibur-backup` image, or reindex the sources whose documents that segment holds |
+| `excalibur_query_unnamed_results_dropped_total` rose, or query answers are `degraded` at full coverage with a WARN naming segments whose results "carry no chunk identity" | Those segments' `.docmap` is missing or damaged, so their graph nodes name no chunk and cannot be returned | Run `excalibur-fsck` with the node stopped to confirm which mapping is damaged. Nothing rebuilds a mapping in place, and a compaction only re-keys the one it finds: restore the graph and its mapping together from an `excalibur-backup` image, or reindex the sources whose documents that segment holds |
 | `lexical.unreadableSegments` is above zero, or `excalibur_lexical_unreadable_segments` is | A lexical segment failed its checksum or lost a file, so its chunks (`unsearchableChunks`) match no keyword query. The node's log names it at `ERROR` as it opens, with the reason | If `lexical.unreadable` says `rebuildable: true`, nothing: the next compaction rebuilds it, and `segments_rebuilt` on `/v1/compact/status` reports it. Otherwise its key table is damaged too — check the disk, and reindex the documents of the sources it served. The first erasure the node records removes such a segment, so copy it aside with `excalibur-fsck --repair` first if you want to keep it |
 | A re-crawled document appears twice in results | Not the chunk index — it replaces a chunk identifier rather than appending. Check whether the source is listing one document under two ids | Compare the `document_id` values on the two hits — that is the chunk identifier, `source:document:chunk:N`: identical means a bug, different means the source |
 | `/v1/stats` reports `cuckoo.saturated: true` | The membership filter is full. A level that cannot record a term is no longer trusted to say what its segment lacks, so queries order segments by their term sketches alone. Answers are unaffected; a query that runs out of time may have spent it on less likely segments first | Raise `excalibur.filter.corpus-capacity` past your term count and restart |
