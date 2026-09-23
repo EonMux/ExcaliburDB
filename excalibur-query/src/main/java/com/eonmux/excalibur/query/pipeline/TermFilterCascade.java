@@ -13,52 +13,57 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * Stage 1: Hierarchical Cuckoo Filter Cascade.
  *
- * <p>Eliminates segments that cannot contain relevant entries using
- * the hierarchical Cuckoo filter. Segments that pass this stage
- * are candidates for further processing.</p>
+ * <p>Moves the candidate segments the hierarchical Cuckoo filter vouches hold none of the query
+ * text's terms behind the ones that may hold some, keeping Stage 0b's order within each group.
+ * Every candidate is still searched.</p>
  *
- * <h2>Term-Based Filtering</h2>
- * <p>This implementation uses term-based filtering:
+ * <h2>Why term membership orders and never excludes</h2>
+ * <p>Every request the pipeline runs is a nearest-neighbour query over an embedding, and the
+ * HTTP route hands it the question's text beside that embedding. The embedding is there because
+ * the words a question is phrased in need not be the words of the documents that answer it: a
+ * segment whose chunks say "OOM killer" is exactly where "out of RAM" should reach. A segment
+ * holding none of the query's terms can therefore hold its nearest neighbours - every non-empty
+ * segment holds k nearest vectors, whatever words sit beside them - and dropping it on the
+ * filter's word loses them with nothing to show for it: the query succeeds, coverage reads as
+ * complete, and the results are simply further away. No request asks for term-gated vector
+ * search, so there is no case in which the exclusion is the answer asked for.</p>
+ *
+ * <p>What the filter's answer does say is where the query's words are, and a segment holding
+ * them is the likelier one to answer. So, like Stage 0b's sketch estimate, it decides the order
+ * the segments are dispatched in, which is what a query that runs out of time has spent its
+ * time on. The two signals differ: the sketch multiplies each term's estimated share of a
+ * segment, which a single absent term takes to nearly nothing, and over-counts; the filter asks
+ * whether any one term is present, with a false-positive rate the filter is sized for. The
+ * filter's answer is the coarser key, so it partitions and the sketch orders within each
+ * part.</p>
+ *
+ * <h2>Term-Based Lookup</h2>
  * <ol>
  *   <li>Extract significant terms from query text using {@link TermExtractor}</li>
- *   <li>For each term, find candidate segments that might contain that term</li>
- *   <li>Union all candidate segments across all query terms</li>
- *   <li>This gives segments that might contain ANY of the query terms</li>
+ *   <li>For each term, find the segments that might contain it, asking the corpus-wide level
+ *       and then each segment's own</li>
+ *   <li>Union the segments across all query terms: a segment holding any one of them is kept
+ *       in front</li>
  * </ol>
+ * <p>Ingestion and the shard's level refills file chunk text through the same
+ * {@link TermExtractor}, and segment ids are compared as {@code String.valueOf(segmentId)} on
+ * both sides.</p>
  *
- * <h2>Key Matching</h2>
- * <p><strong>CRITICAL:</strong> For this to work correctly:
- * <ul>
- *   <li><strong>Ingestion:</strong> Terms from chunk text are inserted into the filter</li>
- *   <li><strong>Query:</strong> Terms from query text are used to find candidate segments</li>
- *   <li>Both use the same {@link TermExtractor} for consistent term extraction</li>
- * </ul>
- *
- * <h2>Segment ID Format</h2>
- * <p>Segment IDs are compared as strings using {@code String.valueOf(segmentId)}
- * to match the format used during ingestion. Both sides must use this format.</p>
- *
- * <h2>Domain Correctness</h2>
- * <ul>
- *   <li>Query terms extracted consistently with ingestion pipeline</li>
- *   <li>Segment IDs compared as strings (filter returns String IDs)</li>
- *   <li>Empty candidate set is valid (no segments match any query term)</li>
- *   <li>If no terms extracted, all candidates pass through (no filtering)</li>
- * </ul>
- *
- * <h2>Coverage is judged over the whole lookup, not after it</h2>
- * <p>A segment is pruned on two answers taken at different moments: that its level covers it,
- * and that none of the query's terms was found in that level. A rebuild of the level can
- * complete between them - the lookups ran against a level still being refilled and missed a
- * term the segment holds, and coverage asked afterwards says trusted. So each candidate's
+ * <h2>A segment is moved back only on a verdict the filter could give</h2>
+ * <p>A level speaks for a segment only while it holds everything the segment holds: see
+ * {@link #filterCovers} for the ways it may not. A segment the filter does not cover stays in
+ * front, since the filter has not looked at it. And coverage is judged over the whole lookup,
+ * not after it: a rebuild of the level can complete between the lookups and the verdict - the
+ * lookups ran against a level still being refilled and missed a term the segment holds, and
+ * coverage asked afterwards says trusted. So each candidate's
  * {@linkplain HierarchicalCuckooFilter#coverageStamp(String) coverage stamp} is read before the
- * lookups and again after, and a segment is pruned only when both are the same covering stamp:
- * the level was then trusted, and was the same level, for every lookup in between.</p>
+ * lookups and again after, and a segment is moved back only when both are the same covering
+ * stamp. A wrong verdict now costs order rather than results, but an ordering signal is worth
+ * having only while it says what the filter actually knows.</p>
  */
 final class TermFilterCascade {
 
@@ -68,18 +73,18 @@ final class TermFilterCascade {
 
     /**
      * @param hierarchicalFilter The filter to consult, or null when none is configured, in
-     *                           which case every candidate passes
+     *                           which case the order is left as it is
      */
     TermFilterCascade(HierarchicalCuckooFilter hierarchicalFilter) {
         this.hierarchicalFilter = hierarchicalFilter;
     }
 
     /**
-     * Drops the candidate segments the filter can vouch hold none of the query's terms.
+     * Moves the candidates the filter vouches hold none of the query's terms to the back.
      *
      * @param context The pipeline context with segment candidates
      * @param token The cancellation token
-     * @return Context with the surviving candidates
+     * @return Context with every candidate, those that may hold a query term first
      */
     PipelineContext apply(PipelineContext context, CancellationToken token) {
         token.checkCancelled("Stage 1 cancelled before Cuckoo filter cascade");
@@ -88,38 +93,41 @@ final class TermFilterCascade {
 
         List<String> queryTerms = termsToLookUp(context);
         if (queryTerms.isEmpty()) {
-            return context.withCandidates(new ArrayList<>(context.candidates));
+            return context;
         }
 
         LOGGER.trace("Stage 1: Extracted {} terms from query: {}",
             queryTerms.size(), queryTerms);
 
-        // Before the lookups: a segment is prunable only if its level was already trusted when
-        // they began and still is, unchanged, when they end.
+        // Before the lookups: a segment may be moved back only if its level was already trusted
+        // when they began and still is, unchanged, when they end.
         Map<Long, Long> coveredBefore = coverageStamps(context.candidates);
         TermMatches matches = segmentsHoldingAnyTerm(queryTerms);
 
-        // A segment is excluded only on the word of a filter that actually holds its terms.
-        // Several ways it does not. A level is filled by the writes that reach its segment, so
-        // one whose segment took entries another way - reopened at startup, handed its share of
-        // a split, rewritten by a compaction - is stale until the shard refills it from the
-        // segment; a segment with no level, or an empty one, has had nothing looked at; and a
-        // level that ran out of room refused terms it was asked to record, so it holds some of a
-        // segment and reads as though it held all of it. Reading either silence as "this term
-        // is in no segment" makes queries return zero results for documents sitting in storage.
-        // Nothing errors; the database simply answers that it knows nothing. An index that
-        // cannot speak for a segment has no verdict to give.
-        List<SegmentCandidate> passed = context.candidates.stream()
-            .filter(c -> survivesTermFilter(hierarchicalFilter, c.segmentId(), matches.segmentIds(),
-                coveredBefore.getOrDefault(c.segmentId(), HierarchicalCuckooFilter.NOT_COVERED)))
-            .collect(Collectors.toList());
+        List<SegmentCandidate> mayHoldTerms = new ArrayList<>(context.candidates.size());
+        List<SegmentCandidate> holdNone = new ArrayList<>();
+        for (SegmentCandidate candidate : context.candidates) {
+            long stampBefore = coveredBefore.getOrDefault(
+                candidate.segmentId(), HierarchicalCuckooFilter.NOT_COVERED);
+            if (mayHoldQueryTerms(hierarchicalFilter, candidate.segmentId(),
+                    matches.segmentIds(), stampBefore)) {
+                mayHoldTerms.add(candidate);
+            } else {
+                holdNone.add(candidate);
+            }
+        }
 
-        LOGGER.debug("Stage 1: {} of {} segments passed Cuckoo filter cascade "
-            + "({} terms matched, {} unique segment IDs from filter)",
-            passed.size(), context.candidates.size(), matches.termsWithMatches(),
-            matches.segmentIds().size());
+        LOGGER.debug("Stage 1: {} of {} segments may hold a query term and are searched first, "
+            + "{} hold none ({} terms matched, {} unique segment IDs from filter)",
+            mayHoldTerms.size(), context.candidates.size(), holdNone.size(),
+            matches.termsWithMatches(), matches.segmentIds().size());
 
-        return context.withCandidates(passed);
+        if (holdNone.isEmpty()) {
+            return context;
+        }
+        List<SegmentCandidate> ordered = new ArrayList<>(mayHoldTerms);
+        ordered.addAll(holdNone);
+        return context.withCandidates(ordered);
     }
 
     /**
@@ -127,25 +135,22 @@ final class TermFilterCascade {
      *
      * <p>Three silences end the cascade the same way and are told apart only in the log: no
      * filter is configured, the request carried no text, and the text held no significant term.
-     * In none of them has anything been asked of the filter, so no segment may be dropped on
-     * the strength of it.</p>
+     * In none of them has anything been asked of the filter, so the order is left alone.</p>
      *
      * @param context The pipeline context, read for the query text and the candidate count
-     *                the log reports as passing untouched
-     * @return The terms to look up, or an empty list when every candidate must pass
+     *                the log reports
+     * @return The terms to look up, or an empty list when the order stands as it is
      */
     private List<String> termsToLookUp(PipelineContext context) {
-        // If no hierarchical filter configured, pass all segments through
         if (hierarchicalFilter == null) {
-            LOGGER.debug("Stage 1: No hierarchical filter configured, {} candidates pass",
+            LOGGER.debug("Stage 1: No hierarchical filter configured, {} candidates left in order",
                 context.candidates.size());
             return List.of();
         }
 
-        // Extract query text
         String queryText = context.request.queryText();
         if (queryText == null || queryText.isEmpty()) {
-            LOGGER.debug("Stage 1: No query text for filter lookup, {} candidates pass",
+            LOGGER.debug("Stage 1: No query text for filter lookup, {} candidates left in order",
                 context.candidates.size());
             return List.of();
         }
@@ -153,8 +158,8 @@ final class TermFilterCascade {
         // Extract terms from query text using the same TermExtractor as ingestion
         List<String> queryTerms = TermExtractor.extractTerms(queryText);
         if (queryTerms.isEmpty()) {
-            LOGGER.debug("Stage 1: No significant terms extracted from query, {} candidates pass",
-                context.candidates.size());
+            LOGGER.debug("Stage 1: No significant terms extracted from query, {} candidates left "
+                + "in order", context.candidates.size());
         }
         return queryTerms;
     }
@@ -179,9 +184,9 @@ final class TermFilterCascade {
     /**
      * Unions the segments the filter reports for each query term.
      *
-     * <p>The union, not the intersection: a segment holding any one of the query's terms may
-     * still hold the answer, and requiring all of them would exclude segments on a test the
-     * ranking stages never applied.</p>
+     * <p>The union, not the intersection: a segment holding any one of the query's terms is as
+     * likely a place for the answer as the ranking stages can tell, and requiring all of them
+     * would move segments back on a test the ranking never applies.</p>
      *
      * @param queryTerms The terms extracted from the query text
      * @return The segment ids the filter named, and how many terms named at least one
@@ -217,11 +222,13 @@ final class TermFilterCascade {
     /**
      * Whether the hierarchical filter holds everything a segment holds.
      *
-     * <p>Only a segment the filter has actually been populated for can be excluded by it, and
-     * only while the filter has had room for every term of it. A segment with no registered
-     * filter, one holding nothing, or one whose segment or corpus level has refused a
-     * term for want of room is a segment the filter has no opinion about — which is not the
-     * same as one it has looked at and rejected.
+     * <p>A level is filled by the writes that reach its segment, so one whose segment took
+     * entries another way - reopened at startup, handed its share of a split, rewritten by a
+     * compaction - is stale until the shard refills it from the segment; a segment with no
+     * level, or an empty one, has had nothing looked at; and a level that ran out of room
+     * refused terms it was asked to record, so it holds some of a segment and reads as though
+     * it held all of it. In each case the filter's silence about a term says nothing about the
+     * segment.</p>
      *
      * @param segmentId The segment's id
      * @return true when the filter's silence about this segment is meaningful
@@ -231,7 +238,7 @@ final class TermFilterCascade {
     }
 
     /**
-     * Whether a segment survives the term filter.
+     * Whether a segment stays among those searched first.
      *
      * <p>It does when a query term was found in it, or when the filter did not speak for it for
      * the whole of the lookups: see {@link #filterCovers} for why a filter may have nothing to
@@ -243,10 +250,11 @@ final class TermFilterCascade {
      * @param matched       Segment ids the query's terms were found in
      * @param stampBefore   The segment's coverage stamp read before the lookups, or
      *                      {@link HierarchicalCuckooFilter#NOT_COVERED}
-     * @return true when the segment should be searched
+     * @return true when the segment may hold a query term; false only when the filter vouches
+     *         it holds none
      */
-    static boolean survivesTermFilter(HierarchicalCuckooFilter filter, long segmentId,
-                                      Set<String> matched, long stampBefore) {
+    static boolean mayHoldQueryTerms(HierarchicalCuckooFilter filter, long segmentId,
+                                     Set<String> matched, long stampBefore) {
         if (matched.contains(String.valueOf(segmentId))) {
             return true;
         }

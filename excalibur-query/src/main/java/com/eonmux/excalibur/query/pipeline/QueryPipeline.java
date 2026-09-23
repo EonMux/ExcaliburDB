@@ -36,7 +36,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>QueryPipeline implements the six-stage query execution flow from Phase 6:</p>
  * <ol>
  *   <li><strong>Stage 0 - Epoch Snapshot:</strong> Capture visibility epoch and resolve queryable segments</li>
- *   <li><strong>Stage 1 - Cuckoo Filter Cascade:</strong> Eliminate segments that cannot contain relevant entries</li>
+ *   <li><strong>Stage 1 - Cuckoo Filter Cascade:</strong> Search the segments that may hold the query text's
+ *       terms first; every segment is still searched, since a vector's neighbours need not share its words</li>
  *   <li><strong>Stage 2 - LSH Candidates:</strong> Name the entries sharing the query's hash buckets,
  *       for Stage 3 to measure exactly beside its graph search; never excludes or narrows</li>
  *   <li><strong>Stage 3 - HNSW Vector Search:</strong> Precise ANN within candidate segments with tail scan</li>
@@ -248,7 +249,7 @@ public class QueryPipeline {
      * @param distanceFunction The distance function
      * @param llmScorer Optional LLM scorer for Stage 5
      * @param coverageThreshold Threshold for degraded state
-     * @param hierarchicalFilter Optional hierarchical Cuckoo filter for Stage 1 pruning
+     * @param hierarchicalFilter Optional hierarchical Cuckoo filter Stage 1 orders segments by
      */
     public QueryPipeline(
             StorageEngine storageEngine,
@@ -277,7 +278,7 @@ public class QueryPipeline {
      * @param distanceFunction The distance function
      * @param llmScorer Optional LLM scorer for Stage 5
      * @param coverageThreshold Threshold for degraded state
-     * @param hierarchicalFilter Optional hierarchical Cuckoo filter for Stage 1 pruning
+     * @param hierarchicalFilter Optional hierarchical Cuckoo filter Stage 1 orders segments by
      * @param epochIsolationValidator Optional validator for node-level epoch filtering
      */
     public QueryPipeline(
@@ -311,7 +312,7 @@ public class QueryPipeline {
      * @param distanceFunction The distance function
      * @param llmScorer Optional LLM scorer for Stage 5
      * @param coverageThreshold Threshold for degraded state
-     * @param hierarchicalFilter Optional hierarchical Cuckoo filter for Stage 1 pruning
+     * @param hierarchicalFilter Optional hierarchical Cuckoo filter Stage 1 orders segments by
      * @param epochIsolationValidator Optional validator for node-level epoch filtering
      * @param pqSearch Whether a segment holding a trained quantizer may be searched through it
      */
@@ -655,7 +656,7 @@ public class QueryPipeline {
         context = SegmentPrioritizer.prioritize(context, token);
         partialContext.set(context);
 
-        // Stage 1: Cuckoo Filter Cascade
+        // Stage 1: Cuckoo Filter Cascade, which orders the segments and never excludes one
         context = termFilterCascade.apply(context, token);
         partialContext.set(context);
 

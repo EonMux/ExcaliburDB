@@ -24,9 +24,10 @@ import java.util.function.Supplier;
  * brute-force tail scan over un-integrated entries.</p>
  *
  * <p><strong>Candidate-Based Execution:</strong> Uses the candidates from
- * stages 0-1, which have been filtered by visibility tracking and the Cuckoo
- * filter cascade, each carrying the nodes stage 2's LSH lookup named for it.
- * This ensures that only segments visible at the captured epoch are searched.</p>
+ * stages 0-1, which visibility tracking has filtered and the sketch estimate and the Cuckoo
+ * filter cascade have ordered, each carrying the nodes stage 2's LSH lookup named for it.
+ * This ensures that only segments visible at the captured epoch are searched, and that the
+ * segments likeliest to answer are dispatched first.</p>
  *
  * <p><strong>Parallel Execution:</strong> Searches are executed in parallel
  * using the {@link ParallelQueryDispatcher} for improved latency across

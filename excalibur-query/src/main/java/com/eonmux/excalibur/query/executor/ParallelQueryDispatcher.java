@@ -173,8 +173,8 @@ public class ParallelQueryDispatcher {
      *
      * <p>The dispatcher fans out; it does not decide what to fan out to. Which segments a query
      * may read is settled by {@link com.eonmux.excalibur.query.pipeline.QueryPipeline}'s earlier stages -
-     * visibility, lifecycle state, the Cuckoo filter cascade - and arrives
-     * here already chosen, so there is one answer to "was this segment searched" rather than two
+     * visibility and lifecycle state, with the sketch estimate and the Cuckoo filter cascade
+     * deciding the order - and arrives here already chosen, so there is one answer to "was this segment searched" rather than two
      * that can drift apart.</p>
      *
      * @param segmentsToSearch The segments to search, each with the graph to search it in and the
