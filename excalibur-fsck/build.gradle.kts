@@ -38,7 +38,7 @@ dependencies {
     implementation(project(":excalibur-filter"))
     implementation(project(":excalibur-retrieval"))
     // The per-tenant graph staging logs live in the data directory too, and this is where their
-    // magic numbers and the one public read-only verifier among them are declared.
+    // magic numbers and the read-only inspections that replay each of them are declared.
     implementation(project(":excalibur-graph"))
     // The ingestion registries - the document registry, the source catalog and the source status
     // history - are written and read there, and the versions and markers a checker must accept

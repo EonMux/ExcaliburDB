@@ -426,6 +426,16 @@ swapped, both are staging leftovers, and the mapping is moved aside first; alone
 completed and it is the mapping the node installs on its next open, so it is verified, reported
 as `compacted-mapping-pending`, and never repaired — a damaged one goes to an operator.
 
+A namespace's graph staging logs — its two label interners, `triples.log`, `entity_text.log`,
+`erasure.log` and `withdrawals.log` — are replayed record by record, each by a read-only
+inspection that lives in the graph module beside the replay the node opens it with, so the two
+cannot disagree about what a record is. A log whose every record matched its checksum is `INTACT`,
+with the count proven. One ending in bytes that do not read as a record, with nothing readable
+after them, is `UNSEALED`: that is a process killed mid-append, and the node cuts those bytes off
+when it next opens the log, so the repair plan leaves it to the node. Damage the node refuses — a
+record failing its checksum with an intact one after it, or any whole record of the fixed-width
+`triples.log` failing its checksum — is `CORRUPT`.
+
 Repair is off by default: without `--repair` the plan is printed and nothing is touched. With it,
 the tool writes, and each write is stated before it is made. **No repair ever deletes anything.**
 A damaged file, an index whose segment is gone, or a staged file a rename never published is moved
@@ -436,14 +446,17 @@ write-ahead log that ends in a torn record — an append that never completed �
 opcode cleared, the same one-byte write the log itself makes when an append fails its fsync, so
 the log reads as ending before it. What it will not attempt matters as much as what it will: a
 damaged `catalog.dat`, a damaged `routing.dir`, a routing slot pointing at a missing segment, a
-write-ahead log damaged in the middle, or a damaged lexical store `manifest` are all reported under
-*needs an operator* and left alone. Which hash slot belongs to which segment after a split is not
+write-ahead log damaged in the middle, a damaged lexical store `manifest`, or a damaged graph
+staging log are all reported under *needs an operator* and left alone. Which hash slot belongs to which segment after a split is not
 recoverable from file names — that is why the directory is written down — and the records behind
 damage in a log were fsynced and acknowledged, so trimming past them would destroy committed
 writes. A log damaged in the middle is not moved aside either, for the same reason: setting the
 file aside sets those records aside with it, and unlike an index, nothing rebuilds a log. Nor is a
 lexical manifest: a store without one opens as a new, empty index and deletes every segment the
-empty manifest does not name. A damaged lexical segment, by contrast, is moved aside like any
+empty manifest does not name. Nor is a staging log: nothing rebuilds one and the node opens a
+missing one as empty, so moved aside, a label interner would hand its ids out again under the
+published graph, the triple log would empty the next build, and the erasure and withdrawal logs
+would forget what is still owed. A damaged lexical segment, by contrast, is moved aside like any
 damaged file — the node keeps it out of every query either way, and its next compaction rebuilds
 it from its key table and the stored text.
 
@@ -484,7 +497,7 @@ already there when it was copied verifies faithfully:
 | HNSW graphs and their node mappings, quantiser codebooks, LSH tables | the vector and filter modules, on a scratch copy | the seal a clean close writes. A mapping names each node's chunk at version 3 and its document at versions 1 and 2; one at a version the node does not read fails the image |
 | a compaction's staged pair (`segment_<N>.hnsw.compact`, `.hnsw.compact.docmap`) | `excalibur-fsck`, read-only | nothing, while both are there: the compaction never swapped, the node discards the pair on open, and a torn pair does not fail the image. A staged mapping alone is the only mapping the swapped graph matches, and is verified against its seal like any mapping |
 | write-ahead logs | `excalibur-fsck`'s checkers, read-only | every record replayed against its checksum |
-| graph staging logs | `excalibur-fsck`, read-only | the erasure ledger: every record against its CRC. The triple, entity and label logs: only their header, because their one open path writes |
+| graph staging logs | `excalibur-fsck`, read-only | every record of the label, triple, entity text, erasure and withdrawal logs against its CRC, walked by the graph module's own replay without opening the log. One ending in a write cut short is healthy and unproven: the node trims it on open. Damage the node refuses fails the image |
 | the lexical store | `excalibur-fsck`, read-only, as one structure | every column of every segment its manifest names |
 | segment term sketches (`segment_<N>.tfs`) | `excalibur-fsck`, read-only | a CRC32C over the header and one over the body. A damaged sketch is reported and does not fail the image: a node restored from it rebuilds the sketch when it opens the segment. One that cannot be read at all fails it |
 | the document registry, the source catalog and the source status history | `excalibur-fsck`, read-only | nothing — these formats carry no checksum. Each is held to what its reader requires — a header version it reads and a trailing record count that matches its lines — so one the node would refuse fails the image; a status history the node would only discard does not |

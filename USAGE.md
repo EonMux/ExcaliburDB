@@ -2943,9 +2943,9 @@ file too damaged to open still be judged. Each is reported as one of:
 |---|---|
 | `INTACT` | Bytes were weighed against a stored checksum and matched. The only status that is a claim of soundness |
 | `CORRUPT` | Bytes were weighed against a stored checksum and did not match |
-| `UNSEALED` | A writer still holds it. Deliberately not the same statement as intact |
+| `UNSEALED` | A writer still holds it, or a crash cut its last write short and the node cuts that write off when it next opens the file. Deliberately not the same statement as intact |
 | `LEGACY_UNPROTECTED` | Structure proven whole, but the format carries no checksum, so the contents cannot be verified |
-| `UNCHECKED` | Not a format this tool knows, or one with no read-only replay. Not evidence of damage and not evidence of health |
+| `UNCHECKED` | Not a format this tool knows, or one that carries nothing to check against. Not evidence of damage and not evidence of health |
 | `MISSING` / `UNREADABLE` | Named but absent; or a device or permission problem, or a header naming a format version this build does not read — the node refuses such a file too, so it fails the run and is put to an operator rather than moved aside |
 | `NOT_DATA` | A JVM heap dump (`*.hprof`) a node wrote into the directory. Reported with its size and never read: not engine state, so it neither passes nor fails anything, `--strict` included. Point `-XX:HeapDumpPath` elsewhere and move it there |
 
@@ -2962,6 +2962,24 @@ one document.
 
 It also checks across files: a catalog row naming a segment that is not there, an index with no
 segment, a staged file a rename never published.
+
+A namespace's graph staging logs — `entities.labels`, `relations.labels`, `triples.log`,
+`entity_text.log`, `erasure.log` and `withdrawals.log` under `<namespace>/graph-staging/` — are
+replayed record by record, each through a read-only inspection that lives beside the code the node
+opens and builds from it with, so the verdict is the node's:
+
+- Every record matched its checksum: `INTACT`, with the count proven (labels, staged facts,
+  snippets, or the erasures and withdrawals still owed). A triple or entity text log an earlier
+  build wrote is read in its own version and says the node rewrites it on its next open.
+- The log ends in bytes that do not read as a record, with nothing readable after them: `UNSEALED`.
+  That is what a process killed mid-append leaves, and the node cuts those bytes off when it next
+  opens the log, keeping every record before them — so it is not damage, it does fail `--strict`,
+  and the repair plan leaves it to the node.
+- Damage the node refuses — a record that fails its checksum with an intact record after it, or,
+  in `triples.log`, whose records are fixed width, any whole record that fails its checksum:
+  `CORRUPT`, and left for an operator (below). The node refuses the label interners and the entity
+  text log when it opens them, and a corrupt `triples.log` fails every graph build and erasure.
+- A header naming a version this build does not read: `UNREADABLE`, as for any other file.
 
 Three files are judged by what the node does with them rather than by name alone:
 
@@ -3023,6 +3041,7 @@ quarantine and the original directory removed. What it refuses to attempt matter
 | A write-ahead log damaged in the middle | The records behind the damage were fsynced and acknowledged. Trimming past them would destroy committed writes, and so would moving the file aside — nothing rebuilds a log the way a reindex rebuilds an index |
 | A damaged `segment_<N>.hnsw.compact.docmap` with no `.hnsw.compact` beside it | The graph already holds the compacted numbering, and without this mapping it would be served through the pre-compaction one — wrong documents rather than an error. Restore the graph and both mappings together, or reindex the segment |
 | A damaged lexical store `manifest` | A store without its manifest opens as a new, empty index and deletes every segment the empty manifest does not name. Restore the manifest from a backup, or remove the whole `chunk-index` directory and reindex |
+| A damaged graph staging log | Nothing rebuilds one, and the node opens a missing one as empty. Moved aside, a label interner hands its ids out again under the published graph, so entities are served under other entities' names; `triples.log` empties the next graph build; `entity_text.log` leaves entities nothing to be ranked or embedded by; `erasure.log` and `withdrawals.log` forget what is still owed. Restore the namespace's `graph-staging` directory from a backup, all its logs together, since they refer to one another by id |
 | Anything `UNREADABLE` | A device or permission problem, or a header naming a format version a newer build wrote. Either way nothing is known about the contents, and a newer build's file is not damaged |
 
 Exit codes: `0` no damage, `1` damage found, `2` the command line was wrong, `3` the check itself failed — which says nothing about the directory and must not be read as `0`.
