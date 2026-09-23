@@ -150,7 +150,6 @@ public final class ReindexerFactory {
                 offsetWriter,
                 batchPublisher,
                 storageEngine.getCatalog(),
-                storageEngine.getLifecycleManager(),
                 indexOrchestrator.getVisibilityTracker()
             );
         } else {

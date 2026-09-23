@@ -9,7 +9,6 @@ import com.eonmux.excalibur.ingest.source.Source;
 import com.eonmux.excalibur.ingest.source.SourceException;
 import com.eonmux.excalibur.shard.VisibilityTracker;
 import com.eonmux.excalibur.store.SegmentCatalog;
-import com.eonmux.excalibur.store.SegmentLifecycleManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -59,7 +58,6 @@ class RollingReplacementCleanupTest {
             new DocumentBatchPublisher(visibility, registry, filter, () -> { },
                 new ReentrantLock()),
             catalog,
-            new SegmentLifecycleManager(catalog),
             visibility);
     }
 
