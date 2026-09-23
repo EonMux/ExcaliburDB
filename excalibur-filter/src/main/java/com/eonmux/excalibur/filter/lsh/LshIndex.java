@@ -148,12 +148,10 @@ public class LshIndex implements AutoCloseable {
         LshIndex index = new LshIndex(config, tables);
 
         // Every insert goes into every table, so each table holds the same set of entry ids and
-        // any one of their counts is the index's. Summing them multiplied the restored count by
-        // the number of tables, which the query pipeline reads as coverage: a 15-table index that
-        // had seen a twentieth of a segment came back claiming to cover it three times over, and
-        // an empty answer from an index believed to be that complete excludes the segment from
-        // the query entirely. The maximum, rather than the first, so a table left short by an
-        // interrupted write does not understate the whole index.
+        // any one of their counts is the index's. Summing them would multiply the restored count
+        // by the number of tables: a 15-table index that had seen a twentieth of a segment would
+        // come back claiming to hold it three times over. The maximum, rather than the first, so
+        // a table left short by an interrupted write does not understate the whole index.
         long restored = 0;
         for (LshHashTable table : tables) {
             restored = Math.max(restored, table.entryCount());

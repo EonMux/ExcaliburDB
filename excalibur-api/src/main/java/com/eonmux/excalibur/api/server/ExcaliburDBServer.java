@@ -546,7 +546,8 @@ public class ExcaliburDBServer {
      * <p>When LSH is configured:</p>
      * <ul>
      *   <li>Every vector written to a segment is also inserted into its LSH index</li>
-     *   <li>Query Stage 2 (LSH pre-filter) can efficiently prune candidates</li>
+     *   <li>Query Stage 2 names each query's bucket-mates, which Stage 3 measures beside the
+     *       graph search</li>
      *   <li>Tombstones are removed from LSH indices during deletion propagation</li>
      * </ul>
      *

@@ -21,11 +21,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * The LSH pre-filter and the HNSW graph share one id space, and it is the graph's.
  *
  * <p>Stage 2 of the query pipeline hands the ids an LSH index returns straight to
- * {@link HnswGraph#search(float[], int, Set)}, which keeps only results whose node id is in that
- * set. This test holds both halves of that arrangement against each other, because nothing else
- * does: the two components live in different modules, neither validates the ids it is given, and
- * a disagreement between them produces no error at all - only a segment that quietly stops
- * returning results.</p>
+ * {@link HnswGraph#search(float[], int, Set)}, which measures the named nodes so stage 3 can rank
+ * them in beside its graph search. This test holds both halves of that arrangement against each
+ * other, because nothing else does: the two components live in different modules, neither
+ * validates the ids it is given, and a disagreement between them produces no error at all - only
+ * an index whose every answer measures the wrong nodes.</p>
  */
 @DisplayName("LSH pre-filter and HNSW graph id space")
 class LshHnswEntryIdContractTest {
@@ -34,7 +34,7 @@ class LshHnswEntryIdContractTest {
     private static final int VECTORS = 50;
 
     @Test
-    @DisplayName("candidates keyed by node id narrow the search; foreign ids empty it")
+    @DisplayName("candidates keyed by node id name the graph's nodes; foreign ids name none")
     void theIdSpaceIsTheGraphs(@TempDir Path tempDir) throws Exception {
         List<float[]> vectors = deterministicVectors();
 
@@ -73,14 +73,15 @@ class LshHnswEntryIdContractTest {
                 assertThat(nodeIdCandidates).contains(result.nodeId()));
 
             // The failure this arrangement is exposed to, kept visible on purpose: ids from any
-            // other space are not merely less useful, they exclude every result. That is why the
-            // pre-filter is written where node ids are assigned rather than during ingestion.
+            // other space are not merely less useful, they name nothing the graph holds. That is
+            // why the pre-filter is written where node ids are assigned rather than during
+            // ingestion.
             Set<Long> foreignCandidates = byChunkHash.query(query);
             assertThat(foreignCandidates)
                 .as("the foreign-keyed index holds the vector too, so it also offers candidates")
                 .isNotEmpty();
             assertThat(graph.search(query, 10, foreignCandidates))
-                .as("but they name no node, so the search returns nothing at all")
+                .as("but they name no node, so measuring them yields nothing at all")
                 .isEmpty();
         }
     }

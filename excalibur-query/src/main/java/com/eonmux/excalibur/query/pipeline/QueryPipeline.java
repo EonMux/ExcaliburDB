@@ -37,7 +37,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * <ol>
  *   <li><strong>Stage 0 - Epoch Snapshot:</strong> Capture visibility epoch and resolve queryable segments</li>
  *   <li><strong>Stage 1 - Cuckoo Filter Cascade:</strong> Eliminate segments that cannot contain relevant entries</li>
- *   <li><strong>Stage 2 - LSH Pre-filter:</strong> Coarse vector similarity filtering</li>
+ *   <li><strong>Stage 2 - LSH Candidates:</strong> Name the entries sharing the query's hash buckets,
+ *       for Stage 3 to measure exactly beside its graph search; never excludes or narrows</li>
  *   <li><strong>Stage 3 - HNSW Vector Search:</strong> Precise ANN within candidate segments with tail scan</li>
  *   <li><strong>Stage 4 - Full Vector Rerank:</strong> Exact distance on full-precision vectors</li>
  *   <li><strong>Stage 5 - LLM Relevancy Scoring:</strong> Score candidates with LLM (optional)</li>
@@ -658,8 +659,8 @@ public class QueryPipeline {
         context = termFilterCascade.apply(context, token);
         partialContext.set(context);
 
-        // Stage 2: LSH Pre-filter
-        context = LshPreFilter.apply(context, token);
+        // Stage 2: LSH candidates, measured beside the graph search rather than instead of it
+        context = LshCandidateStage.apply(context, token);
         partialContext.set(context);
 
         // Stage 3: HNSW Vector Search with Tail Scan

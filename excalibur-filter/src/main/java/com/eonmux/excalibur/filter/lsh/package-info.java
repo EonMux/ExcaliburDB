@@ -3,9 +3,12 @@
  *
  * <h2>Overview</h2>
  * <p>This package provides multi-probe random hyperplane LSH implementation for
- * approximate nearest neighbor pre-filtering on float vectors. LSH is used in
- * ExcaliburDB as a coarse vector similarity filter to reduce candidates before
- * precise HNSW search.</p>
+ * approximate nearest neighbor candidate generation on float vectors. ExcaliburDB
+ * uses it beside HNSW search, not in front of it: the entries sharing a query's
+ * buckets are measured exactly and ranked in with the graph's results, which
+ * recovers near neighbours the graph walk passed over. A bucket bounds nothing
+ * about the distance of what it leaves out, so its answer is never used to
+ * exclude or confine a search.</p>
  *
  * <h2>Components</h2>
  * <ul>

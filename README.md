@@ -10,7 +10,7 @@ ExcaliburDB is built on Java 21's Panama Foreign Function & Memory API for zero-
 
 - **HNSW (Hierarchical Navigable Small World) graphs** for approximate nearest neighbor search with configurable efConstruction and efSearch parameters
 - **Cuckoo filters** for probabilistic set membership testing with deletion support
-- **LSH (Locality-Sensitive Hashing)** for coarse vector pre-filtering, built per segment on a node that embeds its corpus. A lexical-only node writes none: it would be dead weight on every write, keyed by node ids nothing assigns
+- **LSH (Locality-Sensitive Hashing)** for vector candidate generation beside the HNSW search: a query's bucket-mates are measured exactly and ranked in with the graph's results, never used to exclude or confine a search. Built per segment on a node that embeds its corpus. A lexical-only node writes none: it would be dead weight on every write, keyed by node ids nothing assigns
 - **Epoch-based visibility tracking** for consistent query snapshots during concurrent ingestion
 - **LLM integration** for semantic relevancy scoring, with a circuit breaker on each of the chat and embedding paths and a fallback when either is open
 - **Queryability guarantee** - the system remains queryable at all times, including during initial indexing and re-indexing operations
@@ -593,9 +593,9 @@ variable of the same name as the token it presents to the node — see
 | `excalibur.shard.compaction-max-concurrent` | 4 | Segments the scheduled sweep will rewrite in one pass, so a burst of eligible segments cannot spend the whole machine on rewrites. They are rewritten one after another, not at once, and `POST /v1/compact` is not subject to this. 1 to 16; a value outside that is refused at startup against the property name |
 | `excalibur.shard.hnsw-compaction-interval-ms` | 60000 | The same sweep for the vector graph, which reclaims deleted nodes by renumbering rather than by rewriting a log. At least 10000 |
 | `excalibur.shard.hnsw-compaction-tombstone-ratio` | 0.2 | Deleted fraction of a graph at which its nodes are worth renumbering. 0.05 to 0.5 |
-| `excalibur.shard.lsh-hash-tables` | 15 | Hash tables in a segment's LSH index. More finds more of the true neighbours and reads more buckets. At most 256: each table allocates hash-functions × dimensions floats, per segment |
-| `excalibur.shard.lsh-hash-functions` | 16 | Hash functions concatenated into one bucket key. More makes each bucket narrower. At most 63, because the key is packed into a long |
-| `excalibur.shard.lsh-probes` | 3 | Neighbouring buckets probed beside the query's own. At most 64 |
+| `excalibur.shard.lsh-hash-tables` | 15 | Hash tables in a segment's LSH index, whose bucket-mates of a query are measured exactly beside the graph search and ranked in with its results. More names more of the true neighbours the graph search might walk past, and costs more buckets probed and more nodes measured per query. The candidates only ever add to an answer, so no shape can lose a result. At most 256: each table allocates hash-functions × dimensions floats, per segment |
+| `excalibur.shard.lsh-hash-functions` | 16 | Hash functions concatenated into one bucket key. More makes each bucket narrower: fewer candidates measured per query, and fewer missed neighbours recovered. At most 63, because the key is packed into a long |
+| `excalibur.shard.lsh-probes` | 3 | Neighbouring buckets probed beside the query's own, widening the candidates the same way more tables do. At most 64 |
 | `excalibur.shard.volumes` | _(empty)_ | Directories segments are placed across, beyond the data directory. Empty keeps everything in the data directory. Named volumes are spread over by a consistent hash of the segment id, so adding one later moves as few existing segments as possible — and each must already exist as a directory and stay mounted. A volume the node cannot find is refused rather than created, and a restart that cannot see a segment its catalog records refuses to start rather than quietly serving a partial corpus. Two entries that resolve to one directory — a symlink, a relative path, a `..` that walks out and back in — are refused at startup naming both spellings, since the ring would give that directory two shares. Changing the set re-weights the ring for **new** segments only: what is on disk stays where it is, write-ahead logs and split children included |
 | `excalibur.shard.pq-search-enabled` | false | Whether a segment's product quantiser answers the first pass of a vector search. On, candidates are scored from their quantised codes and the survivors rescored against their full-precision vectors, so the ranking returned is still exact; what the approximation can cost is a document the first pass never shortlisted |
 | `excalibur.shard.pq-oversample` | 4 | Candidates the quantised pass collects per result asked for — what buys back the recall the approximation costs. At least 1 |
@@ -2508,8 +2508,8 @@ Queries execute through a 7-stage pipeline:
 1. **Epoch Snapshot** - Capture visibility epoch, resolve queryable segments
 2. **Segment Prioritisation** - Order the candidate segments by estimated selectivity
 3. **Cuckoo Filter Cascade** - Eliminate segments that cannot contain relevant terms, checking a corpus-wide filter and then each segment's own. There is no level between them: documents are placed by key hash, so a group of segments holds nearly the whole vocabulary and could rule nothing out
-4. **LSH Pre-filter** - Coarse vector similarity filtering
-5. **HNSW Vector Search** - Precise ANN search with tail scan for unindexed entries
+4. **LSH Candidates** - Name each segment's entries that share the query's hash buckets, for stage 5 to measure beside its graph search. Excludes no segment and confines no search
+5. **HNSW Vector Search** - Precise ANN search, with stage 4's candidates measured and ranked in, and a tail scan for unindexed entries
 6. **Full Vector Rerank** - Exact distance computation on candidates
 7. **LLM Relevancy Scoring** - Optional semantic relevancy scoring
 
@@ -2556,27 +2556,37 @@ be refilled, a level having refused a term for want of room, and no filter being
 — and in each case stage 3 passes the segment through. Pruning is an optimisation; the filter never
 costs a result.
 
-The pre-filter in stage 4 hands stage 5 a set of candidate ids per segment, and stage 5 answers
-with the nearest members of that set rather than the nearest of the whole graph. The set is carried
-on the dispatcher input the segment is searched under, because each segment has its own index, its
-own probe and its own node ids; a segment the pre-filter had no opinion about is handed no set and
-searched in full. The two stages
-therefore share one id space, and it is the graph's: the pre-filter is written by the HNSW
-integration worker as it assigns node ids, not during ingestion, which holds the vector but not yet
-the id it will be searched by. A pre-filter populated from any other id space would not narrow a
-search but empty it, since every candidate would name a node the graph does not have.
+Stage 4 adds candidates and never removes any. A query asks for the k nearest vectors, and every
+non-empty segment has k nearest vectors however far away they are; an LSH bucket says which entries
+hashed alongside the query, a likelihood that falls off with distance, and bounds nothing about the
+distance of what it leaves out. An empty answer therefore means "nothing within the radius the hash
+shape favours", not "no neighbours here", and a short answer is some likely neighbours rather than
+the only ones. So stage 4 excludes no segment and confines no search: it hands stage 5, per
+segment, the node ids that share the query's buckets, and stage 5 measures those nodes exactly and
+ranks them together with what the graph search returned. A named node enters the answer only by
+being closer than a result the graph search found, so the answer is never worse than the graph
+search alone, and is better wherever the graph's beam walked past a near neighbour the buckets
+caught. The quantised search, where it is enabled, runs exactly as it would without the candidates;
+its results are rescored on full-precision vectors, so they rank against the measured candidates on
+one scale.
+
+The candidate ids are carried on the dispatcher input the segment is searched under, because each
+segment has its own index, its own probe and its own node ids. The two stages therefore share one
+id space, and it is the graph's: the pre-filter is written by the HNSW integration worker as it
+assigns node ids, not during ingestion, which holds the vector but not yet the id it will be
+searched by. A pre-filter populated from any other id space would name nothing the graph holds, or
+the wrong vectors, and contribute nothing but wasted measurements.
 
 A candidate set names a scattering of nodes drawn from wherever the pre-filter's buckets fell, not a
 connected region of the graph, so the graph's edges are used to reach named nodes and never to
-decide which of them may be returned. A walk permitted to step only from one named node to another
-would be walking an edgeless subgraph and would come back with whatever it started on. Stage 5
-therefore answers a set one of two ways, whichever does less work: it measures every named node
-when the set is small, which is exact at one node read per name, or it runs the ordinary graph
-search and admits only named nodes to its results. Measuring reads `|C|` nodes; a search that
-admits a `|C| / nodeCount` fraction of what it visits reads on the order of `ef * nodeCount / |C|`
-before its beam is full, so measuring is both the cheaper and the exact answer while
+decide which of them may be measured. Stage 5 measures a set one of two ways, whichever does less
+work: it reads every named node when the set is small, which is exact at one node read per name, or
+it runs a second graph search that keeps only named nodes. Reading reads `|C|` nodes; a search that
+keeps a `|C| / nodeCount` fraction of what it visits reads on the order of `ef * nodeCount / |C|`
+before its beam is full, so reading is both the cheaper and the exact answer while
 `|C|² <= ef * nodeCount` - which for a hundred-thousand-node segment at `ef = 200` covers every
-candidate set a pre-filter realistically produces.
+candidate set the default shape realistically produces. That is the whole cost of stage 4 to a
+query: a probe of each table, plus those reads.
 
 Because it is keyed by node id, a pre-filter is only meaningful beside the graph it was built
 against. The storage engine therefore attaches one wherever it attaches a graph - segments it
@@ -2584,14 +2594,11 @@ creates, segments it recovers at start-up, and split children - discards the per
 split child would otherwise inherit under its parent's name, and carries it across a compaction,
 which replaces the file but not the graph.
 
-Either answer is acted on only where the index has seen what it is speaking about. An index
-holding fewer entries than its graph has nodes is ignored outright and the segment is searched in
-full, because the nodes it missed are exactly the ones its answer cannot mention - narrowing a
-search to such an answer drops matches just as surely as excluding the segment would, only fewer
-of them. An index that does cover the graph narrows what the search may return; excluding the
-segment needs more than that, because it skips the tail scan too, so it also needs the graph to have absorbed the
-whole write log. No index has ever seen that un-integrated tail, which stage 5 scans directly from
-the log.
+Since the candidates can only add to an answer, an index that disagrees with its graph costs work
+and nothing else: one that has not yet seen every node names fewer of them, an id naming no live
+node is skipped when it is measured, and no index has ever seen the un-integrated write-log tail,
+which stage 5 scans directly from the log regardless. `QueryPipelineRecallGateTest` holds the whole
+pipeline to its graphs' recall against brute force - see [Running Benchmarks](#running-benchmarks).
 
 ### Segment Identity
 
@@ -2911,7 +2918,17 @@ than in one, and it is the only thing that runs them:
 The gates are not all in `excalibur-bench`. A Test task only ever runs its own project's classes,
 so while the task existed there alone, the tags outside it ran nowhere: the Cuckoo filter's false
 positive rate over a million items, and HNSW recall@10 against brute force, are assertions about
-this system's stated guarantees that no task in the build could execute. The aggregate task is
+this system's stated guarantees that no task in the build could execute.
+
+HNSW recall is measured on the graph alone, which says nothing about the stages in front of it. So
+`excalibur-query` gates the answer a caller actually gets: `QueryPipelineRecallGateTest` runs the
+whole query pipeline over 20,000 clustered 64-dimensional vectors spread across eight segments,
+each with a fully integrated graph and an LSH index of the default shape, and asserts that its
+recall@10 against brute force is at least 0.95 and no more than 0.01 below that of the same graphs
+searched directly and merged. The 0.01 absorbs ties at the tenth distance and nothing else: the
+pipeline searches every graph at least as widely, and its LSH candidates can displace a result only
+with a closer one. `QueryPipelineVectorRecallTest` makes the same comparison on a smaller corpus in
+the ordinary `test` task. The aggregate task is
 derived from the module list rather than written out, because a list goes stale the moment a
 module is added and a gate run that skips a module reports a pass over assertions it never ran.
 
@@ -2999,7 +3016,7 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `HierarchicalDeletionPropagationIntegrationTest` - A delete reaches the corpus and segment levels of the hierarchical filter, including under concurrency
 - `DocumentErasureIntegrationTest` - An erased document leaves storage, the lexical index's files and vector search, through the node's own erasure wiring
 - `GraphRouteIntegrationTest` - A document ingested from a directory, with extraction against a stand-in OpenAI-compatible chat endpoint, is built into the graph and answered from over HTTP as of a date after its fact began, and declined as of one before
-- `LshHnswEntryIdContractTest` - The LSH pre-filter returns ids in the HNSW graph's id space, so stage 2 filters the right nodes
+- `LshHnswEntryIdContractTest` - The LSH pre-filter returns ids in the HNSW graph's id space, so the candidates stage 5 measures are the nodes the buckets describe
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
 - `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback
@@ -3046,7 +3063,8 @@ through the installed start scripts and the JVM flags they carry. It finishes wi
 read.
 
 **Gates.** `./gradlew benchmarkTest`, the task `test` leaves out: the Cuckoo filter's false
-positive rate over a million items, HNSW recall@10 against brute force, and the point-lookup
+positive rate over a million items, HNSW recall@10 against brute force, the query pipeline's
+end-to-end recall@10 against brute force and against its own graphs, and the point-lookup
 regression floor. It is a job of its own because it takes minutes, and a timing gate going red
 should not make the build look as though the code failed to compile or pass. Running it on a
 shared runner is sound because of what those tests assert: the recall and false-positive gates are

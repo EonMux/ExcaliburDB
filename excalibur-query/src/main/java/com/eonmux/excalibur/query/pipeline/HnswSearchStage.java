@@ -24,9 +24,9 @@ import java.util.function.Supplier;
  * brute-force tail scan over un-integrated entries.</p>
  *
  * <p><strong>Candidate-Based Execution:</strong> Uses the candidates from
- * stages 0-2 which have been filtered by visibility tracking, Cuckoo filter
- * cascade, and LSH pre-filtering. This ensures that only segments visible
- * at the captured epoch are searched.</p>
+ * stages 0-1, which have been filtered by visibility tracking and the Cuckoo
+ * filter cascade, each carrying the nodes stage 2's LSH lookup named for it.
+ * This ensures that only segments visible at the captured epoch are searched.</p>
  *
  * <p><strong>Parallel Execution:</strong> Searches are executed in parallel
  * using the {@link ParallelQueryDispatcher} for improved latency across
@@ -171,17 +171,16 @@ final class HnswSearchStage {
     }
 
     /**
-     * Describes each candidate to the dispatcher, carrying across what stage 2 decided about it.
+     * Describes each candidate to the dispatcher, carrying across the nodes stage 2 named in it.
      *
      * @param context The pipeline context with the surviving candidates
      * @return The segments to fan out to
      */
     private static List<ParallelQueryDispatcher.SegmentInfo> segmentsToSearch(PipelineContext context) {
-        // Convert SegmentCandidates to SegmentInfo for the dispatcher, carrying across what
-        // stage 2 decided about each segment. A candidate set that reached here is non-empty and
-        // names nodes of this segment's graph, so the search is confined to it; a segment stage 2
-        // left alone - no index, an unreadable one, or one whose emptiness proved nothing - is
-        // handed a null set and searched whole.
+        // Convert SegmentCandidates to SegmentInfo for the dispatcher, carrying across the nodes
+        // stage 2 found in each segment's LSH index. They are measured beside the graph search,
+        // which covers the whole graph either way; a segment whose index named nothing, or that
+        // has none, is handed a null set and adds nothing to it.
         List<ParallelQueryDispatcher.SegmentInfo> segmentsToSearch = new ArrayList<>();
         for (SegmentCandidate candidate : context.candidates) {
             if (candidate.isValid()) {

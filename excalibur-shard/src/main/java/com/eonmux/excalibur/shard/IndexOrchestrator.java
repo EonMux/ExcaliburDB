@@ -1014,8 +1014,9 @@ public class IndexOrchestrator implements AutoCloseable, SplitWorker.SplitListen
      * Sets the vector pre-filter that HNSW integration mirrors into.
      *
      * <p>The pre-filter is keyed by HNSW node id, and this orchestrator owns the worker that
-     * assigns those ids. Wiring it here is what lets the query pipeline intersect a pre-filter
-     * answer with the graph's own nodes rather than with an id space nothing else uses.</p>
+     * assigns those ids. Wiring it here is what lets the query pipeline measure the nodes a
+     * pre-filter names as the graph's own nodes rather than as ids from a space nothing else
+     * uses.</p>
      *
      * @param vectorPrefilter The pre-filter to mirror into, or null to maintain none
      */
