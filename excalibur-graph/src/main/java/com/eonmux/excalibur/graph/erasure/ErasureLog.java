@@ -23,6 +23,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.zip.CRC32;
 
+import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.file.TailIntegrity;
 import com.eonmux.excalibur.graph.provenance.SourceType;
 
@@ -319,21 +321,77 @@ public final class ErasureLog implements AutoCloseable {
         if (!Files.exists(file) || Files.size(file) < HEADER_BYTES) {
             return Pending.NONE;
         }
+        return examine(file).pending();
+    }
 
+    /**
+     * What a log owes, together with what its records are, as read from the file.
+     *
+     * @param pending What is outstanding, exactly as {@link #inspect} reports it
+     * @param log     How many records were replayed, and whether the file ends in a torn tail
+     *                the open would cut off
+     */
+    public record Inspection(Pending pending, LogInspection log) {
+
+        /** @throws NullPointerException if either part is null */
+        public Inspection {
+            Objects.requireNonNull(pending, "pending must not be null");
+            Objects.requireNonNull(log, "log must not be null");
+        }
+    }
+
+    /**
+     * Reads a log's records without opening it, for a caller judging the file rather than
+     * scheduling a sweep.
+     *
+     * <p>{@link #inspect} answers what is owed, which is all a sweep needs, and so says nothing
+     * about a torn tail: the obligations before it stand either way. An offline checker needs the
+     * rest - how many records it proved, and whether the file ends in bytes the next open cuts
+     * off - because a file that will change when the node next touches it is not one it can call
+     * sound. This is the same single read and the same replay, refusing everything
+     * {@link #inspect} refuses, with damage that has an intact record behind it raised as a
+     * {@link LogCorruptionException}.</p>
+     *
+     * @param file The log file
+     * @return What it owes and what its records are
+     * @throws IOException if the file is absent, shorter than its header, not an erasure log of a
+     *                     version this build reads, holds an intact record this build cannot
+     *                     interpret, or cannot be read
+     * @throws LogCorruptionException if damage has an intact record behind it
+     * @throws NullPointerException if {@code file} is null
+     */
+    public static Inspection inspectLog(Path file) throws IOException {
+        Objects.requireNonNull(file, "file must not be null");
+        if (Files.size(file) < HEADER_BYTES) {
+            throw new IOException("erasure log " + file + " is shorter than its "
+                + HEADER_BYTES + "-byte header");
+        }
+        return examine(file);
+    }
+
+    /**
+     * Replays a log that holds at least a header, and judges its tail as {@link #open} does.
+     *
+     * @param file The log file
+     * @return What it owes and what its records are
+     * @throws IOException if the file cannot be read or replayed
+     * @throws LogCorruptionException if damage has an intact record behind it
+     */
+    private static Inspection examine(Path file) throws IOException {
         Replay replay = replay(file);
         // The same distinction open() draws, drawn read-only: a tail that is merely torn is the
         // ordinary outcome of a process killed mid-append and the records before it stand, while
         // records following damage were acknowledged to a caller and must not be silently
         // dropped from the count.
-        if (Files.size(file) > replay.validBytes()) {
-            TailIntegrity.requireTornTail(file, "erasure log", replay.contents(),
-                replay.validBytes(), ErasureLog::recordStartsAt);
-        }
+        TailIntegrity.requireTornTail(file, "erasure log", replay.contents(),
+            replay.validBytes(), ErasureLog::recordStartsAt);
 
         Optional<Instant> oldest = replay.outstanding().values().stream()
             .map(ErasureRequest::requestedAt)
             .min(Instant::compareTo);
-        return new Pending(replay.outstanding().size(), oldest);
+        return new Inspection(new Pending(replay.outstanding().size(), oldest),
+            new LogInspection(VERSION, replay.records(), replay.validBytes(),
+                replay.contents().length));
     }
 
     /**
@@ -572,9 +630,11 @@ public final class ErasureLog implements AutoCloseable {
      * @param nextId      One past the highest id ever submitted, so a completed request's id is
      *                    never handed out again and an audit of the file stays unambiguous
      * @param validBytes  Length of the file up to the end of the last intact record
+     * @param records     How many intact records were replayed, submissions and completions both
+     * @param contents    The whole file as read, so the tail can be examined without re-reading it
      */
     private record Replay(Map<Long, ErasureRequest> outstanding, long nextId, long validBytes,
-                          byte[] contents) {
+                          long records, byte[] contents) {
     }
 
     /**
@@ -651,7 +711,7 @@ public final class ErasureLog implements AutoCloseable {
     private static Replay replay(Path path) throws IOException {
         Map<Long, ErasureRequest> outstanding = new LinkedHashMap<>();
         if (!Files.exists(path) || Files.size(path) < HEADER_BYTES) {
-            return new Replay(outstanding, FIRST_ID, HEADER_BYTES, new byte[0]);
+            return new Replay(outstanding, FIRST_ID, HEADER_BYTES, 0, new byte[0]);
         }
 
         byte[] contents = Files.readAllBytes(path);
@@ -669,6 +729,7 @@ public final class ErasureLog implements AutoCloseable {
 
         long nextId = FIRST_ID;
         int validBytes = HEADER_BYTES;
+        long records = 0;
         while (true) {
             if (buffer.remaining() < Integer.BYTES) {
                 break;
@@ -691,8 +752,9 @@ public final class ErasureLog implements AutoCloseable {
 
             nextId = Math.max(nextId, applyRecord(path, body, outstanding));
             validBytes = buffer.position();
+            records++;
         }
-        return new Replay(outstanding, nextId, validBytes, contents);
+        return new Replay(outstanding, nextId, validBytes, records, contents);
     }
 
     /**

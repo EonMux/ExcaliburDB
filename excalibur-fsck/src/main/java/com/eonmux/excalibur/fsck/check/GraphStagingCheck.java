@@ -179,11 +179,22 @@ public final class GraphStagingCheck {
             return refused;
         }
         try {
-            ErasureLog.Pending pending = ErasureLog.inspect(file);
+            ErasureLog.Inspection inspection = ErasureLog.inspectLog(file);
+            LogInspection log = inspection.log();
+            String outstanding = inspection.pending().count() + " " + owed
+                + " are still outstanding";
+            if (log.hasTornTail()) {
+                return new FileCheck(file, relative, format, "v" + ErasureLog.VERSION,
+                    CheckStatus.UNSEALED,
+                    "the log ends in " + log.tornBytes() + " bytes that do not read as a "
+                        + "record, with nothing readable after them: the shape a write cut "
+                        + "short by a crash leaves. The node cuts them off when it next opens "
+                        + "the log, keeping the " + log.records() + " records before them, all "
+                        + "of which matched their checksums; " + outstanding, size);
+            }
             return new FileCheck(file, relative, format, "v" + ErasureLog.VERSION,
                 CheckStatus.INTACT,
-                "every record matched its checksum; " + pending.count() + " " + owed
-                    + " are still outstanding", size);
+                "every record matched its checksum; " + outstanding, size);
 
         } catch (IOException e) {
             // Put to an operator for the reason the class comment gives: moved aside, the log

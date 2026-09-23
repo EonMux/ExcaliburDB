@@ -256,6 +256,55 @@ class ErasureLogInspectionTest {
             }
         }
 
+        @Test
+        @DisplayName("the records behind what is owed are reported, torn tail and all")
+        void inspectingTheRecordsReportsTheTail(@TempDir Path dir) throws IOException {
+            Path file = logFile(dir);
+            try (ErasureLog log = ErasureLog.open(file)) {
+                long first = log.submit(new ErasureScope.Entity(7), WHEN);
+                log.submit(new ErasureScope.Entity(9), WHEN.plusSeconds(10));
+                log.complete(java.util.List.of(first));
+            }
+            long whole = Files.size(file);
+            Files.write(file, new byte[] {0, 0, 0, 90, 1, 2}, StandardOpenOption.APPEND);
+            Path copy = dir.resolve("copy.log");
+            Files.copy(file, copy);
+            byte[] before = Files.readAllBytes(file);
+
+            ErasureLog.Inspection inspection = ErasureLog.inspectLog(file);
+
+            assertThat(inspection.pending()).isEqualTo(ErasureLog.inspect(file));
+            assertThat(inspection.pending().count()).isEqualTo(1);
+            assertThat(inspection.log().records())
+                .as("two submissions and one completion")
+                .isEqualTo(3);
+            assertThat(inspection.log().intactBytes()).isEqualTo(whole);
+            assertThat(inspection.log().tornBytes()).isEqualTo(6);
+            assertThat(Files.readAllBytes(file)).isEqualTo(before);
+            ErasureLog.open(copy).close();
+            assertThat(Files.size(copy))
+                .as("the tail it reports is the tail the open cuts off")
+                .isEqualTo(inspection.log().intactBytes());
+        }
+
+        @Test
+        @DisplayName("inspecting the records refuses what inspecting the obligations refuses")
+        void inspectingTheRecordsRefusesMidLogDamage(@TempDir Path dir) throws IOException {
+            Path file = logFile(dir);
+            try (ErasureLog log = ErasureLog.open(file)) {
+                log.submit(new ErasureScope.Entity(7), WHEN);
+                log.submit(new ErasureScope.Entity(9), WHEN);
+            }
+            byte[] contents = Files.readAllBytes(file);
+            contents[ErasureLog.HEADER_BYTES + Integer.BYTES + 2] ^= (byte) 0xFF;
+            Files.write(file, contents);
+
+            assertThatThrownBy(() -> ErasureLog.inspectLog(file))
+                .isInstanceOf(com.eonmux.excalibur.graph.file.LogCorruptionException.class);
+            assertThatThrownBy(() -> ErasureLog.inspectLog(dir.resolve("absent.log")))
+                .isInstanceOf(IOException.class);
+        }
+
         /** Keeps the CRC import honest: the damage test relies on the framing this computes. */
         @Test
         @DisplayName("the framing these tests damage is the framing the log writes")

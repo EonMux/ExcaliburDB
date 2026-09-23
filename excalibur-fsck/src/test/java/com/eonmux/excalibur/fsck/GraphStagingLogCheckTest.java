@@ -210,6 +210,28 @@ class GraphStagingLogCheckTest {
         assertThat(fingerprint(file)).isEqualTo(before);
     }
 
+    @ParameterizedTest(name = "{0} ending in a write cut short is unsealed, as the node trims it")
+    @ValueSource(strings = {GraphStagingCheck.ERASURE_LOG, GraphStagingCheck.WITHDRAWAL_LOG})
+    void aTornObligationLogIsUnsealed(String name) throws IOException {
+        Path file = staging.resolve(name);
+        try (ErasureLog log = ErasureLog.open(file)) {
+            log.submit(new ErasureScope.Entity(0), Instant.EPOCH);
+        }
+        appendBytes(file, 5);
+        String before = fingerprint(file);
+
+        FileCheck result = check(name);
+
+        assertThat(result.status()).as(result.detail()).isEqualTo(CheckStatus.UNSEALED);
+        assertThat(result.detail())
+            .contains("5 bytes")
+            .contains("cuts them off when it next opens")
+            .contains("keeping the 1 records before them")
+            .contains("1 ")
+            .endsWith("are still outstanding");
+        assertThat(fingerprint(file)).isEqualTo(before);
+    }
+
     @ParameterizedTest(name = "{0} at a version this build does not read is unreadable")
     @ValueSource(strings = {
         GraphStagingStore.ENTITY_LABELS,
