@@ -3,6 +3,9 @@ package com.eonmux.excalibur.vector.hnsw;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collection;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -113,7 +116,7 @@ final class HnswTombstones {
     /**
      * Retires every node a named document contributed.
      *
-     * @param documentId The document to retire, in the form node attribution uses
+     * @param documentId The document key
      * @return The number of nodes newly tombstoned
      */
     int deleteDocument(String documentId) {
@@ -124,15 +127,78 @@ final class HnswTombstones {
             return 0;
         }
 
-        int retired = 0;
-        for (long nodeId : mapping.getNodesForDocument(documentId)) {
-            if (graph.delete(nodeId)) {
-                retired++;
-            }
-        }
-
+        int retired = retireAll(mapping.getNodesForDocument(documentId), -1);
         if (retired > 0) {
             LOGGER.info("Retired {} node(s) of document {}", retired, documentId);
+        }
+        return retired;
+    }
+
+    /**
+     * Retires every node attributed to any of the named chunks.
+     *
+     * @param chunkIds The chunk ids
+     * @return The number of nodes newly tombstoned
+     */
+    int deleteChunks(Collection<String> chunkIds) {
+        Objects.requireNonNull(chunkIds, "chunkIds cannot be null");
+        graph.validateNotClosed();
+
+        NodeDocumentMapping mapping = graph.nodeDocumentMapping;
+        if (mapping == null) {
+            return 0;
+        }
+
+        int retired = 0;
+        for (String chunkId : chunkIds) {
+            retired += retireAll(mapping.getNodesForChunk(chunkId), -1);
+        }
+        if (retired > 0) {
+            LOGGER.debug("Retired {} node(s) of {} chunk(s)", retired, chunkIds.size());
+        }
+        return retired;
+    }
+
+    /**
+     * Attributes a node to a chunk and retires every other node attributed to it.
+     *
+     * <p>Registered before the others are retired, so a reader that looks the chunk up in
+     * between finds the new node among its nodes rather than none.</p>
+     *
+     * @param nodeId  The chunk's newest node
+     * @param chunkId The chunk id
+     * @return How many earlier nodes were newly retired
+     */
+    int attributeChunk(long nodeId, String chunkId) {
+        graph.validateNotClosed();
+
+        NodeDocumentMapping mapping = graph.nodeDocumentMapping;
+        if (mapping == null) {
+            return 0;
+        }
+        mapping.register(nodeId, chunkId);
+
+        int retired = retireAll(mapping.getNodesForChunk(chunkId), nodeId);
+        if (retired > 0) {
+            LOGGER.debug("Node {} supersedes {} earlier node(s) of chunk {}",
+                nodeId, retired, chunkId);
+        }
+        return retired;
+    }
+
+    /**
+     * Tombstones every node of a set except one.
+     *
+     * @param nodeIds The nodes
+     * @param keep    A node to leave alone, or -1 for none
+     * @return How many were newly tombstoned
+     */
+    private int retireAll(Set<Long> nodeIds, long keep) {
+        int retired = 0;
+        for (long nodeId : nodeIds) {
+            if (nodeId != keep && graph.delete(nodeId)) {
+                retired++;
+            }
         }
         return retired;
     }

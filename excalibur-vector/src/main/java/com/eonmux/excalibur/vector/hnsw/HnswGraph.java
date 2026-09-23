@@ -152,8 +152,9 @@ public class HnswGraph implements AutoCloseable {
     volatile long generation = 0;
 
     /**
-     * Maps internal HNSW node IDs to document IDs (e.g. "doc1", "source1:file1"). This is what
-     * lets document-level filtering and payload resolution attribute a result.
+     * Maps internal HNSW node IDs to the chunk each is the vector of
+     * ({@code sourceId:documentId:chunk:N}). This is what names a result, lets document-level
+     * filtering derive the document from it, and lets a chunk or a document be retired.
      */
     volatile NodeDocumentMapping nodeDocumentMapping;
 
@@ -545,23 +546,43 @@ public class HnswGraph implements AutoCloseable {
      * Retires every node a named document contributed.
      *
      * <p>A node carries no text, so an erased document's vectors look like harmless residue. They
-     * are not: a node is attributed to a document, and a search that ranks it says that document
-     * matched - with a distance, and with the document's name - whether or not there is any text
-     * left to show for it. This is what makes an erasure reach the vector index.</p>
+     * are not: a search that ranks one names its chunk - with a distance, and with the document's
+     * name inside the identifier - whether or not there is any text left to show for it. This is
+     * what makes an erasure reach the vector index.</p>
      *
-     * <p>Each node is retired by {@link #delete(long)}, so the tombstones are the same ones every
-     * traversal skips, a restart reads back, and {@link #compact(java.nio.file.Path)} reclaims.
-     * Nodes are attributed by {@link #registerDocumentId(long, String)}, which the integration
-     * worker calls as it inserts; a graph with no mapping has nothing to name and retires
-     * nothing.</p>
+     * <p>Nodes are attributed to chunks, and every chunk id carries its document key, so the
+     * document's nodes are the ones whose chunk belongs to it; a mapping still keyed by document,
+     * read from a data directory an older build wrote, names the document directly and is answered
+     * the same way. Each node is retired by {@link #delete(long)}, so the tombstones are the same
+     * ones every traversal skips, a restart reads back, and
+     * {@link #compact(java.nio.file.Path)} reclaims. A graph with no mapping has nothing to name
+     * and retires nothing.</p>
      *
-     * @param documentId The document to retire, in the form node attribution uses
+     * @param documentId The document key, {@code sourceId:documentId}
      * @return The number of nodes newly tombstoned; zero when the graph holds none of them, or
      *         when they were already retired
      * @throws IllegalStateException if graph is closed
      */
     public int deleteDocument(String documentId) {
         return tombstones.deleteDocument(documentId);
+    }
+
+    /**
+     * Retires every node attributed to the named chunks.
+     *
+     * <p>For a replacement that is shorter than the version it replaces: the chunk ids past its
+     * end leave storage and the lexical index, and this is what takes their vectors with them.
+     * Only chunks the replacement does not hold may be named here - a chunk id the new version
+     * reuses has its old vector retired by {@link #attributeChunk(long, String)} when the new one
+     * arrives, and naming it here would retire the new one too if it had already arrived.</p>
+     *
+     * @param chunkIds The chunk ids, {@code sourceId:documentId:chunk:N}
+     * @return The number of nodes newly tombstoned
+     * @throws NullPointerException if chunkIds is null
+     * @throws IllegalStateException if graph is closed
+     */
+    public int deleteChunks(java.util.Collection<String> chunkIds) {
+        return tombstones.deleteChunks(chunkIds);
     }
 
     /**
@@ -1268,34 +1289,73 @@ public class HnswGraph implements AutoCloseable {
     // ==================== Node-to-Document Mapping ====================
 
     /**
-     * Registers a document ID for a node.
+     * Attributes a node to the identifier it will be reported under, and nothing more.
      *
-     * <p>This method associates an HNSW node ID with the actual document ID
-     * from the source document. This mapping is essential for the
-     * {@code DocumentAtomicityFilter} to correctly identify which document
-     * each query result belongs to.</p>
-     *
-     * <p><strong>Call this method after inserting a vector with a document ID.</strong></p>
+     * <p>The identifier is the chunk id the node is the vector of. This registers it without
+     * retiring anything, which is right where the caller knows no other node holds the same chunk
+     * - a graph rebuilt from a segment's live entries, one per key, or a compaction copying
+     * nodes that were already attributed. The integration worker, which inserts whatever the
+     * write log holds including a chunk's later values, uses
+     * {@link #attributeChunk(long, String)} instead.</p>
      *
      * @param nodeId The HNSW node ID
-     * @param documentId The document ID (e.g., "doc1", "source1:file1")
+     * @param documentId The chunk id, {@code sourceId:documentId:chunk:N}
      * @throws IllegalArgumentException if nodeId is negative or documentId is null/empty
      */
     public void registerDocumentId(long nodeId, String documentId) {
         if (nodeDocumentMapping != null) {
             nodeDocumentMapping.register(nodeId, documentId);
-            LOGGER.trace("Registered documentId={} for nodeId={}", documentId, nodeId);
+            LOGGER.trace("Registered key={} for nodeId={}", documentId, nodeId);
         }
     }
 
     /**
-     * Gets the document ID for a node.
+     * Attributes a node to a chunk as that chunk's current vector, retiring the nodes that held
+     * its earlier values.
+     *
+     * <p>A chunk id is reused whenever a document is posted or re-crawled again, and the chunk's
+     * new value becomes a new node. Storage keeps only the newest value under the id; the graph
+     * keeps every node until something retires it, and an old one left alone goes on ranking the
+     * old text under the reused name - a query about wording the document no longer has finds it
+     * anyway, and every re-post grows the graph by a document's worth of dead vectors.</p>
+     *
+     * <p>Retiring here, as the new value is attributed, rather than when the replacement is
+     * published, is what keeps the chunk from ever being without a vector: the old node stays
+     * searchable until the new one is in the graph, and the two are ordered by the write log the
+     * worker reads rather than by a race between the worker and the ingesting thread. Called in
+     * log order, the last value written is the one left standing.</p>
+     *
+     * @param nodeId  The node just inserted for the chunk
+     * @param chunkId The chunk id, {@code sourceId:documentId:chunk:N}
+     * @return How many earlier nodes of the chunk were newly retired
+     * @throws IllegalArgumentException if nodeId is negative or chunkId is null/empty
+     * @throws IllegalStateException if graph is closed
+     */
+    public int attributeChunk(long nodeId, String chunkId) {
+        return tombstones.attributeChunk(nodeId, chunkId);
+    }
+
+    /**
+     * Gets the identifier a node is reported under.
      *
      * @param nodeId The HNSW node ID
-     * @return The document ID, or null if not found
+     * @return The chunk id - or, in a mapping an older build wrote and the node has not re-keyed
+     *         yet, the document key - or null if the node is not attributed
      */
     public String getDocumentId(long nodeId) {
         return nodeDocumentMapping != null ? nodeDocumentMapping.getDocumentId(nodeId) : null;
+    }
+
+    /**
+     * What this graph's node attribution names.
+     *
+     * @return {@link NodeDocumentMapping.Keying#CHUNK} for every graph this build writes, and
+     *         {@link NodeDocumentMapping.Keying#DOCUMENT} for one opened from a mapping an older
+     *         build wrote that has not been re-keyed yet; see {@link ChunkAttributionUpgrade}
+     */
+    public NodeDocumentMapping.Keying attributionKeying() {
+        NodeDocumentMapping mapping = nodeDocumentMapping;
+        return mapping == null ? NodeDocumentMapping.Keying.CHUNK : mapping.keying();
     }
 
     /**

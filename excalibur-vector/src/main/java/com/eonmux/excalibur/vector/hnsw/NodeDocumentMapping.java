@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.vector.hnsw;
 
 import com.eonmux.excalibur.core.integrity.IntegrityReport;
+import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.vector.durability.DurableFiles;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,6 +15,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -21,55 +23,75 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * Maps HNSW node IDs to document IDs for document atomicity filtering.
+ * Maps HNSW node IDs to the chunk each node is the vector of.
  *
- * <p>This class provides the critical mapping between internal HNSW graph node IDs
- * (which are long integers assigned sequentially) and actual document IDs (which are
- * strings like "doc1", "source1:file1"). This mapping is essential for the
- * {@code DocumentAtomicityFilter} to correctly identify which document each query
- * result belongs to.</p>
+ * <p>A graph node is a number assigned in insertion order; the chunk it embeds is a string,
+ * {@code sourceId:documentId:chunk:N} as {@link ChunkIdentifiers} forms it. This mapping is the
+ * only link between the two, and everything that names a vector hit goes through it: the query
+ * result's identifier, the text read back for it, the atomicity filter that asks whether its
+ * document is published, and the retirement of a chunk or of a whole document.</p>
  *
- * <h2>Purpose</h2>
- * <p>During ingestion, vectors are inserted into the HNSW graph with:</p>
- * <ul>
- *   <li>An auto-generated numeric node ID (e.g., 0, 1, 2, ...)</li>
- *   <li>The actual document ID from the source (e.g., "doc-atomic-1")</li>
- * </ul>
+ * <h2>Why a chunk and not its document</h2>
+ * <p>A node is one chunk's embedding, so the chunk is the only identity that is true of it. Naming
+ * the document instead loses three things at once: which passage matched (every chunk of a
+ * document collapses into one result whose text cannot be read back), agreement with the lexical
+ * index (which names chunks, so hybrid fusion could never recognise the same passage returned by
+ * both signals), and the ability to retire one version of a chunk without the rest - a document
+ * re-posted with new text would leave the old embedding ranked under the document's name, because
+ * nothing narrower than the whole document could be named to retire it. The document is still one
+ * derivation away: {@link ChunkIdentifiers#documentKeyOfChunk(String)} is the single definition
+ * of that convention, and it is what {@link #getNodesForDocument(String)} and the atomicity
+ * filter use.</p>
  *
- * <p>During queries, the HNSW search returns node IDs. This mapping allows
- * converting node IDs back to document IDs for visibility filtering.</p>
+ * <h2>Supersession</h2>
+ * <p>Several nodes may name the same chunk: a chunk id is reused when a document is re-posted, and
+ * the integration worker inserts the new value's vector as a new node. Only the newest is the
+ * chunk's vector; {@code HnswGraph.attributeChunk} retires the others as it attributes the new
+ * one, and {@link #getNodesForChunk(String)} is what makes that retirement cheap.</p>
  *
- * <h2>Mapping Format</h2>
- * <p>The mapping is persisted to disk using a simple format:</p>
+ * <h2>File format</h2>
  * <pre>
  * +---------------------------+
- * | Header (16 bytes)         |
- * | - magic (8B): 0x4E4F4445 |
- * | - entryCount (8B)         |
+ * | Header (48 bytes)         |  laid out in {@link NodeMappingIntegrity}
  * +---------------------------+
  * | Entry 1:                  |
  * | - nodeId (8B)             |
- * | - docIdLen (4B)           |
- * | - docId (UTF-8 bytes)     |
+ * | - keyLen (4B)             |
+ * | - key (UTF-8 bytes)       |
  * +---------------------------+
  * | Entry 2...                |
  * +---------------------------+
  * </pre>
  *
- * <h2>Thread Safety</h2>
- * <p><strong>This class is fully thread-safe.</strong></p>
+ * <h2>Versions</h2>
  * <ul>
- *   <li>Read operations are lock-free (ConcurrentHashMap)</li>
- *   <li>Write operations use read-write locks</li>
- *   <li>Persistence operations are synchronized</li>
+ *   <li>Version {@value #VERSION_V1}: a 24-byte header, no checksum, entries naming
+ *       documents.</li>
+ *   <li>Version {@value #VERSION_DOCUMENT_KEYED}: the 48-byte checksummed header, entries naming
+ *       documents.</li>
+ *   <li>Version {@value #VERSION}: the same layout, entries naming chunks.</li>
  * </ul>
+ * <p>The entry layout never changed; what changed is what the string in it means, and the version
+ * is the only thing that says so. A mapping read from a version 1 or 2 file is
+ * {@link Keying#DOCUMENT document-keyed} and is persisted at version 2 for as long as it stays
+ * that way - writing it at version 3 would present document keys as chunk keys. It becomes
+ * chunk-keyed only through {@link #rekeyToChunks(Map)}, which the node drives from the segment's
+ * own entries before it integrates anything more into the graph; see
+ * {@link ChunkAttributionUpgrade}.</p>
+ *
+ * <h2>Thread Safety</h2>
+ * <p><strong>This class is fully thread-safe.</strong> Lookups by node are lock-free; the reverse
+ * indexes by chunk and by document are changed together with the forward map under one monitor,
+ * so a lookup by chunk or document never sees a node the forward map has not registered.
+ * Persistence takes its own read-write lock.</p>
  *
  * <h2>Domain Constraints</h2>
  * <ul>
  *   <li>Node IDs are non-negative long integers</li>
- *   <li>Document IDs are non-null, non-empty strings</li>
- *   <li>Each node ID maps to exactly one document ID</li>
- *   <li>Multiple nodes may map to the same document ID (chunks)</li>
+ *   <li>Keys are non-null, non-empty strings</li>
+ *   <li>Each node ID maps to exactly one key</li>
+ *   <li>Several nodes may map to one chunk (values not yet retired) and to one document (its
+ *       chunks)</li>
  * </ul>
  *
  * @author ExcaliburDB
@@ -86,15 +108,40 @@ public class NodeDocumentMapping {
     static final long MAGIC = 0x4E4F44454D415053L;
 
     /**
-     * Current file format version. Version 2 added the integrity block described on
-     * {@link NodeMappingIntegrity}.
+     * Current file format version: entries name chunks. The layout is version 2's; the class
+     * documentation says why the meaning of the key needed a version of its own.
      */
-    static final int VERSION = 2;
+    public static final int VERSION = 3;
 
     /**
-     * The version written before the header carried checksums.
+     * The checksummed version whose entries name documents. Still written for a mapping loaded
+     * from a document-keyed file until it has been re-keyed, so the version on disk never claims
+     * a keying its entries do not have.
+     */
+    public static final int VERSION_DOCUMENT_KEYED = 2;
+
+    /**
+     * The version written before the header carried checksums. Its entries name documents.
      */
     static final int VERSION_V1 = 1;
+
+    /**
+     * The first version whose header carries the integrity block.
+     */
+    static final int FIRST_SEALED_VERSION = VERSION_DOCUMENT_KEYED;
+
+    /**
+     * What the keys of a mapping name.
+     */
+    public enum Keying {
+        /** Each node names the chunk it is the vector of. What this build writes. */
+        CHUNK,
+        /**
+         * Each node names only the document its chunk belongs to. Read from files written
+         * before nodes were attributed to chunks, and served until the node re-keys them.
+         */
+        DOCUMENT
+    }
 
     /**
      * Header size in bytes.
@@ -128,9 +175,31 @@ public class NodeDocumentMapping {
     private final Path mappingPath;
 
     /**
-     * Thread-safe map from node ID to document ID.
+     * Thread-safe map from node ID to key.
      */
     private final ConcurrentHashMap<Long, String> nodeToDocument;
+
+    /**
+     * Nodes by the exact key they were registered under: by chunk, in a chunk-keyed mapping.
+     * Guarded by {@link #indexLock}.
+     */
+    private final Map<String, Set<Long>> nodesByKey = new HashMap<>();
+
+    /**
+     * Nodes by the document their key belongs to, through
+     * {@link ChunkIdentifiers#documentKeyOfChunk(String)}. That returns a document key unchanged,
+     * so the same index answers for either keying. Guarded by {@link #indexLock}.
+     */
+    private final Map<String, Set<Long>> nodesByDocument = new HashMap<>();
+
+    /** Guards the reverse indexes and their agreement with the forward map. */
+    private final Object indexLock = new Object();
+
+    /**
+     * What the keys name: chunks for a new mapping, documents for one loaded from an older file
+     * until {@link #rekeyToChunks(Map)} replaces its entries.
+     */
+    private volatile Keying keying = Keying.CHUNK;
 
     /**
      * Lock for coordinating persistence operations.
@@ -193,12 +262,13 @@ public class NodeDocumentMapping {
     // ==================== Mapping Operations ====================
 
     /**
-     * Registers a mapping from node ID to document ID.
+     * Registers a mapping from node ID to key.
      *
-     * <p>If the node ID already has a mapping, it will be updated.</p>
+     * <p>If the node ID already has a mapping, it will be updated. The key is the chunk id the
+     * node is the vector of, in the chunk-keyed mapping every graph this build creates holds.</p>
      *
      * @param nodeId The HNSW node ID
-     * @param documentId The document ID
+     * @param documentId The key: the chunk id, {@code sourceId:documentId:chunk:N}
      * @throws IllegalArgumentException if nodeId is negative or documentId is null/empty
      */
     public void register(long nodeId, String documentId) {
@@ -209,8 +279,47 @@ public class NodeDocumentMapping {
             throw new IllegalArgumentException("documentId must be non-null and non-empty");
         }
 
-        nodeToDocument.put(nodeId, documentId);
-        LOGGER.trace("Registered mapping: nodeId={} -> documentId={}", nodeId, documentId);
+        synchronized (indexLock) {
+            unindex(nodeId, nodeToDocument.put(nodeId, documentId));
+            index(nodeId, documentId);
+        }
+        LOGGER.trace("Registered mapping: nodeId={} -> key={}", nodeId, documentId);
+    }
+
+    /**
+     * Files a node under its key and under the document the key belongs to.
+     *
+     * @param nodeId The node
+     * @param key    Its key
+     */
+    private void index(long nodeId, String key) {
+        nodesByKey.computeIfAbsent(key, k -> new HashSet<>()).add(nodeId);
+        nodesByDocument.computeIfAbsent(ChunkIdentifiers.documentKeyOfChunk(key),
+            k -> new HashSet<>()).add(nodeId);
+    }
+
+    /**
+     * Removes a node from the reverse indexes it was filed under.
+     *
+     * @param nodeId The node
+     * @param key    The key it was filed under, or null when it was not filed
+     */
+    private void unindex(long nodeId, String key) {
+        if (key == null) {
+            return;
+        }
+        removeFrom(nodesByKey, key, nodeId);
+        removeFrom(nodesByDocument, ChunkIdentifiers.documentKeyOfChunk(key), nodeId);
+    }
+
+    /**
+     * Removes one node from one reverse index entry, dropping the entry once it is empty.
+     */
+    private static void removeFrom(Map<String, Set<Long>> index, String key, long nodeId) {
+        Set<Long> nodes = index.get(key);
+        if (nodes != null && nodes.remove(nodeId) && nodes.isEmpty()) {
+            index.remove(key);
+        }
     }
 
     /**
@@ -242,7 +351,11 @@ public class NodeDocumentMapping {
      * @return The previous document ID, or null if not found
      */
     public String remove(long nodeId) {
-        String removed = nodeToDocument.remove(nodeId);
+        String removed;
+        synchronized (indexLock) {
+            removed = nodeToDocument.remove(nodeId);
+            unindex(nodeId, removed);
+        }
         if (removed != null) {
             LOGGER.trace("Removed mapping for nodeId={}", nodeId);
         }
@@ -252,21 +365,90 @@ public class NodeDocumentMapping {
     /**
      * Returns all node IDs that belong to a specific document.
      *
-     * <p>This is useful for finding all chunks of a document when
-     * the document needs to be tombstoned.</p>
+     * <p>Every node whose key is one of the document's chunk ids - or, in a document-keyed
+     * mapping, the document key itself - which is what erasure and a rolled-back ingestion have
+     * to retire. Answered from an index rather than a scan: erasing a thousand documents would
+     * otherwise read every entry of every graph a thousand times.</p>
      *
-     * @param documentId The document ID
-     * @return Set of node IDs belonging to the document
+     * @param documentId The document key, {@code sourceId:documentId}
+     * @return A snapshot of the nodes belonging to the document
      */
     public Set<Long> getNodesForDocument(String documentId) {
         if (documentId == null) {
             return Collections.emptySet();
         }
+        synchronized (indexLock) {
+            Set<Long> nodes = nodesByDocument.get(documentId);
+            return nodes == null ? Collections.emptySet() : Set.copyOf(nodes);
+        }
+    }
 
-        return nodeToDocument.entrySet().stream()
-            .filter(e -> documentId.equals(e.getValue()))
-            .map(Map.Entry::getKey)
-            .collect(java.util.stream.Collectors.toSet());
+    /**
+     * Returns all node IDs registered under one chunk id.
+     *
+     * <p>More than one only while a superseded value's node has not been retired yet. Always
+     * empty in a {@link Keying#DOCUMENT document-keyed} mapping, whose keys name no chunk.</p>
+     *
+     * @param chunkId The chunk id
+     * @return A snapshot of the nodes registered under it
+     */
+    public Set<Long> getNodesForChunk(String chunkId) {
+        if (chunkId == null) {
+            return Collections.emptySet();
+        }
+        synchronized (indexLock) {
+            Set<Long> nodes = nodesByKey.get(chunkId);
+            return nodes == null ? Collections.emptySet() : Set.copyOf(nodes);
+        }
+    }
+
+    /**
+     * What this mapping's keys name.
+     *
+     * @return {@link Keying#CHUNK} unless the mapping was loaded from a file written before nodes
+     *         were attributed to chunks and has not been re-keyed since
+     */
+    public Keying keying() {
+        return keying;
+    }
+
+    /**
+     * Replaces every entry with chunk-keyed ones, and from then on persists as chunk-keyed.
+     *
+     * <p>The one way a document-keyed mapping stops being one. All at once rather than entry by
+     * entry: a mapping holding keys of both kinds would be persisted under one version or the
+     * other, and either claim would be false for part of it.</p>
+     *
+     * @param chunkKeyed The complete new contents, node to chunk id
+     * @throws NullPointerException if chunkKeyed is null
+     * @throws IllegalArgumentException if any entry is not a valid mapping
+     */
+    public void rekeyToChunks(Map<Long, String> chunkKeyed) {
+        Objects.requireNonNull(chunkKeyed, "chunkKeyed cannot be null");
+        synchronized (indexLock) {
+            nodeToDocument.clear();
+            nodesByKey.clear();
+            nodesByDocument.clear();
+            keying = Keying.CHUNK;
+            for (Map.Entry<Long, String> entry : chunkKeyed.entrySet()) {
+                register(entry.getKey(), entry.getValue());
+            }
+        }
+        LOGGER.debug("Re-keyed {} mappings to chunks", chunkKeyed.size());
+    }
+
+    /**
+     * Sets what the entries about to be registered name, for a mapping rebuilt from another.
+     *
+     * <p>Compaction copies a mapping into a fresh one under new node numbers, and the copy has to
+     * be persisted under the same version as the original: a document-keyed mapping must not come
+     * out of a compaction claiming to name chunks.</p>
+     *
+     * @param keying What the entries name
+     * @throws NullPointerException if keying is null
+     */
+    void useKeying(Keying keying) {
+        this.keying = Objects.requireNonNull(keying, "keying cannot be null");
     }
 
     /**
@@ -300,7 +482,11 @@ public class NodeDocumentMapping {
      * Clears all mappings.
      */
     public void clear() {
-        nodeToDocument.clear();
+        synchronized (indexLock) {
+            nodeToDocument.clear();
+            nodesByKey.clear();
+            nodesByDocument.clear();
+        }
         LOGGER.debug("Cleared all mappings");
     }
 
@@ -340,7 +526,7 @@ public class NodeDocumentMapping {
             ByteBuffer payload = encodeEntries();
             ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
             header.putLong(0, MAGIC);
-            header.putInt(Long.BYTES, VERSION);
+            header.putInt(Long.BYTES, versionFor(keying));
             header.putLong(OFFSET_ENTRY_COUNT, entryCount);
 
             // The payload is digested before either part is written, so the checksum in the
@@ -366,6 +552,26 @@ public class NodeDocumentMapping {
         } finally {
             persistenceLock.writeLock().unlock();
         }
+    }
+
+    /**
+     * The version a mapping of this keying is written at.
+     *
+     * @param keying What the entries name
+     * @return {@link #VERSION} for chunks, {@link #VERSION_DOCUMENT_KEYED} for documents
+     */
+    static int versionFor(Keying keying) {
+        return keying == Keying.CHUNK ? VERSION : VERSION_DOCUMENT_KEYED;
+    }
+
+    /**
+     * What the entries of a file at a given version name.
+     *
+     * @param version A version {@link #readVersion} accepted
+     * @return The keying its entries were written under
+     */
+    static Keying keyingOf(int version) {
+        return version == VERSION ? Keying.CHUNK : Keying.DOCUMENT;
     }
 
     /**
@@ -430,7 +636,7 @@ public class NodeDocumentMapping {
 
         persistenceLock.writeLock().lock();
         try {
-            nodeToDocument.clear();
+            clear();
 
             try (FileChannel channel = FileChannel.open(mappingPath, StandardOpenOption.READ)) {
                 long fileSize = channel.size();
@@ -487,9 +693,14 @@ public class NodeDocumentMapping {
                     ByteBuffer docIdBuffer = ByteBuffer.allocate(docIdLen);
                     readFully(channel, docIdBuffer, "document ID of entry " + i);
                     String documentId = new String(docIdBuffer.array(), StandardCharsets.UTF_8);
+                    if (nodeId < 0 || documentId.isEmpty()) {
+                        throw new IOException("Corrupt mapping file " + mappingPath + ": entry " + i
+                            + " maps node " + nodeId + " to an empty or invalid key");
+                    }
 
-                    nodeToDocument.put(nodeId, documentId);
+                    register(nodeId, documentId);
                 }
+                keying = keyingOf(version);
             }
 
             LOGGER.debug("Loaded {} mappings from {}", nodeToDocument.size(), mappingPath);
@@ -565,21 +776,25 @@ public class NodeDocumentMapping {
      * @return The entry count currently recorded in the header
      * @throws IOException if the existing header is not a valid mapping header
      */
-    private static ByteBuffer readOrInitializeHeader(FileChannel channel, Path mappingPath)
+    private ByteBuffer readOrInitializeHeader(FileChannel channel, Path mappingPath)
             throws IOException {
+        int expected = versionFor(keying);
         ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
         if (channel.size() < HEADER_SIZE) {
             header.putLong(0, MAGIC);
-            header.putInt(Long.BYTES, VERSION);
+            header.putInt(Long.BYTES, expected);
             header.putLong(OFFSET_ENTRY_COUNT, 0L);
             return header;
         }
 
+        // An append adds a key of this mapping's keying to a file that declares one, so the two
+        // have to agree: a chunk id appended to a document-keyed file, or the reverse, would be
+        // read back under the wrong meaning.
         int version = readVersion(channel, mappingPath);
-        if (version != VERSION) {
+        if (version != expected) {
             throw new IOException("Mapping file " + mappingPath + " is at format version "
-                + version + ", which cannot be appended to by this build; compact the mapping "
-                + "to rewrite it at version " + VERSION);
+                + version + ", which cannot be appended to by this mapping; compact the mapping "
+                + "to rewrite it at version " + expected);
         }
         readFully(channel, header, 0, "mapping header");
         return header;
@@ -601,7 +816,7 @@ public class NodeDocumentMapping {
             throw new IOException("Invalid mapping file (bad magic number): " + mappingPath);
         }
         int version = probe.getInt(Long.BYTES);
-        if (version != VERSION && version != VERSION_V1) {
+        if (version != VERSION && version != VERSION_DOCUMENT_KEYED && version != VERSION_V1) {
             throw new IOException("Unsupported mapping file version " + version + " in "
                 + mappingPath);
         }
@@ -663,7 +878,7 @@ public class NodeDocumentMapping {
 
     @Override
     public String toString() {
-        return String.format("NodeDocumentMapping{entries=%d, persistent=%s, path=%s}",
-            nodeToDocument.size(), persistent, mappingPath);
+        return String.format("NodeDocumentMapping{entries=%d, keying=%s, persistent=%s, path=%s}",
+            nodeToDocument.size(), keying, persistent, mappingPath);
     }
 }

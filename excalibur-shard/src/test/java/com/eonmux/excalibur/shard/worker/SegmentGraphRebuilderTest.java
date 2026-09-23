@@ -114,6 +114,10 @@ class SegmentGraphRebuilderTest {
 
             assertThat(inserted).isEqualTo(ENTRIES);
             assertThat(tracker.getLastIntegratedOffset()).isEqualTo(head);
+            assertThat(graph.getNodeDocumentMapping().getAllMappings().values())
+                .as("each node is attributed to its chunk, as the integration worker names it")
+                .containsExactlyInAnyOrder("source:doc:chunk:0", "source:doc:chunk:1",
+                    "source:doc:chunk:2", "source:doc:chunk:3", "source:doc:chunk:4");
         }
     }
 }

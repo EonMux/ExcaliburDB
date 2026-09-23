@@ -10,8 +10,10 @@ import com.eonmux.excalibur.store.SegmentCatalog;
 import com.eonmux.excalibur.store.WriteLog;
 import com.eonmux.excalibur.store.format.LogEntry;
 import com.eonmux.excalibur.metrics.Metrics;
+import com.eonmux.excalibur.vector.hnsw.ChunkAttributionUpgrade;
 import com.eonmux.excalibur.vector.hnsw.HnswGraph;
 import com.eonmux.excalibur.vector.hnsw.IncrementalInsertResult;
+import com.eonmux.excalibur.vector.hnsw.NodeDocumentMapping;
 import com.eonmux.excalibur.vector.hnsw.TailOffsetTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +37,17 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>Worker inserts entries into HNSW graph</li>
  *   <li>On success, worker updates lastIntegratedOffset</li>
  * </ol>
+ *
+ * <h2>Chunk attribution</h2>
+ * <p>Each node is attributed to the chunk id its write-log entry was written under, and the log
+ * is replayed in order: a PUT of a chunk id the graph already holds a node for supersedes that
+ * node ({@link HnswGraph#attributeChunk}), and a DELETE retires the chunk's nodes. Storage keeps
+ * only the newest value under a key, and this is what makes the graph agree with it - a document
+ * re-posted with new text, a shorter replacement's dropped tail and an erased document all leave
+ * no vector behind, in exactly the order storage saw them, whatever the ingesting thread was
+ * doing meanwhile. A graph whose mapping an older build keyed by document is re-keyed from the
+ * segment's entries before anything more is integrated into it; see
+ * {@link ChunkAttributionUpgrade}.</p>
  *
  * <h2>Backpressure Mechanism</h2>
  * <p>Every cycle the worker measures the integration queue (entries between
@@ -180,6 +193,13 @@ public class HnswIntegrationWorker {
     private volatile com.eonmux.excalibur.store.VectorPrefilter vectorPrefilter;
 
     private volatile Thread workerThread;
+
+    /**
+     * Segments whose attribution upgrade has failed and been reported, so a failure that repeats
+     * every cycle is logged once rather than ten times a second.
+     */
+    private final java.util.Set<java.nio.file.Path> reportedUpgradeFailures =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /**
      * How the running loop is told to stop, replaced on every {@link #start()}.
@@ -733,6 +753,12 @@ public class HnswIntegrationWorker {
             return 0;
         }
 
+        // Before anything is attributed: a mapping an older build keyed by document cannot take
+        // a chunk id, and it cannot be persisted at all once it holds both kinds of key.
+        if (!attributionReady(indexable)) {
+            return 0;
+        }
+
         long writeLogHead = writeLog.writeOffset();
         long lastIntegrated = tracker.getLastIntegratedOffset();
 
@@ -740,20 +766,30 @@ public class HnswIntegrationWorker {
             return 0; // No entries to integrate
         }
 
-        // Collect vectors, offsets, and document IDs for batch integration
+        // Collect vectors, offsets and chunk ids for batch integration, and the deletions
+        // between them in log order
         List<float[]> vectors = new ArrayList<>(batchSize);
         List<Long> offsets = new ArrayList<>(batchSize);
-        List<String> documentIds = new ArrayList<>(batchSize);
+        List<String> chunkIds = new ArrayList<>(batchSize);
+        List<Retirement> retirements = new ArrayList<>();
 
         long currentOffset = readBatch(writeLog, graph, lastIntegrated, writeLogHead,
-            vectors, offsets, documentIds);
+            vectors, offsets, chunkIds, retirements);
 
         if (vectors.isEmpty()) {
+            // Deletions still apply: an erasure writes nothing but them.
+            retireInOrder(graph, retirements, 0, Integer.MAX_VALUE);
             // No usable vectors found; advance past the entries that were skipped so a
             // malformed or wrongly dimensioned entry cannot stall the log tail forever.
             if (currentOffset > lastIntegrated) {
                 tailMoved(segment);
                 tracker.compareAndSetOffset(currentOffset);
+                if (!retirements.isEmpty()) {
+                    // The checkpoint and the tombstones it vouches for reach disk together; a
+                    // checkpoint alone would skip the deletions on restart and leave the erased
+                    // chunks' vectors live.
+                    tracker.flush();
+                }
             } else {
                 reportStalledTail(segment, lastIntegrated, writeLogHead);
             }
@@ -768,19 +804,21 @@ public class HnswIntegrationWorker {
 
             List<IncrementalInsertResult> results = tracker.integrateBatch(vectors, offsets);
 
-            int successCount = recordInsertResults(graph, results, documentIds);
+            int successCount = recordInsertResults(graph, results, chunkIds, retirements);
 
             mirrorIntoPrefilter(segment, results, vectors);
 
-            if (successCount > 0) {
-                LOGGER.debug("Integrated {}/{} vectors from segment {} at epoch {}",
-                    successCount, vectors.size(), segment.path(), batchEpoch);
+            if (successCount > 0 || !retirements.isEmpty()) {
+                LOGGER.debug("Integrated {}/{} vectors and {} deletion(s) from segment {} at "
+                    + "epoch {}", successCount, vectors.size(), retirements.size(),
+                    segment.path(), batchEpoch);
 
                 // Checkpoint durably at the batch boundary. flush() writes the offset and
                 // forces the graph's mapping, so the node pages the checkpoint vouches for
                 // reach disk with it. A checkpoint that survived a crash without its nodes
                 // would silently lose vectors; one that was lost would re-insert the whole
-                // batch as duplicate nodes on restart.
+                // batch on restart - each re-inserted node superseding its first copy, so the
+                // cost is the repeated work and the dead nodes, not a wrong answer.
                 tracker.flush();
 
                 // The pre-filter is made durable with the checkpoint that vouches for the nodes
@@ -788,8 +826,9 @@ public class HnswIntegrationWorker {
                 // no longer has.
                 flushPrefilter(segment);
 
-                // Notify listener
-                listener.onVectorsIntegrated(segment, successCount);
+                if (successCount > 0) {
+                    listener.onVectorsIntegrated(segment, successCount);
+                }
             }
 
             return successCount;
@@ -802,6 +841,15 @@ public class HnswIntegrationWorker {
     }
 
     /**
+     * A write-log DELETE, positioned among the batch's PUTs.
+     *
+     * @param beforePut How many of the batch's collected PUTs precede it in the log
+     * @param chunkId   The deleted key
+     */
+    private record Retirement(int beforePut, String chunkId) {
+    }
+
+    /**
      * Reads up to {@code batchSize} integrable entries from the write log tail.
      *
      * <p>Entries that carry no vector, or a vector whose dimension does not match the
@@ -809,17 +857,23 @@ public class HnswIntegrationWorker {
      * batch insert, which would leave the offset unadvanced and re-insert every preceding
      * vector of the batch on the next cycle, forever.</p>
      *
+     * <p>DELETEs are collected too, with their position among the PUTs, because a key deleted
+     * and then written again in one batch has to end with the new value's node standing, and a
+     * key written and then deleted with none.</p>
+     *
      * @param writeLog     The segment's write log
      * @param graph        The segment's graph, whose dimension the vectors must match
      * @param fromOffset   First un-integrated offset
      * @param writeLogHead Current head of the write log
      * @param vectors      Collects the vectors to insert
      * @param offsets      Collects the END offset of each collected vector's entry
-     * @param documentIds  Collects the document ID of each collected vector's entry
+     * @param chunkIds     Collects the key of each collected vector's entry
+     * @param retirements  Collects the deletions, in log order
      * @return The offset immediately after the last entry examined
      */
     private long readBatch(WriteLog writeLog, HnswGraph graph, long fromOffset, long writeLogHead,
-                           List<float[]> vectors, List<Long> offsets, List<String> documentIds) {
+                           List<float[]> vectors, List<Long> offsets, List<String> chunkIds,
+                           List<Retirement> retirements) {
         int expectedDimension = graph.config().dimension();
         long currentOffset = fromOffset;
         int entriesRead = 0;
@@ -841,13 +895,18 @@ public class HnswIntegrationWorker {
                     vectors.add(vector);
                     // Pass END offset (not START offset) so tracker knows where next entry begins
                     offsets.add(entryEndOffset);
-                    // Extract document ID from entry key (format: documentId:chunkIndex)
-                    documentIds.add(extractDocumentId(entry.key()));
+                    chunkIds.add(chunkIdOf(entry.key()));
                     entriesRead++;
                 } else if (vector != null) {
                     LOGGER.warn("Skipping write log entry at offset {}: vector dimension {} does "
                         + "not match graph dimension {}", currentOffset, vector.length,
                         expectedDimension);
+                }
+            } else if (entry.isDelete()) {
+                String chunkId = chunkIdOf(entry.key());
+                if (chunkId != null) {
+                    retirements.add(new Retirement(vectors.size(), chunkId));
+                    entriesRead++;
                 }
             }
 
@@ -940,17 +999,27 @@ public class HnswIntegrationWorker {
     }
 
     /**
-     * Records the node-to-document mapping for the nodes a batch inserted.
+     * Attributes the nodes a batch inserted to their chunks, applying the batch's deletions
+     * between them in log order.
+     *
+     * <p>Each attribution retires the nodes of the chunk's earlier values, and each deletion the
+     * nodes the chunk has at that point, so the batch leaves the graph holding what storage
+     * holds: the last value written under each key, or nothing for a key whose last operation was
+     * a delete.</p>
      *
      * @param graph       The segment's graph
      * @param results     The batch insertion results
-     * @param documentIds The document IDs, positionally aligned with the results
+     * @param chunkIds    The chunk ids, positionally aligned with the results
+     * @param retirements The batch's deletions, in log order
      * @return Number of successful insertions
      */
     private int recordInsertResults(HnswGraph graph, List<IncrementalInsertResult> results,
-                                    List<String> documentIds) {
+                                    List<String> chunkIds, List<Retirement> retirements) {
         int successCount = 0;
+        int nextRetirement = 0;
         for (int i = 0; i < results.size(); i++) {
+            nextRetirement = retireInOrder(graph, retirements, nextRetirement, i);
+
             IncrementalInsertResult result = results.get(i);
             if (!result.isSuccess()) {
                 LOGGER.debug("Vector integration failed at offset {} (nodeId={})",
@@ -959,15 +1028,119 @@ public class HnswIntegrationWorker {
             }
 
             successCount++;
-            // Register the node-to-document mapping for atomicity filtering.
-            // This maps the HNSW node ID to the actual document ID string.
-            String documentId = i < documentIds.size() ? documentIds.get(i) : null;
-            if (documentId != null) {
-                graph.registerDocumentId(result.nodeId(), documentId);
-                LOGGER.trace("Registered nodeId={} -> documentId={}", result.nodeId(), documentId);
+            String chunkId = i < chunkIds.size() ? chunkIds.get(i) : null;
+            if (chunkId != null) {
+                int superseded = graph.attributeChunk(result.nodeId(), chunkId);
+                LOGGER.trace("Attributed nodeId={} to chunk {}, superseding {}",
+                    result.nodeId(), chunkId, superseded);
             }
         }
+        retireInOrder(graph, retirements, nextRetirement, Integer.MAX_VALUE);
         return successCount;
+    }
+
+    /**
+     * Applies the deletions that precede a given PUT of the batch.
+     *
+     * @param graph       The segment's graph
+     * @param retirements The batch's deletions, in log order
+     * @param from        The first deletion not yet applied
+     * @param beforePut   Apply those positioned before this PUT
+     * @return The first deletion still not applied
+     */
+    private static int retireInOrder(HnswGraph graph, List<Retirement> retirements, int from,
+                                     int beforePut) {
+        int next = from;
+        while (next < retirements.size() && retirements.get(next).beforePut() <= beforePut) {
+            String chunkId = retirements.get(next).chunkId();
+            int retired = graph.deleteChunks(List.of(chunkId));
+            if (retired > 0) {
+                LOGGER.trace("Retired {} node(s) of deleted chunk {}", retired, chunkId);
+            }
+            next++;
+        }
+        return next;
+    }
+
+    /**
+     * Makes sure a graph's attribution names chunks before anything more is attributed in it.
+     *
+     * <p>A graph opened from a data directory an older build wrote attributes its nodes to
+     * documents. It is re-keyed from the segment's live entries, here and on this thread, because
+     * this is the thread that attributes nodes in it: nothing else can add a chunk id to the
+     * mapping while the re-keying is under way. Until it succeeds the graph goes on being served
+     * as it is - hits named by document, as that build named them - and nothing new is integrated
+     * into it.</p>
+     *
+     * @param indexable The segment with its graph
+     * @return true when the graph is chunk-keyed and integration may proceed
+     */
+    private boolean attributionReady(IndexableSegment indexable) {
+        HnswGraph graph = indexable.graph;
+        if (graph.attributionKeying() == NodeDocumentMapping.Keying.CHUNK) {
+            return true;
+        }
+        Segment segment = indexable.segment;
+        try (Segment.EntryIterator entries = segment.liveEntries()) {
+            ChunkAttributionUpgrade.Outcome outcome =
+                ChunkAttributionUpgrade.run(graph, liveChunks(entries, graph.config().dimension()));
+            if (outcome.retry()) {
+                LOGGER.info("The graph of {} was compacted while its attribution was being "
+                    + "re-keyed to chunks; re-keying again on the next cycle", segment.path());
+                return false;
+            }
+            reportedUpgradeFailures.remove(segment.path());
+            return true;
+        } catch (RuntimeException e) {
+            if (reportedUpgradeFailures.add(segment.path())) {
+                LOGGER.error("Could not re-key the attribution of {}'s graph from documents to "
+                    + "chunks, so nothing more is integrated into it and its hits go on naming "
+                    + "documents; retrying every cycle: {}", segment.path(), e.toString(), e);
+            }
+            return false;
+        }
+    }
+
+    /**
+     * The live chunks of a segment that carry an embedding the graph could hold.
+     *
+     * @param entries   The segment's live entries
+     * @param dimension The graph's dimension
+     * @return The chunk ids and their embeddings
+     */
+    private static java.util.Iterator<ChunkAttributionUpgrade.LiveChunk> liveChunks(
+            Segment.EntryIterator entries, int dimension) {
+        return new java.util.Iterator<>() {
+            private ChunkAttributionUpgrade.LiveChunk next = advance();
+
+            private ChunkAttributionUpgrade.LiveChunk advance() {
+                while (entries.hasNext()) {
+                    com.eonmux.excalibur.store.format.SegmentEntry entry = entries.next();
+                    byte[] value = entry.value();
+                    float[] vector = value == null ? null : ChunkPayloadCodec.embeddingOf(value);
+                    String chunkId = chunkIdOf(entry.key());
+                    if (vector != null && vector.length == dimension && chunkId != null) {
+                        return new ChunkAttributionUpgrade.LiveChunk(chunkId, vector);
+                    }
+                }
+                return null;
+            }
+
+            @Override
+            public boolean hasNext() {
+                return next != null;
+            }
+
+            @Override
+            public ChunkAttributionUpgrade.LiveChunk next() {
+                if (next == null) {
+                    throw new java.util.NoSuchElementException();
+                }
+                ChunkAttributionUpgrade.LiveChunk current = next;
+                next = advance();
+                return current;
+            }
+        };
     }
 
     /**
@@ -985,25 +1158,25 @@ public class HnswIntegrationWorker {
     }
 
     /**
-     * Extracts the document key from an entry key.
+     * Decodes the chunk id a node is attributed to from its write-log entry key.
      *
-     * <p>Delegates to {@link ChunkIdentifiers}, which is the single definition of this
-     * convention. The document key registered here is what excalibur-query's atomicity filter
-     * later looks up in the visibility tracker, and what {@code SegmentGraphRebuilder} registers
-     * when the same segment's graph is rebuilt instead of integrated incrementally. Deriving it
-     * here independently is how those three drift apart, and every way they can disagree is
-     * silent: the node is registered under a key nothing asks about, so the document is dropped
-     * from results rather than reported as an error.</p>
+     * <p>The storage key is the chunk id, {@code sourceId:documentId:chunk:N} as
+     * {@link ChunkIdentifiers} forms it, and it is registered whole. The document is derived from
+     * it where it is needed - by the atomicity filter, by document erasure - through
+     * {@link ChunkIdentifiers#documentKeyOfChunk(String)}, the single definition of that
+     * convention, rather than being decided here. {@code SegmentGraphRebuilder} registers the
+     * same string when the same segment's graph is rebuilt instead of integrated incrementally,
+     * and the tail scan reports it for an entry not integrated yet, so a hit carries one identity
+     * however the node came to exist.</p>
      *
      * @param key The entry key bytes (UTF-8 encoded)
-     * @return The document key, or null if the entry carries no key
+     * @return The chunk id, or null if the entry carries no key
      */
-    private String extractDocumentId(byte[] key) {
+    private static String chunkIdOf(byte[] key) {
         if (key == null || key.length == 0) {
             return null;
         }
-        return ChunkIdentifiers.documentKeyOfChunk(
-            new String(key, java.nio.charset.StandardCharsets.UTF_8));
+        return new String(key, java.nio.charset.StandardCharsets.UTF_8);
     }
 
     /**

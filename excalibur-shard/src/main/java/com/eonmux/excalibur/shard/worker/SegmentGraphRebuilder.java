@@ -1,7 +1,6 @@
 package com.eonmux.excalibur.shard.worker;
 
 import com.eonmux.excalibur.core.codec.ChunkPayloadCodec;
-import com.eonmux.excalibur.core.text.ChunkIdentifiers;
 import com.eonmux.excalibur.store.Segment;
 import com.eonmux.excalibur.store.format.SegmentEntry;
 import com.eonmux.excalibur.vector.hnsw.HnswGraph;
@@ -91,8 +90,9 @@ public final class SegmentGraphRebuilder {
                 long nodeId = graph.insert(vector);
                 byte[] key = entry.key();
                 if (key != null && key.length > 0) {
-                    graph.registerDocumentId(nodeId, ChunkIdentifiers.documentKeyOfChunk(
-                        new String(key, StandardCharsets.UTF_8)));
+                    // The chunk id itself, as the integration worker attributes it: live entries
+                    // hold one value per key, so no node here supersedes another.
+                    graph.registerDocumentId(nodeId, new String(key, StandardCharsets.UTF_8));
                 }
                 inserted++;
             }
