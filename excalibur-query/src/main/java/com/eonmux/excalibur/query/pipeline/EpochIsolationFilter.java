@@ -54,8 +54,10 @@ final class EpochIsolationFilter {
                     sr.segmentId(), sr.results(), queryEpoch);
                 totalFiltered += sr.results().size() - filtered.size();
 
-                // Create new result with filtered list, keeping the tail-scan chunk
-                // text so the surviving results still carry their payloads
+                // Create new result with filtered list, keeping the tail-scan chunk text so
+                // the surviving results still carry their payloads, and whether the segment
+                // was read in full: dropping invisible nodes does not make a tail scan that
+                // stopped early into one that saw everything.
                 filteredResults.add(new SegmentQueryTask.SegmentQueryResult(
                     sr.segmentId(),
                     filtered,
@@ -63,7 +65,8 @@ final class EpochIsolationFilter {
                     sr.durationMs(),
                     sr.success(),
                     sr.errorMessage(),
-                    sr.payloads()
+                    sr.payloads(),
+                    sr.complete()
                 ));
             } else {
                 filteredResults.add(sr);
