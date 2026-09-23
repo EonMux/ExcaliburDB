@@ -9,6 +9,7 @@ import com.eonmux.excalibur.graph.erasure.GraphErasureCoordinator;
 import com.eonmux.excalibur.graph.erasure.ServedArtifactEraser;
 import com.eonmux.excalibur.graph.staging.GraphBuilder;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
+import com.eonmux.excalibur.graph.staging.ReferencedLabels;
 import com.eonmux.excalibur.ingest.graph.StagedWithdrawals;
 import com.eonmux.excalibur.retrieval.build.GraphDirectoryBuilder;
 import com.eonmux.excalibur.retrieval.lexical.DerivedArtifactEraser;
@@ -133,7 +134,8 @@ public final class GraphTenant implements AutoCloseable {
 
         Deque<AutoCloseable> opened = new ArrayDeque<>();
         try {
-            GraphStagingStore staging = GraphStagingStore.open(stagingDirectory);
+            GraphStagingStore staging = GraphStagingStore.open(stagingDirectory,
+                labelHolders(directory));
             opened.push(staging);
 
             StagedWithdrawals withdrawals = StagedWithdrawals.open(
@@ -298,6 +300,26 @@ public final class GraphTenant implements AutoCloseable {
     public static Path stagingDirectoryOf(Path graphDirectory) {
         Objects.requireNonNull(graphDirectory, "graphDirectory must not be null");
         return graphDirectory.resolveSibling(graphDirectory.getFileName() + STAGING_SUFFIX);
+    }
+
+    /**
+     * Everything outside a namespace's staging directory's own logs that names its label ids.
+     *
+     * <p>The graph published from it, and the two logs of requests still to be applied to it -
+     * erasures and withdrawals - which name entities by id. The staging store asks these before
+     * it lets an interner with a damaged last record give an id up, so an id any of them holds
+     * is never handed to a different label; see {@link ReferencedLabels}. {@code fsck} names the
+     * same holders for the same question.</p>
+     *
+     * @param graphDirectory Where the namespace's graph is served from
+     * @return The holders
+     */
+    static ReferencedLabels labelHolders(Path graphDirectory) {
+        Path staging = stagingDirectoryOf(graphDirectory);
+        return ReferencedLabels.all(
+            ReferencedLabels.publishedIn(graphDirectory),
+            ReferencedLabels.owedIn(staging.resolve(ERASURE_LOG)),
+            ReferencedLabels.owedIn(staging.resolve(StagedWithdrawals.LOG_FILE)));
     }
 
     /**

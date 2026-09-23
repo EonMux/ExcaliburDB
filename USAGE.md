@@ -2983,11 +2983,19 @@ opens and builds from it with, so the verdict is the node's:
 - The log ends in bytes that do not read as a record, with nothing readable after them: `UNSEALED`.
   That is what a process killed mid-append leaves, and the node cuts those bytes off when it next
   opens the log, keeping every record before them — so it is not damage, it does fail `--strict`,
-  and the repair plan leaves it to the node.
-- Damage the node refuses — a record that fails its checksum with an intact record after it, or,
-  in `triples.log`, whose records are fixed width, any whole record that fails its checksum:
-  `CORRUPT`, and left for an operator (below). The node refuses the label interners and the entity
-  text log when it opens them, and a corrupt `triples.log` fails every graph build and erasure.
+  and the repair plan leaves it to the node. A label interner's last label is cut off like this
+  only while nothing names its id (next point). A file shorter than its 16-byte header whose bytes
+  are the start of that header is `UNSEALED` too: its creation was cut short, and the node starts
+  it afresh.
+- Damage the node refuses — a record that fails its checksum with an intact record after it; in
+  `triples.log`, whose records are fixed width, any whole record that fails its checksum; a label
+  interner whose damaged last label has its id named by the staged facts, the entity text, the
+  graph published beside the staging directory, or an outstanding erasure or withdrawal; or a file
+  shorter than its header whose bytes are not the start of it: `CORRUPT`, and left for an operator
+  (below). The node refuses the label interners and the entity text log when it opens them, and a
+  corrupt `triples.log` fails every graph build and erasure. A label is forced to the device before
+  its id is handed out, so a damaged last label whose id something names was lost after it was
+  written, not cut short by a crash — and the node will not give that id to a new label.
 - A header naming a version this build does not read: `UNREADABLE`, as for any other file.
 
 Four files are judged by what the node does with them rather than by name alone:

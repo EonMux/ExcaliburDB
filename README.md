@@ -448,9 +448,13 @@ inspection that lives in the graph module beside the replay the node opens it wi
 cannot disagree about what a record is. A log whose every record matched its checksum is `INTACT`,
 with the count proven. One ending in bytes that do not read as a record, with nothing readable
 after them, is `UNSEALED`: that is a process killed mid-append, and the node cuts those bytes off
-when it next opens the log, so the repair plan leaves it to the node. Damage the node refuses — a
-record failing its checksum with an intact one after it, or any whole record of the fixed-width
-`triples.log` failing its checksum — is `CORRUPT`.
+when it next opens the log, so the repair plan leaves it to the node; so is a file shorter than its
+header whose bytes begin that header, which the node starts afresh. Damage the node refuses — a
+record failing its checksum with an intact one after it, any whole record of the fixed-width
+`triples.log` failing its checksum, a label interner's damaged last label whose id the staged
+facts, the entity text, the graph published beside the staging directory or an outstanding
+erasure or withdrawal still names, or a file shorter than its header that does not begin it — is
+`CORRUPT`.
 
 Repair is off by default: without `--repair` the plan is printed and nothing is touched. With it,
 the tool writes, and each write is stated before it is made. **No repair ever deletes anything.**
@@ -1273,6 +1277,18 @@ Facts accumulate in `<graph dir>-staging`, beside the store rather than inside i
 replaces the store wholesale, and the record the next build reads has to survive that. Entity ids
 are assigned once and never renumbered, so the Lucene indexes that store them stay correct across a
 rebuild they did not take part in.
+
+A crash during ingestion costs the facts that were in flight and nothing staged before them: each
+staging log cuts off a record a crash left half-written when it next opens. The label interners
+are held to more, because an id is written into the staged facts, the entity text, the published
+graph and entity erasure requests, and none of those records the name. A new label is forced to the
+device before its id is handed out, so a half-written label never held an id anybody has. A last
+label that fails its checksum is therefore cut off only when nothing - staged facts, entity text,
+the published graph, an outstanding erasure or withdrawal - refers to its id; when something does,
+the label was lost after it was written, and the namespace refuses to open rather than hand that id
+to the next new label and serve one entity under another's name. A staging log shorter than its
+16-byte header is started afresh when its bytes are the start of that header - its creation cut
+short - and refused, untouched, when they are anything else.
 
 A build sorts the namespace's staged facts in memory before writing them: about 48 bytes of heap per
 fact at its peak, up to 66 with the buffer's growth slack, and at most 2,147,483,639 facts in one

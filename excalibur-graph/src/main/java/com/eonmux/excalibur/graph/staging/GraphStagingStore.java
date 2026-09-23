@@ -3,6 +3,7 @@ package com.eonmux.excalibur.graph.staging;
 import com.eonmux.excalibur.graph.build.BuildCancellation;
 import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogHeader;
 import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.provenance.Provenance;
 import com.eonmux.excalibur.graph.provenance.SourceType;
@@ -87,6 +88,22 @@ import java.util.zip.CRC32;
  * needs forced first, or a power loss leaves the registry saying the facts were taken while the
  * facts are gone. {@link #close()} forces for the same reason: a store nobody holds any more is
  * one nobody will force later.</p>
+ *
+ * <p>The interners are the exception, and are forced as they go: an id is written into the logs
+ * here and into artifacts beyond them, and none of those may reach the device ahead of the label
+ * that says who the id is. See {@link LabelInterner}.</p>
+ *
+ * <h2>Ids nothing may lose</h2>
+ * <p>An interner whose last record is damaged is opened by cutting that record off, which is
+ * only safe while nothing holds its id. So when one has, the open reads the highest id staged
+ * facts and entity text refer to, together with whatever {@link ReferencedLabels} the caller
+ * names - a published graph, an erasure log - and refuses rather than give an id that is held
+ * to a new label. {@link #inspectLabels} asks the same question without opening anything.</p>
+ *
+ * <h2>A log shorter than its header</h2>
+ * <p>Each log is created by writing its header, so a file shorter than one is either that write
+ * cut short, which the open starts afresh, or bytes some other writer left, which the open
+ * refuses and leaves alone. See {@link LogHeader}.</p>
  *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent appends, which is what ingestion does - one virtual thread per document.
@@ -196,7 +213,21 @@ public final class GraphStagingStore implements AutoCloseable {
      * @throws IOException if the directory or its files cannot be opened
      */
     public static GraphStagingStore open(Path directory) throws IOException {
-        return open(directory, Clock.systemUTC());
+        return open(directory, Clock.systemUTC(), ReferencedLabels.NONE);
+    }
+
+    /**
+     * Opens the staging store in {@code directory}, naming what else holds its label ids.
+     *
+     * @param directory Where the interners and the log live
+     * @param holders   What outside the directory refers to label ids; see {@link #open(Path,
+     *                  Clock, ReferencedLabels)}
+     * @return The store
+     * @throws IOException if the directory or its files cannot be opened
+     */
+    public static GraphStagingStore open(Path directory, ReferencedLabels holders)
+            throws IOException {
+        return open(directory, Clock.systemUTC(), holders);
     }
 
     /**
@@ -209,20 +240,65 @@ public final class GraphStagingStore implements AutoCloseable {
      *                     version cannot be upgraded
      */
     public static GraphStagingStore open(Path directory, Clock clock) throws IOException {
+        return open(directory, clock, ReferencedLabels.NONE);
+    }
+
+    /**
+     * Opens the staging store in {@code directory}.
+     *
+     * <h3>What {@code holders} is for</h3>
+     * <p>An interner whose last record is damaged may be trimmed only when no id it could have
+     * held is held anywhere; see "Ids nothing may lose". The staged facts and entity text in this
+     * directory are always asked. {@code holders} names what lives elsewhere and refers to the
+     * same ids - the graph published from this staging, and the erasure logs whose requests name
+     * entities by id - and is read only when an interner would otherwise give an id up.</p>
+     *
+     * @param directory Where the interners and the log live
+     * @param clock     What the day a fact is staged on is read from
+     * @param holders   What outside the directory refers to label ids
+     * @return The store
+     * @throws IOException if the directory or its files cannot be opened, a log is too short to
+     *                     hold a header and is not a torn creation of one, or a log in an earlier
+     *                     version cannot be upgraded
+     * @throws LogCorruptionException if a log is damaged other than at its tail, or an interner
+     *                                would lose an id something refers to
+     */
+    public static GraphStagingStore open(Path directory, Clock clock, ReferencedLabels holders)
+            throws IOException {
         Objects.requireNonNull(directory, "directory must not be null");
         Objects.requireNonNull(clock, "clock must not be null");
+        Objects.requireNonNull(holders, "holders must not be null");
         Files.createDirectories(directory);
 
-        LabelInterner entities = LabelInterner.open(directory.resolve(ENTITY_LABELS));
+        // Judged before anything in the directory is written, so a log that has to be refused
+        // leaves the others as they were too.
+        Path logPath = directory.resolve(TRIPLE_LOG);
+        boolean freshLog = LogHeader.requireCreatable(logPath, "triple log", MAGIC, VERSION);
+        LogHeader.requireCreatable(directory.resolve(ENTITY_TEXT_LOG), "entity text log",
+            EntityTextLog.MAGIC, EntityTextLog.VERSION);
+
+        ReferencedLabels held = everythingHolding(directory, holders);
+        LabelInterner entities = LabelInterner.open(directory.resolve(ENTITY_LABELS),
+            () -> held.reach().entities());
         LabelInterner relations = null;
         DataOutputStream out = null;
         EntityTextLog text = null;
         try {
-            relations = LabelInterner.open(directory.resolve(RELATION_LABELS));
+            relations = LabelInterner.open(directory.resolve(RELATION_LABELS),
+                () -> held.reach().relations());
+
+            if (freshLog && Files.exists(logPath)) {
+                // A header write cut short: truncated so the header is written at the start.
+                LOGGER.warn("starting {} afresh: its {} bytes are a header write a crash cut "
+                    + "short", logPath, Files.size(logPath));
+                try (java.nio.channels.FileChannel channel =
+                         java.nio.channels.FileChannel.open(logPath, StandardOpenOption.WRITE)) {
+                    channel.truncate(0);
+                }
+            }
 
             // Upgraded first, because appending current-width records to a log of the earlier
             // width would misframe every record after the first append.
-            Path logPath = directory.resolve(TRIPLE_LOG);
             upgradeIfEarlierVersion(logPath);
 
             // Truncated to a whole number of records before anything is appended. A process
@@ -758,12 +834,13 @@ public final class GraphStagingStore implements AutoCloseable {
      * cut short; the node refuses such a log in its build and its erasure (and, at version 1, in
      * its upgrade, so the store does not open at all). See {@link #corrupt}. What is reported
      * rather than refused is a trailing partial record, which the open trims; see
-     * {@link LogInspection#hasTornTail()}.</p>
+     * {@link LogInspection#hasTornTail()}. So is a file shorter than its header whose bytes begin
+     * the header this build writes: a creation cut short, which the open starts afresh.</p>
      *
      * @param log The triple log
      * @return How many facts matched their checksums, and where the whole records end
-     * @throws IOException if the file is absent, shorter than its header, not a triple log of a
-     *                     version this build reads, or cannot be read
+     * @throws IOException if the file is absent, too short to be even a torn triple log, not a
+     *                     triple log of a version this build reads, or cannot be read
      * @throws LogCorruptionException if a whole record's checksum fails
      * @throws NullPointerException if {@code log} is null
      */
@@ -771,8 +848,8 @@ public final class GraphStagingStore implements AutoCloseable {
         Objects.requireNonNull(log, "log must not be null");
         byte[] all = Files.readAllBytes(log);
         if (all.length < HEADER_BYTES) {
-            throw new IOException("triple log " + log + " is shorter than its "
-                + HEADER_BYTES + "-byte header");
+            LogHeader.requireTornCreation(log, "triple log", all, MAGIC, VERSION);
+            return LogHeader.tornCreation(VERSION, all);
         }
         int version = versionOf(ByteBuffer.wrap(all), log, "triple log");
         long records;
@@ -789,6 +866,118 @@ public final class GraphStagingStore implements AutoCloseable {
         }
         return new LogInspection(version, records,
             HEADER_BYTES + records * recordBytes(version), all.length);
+    }
+
+    /**
+     * Reads what one of a staging directory's label interners holds without opening it.
+     *
+     * <p>Judged exactly as {@link #open} judges it: the interner's own replay and tail, and -
+     * when the open would give ids up - the highest id the staged facts and entity text beside it
+     * refer to, together with {@code holders}. An offline checker passing the holders the node
+     * passes therefore reaches the node's verdict.</p>
+     *
+     * @param interner {@value #ENTITY_LABELS} or {@value #RELATION_LABELS} in a staging directory
+     * @param holders  What outside the directory refers to label ids
+     * @return How many labels matched their checksums, and where the file stops reading cleanly
+     * @throws IOException if the interner cannot be judged; see {@link LabelInterner#inspect}
+     * @throws LogCorruptionException if the node would refuse the interner for damage, or for
+     *                                an id it would lose that something refers to
+     * @throws IllegalArgumentException if {@code interner} is not named as one of the interners
+     */
+    public static LogInspection inspectLabels(Path interner, ReferencedLabels holders)
+            throws IOException {
+        Objects.requireNonNull(interner, "interner must not be null");
+        Objects.requireNonNull(holders, "holders must not be null");
+        Path name = interner.getFileName();
+        boolean relationLabels = name != null && RELATION_LABELS.equals(name.toString());
+        if (!relationLabels && (name == null || !ENTITY_LABELS.equals(name.toString()))) {
+            throw new IllegalArgumentException("not a staging label interner: " + interner);
+        }
+        Path directory = interner.toAbsolutePath().getParent();
+        ReferencedLabels held = everythingHolding(directory, holders);
+        return LabelInterner.inspect(interner, relationLabels
+            ? () -> held.reach().relations()
+            : () -> held.reach().entities());
+    }
+
+    /**
+     * Everything that holds a staging directory's label ids: its own logs, and {@code holders}.
+     *
+     * <p>Read at most once however many interners ask, and not at all when none does.</p>
+     *
+     * @param directory The staging directory
+     * @param holders   What outside it refers to label ids
+     * @return The holders
+     */
+    private static ReferencedLabels everythingHolding(Path directory, ReferencedLabels holders) {
+        ReferencedLabels all = ReferencedLabels.all(stagedIn(directory), holders);
+        return new ReferencedLabels() {
+            private ReferencedLabels.Reach reach;
+
+            @Override
+            public synchronized ReferencedLabels.Reach reach() throws IOException {
+                if (reach == null) {
+                    reach = all.reach();
+                }
+                return reach;
+            }
+        };
+    }
+
+    /**
+     * The staged facts and entity text in a staging directory, as holders of label ids.
+     *
+     * <p>A log damaged other than at its tail is refused here as its own replay refuses it:
+     * whether it refers to an id cannot be told from the records before the damage.</p>
+     *
+     * @param directory The staging directory
+     * @return The holder
+     */
+    private static ReferencedLabels stagedIn(Path directory) {
+        return () -> {
+            Path text = directory.resolve(ENTITY_TEXT_LOG);
+            return highestInTripleLog(directory.resolve(TRIPLE_LOG))
+                .higher(new ReferencedLabels.Reach(
+                    new ReferencedLabels.Reference(EntityTextLog.highestEntityId(text),
+                        "the entity text in " + text),
+                    ReferencedLabels.Reference.NONE));
+        };
+    }
+
+    /**
+     * The highest entity id and relation id any staged fact names.
+     *
+     * @param log The triple log; need not exist
+     * @return The highest ids, held by the log
+     * @throws IOException if the log is not a triple log this build reads
+     * @throws LogCorruptionException if a whole record's checksum fails
+     */
+    private static ReferencedLabels.Reach highestInTripleLog(Path log) throws IOException {
+        if (!Files.isRegularFile(log) || Files.size(log) < HEADER_BYTES) {
+            // Absent, or a creation cut short: no fact was ever staged in it. Anything else that
+            // short is refused when the store opens the log.
+            return ReferencedLabels.Reach.NONE;
+        }
+        byte[] all = Files.readAllBytes(log);
+        int version = versionOf(ByteBuffer.wrap(all), log, "triple log");
+        int[] highest = {-1, -1};
+        if (version == VERSION_WITHOUT_STATED_ON) {
+            ByteBuffer view = ByteBuffer.wrap(all).order(ByteOrder.LITTLE_ENDIAN);
+            walkLegacy(log, all, start -> {
+                highest[0] = Math.max(highest[0],
+                    Math.max(view.getInt(start), view.getInt(start + 2 * Integer.BYTES)));
+                highest[1] = Math.max(highest[1], view.getInt(start + Integer.BYTES));
+            });
+        } else {
+            Cursor cursor = new Cursor(all, log);
+            while (cursor.next()) {
+                highest[0] = Math.max(highest[0], Math.max(cursor.subject, cursor.object));
+                highest[1] = Math.max(highest[1], cursor.relation);
+            }
+        }
+        String heldBy = "the staged facts in " + log;
+        return new ReferencedLabels.Reach(new ReferencedLabels.Reference(highest[0], heldBy),
+            new ReferencedLabels.Reference(highest[1], heldBy));
     }
 
     /**
@@ -976,8 +1165,6 @@ public final class GraphStagingStore implements AutoCloseable {
             if (closed) {
                 return;
             }
-            entities.flush();
-            relations.flush();
             out.flush();
         }
         text.flush();
@@ -1008,8 +1195,6 @@ public final class GraphStagingStore implements AutoCloseable {
             }
             unsynced = false;
             try {
-                entities.flush();
-                relations.flush();
                 out.flush();
                 text.flush();
                 force();

@@ -205,6 +205,53 @@ public final class LabelDictionary
         return open(directory, name, prefix);
     }
 
+    /**
+     * The highest id a dictionary names, read from its index without mapping it.
+     *
+     * <p>For a caller that needs to know which ids a published graph has already given out -
+     * the staging store, before it lets a label interner give one up - and has no use for the
+     * names. The index is sorted by id, so this reads the header and the last entry and nothing
+     * else.</p>
+     *
+     * @param directory The directory the dictionary was published in
+     * @param name      The base name, without extension
+     * @return The highest id with an entry, or -1 when the dictionary is absent or empty
+     * @throws IOException if the index is present and is not a dictionary this build reads
+     */
+    public static long highestId(Path directory, String name) throws IOException {
+        Path indexPath = directory.resolve(name + ".idx");
+        if (!Files.exists(indexPath)) {
+            return -1;
+        }
+        try (FileChannel channel = FileChannel.open(indexPath, StandardOpenOption.READ)) {
+            long indexBytes = channel.size();
+            java.nio.ByteBuffer header = java.nio.ByteBuffer.allocate(HEADER_BYTES)
+                .order(EdgeStoreDescriptor.COLUMN_BYTE_ORDER);
+            if (indexBytes < HEADER_BYTES || channel.read(header, 0) < HEADER_BYTES) {
+                throw new IOException(indexPath + " is shorter than its header");
+            }
+            if (header.getLong(0) != MAGIC) {
+                throw new IOException(indexPath + " is not a label dictionary");
+            }
+            if (header.getInt(8) != VERSION) {
+                throw new IOException(indexPath + " is version " + header.getInt(8)
+                    + "; this build reads version " + VERSION);
+            }
+            int count = header.getInt(12);
+            if (count < 0 || HEADER_BYTES + (long) count * ENTRY_BYTES > indexBytes) {
+                throw new IOException(indexPath + " declares " + count
+                    + " entries, which does not fit in " + indexBytes + " bytes");
+            }
+            if (count == 0) {
+                return -1;
+            }
+            java.nio.ByteBuffer last = java.nio.ByteBuffer.allocate(Long.BYTES)
+                .order(EdgeStoreDescriptor.COLUMN_BYTE_ORDER);
+            channel.read(last, HEADER_BYTES + (long) (count - 1) * ENTRY_BYTES);
+            return last.getLong(0);
+        }
+    }
+
     /** The number of names held. */
     public int size() {
         return count;

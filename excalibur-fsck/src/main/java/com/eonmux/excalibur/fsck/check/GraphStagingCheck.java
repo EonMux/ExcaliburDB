@@ -2,10 +2,12 @@ package com.eonmux.excalibur.fsck.check;
 
 import com.eonmux.excalibur.graph.erasure.ErasureLog;
 import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogHeader;
 import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.staging.EntityTextLog;
 import com.eonmux.excalibur.graph.staging.GraphStagingStore;
 import com.eonmux.excalibur.graph.staging.LabelInterner;
+import com.eonmux.excalibur.graph.staging.ReferencedLabels;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -19,7 +21,7 @@ import java.nio.file.Path;
  * <h2>Every record is read, by the node's own code</h2>
  * <p>Each of these logs has a read-only inspection beside the code that writes it:
  * {@link ErasureLog#inspect} for {@code erasure.log} and {@code withdrawals.log}, which share a
- * format; {@link LabelInterner#inspect} for the two label interners;
+ * format; {@link GraphStagingStore#inspectLabels} for the two label interners;
  * {@link GraphStagingStore#inspectTripleLog} for the staged facts; and
  * {@link EntityTextLog#inspect} for the text each entity was mentioned in. Every one of them walks
  * the records with the replay the node opens, builds from or upgrades the log with, so what is
@@ -40,6 +42,21 @@ import java.nio.file.Path;
  * repair plan: every one of these logs is the only copy of what it holds, and the node opens a
  * missing one as empty, so moving a damaged one aside would lose outstanding erasures, reassign
  * entity ids or empty the next graph build rather than repair anything.</p>
+ *
+ * <h2>A damaged last label</h2>
+ * <p>An interner's last record failing its checksum is a tail the node trims only while no id it
+ * could have held is referred to: the node forces a label before handing out its id, so a record
+ * a crash cut short held an id nobody has, while one that rotted after being forced may hold an
+ * id the staged facts, the entity text, the graph published beside the staging directory or an
+ * outstanding erasure still names. The node refuses the second rather than give that id to a new
+ * label, so it is {@link CheckStatus#CORRUPT} here, asked of the same holders the node's tenant
+ * names.</p>
+ *
+ * <h2>A file shorter than its header</h2>
+ * <p>Each log is created by writing its header, so a file shorter than one whose bytes begin the
+ * header the node creates it with is that write cut short: {@link CheckStatus#UNSEALED}, since the
+ * node starts the log afresh. Any other file that short is not one the node wrote, and it refuses
+ * to write after it, so it is {@link CheckStatus#CORRUPT}.</p>
  *
  * <h2>The header first</h2>
  * <p>The version in the header is judged before the records are, against the range each log's
@@ -117,9 +134,36 @@ public final class GraphStagingCheck {
                 GraphStagingStore.MAGIC, GraphStagingStore.VERSION_WITHOUT_STATED_ON,
                 GraphStagingStore.VERSION), "staged facts", GraphStagingStore::inspectTripleLog);
         }
+        ReferencedLabels holders = labelHolders(file);
         return inspected(file, relative, new LogFormat("graph label interner",
             LabelInterner.MAGIC, LabelInterner.VERSION, LabelInterner.VERSION), "labels",
-            LabelInterner::inspect);
+            interner -> GraphStagingStore.inspectLabels(interner, holders));
+    }
+
+    /**
+     * What outside a staging directory's own logs names its label ids, as the node names it.
+     *
+     * <p>The node's tenant passes the graph published beside the staging directory and the two
+     * logs of requests still owed inside it; the staged facts and entity text the inspection
+     * reads itself. Named the same way here so that an interner whose damaged last record holds
+     * an id one of them refers to is called corrupt, as the node refuses it, rather than
+     * unsealed.</p>
+     *
+     * @param interner One of the interners in a staging directory
+     * @return The holders
+     */
+    private static ReferencedLabels labelHolders(Path interner) {
+        Path staging = interner.toAbsolutePath().getParent();
+        ReferencedLabels owed = ReferencedLabels.all(
+            ReferencedLabels.owedIn(staging.resolve(ERASURE_LOG)),
+            ReferencedLabels.owedIn(staging.resolve(WITHDRAWAL_LOG)));
+        String name = staging.getFileName().toString();
+        if (!name.endsWith(DIRECTORY_SUFFIX) || name.length() == DIRECTORY_SUFFIX.length()) {
+            return owed;
+        }
+        Path graph = staging.resolveSibling(
+            name.substring(0, name.length() - DIRECTORY_SUFFIX.length()));
+        return ReferencedLabels.all(ReferencedLabels.publishedIn(graph), owed);
     }
 
     /** One log's read-only inspection, as its owning class declares it. */
@@ -277,6 +321,13 @@ public final class GraphStagingCheck {
             ? ". It was written at version " + found.version() + ", and the node rewrites it to "
                 + "version " + log.newest() + " when it next opens it"
             : "";
+        if (found.hasTornTail() && found.intactBytes() == 0) {
+            return new FileCheck(file, relative, format, version, CheckStatus.UNSEALED,
+                "the file is " + found.fileBytes() + " bytes, the start of the header the node "
+                    + "creates the log with and nothing more: its creation was cut short by a "
+                    + "crash. It holds no " + records + ", and the node starts it afresh when it "
+                    + "next opens it", size);
+        }
         if (found.hasTornTail()) {
             return new FileCheck(file, relative, format, version, CheckStatus.UNSEALED,
                 "the log ends in " + found.tornBytes() + " bytes that do not read as a record, "
@@ -327,9 +378,16 @@ public final class GraphStagingCheck {
                 "the file could not be read: " + e, -1), 0, -1);
         }
         if (head.length < HEADER_BYTES) {
+            if (LogHeader.isTornCreation(head, log.magic(), log.newest())) {
+                // The start of the header the node creates the log with: judged by the log's
+                // inspection, which reports it as a creation the node starts afresh.
+                return new Header(null, log.newest(), size);
+            }
             return new Header(new FileCheck(file, relative, format, null, CheckStatus.CORRUPT,
                 "the file is " + size + " bytes, too short to hold its " + HEADER_BYTES
-                    + "-byte header", size, true), 0, size);
+                    + "-byte header, and they are not the start of the header the node creates "
+                    + "it with. The node refuses to open it rather than write after bytes it "
+                    + "cannot account for", size, true), 0, size);
         }
         // Written by DataOutputStream, so the header is big-endian even where the records
         // that follow it are not.

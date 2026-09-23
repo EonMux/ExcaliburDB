@@ -473,6 +473,19 @@ public final class GraphBuilder {
         Files.move(retired, previous, StandardCopyOption.ATOMIC_MOVE);
     }
 
+    /**
+     * Every graph on disk for {@code target}: the served one, and any a publish or a compaction
+     * left set aside, which {@link #recoverInterruptedPublish} may restore.
+     *
+     * @param target Where the graph is served from
+     * @return The directories that exist, served first
+     */
+    static List<Path> servedOrDisplaced(Path target) {
+        return java.util.stream.Stream.of(target, previousFor(target), retiredFor(target))
+            .filter(Files::isDirectory)
+            .toList();
+    }
+
     private static Path retiredFor(Path target) {
         return target.resolveSibling(target.getFileName() + RETIRED_SUFFIX);
     }

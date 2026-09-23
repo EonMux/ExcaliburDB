@@ -24,6 +24,7 @@ import java.util.Optional;
 import java.util.zip.CRC32;
 
 import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogHeader;
 import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.file.TailIntegrity;
 import com.eonmux.excalibur.graph.provenance.SourceType;
@@ -161,10 +162,10 @@ public final class ErasureLog implements AutoCloseable {
      * Opens the log at {@code file}, replaying every request a previous run recorded.
      *
      * <p>A torn tail is truncated away before the file is opened for appending. Leaving it in place
-     * and appending past it is what {@link com.eonmux.excalibur.graph.staging.LabelInterner} does, and for
-     * a log that is read back it is not survivable: the next open stops at the same torn record, so
-     * every request appended after it would be invisible - a submitted erasure silently forgotten
-     * by a file that looks perfectly healthy. Truncating costs the partial record, which was never
+     * and appending past it is not survivable for a log that is read back: the next open stops at
+     * the same torn record, so every request appended after it would be invisible - a submitted
+     * erasure silently forgotten by a file that looks perfectly healthy. Truncating costs the
+     * partial record, which was never
      * acknowledged to anyone because {@link #submit} forces before it returns.
      *
      * @param file The log file; created, with its parent directories, if absent
@@ -188,9 +189,10 @@ public final class ErasureLog implements AutoCloseable {
         // or it is something else entirely. Overwriting it because it is short is how a mistyped
         // path destroys whatever was actually there - and destroying the wrong thing is the exact
         // failure this class exists to make impossible. Only bytes that are a prefix of this log's
-        // own header are treated as a torn header.
-        if (shortOfHeader && !isPrefixOfHeader(file)) {
-            throw new IOException("not an erasure log, and too short to be a torn one: " + file);
+        // own header are treated as a torn header; see LogHeader.
+        if (shortOfHeader) {
+            LogHeader.requireTornCreation(file, "erasure log", Files.readAllBytes(file), MAGIC,
+                VERSION);
         }
 
         boolean fresh = !exists || shortOfHeader;
@@ -367,15 +369,50 @@ public final class ErasureLog implements AutoCloseable {
      */
     public static Inspection inspectLog(Path file) throws IOException {
         Objects.requireNonNull(file, "file must not be null");
-        long size = Files.size(file);
-        if (size < HEADER_BYTES) {
-            if (!isPrefixOfHeader(file)) {
-                throw new IOException("not an erasure log, and too short to be a torn one: "
-                    + file);
-            }
-            return new Inspection(Pending.NONE, new LogInspection(VERSION, 0, 0, size));
+        if (Files.size(file) < HEADER_BYTES) {
+            byte[] contents = Files.readAllBytes(file);
+            LogHeader.requireTornCreation(file, "erasure log", contents, MAGIC, VERSION);
+            return new Inspection(Pending.NONE, LogHeader.tornCreation(VERSION, contents));
         }
         return examine(file);
+    }
+
+    /**
+     * The highest entity id an outstanding request names, read from the file without opening it.
+     *
+     * <p>An outstanding entity-scoped request holds an entity id and nothing else: the name it was
+     * resolved from is not recorded, because recording it would put the name the request exists
+     * to destroy into one more file. So if that id were given to another label before the request
+     * was applied, the request would erase the other entity. The staging store asks this before
+     * it lets a label interner give up an id; see
+     * {@link com.eonmux.excalibur.graph.staging.ReferencedLabels#owedIn}.</p>
+     *
+     * @param file The log file; need not exist
+     * @return The id, or -1 when no outstanding request names an entity
+     * @throws IOException if the file exists and is not an erasure log this build can read
+     * @throws LogCorruptionException if damage has an intact record behind it
+     * @throws NullPointerException if {@code file} is null
+     */
+    public static long highestEntityOwed(Path file) throws IOException {
+        Objects.requireNonNull(file, "file must not be null");
+        if (!Files.exists(file)) {
+            return -1;
+        }
+        if (Files.size(file) < HEADER_BYTES) {
+            // A torn creation owes nothing; anything else that short is refused as the open
+            // refuses it.
+            inspectLog(file);
+            return -1;
+        }
+        Replay replay = replay(file);
+        TailIntegrity.requireTornTail(file, "erasure log", replay.contents(),
+            replay.validBytes(), ErasureLog::recordStartsAt);
+        return replay.outstanding().values().stream()
+            .map(ErasureRequest::scope)
+            .filter(ErasureScope.Entity.class::isInstance)
+            .mapToLong(scope -> ((ErasureScope.Entity) scope).entityId())
+            .max()
+            .orElse(-1);
     }
 
     /**
@@ -692,31 +729,6 @@ public final class ErasureLog implements AutoCloseable {
      * @return What survived, and where the intact records end
      * @throws IOException if the file exists but is not an erasure log this build can read
      */
-    /**
-     * Whether a file shorter than a header is the beginning of one of these logs.
-     *
-     * <p>The header starts with the magic, so a write interrupted inside it leaves a strict prefix
-     * of those eight bytes. Anything else that is merely short is somebody's data, and treating it
-     * as a torn log would truncate it to nothing and write a header over it.</p>
-     *
-     * @param file The file
-     * @return true when its bytes are a prefix of this log's header
-     * @throws IOException if it cannot be read
-     */
-    private static boolean isPrefixOfHeader(Path file) throws IOException {
-        byte[] actual = Files.readAllBytes(file);
-        if (actual.length == 0) {
-            return true;
-        }
-        byte[] magic = ByteBuffer.allocate(Long.BYTES).putLong(MAGIC).array();
-        for (int i = 0; i < actual.length && i < magic.length; i++) {
-            if (actual[i] != magic[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     private static Replay replay(Path path) throws IOException {
         Map<Long, ErasureRequest> outstanding = new LinkedHashMap<>();
         if (!Files.exists(path) || Files.size(path) < HEADER_BYTES) {

@@ -135,11 +135,9 @@ class LabelInternerTest {
             try (LabelInterner interner = LabelInterner.open(path)) {
                 interner.intern("a");
                 interner.intern("b");
-                interner.flush();
                 byte[] before = Files.readAllBytes(path);
 
                 assertThat(interner.tombstone(id -> false)).isZero();
-                interner.flush();
 
                 assertThat(Files.readAllBytes(path)).isEqualTo(before);
             }

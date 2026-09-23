@@ -306,6 +306,18 @@ class StagingLogInspectionTest {
                 .isInstanceOf(LogCorruptionException.class);
         }
 
+        @Test
+        @DisplayName("the highest entity id a log names is read in either version")
+        void theHighestEntityIdIsRead(@TempDir Path dir) throws IOException {
+            Path legacy = dir.resolve("legacy.log");
+            Files.write(legacy, legacyLog("Ada wrote the first program", "Grace wrote a compiler"));
+            Path current = write(dir, "Ada", "Grace", "Barbara");
+
+            assertThat(EntityTextLog.highestEntityId(legacy)).isEqualTo(1);
+            assertThat(EntityTextLog.highestEntityId(current)).isEqualTo(2);
+            assertThat(EntityTextLog.highestEntityId(dir.resolve("absent.log"))).isEqualTo(-1);
+        }
+
         /** A log in the pre-provenance format, as an earlier build wrote it. */
         private static byte[] legacyLog(String... snippets) throws IOException {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();

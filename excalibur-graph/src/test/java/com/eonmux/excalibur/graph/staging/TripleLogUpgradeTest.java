@@ -214,4 +214,24 @@ class TripleLogUpgradeTest {
         Files.write(headerless, new byte[3]);
         assertThat(GraphStagingStore.factsOnDisk(headerless)).isZero();
     }
+
+    @Test
+    @DisplayName("a version 1 log's facts hold their ids: a damaged last label they name is "
+        + "refused, and the log is not upgraded")
+    void aLegacyLogHoldsItsIds(@TempDir Path dir) throws IOException {
+        // Ada (1) is the CEO of Grace (2); Grace is the last entity label interned.
+        Path log = legacyStaging(dir, legacyRecord(1, 0, 2, TemporalFilter.UNDATED,
+            TemporalFilter.OPEN, FIRST));
+        Path entities = dir.resolve(GraphStagingStore.ENTITY_LABELS);
+        byte[] labels = Files.readAllBytes(entities);
+        labels[labels.length - Integer.BYTES - 1] ^= 0x40;
+        Files.write(entities, labels);
+        byte[] before = Files.readAllBytes(log);
+
+        assertThatThrownBy(() -> GraphStagingStore.open(dir))
+            .isInstanceOf(com.eonmux.excalibur.graph.file.LogCorruptionException.class)
+            .hasMessageContaining("id 2 is held by")
+            .hasMessageContaining(GraphStagingStore.TRIPLE_LOG);
+        assertThat(Files.readAllBytes(log)).isEqualTo(before);
+    }
 }

@@ -3,6 +3,7 @@ package com.eonmux.excalibur.graph.staging;
 import com.eonmux.excalibur.graph.build.BuildCancellation;
 import com.eonmux.excalibur.graph.file.Durability;
 import com.eonmux.excalibur.graph.file.LogCorruptionException;
+import com.eonmux.excalibur.graph.file.LogHeader;
 import com.eonmux.excalibur.graph.file.LogInspection;
 import com.eonmux.excalibur.graph.file.TailIntegrity;
 import com.eonmux.excalibur.graph.provenance.Provenance;
@@ -58,6 +59,9 @@ import java.util.zip.CRC32;
  * bytes and the source id, and with the checksum over the text alone. A file in that version is
  * rewritten to the current one when it is opened; see {@link #open}.
  *
+ * <p>A file shorter than its header is judged by {@link LogHeader}: the start of the header this
+ * build writes is a creation cut short and is started afresh, and anything else is refused.
+ *
  * <h2>Thread Safety</h2>
  * <p>Safe for concurrent appends. Replay and erasure read the file, so they see what has been
  * flushed; both flush first.
@@ -96,6 +100,9 @@ public final class EntityTextLog implements AutoCloseable {
 
     /** Suffix of the replacement a rewrite builds beside the log before swapping it in. */
     private static final String REWRITE_SUFFIX = ".rewriting";
+
+    /** What this log is called in messages. */
+    private static final String WHAT = "entity text log";
 
     private final Path path;
     private final Object lock = new Object();
@@ -182,12 +189,59 @@ public final class EntityTextLog implements AutoCloseable {
         if (parent != null) {
             Files.createDirectories(parent);
         }
-        if (Files.exists(path) && Files.size(path) >= HEADER_BYTES
-            && versionOf(path) == VERSION_WITHOUT_PROVENANCE) {
+        if (LogHeader.requireCreatable(path, WHAT, MAGIC, VERSION)) {
+            if (Files.exists(path)) {
+                // A header write cut short: truncated so the header is written at the start of
+                // the file, where the next open reads it, rather than after the fragment.
+                LOGGER.warn("starting {} afresh: its {} bytes are a header write a crash cut "
+                    + "short", path, Files.size(path));
+                try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+                    channel.truncate(0);
+                }
+            }
+            return new EntityTextLog(path, openForAppend(path));
+        }
+        if (versionOf(path) == VERSION_WITHOUT_PROVENANCE) {
             upgrade(path);
         }
         trimTornTail(path);
         return new EntityTextLog(path, openForAppend(path));
+    }
+
+    /**
+     * The highest entity id any snippet is recorded against, read without opening the log.
+     *
+     * <p>A snippet names its entity by id alone, so this is one of the places an id lives that
+     * a label interner must not give up; see {@link ReferencedLabels}. Walked with the replay
+     * {@link #forEach} uses, in either version, so a torn tail ends the walk and damage with a
+     * readable snippet behind it is refused.</p>
+     *
+     * @param path The log; need not exist
+     * @return The id, or -1 when the log holds no snippet
+     * @throws IOException if the log is not one this build reads
+     * @throws LogCorruptionException if damage has an intact snippet behind it
+     * @throws NullPointerException if {@code path} is null
+     */
+    public static long highestEntityId(Path path) throws IOException {
+        Objects.requireNonNull(path, "path must not be null");
+        if (!Files.isRegularFile(path) || Files.size(path) < HEADER_BYTES) {
+            // Absent, or a creation cut short: no snippet was ever recorded in it. Anything else
+            // that short is refused when the store opens the log.
+            return -1;
+        }
+        byte[] all = Files.readAllBytes(path);
+        long[] highest = {-1};
+        if (versionOf(all, path) == VERSION_WITHOUT_PROVENANCE) {
+            walkLegacy(path, all, (entityId, text) ->
+                highest[0] = Math.max(highest[0], entityId));
+            return highest[0];
+        }
+        Cursor cursor = new Cursor(all);
+        while (cursor.next()) {
+            highest[0] = Math.max(highest[0], cursor.entityId);
+        }
+        cursor.requireTornTail(path);
+        return highest[0];
     }
 
     /**
@@ -248,18 +302,24 @@ public final class EntityTextLog implements AutoCloseable {
      * intact record somewhere after it - the last as a {@link LogCorruptionException}, so that
      * damage can be told apart from a file that merely could not be read. A record that fails its
      * checksum with nothing readable after it is reported rather than refused, because the open
-     * treats it as a write cut short and trims it; see {@link LogInspection#hasTornTail()}.</p>
+     * treats it as a write cut short and trims it; see {@link LogInspection#hasTornTail()}. So is
+     * a file shorter than its header whose bytes begin the header this build writes: a creation
+     * cut short, which the open starts afresh.</p>
      *
      * @param path The log's file
      * @return How many snippets matched their checksums, and where the file stops reading cleanly
-     * @throws IOException if the file is absent, shorter than its header, not a log of a version
-     *                     this build reads, or cannot be read
+     * @throws IOException if the file is absent, too short to be even a torn one of these logs,
+     *                     not a log of a version this build reads, or cannot be read
      * @throws LogCorruptionException if damage has an intact snippet behind it
      * @throws NullPointerException if {@code path} is null
      */
     public static LogInspection inspect(Path path) throws IOException {
         Objects.requireNonNull(path, "path must not be null");
         byte[] all = Files.readAllBytes(path);
+        if (all.length < HEADER_BYTES) {
+            LogHeader.requireTornCreation(path, WHAT, all, MAGIC, VERSION);
+            return LogHeader.tornCreation(VERSION, all);
+        }
         if (versionOf(all, path) == VERSION_WITHOUT_PROVENANCE) {
             return walkLegacy(path, all, (entityId, text) -> {
                 // Counted only; nothing is carried anywhere.

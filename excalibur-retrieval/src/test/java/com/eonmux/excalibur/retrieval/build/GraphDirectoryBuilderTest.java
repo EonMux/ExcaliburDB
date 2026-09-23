@@ -360,10 +360,12 @@ class GraphDirectoryBuilderTest {
             stage(staging);
         }
 
-        // Half a label record at the end, as a process killed mid-append leaves.
+        // Half a label record at the end, as a process killed while interning a new label leaves.
+        // Its id was never handed out - a label is forced before its id is returned - so nothing
+        // staged names it, and the open may cut it off.
         Path labels = stagingDir.resolve(GraphStagingStore.ENTITY_LABELS);
-        byte[] bytes = Files.readAllBytes(labels);
-        Files.write(labels, java.util.Arrays.copyOf(bytes, bytes.length - 3));
+        Files.write(labels, new byte[] {0, 0, 0, 40, 'P', 'a', 'r'},
+            java.nio.file.StandardOpenOption.APPEND);
 
         int londonFirst;
         try (GraphStagingStore reopened = GraphStagingStore.open(stagingDir)) {
