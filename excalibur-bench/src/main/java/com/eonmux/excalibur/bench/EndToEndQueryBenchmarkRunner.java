@@ -202,18 +202,19 @@ public class EndToEndQueryBenchmarkRunner {
      */
     private static void printNotes() {
         System.out.println("┌─────────────────────────────────────────────────────────────┐");
-        System.out.println("│ Notes                                                        │");
+        System.out.println("│ Notes                                                       │");
         System.out.println("├─────────────────────────────────────────────────────────────┤");
-        System.out.println("│ Latency includes all 6 query pipeline stages:               │");
-        System.out.println("│   Stage 0: Epoch snapshot                                    │");
-        System.out.println("│   Stage 1: Cuckoo filter cascade                             │");
-        System.out.println("│   Stage 2: LSH pre-filter                                    │");
-        System.out.println("│   Stage 3: HNSW vector search + tail scan                    │");
-        System.out.println("│   Stage 4: Full vector rerank                                │");
-        System.out.println("│   Stage 5: LLM relevancy scoring (disabled)                  │");
+        System.out.println("│ Latency includes all 7 query pipeline stages:               │");
+        System.out.println("│   1. Epoch snapshot                                         │");
+        System.out.println("│   2. Segment prioritisation                                 │");
+        System.out.println("│   3. Cuckoo filter cascade (orders segments)                │");
+        System.out.println("│   4. LSH candidates                                         │");
+        System.out.println("│   5. HNSW vector search + tail scan                         │");
+        System.out.println("│   6. Full vector rerank                                     │");
+        System.out.println("│   7. LLM relevancy scoring (disabled)                       │");
         System.out.println("│                                                             │");
         System.out.println("│ LLM scoring is disabled to ensure consistent, repeatable    │");
-        System.out.println("│ measurements without external API latency variance.          │");
+        System.out.println("│ measurements without external API latency variance.         │");
         System.out.println("└─────────────────────────────────────────────────────────────┘");
         System.out.println();
         System.out.println("Starting benchmark execution...");

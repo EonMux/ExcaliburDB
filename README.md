@@ -3048,7 +3048,7 @@ anything tagged `slow` or `benchmark` is excluded there and has to be asked for 
 - `HierarchicalDeletionPropagationIntegrationTest` - A delete reaches the corpus and segment levels of the hierarchical filter, including under concurrency
 - `DocumentErasureIntegrationTest` - An erased document leaves storage, the lexical index's files and vector search, through the node's own erasure wiring
 - `GraphRouteIntegrationTest` - A document ingested from a directory, with extraction against a stand-in OpenAI-compatible chat endpoint, is built into the graph and answered from over HTTP as of a date after its fact began, and declined as of one before
-- `LshHnswEntryIdContractTest` - The LSH pre-filter returns ids in the HNSW graph's id space, so the candidates stage 5 measures are the nodes the buckets describe
+- `LshHnswEntryIdContractTest` - The LSH index returns ids in the HNSW graph's id space, so the candidates stage 5 measures are the nodes the buckets describe
 - `SegmentPrefilterLifecycleTest` - A segment's vector pre-filter lives and dies with the graph it is keyed against, including across a split
 - `AtomicDocumentWriterTest` - The write-log driver the other suites ingest through records true offsets and keeps each document's chunks contiguous
 - `VectorApiResolutionTest` - The test JVM resolves `jdk.incubator.vector`, so the SIMD kernels are what the suites exercise rather than the scalar fallback

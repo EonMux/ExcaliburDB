@@ -27,11 +27,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <ul>
  *   <li><b>Embeddings</b> are a hashed bag of words over a constant component, L2-normalised, with
  *       one synonym - {@code ram} means {@code memory} - and one word given no weight at all,
- *       {@code kernel}. A node's vector search only searches the segments whose term filter
- *       holds a word of the question, so a question reaches a document through vectors only if
- *       they share a word; weighing nothing for the shared word is what leaves the ranking inside
- *       those segments to meaning, the way a real model largely discounts a word every candidate
- *       contains.</li>
+ *       {@code kernel}. Weighing nothing for a word two candidates share is what leaves their
+ *       ranking to meaning, the way a real model largely discounts a word every candidate
+ *       contains: the question about exhausted RAM then lands on the document about memory rather
+ *       than the one that repeats "kernel". The constant component means every text has a nearest
+ *       neighbour, so a question sharing nothing with any document is still answered - by the
+ *       shortest one, which is how a real model's weakest match looks too.</li>
  *   <li><b>Relation extraction</b> finds one dated fact in the document about Byron's daughter,
  *       naming her, and nothing anywhere else.</li>
  *   <li><b>Query expansion</b> turns a question about TLS into the words the TLS document

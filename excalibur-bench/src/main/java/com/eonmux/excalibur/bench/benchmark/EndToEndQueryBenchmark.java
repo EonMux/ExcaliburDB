@@ -34,8 +34,8 @@ import java.util.stream.Collectors;
  * JMH benchmark for end-to-end query latency (p50/p99).
  *
  * <p>Measures the full query pipeline latency from request to response,
- * including all stages: epoch snapshot, Cuckoo filter cascade, LSH pre-filter,
- * HNSW search, tail scan, reranking, and optional LLM scoring.</p>
+ * including all stages: epoch snapshot, segment prioritisation, Cuckoo filter ordering,
+ * LSH candidates, HNSW search, tail scan, reranking, and optional LLM scoring.</p>
  *
  * <h2>Performance Target</h2>
  * <ul>

@@ -36,7 +36,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *       means memory) ranks the OOM document first, and the node's hybrid breaks the resulting tie
  *       towards the vector signal, so only a strategy with vectors answers it.</li>
  *   <li>"TLS problem" shares no word with the TLS document; only expansion (certificate chain,
- *       handshake) reaches it.</li>
+ *       handshake) reaches it. A vector search still answers it - every segment has nearest
+ *       neighbours - with a document that merely scores least badly, and at k=1 that neighbour and
+ *       expansion's first answer each top one list. The hybrid breaks that tie towards the vector
+ *       signal, so expansion earns this question alone or beside the graph, but not beside the
+ *       vectors. That is the trade the comparison exists to show: a dense signal with nothing
+ *       relevant to say still takes a rank.</li>
  *   <li>"What did Ada Lovelace write?" is ranked by BM25 to the portrait document, which names her
  *       twice in fewer words than the Byron document names her once. Only the graph points at
  *       the Byron document, through the fact extracted from it, so only a strategy with the graph
@@ -122,28 +127,14 @@ class ModelBackedEvaluationTest {
     }
 
     /**
-     * Checks a vector-backed row: exactly {@code withVectors} when the node's vector signal
-     * contributed to every answer, and between {@code without} and {@code withVectors} when the
-     * harness noted answers it contributed nothing to.
-     *
-     * <p>A node's LSH pre-filter currently drops every integrated segment whose buckets the
-     * question's vector does not collide with, so on a freshly ingested node the vector half of
-     * {@code /v1/query} finds nothing for most questions and the hybrid answers from BM25 alone.
-     * The harness measures the node as it serves and counts those answers; the row then scores
-     * anywhere from what BM25 alone earns to what the vectors would add, and no more than that.
+     * Checks a vector-backed row, whose vector signal must have answered every question: a row
+     * the harness notes as short of vectors measured a node whose vector search failed, and its
+     * score would say nothing about what the vectors add.
      */
-    private static void assertVectorRow(String output, RetrievalStrategy strategy,
-                                        String withVectors, String without) {
-        double recall = Double.parseDouble(recall(output, strategy));
-        boolean shortOfVectors = output.contains("note: " + strategy
-            + " - the vector signal found none of the results");
-        if (shortOfVectors) {
-            assertThat(recall).as("%s, some answers without vectors", strategy)
-                .isBetween(Double.parseDouble(without), Double.parseDouble(withVectors));
-        } else {
-            assertThat(recall).as("%s, vectors in every answer", strategy)
-                .isEqualTo(Double.parseDouble(withVectors));
-        }
+    private static void assertVectorRow(String output, RetrievalStrategy strategy, String expected) {
+        assertThat(output).as("%s had vectors in every answer", strategy)
+            .doesNotContain("note: " + strategy + " - the vector signal found none of the results");
+        assertThat(recall(output, strategy)).as("%s", strategy).isEqualTo(expected);
     }
 
     @Test
@@ -158,11 +149,11 @@ class ModelBackedEvaluationTest {
         assertThat(recall(output, RetrievalStrategy.BM25_GRAPH))
             .as("the graph reaches the Byron document through the extracted fact")
             .isEqualTo("0.3333");
-        assertVectorRow(output, RetrievalStrategy.BM25_VECTOR, "0.3333", "0.0000");
+        assertVectorRow(output, RetrievalStrategy.BM25_VECTOR, "0.3333");
         assertThat(recall(output, RetrievalStrategy.BM25_EXPANSION_GRAPH))
             .as("expansion answers TLS and the graph answers Ada Lovelace").isEqualTo("0.6667");
-        assertVectorRow(output, RetrievalStrategy.BM25_EXPANSION_VECTOR, "0.6667", "0.3333");
-        assertVectorRow(output, RetrievalStrategy.FULL_HYBRID, "1.0000", "0.6667");
+        assertVectorRow(output, RetrievalStrategy.BM25_EXPANSION_VECTOR, "0.3333");
+        assertVectorRow(output, RetrievalStrategy.FULL_HYBRID, "0.6667");
 
         assertThat(model.extractionCalls()).as("every document went through extraction, once")
             .isEqualTo(5);
@@ -194,7 +185,7 @@ class ModelBackedEvaluationTest {
             String.valueOf(StubModelEndpoint.DIMENSIONS));
 
         assertThat(output).contains("=== lucene engine ===").doesNotContain("native engine");
-        assertVectorRow(output, RetrievalStrategy.BM25_VECTOR, "0.3333", "0.0000");
+        assertVectorRow(output, RetrievalStrategy.BM25_VECTOR, "0.3333");
         assertThat(row(output, RetrievalStrategy.BM25_EXPANSION_VECTOR))
             .contains("skipped").contains("chat model");
         assertThat(row(output, RetrievalStrategy.BM25_GRAPH))
