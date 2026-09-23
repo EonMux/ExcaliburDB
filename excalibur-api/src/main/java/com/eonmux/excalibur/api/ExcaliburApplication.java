@@ -694,10 +694,14 @@ public final class ExcaliburApplication {
 
         LOGGER.info("========================================");
         LOGGER.info("ExcaliburDB server started successfully");
-        LOGGER.info("Listening on port: {}", port);
-        LOGGER.info("Health endpoint: http://localhost:{}/health", port);
-        LOGGER.info("Stats endpoint: http://localhost:{}/v1/stats", port);
-        LOGGER.info("Query endpoint: http://localhost:{}/v1/query", port);
+        // From the bound socket, not the configured port and a guessed host: a TLS listener
+        // refuses the http URL, a node bound to one interface is not on localhost, and port 0
+        // binds an ephemeral port the configuration never names.
+        String baseUrl = server.baseUrl();
+        LOGGER.info("Listening on: {}", baseUrl);
+        LOGGER.info("Health endpoint: {}/health", baseUrl);
+        LOGGER.info("Stats endpoint: {}/v1/stats", baseUrl);
+        LOGGER.info("Query endpoint: {}/v1/query", baseUrl);
         LOGGER.info("========================================");
 
         // Keep the main thread alive

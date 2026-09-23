@@ -1,6 +1,7 @@
 package com.eonmux.excalibur.api.server;
 
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsServer;
 import com.eonmux.excalibur.api.bootstrap.GraphTenants;
 import com.eonmux.excalibur.api.bootstrap.NamespaceRoutingGraphIngestSink;
 import com.eonmux.excalibur.api.endpoint.BuildInfo;
@@ -31,6 +32,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
@@ -770,6 +774,40 @@ public class ExcaliburDBServer {
             return -1;
         }
         return current.getAddress().getPort();
+    }
+
+    /**
+     * The URL the server is listening on: the scheme it serves and the address it is bound to.
+     *
+     * <p>Read from the bound socket rather than rebuilt from configuration, so it is the port
+     * actually taken - an ephemeral one for port 0 - and the interface actually bound, and says
+     * {@code https} exactly when the listener is a TLS one. A wildcard bind reports the wildcard
+     * address, because that is what the node listens on; no single host name would be true of
+     * it.</p>
+     *
+     * @return The base URL, without a trailing slash, or null if the server is not started
+     */
+    public String baseUrl() {
+        HttpServer current = server;
+        if (current == null) {
+            return null;
+        }
+        return urlOf(current instanceof HttpsServer, current.getAddress());
+    }
+
+    /**
+     * Spells a listening address as a URL.
+     *
+     * @param tls     Whether the listener serves TLS
+     * @param address The bound address
+     * @return {@code scheme://host:port}, an IPv6 host in brackets so its colons are not read as
+     *         the port separator
+     */
+    static String urlOf(boolean tls, InetSocketAddress address) {
+        InetAddress host = address.getAddress();
+        String literal = host.getHostAddress();
+        String spelled = host instanceof Inet6Address ? "[" + literal + "]" : literal;
+        return (tls ? "https" : "http") + "://" + spelled + ":" + address.getPort();
     }
 
     /**
