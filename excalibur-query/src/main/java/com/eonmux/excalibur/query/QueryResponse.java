@@ -60,6 +60,7 @@ public final class QueryResponse implements CachedAnswer {
     private final boolean timedOut;
     private final boolean cancelled;
     private final boolean llmScored;
+    private final boolean retrievalExhausted;
 
     /**
      * Creates a new QueryResponse with all fields.
@@ -92,7 +93,8 @@ public final class QueryResponse implements CachedAnswer {
     public QueryResponse(String queryId, List<QueryResultItem> results, IndexCoverage coverage,
                          long queryTimeMs, boolean fromCache, boolean timedOut,
                          boolean cancelled) {
-        this(queryId, results, coverage, queryTimeMs, fromCache, timedOut, cancelled, false);
+        this(queryId, results, coverage, queryTimeMs, fromCache, timedOut, cancelled, false,
+            false);
     }
 
     /**
@@ -106,11 +108,12 @@ public final class QueryResponse implements CachedAnswer {
      * @param timedOut Whether the query timed out
      * @param cancelled Whether the caller cancelled the query
      * @param llmScored Whether relevancy scoring ordered the results
+     * @param retrievalExhausted Whether retrieval ran out of candidates before its limit
      * @throws NullPointerException if results or coverage is null
      */
     private QueryResponse(String queryId, List<QueryResultItem> results, IndexCoverage coverage,
                           long queryTimeMs, boolean fromCache, boolean timedOut,
-                          boolean cancelled, boolean llmScored) {
+                          boolean cancelled, boolean llmScored, boolean retrievalExhausted) {
         this.queryId = queryId;
         this.results = Collections.unmodifiableList(new ArrayList<>(
             Objects.requireNonNull(results, "Results cannot be null")));
@@ -120,6 +123,7 @@ public final class QueryResponse implements CachedAnswer {
         this.timedOut = timedOut;
         this.cancelled = cancelled;
         this.llmScored = llmScored;
+        this.retrievalExhausted = retrievalExhausted;
     }
 
     /**
@@ -258,8 +262,9 @@ public final class QueryResponse implements CachedAnswer {
     /**
      * Returns whether the caller cancelled the query.
      *
-     * <p>A cancelled query answers with whatever it had reached, which is usually nothing.
-     * Without this flag that answer is an empty result list at HTTP 200 with
+     * <p>A cancelled query answers with no results, whatever it had reached: a withdrawn
+     * question is not answered, not even in part. Without this flag that answer is an empty
+     * result list at HTTP 200 with
      * {@link #timedOut()} false - the same shape as a query that searched the whole corpus
      * and matched nothing. The two mean opposite things to whoever reads them.</p>
      *
@@ -305,6 +310,34 @@ public final class QueryResponse implements CachedAnswer {
     }
 
     /**
+     * Returns whether retrieval ran out of candidates before the limit it searched to.
+     *
+     * <p>True when the merge of every segment's answer came back shallower than the candidate
+     * count it asked for, so nothing past these results was left unconsidered. It is what lets
+     * a short answer stand behind its own length after relevancy scoring: a threshold that
+     * removed candidates from a set that was everything there was leaves an exact count, while
+     * one applied to a full candidate set says nothing about what lay past it. Never true of
+     * an answer a deadline or a withdrawal cut short, and false unless the pipeline that
+     * produced this answer established it.</p>
+     *
+     * @return true when retrieval had nothing further to give
+     */
+    public boolean retrievalExhausted() {
+        return retrievalExhausted;
+    }
+
+    /**
+     * Creates a new QueryResponse saying whether retrieval ran out of candidates.
+     *
+     * @param exhausted Whether retrieval had nothing further to give
+     * @return A new QueryResponse with the flag
+     */
+    public QueryResponse withRetrievalExhausted(boolean exhausted) {
+        return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
+            cancelled, llmScored, exhausted);
+    }
+
+    /**
      * Returns the top result, or null if no results.
      *
      * @return The first result, or null
@@ -320,7 +353,7 @@ public final class QueryResponse implements CachedAnswer {
      */
     public QueryResponse withFromCache() {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, true, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     /**
@@ -331,7 +364,7 @@ public final class QueryResponse implements CachedAnswer {
      */
     public QueryResponse withQueryTimeMs(long newQueryTimeMs) {
         return new QueryResponse(queryId, results, coverage, newQueryTimeMs, fromCache, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     /**
@@ -342,7 +375,7 @@ public final class QueryResponse implements CachedAnswer {
      */
     public QueryResponse withTimedOut(boolean timedOut) {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     /**
@@ -353,7 +386,7 @@ public final class QueryResponse implements CachedAnswer {
      */
     public QueryResponse withCancelled(boolean cancelled) {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     /**
@@ -364,7 +397,7 @@ public final class QueryResponse implements CachedAnswer {
      */
     public QueryResponse withQueryId(String queryId) {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     /**
@@ -375,7 +408,7 @@ public final class QueryResponse implements CachedAnswer {
      */
     public QueryResponse withLlmScored(boolean llmScored) {
         return new QueryResponse(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     /**
@@ -391,7 +424,7 @@ public final class QueryResponse implements CachedAnswer {
      */
     public QueryResponse withResults(List<QueryResultItem> newResults) {
         return new QueryResponse(queryId, newResults, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     /**
@@ -403,7 +436,7 @@ public final class QueryResponse implements CachedAnswer {
      */
     public QueryResponse withCoverage(IndexCoverage newCoverage) {
         return new QueryResponse(queryId, results, newCoverage, queryTimeMs, fromCache, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     /**
@@ -438,6 +471,7 @@ public final class QueryResponse implements CachedAnswer {
             timedOut == that.timedOut &&
             cancelled == that.cancelled &&
             llmScored == that.llmScored &&
+            retrievalExhausted == that.retrievalExhausted &&
             Objects.equals(queryId, that.queryId) &&
             results.equals(that.results) &&
             coverage.equals(that.coverage);
@@ -446,7 +480,7 @@ public final class QueryResponse implements CachedAnswer {
     @Override
     public int hashCode() {
         return Objects.hash(queryId, results, coverage, queryTimeMs, fromCache, timedOut,
-            cancelled, llmScored);
+            cancelled, llmScored, retrievalExhausted);
     }
 
     @Override

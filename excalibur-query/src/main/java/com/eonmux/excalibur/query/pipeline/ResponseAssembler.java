@@ -103,9 +103,10 @@ final class ResponseAssembler {
      */
     QueryResponse buildResponse(PipelineContext context, long durationMs) {
         // A response is degraded when coverage is below the threshold, when a segment errored or
-        // timed out - all three of which computeDegraded reads off the numbers below - and for two
-        // reasons no count records, which are ORed in afterwards: LLM scoring that fell back to
-        // vector-only ranking, and a segment that answered from part of its write log.
+        // timed out - all three of which computeDegraded reads off the numbers below - and for
+        // three reasons no count records, which are ORed in afterwards: LLM scoring that fell
+        // back to vector-only ranking, a segment that answered from part of its write log, and
+        // results Stage 4 found and dropped because nothing names them.
         IndexCoverage coverage = coverageCounts.census().onto(IndexCoverage.builder())
             .tailScanEntries(context.totalTailScanEntries)
             .segmentsSearched(CoverageCounts.segmentsAnswering(context.segmentResults))
@@ -119,7 +120,9 @@ final class ResponseAssembler {
             // No count records that: it is not an error and not a timeout, and its results are
             // kept, so without this the response would say the whole corpus was searched.
             .orDegraded(CoverageCounts.anySegmentIncomplete(context.segmentResults))
+            .orDegraded(context.unnamedResultsDropped > 0)
             .build();
+        Metrics.recordUnnamedResultsDropped(context.unnamedResultsDropped);
 
         // Whether Stage 5 ordered the ranking is part of the answer, not of how it was made:
         // it decides whether a score is a similarity or a relevancy judgement.
@@ -129,7 +132,8 @@ final class ResponseAssembler {
             durationMs,
             false,
             false
-        ).withLlmScored(context.llmScored);
+        ).withLlmScored(context.llmScored)
+            .withRetrievalExhausted(context.retrievalExhausted);
 
         // DOMAIN CORRECTNESS VALIDATION:
         // Validate the response meets all domain correctness constraints
@@ -153,11 +157,13 @@ final class ResponseAssembler {
     /**
      * Handles pipeline errors and creates appropriate response.
      *
-     * <p>When the pipeline is interrupted by a timeout or cancellation, any results
-     * that were already computed by earlier stages are returned as best-effort partial
-     * results. Hard failures - and interruptions that happened before any stage completed -
-     * produce an empty result set: a stage that threw did not produce an answer, and
-     * whatever earlier stages left behind is not one either.</p>
+     * <p>When the pipeline runs out of time, any results that were already computed by
+     * earlier stages are returned as best-effort partial results. A cancellation returns none:
+     * the caller withdrew the question, and handing back whatever the stages had reached
+     * answers part of a question nobody is asking any more. Hard failures - and timeouts that
+     * happened before any stage completed - produce an empty result set too: a stage that
+     * threw did not produce an answer, and whatever earlier stages left behind is not one
+     * either.</p>
      *
      * @param error         The error that terminated the pipeline
      * @param request       The original query request
@@ -180,23 +186,25 @@ final class ResponseAssembler {
 
         logPipelineError(error, durationMs, token, timedOut, cancelled);
 
-        // Return partial results only for an interruption, which is what the contract
-        // promises. A hard failure means a stage did not do its job, so whatever earlier
-        // stages happened to accumulate is not an answer to the query - returning it would
-        // present an arbitrary prefix of the pipeline as a successful (if degraded) result.
-        boolean interrupted = timedOut || cancelled;
+        // Return partial results only for a timeout, which is what the contract promises. A
+        // hard failure means a stage did not do its job, so whatever earlier stages happened
+        // to accumulate is not an answer to the query - returning it would present an
+        // arbitrary prefix of the pipeline as a successful (if degraded) result. A withdrawal
+        // is answered with nothing for the reason the caller gave: the question was taken
+        // back.
+        boolean partial = timedOut && !cancelled;
         // Stage 4 leaves its ranking oversampled when Stage 5 is going to run, because Stage 5's
         // threshold filter is meant to choose from it. If Stage 5 is what the interruption
         // caught, that list goes to the caller as it stands - so it is cut here to the size the
         // caller actually asked for.
-        List<QueryResultItem> partialResults = (interrupted && partialContext != null)
+        List<QueryResultItem> partialResults = (partial && partialContext != null)
             ? QueryPipeline.truncate(partialContext.mergedResults, request.topK())
             : Collections.emptyList();
 
-        IndexCoverage coverage = degradedCoverage(interrupted ? partialContext : null);
+        IndexCoverage coverage = degradedCoverage(partial ? partialContext : null);
 
-        // Cancelled is reported separately from timedOut: the two produce the same shape of
-        // answer - degraded, usually empty - and only this flag tells the caller which of them
+        // Cancelled is reported separately from timedOut: both answers are degraded, and a
+        // cancelled one is always empty, so only this flag tells the caller which of them
         // happened, or that either did rather than the corpus holding no match.
         return new QueryResponse(
             null,
@@ -206,7 +214,7 @@ final class ResponseAssembler {
             false,
             timedOut,
             cancelled
-        ).withLlmScored(interrupted && partialContext != null && partialContext.llmScored);
+        ).withLlmScored(partial && partialContext != null && partialContext.llmScored);
     }
 
     /**
@@ -229,8 +237,8 @@ final class ResponseAssembler {
      * The coverage reported for a query that did not finish.
      *
      * @param partialContext The most recently completed stage's context, or null when no
-     *                       partial answer may be reported - a hard failure, or an
-     *                       interruption that caught no stage
+     *                       partial answer may be reported - a hard failure, a
+     *                       withdrawal, or a timeout that caught no stage
      * @return Coverage marked degraded, carrying whatever was actually reached
      */
     private IndexCoverage degradedCoverage(PipelineContext partialContext) {

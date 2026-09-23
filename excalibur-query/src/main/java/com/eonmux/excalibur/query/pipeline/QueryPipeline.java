@@ -53,7 +53,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>Results are always sorted by distance/score (closest first)</li>
  *   <li>No duplicate entries in results</li>
  *   <li>Coverage accurately reflects segments searched</li>
- *   <li>Partial results returned on timeout</li>
+ *   <li>Partial results returned on timeout; none on cancellation, which withdraws the question</li>
  * </ul>
  *
  * <h2>Thread Safety</h2>

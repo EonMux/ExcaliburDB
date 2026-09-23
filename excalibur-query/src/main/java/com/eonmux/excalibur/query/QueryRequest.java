@@ -114,6 +114,11 @@ public final class QueryRequest {
      */
     private final String correlationId;
 
+    /**
+     * Whether every result must carry the string identifier ingestion assigned.
+     */
+    private final boolean requireNamedResults;
+
     // ==================== Constructors ====================
 
     private QueryRequest(Builder builder) {
@@ -129,6 +134,7 @@ public final class QueryRequest {
         this.llmThreshold = builder.llmThreshold;
         this.oversamplingFactor = builder.oversamplingFactor;
         this.correlationId = builder.correlationId;
+        this.requireNamedResults = builder.requireNamedResults;
 
         validate();
     }
@@ -326,6 +332,24 @@ public final class QueryRequest {
         return correlationId;
     }
 
+    /**
+     * Returns whether a result the pipeline cannot name is dropped rather than returned.
+     *
+     * <p>A graph node whose node-to-document mapping entry is missing - a mapping file that
+     * could not be opened, or an entry lost before it was persisted - is found by the search
+     * but carries no identifier ingestion assigned, only its node id. An embedded caller can
+     * still use that result, through {@link QueryResultItem#segmentId()} and
+     * {@link QueryResultItem#nodeId()}. A caller outside the process cannot: the node id is
+     * renumbered by compaction and names nothing it can fetch, fuse or erase by. Such a caller
+     * asks for this, and the pipeline drops those results before it cuts the ranking to
+     * {@link #topK()}, so the page is filled from results that can be named.</p>
+     *
+     * @return true when unnamed results are dropped
+     */
+    public boolean requireNamedResults() {
+        return requireNamedResults;
+    }
+
     // ==================== Conversion ====================
 
     /**
@@ -367,6 +391,7 @@ public final class QueryRequest {
             enableLlmScoring == that.enableLlmScoring &&
             Float.compare(that.llmThreshold, llmThreshold) == 0 &&
             oversamplingFactor == that.oversamplingFactor &&
+            requireNamedResults == that.requireNamedResults &&
             Objects.equals(queryText, that.queryText) &&
             Arrays.equals(queryVector, that.queryVector) &&
             Objects.equals(correlationId, that.correlationId);
@@ -376,7 +401,7 @@ public final class QueryRequest {
     public int hashCode() {
         int result = Objects.hash(queryText, topK, timeoutMs,
             includePartialSegments, threshold, enableLlmScoring, llmThreshold,
-            oversamplingFactor, correlationId);
+            oversamplingFactor, correlationId, requireNamedResults);
         result = 31 * result + Arrays.hashCode(queryVector);
         return result;
     }
@@ -404,6 +429,7 @@ public final class QueryRequest {
         private float llmThreshold = 0.3f;
         private int oversamplingFactor = QueryOptions.DEFAULT_OVERSAMPLING_FACTOR;
         private String correlationId;
+        private boolean requireNamedResults;
 
         private Builder() {}
 
@@ -542,6 +568,18 @@ public final class QueryRequest {
                 throw new IllegalArgumentException("oversamplingFactor must be at least 1: " + oversamplingFactor);
             }
             this.oversamplingFactor = oversamplingFactor;
+            return this;
+        }
+
+        /**
+         * Sets whether a result the pipeline cannot name is dropped rather than returned.
+         *
+         * @param requireNamedResults true for a caller that can only use named results
+         * @return This builder
+         * @see QueryRequest#requireNamedResults()
+         */
+        public Builder requireNamedResults(boolean requireNamedResults) {
+            this.requireNamedResults = requireNamedResults;
             return this;
         }
 

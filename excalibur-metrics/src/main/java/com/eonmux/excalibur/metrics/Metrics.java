@@ -260,6 +260,37 @@ public final class Metrics {
     }
 
     /**
+     * Query results dropped because they carried no document identity.
+     *
+     * <p>A counter rather than a log line alone: each drop is a hit the node found and could
+     * not return, it recurs on every query that reaches the same graph nodes until their
+     * segments' graphs are restored or reindexed, and any increase means a node-to-document
+     * mapping is missing entries.</p>
+     */
+    private static final AtomicLong unnamedResultsDropped =
+        new AtomicLong();
+
+    /**
+     * Counts query results dropped because they carried no document identity.
+     *
+     * @param count How many were dropped; non-positive counts are ignored
+     */
+    public static void recordUnnamedResultsDropped(long count) {
+        if (count > 0) {
+            unnamedResultsDropped.addAndGet(count);
+        }
+    }
+
+    /**
+     * Gets how many query results were dropped because they carried no document identity.
+     *
+     * @return Lifetime count
+     */
+    public static long getUnnamedResultsDropped() {
+        return unnamedResultsDropped.get();
+    }
+
+    /**
      * Gets the current ingestion rate (entries per second).
      *
      * <p>Domain: Returns a value in range [0, Long.MAX_VALUE]. Typical values
